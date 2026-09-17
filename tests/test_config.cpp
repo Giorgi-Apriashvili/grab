@@ -1,0 +1,162 @@
+#include "config.hpp"
+#include "ini.hpp"
+#include "util.hpp"
+
+#include <doctest/doctest.h>
+
+using namespace grab;
+
+namespace {
+GrabConfig parse_ok(std::string_view text) {
+    auto doc = ini::parse(text);
+    REQUIRE(doc.has_value());
+    auto cfg = parse_grab_config(*doc);
+    REQUIRE_MESSAGE(cfg.has_value(), cfg.error_or(""));
+    return *cfg;
+}
+} // namespace
+
+TEST_CASE("minimal grab.conf gets built-in defaults") {
+    const auto cfg = parse_ok("[hetzner]\nsearch_roots = /home/alice\n");
+    CHECK(cfg.rclone == "rclone");
+    CHECK(cfg.ssh == "ssh");
+    CHECK_FALSE(cfg.rclone_config.has_value());
+    CHECK_FALSE(cfg.default_remote.has_value());
+    REQUIRE(cfg.remotes.size() == 1);
+    const auto& r = cfg.remotes[0];
+    CHECK(r.name == "hetzner");
+    CHECK(r.rclone_remote == "hetzner");
+    CHECK(r.search_roots == std::vector<std::string>{"/home/alice"});
+    CHECK(r.max_depth == 4);
+    CHECK(r.skip_hidden);
+    CHECK(r.ssh_options.empty());
+    CHECK(r.common_flags == util::split_args(default_common_flags));
+    CHECK(r.folder_flags == util::split_args(default_folder_flags));
+    CHECK(r.file_flags == util::split_args(default_file_flags));
+}
+
+TEST_CASE("explicit keys override defaults, blank flag keys mean no flags") {
+    const auto cfg = parse_ok("[grab]\n"
+                              "rclone = C:\\Tools\\rclone.exe\n"
+                              "rclone_config = C:\\cfg\\rclone.conf\n"
+                              "ssh = \n"
+                              "default_remote = box\n"
+                              "[box]\n"
+                              "rclone_remote = hetzner\n"
+                              "search_roots = /home/alice, /srv\n"
+                              "max_depth = 2\n"
+                              "skip_hidden = no\n"
+                              "ssh_options = -o ServerAliveInterval=30\n"
+                              "common_flags =\n"
+                              "folder_flags = --transfers 8\n");
+    CHECK(cfg.rclone == "C:\\Tools\\rclone.exe");
+    REQUIRE(cfg.rclone_config.has_value());
+    CHECK(util::path_to_utf8(*cfg.rclone_config) == "C:\\cfg\\rclone.conf");
+    CHECK(cfg.ssh == "ssh"); // blank falls back
+    CHECK(cfg.default_remote == "box");
+    REQUIRE(cfg.remotes.size() == 1);
+    const auto& r = cfg.remotes[0];
+    CHECK(r.name == "box");
+    CHECK(r.rclone_remote == "hetzner");
+    CHECK(r.search_roots == std::vector<std::string>{"/home/alice", "/srv"});
+    CHECK(r.max_depth == 2);
+    CHECK_FALSE(r.skip_hidden);
+    CHECK(r.ssh_options == std::vector<std::string>{"-o", "ServerAliveInterval=30"});
+    CHECK(r.common_flags.empty());
+    CHECK(r.folder_flags == std::vector<std::string>{"--transfers", "8"});
+    CHECK(r.file_flags == util::split_args(default_file_flags)); // untouched
+}
+
+TEST_CASE("grab.conf validation errors") {
+    auto no_remotes = parse_grab_config(*ini::parse("[grab]\nrclone = rclone\n"));
+    CHECK_FALSE(no_remotes.has_value());
+
+    auto rel_root = parse_grab_config(*ini::parse("[h]\nsearch_roots = home/alice\n"));
+    CHECK_FALSE(rel_root.has_value());
+
+    auto bad_depth = parse_grab_config(*ini::parse("[h]\nmax_depth = deep\n"));
+    CHECK_FALSE(bad_depth.has_value());
+
+    auto zero_depth = parse_grab_config(*ini::parse("[h]\nmax_depth = 0\n"));
+    CHECK_FALSE(zero_depth.has_value());
+
+    auto bad_bool = parse_grab_config(*ini::parse("[h]\nskip_hidden = maybe\n"));
+    CHECK_FALSE(bad_bool.has_value());
+}
+
+TEST_CASE("remote selection") {
+    const auto one = parse_ok("[only]\nsearch_roots = /x\n");
+    auto s = one.select(std::nullopt);
+    REQUIRE(s.has_value());
+    CHECK((*s)->name == "only");
+    CHECK_FALSE(one.select(std::string("nope")).has_value());
+
+    const auto two = parse_ok("[a]\nsearch_roots = /x\n[b]\nsearch_roots = /y\n");
+    CHECK_FALSE(two.select(std::nullopt).has_value()); // ambiguous
+    auto b = two.select(std::string("b"));
+    REQUIRE(b.has_value());
+    CHECK((*b)->name == "b");
+
+    const auto with_default = parse_ok("[grab]\ndefault_remote = b\n[a]\n[b]\n");
+    auto d = with_default.select(std::nullopt);
+    REQUIRE(d.has_value());
+    CHECK((*d)->name == "b");
+
+    const auto bad_default = parse_ok("[grab]\ndefault_remote = zzz\n[a]\n");
+    CHECK_FALSE(bad_default.select(std::nullopt).has_value());
+}
+
+TEST_CASE("rclone.conf sftp remote is read for the ssh step") {
+    auto doc = ini::parse("[hetzner]\n"
+                          "type = sftp\n"
+                          "host = 203.0.113.10\n"
+                          "user = alice\n"
+                          "port = 2222\n"
+                          "key_pem = \n"
+                          "key_file = E:\\keys\\server.pem\n"
+                          "key_file_pass = obscured\n"
+                          "shell_type = unix\n"
+                          "known_hosts_file = C:\\Users\\alice\\.ssh\\known_hosts\n"
+                          "[gdrive]\n"
+                          "type = drive\n");
+    REQUIRE(doc.has_value());
+
+    auto r = parse_rclone_remote(*doc, "hetzner");
+    REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+    CHECK(r->name == "hetzner");
+    CHECK(r->host == "203.0.113.10");
+    CHECK(r->user == "alice");
+    CHECK(r->port == 2222);
+    CHECK(r->key_file == "E:\\keys\\server.pem");
+    CHECK(r->known_hosts_file == "C:\\Users\\alice\\.ssh\\known_hosts");
+
+    auto wrong_type = parse_rclone_remote(*doc, "gdrive");
+    REQUIRE_FALSE(wrong_type.has_value());
+    CHECK(wrong_type.error().find("sftp") != std::string::npos);
+
+    auto missing = parse_rclone_remote(*doc, "nope");
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error().find("hetzner") != std::string::npos); // lists available
+}
+
+TEST_CASE("rclone remote defaults and validation") {
+    auto minimal = parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nhost=h\nuser=u\n"), "s");
+    REQUIRE(minimal.has_value());
+    CHECK(minimal->port == 22);
+    CHECK_FALSE(minimal->key_file.has_value());
+    CHECK_FALSE(minimal->known_hosts_file.has_value());
+
+    CHECK_FALSE(parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nuser=u\n"), "s").has_value());
+    CHECK_FALSE(parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nhost=h\n"), "s").has_value());
+    CHECK_FALSE(parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nhost=h\nuser=u\nport=99999\n"), "s")
+                    .has_value());
+}
+
+TEST_CASE("example config parses and matches the defaults") {
+    const auto cfg = parse_ok(example_config);
+    CHECK(cfg.default_remote == "hetzner");
+    REQUIRE(cfg.remotes.size() == 1);
+    CHECK(cfg.remotes[0].common_flags == util::split_args(default_common_flags));
+    CHECK(cfg.remotes[0].folder_flags == util::split_args(default_folder_flags));
+    CHECK(cfg.remotes[0].file_flags == util::split_args(default_file_flags));
+}

@@ -1,0 +1,14 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "cmake.options.statusBarVisibility": "visible",
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}/build/clang-cl-debug",
+    "--header-insertion=never",
+    "--completion-style=detailed"
+  ],
+  "files.associations": {
+    "*.conf": "ini",
+    "grab.conf.example": "ini"
+  }
+}
