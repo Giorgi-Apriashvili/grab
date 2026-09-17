@@ -185,7 +185,7 @@ int run(const Options& opts) {
 
     // 5. transfer ------------------------------------------------------------------------
     std::println(stderr, "grab: {} {}  ->  {}", mode_noun(opts.mode),
-                 remote_spec(settings.rclone_remote, *chosen), util::path_to_utf8(dest));
+                 remote_spec(settings.rclone_remote, *chosen), util::path_to_utf8(local_target(rq)));
     auto code = proc::run_inherit(rclone_argv);
     if (!code) {
         error(code.error());

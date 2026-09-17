@@ -29,7 +29,10 @@ struct RcloneRequest {
 // "remote:/abs/path"
 [[nodiscard]] std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path);
 
-// Folder: rclone copy   remote:/path DEST         (contents of /path land in DEST)
+// Where the transfer lands locally: DEST\<basename of remote_path>, in both modes.
+[[nodiscard]] std::filesystem::path local_target(const RcloneRequest& req);
+
+// Folder: rclone copy   remote:/path DEST\<name>   (the folder is recreated inside DEST)
 // File:   rclone copyto remote:/path DEST\<name>
 [[nodiscard]] std::vector<std::string> build_rclone_argv(const RcloneRequest& req);
 

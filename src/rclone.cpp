@@ -18,19 +18,16 @@ std::string remote_spec(std::string_view rclone_remote, std::string_view remote_
     return out;
 }
 
-std::vector<std::string> build_rclone_argv(const RcloneRequest& req) {
-    std::vector<std::string> argv{req.rclone_exe};
+std::filesystem::path local_target(const RcloneRequest& req) {
+    return req.dest_dir / util::path_from_utf8(remote_basename(req.remote_path));
+}
 
-    if (req.mode == Mode::folder) {
-        argv.push_back("copy");
-        argv.push_back(remote_spec(req.rclone_remote, req.remote_path));
-        argv.push_back(util::path_to_utf8(req.dest_dir));
-    } else {
-        argv.push_back("copyto");
-        argv.push_back(remote_spec(req.rclone_remote, req.remote_path));
-        argv.push_back(util::path_to_utf8(req.dest_dir / util::path_from_utf8(
-                                                             remote_basename(req.remote_path))));
-    }
+std::vector<std::string> build_rclone_argv(const RcloneRequest& req) {
+    // rclone copy syncs the *contents* of the source directory into the destination, so the
+    // folder is recreated by naming it explicitly; copyto writes the single file to that path.
+    std::vector<std::string> argv{req.rclone_exe, req.mode == Mode::folder ? "copy" : "copyto",
+                                  remote_spec(req.rclone_remote, req.remote_path),
+                                  util::path_to_utf8(local_target(req))};
 
     if (req.rclone_config) {
         argv.push_back("--config");

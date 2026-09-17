@@ -5,15 +5,18 @@ downloads it with rclone using flags tuned for either one big file or a tree of 
 with rclone's live progress in your terminal.
 
 ```
-grab -f releases  E:\Backup\releases     # folder: contents of the remote dir land in E:\Backup\releases
-grab -s movie.mkv E:\Backup              # file:   E:\Backup\movie.mkv
+grab -f releases  E:\Backup     # folder: E:\Backup\releases\...
+grab -s movie.mkv E:\Backup     # file:   E:\Backup\movie.mkv
 ```
+
+`DEST` is the parent directory in both modes; the item is recreated inside it under its
+remote name.
 
 ## How it works
 
 ```
-grab -f releases E:\Backup\releases
-  ├─ 1. parse args      mode=folder, target="releases", dest="E:\Backup\releases"
+grab -f releases E:\Backup
+  ├─ 1. parse args      mode=folder, target="releases", dest="E:\Backup"
   ├─ 2. load config     grab.conf  ->  which rclone remote, where to search, which flags
   │                     rclone.conf -> host / user / port / key for the ssh step
   ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -print0"
@@ -87,8 +90,9 @@ grab (-s|--file | -f|--folder) TARGET DEST [options] [-- extra rclone args]
 
 - `TARGET` is matched with `find -name`, so shell globs work: `grab -f 'Some.Movie*' E:\Backup\tr`.
 - A `TARGET` starting with `/` is used as-is (existence and type are still checked).
-- `DEST` is always a directory and is created if missing. Folder mode copies the *contents*
-  of the remote folder into it. File mode writes `DEST\<name>`.
+- `DEST` is the local parent directory and is created if missing. Both modes write
+  `DEST\<name>`: folder mode recreates the folder there and copies its contents into it,
+  file mode writes the single file. `grab -f releases E:\Backup` yields `E:\Backup\releases\...`.
 - Dot-directories are skipped during the search unless `skip_hidden = false` or the
   target itself starts with a dot.
 - Anything after `--` is appended to the rclone command, e.g. `-- --bwlimit 10M`.

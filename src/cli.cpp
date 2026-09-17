@@ -19,8 +19,8 @@ Usage:
   grab --init | --help | --version
 
 TARGET is a name searched under the remote's search_roots (find -name, globs allowed),
-or an absolute remote path starting with '/'. DEST is always a local directory; in file
-mode the file is written as DEST\<name>.
+or an absolute remote path starting with '/'. DEST is the local parent directory: the
+file or folder is written as DEST\<name>, created if needed.
 
 Options:
   -s, --file           TARGET is a file   (rclone copyto, single-file tuned flags)

@@ -6,7 +6,7 @@
       "type": "lldb",
       "request": "launch",
       "program": "${command:cmake.launchTargetPath}",
-      "args": ["-f", "releases", "E:\\Backup\\releases", "--dry-run", "-v"],
+      "args": ["-f", "releases", "E:\\Backup", "--dry-run", "-v"],
       "cwd": "${workspaceFolder}",
       "terminal": "integrated"
     },

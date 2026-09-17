@@ -18,7 +18,7 @@ TEST_CASE("remote_spec joins remote and absolute path") {
     CHECK(remote_spec("hetzner", "/home/alice/releases") == "hetzner:/home/alice/releases");
 }
 
-TEST_CASE("folder mode builds rclone copy into DEST with common, mode and extra flags in order") {
+TEST_CASE("folder mode recreates the folder inside DEST, flags in common, mode, extra order") {
     const std::vector<std::string> common{"-P", "--sftp-chunk-size", "255Ki"};
     const std::vector<std::string> folder{"--transfers", "4"};
     const std::vector<std::string> extra{"--bwlimit", "10M"};
@@ -28,19 +28,35 @@ TEST_CASE("folder mode builds rclone copy into DEST with common, mode and extra 
     rq.rclone_exe = "rclone";
     rq.rclone_remote = "hetzner";
     rq.remote_path = "/home/alice/releases";
-    rq.dest_dir = util::path_from_utf8("E:\\Backup\\releases");
+    rq.dest_dir = util::path_from_utf8("E:\\Backup");
     rq.common_flags = common;
     rq.mode_flags = folder;
     rq.extra = extra;
 
+    CHECK(local_target(rq) == rq.dest_dir / "releases");
     const auto argv = build_rclone_argv(rq);
     CHECK(argv == std::vector<std::string>{"rclone", "copy", "hetzner:/home/alice/releases",
-                                           util::path_to_utf8(rq.dest_dir), "-P",
+                                           util::path_to_utf8(rq.dest_dir / "releases"), "-P",
                                            "--sftp-chunk-size", "255Ki", "--transfers", "4",
                                            "--bwlimit", "10M"});
 }
 
+TEST_CASE("folder names with spaces and punctuation survive as one path") {
+    RcloneRequest rq;
+    rq.mode = Mode::folder;
+    rq.rclone_exe = "rclone";
+    rq.rclone_remote = "hetzner";
+    rq.remote_path = "/home/alice/courses/Course - Learn to Program with C++ by Jane Doe";
+    rq.dest_dir = util::path_from_utf8("C:\\Users\\alice\\Desktop");
+
+    const auto argv = build_rclone_argv(rq);
+    REQUIRE(argv.size() == 4);
+    CHECK(argv[3] == util::path_to_utf8(
+                         rq.dest_dir / "Course - Learn to Program with C++ by Jane Doe"));
+}
+
 TEST_CASE("file mode builds rclone copyto DEST\\name and passes --config when set") {
+    // Same DEST\<name> rule as folder mode, but with copyto so rclone treats it as a file path.
     const std::vector<std::string> common{"-P"};
     const std::vector<std::string> file{"--multi-thread-streams", "8"};
 
@@ -71,5 +87,6 @@ TEST_CASE("empty flag lists produce a bare command") {
     rq.remote_path = "/p";
     rq.dest_dir = util::path_from_utf8("D:\\out");
     const auto argv = build_rclone_argv(rq);
-    CHECK(argv == std::vector<std::string>{"rclone", "copy", "r:/p", util::path_to_utf8(rq.dest_dir)});
+    CHECK(argv == std::vector<std::string>{"rclone", "copy", "r:/p",
+                                           util::path_to_utf8(rq.dest_dir / "p")});
 }
