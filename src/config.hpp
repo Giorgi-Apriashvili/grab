@@ -11,11 +11,19 @@
 
 namespace grab {
 
+// How TARGET is located on the server.
+enum class FindMethod {
+    auto_detect, // ssh when the rclone remote has a key_file, otherwise rclone
+    ssh,         // ssh + find: one round trip, needs a shell and a key or password prompt
+    rclone       // rclone lsf: SFTP walk, no shell and no prompt needed
+};
+
 // One [section] of grab.conf describing how to search and download from a server.
 struct RemoteSettings {
     std::string name;                      // grab.conf section name, used with -r
     std::string rclone_remote;             // remote name in rclone.conf (default: name)
-    std::vector<std::string> search_roots; // absolute remote dirs; may be empty
+    std::vector<std::string> search_roots; // normalized; "" = login home; may be empty
+    FindMethod find = FindMethod::auto_detect;
     int max_depth = 4;
     bool skip_hidden = true;
     std::vector<std::string> ssh_options;
@@ -43,8 +51,16 @@ struct RcloneRemote {
     std::string user;
     int port = 22;
     std::optional<std::string> key_file;
-    std::optional<std::string> known_hosts_file;
+    std::optional<std::string> known_hosts_file; // rclone's "none" becomes nullopt
 };
+
+// Resolve auto_detect: ssh when the remote authenticates with a key file (a shell is very
+// likely), otherwise rclone (password remotes and storage boxes usually have no shell).
+[[nodiscard]] FindMethod resolve_find_method(const RemoteSettings& settings,
+                                             const RcloneRemote& remote);
+
+// "." and "~" mean the login home and become ""; "/" stays; other roots lose trailing '/'.
+[[nodiscard]] std::string normalize_root(std::string_view root);
 
 // Built-in flag defaults, used when the key is absent from grab.conf.
 inline constexpr std::string_view default_common_flags = "-P --sftp-chunk-size 255Ki";

@@ -20,6 +20,7 @@ grab -f releases E:\Backup
   ├─ 2. load config     grab.conf  ->  which rclone remote, where to search, which flags
   │                     rclone.conf -> host / user / port / key for the ssh step
   ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -print0"
+  │                     (or `rclone lsf -R` for remotes without a key / shell, see Lookup methods)
   │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick (or --first)
   ├─ 4. build rclone    rclone copy   hetzner:/home/alice/releases E:\Backup\releases  + flags
   │                     rclone copyto hetzner:/path/movie.mkv      E:\Backup\movie.mkv  + flags
@@ -95,7 +96,8 @@ grab config [-c PATH]
 ```
 
 - `TARGET` is matched with `find -name`, so shell globs work: `grab -f 'Some.Movie*' E:\Backup\tr`.
-- A `TARGET` starting with `/` is used as-is (existence and type are still checked).
+- A `TARGET` containing `/` is a path, absolute or relative to the login home, and is
+  checked as-is instead of searched for.
 - `DEST` is the local parent directory and is created if missing. Both modes write
   `DEST\<name>`: folder mode recreates the folder there and copies its contents into it,
   file mode writes the single file. `grab -f releases E:\Backup` yields `E:\Backup\releases\...`.
@@ -104,7 +106,26 @@ grab config [-c PATH]
 - Anything after `--` is appended to the rclone command, e.g. `-- --bwlimit 10M`.
 
 Exit codes: `0` ok, `1` usage, `2` config, `3` target not found or pick aborted,
-`4` ssh failed, otherwise rclone's own code.
+`4` remote lookup failed (ssh or rclone listing), otherwise rclone's own code.
+
+## Lookup methods
+
+Per remote, `find =` in grab.conf picks how `TARGET` is located:
+
+| method   | how                                                          | auto picks it when |
+|----------|--------------------------------------------------------------|--------------------|
+| `ssh`    | one `ssh user@host "find ROOTS -maxdepth N -name TARGET"`    | the rclone remote has a `key_file` |
+| `rclone` | `rclone lsf REMOTE:ROOT -R --max-depth N`, filtered locally   | otherwise (password remotes, storage boxes) |
+
+`ssh` is a single round trip but needs a shell on the server and prompts for the key
+passphrase. `rclone` walks the tree over SFTP, a few seconds for a few hundred directories,
+needs no shell and no prompt, and is the right choice for a Hetzner Storage Box, which
+does not run arbitrary commands. On a Storage Box use `search_roots = /home` or leave it
+blank for the home directory; `/` itself is not listable there.
+
+`search_roots` entries may be absolute (`/srv`) or relative to the login home
+(`learning`); blank or `.` means the home directory. `known_hosts_file = none` in
+rclone.conf is honoured as "no known_hosts file" and never passed to ssh.
 
 ## Tuning
 

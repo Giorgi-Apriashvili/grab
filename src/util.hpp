@@ -34,6 +34,9 @@ namespace grab::util {
 
 [[nodiscard]] std::string join(const std::vector<std::string>& items, std::string_view sep);
 
+// ASCII lower-casing, for case-insensitive keywords.
+[[nodiscard]] std::string to_lower(std::string_view s);
+
 #ifdef _WIN32
 [[nodiscard]] std::wstring to_wide(std::string_view utf8);
 [[nodiscard]] std::string to_utf8(std::wstring_view wide);

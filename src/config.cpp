@@ -2,7 +2,6 @@
 
 #include "util.hpp"
 
-#include <algorithm>
 #include <charconv>
 
 namespace grab {
@@ -34,7 +33,11 @@ default_remote = hetzner
 [hetzner]
 # Name of the remote in rclone.conf (defaults to this section's name).
 rclone_remote = hetzner
-# Comma-separated absolute directories to search on the server, all in one `find` call.
+# How TARGET is located: auto = ssh + find when the rclone remote has a key_file, otherwise
+# an rclone listing (password remotes and storage boxes have no shell). Force with ssh | rclone.
+find = auto
+# Comma-separated directories to search: absolute (/srv) or relative to the login home
+# (learning). Blank or . = the home directory itself.
 search_roots = /home/alice
 # How deep below each root `find` may look (find -maxdepth).
 max_depth = 4
@@ -85,15 +88,27 @@ namespace {
                                                           bool fallback) {
     auto v = nonblank(s, key);
     if (!v) return fallback;
-    std::string lower = *v;
-    std::ranges::transform(lower, lower.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string lower = util::to_lower(*v);
     if (lower == "true" || lower == "yes" || lower == "on" || lower == "1") return true;
     if (lower == "false" || lower == "no" || lower == "off" || lower == "0") return false;
     return util::failf("[{}] {} must be true/false, got '{}'", s.name, key, *v);
 }
 
 } // namespace
+
+std::string normalize_root(std::string_view root) {
+    auto r = util::trim(root);
+    if (r == "." || r == "~" || r == "~/") return {};
+    if (r.starts_with("~/")) r.remove_prefix(2);
+    if (r.starts_with("./")) r.remove_prefix(2);
+    while (r.size() > 1 && r.ends_with('/')) r.remove_suffix(1);
+    return std::string(r);
+}
+
+FindMethod resolve_find_method(const RemoteSettings& settings, const RcloneRemote& remote) {
+    if (settings.find != FindMethod::auto_detect) return settings.find;
+    return remote.key_file ? FindMethod::ssh : FindMethod::rclone;
+}
 
 std::filesystem::path default_grab_config_path() {
     if (auto env = util::getenv_utf8("GRAB_CONFIG"); env && !util::trim(*env).empty()) {
@@ -151,11 +166,21 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
         RemoteSettings r;
         r.name = s.name;
         r.rclone_remote = nonblank(s, "rclone_remote").value_or(s.name);
-        if (auto v = s.get("search_roots")) r.search_roots = util::split(*v, ',');
-        for (const auto& root : r.search_roots) {
-            if (!root.starts_with('/')) {
-                return util::failf("[{}] search_roots entries must be absolute, got '{}'", s.name,
-                                   root);
+        if (auto v = s.get("search_roots")) {
+            for (const auto& root : util::split(*v, ',')) {
+                r.search_roots.push_back(normalize_root(root));
+            }
+        }
+        if (auto v = nonblank(s, "find")) {
+            const std::string method = util::to_lower(*v);
+            if (method == "auto") {
+                r.find = FindMethod::auto_detect;
+            } else if (method == "ssh") {
+                r.find = FindMethod::ssh;
+            } else if (method == "rclone") {
+                r.find = FindMethod::rclone;
+            } else {
+                return util::failf("[{}] find must be auto, ssh or rclone, got '{}'", s.name, *v);
             }
         }
         auto depth = int_value(s, "max_depth", 4);
@@ -214,6 +239,11 @@ std::expected<RcloneRemote, std::string> parse_rclone_remote(const ini::Document
     r.port = *port;
     r.key_file = nonblank(*s, "key_file");
     r.known_hosts_file = nonblank(*s, "known_hosts_file");
+    // rclone users write `known_hosts_file = none` to skip host key checks; passing that
+    // literally to ssh (-o UserKnownHostsFile=none) disables its known_hosts handling.
+    if (r.known_hosts_file && util::to_lower(*r.known_hosts_file) == "none") {
+        r.known_hosts_file.reset();
+    }
     return r;
 }
 

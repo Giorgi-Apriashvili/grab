@@ -11,20 +11,22 @@
 
 namespace grab {
 
-bool is_absolute_target(std::string_view target) { return target.starts_with('/'); }
+bool is_path_target(std::string_view target) {
+    return target.find('/') != std::string_view::npos;
+}
 
 std::string build_find_command(const FindRequest& req) {
     const char* type = req.mode == Mode::folder ? "d" : "f";
     std::string cmd = "find";
 
-    if (is_absolute_target(req.target)) {
+    if (is_path_target(req.target)) {
         cmd += ' ';
         cmd += quote::sh_single(req.target);
         cmd += std::format(" -maxdepth 0 -type {} -print0", type);
     } else {
         for (const auto& root : req.roots) {
             cmd += ' ';
-            cmd += quote::sh_single(root);
+            cmd += root.empty() ? std::string(".") : quote::sh_single(root);
         }
         cmd += std::format(" -mindepth 1 -maxdepth {}", req.max_depth);
         // Prune dot-directories unless the user is explicitly looking for a dot-name.
@@ -61,7 +63,9 @@ std::vector<std::string> parse_find_output(std::string_view out) {
     while (start < out.size()) {
         auto end = out.find('\0', start);
         if (end == std::string_view::npos) end = out.size();
-        if (end > start) paths.emplace_back(out.substr(start, end - start));
+        std::string_view item = out.substr(start, end - start);
+        if (item.starts_with("./")) item.remove_prefix(2);
+        if (!item.empty()) paths.emplace_back(item);
         start = end + 1;
     }
     return paths;

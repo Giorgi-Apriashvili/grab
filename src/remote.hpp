@@ -14,13 +14,15 @@ namespace grab {
 
 struct FindRequest {
     Mode mode = Mode::folder;
-    std::string target;              // name pattern or absolute remote path
-    std::vector<std::string> roots;  // ignored when target is absolute
+    std::string target;              // name pattern, or a remote path containing '/'
+    std::vector<std::string> roots;  // "" = login home; ignored when target is a path
     int max_depth = 4;
     bool skip_hidden = true;
 };
 
-[[nodiscard]] bool is_absolute_target(std::string_view target);
+// A target with a '/' is a path (absolute, or relative to the login home) to be checked
+// rather than a name to be searched for.
+[[nodiscard]] bool is_path_target(std::string_view target);
 
 // The `find ... -print0` command run by the remote shell.
 [[nodiscard]] std::string build_find_command(const FindRequest& req);
@@ -31,7 +33,8 @@ struct FindRequest {
                                                       std::span<const std::string> ssh_options,
                                                       const std::string& remote_command);
 
-// Split NUL-separated find output into paths.
+// Split NUL-separated find output into paths; a leading "./" (from a home-relative
+// search) is dropped.
 [[nodiscard]] std::vector<std::string> parse_find_output(std::string_view out);
 
 // Shallowest first, then lexical.

@@ -79,6 +79,12 @@ std::string join(const std::vector<std::string>& items, std::string_view sep) {
     return out;
 }
 
+std::string to_lower(std::string_view s) {
+    std::string out(s);
+    for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
 std::string path_to_utf8(const std::filesystem::path& p) {
     const auto u8 = p.u8string();
     return std::string(u8.begin(), u8.end());

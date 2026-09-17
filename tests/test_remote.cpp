@@ -43,15 +43,33 @@ TEST_CASE("looking for a dot-name disables pruning") {
     CHECK(cmd.find("-name '.config'") != std::string::npos);
 }
 
-TEST_CASE("absolute target only validates existence and type") {
+TEST_CASE("a path target only validates existence and type") {
     FindRequest req;
     req.mode = Mode::folder;
     req.target = "/home/alice/releases";
     req.roots = {"/ignored"};
     CHECK(build_find_command(req) ==
           "find '/home/alice/releases' -maxdepth 0 -type d -print0 2>/dev/null");
-    CHECK(is_absolute_target("/x"));
-    CHECK_FALSE(is_absolute_target("x"));
+
+    req.target = "learning/Course - Intro to Testing - Jane Doe";
+    CHECK(build_find_command(req) ==
+          "find 'learning/Course - Intro to Testing - Jane Doe' -maxdepth 0 "
+          "-type d -print0 2>/dev/null");
+
+    CHECK(is_path_target("/x"));
+    CHECK(is_path_target("a/b"));
+    CHECK_FALSE(is_path_target("x"));
+}
+
+TEST_CASE("a blank root searches the login home") {
+    FindRequest req;
+    req.mode = Mode::folder;
+    req.target = "releases";
+    req.roots = {"", "projects"};
+    req.max_depth = 2;
+    req.skip_hidden = false;
+    CHECK(build_find_command(req) ==
+          "find . 'projects' -mindepth 1 -maxdepth 2 -name 'releases' -type d -print0 2>/dev/null");
 }
 
 TEST_CASE("ssh argv: options, identity, known_hosts, extras, host, command") {
@@ -84,6 +102,9 @@ TEST_CASE("find output is NUL separated, trailing NUL tolerated") {
     CHECK(parse_find_output("").empty());
     CHECK(parse_find_output(std::string("\0\0", 2)).empty());
     CHECK(parse_find_output("/no/terminator") == std::vector<std::string>{"/no/terminator"});
+    // Home-relative searches come back as ./x; the prefix is dropped.
+    CHECK(parse_find_output(std::string("./learning/x\0./y\0", 17)) ==
+          std::vector<std::string>{"learning/x", "y"});
 }
 
 TEST_CASE("matches rank shallowest first, then lexical") {

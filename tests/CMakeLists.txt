@@ -20,6 +20,7 @@ add_executable(grab_tests
     test_cli.cpp
     test_config.cpp
     test_remote.cpp
+    test_listing.cpp
     test_rclone.cpp
     test_process.cpp)
 

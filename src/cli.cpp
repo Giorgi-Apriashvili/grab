@@ -19,9 +19,10 @@ Usage:
   grab config [-c PATH]
   grab --init | --help | --version
 
-TARGET is a name searched under the remote's search_roots (find -name, globs allowed),
-or an absolute remote path starting with '/'. DEST is the local parent directory: the
-file or folder is written as DEST\<name>, created if needed.
+TARGET is a name to search for under the remote's search_roots (find -name style, globs
+allowed), or a remote path containing '/' (absolute, or relative to the login home) that
+is checked as-is. DEST is the local parent directory: the file or folder is written as
+DEST\<name>, created if needed.
 
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
@@ -40,8 +41,8 @@ Options:
   -h, --help           show this help
       --version        show version
 
-Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 ssh failed,
-otherwise rclone's own exit code.
+Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
+(ssh or rclone listing) failed, otherwise rclone's own exit code.
 )";
 }
 

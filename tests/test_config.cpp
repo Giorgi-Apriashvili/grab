@@ -71,8 +71,8 @@ TEST_CASE("grab.conf validation errors") {
     auto no_remotes = parse_grab_config(*ini::parse("[grab]\nrclone = rclone\n"));
     CHECK_FALSE(no_remotes.has_value());
 
-    auto rel_root = parse_grab_config(*ini::parse("[h]\nsearch_roots = home/alice\n"));
-    CHECK_FALSE(rel_root.has_value());
+    auto bad_find = parse_grab_config(*ini::parse("[h]\nfind = telnet\n"));
+    CHECK_FALSE(bad_find.has_value());
 
     auto bad_depth = parse_grab_config(*ini::parse("[h]\nmax_depth = deep\n"));
     CHECK_FALSE(bad_depth.has_value());
@@ -173,6 +173,42 @@ TEST_CASE("editor key and editor_command fallback chain") {
 #else
     CHECK(fallback[0] == "vi");
 #endif
+}
+
+TEST_CASE("search_roots may be absolute or home-relative and are normalized") {
+    const auto cfg = parse_ok("[h]\nsearch_roots = /home/, ., learning/, ~/tv, ~ , /\n");
+    CHECK(cfg.remotes[0].search_roots ==
+          std::vector<std::string>{"/home", "", "learning", "tv", "", "/"});
+    CHECK(normalize_root("./x/") == "x");
+    CHECK(normalize_root("~/") == "");
+    CHECK(normalize_root("/") == "/");
+}
+
+TEST_CASE("find method: explicit, or auto from how the rclone remote authenticates") {
+    CHECK(parse_ok("[h]\n").remotes[0].find == FindMethod::auto_detect);
+    CHECK(parse_ok("[h]\nfind = SSH\n").remotes[0].find == FindMethod::ssh);
+    CHECK(parse_ok("[h]\nfind = rclone\n").remotes[0].find == FindMethod::rclone);
+
+    RcloneRemote with_key;
+    with_key.key_file = "E:\\k.pem";
+    RcloneRemote with_password; // no key_file: rclone.conf carries `pass`
+    RemoteSettings automatic;
+    CHECK(resolve_find_method(automatic, with_key) == FindMethod::ssh);
+    CHECK(resolve_find_method(automatic, with_password) == FindMethod::rclone);
+
+    RemoteSettings forced;
+    forced.find = FindMethod::rclone;
+    CHECK(resolve_find_method(forced, with_key) == FindMethod::rclone);
+}
+
+TEST_CASE("known_hosts_file = none is treated as unset, never passed to ssh") {
+    auto r = parse_rclone_remote(*ini::parse("[box]\ntype = sftp\nhost = h\nuser = u\nport = 23\n"
+                                             "known_hosts_file = none\npass = obscured\n"),
+                                 "box");
+    REQUIRE(r.has_value());
+    CHECK_FALSE(r->known_hosts_file.has_value());
+    CHECK_FALSE(r->key_file.has_value());
+    CHECK(r->port == 23);
 }
 
 TEST_CASE("example config parses and matches the defaults") {

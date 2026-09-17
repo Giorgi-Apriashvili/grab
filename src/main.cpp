@@ -4,6 +4,7 @@
 #include "cli.hpp"
 #include "config.hpp"
 #include "ini.hpp"
+#include "listing.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
@@ -32,7 +33,7 @@ constexpr int exit_ok = 0;
 constexpr int exit_usage = 1;
 constexpr int exit_config = 2;
 constexpr int exit_not_found = 3;
-constexpr int exit_ssh = 4;
+constexpr int exit_lookup = 4; // ssh or rclone listing failed
 
 void error(std::string_view msg) { std::println(stderr, "grab: error: {}", msg); }
 
@@ -102,6 +103,71 @@ int do_config(const std::filesystem::path& path) {
     return *code;
 }
 
+std::string describe_roots(const std::vector<std::string>& roots) {
+    std::vector<std::string> shown;
+    for (const auto& r : roots) shown.push_back(r.empty() ? "~" : r);
+    return util::join(shown, ", ");
+}
+
+// 3a. ssh + find: one round trip, needs a shell on the server.
+std::expected<std::vector<std::string>, std::string>
+lookup_via_ssh(const Options& opts, const GrabConfig& cfg, const RemoteSettings& settings,
+               const RcloneRemote& conn, const std::vector<std::string>& roots, int max_depth) {
+    FindRequest req;
+    req.mode = opts.mode;
+    req.target = opts.target;
+    req.roots = roots;
+    req.max_depth = max_depth;
+    req.skip_hidden = settings.skip_hidden;
+
+    const auto argv = build_ssh_argv(cfg.ssh, conn, settings.ssh_options, build_find_command(req));
+    if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
+
+    auto res = proc::run_capture(argv);
+    if (!res) return util::fail(res.error());
+    if (res->exit_code == 255) {
+        return util::failf("ssh to {}@{}:{} failed (exit 255); see the message above. If this "
+                           "host has no shell (e.g. a storage box), set `find = rclone` in [{}]",
+                           conn.user, conn.host, conn.port, settings.name);
+    }
+    return parse_find_output(res->out);
+}
+
+// 3b. rclone lsf: an SFTP walk per root, works without a shell and without prompts.
+std::expected<std::vector<std::string>, std::string>
+lookup_via_rclone(const Options& opts, const GrabConfig& cfg, const RemoteSettings& settings,
+                  const std::vector<std::string>& roots, int max_depth) {
+    // A path target is checked with a single listing of its parent, whatever the roots.
+    const std::vector<std::string> bases =
+        is_path_target(opts.target) ? std::vector<std::string>{""} : roots;
+
+    std::vector<std::string> matches;
+    for (const auto& root : bases) {
+        ListRequest req;
+        req.mode = opts.mode;
+        req.target = opts.target;
+        req.root = root;
+        req.max_depth = max_depth;
+        req.skip_hidden = settings.skip_hidden;
+        req.rclone_exe = cfg.rclone;
+        req.rclone_config = cfg.rclone_config;
+        req.rclone_remote = settings.rclone_remote;
+
+        const auto argv = build_lsf_argv(req);
+        if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
+
+        auto res = proc::run_capture(argv);
+        if (!res) return util::fail(res.error());
+        if (res->exit_code != 0) {
+            return util::failf("rclone lsf of '{}' failed (exit {}); see the message above",
+                               argv[2], res->exit_code);
+        }
+        auto found = parse_lsf_output(req, res->out);
+        matches.insert(matches.end(), found.begin(), found.end());
+    }
+    return matches;
+}
+
 int run(const Options& opts) {
     // 2. configuration -------------------------------------------------------------------
     const auto cfg_path = opts.config.value_or(default_grab_config_path());
@@ -145,42 +211,32 @@ int run(const Options& opts) {
     }
 
     // 3. resolve the remote path ---------------------------------------------------------
-    FindRequest req;
-    req.mode = opts.mode;
-    req.target = opts.target;
-    req.roots = settings.search_roots;
-    req.max_depth = opts.depth.value_or(settings.max_depth);
-    req.skip_hidden = settings.skip_hidden;
+    const int max_depth = opts.depth.value_or(settings.max_depth);
+    std::vector<std::string> roots = settings.search_roots;
+    if (roots.empty()) roots.emplace_back(); // the login home
 
-    if (!is_absolute_target(req.target) && req.roots.empty()) {
-        error(std::format("[{}] search_roots is not set; add it to grab.conf or pass an absolute "
-                          "remote path",
-                          settings.name));
-        return exit_config;
+    const FindMethod method = resolve_find_method(settings, *conn);
+    if (opts.verbose) {
+        std::println(stderr, "grab: looking up '{}' via {}", opts.target,
+                     method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
+    }
+    auto lookup = method == FindMethod::ssh
+                      ? lookup_via_ssh(opts, *cfg, settings, *conn, roots, max_depth)
+                      : lookup_via_rclone(opts, *cfg, settings, roots, max_depth);
+    if (!lookup) {
+        error(lookup.error());
+        return exit_lookup;
     }
 
-    const auto ssh_argv =
-        build_ssh_argv(cfg->ssh, *conn, settings.ssh_options, build_find_command(req));
-    if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(ssh_argv));
-
-    auto found = proc::run_capture(ssh_argv);
-    if (!found) {
-        error(found.error());
-        return exit_ssh;
-    }
-    if (found->exit_code == 255) {
-        error(std::format("ssh to {}@{}:{} failed (exit 255); see the message above", conn->user,
-                          conn->host, conn->port));
-        return exit_ssh;
-    }
-
-    auto matches = parse_find_output(found->out);
+    auto matches = std::move(*lookup);
     if (matches.empty()) {
-        if (is_absolute_target(req.target)) {
-            error(std::format("no {} at '{}' on {}", mode_noun(req.mode), req.target, conn->host));
+        if (is_path_target(opts.target)) {
+            error(std::format("no {} at '{}' on {}", mode_noun(opts.mode), opts.target,
+                              conn->host));
         } else {
-            error(std::format("no {} named '{}' under {} (max depth {}) on {}", mode_noun(req.mode),
-                              req.target, util::join(req.roots, ", "), req.max_depth, conn->host));
+            error(std::format("no {} named '{}' under {} (max depth {}) on {}",
+                              mode_noun(opts.mode), opts.target, describe_roots(roots), max_depth,
+                              conn->host));
         }
         return exit_not_found;
     }

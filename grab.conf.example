@@ -25,7 +25,11 @@ default_remote = hetzner
 [hetzner]
 # Name of the remote in rclone.conf (defaults to this section's name).
 rclone_remote = hetzner
-# Comma-separated absolute directories to search on the server, all in one `find` call.
+# How TARGET is located: auto = ssh + find when the rclone remote has a key_file, otherwise
+# an rclone listing (password remotes and storage boxes have no shell). Force with ssh | rclone.
+find = auto
+# Comma-separated directories to search: absolute (/srv) or relative to the login home
+# (learning). Blank or . = the home directory itself.
 search_roots = /home/alice
 # How deep below each root `find` may look (find -maxdepth).
 max_depth = 4
