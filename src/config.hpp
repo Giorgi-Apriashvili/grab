@@ -63,9 +63,9 @@ struct RcloneRemote {
 [[nodiscard]] std::string normalize_root(std::string_view root);
 
 // Built-in flag defaults, used when the key is absent from grab.conf.
-inline constexpr std::string_view default_common_flags = "-P --sftp-chunk-size 255Ki";
-inline constexpr std::string_view default_folder_flags =
-    "--transfers 4 --checkers 8 --multi-thread-streams 4";
+inline constexpr std::string_view default_common_flags =
+    "-P --sftp-chunk-size 255Ki --sftp-disable-hashcheck";
+inline constexpr std::string_view default_folder_flags = "--transfers 8 --checkers 8";
 inline constexpr std::string_view default_file_flags =
     "--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi";
 

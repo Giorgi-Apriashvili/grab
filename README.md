@@ -133,12 +133,15 @@ Defaults (override per remote in grab.conf):
 
 | key            | default                                                                     | why |
 |----------------|-----------------------------------------------------------------------------|-----|
-| `common_flags` | `-P --sftp-chunk-size 255Ki`                                                | live progress; 255 KiB is the largest SFTP packet OpenSSH accepts, ~8x fewer round trips than the 32 KiB default |
-| `folder_flags` | `--transfers 4 --checkers 8 --multi-thread-streams 4`                       | ≤16 concurrent connections, safely under sshd's default `MaxStartups`/`MaxSessions` |
-| `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections |
+| `common_flags` | `-P --sftp-chunk-size 255Ki --sftp-disable-hashcheck`                       | live progress; 255 KiB is the largest SFTP packet OpenSSH accepts, ~8x fewer round trips than the 32 KiB default; skipping the post-transfer server-side `md5sum` measured 10–30% faster |
+| `folder_flags` | `--transfers 8 --checkers 8`                                                | more transfers hide per-file round trips on trees of small files; with rclone's default 4 streams that is ≤32 connections, which both test servers accepted without errors |
+| `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
 Concurrent SFTP connections ≈ `transfers × multi-thread-streams` (+ checkers). If the
 server logs `MaxStartups` drops, lower one of them. `--bwlimit` can be passed after `--`.
+`--sftp-disable-hashcheck` trades end-to-end checksum verification for speed; SSH already
+protects the bytes in flight, so what remains undetected is disk-level corruption. Remove it
+from `common_flags` if that matters more than minutes saved on large files.
 
 ## Layout
 

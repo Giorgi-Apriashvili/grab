@@ -46,12 +46,15 @@ skip_hidden = true
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
 ssh_options =
 # rclone flags used in both modes. 255Ki is the largest SFTP packet OpenSSH accepts and
-# cuts round trips roughly 8x compared with the 32Ki default.
-common_flags = -P --sftp-chunk-size 255Ki
-# rclone flags for -f/--folder (rclone copy). Concurrent connections ~= transfers x streams;
-# keep that under ~16 to stay clear of sshd's default MaxStartups/MaxSessions limits.
-folder_flags = --transfers 4 --checkers 8 --multi-thread-streams 4
-# rclone flags for -s/--file (rclone copyto). One big object: parallel range reads.
+# cuts round trips roughly 8x compared with the 32Ki default. --sftp-disable-hashcheck skips
+# the post-transfer md5sum rclone would otherwise run on the server (minutes for a 30 GB
+# file); SSH already guarantees integrity in flight.
+common_flags = -P --sftp-chunk-size 255Ki --sftp-disable-hashcheck
+# rclone flags for -f/--folder (rclone copy). More transfers hide per-file round trips on
+# trees of small files; 8 keeps connections (transfers x multi-thread streams) modest.
+folder_flags = --transfers 8 --checkers 8
+# rclone flags for -s/--file (rclone copyto). One big object: parallel range reads. Keep the
+# chunk size large: 8Mi chunks measured ~2x slower than 64Mi (each chunk re-opens the file).
 file_flags = --multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi
 )";
 
