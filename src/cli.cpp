@@ -16,11 +16,16 @@ std::string usage() {
 
 Usage:
   grab (-s|--file | -f|--folder) TARGET DEST [options] [-- extra rclone args]
+  grab config [-c PATH]
   grab --init | --help | --version
 
 TARGET is a name searched under the remote's search_roots (find -name, globs allowed),
 or an absolute remote path starting with '/'. DEST is the local parent directory: the
 file or folder is written as DEST\<name>, created if needed.
+
+Commands:
+  config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
+                       $EDITOR, else notepad. The file is created from the example if missing.
 
 Options:
   -s, --file           TARGET is a file   (rclone copyto, single-file tuned flags)
@@ -60,7 +65,15 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     std::vector<std::string> positionals;
     bool passthrough = false;
 
-    for (std::size_t i = 0; i < args.size(); ++i) {
+    // `grab config ...` is a subcommand; a folder literally named "config" is still reachable
+    // with a mode flag first (`grab -f config DEST`).
+    std::size_t start = 0;
+    if (!args.empty() && args[0] == "config") {
+        result.action = CliAction::config;
+        start = 1;
+    }
+
+    for (std::size_t i = start; i < args.size(); ++i) {
         const std::string& a = args[i];
 
         if (passthrough) {
@@ -127,8 +140,11 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         }
     }
 
-    if (result.action == CliAction::init) {
-        if (!positionals.empty()) return util::fail("--init takes no TARGET/DEST arguments");
+    if (result.action == CliAction::init || result.action == CliAction::config) {
+        if (!positionals.empty() || mode) {
+            return util::failf("`grab {}` takes no TARGET/DEST arguments",
+                               result.action == CliAction::init ? "--init" : "config");
+        }
         return result;
     }
 

@@ -25,6 +25,8 @@ rclone = rclone
 rclone_config =
 # ssh executable used for the remote `find`. Blank = `ssh` on PATH (Windows OpenSSH).
 ssh = ssh
+# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.
+editor =
 # Remote section to use when -r/--remote is not given. Optional when only one remote exists.
 default_remote = hetzner
 
@@ -140,6 +142,7 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
         if (auto v = nonblank(*g, "rclone")) cfg.rclone = *v;
         if (auto v = nonblank(*g, "rclone_config")) cfg.rclone_config = util::path_from_utf8(*v);
         if (auto v = nonblank(*g, "ssh")) cfg.ssh = *v;
+        if (auto v = nonblank(*g, "editor")) cfg.editor = *v;
         if (auto v = nonblank(*g, "default_remote")) cfg.default_remote = *v;
     }
 
@@ -212,6 +215,24 @@ std::expected<RcloneRemote, std::string> parse_rclone_remote(const ini::Document
     r.key_file = nonblank(*s, "key_file");
     r.known_hosts_file = nonblank(*s, "known_hosts_file");
     return r;
+}
+
+std::vector<std::string> editor_command(const std::vector<std::string>& candidates,
+                                        const std::filesystem::path& file) {
+    std::vector<std::string> argv;
+    for (const auto& candidate : candidates) {
+        argv = util::split_args(candidate);
+        if (!argv.empty()) break;
+    }
+    if (argv.empty()) {
+#ifdef _WIN32
+        argv = {"notepad"};
+#else
+        argv = {"vi"};
+#endif
+    }
+    argv.push_back(util::path_to_utf8(file));
+    return argv;
 }
 
 std::expected<RcloneRemote, std::string> load_rclone_remote(const std::filesystem::path& p,

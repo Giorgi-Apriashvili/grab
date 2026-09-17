@@ -24,7 +24,7 @@ struct Options {
     std::vector<std::string> extra;  // everything after "--", appended to the rclone argv
 };
 
-enum class CliAction { run, help, version, init };
+enum class CliAction { run, help, version, init, config };
 
 struct CliResult {
     CliAction action = CliAction::run;

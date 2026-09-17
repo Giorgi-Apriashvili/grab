@@ -152,6 +152,29 @@ TEST_CASE("rclone remote defaults and validation") {
                     .has_value());
 }
 
+TEST_CASE("editor key and editor_command fallback chain") {
+    CHECK(parse_ok("[grab]\neditor = code --wait\n[h]\n").editor == "code --wait");
+    CHECK_FALSE(parse_ok("[grab]\neditor =\n[h]\n").editor.has_value());
+
+    const auto file = util::path_from_utf8("C:\\Users\\alice\\AppData\\Roaming\\grab\\grab.conf");
+    const auto f = util::path_to_utf8(file);
+
+    CHECK(editor_command({"code --wait", "vim", ""}, file) ==
+          std::vector<std::string>{"code", "--wait", f});
+    CHECK(editor_command({"", "   ", "vim"}, file) == std::vector<std::string>{"vim", f});
+    CHECK(editor_command({"\"C:\\Program Files\\Notepad++\\notepad++.exe\" -multiInst", "x"}, file) ==
+          std::vector<std::string>{"C:\\Program Files\\Notepad++\\notepad++.exe", "-multiInst", f});
+
+    const auto fallback = editor_command({}, file);
+    REQUIRE(fallback.size() == 2);
+    CHECK(fallback[1] == f);
+#ifdef _WIN32
+    CHECK(fallback[0] == "notepad");
+#else
+    CHECK(fallback[0] == "vi");
+#endif
+}
+
 TEST_CASE("example config parses and matches the defaults") {
     const auto cfg = parse_ok(example_config);
     CHECK(cfg.default_remote == "hetzner");

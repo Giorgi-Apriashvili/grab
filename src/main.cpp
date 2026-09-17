@@ -3,6 +3,7 @@
 
 #include "cli.hpp"
 #include "config.hpp"
+#include "ini.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
@@ -73,6 +74,32 @@ int do_init(const std::filesystem::path& path) {
     std::println("wrote example config to {}", util::path_to_utf8(path));
     std::println("edit search_roots / default_remote, then run e.g.  grab -f NAME E:\\Backup\\NAME");
     return exit_ok;
+}
+
+int do_config(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        if (const int rc = do_init(path); rc != exit_ok) return rc;
+    }
+
+    // Read only the [grab] editor key, without validating the rest: a broken config file
+    // must still be openable so it can be fixed.
+    std::vector<std::string> candidates;
+    if (auto doc = ini::parse_file(path)) {
+        if (const auto* g = doc->find("grab")) candidates.push_back(g->get("editor").value_or(""));
+    }
+    candidates.push_back(util::getenv_utf8("VISUAL").value_or(""));
+    candidates.push_back(util::getenv_utf8("EDITOR").value_or(""));
+
+    const auto argv = editor_command(candidates, path);
+    std::println(stderr, "grab: opening {} with {}", util::path_to_utf8(path), argv.front());
+    auto code = proc::run_inherit(argv);
+    if (!code) {
+        error(code.error());
+        std::println(stderr, "hint: set `editor =` in the [grab] section, or $VISUAL / $EDITOR");
+        return exit_config;
+    }
+    return *code;
 }
 
 int run(const Options& opts) {
@@ -218,6 +245,8 @@ int main(int argc, char** argv) {
         return exit_ok;
     case CliAction::init:
         return do_init(parsed->opts.config.value_or(default_grab_config_path()));
+    case CliAction::config:
+        return do_config(parsed->opts.config.value_or(default_grab_config_path()));
     case CliAction::run:
         return run(parsed->opts);
     }

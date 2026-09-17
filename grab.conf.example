@@ -16,6 +16,8 @@ rclone = rclone
 rclone_config =
 # ssh executable used for the remote `find`. Blank = `ssh` on PATH (Windows OpenSSH).
 ssh = ssh
+# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.
+editor =
 # Remote section to use when -r/--remote is not given. Optional when only one remote exists.
 default_remote = hetzner
 

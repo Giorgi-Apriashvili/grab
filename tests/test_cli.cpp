@@ -83,6 +83,28 @@ TEST_CASE("help, version and init short-circuit") {
     CHECK_FALSE(parse_args(args({"--init", "stray"})).has_value());
 }
 
+TEST_CASE("config subcommand") {
+    auto c = parse_args(args({"config"}));
+    REQUIRE(c.has_value());
+    CHECK(c->action == CliAction::config);
+    CHECK_FALSE(c->opts.config.has_value());
+
+    auto with_path = parse_args(args({"config", "-c", "C:\\g.conf"}));
+    REQUIRE(with_path.has_value());
+    CHECK(with_path->action == CliAction::config);
+    REQUIRE(with_path->opts.config.has_value());
+    CHECK(util::path_to_utf8(*with_path->opts.config) == "C:\\g.conf");
+
+    CHECK_FALSE(parse_args(args({"config", "stray"})).has_value());
+    CHECK_FALSE(parse_args(args({"config", "-f"})).has_value());
+
+    // A folder literally named "config" is still grabbable when a mode flag comes first.
+    auto r = parse_args(args({"-f", "config", "E:\\x"}));
+    REQUIRE(r.has_value());
+    CHECK(r->action == CliAction::run);
+    CHECK(r->opts.target == "config");
+}
+
 TEST_CASE("absolute remote targets are accepted as names") {
     auto r = parse_args(args({"-f", "/home/alice/releases", "E:\\Backup\\releases"}));
     REQUIRE(r.has_value());

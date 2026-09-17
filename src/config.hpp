@@ -28,6 +28,7 @@ struct GrabConfig {
     std::string rclone = "rclone";
     std::optional<std::filesystem::path> rclone_config; // only when set explicitly
     std::string ssh = "ssh";
+    std::optional<std::string> editor; // [grab] editor, used by `grab config`
     std::optional<std::string> default_remote;
     std::vector<RemoteSettings> remotes;
 
@@ -65,5 +66,11 @@ extern const std::string_view example_config;
                                                                             std::string_view name);
 [[nodiscard]] std::expected<RcloneRemote, std::string>
 load_rclone_remote(const std::filesystem::path& p, std::string_view name);
+
+// Command that opens `file` for editing: the first non-blank candidate (in practice
+// [grab] editor, $VISUAL, $EDITOR) split shell-style, else notepad on Windows and vi
+// elsewhere, with `file` appended as the last argument.
+[[nodiscard]] std::vector<std::string> editor_command(const std::vector<std::string>& candidates,
+                                                      const std::filesystem::path& file);
 
 } // namespace grab

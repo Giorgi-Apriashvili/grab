@@ -56,7 +56,12 @@ In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 
 ```powershell
 grab --init          # writes %APPDATA%\grab\grab.conf with comments, if absent
+grab config          # opens it in your editor, creating it first if needed
 ```
+
+`grab config` uses the `editor` key in `[grab]` (for example `editor = code --wait`),
+otherwise `$VISUAL`, then `$EDITOR`, and finally Notepad. It reads only that key, so a
+config with a syntax error can still be opened and fixed.
 
 Minimal `grab.conf`:
 
@@ -78,6 +83,7 @@ Add one `[section]` per server and choose with `-r NAME`.
 
 ```
 grab (-s|--file | -f|--folder) TARGET DEST [options] [-- extra rclone args]
+grab config [-c PATH]
 
   -r, --remote NAME    grab.conf section to use
   -c, --config PATH    grab.conf path
