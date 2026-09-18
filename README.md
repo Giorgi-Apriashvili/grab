@@ -1,5 +1,7 @@
 # grab
 
+[![build](https://github.com/Giorgi-Apriashvili/grab/actions/workflows/build.yml/badge.svg)](https://github.com/Giorgi-Apriashvili/grab/actions/workflows/build.yml)
+
 Fetch a file or folder from a Linux server **by name**. `grab` finds it over ssh, then
 downloads it with rclone using flags tuned for either one big file or a tree of files,
 with rclone's live progress in your terminal.
@@ -54,6 +56,23 @@ In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 `build/clang-cl-debug/compile_commands.json`; `launch.json` has a CodeLLDB dry-run config.
 
 ## Install
+
+### From a release (Windows)
+
+Download from the [Releases page](https://github.com/Giorgi-Apriashvili/grab/releases):
+
+- `grab-x.y.z-windows-x64-setup.exe`: per-user installer, no admin rights. It puts `grab.exe`
+  in `%USERPROFILE%\programs\grab\bin`, adds that folder to your user PATH, writes a commented
+  default config to `%APPDATA%\grab\grab.conf` if you don't have one, and registers an
+  uninstaller (Settings → Apps) that removes the files and the PATH entry but keeps your config.
+- `grab-x.y.z-windows-x64.zip`: the same files without an installer; put `grab.exe` wherever
+  you like and run `grab --init` once.
+
+The installer is not code-signed, so SmartScreen shows "Windows protected your PC" the first
+time; choose "More info → Run anyway". The exe links the C runtime statically and has no other
+dependencies.
+
+### From source
 
 ```powershell
 cmake --install build\clang-cl-release
@@ -169,6 +188,20 @@ src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix
 src/util.*      strings, paths, environment src/main.cpp   the five steps
 tests/          doctest unit tests (fetched by CMake)
 ```
+
+## Releasing
+
+GitHub Actions ([build.yml](.github/workflows/build.yml)) builds and tests every push and pull
+request with MSVC and clang-cl. Pushing a version tag additionally runs the `dist` target, which
+packs the portable zip and compiles the Inno Setup installer from
+[installer/grab.iss.in](installer/grab.iss.in), and attaches both to a GitHub Release.
+
+1. Bump `project(grab VERSION x.y.z)` in `CMakeLists.txt` and commit.
+2. `git tag vx.y.z` and `git push origin master --tags`.
+
+The workflow refuses a tag that doesn't match the project version. Locally,
+`cmake --build --preset clang-cl-release --target dist` always produces the zip and also the
+installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`).
 
 ## License
 

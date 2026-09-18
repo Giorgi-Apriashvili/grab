@@ -1,0 +1,81 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.preset }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [msvc-release, clang-cl-release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches project(VERSION)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $match = Select-String -Path CMakeLists.txt -Pattern 'VERSION\s+(\d+\.\d+\.\d+)' | Select-Object -First 1
+          $version = $match.Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "tag ${{ github.ref_name }} does not match project version v$version in CMakeLists.txt"
+          }
+          Write-Output "tag matches project version v$version"
+
+      # Provides cl/link/rc for the msvc preset; harmless for clang-cl, which finds the
+      # Visual Studio installation on its own.
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Put LLVM on PATH
+        if: matrix.preset == 'clang-cl-release'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      # Inno Setup 6 is preinstalled on the Windows runner image, so dist yields both files.
+      - name: Package (portable zip + Inno Setup installer)
+        if: matrix.preset == 'msvc-release'
+        run: cmake --build --preset msvc-release --target dist
+
+      - name: Upload artifacts
+        if: matrix.preset == 'msvc-release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: grab-windows-x64
+          path: |
+            build/msvc-release/dist/*.zip
+            build/msvc-release/dist/*.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: grab-windows-x64
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

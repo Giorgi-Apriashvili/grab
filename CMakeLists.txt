@@ -89,6 +89,64 @@ if(WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# Release artifacts: `cmake --build --preset <p> --target dist` writes to <build>/dist/
+#   grab-<version>-windows-x64.zip        portable: grab.exe, example config, README, LICENSE
+#   grab-<version>-windows-x64-setup.exe  Inno Setup per-user installer, when ISCC is available
+# ---------------------------------------------------------------------------
+if(WIN32)
+    set(GRAB_DIST_DIR "${CMAKE_BINARY_DIR}/dist")
+    set(GRAB_STAGE_DIR "${GRAB_DIST_DIR}/stage")
+    set(GRAB_ZIP "${GRAB_DIST_DIR}/grab-${PROJECT_VERSION}-windows-x64.zip")
+    set(GRAB_EXTRA_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/grab.conf.example"
+        "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+        "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+
+    # Inno Setup wants native paths; the script is generated from installer/grab.iss.in.
+    file(TO_NATIVE_PATH "${GRAB_DIST_DIR}" GRAB_DIST_DIR_NATIVE)
+    file(TO_NATIVE_PATH "${GRAB_STAGE_DIR}" GRAB_STAGE_DIR_NATIVE)
+    configure_file(installer/grab.iss.in "${CMAKE_BINARY_DIR}/installer/grab.iss" @ONLY)
+
+    find_program(GRAB_ISCC NAMES iscc ISCC
+        PATHS "C:/Program Files (x86)/Inno Setup 6"
+              "$ENV{ProgramFiles}/Inno Setup 6"
+              "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6"
+        DOC "Inno Setup compiler (ISCC.exe); enables the installer half of the dist target")
+
+    set(GRAB_STAGED
+        "${GRAB_STAGE_DIR}/grab.exe"
+        "${GRAB_STAGE_DIR}/grab.conf.example"
+        "${GRAB_STAGE_DIR}/README.md"
+        "${GRAB_STAGE_DIR}/LICENSE")
+    add_custom_command(OUTPUT ${GRAB_STAGED}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" ${GRAB_EXTRA_FILES} "${GRAB_STAGE_DIR}"
+        DEPENDS grab ${GRAB_EXTRA_FILES}
+        COMMENT "Staging release files"
+        VERBATIM)
+    add_custom_command(OUTPUT "${GRAB_ZIP}"
+        COMMAND ${CMAKE_COMMAND} -E tar cf "${GRAB_ZIP}" --format=zip --
+                grab.exe grab.conf.example README.md LICENSE
+        WORKING_DIRECTORY "${GRAB_STAGE_DIR}"
+        DEPENDS ${GRAB_STAGED}
+        COMMENT "Packing ${GRAB_ZIP}"
+        VERBATIM)
+    add_custom_target(dist DEPENDS "${GRAB_ZIP}")
+
+    if(GRAB_ISCC)
+        add_custom_command(TARGET dist POST_BUILD
+            COMMAND "${GRAB_ISCC}" /Q "${CMAKE_BINARY_DIR}/installer/grab.iss"
+            COMMENT "Building the Inno Setup installer into ${GRAB_DIST_DIR}"
+            VERBATIM)
+    else()
+        add_custom_command(TARGET dist POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo
+                    "dist: Inno Setup (ISCC.exe) not found, installer skipped; zip written to ${GRAB_DIST_DIR}"
+            VERBATIM)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 if(GRAB_BUILD_TESTS)
