@@ -111,7 +111,7 @@ grab config [-c PATH]
       --init           write an example grab.conf
 ```
 
-- `TARGET` is matched with `find -name`, so shell globs work: `grab -f 'Some.Movie*' E:\Backup\tr`.
+- `TARGET` is matched with `find -name`, so shell globs work: `grab -f 'Season.01*' E:\Backup`.
 - A `TARGET` containing `/` is a path, absolute or relative to the login home, and is
   checked as-is instead of searched for.
 - `DEST` is the local parent directory and is created if missing. Both modes write
@@ -163,8 +163,13 @@ from `common_flags` if that matters more than minutes saved on large files.
 
 ```
 src/cli.*       argument parsing            src/remote.*   find command, ssh argv, match picking
-src/ini.*       INI reader (grab + rclone)  src/rclone.*   rclone argv for both modes
-src/config.*    grab.conf / rclone.conf     src/process.*  CreateProcess / posix_spawn wrappers
-src/quote.*     Windows + sh quoting        src/main.cpp   the five steps
+src/ini.*       INI reader (grab + rclone)  src/listing.*  rclone lsf lookup, glob matching
+src/config.*    grab.conf / rclone.conf     src/rclone.*   rclone argv for both modes
+src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix_spawn wrappers
+src/util.*      strings, paths, environment src/main.cpp   the five steps
 tests/          doctest unit tests (fetched by CMake)
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
