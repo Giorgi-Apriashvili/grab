@@ -1,0 +1,101 @@
+; Inno Setup script for grab. CMake configures this template into <build>/installer/grab.iss;
+; edit installer/grab.iss.in in the source tree, not the generated copy.
+;
+; Per-user installer: no admin rights, installs to %USERPROFILE%\programs\grab, adds bin to the
+; user PATH, writes the default config with `grab --init` if none exists. The uninstaller removes
+; the files and the PATH entry but leaves %APPDATA%\grab\grab.conf alone (user data).
+
+[Setup]
+AppId={{B7E9C1D4-5F2A-4C3E-9A8B-2D6F1E0C7A55}
+AppName=grab
+AppVersion=@PROJECT_VERSION@
+AppVerName=grab @PROJECT_VERSION@
+AppPublisher=Giorgi Apriashvili
+AppPublisherURL=https://github.com/Giorgi-Apriashvili/grab
+AppSupportURL=https://github.com/Giorgi-Apriashvili/grab/issues
+DefaultDirName={%USERPROFILE}\programs\grab
+DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0
+ChangesEnvironment=yes
+LicenseFile=@GRAB_STAGE_DIR_NATIVE@\LICENSE
+OutputDir=@GRAB_DIST_DIR_NATIVE@
+OutputBaseFilename=grab-@PROJECT_VERSION@-windows-x64-setup
+UninstallDisplayName=grab
+UninstallDisplayIcon={app}\bin\grab.exe
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+
+[Files]
+Source: "@GRAB_STAGE_DIR_NATIVE@\grab.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "@GRAB_STAGE_DIR_NATIVE@\grab.conf.example"; DestDir: "{app}"; Flags: ignoreversion
+Source: "@GRAB_STAGE_DIR_NATIVE@\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "@GRAB_STAGE_DIR_NATIVE@\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+[Registry]
+; Append bin to the user PATH only when it is not already there. expandsz keeps existing
+; %VAR% entries unexpanded. ChangesEnvironment=yes makes Inno broadcast the change afterwards.
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsAddPath(ExpandConstant('{app}\bin'))
+
+[UninstallDelete]
+; Inno removes only directories it created. When {app} pre-existed (a developer ran
+; `cmake --install` into the same folder) this at least removes the emptied bin folder; {app}
+; itself still holds unins000.exe while this runs, so an empty {app} stays behind in that case.
+; %APPDATA%\grab is deliberately left alone.
+Type: dirifempty; Name: "{app}\bin"
+
+[Run]
+Filename: "{app}\bin\grab.exe"; Parameters: "--init"; Flags: runhidden waituntilterminated; StatusMsg: "Writing the default configuration to %APPDATA%\grab\grab.conf..."
+Filename: "{app}\bin\grab.exe"; Parameters: "config"; Description: "Open grab.conf for editing now"; Flags: postinstall nowait skipifsilent unchecked
+
+[Code]
+// True when Dir is not yet an entry of the user PATH. Whole-entry, case-insensitive match,
+// tolerant of a trailing backslash on the stored entry.
+function NeedsAddPath(Dir: string): Boolean;
+var
+  Path, Haystack, Needle: string;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path) then
+    Path := '';
+  Haystack := ';' + Uppercase(Path) + ';';
+  Needle := Uppercase(RemoveBackslash(Dir));
+  Result := (Pos(';' + Needle + ';', Haystack) = 0) and (Pos(';' + Needle + '\;', Haystack) = 0);
+end;
+
+// Remove Dir from the user PATH, keeping every other entry byte for byte.
+procedure RemoveFromUserPath(Dir: string);
+var
+  Path, Haystack, Needle: string;
+  P: Integer;
+begin
+  if not RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path) then
+    exit;
+  Haystack := ';' + Uppercase(Path) + ';';
+  Needle := ';' + Uppercase(RemoveBackslash(Dir)) + ';';
+  P := Pos(Needle, Haystack);
+  if P = 0 then
+  begin
+    Needle := ';' + Uppercase(RemoveBackslash(Dir)) + '\;';
+    P := Pos(Needle, Haystack);
+  end;
+  if P = 0 then
+    exit;
+  // Haystack and the wrapped original line up position for position, so cut the entry (without
+  // its trailing separator) out of the original-case string.
+  Path := ';' + Path + ';';
+  Delete(Path, P, Length(Needle) - 1);
+  if (Length(Path) > 0) and (Path[1] = ';') then
+    Delete(Path, 1, 1);
+  if (Length(Path) > 0) and (Path[Length(Path)] = ';') then
+    Delete(Path, Length(Path), 1);
+  RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Path);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+    RemoveFromUserPath(ExpandConstant('{app}\bin'));
+end;

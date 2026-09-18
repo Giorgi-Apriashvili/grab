@@ -50,6 +50,18 @@
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
     {
+      "name": "msvc-release",
+      "displayName": "MSVC Release (run from a Developer PowerShell)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+        "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/programs/grab"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
       "name": "linux-debug",
       "displayName": "Linux Debug (g++/clang++ default)",
       "inherits": "base",
@@ -64,12 +76,14 @@
     { "name": "clang-cl-debug", "configurePreset": "clang-cl-debug" },
     { "name": "clang-cl-release", "configurePreset": "clang-cl-release" },
     { "name": "msvc-debug", "configurePreset": "msvc-debug" },
+    { "name": "msvc-release", "configurePreset": "msvc-release" },
     { "name": "linux-debug", "configurePreset": "linux-debug" }
   ],
   "testPresets": [
     { "name": "clang-cl-debug", "configurePreset": "clang-cl-debug", "output": { "outputOnFailure": true } },
     { "name": "clang-cl-release", "configurePreset": "clang-cl-release", "output": { "outputOnFailure": true } },
     { "name": "msvc-debug", "configurePreset": "msvc-debug", "output": { "outputOnFailure": true } },
+    { "name": "msvc-release", "configurePreset": "msvc-release", "output": { "outputOnFailure": true } },
     { "name": "linux-debug", "configurePreset": "linux-debug", "output": { "outputOnFailure": true } }
   ]
 }
