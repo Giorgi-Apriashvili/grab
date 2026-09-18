@@ -53,6 +53,22 @@ ctest --preset clang-cl-debug --output-on-failure
 In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 `build/clang-cl-debug/compile_commands.json`; `launch.json` has a CodeLLDB dry-run config.
 
+## Install
+
+```powershell
+cmake --install build\clang-cl-release
+```
+
+This puts `grab.exe` in `%USERPROFILE%\programs\grab\bin` (no admin rights needed) and
+adds that directory to your user PATH, so `grab` works from any terminal opened afterwards.
+The PATH step is idempotent and keeps existing `%VAR%` entries intact; skip it with
+`-DGRAB_INSTALL_ADD_TO_PATH=OFF` at configure time, or install elsewhere with
+`cmake --install build\clang-cl-release --prefix D:\tools\grab`. In VS Code, the task
+"Install grab (Release)" (Terminal → Run Task) builds Release and installs it in one go,
+whatever preset is active; "CMake: Install" from the Command Palette installs the active
+preset's build instead. The Windows presets link the C runtime statically, so the
+installed exe has no VC redistributable dependency.
+
 ## Configure
 
 ```powershell

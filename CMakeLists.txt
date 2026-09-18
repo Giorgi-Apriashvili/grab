@@ -10,6 +10,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Install per user, no admin rights needed: %USERPROFILE%\programs\grab on Windows,
+# ~/.local elsewhere. The presets pass the same value; this covers a plain `cmake -S . -B`.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    if(WIN32)
+        set(CMAKE_INSTALL_PREFIX "$ENV{USERPROFILE}/programs/grab" CACHE PATH "Install prefix" FORCE)
+    else()
+        set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "Install prefix" FORCE)
+    endif()
+endif()
+file(TO_CMAKE_PATH "${CMAKE_INSTALL_PREFIX}" CMAKE_INSTALL_PREFIX) # forward slashes throughout
+
 if(PROJECT_IS_TOP_LEVEL)
     option(GRAB_BUILD_TESTS "Build the grab unit tests (doctest via FetchContent)" ON)
 else()
@@ -48,7 +59,34 @@ endif()
 add_executable(grab src/main.cpp)
 target_link_libraries(grab PRIVATE grab_core $<$<PLATFORM_ID:Windows>:shell32>)
 
+# ---------------------------------------------------------------------------
+# Install: <prefix>/bin/grab.exe plus the commented example config. On Windows the user
+# PATH gains <prefix>/bin so `grab` works from any new terminal.
+# ---------------------------------------------------------------------------
 install(TARGETS grab RUNTIME DESTINATION bin)
+install(FILES grab.conf.example DESTINATION .)
+
+if(WIN32)
+    option(GRAB_INSTALL_ADD_TO_PATH "On install, add <prefix>/bin to the user PATH" ON)
+    if(GRAB_INSTALL_ADD_TO_PATH)
+        # \${...} is evaluated at install time, so `cmake --install --prefix X` is honoured.
+        install(CODE "
+            execute_process(
+                COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                        -File \"${CMAKE_CURRENT_SOURCE_DIR}/cmake/add_to_user_path.ps1\"
+                        -Directory \"\${CMAKE_INSTALL_PREFIX}/bin\"
+                RESULT_VARIABLE grab_path_rc
+                OUTPUT_VARIABLE grab_path_out
+                ERROR_VARIABLE grab_path_err)
+            string(STRIP \"\${grab_path_out}\${grab_path_err}\" grab_path_msg)
+            if(NOT grab_path_rc EQUAL 0)
+                message(WARNING \"could not update the user PATH: \${grab_path_msg}\")
+            else()
+                message(STATUS \"\${grab_path_msg}\")
+            endif()
+        ")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests

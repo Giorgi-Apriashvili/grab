@@ -19,7 +19,9 @@
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "clang-cl",
         "CMAKE_LINKER_TYPE": "LLD",
-        "CMAKE_RC_COMPILER": "llvm-rc"
+        "CMAKE_RC_COMPILER": "llvm-rc",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+        "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/programs/grab"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
@@ -41,7 +43,9 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "cl",
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+        "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/programs/grab"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
@@ -49,7 +53,10 @@
       "name": "linux-debug",
       "displayName": "Linux Debug (g++/clang++ default)",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_INSTALL_PREFIX": "$env{HOME}/.local"
+      },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     }
   ],

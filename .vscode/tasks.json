@@ -1,0 +1,14 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Install grab (Release)",
+      "detail": "Configure + build the clang-cl Release preset, then install to %USERPROFILE%\\programs\\grab and add its bin to the user PATH",
+      "type": "shell",
+      "command": "cmake --preset clang-cl-release && cmake --build --preset clang-cl-release && cmake --install build/clang-cl-release",
+      "problemMatcher": ["$msCompile"],
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    }
+  ]
+}
