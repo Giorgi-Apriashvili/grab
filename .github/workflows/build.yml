@@ -52,6 +52,17 @@ jobs:
         if: matrix.preset == 'msvc-release'
         run: cmake --build --preset msvc-release --target dist
 
+      # `grab update` refuses any download that doesn't match this file.
+      - name: Checksums
+        if: matrix.preset == 'msvc-release'
+        shell: pwsh
+        working-directory: build/msvc-release/dist
+        run: |
+          Get-ChildItem -File | Where-Object { $_.Extension -in '.zip', '.exe' } | Sort-Object Name |
+            ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
       - name: Upload artifacts
         if: matrix.preset == 'msvc-release'
         uses: actions/upload-artifact@v4
@@ -60,6 +71,7 @@ jobs:
           path: |
             build/msvc-release/dist/*.zip
             build/msvc-release/dist/*.exe
+            build/msvc-release/dist/SHA256SUMS.txt
           if-no-files-found: error
 
   release:

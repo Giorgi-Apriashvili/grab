@@ -17,6 +17,7 @@ std::string usage() {
 Usage:
   grab (-s|--file | -f|--folder) TARGET DEST [options] [-- extra rclone args]
   grab config [-c PATH]
+  grab update [--check]
   grab --init | --help | --version
 
 TARGET is a name to search for under the remote's search_roots (find -name style, globs
@@ -27,6 +28,8 @@ DEST\<name>, created if needed.
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
                        $EDITOR, else notepad. The file is created from the example if missing.
+  update               install the latest GitHub release over this copy (Windows), after
+                       verifying its SHA-256; --check only reports whether one is available.
 
 Options:
   -s, --file           TARGET is a file   (rclone copyto, single-file tuned flags)
@@ -42,7 +45,7 @@ Options:
       --version        show version
 
 Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
-(ssh or rclone listing) failed, otherwise rclone's own exit code.
+(ssh or rclone listing) failed, 5 update failed, otherwise rclone's own exit code.
 )";
 }
 
@@ -66,11 +69,14 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     std::vector<std::string> positionals;
     bool passthrough = false;
 
-    // `grab config ...` is a subcommand; a folder literally named "config" is still reachable
-    // with a mode flag first (`grab -f config DEST`).
+    // `grab config` and `grab update` are subcommands only as the first argument, so a folder
+    // literally named "config" or "update" is still reachable with a mode flag first.
     std::size_t start = 0;
     if (!args.empty() && args[0] == "config") {
         result.action = CliAction::config;
+        start = 1;
+    } else if (!args.empty() && args[0] == "update") {
+        result.action = CliAction::update;
         start = 1;
     }
 
@@ -126,6 +132,8 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             result.opts.dry_run = true;
         } else if (name == "-v" || name == "--verbose") {
             result.opts.verbose = true;
+        } else if (name == "--check") {
+            result.opts.check = true;
         } else if (name == "--init") {
             result.action = CliAction::init;
         } else if (name == "-h" || name == "--help") {
@@ -141,10 +149,16 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         }
     }
 
-    if (result.action == CliAction::init || result.action == CliAction::config) {
+    if (result.opts.check && result.action != CliAction::update) {
+        return util::fail("--check only applies to `grab update`");
+    }
+    if (result.action == CliAction::init || result.action == CliAction::config ||
+        result.action == CliAction::update) {
         if (!positionals.empty() || mode) {
-            return util::failf("`grab {}` takes no TARGET/DEST arguments",
-                               result.action == CliAction::init ? "--init" : "config");
+            const char* cmd = result.action == CliAction::init     ? "--init"
+                              : result.action == CliAction::config ? "config"
+                                                                   : "update";
+            return util::failf("`grab {}` takes no TARGET/DEST arguments", cmd);
         }
         return result;
     }

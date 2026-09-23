@@ -72,6 +72,22 @@ The installer is not code-signed, so SmartScreen shows "Windows protected your P
 time; choose "More info → Run anyway". The exe links the C runtime statically and has no other
 dependencies.
 
+### Updating
+
+```powershell
+grab update --check   # is a newer release out?
+grab update           # download, verify and install it over this copy
+```
+
+`grab update` reads the latest GitHub release and, when it is newer, downloads the matching
+asset and checks it against the release's `SHA256SUMS.txt`. It refuses anything that doesn't
+match. Nothing is changed before that check passes. A copy installed with the setup exe is
+upgraded by running the new installer silently, so Add/Remove Programs shows the new version.
+A portable or `cmake --install` copy has its `grab.exe` swapped in place. The replaced binary is
+left as `grab.exe.old` and removed the next time grab runs. It uses the `curl.exe` and `tar.exe`
+that ship with Windows 10 and later. Versions before 0.2.0 have no `update` command; install
+0.2.0 once from the Releases page.
+
 ### From source
 
 ```powershell
@@ -150,7 +166,8 @@ grab config [-c PATH]
 - Anything after `--` is appended to the rclone command, e.g. `-- --bwlimit 10M`.
 
 Exit codes: `0` ok, `1` usage, `2` config, `3` target not found or pick aborted,
-`4` remote lookup failed (ssh or rclone listing), otherwise rclone's own code.
+`4` remote lookup failed (ssh or rclone listing), `5` `grab update` failed, otherwise
+rclone's own code.
 
 ## Lookup methods
 
@@ -203,7 +220,8 @@ tests/          doctest unit tests (fetched by CMake)
 GitHub Actions ([build.yml](.github/workflows/build.yml)) builds and tests every push and pull
 request with MSVC and clang-cl. Pushing a version tag additionally runs the `dist` target, which
 packs the portable zip and compiles the Inno Setup installer from
-[installer/grab.iss.in](installer/grab.iss.in), and attaches both to a GitHub Release.
+[installer/grab.iss.in](installer/grab.iss.in), writes `SHA256SUMS.txt` for both, and attaches
+all three to a GitHub Release. `grab update` depends on that checksum file.
 
 1. Bump `project(grab VERSION x.y.z)` in `CMakeLists.txt` and commit.
 2. `git tag vx.y.z` and `git push origin master --tags`.

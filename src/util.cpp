@@ -8,6 +8,7 @@
 #ifdef _WIN32
 #include <windows.h>
 
+#include <bcrypt.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -140,6 +141,58 @@ std::filesystem::path config_home() {
 
 bool stdin_is_tty() { return _isatty(_fileno(stdin)) != 0; }
 
+std::filesystem::path self_exe_path() {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) return {};
+        if (n < buf.size()) {
+            buf.resize(n);
+            return std::filesystem::path(buf);
+        }
+        buf.resize(buf.size() * 2); // truncated: long path
+    }
+}
+
+std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return failf("cannot open '{}'", path_to_utf8(p));
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
+        return fail("SHA-256 is not available (BCryptOpenAlgorithmProvider failed)");
+    }
+    struct Guard {
+        BCRYPT_ALG_HANDLE& alg;
+        BCRYPT_HASH_HANDLE& hash;
+        ~Guard() {
+            if (hash != nullptr) BCryptDestroyHash(hash);
+            if (alg != nullptr) BCryptCloseAlgorithmProvider(alg, 0);
+        }
+    } guard{alg, hash};
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) < 0) {
+        return fail("BCryptCreateHash failed");
+    }
+
+    std::vector<char> buf(1 << 16);
+    while (in) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        const auto n = static_cast<ULONG>(in.gcount());
+        if (n > 0 && BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf.data()), n, 0) < 0) {
+            return fail("BCryptHashData failed");
+        }
+    }
+    if (in.bad()) return failf("error reading '{}'", path_to_utf8(p));
+
+    unsigned char digest[32];
+    if (BCryptFinishHash(hash, digest, sizeof(digest), 0) < 0) return fail("BCryptFinishHash failed");
+    std::string hex;
+    hex.reserve(64);
+    for (const unsigned char b : digest) hex += std::format("{:02x}", b);
+    return hex;
+}
+
 #else
 
 std::optional<std::string> getenv_utf8(const char* name) {
@@ -155,6 +208,16 @@ std::filesystem::path config_home() {
 }
 
 bool stdin_is_tty() { return isatty(STDIN_FILENO) != 0; }
+
+std::filesystem::path self_exe_path() {
+    std::error_code ec;
+    auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::filesystem::path{} : p;
+}
+
+std::expected<std::string, std::string> sha256_file(const std::filesystem::path&) {
+    return fail("SHA-256 hashing is only implemented on Windows");
+}
 
 #endif
 

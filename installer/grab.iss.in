@@ -45,6 +45,7 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 ; `cmake --install` into the same folder) this at least removes the emptied bin folder; {app}
 ; itself still holds unins000.exe while this runs, so an empty {app} stays behind in that case.
 ; %APPDATA%\grab is deliberately left alone.
+Type: files; Name: "{app}\bin\grab.exe.old"
 Type: dirifempty; Name: "{app}\bin"
 
 [Run]

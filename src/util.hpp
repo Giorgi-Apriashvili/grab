@@ -30,6 +30,12 @@ namespace grab::util {
 
 [[nodiscard]] bool stdin_is_tty();
 
+// Absolute path of the running executable, or empty when it cannot be determined.
+[[nodiscard]] std::filesystem::path self_exe_path();
+
+// Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
+[[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
+
 [[nodiscard]] std::expected<std::string, std::string> read_file(const std::filesystem::path& p);
 
 [[nodiscard]] std::string join(const std::vector<std::string>& items, std::string_view sep);
