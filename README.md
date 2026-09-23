@@ -104,6 +104,26 @@ whatever preset is active; "CMake: Install" from the Command Palette installs th
 preset's build instead. The Windows presets link the C runtime statically, so the
 installed exe has no VC redistributable dependency.
 
+## GUI (preview)
+
+`grab-gui.exe` is a window over the same engine: pick a server, search by words, select
+results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the
+download queue with live progress, cancel and retry. It reads the same grab.conf and
+remembers the last server, mode and destination per server in `%APPDATA%\grab\gui.json`.
+
+- It needs the Microsoft Edge WebView2 Runtime, which ships with Windows 11 and current
+  Windows 10. Without it, grab-gui offers the download link.
+- It never prompts for an ssh passphrase, since it has no console. For key-based servers,
+  load the key into ssh-agent (`ssh-add <key file>`). A search then fails fast with that
+  hint instead of hanging.
+- Start-up is about half a second. Memory use is ~20 MB for grab-gui plus the WebView2
+  browser processes, typically 150–300 MB.
+- UI development: set `GRAB_UI_DIR` to `src\gui\ui` and grab-gui serves the page from there,
+  so edits need only a reload (Debug builds have DevTools and F5).
+
+The GUI is built with the rest (`GRAB_BUILD_GUI=ON` by default). Installer integration comes
+later; for now run `build\<preset>\grab-gui.exe` directly.
+
 ## Configure
 
 ```powershell

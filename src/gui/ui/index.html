@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'">
+<title>grab</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="bar top">
+  <span class="brand">grab</span>
+  <label class="field remote">
+    <span class="label">Server</span>
+    <select id="remote" title="Server (grab.conf section)"></select>
+  </label>
+  <span id="remote-info" class="chip" hidden></span>
+  <span class="spacer"></span>
+  <span id="version" class="muted"></span>
+</header>
+
+<form id="search-form" class="bar search" autocomplete="off">
+  <input id="query" type="search" placeholder="Search by name, e.g. lioness s03e08" spellcheck="false" autofocus>
+  <div class="segmented" role="radiogroup" aria-label="Look for">
+    <button type="button" data-mode="file" role="radio">Files</button>
+    <button type="button" data-mode="folder" role="radio">Folders</button>
+  </div>
+  <label class="check" title="Match the whole name exactly, case-sensitive">
+    <input id="exact" type="checkbox"> Exact
+  </label>
+  <button id="search-btn" type="submit" class="primary">Search</button>
+</form>
+
+<div id="banner" class="banner" hidden></div>
+
+<main class="results-wrap">
+  <div class="results-head row">
+    <input id="select-all" type="checkbox" title="Select all" aria-label="Select all">
+    <span class="name">Name</span>
+    <span class="size">Size</span>
+    <span class="dir">Folder</span>
+  </div>
+  <div id="results" class="results" tabindex="0" aria-label="Search results">
+    <div id="spacer"></div>
+    <div id="rows"></div>
+    <div id="empty" class="empty"></div>
+  </div>
+</main>
+
+<footer class="bar action">
+  <span id="summary" class="muted"></span>
+  <span class="spacer"></span>
+  <label class="field dest">
+    <span class="label">Save to</span>
+    <input id="dest" type="text" spellcheck="false">
+  </label>
+  <button id="browse" type="button">Browse…</button>
+  <button id="download" type="button" class="primary" disabled>Download</button>
+</footer>
+
+<section id="downloads" class="downloads" hidden>
+  <div class="downloads-head">
+    <span class="title">Downloads</span>
+    <span id="dl-summary" class="muted"></span>
+    <span class="spacer"></span>
+    <button id="clear-finished" type="button" class="subtle">Clear finished</button>
+  </div>
+  <div id="queue" class="queue"></div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
