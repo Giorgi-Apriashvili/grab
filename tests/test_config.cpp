@@ -4,10 +4,10 @@
 
 #include <doctest/doctest.h>
 
-#include <cstdlib>
-
 #ifdef _WIN32
-#include <windows.h>
+#include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
+#else
+#include <cstdlib> // setenv, unsetenv
 #endif
 
 using namespace grab;

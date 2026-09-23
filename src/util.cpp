@@ -6,10 +6,10 @@
 #include <iterator>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
 #include <bcrypt.h>
-#include <io.h>
+#include <io.h> // IWYU pragma: keep (documented header for _isatty/_fileno)
 #else
 #include <unistd.h>
 #endif
