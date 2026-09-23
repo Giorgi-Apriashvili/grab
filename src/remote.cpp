@@ -18,13 +18,16 @@ bool is_path_target(std::string_view target) {
 }
 
 std::string build_find_command(const FindRequest& req) {
-    const char* type = req.mode == Mode::folder ? "d" : "f";
+    const bool folder = req.mode == Mode::folder;
+    const char* type = folder ? "d" : "f";
+    // Folder sizes would need du; files report theirs cheaply.
+    const char* print = folder ? "-print0" : "-printf '%s\\t%p\\0'";
     std::string cmd = "find";
 
     if (is_path_target(req.target)) {
         cmd += ' ';
         cmd += quote::sh_single(req.target);
-        cmd += std::format(" -maxdepth 0 -type {} -print0", type);
+        cmd += std::format(" -maxdepth 0 -type {} {}", type, print);
     } else {
         for (const auto& root : req.roots) {
             cmd += ' ';
@@ -54,7 +57,7 @@ std::string build_find_command(const FindRequest& req) {
             cmd += quote::sh_single(query.text);
             break;
         }
-        cmd += std::format(" -type {} -print0", type);
+        cmd += std::format(" -type {} {}", type, print);
     }
     cmd += " 2>/dev/null";
     return cmd;
@@ -76,18 +79,34 @@ std::vector<std::string> build_ssh_argv(const std::string& ssh_exe, const Rclone
     return argv;
 }
 
-std::vector<std::string> parse_find_output(std::string_view out) {
-    std::vector<std::string> paths;
+std::vector<RemoteEntry> parse_find_output(std::string_view out, bool sized) {
+    std::vector<RemoteEntry> entries;
     std::size_t start = 0;
     while (start < out.size()) {
         auto end = out.find('\0', start);
         if (end == std::string_view::npos) end = out.size();
         std::string_view item = out.substr(start, end - start);
-        if (item.starts_with("./")) item.remove_prefix(2);
-        if (!item.empty()) paths.emplace_back(item);
         start = end + 1;
+
+        RemoteEntry e;
+        if (sized) {
+            const auto tab = item.find('\t');
+            if (tab != std::string_view::npos) {
+                std::uint64_t size = 0;
+                const auto digits = item.substr(0, tab);
+                const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), size);
+                if (ec == std::errc{} && ptr == digits.data() + digits.size() && !digits.empty()) {
+                    e.size = size;
+                    item.remove_prefix(tab + 1);
+                }
+            }
+        }
+        if (item.starts_with("./")) item.remove_prefix(2);
+        if (item.empty()) continue;
+        e.path = std::string(item);
+        entries.push_back(std::move(e));
     }
-    return paths;
+    return entries;
 }
 
 void rank_matches(std::vector<std::string>& matches, const Query& query) {
@@ -166,7 +185,8 @@ std::expected<std::vector<std::size_t>, std::string> parse_selection(std::string
 
 std::expected<std::vector<std::string>, std::string>
 choose_matches(std::vector<std::string> matches, const Query& query, const PickOptions& pick,
-               std::istream& in, std::ostream& err) {
+               std::istream& in, std::ostream& err,
+               const std::function<std::string(const std::string&)>& describe) {
     if (matches.empty()) return util::fail("no match to choose from");
     rank_matches(matches, query);
     if (matches.size() == 1 || pick.first) return std::vector<std::string>{matches.front()};
@@ -175,7 +195,9 @@ choose_matches(std::vector<std::string> matches, const Query& query, const PickO
     constexpr std::size_t shown_max = 100;
     const std::size_t shown = std::min(matches.size(), shown_max);
     err << std::format("{} matches:\n", matches.size());
-    for (std::size_t i = 0; i < shown; ++i) err << std::format("  [{}] {}\n", i + 1, matches[i]);
+    for (std::size_t i = 0; i < shown; ++i) {
+        err << std::format("  [{}] {}{}\n", i + 1, matches[i], describe ? describe(matches[i]) : "");
+    }
     if (shown < matches.size()) {
         err << std::format("  ... {} more not shown; refine the search, or answer a for all\n",
                            matches.size() - shown);

@@ -3,8 +3,8 @@
 
 #include "cli.hpp"
 #include "config.hpp"
+#include "engine.hpp"
 #include "ini.hpp"
-#include "listing.hpp"
 #include "match.hpp"
 #include "process.hpp"
 #include "quote.hpp"
@@ -19,6 +19,7 @@
 #include <iostream>
 #include <print>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -124,7 +125,7 @@ int do_init(const std::filesystem::path& path) {
     }
     std::println("wrote {} with {} remote(s) from rclone.conf:", shown, remotes.size());
     for (const auto& r : remotes) std::println("  [{}]  {}", r.name, describe_remote(r));
-    std::println("ready: grab -f NAME DEST   (search_roots is blank = login home; narrow it with "
+    std::println("ready: grab NAME [DEST]   (search_roots is blank = login home; narrow it with "
                  "`grab config`)");
     return exit_ok;
 }
@@ -161,69 +162,10 @@ std::string describe_roots(const std::vector<std::string>& roots) {
     return util::join(shown, ", ");
 }
 
-// 3a. ssh + find: one round trip, needs a shell on the server.
-std::expected<std::vector<std::string>, std::string>
-lookup_via_ssh(const Options& opts, const GrabConfig& cfg, const RemoteSettings& settings,
-               const RcloneRemote& conn, const std::vector<std::string>& roots, int max_depth) {
-    FindRequest req;
-    req.mode = opts.mode;
-    req.target = opts.target;
-    req.exact = opts.exact;
-    req.roots = roots;
-    req.max_depth = max_depth;
-    req.skip_hidden = settings.skip_hidden;
-
-    const auto argv = build_ssh_argv(cfg.ssh, conn, settings.ssh_options, build_find_command(req));
-    if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
-
-    auto res = proc::run_capture(argv);
-    if (!res) return util::fail(res.error());
-    if (res->exit_code == 255) {
-        return util::failf("ssh to {}@{}:{} failed (exit 255); see the message above. If this "
-                           "host has no shell (e.g. a storage box), set `find = rclone` in [{}]",
-                           conn.user, conn.host, conn.port, settings.name);
-    }
-    return parse_find_output(res->out);
-}
-
-// 3b. rclone lsf: an SFTP walk per root, works without a shell and without prompts.
-std::expected<std::vector<std::string>, std::string>
-lookup_via_rclone(const Options& opts, const GrabConfig& cfg, const RemoteSettings& settings,
-                  const std::vector<std::string>& roots, int max_depth) {
-    // A path target is checked with a single listing of its parent, whatever the roots.
-    const std::vector<std::string> bases =
-        is_path_target(opts.target) ? std::vector<std::string>{""} : roots;
-
-    std::vector<std::string> matches;
-    for (const auto& root : bases) {
-        ListRequest req;
-        req.mode = opts.mode;
-        req.target = opts.target;
-        req.exact = opts.exact;
-        req.root = root;
-        req.max_depth = max_depth;
-        req.skip_hidden = settings.skip_hidden;
-        req.rclone_exe = cfg.rclone;
-        req.rclone_config = cfg.rclone_config;
-        req.rclone_remote = settings.rclone_remote;
-
-        const auto argv = build_lsf_argv(req);
-        if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
-
-        auto res = proc::run_capture(argv);
-        if (!res) return util::fail(res.error());
-        if (res->exit_code != 0) {
-            return util::failf("rclone lsf of '{}' failed (exit {}); see the message above",
-                               argv[2], res->exit_code);
-        }
-        auto found = parse_lsf_output(req, res->out);
-        matches.insert(matches.end(), found.begin(), found.end());
-    }
-    return matches;
-}
-
-// Absolute, normalized DEST directory, created if missing.
-std::expected<std::filesystem::path, std::string> prepare_destination(const std::filesystem::path& in) {
+// Absolute, normalized DEST directory, created if missing (unless `create` is false, as for
+// --dry-run, which must not touch the disk).
+std::expected<std::filesystem::path, std::string> prepare_destination(const std::filesystem::path& in,
+                                                                     bool create = true) {
     std::error_code ec;
     auto dest = std::filesystem::absolute(in, ec);
     if (ec) return util::failf("bad destination '{}': {}", util::path_to_utf8(in), ec.message());
@@ -231,6 +173,7 @@ std::expected<std::filesystem::path, std::string> prepare_destination(const std:
     if (std::filesystem::exists(dest, ec) && !std::filesystem::is_directory(dest, ec)) {
         return util::failf("destination '{}' exists and is not a directory", util::path_to_utf8(dest));
     }
+    if (!create) return dest;
     std::filesystem::create_directories(dest, ec);
     if (ec) {
         return util::failf("cannot create destination '{}': {}", util::path_to_utf8(dest),
@@ -242,23 +185,13 @@ std::expected<std::filesystem::path, std::string> prepare_destination(const std:
 int run(const Options& opts) {
     // 2. configuration -------------------------------------------------------------------
     const auto cfg_path = opts.config.value_or(default_grab_config_path());
-    auto cfg = load_grab_config(cfg_path);
-    if (!cfg) {
-        error(cfg.error());
-        std::println(stderr, "hint: run `grab --init` to create {}", util::path_to_utf8(cfg_path));
-        return exit_config;
-    }
-    auto remote = cfg->select(opts.remote);
-    if (!remote) {
-        error(remote.error());
-        return exit_config;
-    }
-    const RemoteSettings& settings = **remote;
-
-    const auto rclone_conf = cfg->rclone_config.value_or(default_rclone_config_path());
-    auto conn = load_rclone_remote(rclone_conf, settings.rclone_remote);
-    if (!conn) {
-        error(conn.error());
+    auto ctx = engine::load_context(cfg_path, opts.remote);
+    if (!ctx) {
+        error(ctx.error());
+        std::error_code ec;
+        if (!std::filesystem::exists(cfg_path, ec)) {
+            std::println(stderr, "hint: run `grab --init` to create {}", util::path_to_utf8(cfg_path));
+        }
         return exit_config;
     }
 
@@ -267,7 +200,7 @@ int run(const Options& opts) {
     const bool interactive = util::stdin_is_tty();
     std::filesystem::path dest;
     if (opts.dest) {
-        auto prepared = prepare_destination(*opts.dest);
+        auto prepared = prepare_destination(*opts.dest, !opts.dry_run);
         if (!prepared) {
             error(prepared.error());
             return exit_config;
@@ -279,42 +212,54 @@ int run(const Options& opts) {
     }
 
     // 3. resolve the remote path ---------------------------------------------------------
-    const int max_depth = opts.depth.value_or(settings.max_depth);
-    std::vector<std::string> roots = settings.search_roots;
-    if (roots.empty()) roots.emplace_back(); // the login home
-
-    const FindMethod method = resolve_find_method(settings, *conn);
     if (opts.verbose) {
         std::println(stderr, "grab: looking up '{}' via {}", opts.target,
-                     method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
+                     ctx->method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
     }
-    auto lookup = method == FindMethod::ssh
-                      ? lookup_via_ssh(opts, *cfg, settings, *conn, roots, max_depth)
-                      : lookup_via_rclone(opts, *cfg, settings, roots, max_depth);
-    if (!lookup) {
-        error(lookup.error());
+    engine::SearchRequest req;
+    req.target = opts.target;
+    req.mode = opts.mode;
+    req.exact = opts.exact;
+    req.depth = opts.depth;
+    const engine::CommandHook trace = [&](const std::vector<std::string>& argv) {
+        if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
+    };
+    auto found = engine::search(*ctx, req, {}, trace);
+    if (!found) {
+        error(found.error());
         return exit_lookup;
     }
 
-    auto matches = std::move(*lookup);
     const Query query = make_query(opts.target, opts.exact);
-    if (matches.empty()) {
+    if (found->hits.empty()) {
         if (is_path_target(opts.target)) {
             error(std::format("no {} at '{}' on {}", mode_noun(opts.mode), opts.target,
-                              conn->host));
+                              ctx->remote.host));
         } else {
             error(std::format("no {} {} '{}' under {} (max depth {}) on {}", mode_noun(opts.mode),
                               query.kind == Query::Kind::words ? "matching" : "named", opts.target,
-                              describe_roots(roots), max_depth, conn->host));
+                              describe_roots(found->roots), found->max_depth, ctx->remote.host));
         }
         return exit_not_found;
     }
 
+    std::vector<std::string> paths;
+    std::unordered_map<std::string, std::uint64_t> sizes;
+    for (const auto& hit : found->hits) {
+        paths.push_back(hit.path);
+        if (hit.size) sizes.emplace(hit.path, *hit.size);
+    }
     PickOptions pick;
     pick.first = opts.first;
     pick.all = opts.all;
     pick.interactive = interactive;
-    auto chosen = choose_matches(std::move(matches), query, pick, std::cin, std::cerr);
+    auto chosen = choose_matches(std::move(paths), query, pick, std::cin, std::cerr,
+                                 [&](const std::string& path) {
+                                     const auto it = sizes.find(path);
+                                     return it == sizes.end()
+                                                ? std::string{}
+                                                : std::format("  ({})", util::format_size(it->second));
+                                 });
     if (!chosen) {
         error(chosen.error());
         return exit_not_found;
@@ -329,7 +274,7 @@ int run(const Options& opts) {
                 error(answer.error());
                 return exit_usage;
             }
-            auto prepared = prepare_destination(*answer);
+            auto prepared = prepare_destination(*answer, !opts.dry_run);
             if (prepared) {
                 dest = std::move(*prepared);
                 break;
@@ -340,17 +285,6 @@ int run(const Options& opts) {
     }
 
     // 4 + 5. one rclone run per chosen item ----------------------------------------------
-    RcloneRequest rq;
-    rq.mode = opts.mode;
-    rq.rclone_exe = cfg->rclone;
-    rq.rclone_config = cfg->rclone_config;
-    rq.rclone_remote = settings.rclone_remote;
-    rq.dest_dir = dest;
-    rq.common_flags = settings.common_flags;
-    rq.mode_flags = opts.mode == Mode::folder ? settings.folder_flags : settings.file_flags;
-    rq.extra = opts.extra;
-
-    constexpr int interrupted = 130; // Ctrl+C, see proc::run_inherit
     const std::size_t total = chosen->size();
     std::size_t done = 0;
     int first_failure = 0;
@@ -358,8 +292,8 @@ int run(const Options& opts) {
     bool stopped = false;
 
     for (std::size_t i = 0; i < total; ++i) {
-        rq.remote_path = (*chosen)[i];
-        const auto rclone_argv = build_rclone_argv(rq);
+        const std::string& path = (*chosen)[i];
+        const auto rclone_argv = engine::download_argv(*ctx, opts.mode, path, dest, opts.extra);
         if (opts.verbose || opts.dry_run) {
             std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
         }
@@ -367,8 +301,8 @@ int run(const Options& opts) {
 
         const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
         std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
-                     remote_spec(settings.rclone_remote, rq.remote_path),
-                     util::path_to_utf8(local_target(rq)));
+                     remote_spec(ctx->settings.rclone_remote, path),
+                     util::path_to_utf8(dest / util::path_from_utf8(remote_basename(path))));
         auto code = proc::run_inherit(rclone_argv);
         if (!code) {
             error(code.error());
@@ -379,8 +313,8 @@ int run(const Options& opts) {
             continue;
         }
         if (first_failure == 0) first_failure = *code;
-        failed.push_back(rq.remote_path);
-        if (*code == interrupted) {
+        failed.push_back(path);
+        if (*code == proc::exit_stopped) {
             stopped = i + 1 < total;
             break;
         }

@@ -1,5 +1,9 @@
 #include "listing.hpp"
 
+#include <charconv>
+#include <cstdint>
+#include <optional>
+
 #include "match.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
@@ -29,6 +33,7 @@ std::vector<std::string> build_lsf_argv(const ListRequest& req) {
     const std::string base = path_target ? parent_of(req.target) : req.root;
 
     std::vector<std::string> argv{req.rclone_exe, "lsf", remote_spec(req.rclone_remote, base),
+                                  "--format", "sp",
                                   req.mode == Mode::folder ? "--dirs-only" : "--files-only"};
     if (!path_target) {
         argv.insert(argv.end(), {"-R", "--max-depth", std::to_string(req.max_depth)});
@@ -44,14 +49,14 @@ std::vector<std::string> build_lsf_argv(const ListRequest& req) {
     return argv;
 }
 
-std::vector<std::string> parse_lsf_output(const ListRequest& req, std::string_view out) {
+std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req, std::string_view out) {
     const bool path_target = is_path_target(req.target);
     const std::string want = path_target ? remote_basename(req.target) : req.target;
     const std::string base = path_target ? parent_of(req.target) : req.root;
     const Query query = make_query(req.target, req.exact);
     const bool filter_hidden = req.skip_hidden && !path_target && !wants_hidden(query);
 
-    std::vector<std::string> found;
+    std::vector<RemoteEntry> found;
     std::size_t start = 0;
     while (start < out.size()) {
         auto end = out.find('\n', start);
@@ -61,6 +66,16 @@ std::vector<std::string> parse_lsf_output(const ListRequest& req, std::string_vi
 
         if (line.ends_with('\r')) line.remove_suffix(1);
         if (line.empty()) continue;
+
+        // "<size>;<path>": the size comes first, so a ';' inside the path is harmless.
+        std::optional<std::uint64_t> size;
+        if (const auto semi = line.find(';'); semi != std::string_view::npos) {
+            const auto digits = line.substr(0, semi);
+            std::uint64_t n = 0;
+            const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), n);
+            if (ec == std::errc{} && ptr == digits.data() + digits.size() && !digits.empty()) size = n;
+            if (digits == "-1" || size) line.remove_prefix(semi + 1);
+        }
         const bool is_dir = line.ends_with('/');
         if (is_dir) line.remove_suffix(1);
         if (line.empty() || is_dir != (req.mode == Mode::folder)) continue;
@@ -78,7 +93,7 @@ std::vector<std::string> parse_lsf_output(const ListRequest& req, std::string_vi
 
         const std::string name = remote_basename(line);
         const bool hit = path_target ? name == want : matches(query, name);
-        if (hit) found.push_back(join_remote(base, line));
+        if (hit) found.push_back(RemoteEntry{join_remote(base, line), size});
     }
     return found;
 }

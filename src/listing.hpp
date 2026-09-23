@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cli.hpp"
+#include "remote.hpp"
 
 #include <filesystem>
 #include <optional>
@@ -31,13 +32,14 @@ struct ListRequest {
 // "learning/x" -> "learning"   "/x" -> "/"   "a/b/" -> "a"   "x" -> ""
 [[nodiscard]] std::string parent_of(std::string_view path);
 
-// Name search: `rclone lsf REMOTE:root -R --max-depth N --dirs-only|--files-only [--exclude ...]`.
-// Path target:  `rclone lsf REMOTE:<parent> --dirs-only|--files-only` (one level).
+// Name search: `rclone lsf REMOTE:root --format sp --dirs-only|--files-only -R --max-depth N [--exclude ...]`.
+// Path target:  `rclone lsf REMOTE:<parent> --format sp --dirs-only|--files-only` (one level).
 [[nodiscard]] std::vector<std::string> build_lsf_argv(const ListRequest& req);
 
-// Remote paths from lsf output (one entry per line, directories end with '/') whose last
-// component matches the query (see match.hpp); results are joined onto the root / parent.
-[[nodiscard]] std::vector<std::string> parse_lsf_output(const ListRequest& req,
+// Entries from lsf output ("<size>;<path>" per line, directories end with '/' and have size
+// -1) whose last component matches the query (see match.hpp); paths are joined onto the
+// root / parent.
+[[nodiscard]] std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req,
                                                         std::string_view out);
 
 } // namespace grab

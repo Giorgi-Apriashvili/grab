@@ -1,6 +1,7 @@
 #include "json.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <format>
 
 namespace grab::json {
@@ -245,6 +246,128 @@ private:
 std::expected<Value, std::string> parse(std::string_view text) {
     if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
     return Parser(text).document();
+}
+
+Value Value::make_string(std::string s) {
+    Value v;
+    v.kind = Kind::string;
+    v.str = std::move(s);
+    return v;
+}
+
+Value Value::make_number(double n) {
+    Value v;
+    v.kind = Kind::number;
+    v.number = n;
+    return v;
+}
+
+Value Value::make_bool(bool b) {
+    Value v;
+    v.kind = Kind::boolean;
+    v.boolean = b;
+    return v;
+}
+
+Value Value::make_array() {
+    Value v;
+    v.kind = Kind::array;
+    return v;
+}
+
+Value Value::make_object() {
+    Value v;
+    v.kind = Kind::object;
+    return v;
+}
+
+Value& Value::push(Value v) {
+    items.push_back(std::move(v));
+    return *this;
+}
+
+Value& Value::set(std::string key, Value v) {
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i] == key) {
+            items[i] = std::move(v);
+            return *this;
+        }
+    }
+    keys.push_back(std::move(key));
+    items.push_back(std::move(v));
+    return *this;
+}
+
+std::string quote(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out += '"';
+    for (const char c : s) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                out += std::format("\\u{:04x}", static_cast<unsigned>(static_cast<unsigned char>(c)));
+            } else {
+                out += c;
+            }
+        }
+    }
+    out += '"';
+    return out;
+}
+
+namespace {
+
+void write(const Value& v, std::string& out) {
+    switch (v.kind) {
+    case Value::Kind::null: out += "null"; return;
+    case Value::Kind::boolean: out += v.boolean ? "true" : "false"; return;
+    case Value::Kind::number: {
+        const double n = v.number;
+        if (!std::isfinite(n)) {
+            out += "null";
+        } else if (n == std::floor(n) && std::fabs(n) < 9007199254740992.0) { // 2^53
+            out += std::format("{}", static_cast<long long>(n));
+        } else {
+            out += std::format("{}", n); // shortest round-trip form
+        }
+        return;
+    }
+    case Value::Kind::string: out += quote(v.str); return;
+    case Value::Kind::array:
+        out += '[';
+        for (std::size_t i = 0; i < v.items.size(); ++i) {
+            if (i > 0) out += ',';
+            write(v.items[i], out);
+        }
+        out += ']';
+        return;
+    case Value::Kind::object:
+        out += '{';
+        for (std::size_t i = 0; i < v.items.size(); ++i) {
+            if (i > 0) out += ',';
+            out += quote(v.keys[i]);
+            out += ':';
+            write(v.items[i], out);
+        }
+        out += '}';
+        return;
+    }
+}
+
+} // namespace
+
+std::string stringify(const Value& v) {
+    std::string out;
+    write(v, out);
+    return out;
 }
 
 } // namespace grab::json

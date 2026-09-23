@@ -152,7 +152,8 @@ grab config [-c PATH]
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
-  -n, --dry-run        resolve the target and print the rclone command, transfer nothing
+  -n, --dry-run        resolve the target and print the rclone command; transfers nothing and
+                       creates no folders
   -v, --verbose        echo the ssh and rclone command lines
       --init           write an example grab.conf
 ```
@@ -164,6 +165,9 @@ grab config [-c PATH]
   (`find -iname`), so only hits travel back.
 - A `TARGET` containing `*`, `?` or `[` is a glob instead, also case-insensitive:
   `grab -f 'Season.0[1-3]*' E:\Backup`. `--exact` matches the whole name, case-sensitive.
+- File matches show their size in the list. The ssh lookup gets sizes from GNU find's `-printf`,
+  which any mainstream Linux server has; a server without it finds no files over ssh, so use
+  `find = rclone` for it.
 - With several matches you get a numbered list, best first. Exact names rank first, then
   names starting with your first word, then the shallowest, then alphabetical, so a
   season lists in episode order. Answer `3`, `1-5,8`, `a` for all, Enter for `[1]`, or `q`.

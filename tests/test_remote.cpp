@@ -21,7 +21,7 @@ TEST_CASE("find command: words become one -iname per word, over several roots") 
     req.skip_hidden = true;
     CHECK(build_find_command(req) ==
           "find '/home/alice' '/srv/my data' -mindepth 1 -maxdepth 4 "
-          "\\( -name '.*' -prune \\) -o -iname '*lioness*' -iname '*s03e08*' -type f -print0 "
+          "\\( -name '.*' -prune \\) -o -iname '*lioness*' -iname '*s03e08*' -type f -printf '%s\\t%p\\0' "
           "2>/dev/null");
 }
 
@@ -34,7 +34,7 @@ TEST_CASE("find command: words are glob-escaped and shell-quoted") {
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
           "find '/home/alice' -mindepth 1 -maxdepth 2 -iname '*movie'\\''s*' -iname '*50%\\]*' "
-          "-type f -print0 2>/dev/null");
+          "-type f -printf '%s\\t%p\\0' 2>/dev/null");
 }
 
 TEST_CASE("find command: glob gets -iname, --exact gets -name") {
@@ -118,14 +118,27 @@ TEST_CASE("ssh argv without key or known_hosts") {
 }
 
 TEST_CASE("find output is NUL separated, trailing NUL tolerated") {
+    using V = std::vector<RemoteEntry>;
     const std::string out("/a/b\0/a/c d\0", 12);
-    CHECK(parse_find_output(out) == std::vector<std::string>{"/a/b", "/a/c d"});
-    CHECK(parse_find_output("").empty());
-    CHECK(parse_find_output(std::string("\0\0", 2)).empty());
-    CHECK(parse_find_output("/no/terminator") == std::vector<std::string>{"/no/terminator"});
+    CHECK(parse_find_output(out, false) == V{{"/a/b", {}}, {"/a/c d", {}}});
+    CHECK(parse_find_output("", false).empty());
+    CHECK(parse_find_output(std::string("\0\0", 2), false).empty());
+    CHECK(parse_find_output("/no/terminator", false) == V{{"/no/terminator", {}}});
     // Home-relative searches come back as ./x; the prefix is dropped.
-    CHECK(parse_find_output(std::string("./learning/x\0./y\0", 17)) ==
-          std::vector<std::string>{"learning/x", "y"});
+    CHECK(parse_find_output(std::string("./learning/x\0./y\0", 17), false) ==
+          V{{"learning/x", {}}, {"y", {}}});
+}
+
+TEST_CASE("sized find output: <size>\\t<path>, from -printf") {
+    using V = std::vector<RemoteEntry>;
+    const std::string out = std::string("13367823676\t./downloads/tv/Lioness.S03E08.mkv") + '\0' +
+                            "0\t/srv/empty.txt" + '\0' + "not-a-size\t/weird\tname" + '\0';
+    CHECK(parse_find_output(out, true) ==
+          V{{"downloads/tv/Lioness.S03E08.mkv", 13367823676ULL},
+            {"/srv/empty.txt", 0ULL},
+            {"not-a-size\t/weird\tname", {}}});
+    // A folder listing is never split on tabs.
+    CHECK(parse_find_output(std::string("12\tdir") + '\0', false) == V{{"12\tdir", {}}});
 }
 
 TEST_CASE("ranking: exact name, then prefix, then depth, then case-insensitive path") {
