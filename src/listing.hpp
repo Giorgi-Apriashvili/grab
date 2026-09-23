@@ -15,7 +15,8 @@ namespace grab {
 // the tree bounded by max_depth.
 struct ListRequest {
     Mode mode = Mode::folder;
-    std::string target;   // name pattern, or a remote path containing '/'
+    std::string target;   // search words / pattern, or a remote path containing '/'
+    bool exact = false;   // --exact: whole-name, case-sensitive (see match.hpp)
     std::string root;     // "" = the login home, "/abs" or "relative/to/home"
     int max_depth = 4;
     bool skip_hidden = true;
@@ -23,9 +24,6 @@ struct ListRequest {
     std::optional<std::filesystem::path> rclone_config;
     std::string rclone_remote;
 };
-
-// fnmatch-style matching as `find -name` does it: * ? [set] [!set]; no escapes.
-[[nodiscard]] bool glob_match(std::string_view pattern, std::string_view name);
 
 // ("", "a/b") -> "a/b"   ("/", "a") -> "/a"   ("x/", "a") -> "x/a"
 [[nodiscard]] std::string join_remote(std::string_view root, std::string_view rel);
@@ -38,7 +36,7 @@ struct ListRequest {
 [[nodiscard]] std::vector<std::string> build_lsf_argv(const ListRequest& req);
 
 // Remote paths from lsf output (one entry per line, directories end with '/') whose last
-// component matches the target; results are joined onto the root / parent.
+// component matches the query (see match.hpp); results are joined onto the root / parent.
 [[nodiscard]] std::vector<std::string> parse_lsf_output(const ListRequest& req,
                                                         std::string_view out);
 

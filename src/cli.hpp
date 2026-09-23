@@ -19,6 +19,8 @@ struct Options {
     std::optional<std::filesystem::path> config;
     std::optional<int> depth;
     bool first = false;
+    bool all = false;                // --all: take every match without asking
+    bool exact = false;              // --exact: whole-name, case-sensitive matching
     bool dry_run = false;
     bool verbose = false;
     bool check = false;              // `grab update --check`

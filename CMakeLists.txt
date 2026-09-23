@@ -37,6 +37,7 @@ add_library(grab_core STATIC
     src/cli.cpp
     src/config.cpp
     src/remote.cpp
+    src/match.cpp
     src/listing.cpp
     src/rclone.cpp
     src/process.cpp

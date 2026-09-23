@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "ini.hpp"
 #include "listing.hpp"
+#include "match.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
@@ -167,6 +168,7 @@ lookup_via_ssh(const Options& opts, const GrabConfig& cfg, const RemoteSettings&
     FindRequest req;
     req.mode = opts.mode;
     req.target = opts.target;
+    req.exact = opts.exact;
     req.roots = roots;
     req.max_depth = max_depth;
     req.skip_hidden = settings.skip_hidden;
@@ -197,6 +199,7 @@ lookup_via_rclone(const Options& opts, const GrabConfig& cfg, const RemoteSettin
         ListRequest req;
         req.mode = opts.mode;
         req.target = opts.target;
+        req.exact = opts.exact;
         req.root = root;
         req.max_depth = max_depth;
         req.skip_hidden = settings.skip_hidden;
@@ -280,52 +283,84 @@ int run(const Options& opts) {
     }
 
     auto matches = std::move(*lookup);
+    const Query query = make_query(opts.target, opts.exact);
     if (matches.empty()) {
         if (is_path_target(opts.target)) {
             error(std::format("no {} at '{}' on {}", mode_noun(opts.mode), opts.target,
                               conn->host));
         } else {
-            error(std::format("no {} named '{}' under {} (max depth {}) on {}",
-                              mode_noun(opts.mode), opts.target, describe_roots(roots), max_depth,
-                              conn->host));
+            error(std::format("no {} {} '{}' under {} (max depth {}) on {}", mode_noun(opts.mode),
+                              query.kind == Query::Kind::words ? "matching" : "named", opts.target,
+                              describe_roots(roots), max_depth, conn->host));
         }
         return exit_not_found;
     }
 
-    auto chosen = choose_match(std::move(matches), opts.first, util::stdin_is_tty(), std::cin,
-                               std::cerr);
+    PickOptions pick;
+    pick.first = opts.first;
+    pick.all = opts.all;
+    pick.interactive = util::stdin_is_tty();
+    auto chosen = choose_matches(std::move(matches), query, pick, std::cin, std::cerr);
     if (!chosen) {
         error(chosen.error());
         return exit_not_found;
     }
 
-    // 4. rclone command ------------------------------------------------------------------
+    // 4 + 5. one rclone run per chosen item ----------------------------------------------
     RcloneRequest rq;
     rq.mode = opts.mode;
     rq.rclone_exe = cfg->rclone;
     rq.rclone_config = cfg->rclone_config;
     rq.rclone_remote = settings.rclone_remote;
-    rq.remote_path = *chosen;
     rq.dest_dir = dest;
     rq.common_flags = settings.common_flags;
     rq.mode_flags = opts.mode == Mode::folder ? settings.folder_flags : settings.file_flags;
     rq.extra = opts.extra;
-    const auto rclone_argv = build_rclone_argv(rq);
 
-    if (opts.verbose || opts.dry_run) {
-        std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
+    constexpr int interrupted = 130; // Ctrl+C, see proc::run_inherit
+    const std::size_t total = chosen->size();
+    std::size_t done = 0;
+    int first_failure = 0;
+    std::vector<std::string> failed;
+    bool stopped = false;
+
+    for (std::size_t i = 0; i < total; ++i) {
+        rq.remote_path = (*chosen)[i];
+        const auto rclone_argv = build_rclone_argv(rq);
+        if (opts.verbose || opts.dry_run) {
+            std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
+        }
+        if (opts.dry_run) continue;
+
+        const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
+        std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
+                     remote_spec(settings.rclone_remote, rq.remote_path),
+                     util::path_to_utf8(local_target(rq)));
+        auto code = proc::run_inherit(rclone_argv);
+        if (!code) {
+            error(code.error());
+            return exit_config;
+        }
+        if (*code == 0) {
+            ++done;
+            continue;
+        }
+        if (first_failure == 0) first_failure = *code;
+        failed.push_back(rq.remote_path);
+        if (*code == interrupted) {
+            stopped = i + 1 < total;
+            break;
+        }
     }
     if (opts.dry_run) return exit_ok;
 
-    // 5. transfer ------------------------------------------------------------------------
-    std::println(stderr, "grab: {} {}  ->  {}", mode_noun(opts.mode),
-                 remote_spec(settings.rclone_remote, *chosen), util::path_to_utf8(local_target(rq)));
-    auto code = proc::run_inherit(rclone_argv);
-    if (!code) {
-        error(code.error());
-        return exit_config;
+    if (total > 1) {
+        std::string summary = std::format("grab: {} of {} done", done, total);
+        if (!failed.empty()) summary += std::format("; failed: {}", util::join(failed, ", "));
+        if (stopped) summary += "; stopped after Ctrl+C";
+        std::println(stderr, "{}", summary);
     }
-    return *code;
+    return first_failure;
 }
 
 } // namespace

@@ -23,7 +23,7 @@ grab -f releases E:\Backup
   │                     rclone.conf -> host / user / port / key for the ssh step
   ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -print0"
   │                     (or `rclone lsf -R` for remotes without a key / shell, see Lookup methods)
-  │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick (or --first)
+  │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick, several allowed
   ├─ 4. build rclone    rclone copy   hetzner:/home/alice/releases E:\Backup\releases  + flags
   │                     rclone copyto hetzner:/path/movie.mkv      E:\Backup\movie.mkv  + flags
   └─ 5. run rclone      console inherited (live -P progress), Ctrl+C goes to rclone
@@ -149,13 +149,26 @@ grab config [-c PATH]
   -r, --remote NAME    grab.conf section to use
   -c, --config PATH    grab.conf path
       --depth N        override max_depth for this run
-      --first          take the shallowest match instead of asking
+      --first          take the best match instead of asking
+      --all            take every match instead of asking
+      --exact          match TARGET as a whole name or glob, case-sensitive
   -n, --dry-run        resolve the target and print the rclone command, transfer nothing
   -v, --verbose        echo the ssh and rclone command lines
       --init           write an example grab.conf
 ```
 
-- `TARGET` is matched with `find -name`, so shell globs work: `grab -f 'Season.01*' E:\Backup`.
+- `TARGET` is a search: every word must appear in the name, ignoring case, in any order.
+  `grab -s lioness E:\TV` lists every file with "lioness" in its name.
+  `grab -s "lioness s03e08" E:\TV` narrows that to one episode, and so does
+  `grab -s "the unravelling" E:\TV`. With the ssh lookup the filtering happens on the server
+  (`find -iname`), so only hits travel back.
+- A `TARGET` containing `*`, `?` or `[` is a glob instead, also case-insensitive:
+  `grab -f 'Season.0[1-3]*' E:\Backup`. `--exact` matches the whole name, case-sensitive.
+- With several matches you get a numbered list, best first. Exact names rank first, then
+  names starting with your first word, then the shallowest, then alphabetical, so a
+  season lists in episode order. Answer `3`, `1-5,8`, `a` for all, Enter for `[1]`, or `q`.
+  Each pick is downloaded in turn and a summary follows. `--first` and `--all` answer
+  without asking, for scripts.
 - A `TARGET` containing `/` is a path, absolute or relative to the login home, and is
   checked as-is instead of searched for.
 - `DEST` is the local parent directory and is created if missing. Both modes write
@@ -175,7 +188,7 @@ Per remote, `find =` in grab.conf picks how `TARGET` is located:
 
 | method   | how                                                          | auto picks it when |
 |----------|--------------------------------------------------------------|--------------------|
-| `ssh`    | one `ssh user@host "find ROOTS -maxdepth N -name TARGET"`    | the rclone remote has a `key_file` |
+| `ssh`    | one `ssh user@host "find ROOTS -maxdepth N -iname '*WORD*' ..."` | the rclone remote has a `key_file` |
 | `rclone` | `rclone lsf REMOTE:ROOT -R --max-depth N`, filtered locally   | otherwise (password remotes, storage boxes) |
 
 `ssh` is a single round trip but needs a shell on the server and prompts for the key
