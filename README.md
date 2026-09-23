@@ -91,9 +91,18 @@ installed exe has no VC redistributable dependency.
 ## Configure
 
 ```powershell
-grab --init          # writes %APPDATA%\grab\grab.conf with comments, if absent
+grab --init          # writes %APPDATA%\grab\grab.conf from your rclone.conf, if absent
 grab config          # opens it in your editor, creating it first if needed
 ```
+
+`--init` reads rclone.conf (`$RCLONE_CONFIG`, else `%APPDATA%\rclone\rclone.conf`) and writes
+one section per sftp remote. `search_roots` is left blank, meaning the login home, and
+`default_remote` is the first remote, so grab works right away. The rclone flag keys are
+written commented out, so later improvements to the built-in defaults still reach you;
+uncomment one to override it. Non-sftp remotes are listed in a comment. With no usable
+rclone.conf (missing, encrypted, or no sftp remote) you get the generic example to edit
+instead. Run `--init` again later: it never rewrites an existing file, but prints ready-to-paste
+sections for sftp remotes you have added to rclone.conf since.
 
 `grab config` uses the `editor` key in `[grab]` (for example `editor = code --wait`),
 otherwise `$VISUAL`, then `$EDITOR`, and finally Notepad. It reads only that key, so a

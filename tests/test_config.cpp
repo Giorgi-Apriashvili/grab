@@ -4,6 +4,12 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdlib>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using namespace grab;
 
 namespace {
@@ -209,6 +215,122 @@ TEST_CASE("known_hosts_file = none is treated as unset, never passed to ssh") {
     CHECK_FALSE(r->known_hosts_file.has_value());
     CHECK_FALSE(r->key_file.has_value());
     CHECK(r->port == 23);
+}
+
+namespace {
+const char* const rclone_fixture = "[hetzner]\n"
+                                   "type = sftp\n"
+                                   "host = 203.0.113.10\n"
+                                   "user = alice\n"
+                                   "port = 2222\n"
+                                   "key_file = E:\\keys\\server.pem\n"
+                                   "key_file_pass = obscured\n"
+                                   "[gdrive]\n"
+                                   "type = drive\n"
+                                   "[box]\n"
+                                   "type = sftp\n"
+                                   "host = box.example.com\n"
+                                   "user = u1-sub1\n"
+                                   "port = 23\n"
+                                   "pass = obscured\n"
+                                   "known_hosts_file = none\n"
+                                   "[broken]\n"
+                                   "type = sftp\n"
+                                   "user = nohost\n";
+
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    SetEnvironmentVariableW(util::to_wide(name).c_str(),
+                            value ? util::to_wide(value).c_str() : nullptr);
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+} // namespace
+
+TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp remote") {
+    auto rclone = ini::parse(rclone_fixture);
+    REQUIRE(rclone.has_value());
+    const auto text = generate_grab_config(&*rclone, "C:\\Users\\alice\\rclone.conf");
+
+    // Skipped remotes are named with a reason, not given sections.
+    CHECK(text.find("C:\\Users\\alice\\rclone.conf") != std::string::npos);
+    CHECK(text.find("gdrive (drive)") != std::string::npos);
+    CHECK(text.find("broken (sftp, incomplete") != std::string::npos);
+    CHECK(text.find("[gdrive]") == std::string::npos);
+    CHECK(text.find("[broken]") == std::string::npos);
+    CHECK(text.find("alice@203.0.113.10:2222, key file, lookup via ssh + find") != std::string::npos);
+    CHECK(text.find("u1-sub1@box.example.com:23, no key file, lookup via rclone lsf") !=
+          std::string::npos);
+
+    const auto cfg = parse_ok(text);
+    CHECK(cfg.default_remote == "hetzner");
+    REQUIRE(cfg.remotes.size() == 2);
+    CHECK(cfg.remotes[0].name == "hetzner");
+    CHECK(cfg.remotes[1].name == "box");
+    for (const auto& r : cfg.remotes) {
+        CHECK(r.rclone_remote == r.name);
+        CHECK(r.find == FindMethod::auto_detect);
+        CHECK(r.search_roots.empty()); // blank = login home
+        CHECK(r.max_depth == 4);
+        // Flag keys are commented out, so the built-in defaults apply.
+        CHECK(r.common_flags == util::split_args(default_common_flags));
+        CHECK(r.folder_flags == util::split_args(default_folder_flags));
+        CHECK(r.file_flags == util::split_args(default_file_flags));
+        CHECK(r.ssh_options.empty());
+    }
+}
+
+TEST_CASE("generate_grab_config falls back to the example when nothing is usable") {
+    CHECK(generate_grab_config(nullptr, "x") == example_config);
+    auto only_drive = ini::parse("[gdrive]\ntype = drive\n");
+    REQUIRE(only_drive.has_value());
+    CHECK(generate_grab_config(&*only_drive, "x") == example_config);
+}
+
+TEST_CASE("a remote named grab gets a non-colliding section name") {
+    auto rclone = ini::parse("[grab]\ntype = sftp\nhost = h\nuser = u\n");
+    REQUIRE(rclone.has_value());
+    const auto cfg = parse_ok(generate_grab_config(&*rclone, "x"));
+    REQUIRE(cfg.remotes.size() == 1);
+    CHECK(cfg.remotes[0].name == "grab_remote");
+    CHECK(cfg.remotes[0].rclone_remote == "grab");
+    CHECK(cfg.default_remote == "grab_remote");
+}
+
+TEST_CASE("missing_remotes lists sftp remotes no section references") {
+    auto rclone = ini::parse(rclone_fixture);
+    REQUIRE(rclone.has_value());
+
+    // A section named differently but pointing at `box` covers it.
+    const auto cfg = parse_ok("[myserver]\nrclone_remote = box\n");
+    const auto missing = missing_remotes(cfg, *rclone);
+    REQUIRE(missing.size() == 1);
+    CHECK(missing[0].name == "hetzner");
+
+    const auto all = parse_ok("[hetzner]\n[b]\nrclone_remote = box\n");
+    CHECK(missing_remotes(all, *rclone).empty());
+}
+
+TEST_CASE("encrypted rclone.conf is detected") {
+    CHECK(is_encrypted_rclone_config("# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nabc="));
+    CHECK(is_encrypted_rclone_config("\xEF\xBB\xBF# Encrypted rclone configuration File\n"));
+    CHECK(is_encrypted_rclone_config("RCLONE_ENCRYPT_V0:\nabc"));
+    CHECK_FALSE(is_encrypted_rclone_config("[hetzner]\ntype = sftp\n"));
+}
+
+TEST_CASE("RCLONE_CONFIG overrides the default rclone.conf path") {
+    const auto previous = util::getenv_utf8("RCLONE_CONFIG");
+    set_env("RCLONE_CONFIG", "D:\\portable\\rclone.conf");
+    CHECK(util::path_to_utf8(default_rclone_config_path()) == "D:\\portable\\rclone.conf");
+    set_env("RCLONE_CONFIG", nullptr);
+    CHECK(default_rclone_config_path().filename() == "rclone.conf");
+    CHECK(default_rclone_config_path().parent_path().filename() == "rclone");
+    set_env("RCLONE_CONFIG", previous ? previous->c_str() : nullptr);
 }
 
 TEST_CASE("example config parses and matches the defaults") {

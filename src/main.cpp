@@ -54,26 +54,76 @@ std::vector<std::string> collect_args([[maybe_unused]] int argc, [[maybe_unused]
     return args;
 }
 
+// rclone.conf for --init, or nullopt with the reason printed.
+std::optional<ini::Document> read_rclone_for_init(const std::filesystem::path& p) {
+    const auto shown = util::path_to_utf8(p);
+    auto text = util::read_file(p);
+    if (!text) {
+        std::println("no rclone.conf at {}", shown);
+        return std::nullopt;
+    }
+    if (is_encrypted_rclone_config(*text)) {
+        std::println("{} is encrypted; grab cannot read its remotes", shown);
+        return std::nullopt;
+    }
+    auto doc = ini::parse(*text);
+    if (!doc) {
+        std::println("cannot parse {}: {}", shown, doc.error());
+        return std::nullopt;
+    }
+    return std::move(*doc);
+}
+
 int do_init(const std::filesystem::path& path) {
     std::error_code ec;
+    const auto shown = util::path_to_utf8(path);
+
     if (std::filesystem::exists(path, ec)) {
-        std::println("config already exists: {}", util::path_to_utf8(path));
+        std::println("config already exists: {}", shown);
+        // Never rewrite it; only point out rclone remotes it does not cover yet.
+        auto cfg = load_grab_config(path);
+        if (!cfg) return exit_ok;
+        auto rclone = read_rclone_for_init(cfg->rclone_config.value_or(default_rclone_config_path()));
+        if (!rclone) return exit_ok;
+        const auto missing = missing_remotes(*cfg, *rclone);
+        if (missing.empty()) return exit_ok;
+        std::println("\nrclone.conf has sftp remotes grab.conf does not use yet. To add them, paste");
+        std::println("these sections into the file (`grab config` opens it):\n");
+        for (const auto& r : missing) std::println("{}", remote_section(r));
         return exit_ok;
     }
+
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) {
         error(std::format("cannot create {}: {}", util::path_to_utf8(path.parent_path()),
                           ec.message()));
         return exit_config;
     }
+
+    const auto rclone_path = default_rclone_config_path();
+    const auto rclone = read_rclone_for_init(rclone_path);
+    const auto remotes = rclone ? usable_sftp_remotes(*rclone) : std::vector<RcloneRemote>{};
+    const auto text =
+        generate_grab_config(rclone ? &*rclone : nullptr, util::path_to_utf8(rclone_path));
+
     std::ofstream out(path, std::ios::binary);
     if (!out) {
-        error(std::format("cannot write {}", util::path_to_utf8(path)));
+        error(std::format("cannot write {}", shown));
         return exit_config;
     }
-    out << example_config;
-    std::println("wrote example config to {}", util::path_to_utf8(path));
-    std::println("edit search_roots / default_remote, then run e.g.  grab -f NAME E:\\Backup\\NAME");
+    out << text;
+
+    if (remotes.empty()) {
+        if (rclone) std::println("no usable sftp remote in rclone.conf");
+        std::println("wrote example config to {}", shown);
+        std::println("set up the server with `rclone config`, then edit the example section "
+                     "(`grab config`)");
+        return exit_ok;
+    }
+    std::println("wrote {} with {} remote(s) from rclone.conf:", shown, remotes.size());
+    for (const auto& r : remotes) std::println("  [{}]  {}", r.name, describe_remote(r));
+    std::println("ready: grab -f NAME DEST   (search_roots is blank = login home; narrow it with "
+                 "`grab config`)");
     return exit_ok;
 }
 
