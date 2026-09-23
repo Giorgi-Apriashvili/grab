@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -39,6 +40,9 @@ namespace grab::util {
 [[nodiscard]] std::expected<std::string, std::string> read_file(const std::filesystem::path& p);
 
 [[nodiscard]] std::string join(const std::vector<std::string>& items, std::string_view sep);
+
+// Human-readable byte count: "512 B", "1.5 KiB", "12.4 GiB".
+[[nodiscard]] std::string format_size(std::uint64_t bytes);
 
 // ASCII lower-casing, for case-insensitive keywords.
 [[nodiscard]] std::string to_lower(std::string_view s);

@@ -79,6 +79,18 @@ std::string join(const std::vector<std::string>& items, std::string_view sep) {
     return out;
 }
 
+std::string format_size(std::uint64_t bytes) {
+    if (bytes < 1024) return std::format("{} B", bytes);
+    constexpr const char* units[] = {"KiB", "MiB", "GiB", "TiB", "PiB"};
+    double value = static_cast<double>(bytes) / 1024.0;
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < std::size(units)) {
+        value /= 1024.0;
+        ++unit;
+    }
+    return std::format("{:.1f} {}", value, units[unit]);
+}
+
 std::string to_lower(std::string_view s) {
     std::string out(s);
     for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
