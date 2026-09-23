@@ -69,11 +69,12 @@ inline constexpr std::string_view default_folder_flags = "--transfers 8 --checke
 inline constexpr std::string_view default_file_flags =
     "--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi";
 
-// Commented example written by `grab --init`.
+// Commented example with a placeholder server; `grab --init` falls back to it when rclone.conf
+// is missing, encrypted or has no usable sftp remote.
 extern const std::string_view example_config;
 
 [[nodiscard]] std::filesystem::path default_grab_config_path();   // $GRAB_CONFIG or <config>/grab/grab.conf
-[[nodiscard]] std::filesystem::path default_rclone_config_path(); // <config>/rclone/rclone.conf
+[[nodiscard]] std::filesystem::path default_rclone_config_path(); // $RCLONE_CONFIG or <config>/rclone/rclone.conf
 
 [[nodiscard]] std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& doc);
 [[nodiscard]] std::expected<GrabConfig, std::string> load_grab_config(const std::filesystem::path& p);
@@ -82,6 +83,32 @@ extern const std::string_view example_config;
                                                                             std::string_view name);
 [[nodiscard]] std::expected<RcloneRemote, std::string>
 load_rclone_remote(const std::filesystem::path& p, std::string_view name);
+
+// ---- generating grab.conf from rclone.conf (grab --init) ------------------------------------
+
+// True for a config encrypted with `rclone config` -> "Set configuration password".
+[[nodiscard]] bool is_encrypted_rclone_config(std::string_view text);
+
+// sftp remotes in rclone.conf that grab can use (host and user present), in file order.
+[[nodiscard]] std::vector<RcloneRemote> usable_sftp_remotes(const ini::Document& rclone);
+
+// Usable sftp remotes that no grab.conf section references through rclone_remote.
+[[nodiscard]] std::vector<RcloneRemote> missing_remotes(const GrabConfig& cfg,
+                                                        const ini::Document& rclone);
+
+// "alice@host:22, key file, lookup via ssh + find"
+[[nodiscard]] std::string describe_remote(const RcloneRemote& remote);
+
+// A commented grab.conf section for one rclone remote. search_roots is left blank (the login
+// home, correct for both lookup methods) and the rclone flag keys are written commented out,
+// so later changes to the built-in defaults still apply.
+[[nodiscard]] std::string remote_section(const RcloneRemote& remote);
+
+// A complete grab.conf: the [grab] block plus one section per usable sftp remote, with
+// default_remote set to the first. Returns example_config when `rclone` is null or has no
+// usable sftp remote.
+[[nodiscard]] std::string generate_grab_config(const ini::Document* rclone,
+                                               std::string_view rclone_path);
 
 // Command that opens `file` for editing: the first non-blank candidate (in practice
 // [grab] editor, $VISUAL, $EDITOR) split shell-style, else notepad on Windows and vi

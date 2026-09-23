@@ -2,7 +2,9 @@
 
 #include "util.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <format>
 
 namespace grab {
 
@@ -121,6 +123,10 @@ std::filesystem::path default_grab_config_path() {
 }
 
 std::filesystem::path default_rclone_config_path() {
+    // Same precedence as rclone itself, so grab and rclone read the same file.
+    if (auto env = util::getenv_utf8("RCLONE_CONFIG"); env && !util::trim(*env).empty()) {
+        return util::path_from_utf8(util::trim(*env));
+    }
     return util::config_home() / "rclone" / "rclone.conf";
 }
 
@@ -270,14 +276,135 @@ std::vector<std::string> editor_command(const std::vector<std::string>& candidat
 
 std::expected<RcloneRemote, std::string> load_rclone_remote(const std::filesystem::path& p,
                                                             std::string_view name) {
-    auto doc = ini::parse_file(p);
-    if (!doc) {
+    auto text = util::read_file(p);
+    if (!text) {
         return util::failf("{} (set rclone_config in grab.conf if rclone.conf lives elsewhere)",
-                           doc.error());
+                           text.error());
     }
+    if (is_encrypted_rclone_config(*text)) {
+        return util::failf("{} is encrypted and grab cannot decrypt it to read the remote's host, "
+                           "user and port; point rclone_config in grab.conf at an unencrypted "
+                           "rclone.conf",
+                           util::path_to_utf8(p));
+    }
+    auto doc = ini::parse(*text);
+    if (!doc) return util::failf("{}: {}", util::path_to_utf8(p), doc.error());
     auto r = parse_rclone_remote(*doc, name);
     if (!r) return util::failf("{}: {}", util::path_to_utf8(p), r.error());
     return r;
+}
+
+// ---- generating grab.conf from rclone.conf ---------------------------------------------------
+
+namespace {
+
+// Section name for a remote; "grab" is taken by the global section.
+std::string section_name_for(std::string_view remote) {
+    return remote == "grab" ? std::string("grab_remote") : std::string(remote);
+}
+
+// Splits rclone.conf into usable sftp remotes and "name (reason)" labels for the rest.
+void classify_remotes(const ini::Document& rclone, std::vector<RcloneRemote>& usable,
+                      std::vector<std::string>& skipped) {
+    for (const auto& s : rclone.sections) {
+        if (s.name.empty()) continue;
+        const auto type = nonblank(s, "type").value_or("unknown type");
+        if (type != "sftp") {
+            skipped.push_back(std::format("{} ({})", s.name, type));
+            continue;
+        }
+        if (auto r = parse_rclone_remote(rclone, s.name)) {
+            usable.push_back(std::move(*r));
+        } else {
+            skipped.push_back(std::format("{} (sftp, incomplete: no host/user or bad port)", s.name));
+        }
+    }
+}
+
+} // namespace
+
+bool is_encrypted_rclone_config(std::string_view text) {
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3); // UTF-8 BOM
+    return text.starts_with("# Encrypted rclone configuration") ||
+           util::trim(text).starts_with("RCLONE_ENCRYPT_V");
+}
+
+std::vector<RcloneRemote> usable_sftp_remotes(const ini::Document& rclone) {
+    std::vector<RcloneRemote> usable;
+    std::vector<std::string> skipped;
+    classify_remotes(rclone, usable, skipped);
+    return usable;
+}
+
+std::vector<RcloneRemote> missing_remotes(const GrabConfig& cfg, const ini::Document& rclone) {
+    std::vector<RcloneRemote> out;
+    for (auto& r : usable_sftp_remotes(rclone)) {
+        const bool referenced = std::ranges::any_of(
+            cfg.remotes, [&](const RemoteSettings& s) { return s.rclone_remote == r.name; });
+        if (!referenced) out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::string describe_remote(const RcloneRemote& remote) {
+    const bool ssh = resolve_find_method(RemoteSettings{}, remote) == FindMethod::ssh;
+    return std::format("{}@{}:{}, {}, lookup via {}", remote.user, remote.host, remote.port,
+                       remote.key_file ? "key file" : "no key file", ssh ? "ssh + find" : "rclone lsf");
+}
+
+std::string remote_section(const RcloneRemote& remote) {
+    std::string s;
+    s += std::format("# rclone.conf [{}]: {}\n", remote.name, describe_remote(remote));
+    s += std::format("[{}]\n", section_name_for(remote.name));
+    s += std::format("rclone_remote = {}\n", remote.name);
+    s += "# auto = ssh + find when the rclone remote has a key_file, otherwise rclone lsf.\n";
+    s += "find = auto\n";
+    s += "# Where to search: comma-separated absolute (/srv) or home-relative (media) dirs.\n";
+    s += "# Blank = the login home. Narrow it to speed up searches on big servers.\n";
+    s += "search_roots =\n";
+    s += "max_depth = 4\n";
+    s += "skip_hidden = true\n";
+    s += "# Built-in defaults, shown for reference; uncomment a line to override it here.\n";
+    s += "# ssh_options = -o ServerAliveInterval=30\n";
+    s += std::format("# common_flags = {}\n", default_common_flags);
+    s += std::format("# folder_flags = {}\n", default_folder_flags);
+    s += std::format("# file_flags = {}\n", default_file_flags);
+    return s;
+}
+
+std::string generate_grab_config(const ini::Document* rclone, std::string_view rclone_path) {
+    if (rclone == nullptr) return std::string(example_config);
+    std::vector<RcloneRemote> usable;
+    std::vector<std::string> skipped;
+    classify_remotes(*rclone, usable, skipped);
+    if (usable.empty()) return std::string(example_config);
+
+    std::string out = "# grab.conf - settings for the `grab` CLI\n#\n";
+    out += "# Generated by `grab --init` from the sftp remotes in\n";
+    out += std::format("#   {}\n", rclone_path);
+    out += "# Connection details (host, user, port, key, passphrase) stay in rclone.conf; each\n"
+           "# section below names its rclone remote. Run `grab --init` again to list sftp remotes\n"
+           "# added to rclone.conf later. grab.conf.example explains every key.\n"
+           "# Comments must be on their own line; a ; or # after a value is part of the value.\n";
+    if (!skipped.empty()) {
+        out += std::format("#\n# Skipped rclone remotes (grab needs sftp): {}\n",
+                           util::join(skipped, ", "));
+    }
+    out += "\n[grab]\n";
+    out += "rclone = rclone\n";
+    out += "# rclone.conf to read connection details from. Blank = rclone's default\n"
+           "# ($RCLONE_CONFIG, else %APPDATA%\\rclone\\rclone.conf).\n";
+    out += "rclone_config =\n";
+    out += "ssh = ssh\n";
+    out += "# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.\n";
+    out += "editor =\n";
+    out += "# Remote used when -r/--remote is not given.\n";
+    out += std::format("default_remote = {}\n", section_name_for(usable.front().name));
+    for (const auto& r : usable) {
+        out += '\n';
+        out += remote_section(r);
+    }
+    return out;
 }
 
 } // namespace grab
