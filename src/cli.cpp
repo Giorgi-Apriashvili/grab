@@ -20,10 +20,12 @@ Usage:
   grab update [--check]
   grab --init | --help | --version
 
-TARGET is a name to search for under the remote's search_roots (find -name style, globs
-allowed), or a remote path containing '/' (absolute, or relative to the login home) that
-is checked as-is. DEST is the local parent directory: the file or folder is written as
-DEST\<name>, created if needed.
+TARGET is searched for under the remote's search_roots. By default every word must appear
+in the name, ignoring case, in any order: `grab -s "lioness s03e08" E:\TV`. A TARGET with
+* ? or [ is a glob (case-insensitive); --exact matches the whole name exactly. A TARGET
+containing '/' is a remote path (absolute, or relative to the login home), checked as-is.
+With several matches you pick from a numbered list: 3, 1-5,8, a = all, Enter = 1.
+DEST is the local parent directory: each item is written as DEST\<name>, created if needed.
 
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
@@ -37,7 +39,9 @@ Options:
   -r, --remote NAME    grab.conf section to use (default: [grab] default_remote)
   -c, --config PATH    grab.conf path (default: %APPDATA%\grab\grab.conf or $GRAB_CONFIG)
       --depth N        override max_depth for this run
-      --first          take the shallowest match instead of asking
+      --first          take the best match instead of asking
+      --all            take every match instead of asking
+      --exact          match TARGET as a whole name or glob, case-sensitive
   -n, --dry-run        resolve the target and print the rclone command, transfer nothing
   -v, --verbose        echo the ssh and rclone command lines before running them
       --init           write a commented example grab.conf to the config path if absent
@@ -128,6 +132,10 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             result.opts.depth = *n;
         } else if (name == "--first") {
             result.opts.first = true;
+        } else if (name == "--all") {
+            result.opts.all = true;
+        } else if (name == "--exact") {
+            result.opts.exact = true;
         } else if (name == "-n" || name == "--dry-run") {
             result.opts.dry_run = true;
         } else if (name == "-v" || name == "--verbose") {

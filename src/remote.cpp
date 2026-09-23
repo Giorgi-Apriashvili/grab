@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <format>
 #include <istream>
 #include <ostream>
+#include <utility>
 
 namespace grab {
 
@@ -29,12 +31,29 @@ std::string build_find_command(const FindRequest& req) {
             cmd += root.empty() ? std::string(".") : quote::sh_single(root);
         }
         cmd += std::format(" -mindepth 1 -maxdepth {}", req.max_depth);
+        const Query query = make_query(req.target, req.exact);
         // Prune dot-directories unless the user is explicitly looking for a dot-name.
-        if (req.skip_hidden && !req.target.starts_with('.')) {
+        if (req.skip_hidden && !wants_hidden(query)) {
             cmd += " \\( -name '.*' -prune \\) -o";
         }
-        cmd += " -name ";
-        cmd += quote::sh_single(req.target);
+        // Filter on the server so only hits cross the network. Consecutive predicates are
+        // ANDed by find, and bind tighter than the -o above.
+        switch (query.kind) {
+        case Query::Kind::words:
+            for (const auto& term : query.terms) {
+                cmd += " -iname ";
+                cmd += quote::sh_single("*" + escape_glob(term) + "*");
+            }
+            break;
+        case Query::Kind::glob:
+            cmd += " -iname ";
+            cmd += quote::sh_single(query.text);
+            break;
+        case Query::Kind::exact:
+            cmd += " -name ";
+            cmd += quote::sh_single(query.text);
+            break;
+        }
         cmd += std::format(" -type {} -print0", type);
     }
     cmd += " 2>/dev/null";
@@ -71,45 +90,117 @@ std::vector<std::string> parse_find_output(std::string_view out) {
     return paths;
 }
 
-void rank_matches(std::vector<std::string>& matches) {
-    auto depth = [](const std::string& p) { return std::ranges::count(p, '/'); };
-    std::ranges::stable_sort(matches, [&](const std::string& a, const std::string& b) {
-        const auto da = depth(a);
-        const auto db = depth(b);
-        if (da != db) return da < db;
-        return a < b;
+void rank_matches(std::vector<std::string>& matches, const Query& query) {
+    struct Key {
+        int tier;
+        std::ptrdiff_t depth;
+        std::string folded;
+    };
+    std::vector<std::pair<Key, std::string>> keyed;
+    keyed.reserve(matches.size());
+    for (auto& m : matches) {
+        Key k{match_tier(query, m), std::ranges::count(m, '/'), util::to_lower(m)};
+        keyed.emplace_back(std::move(k), std::move(m));
+    }
+    std::ranges::stable_sort(keyed, [](const auto& a, const auto& b) {
+        if (a.first.tier != b.first.tier) return a.first.tier < b.first.tier;
+        if (a.first.depth != b.first.depth) return a.first.depth < b.first.depth;
+        if (a.first.folded != b.first.folded) return a.first.folded < b.first.folded;
+        return a.second < b.second;
     });
+    for (std::size_t i = 0; i < keyed.size(); ++i) matches[i] = std::move(keyed[i].second);
 }
 
-std::expected<std::string, std::string> choose_match(std::vector<std::string> matches, bool first,
-                                                     bool interactive, std::istream& in,
-                                                     std::ostream& err) {
-    if (matches.empty()) return util::fail("no match to choose from");
-    rank_matches(matches);
-    if (matches.size() == 1 || first) return matches.front();
-
-    err << std::format("{} matches:\n", matches.size());
-    for (std::size_t i = 0; i < matches.size(); ++i) {
-        err << std::format("  [{}] {}\n", i + 1, matches[i]);
+std::expected<std::vector<std::size_t>, std::string> parse_selection(std::string_view answer,
+                                                                     std::size_t count) {
+    const auto text = util::trim(answer);
+    std::vector<std::size_t> picked;
+    if (text == "a" || text == "A" || text == "all") {
+        for (std::size_t i = 0; i < count; ++i) picked.push_back(i);
+        return picked;
     }
-    if (!interactive) {
-        return util::fail("ambiguous target; rerun with --first or pass the absolute remote path");
+
+    auto number = [&](std::string_view s) -> std::expected<std::size_t, std::string> {
+        std::size_t n = 0;
+        const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), n);
+        if (s.empty() || ec != std::errc{} || ptr != s.data() + s.size()) {
+            return util::failf("'{}' is not a number", s);
+        }
+        if (n < 1 || n > count) return util::failf("{} is outside 1-{}", n, count);
+        return n - 1;
+    };
+    auto add = [&](std::size_t i) {
+        if (std::ranges::find(picked, i) == picked.end()) picked.push_back(i);
+    };
+
+    std::string normalized(text);
+    std::ranges::replace(normalized, ',', ' ');
+    std::size_t pos = 0;
+    while (pos < normalized.size()) {
+        const auto start = normalized.find_first_not_of(" \t", pos);
+        if (start == std::string::npos) break;
+        auto end = normalized.find_first_of(" \t", start);
+        if (end == std::string::npos) end = normalized.size();
+        const std::string_view token = std::string_view(normalized).substr(start, end - start);
+        pos = end;
+
+        if (const auto dash = token.find('-'); dash != std::string_view::npos && dash > 0) {
+            auto lo = number(token.substr(0, dash));
+            if (!lo) return util::fail(lo.error());
+            auto hi = number(token.substr(dash + 1));
+            if (!hi) return util::fail(hi.error());
+            if (*lo <= *hi) {
+                for (auto i = *lo; i <= *hi; ++i) add(i);
+            } else {
+                for (auto i = *lo + 1; i-- > *hi;) add(i);
+            }
+        } else {
+            auto n = number(token);
+            if (!n) return util::fail(n.error());
+            add(*n);
+        }
+    }
+    if (picked.empty()) return util::fail("nothing selected");
+    return picked;
+}
+
+std::expected<std::vector<std::string>, std::string>
+choose_matches(std::vector<std::string> matches, const Query& query, const PickOptions& pick,
+               std::istream& in, std::ostream& err) {
+    if (matches.empty()) return util::fail("no match to choose from");
+    rank_matches(matches, query);
+    if (matches.size() == 1 || pick.first) return std::vector<std::string>{matches.front()};
+    if (pick.all) return matches;
+
+    constexpr std::size_t shown_max = 100;
+    const std::size_t shown = std::min(matches.size(), shown_max);
+    err << std::format("{} matches:\n", matches.size());
+    for (std::size_t i = 0; i < shown; ++i) err << std::format("  [{}] {}\n", i + 1, matches[i]);
+    if (shown < matches.size()) {
+        err << std::format("  ... {} more not shown; refine the search, or answer a for all\n",
+                           matches.size() - shown);
+    }
+    if (!pick.interactive) {
+        return util::fail("several matches; rerun with --first, --all or more search words");
     }
 
     for (int attempt = 0; attempt < 3; ++attempt) {
-        err << std::format("Pick [1-{}] or q to quit: ", matches.size());
+        err << "Pick: number, ranges (1-5,8), a = all, Enter = 1, q = quit: ";
         err.flush();
         std::string line;
         if (!std::getline(in, line)) return util::fail("aborted (no input)");
-        const auto t = util::trim(line);
-        if (t == "q" || t == "Q") return util::fail("aborted");
-        int n = 0;
-        const auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), n);
-        if (ec == std::errc{} && ptr == t.data() + t.size() && n >= 1 &&
-            static_cast<std::size_t>(n) <= matches.size()) {
-            return matches[static_cast<std::size_t>(n) - 1];
+        const auto answer = util::trim(line);
+        if (answer.empty()) return std::vector<std::string>{matches.front()};
+        if (answer == "q" || answer == "Q") return util::fail("aborted");
+        auto picked = parse_selection(answer, matches.size());
+        if (!picked) {
+            err << std::format("invalid choice: {}\n", picked.error());
+            continue;
         }
-        err << "invalid choice\n";
+        std::vector<std::string> out;
+        out.reserve(picked->size());
+        for (const auto i : *picked) out.push_back(matches[i]);
+        return out;
     }
     return util::fail("aborted (too many invalid choices)");
 }

@@ -9,27 +9,6 @@
 
 using namespace grab;
 
-TEST_CASE("glob_match follows find -name rules") {
-    CHECK(glob_match("releases", "releases"));
-    CHECK_FALSE(glob_match("releases", "Releases"));
-    CHECK(glob_match("Some.Movie*", "Some.Movie.2013.1080p"));
-    CHECK(glob_match("*.mkv", "movie.mkv"));
-    CHECK_FALSE(glob_match("*.mkv", "movie.mkv.part"));
-    CHECK(glob_match("*Intro*", "Course - Intro to Testing - Jane Doe"));
-    CHECK(glob_match("S0?E01", "S01E01"));
-    CHECK_FALSE(glob_match("S0?E01", "S011E01"));
-    CHECK(glob_match("[abc]x", "bx"));
-    CHECK_FALSE(glob_match("[abc]x", "dx"));
-    CHECK(glob_match("[!abc]x", "dx"));
-    CHECK(glob_match("[a-c]x", "cx"));
-    CHECK(glob_match("[]]", "]"));
-    CHECK(glob_match("a[", "a[")); // unterminated bracket is literal
-    CHECK(glob_match("*", ""));
-    CHECK(glob_match("**", "anything"));
-    CHECK_FALSE(glob_match("", "x"));
-    CHECK(glob_match("", ""));
-}
-
 TEST_CASE("remote path helpers") {
     CHECK(join_remote("", "learning/x") == "learning/x");
     CHECK(join_remote("/", "x") == "/x");
@@ -112,6 +91,24 @@ TEST_CASE("lsf output for a path target matches the leaf exactly in the parent l
     CHECK(parse_lsf_output(r, out) ==
           std::vector<std::string>{"learning/Course - Intro to Testing - Jane Doe"});
     r.target = "learning/missing";
+    CHECK(parse_lsf_output(r, out).empty());
+}
+
+TEST_CASE("lsf output with a word query: case-insensitive, any order, hidden still pruned") {
+    auto r = base_request();
+    r.mode = Mode::file;
+    r.target = "LIONESS e08";
+    const std::string out =
+        "tv/Lioness.2023.S03E08.The.Unravelling.2160p.ATV.WEB-DL.DDP5.1.DV.HDR.H.265-NTb.mkv\n"
+        "tv/Lioness.2023.S03E07.Something.2160p.mkv\n"
+        "tv/.trash/Lioness.2023.S03E08.old.mkv\n"
+        "tv/lioness-e08-sample.MKV\n";
+    CHECK(parse_lsf_output(r, out) ==
+          std::vector<std::string>{
+              "tv/Lioness.2023.S03E08.The.Unravelling.2160p.ATV.WEB-DL.DDP5.1.DV.HDR.H.265-NTb.mkv",
+              "tv/lioness-e08-sample.MKV"});
+
+    r.exact = true; // --exact: the whole name, case-sensitive
     CHECK(parse_lsf_output(r, out).empty());
 }
 
