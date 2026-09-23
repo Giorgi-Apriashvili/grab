@@ -31,6 +31,10 @@ namespace grab::util {
 
 [[nodiscard]] bool stdin_is_tty();
 
+// One line from stdin with console echo off (passwords); nullopt at end of input. Without a
+// console it reads normally.
+[[nodiscard]] std::optional<std::string> read_secret_line();
+
 // Absolute path of the running executable, or empty when it cannot be determined.
 [[nodiscard]] std::filesystem::path self_exe_path();
 

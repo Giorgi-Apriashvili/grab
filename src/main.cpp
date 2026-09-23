@@ -10,6 +10,7 @@
 #include "quote.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
+#include "server_cli.hpp"
 #include "update.hpp"
 #include "util.hpp"
 
@@ -86,7 +87,7 @@ int do_init(const std::filesystem::path& path) {
         // Never rewrite it; only point out rclone remotes it does not cover yet.
         auto cfg = load_grab_config(path);
         if (!cfg) return exit_ok;
-        auto rclone = read_rclone_for_init(cfg->rclone_config.value_or(default_rclone_config_path()));
+        auto rclone = read_rclone_for_init(cfg->rclone_config.value_or(standard_rclone_config_path()));
         if (!rclone) return exit_ok;
         const auto missing = missing_remotes(*cfg, *rclone);
         if (missing.empty()) return exit_ok;
@@ -103,7 +104,7 @@ int do_init(const std::filesystem::path& path) {
         return exit_config;
     }
 
-    const auto rclone_path = default_rclone_config_path();
+    const auto rclone_path = standard_rclone_config_path();
     const auto rclone = read_rclone_for_init(rclone_path);
     const auto remotes = rclone ? usable_sftp_remotes(*rclone) : std::vector<RcloneRemote>{};
     const auto text =
@@ -115,15 +116,19 @@ int do_init(const std::filesystem::path& path) {
         return exit_config;
     }
     out << text;
+    out.close();
 
     if (remotes.empty()) {
-        if (rclone) std::println("no usable sftp remote in rclone.conf");
-        std::println("wrote example config to {}", shown);
-        std::println("set up the server with `rclone config`, then edit the example section "
-                     "(`grab config`)");
+        std::println("wrote {} (no servers yet)", shown);
+        std::println("add one with:  grab server add");
         return exit_ok;
     }
-    std::println("wrote {} with {} remote(s) from rclone.conf:", shown, remotes.size());
+    // Copy them into grab's own rclone.conf; the standard one is never modified.
+    std::vector<std::string> names;
+    for (const auto& r : remotes) names.push_back(r.name);
+    const auto imported = import_rclone_remotes(names, rclone_path, grab_rclone_config_path());
+    if (!imported.error.empty()) error(imported.error);
+    std::println("wrote {} with {} server(s) imported from rclone.conf:", shown, remotes.size());
     for (const auto& r : remotes) std::println("  [{}]  {}", r.name, describe_remote(r));
     std::println("ready: grab NAME [DEST]   (search_roots is blank = login home; narrow it with "
                  "`grab config`)");
@@ -193,6 +198,10 @@ int run(const Options& opts) {
             std::println(stderr, "hint: run `grab --init` to create {}", util::path_to_utf8(cfg_path));
         }
         return exit_config;
+    }
+    if (!ctx->imported.empty()) {
+        std::println(stderr, "grab: imported {} from rclone.conf into {} (one time)",
+                     util::join(ctx->imported, ", "), util::path_to_utf8(grab_rclone_config_path()));
     }
 
     // destination: a given DEST is checked before the search so a typo fails fast; a missing
@@ -339,9 +348,12 @@ int main(int argc, char** argv) {
     // A previous `grab update` left the replaced binary as grab.exe.old; it can be deleted
     // once that process has exited.
     if (auto self = util::self_exe_path(); !self.empty()) {
-        self += ".old";
+        // grab.exe, rclone.exe or grab-gui.exe replaced by an update: delete once unused.
         std::error_code ignored;
-        std::filesystem::remove(self, ignored);
+        for (const auto& e : std::filesystem::directory_iterator(self.parent_path(), ignored)) {
+            const auto name = e.path().filename().wstring();
+            if (name.ends_with(L".exe.old")) std::filesystem::remove(e.path(), ignored);
+        }
     }
 #endif
     const auto args = collect_args(argc, argv);
@@ -365,6 +377,8 @@ int main(int argc, char** argv) {
         return do_config(parsed->opts.config.value_or(default_grab_config_path()));
     case CliAction::update:
         return update::run(parsed->opts.check);
+    case CliAction::server:
+        return run_server_command(parsed->opts);
     case CliAction::run:
         return run(parsed->opts);
     }

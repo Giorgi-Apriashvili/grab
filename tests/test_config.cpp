@@ -4,6 +4,9 @@
 
 #include <doctest/doctest.h>
 
+#include <filesystem>
+#include <fstream>
+
 #ifdef _WIN32
 #include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
 #else
@@ -74,8 +77,12 @@ TEST_CASE("explicit keys override defaults, blank flag keys mean no flags") {
 }
 
 TEST_CASE("grab.conf validation errors") {
+    // No servers yet is a valid file; asking for one explains how to add it.
     auto no_remotes = parse_grab_config(*ini::parse("[grab]\nrclone = rclone\n"));
-    CHECK_FALSE(no_remotes.has_value());
+    REQUIRE(no_remotes.has_value());
+    auto none = no_remotes->select(std::nullopt);
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error().find("grab server add") != std::string::npos);
 
     auto bad_find = parse_grab_config(*ini::parse("[h]\nfind = telnet\n"));
     CHECK_FALSE(bad_find.has_value());
@@ -264,7 +271,7 @@ TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp 
     CHECK(text.find("[gdrive]") == std::string::npos);
     CHECK(text.find("[broken]") == std::string::npos);
     CHECK(text.find("alice@203.0.113.10:2222, key file, lookup via ssh + find") != std::string::npos);
-    CHECK(text.find("u1-sub1@box.example.com:23, no key file, lookup via rclone lsf") !=
+    CHECK(text.find("u1-sub1@box.example.com:23, password, lookup via rclone lsf") !=
           std::string::npos);
 
     const auto cfg = parse_ok(text);
@@ -285,11 +292,87 @@ TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp 
     }
 }
 
-TEST_CASE("generate_grab_config falls back to the example when nothing is usable") {
-    CHECK(generate_grab_config(nullptr, "x") == example_config);
-    auto only_drive = ini::parse("[gdrive]\ntype = drive\n");
-    REQUIRE(only_drive.has_value());
-    CHECK(generate_grab_config(&*only_drive, "x") == example_config);
+TEST_CASE("generate_grab_config without usable remotes is a [grab] block ready for `grab server add`") {
+    for (const std::string& text : {generate_grab_config(nullptr, "x"),
+                                    [] {
+                                        auto only_drive = ini::parse("[gdrive]\ntype = drive\n");
+                                        return generate_grab_config(&*only_drive, "x");
+                                    }()}) {
+        const auto cfg = parse_ok(text);
+        CHECK(cfg.remotes.empty());
+        CHECK_FALSE(cfg.default_remote.has_value());
+        CHECK(cfg.rclone == "rclone"); // blank = bundled, else PATH
+        CHECK_FALSE(cfg.rclone_config.has_value());
+        CHECK(text.find("grab server add") != std::string::npos);
+    }
+}
+
+TEST_CASE("resolve_rclone_exe: bundled next to grab, else PATH, explicit path wins") {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "grab_test_bundle";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    GrabConfig cfg; // rclone = "rclone"
+    CHECK(resolve_rclone_exe(cfg, dir) == "rclone"); // nothing bundled
+#ifdef _WIN32
+    const auto bundled = dir / "rclone.exe";
+#else
+    const auto bundled = dir / "rclone";
+#endif
+    std::ofstream(bundled) << "x";
+    CHECK(resolve_rclone_exe(cfg, dir) == util::path_to_utf8(bundled));
+    cfg.rclone = "";
+    CHECK(resolve_rclone_exe(cfg, dir) == util::path_to_utf8(bundled));
+    cfg.rclone = "RCLONE.EXE";
+    CHECK(resolve_rclone_exe(cfg, dir) == util::path_to_utf8(bundled));
+    cfg.rclone = "C:\\Tools\\rclone.exe";
+    CHECK(resolve_rclone_exe(cfg, dir) == "C:\\Tools\\rclone.exe");
+    fs::remove_all(dir);
+}
+
+TEST_CASE("import_rclone_remotes copies referenced sections verbatim, once, never touching the source") {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "grab_test_import";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto from = dir / "standard.conf";
+    const auto to = dir / "grab" / "rclone.conf";
+    const std::string standard = "[hetzner]\ntype = sftp\nhost = 203.0.113.10\nuser = alice\n"
+                                 "key_file_pass = OBSCURED+/==\n\n[other]\ntype = drive\n";
+    std::ofstream(from, std::ios::binary) << standard;
+
+    auto r = import_rclone_remotes({"hetzner", "missing"}, from, to);
+    CHECK(r.error.empty());
+    CHECK(r.imported == std::vector<std::string>{"hetzner"});
+    CHECK(r.not_found == std::vector<std::string>{"missing"});
+    auto copied = ini::parse(*util::read_file(to));
+    REQUIRE(copied.has_value());
+    REQUIRE(copied->find("hetzner") != nullptr);
+    CHECK(copied->find("hetzner")->get("key_file_pass") == "OBSCURED+/=="); // verbatim
+    CHECK(copied->find("other") == nullptr);                               // not referenced
+    CHECK(*util::read_file(from) == standard);                             // source untouched
+
+    // Idempotent: nothing more to copy, file unchanged.
+    const auto before = *util::read_file(to);
+    auto again = import_rclone_remotes({"hetzner"}, from, to);
+    CHECK(again.imported.empty());
+    CHECK(*util::read_file(to) == before);
+
+    // A later, second remote is appended without disturbing the first.
+    std::ofstream(from, std::ios::app | std::ios::binary) << "[box]\ntype = sftp\nhost = h\nuser = u\n";
+    auto more = import_rclone_remotes({"hetzner", "box"}, from, to);
+    CHECK(more.imported == std::vector<std::string>{"box"});
+    auto both = ini::parse(*util::read_file(to));
+    CHECK(both->section_names() == std::vector<std::string>{"hetzner", "box"});
+    fs::remove_all(dir);
+}
+
+TEST_CASE("agent remotes are searched over ssh") {
+    auto r = parse_rclone_remote(*ini::parse("[a]\ntype = sftp\nhost = h\nuser = u\nkey_use_agent = true\n"), "a");
+    REQUIRE(r.has_value());
+    CHECK(r->key_use_agent);
+    CHECK(resolve_find_method(RemoteSettings{}, *r) == FindMethod::ssh);
+    CHECK(describe_remote(*r).find("ssh-agent") != std::string::npos);
 }
 
 TEST_CASE("a remote named grab gets a non-colliding section name") {
@@ -326,10 +409,10 @@ TEST_CASE("encrypted rclone.conf is detected") {
 TEST_CASE("RCLONE_CONFIG overrides the default rclone.conf path") {
     const auto previous = util::getenv_utf8("RCLONE_CONFIG");
     set_env("RCLONE_CONFIG", "D:\\portable\\rclone.conf");
-    CHECK(util::path_to_utf8(default_rclone_config_path()) == "D:\\portable\\rclone.conf");
+    CHECK(util::path_to_utf8(standard_rclone_config_path()) == "D:\\portable\\rclone.conf");
     set_env("RCLONE_CONFIG", nullptr);
-    CHECK(default_rclone_config_path().filename() == "rclone.conf");
-    CHECK(default_rclone_config_path().parent_path().filename() == "rclone");
+    CHECK(standard_rclone_config_path().filename() == "rclone.conf");
+    CHECK(standard_rclone_config_path().parent_path().filename() == "rclone");
     set_env("RCLONE_CONFIG", previous ? previous->c_str() : nullptr);
 }
 

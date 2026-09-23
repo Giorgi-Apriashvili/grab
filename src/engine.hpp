@@ -21,13 +21,15 @@ namespace grab::engine {
 
 // Everything needed to talk to one remote.
 struct Context {
-    GrabConfig config;
+    GrabConfig config;    // rclone and rclone_config resolved (bundled exe, grab's own file)
     RemoteSettings settings;
     RcloneRemote remote;  // connection details from rclone.conf
     FindMethod method;    // resolved: ssh or rclone
+    std::vector<std::string> imported; // remotes imported into grab's rclone.conf just now
 };
 
 // grab.conf + the selected remote section + its rclone.conf entry. Errors are ready to show.
+// Also performs the one-time import of referenced remotes into grab's own rclone.conf.
 [[nodiscard]] std::expected<Context, std::string>
 load_context(const std::filesystem::path& config_path, const std::optional<std::string>& remote_name);
 

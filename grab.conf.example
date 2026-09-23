@@ -4,15 +4,16 @@
 # Same INI dialect as rclone.conf: [section], key = value, comment lines start with ; or #.
 # Comments must be on their own line; a ; or # after a value is part of the value.
 #
-# Server connection details (host, user, port, key, passphrase) are NOT stored here.
-# grab reads them from the rclone remote named by `rclone_remote`, so configure the
-# server once with `rclone config` and reference it from here.
+# Server connection details (host, user, port, key, password) are NOT stored here: they live
+# in grab's own rclone.conf (%APPDATA%\grab\rclone.conf), in the rclone remote named by
+# `rclone_remote`. Add servers with `grab server add`; it writes both files.
 
 [grab]
-# rclone executable: a name on PATH or a full path.
-rclone = rclone
-# rclone.conf to read connection details from. Blank = rclone's default location
-# (%APPDATA%\rclone\rclone.conf). When set, it is also passed to rclone as --config.
+# rclone executable. Blank = the rclone.exe bundled with grab (else rclone on PATH);
+# a full path uses that one instead.
+rclone =
+# rclone.conf with the server connections. Blank = grab's own (%APPDATA%\grab\rclone.conf).
+# It is always passed to rclone as --config.
 rclone_config =
 # ssh executable used for the remote `find`. Blank = `ssh` on PATH (Windows OpenSSH).
 ssh = ssh

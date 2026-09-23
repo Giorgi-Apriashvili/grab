@@ -2,6 +2,7 @@
 
 #include <expected>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -20,6 +21,9 @@ struct RunOptions {
     // No console: no console window for the child (CREATE_NO_WINDOW), stdin is NUL, stderr
     // is captured instead of shared. For the GUI, which has no console to share.
     bool detached = false;
+    // run_capture only: bytes written to the child's stdin (then closed), e.g. a password for
+    // `rclone obscure -`, so secrets never appear on a command line.
+    std::optional<std::string> input;
 };
 
 struct CaptureResult {

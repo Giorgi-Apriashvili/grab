@@ -1,8 +1,10 @@
 #include "util.hpp"
 
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 
 #ifdef _WIN32
@@ -10,6 +12,7 @@
 
 #include <bcrypt.h>
 #else
+#include <termios.h>
 #include <unistd.h>
 #endif
 
@@ -158,6 +161,22 @@ bool stdin_is_tty() {
     return in != nullptr && in != INVALID_HANDLE_VALUE && GetConsoleMode(in, &mode) != 0;
 }
 
+std::optional<std::string> read_secret_line() {
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    const bool console = in != nullptr && in != INVALID_HANDLE_VALUE && GetConsoleMode(in, &mode);
+    if (console) SetConsoleMode(in, mode & ~static_cast<DWORD>(ENABLE_ECHO_INPUT));
+    std::string line;
+    const bool ok = static_cast<bool>(std::getline(std::cin, line));
+    if (console) {
+        SetConsoleMode(in, mode);
+        std::fputs("\n", stderr); // the Enter the user typed was not echoed
+    }
+    if (!ok) return std::nullopt;
+    if (line.ends_with('\r')) line.pop_back();
+    return line;
+}
+
 std::filesystem::path self_exe_path() {
     std::wstring buf(MAX_PATH, L'\0');
     for (;;) {
@@ -225,6 +244,24 @@ std::filesystem::path config_home() {
 }
 
 bool stdin_is_tty() { return isatty(STDIN_FILENO) != 0; }
+
+std::optional<std::string> read_secret_line() {
+    termios old{};
+    const bool console = tcgetattr(STDIN_FILENO, &old) == 0;
+    if (console) {
+        termios quiet = old;
+        quiet.c_lflag &= ~static_cast<tcflag_t>(ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
+    std::string line;
+    const bool ok = static_cast<bool>(std::getline(std::cin, line));
+    if (console) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &old);
+        std::fputs("\n", stderr);
+    }
+    if (!ok) return std::nullopt;
+    return line;
+}
 
 std::filesystem::path self_exe_path() {
     std::error_code ec;

@@ -17,6 +17,7 @@ std::string usage() {
 Usage:
   grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- extra rclone args]
   grab config [-c PATH]
+  grab server [list | add [NAME] | trust NAME | remove NAME]
   grab update [--check]
   grab --init | --help | --version
 
@@ -33,6 +34,11 @@ Without DEST, grab asks for one after you have picked (Enter = the current direc
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
                        $EDITOR, else notepad. The file is created from the example if missing.
+  server list          the configured servers: login, auth, lookup method, host key
+  server add [NAME]    set up a server step by step (host, login, host key, search roots);
+                       writes grab.conf and grab's rclone.conf, then tests the connection
+  server trust NAME    fetch, confirm and pin a server's host key
+  server remove NAME   delete a server from grab.conf and grab's rclone.conf
   update               install the latest GitHub release over this copy (Windows), after
                        verifying its SHA-256; --check only reports whether one is available.
 
@@ -84,6 +90,9 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         start = 1;
     } else if (!args.empty() && args[0] == "update") {
         result.action = CliAction::update;
+        start = 1;
+    } else if (!args.empty() && args[0] == "server") {
+        result.action = CliAction::server;
         start = 1;
     }
 
@@ -162,6 +171,20 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
 
     if (result.opts.check && result.action != CliAction::update) {
         return util::fail("--check only applies to `grab update`");
+    }
+    if (result.action == CliAction::server) {
+        if (mode) return util::fail("`grab server` takes no -s/-f");
+        const std::string sub = positionals.empty() ? "list" : positionals[0];
+        const bool needs_name = sub == "trust" || sub == "remove";
+        if (sub != "list" && sub != "add" && !needs_name) {
+            return util::failf("unknown `grab server` command '{}' (list, add, trust, remove)", sub);
+        }
+        if (needs_name && positionals.size() != 2) return util::failf("usage: grab server {} NAME", sub);
+        if (positionals.size() > 2 || (sub == "list" && positionals.size() > 1)) {
+            return util::fail("too many arguments for `grab server`");
+        }
+        result.opts.server_args = positionals.empty() ? std::vector<std::string>{"list"} : positionals;
+        return result;
     }
     if (result.action == CliAction::init || result.action == CliAction::config ||
         result.action == CliAction::update) {

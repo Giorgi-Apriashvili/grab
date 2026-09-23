@@ -105,6 +105,24 @@ TEST_CASE("a stop request ends a long-running child and its children quickly") {
     CHECK(std::chrono::steady_clock::now() - start2 < std::chrono::seconds(5));
 }
 
+TEST_CASE("run_capture feeds input to the child's stdin") {
+#ifdef _WIN32
+    const std::vector<std::string> echo_stdin{"findstr", "^"}; // prints every input line
+#else
+    const std::vector<std::string> echo_stdin{"cat"};
+#endif
+    proc::RunOptions opts;
+    opts.input = std::string("secret-line\nsecond\n");
+    for (const bool detached : {false, true}) {
+        opts.detached = detached;
+        auto r = proc::run_capture(echo_stdin, opts);
+        REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+        CHECK(r->exit_code == 0);
+        CHECK(r->out.find("secret-line") != std::string::npos);
+        CHECK(r->out.find("second") != std::string::npos);
+    }
+}
+
 TEST_CASE("an already-requested stop still returns cleanly") {
     std::stop_source stop;
     stop.request_stop();

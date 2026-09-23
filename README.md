@@ -29,17 +29,17 @@ grab -f releases E:\Backup
   └─ 5. run rclone      console inherited (live -P progress), Ctrl+C goes to rclone
 ```
 
-The ssh step prompts for your key passphrase once per run (Windows OpenSSH, no agent
-needed). The rclone step never prompts because rclone.conf already carries the obscured
-passphrase (`key_file_pass`).
+With a key loaded in ssh-agent the ssh step never prompts; otherwise it asks for the key
+passphrase once per run. The rclone step never prompts, since grab's rclone.conf carries the
+obscured password or passphrase.
 
 ## Requirements
 
 - Windows 10/11 with the built-in OpenSSH client (`ssh.exe`), or any OS with `ssh` on PATH.
-- [rclone](https://rclone.org) on PATH with an **sftp** remote already configured
-  (`rclone config`). grab reads `host`, `user`, `port`, `key_file` and `known_hosts_file`
-  from that remote for the ssh call.
-- The private key's ACL must be restricted to your user (OpenSSH refuses world-readable keys).
+- Nothing else: [rclone](https://rclone.org) ships inside grab (see *Third-party software*),
+  and servers are set up with `grab server add`. You never need to run `rclone config`.
+- A private key used for ssh must have an ACL restricted to your user (OpenSSH refuses
+  world-readable keys).
 
 ## Build
 
@@ -65,8 +65,8 @@ Download from the [Releases page](https://github.com/Giorgi-Apriashvili/grab/rel
   in `%USERPROFILE%\programs\grab\bin`, adds that folder to your user PATH, writes a commented
   default config to `%APPDATA%\grab\grab.conf` if you don't have one, and registers an
   uninstaller (Settings → Apps) that removes the files and the PATH entry but keeps your config.
-- `grab-x.y.z-windows-x64.zip`: the same files without an installer; put `grab.exe` wherever
-  you like and run `grab --init` once.
+- `grab-x.y.z-windows-x64.zip`: the same files without an installer. Unpack it anywhere,
+  keeping `rclone.exe` next to `grab.exe`, and run `grab server add` to set up a server.
 
 The installer is not code-signed, so SmartScreen shows "Windows protected your PC" the first
 time; choose "More info → Run anyway". The exe links the C runtime statically and has no other
@@ -126,19 +126,61 @@ later; for now run `build\<preset>\grab-gui.exe` directly.
 
 ## Configure
 
+### Servers
+
 ```powershell
-grab --init          # writes %APPDATA%\grab\grab.conf from your rclone.conf, if absent
+grab server add              # step by step: host, port, user, login, folders to search
+grab server list             # what is configured, and whether each host key is pinned
+grab server trust NAME       # pin a server's host key (for servers imported without one)
+grab server remove NAME
+```
+
+`grab server add` asks for:
+- the server's host, port and user
+- how to log in: a password, a key file (with an optional passphrase), or ssh-agent
+- which folders to search
+
+Then it:
+- **pins the host key:** shows the server's fingerprints (ED25519, ECDSA and RSA, whichever
+  it has) and saves them to `%APPDATA%\grab\known_hosts` once you confirm. From then on ssh
+  and rclone refuse a server that presents a different key.
+- **writes both config files:** the connection goes into grab's own
+  `%APPDATA%\grab\rclone.conf`, the search settings into grab.conf.
+- **tests the connection:** one check through rclone and, for key or agent logins, one
+  through ssh.
+
+Passwords and passphrases are never shown and never put on a command line. They are passed
+to `rclone obscure` over stdin and stored obscured, as rclone does.
+
+The commands also take answers from piped input, one per line, so they can be scripted. When
+the input runs out, the command stops without changing anything.
+
+Password servers are searched with rclone. Key and ssh-agent servers are searched with ssh +
+find, which is faster; with a passphrase-protected key that needs the key in ssh-agent
+(`ssh-add <key file>`).
+
+**Coming from an earlier grab:** grab.conf used to point at remotes in the standard
+rclone.conf. The first run of this version copies the remotes grab.conf uses into grab's own
+file, once, and never modifies the original. `grab server list` then shows which host keys
+still need `grab server trust`.
+
+### grab.conf
+
+```powershell
+grab --init          # writes %APPDATA%\grab\grab.conf, if absent
 grab config          # opens it in your editor, creating it first if needed
 ```
 
-`--init` reads rclone.conf (`$RCLONE_CONFIG`, else `%APPDATA%\rclone\rclone.conf`) and writes
-one section per sftp remote. `search_roots` is left blank, meaning the login home, and
-`default_remote` is the first remote, so grab works right away. The rclone flag keys are
-written commented out, so later improvements to the built-in defaults still reach you;
-uncomment one to override it. Non-sftp remotes are listed in a comment. With no usable
-rclone.conf (missing, encrypted, or no sftp remote) you get the generic example to edit
-instead. Run `--init` again later: it never rewrites an existing file, but prints ready-to-paste
-sections for sftp remotes you have added to rclone.conf since.
+`--init` writes the `[grab]` block. If you already have sftp remotes in the standard
+rclone.conf (`$RCLONE_CONFIG`, else `%APPDATA%\rclone\rclone.conf`), it imports them into grab's
+own rclone.conf, one grab.conf section each:
+- `search_roots` is blank, meaning the login home.
+- `default_remote` is the first one.
+- The rclone flag keys are written commented out, so later changes to the built-in defaults
+  still reach you. Uncomment one to override it.
+
+Run `--init` again later: it never rewrites an existing file, but prints ready-to-paste
+sections for sftp remotes added to the standard rclone.conf since.
 
 `grab config` uses the `editor` key in `[grab]` (for example `editor = code --wait`),
 otherwise `$VISUAL`, then `$EDITOR`, and finally Notepad. It reads only that key, so a
@@ -155,6 +197,8 @@ rclone_remote = hetzner
 search_roots  = /home/alice
 max_depth     = 4
 ```
+
+`grab server add` writes sections like this for you.
 
 All keys and their defaults are documented in [grab.conf.example](grab.conf.example).
 The config path can be overridden with `--config PATH` or the `GRAB_CONFIG` env var.
@@ -273,6 +317,17 @@ all three to a GitHub Release. `grab update` depends on that checksum file.
 The workflow refuses a tag that doesn't match the project version. Locally,
 `cmake --build --preset clang-cl-release --target dist` always produces the zip and also the
 installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`).
+
+## Third-party software
+
+- **[rclone](https://rclone.org)** v1.75.1, © Nick Craig-Wood, MIT license
+  ([licenses/rclone.txt](licenses/rclone.txt)). `rclone.exe` ships next to `grab.exe`
+  (81 MB, which is why the installer is about 25 MB), and grab uses it rather than any rclone
+  on PATH. Set `rclone = <path>` in `[grab]` to use another copy.
+  - **Pin:** the build downloads the official Windows zip and checks it against the pinned
+    SHA-256, which is rclone's own published `SHA256SUMS` value.
+  - **To bump:** change `GRAB_RCLONE_VERSION` and the hash in `CMakeLists.txt`, then rebuild.
+    `grab update` delivers the new rclone together with grab.
 
 ## License
 
