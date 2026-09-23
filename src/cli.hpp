@@ -12,9 +12,9 @@ namespace grab {
 enum class Mode { file, folder };
 
 struct Options {
-    Mode mode = Mode::folder;
+    Mode mode = Mode::file;
     std::string target;              // name (or absolute remote path) to look for
-    std::filesystem::path dest;      // local directory to download into
+    std::optional<std::filesystem::path> dest; // local directory; asked for when absent
     std::optional<std::string> remote;
     std::optional<std::filesystem::path> config;
     std::optional<int> depth;

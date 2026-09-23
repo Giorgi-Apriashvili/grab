@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <expected>
+#include <filesystem>
 #include <iosfwd>
 #include <span>
 #include <string>
@@ -61,5 +62,10 @@ struct PickOptions {
 [[nodiscard]] std::expected<std::vector<std::string>, std::string>
 choose_matches(std::vector<std::string> matches, const Query& query, const PickOptions& pick,
                std::istream& in, std::ostream& err);
+
+// Ask where to save: prints the prompt on `err`, reads one line from `in`. Enter means
+// `fallback`; surrounding quotes from a pasted path are dropped.
+[[nodiscard]] std::expected<std::filesystem::path, std::string>
+ask_destination(std::istream& in, std::ostream& err, const std::filesystem::path& fallback);
 
 } // namespace grab

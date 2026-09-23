@@ -1,8 +1,10 @@
 #include "remote.hpp"
+#include "util.hpp"
 
 #include <doctest/doctest.h>
 
 #include <cstddef>
+#include <filesystem>
 #include <format>
 #include <sstream>
 #include <string>
@@ -158,6 +160,28 @@ TEST_CASE("parse_selection: numbers, ranges, all, dedup, errors") {
     CHECK_FALSE(parse_selection("x", 5).has_value());
     CHECK_FALSE(parse_selection("1-", 5).has_value());
     CHECK_FALSE(parse_selection(",,", 5).has_value());
+}
+
+TEST_CASE("ask_destination: Enter = fallback, quotes stripped, EOF aborts") {
+    const auto fallback = std::filesystem::path("C:\\cwd");
+    std::ostringstream err;
+
+    std::istringstream enter("\n");
+    auto a = ask_destination(enter, err, fallback);
+    REQUIRE(a.has_value());
+    CHECK(*a == fallback);
+    CHECK(err.str().find("Enter = C:\\cwd") != std::string::npos);
+
+    std::istringstream quoted("  \"E:\\My TV\\Lioness\"  \n");
+    auto b = ask_destination(quoted, err, fallback);
+    REQUIRE(b.has_value());
+    CHECK(util::path_to_utf8(*b) == "E:\\My TV\\Lioness");
+
+    std::istringstream plain("E:\\TV\n");
+    CHECK(util::path_to_utf8(*ask_destination(plain, err, fallback)) == "E:\\TV");
+
+    std::istringstream eof;
+    CHECK_FALSE(ask_destination(eof, err, fallback).has_value());
 }
 
 TEST_CASE("choose_matches: single, --first, --all, non-interactive, interactive") {

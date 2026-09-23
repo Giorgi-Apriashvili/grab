@@ -9,7 +9,6 @@
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
 #include <bcrypt.h>
-#include <io.h> // IWYU pragma: keep (documented header for _isatty/_fileno)
 #else
 #include <unistd.h>
 #endif
@@ -139,7 +138,13 @@ std::filesystem::path config_home() {
     return std::filesystem::current_path();
 }
 
-bool stdin_is_tty() { return _isatty(_fileno(stdin)) != 0; }
+bool stdin_is_tty() {
+    // _isatty() is also true for other character devices such as NUL, which would make grab
+    // prompt when started with stdin redirected; only a real console has a console mode.
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    return in != nullptr && in != INVALID_HANDLE_VALUE && GetConsoleMode(in, &mode) != 0;
+}
 
 std::filesystem::path self_exe_path() {
     std::wstring buf(MAX_PATH, L'\0');

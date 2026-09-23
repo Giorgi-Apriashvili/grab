@@ -222,6 +222,23 @@ lookup_via_rclone(const Options& opts, const GrabConfig& cfg, const RemoteSettin
     return matches;
 }
 
+// Absolute, normalized DEST directory, created if missing.
+std::expected<std::filesystem::path, std::string> prepare_destination(const std::filesystem::path& in) {
+    std::error_code ec;
+    auto dest = std::filesystem::absolute(in, ec);
+    if (ec) return util::failf("bad destination '{}': {}", util::path_to_utf8(in), ec.message());
+    dest = dest.lexically_normal();
+    if (std::filesystem::exists(dest, ec) && !std::filesystem::is_directory(dest, ec)) {
+        return util::failf("destination '{}' exists and is not a directory", util::path_to_utf8(dest));
+    }
+    std::filesystem::create_directories(dest, ec);
+    if (ec) {
+        return util::failf("cannot create destination '{}': {}", util::path_to_utf8(dest),
+                           ec.message());
+    }
+    return dest;
+}
+
 int run(const Options& opts) {
     // 2. configuration -------------------------------------------------------------------
     const auto cfg_path = opts.config.value_or(default_grab_config_path());
@@ -245,23 +262,20 @@ int run(const Options& opts) {
         return exit_config;
     }
 
-    // destination ------------------------------------------------------------------------
-    std::error_code ec;
-    auto dest = std::filesystem::absolute(opts.dest, ec);
-    if (ec) {
-        error(std::format("bad destination '{}': {}", util::path_to_utf8(opts.dest), ec.message()));
-        return exit_config;
-    }
-    dest = dest.lexically_normal();
-    if (std::filesystem::exists(dest, ec) && !std::filesystem::is_directory(dest, ec)) {
-        error(std::format("destination '{}' exists and is not a directory", util::path_to_utf8(dest)));
-        return exit_config;
-    }
-    std::filesystem::create_directories(dest, ec);
-    if (ec) {
-        error(std::format("cannot create destination '{}': {}", util::path_to_utf8(dest),
-                          ec.message()));
-        return exit_config;
+    // destination: a given DEST is checked before the search so a typo fails fast; a missing
+    // one is asked for after the pick, which needs a terminal.
+    const bool interactive = util::stdin_is_tty();
+    std::filesystem::path dest;
+    if (opts.dest) {
+        auto prepared = prepare_destination(*opts.dest);
+        if (!prepared) {
+            error(prepared.error());
+            return exit_config;
+        }
+        dest = std::move(*prepared);
+    } else if (!interactive) {
+        error("no DEST given and no terminal to ask for one; pass DEST, e.g. grab NAME E:\\Downloads");
+        return exit_usage;
     }
 
     // 3. resolve the remote path ---------------------------------------------------------
@@ -299,11 +313,30 @@ int run(const Options& opts) {
     PickOptions pick;
     pick.first = opts.first;
     pick.all = opts.all;
-    pick.interactive = util::stdin_is_tty();
+    pick.interactive = interactive;
     auto chosen = choose_matches(std::move(matches), query, pick, std::cin, std::cerr);
     if (!chosen) {
         error(chosen.error());
         return exit_not_found;
+    }
+
+    if (!opts.dest) {
+        std::error_code cwd_ec;
+        const auto cwd = std::filesystem::current_path(cwd_ec);
+        for (int attempt = 0;; ++attempt) {
+            auto answer = ask_destination(std::cin, std::cerr, cwd);
+            if (!answer) {
+                error(answer.error());
+                return exit_usage;
+            }
+            auto prepared = prepare_destination(*answer);
+            if (prepared) {
+                dest = std::move(*prepared);
+                break;
+            }
+            error(prepared.error());
+            if (attempt == 2) return exit_config;
+        }
     }
 
     // 4 + 5. one rclone run per chosen item ----------------------------------------------

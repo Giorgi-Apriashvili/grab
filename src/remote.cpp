@@ -205,4 +205,20 @@ choose_matches(std::vector<std::string> matches, const Query& query, const PickO
     return util::fail("aborted (too many invalid choices)");
 }
 
+std::expected<std::filesystem::path, std::string>
+ask_destination(std::istream& in, std::ostream& err, const std::filesystem::path& fallback) {
+    err << std::format("Save to folder (Enter = {}): ", util::path_to_utf8(fallback));
+    err.flush();
+    std::string line;
+    if (!std::getline(in, line)) return util::fail("aborted (no destination given)");
+    auto answer = util::trim(line);
+    // Explorer's "Copy as path" and drag-and-drop add quotes.
+    if (answer.size() >= 2 && (answer.front() == '"' || answer.front() == '\'') &&
+        answer.back() == answer.front()) {
+        answer = util::trim(answer.substr(1, answer.size() - 2));
+    }
+    if (answer.empty()) return fallback;
+    return util::path_from_utf8(answer);
+}
+
 } // namespace grab
