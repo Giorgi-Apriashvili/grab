@@ -236,18 +236,24 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     Pipe out;
     if (auto r = make_pipe(out, true); !r) return util::fail(r.error());
     Pipe err;
+    Pipe in;
     Handle null_in;
+    if (opts.input) {
+        if (auto r = make_pipe(in, false); !r) return util::fail(r.error());
+    }
 
     StdHandles std_h;
     std_h.out = out.write.h;
     if (opts.detached) {
         if (auto r = make_pipe(err, true); !r) return util::fail(r.error());
-        if (auto r = open_null(null_in); !r) return util::fail(r.error());
-        std_h.in = null_in.h;
+        if (!opts.input) {
+            if (auto r = open_null(null_in); !r) return util::fail(r.error());
+        }
+        std_h.in = opts.input ? in.read.h : null_in.h;
         std_h.err = err.write.h;
         std_h.exclusive = true;
     } else {
-        std_h.in = GetStdHandle(STD_INPUT_HANDLE);
+        std_h.in = opts.input ? in.read.h : GetStdHandle(STD_INPUT_HANDLE);
         std_h.err = GetStdHandle(STD_ERROR_HANDLE);
     }
 
@@ -256,7 +262,21 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     if (auto r = launch(argv, std_h, opts.detached, child); !r) return util::fail(r.error());
     out.write.close(); // only the child holds the write ends now
     err.write.close();
+    in.read.close();
     std::stop_callback on_stop(opts.stop, [&] { TerminateJobObject(child.job.h, exit_stopped); });
+
+    // Feed stdin from a thread so a child that writes before reading cannot deadlock us.
+    std::jthread writer;
+    if (opts.input) {
+        writer = std::jthread([&] {
+            DWORD written = 0;
+            const std::string& data = *opts.input;
+            if (!data.empty()) {
+                WriteFile(in.write.h, data.data(), static_cast<DWORD>(data.size()), &written, nullptr);
+            }
+            in.write.close();
+        });
+    }
 
     CaptureResult result;
     std::jthread err_reader;
@@ -265,6 +285,7 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     }
     drain(out.read.h, [&](std::string_view s) { result.out += s; });
     if (err_reader.joinable()) err_reader.join();
+    if (writer.joinable()) writer.join();
     result.exit_code = wait_exit(child); // a stopped job exits with exit_stopped
     return result;
 }
@@ -376,13 +397,30 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
         return util::failf("cannot create pipe: {}", std::strerror(errno));
     }
 
+    int in[2] = {-1, -1};
+    if (opts.input && pipe(in) != 0) {
+        close(out[0]);
+        close(out[1]);
+        if (opts.detached) {
+            close(err[0]);
+            close(err[1]);
+        }
+        return util::failf("cannot create pipe: {}", std::strerror(errno));
+    }
+
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
     posix_spawn_file_actions_addclose(&actions, out[0]);
     posix_spawn_file_actions_addclose(&actions, out[1]);
-    if (opts.detached) {
+    if (opts.input) {
+        posix_spawn_file_actions_adddup2(&actions, in[0], STDIN_FILENO);
+        posix_spawn_file_actions_addclose(&actions, in[0]);
+        posix_spawn_file_actions_addclose(&actions, in[1]);
+    } else if (opts.detached) {
         posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    }
+    if (opts.detached) {
         posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
         posix_spawn_file_actions_addclose(&actions, err[0]);
         posix_spawn_file_actions_addclose(&actions, err[1]);
@@ -393,12 +431,31 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     posix_spawn_file_actions_destroy(&actions);
     close(out[1]);
     if (opts.detached) close(err[1]);
+    if (opts.input) close(in[0]);
     if (!pid) {
         close(out[0]);
         if (opts.detached) close(err[0]);
+        if (opts.input) close(in[1]);
         return util::fail(pid.error());
     }
     std::stop_callback on_stop(opts.stop, [&] { kill(-*pid, SIGTERM); });
+
+    std::jthread writer;
+    if (opts.input) {
+        writer = std::jthread([&] {
+            const std::string& data = *opts.input;
+            std::size_t done = 0;
+            while (done < data.size()) {
+                const ssize_t n = write(in[1], data.data() + done, data.size() - done);
+                if (n > 0) {
+                    done += static_cast<std::size_t>(n);
+                } else if (errno != EINTR) {
+                    break;
+                }
+            }
+            close(in[1]);
+        });
+    }
 
     CaptureResult result;
     std::jthread err_reader;
@@ -407,6 +464,7 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     }
     drain(out[0], [&](std::string_view s) { result.out += s; });
     if (err_reader.joinable()) err_reader.join();
+    if (writer.joinable()) writer.join();
     close(out[0]);
     if (opts.detached) close(err[0]);
     const int code = wait_pid(*pid);

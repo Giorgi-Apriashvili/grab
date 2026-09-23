@@ -21,12 +21,22 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
     if (!selected) return util::fail(selected.error());
     RemoteSettings settings = **selected;
 
-    const auto rclone_conf = cfg->rclone_config.value_or(default_rclone_config_path());
-    auto remote = load_rclone_remote(rclone_conf, settings.rclone_remote);
-    if (!remote) return util::fail(remote.error());
+    // Move referenced remotes into grab's own rclone.conf the first time (idempotent).
+    auto imported = migrate_rclone_remotes(*cfg);
+
+    cfg->rclone = resolve_rclone_exe(*cfg, util::self_exe_path().parent_path());
+    cfg->rclone_config = effective_rclone_config(*cfg); // always passed as --config
+    auto remote = load_rclone_remote(*cfg->rclone_config, settings.rclone_remote);
+    if (!remote) {
+        std::string msg = remote.error();
+        if (!imported.error.empty()) msg += std::format(" (import from rclone.conf failed: {})", imported.error);
+        msg += std::format(". Add the server with `grab server add`.");
+        return util::fail(msg);
+    }
 
     const FindMethod method = resolve_find_method(settings, *remote);
-    return Context{std::move(*cfg), std::move(settings), std::move(*remote), method};
+    return Context{std::move(*cfg), std::move(settings), std::move(*remote), method,
+                   std::move(imported.imported)};
 }
 
 namespace {

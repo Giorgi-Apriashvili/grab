@@ -25,9 +25,10 @@ struct Options {
     bool verbose = false;
     bool check = false;              // `grab update --check`
     std::vector<std::string> extra;  // everything after "--", appended to the rclone argv
+    std::vector<std::string> server_args; // `grab server SUBCOMMAND [NAME]`
 };
 
-enum class CliAction { run, help, version, init, config, update };
+enum class CliAction { run, help, version, init, config, update, server };
 
 struct CliResult {
     CliAction action = CliAction::run;

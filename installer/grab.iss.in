@@ -31,6 +31,9 @@ WizardStyle=modern
 
 [Files]
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+; Bundled rclone (MIT, notice in licenses\rclone.txt); grab prefers it over any on PATH.
+Source: "@GRAB_STAGE_DIR_NATIVE@\rclone.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\rclone.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab.conf.example"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
@@ -45,8 +48,9 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 ; `cmake --install` into the same folder) this at least removes the emptied bin folder; {app}
 ; itself still holds unins000.exe while this runs, so an empty {app} stays behind in that case.
 ; %APPDATA%\grab is deliberately left alone.
-Type: files; Name: "{app}\bin\grab.exe.old"
+Type: files; Name: "{app}\bin\*.exe.old"
 Type: dirifempty; Name: "{app}\bin"
+Type: dirifempty; Name: "{app}\licenses"
 
 [Run]
 Filename: "{app}\bin\grab.exe"; Parameters: "--init"; Flags: runhidden waituntilterminated; StatusMsg: "Writing the default configuration to %APPDATA%\grab\grab.conf..."

@@ -296,29 +296,65 @@ int run(bool check_only) {
     std::println("verified SHA-256 {}", *actual);
 
     if (mode == InstallMode::portable) {
+        const auto unpacked = tmp / "unpacked";
+        std::filesystem::create_directories(unpacked, ec);
         auto untar = proc::run_capture(std::vector<std::string>{
-            "tar", "-xf", util::path_to_utf8(payload), "-C", util::path_to_utf8(tmp), "grab.exe"});
-        const auto fresh = tmp / "grab.exe";
-        if (!untar || untar->exit_code != 0 || !std::filesystem::exists(fresh, ec)) {
-            error(std::format("cannot extract grab.exe from {}", name));
+            "tar", "-xf", util::path_to_utf8(payload), "-C", util::path_to_utf8(unpacked)});
+        if (!untar || untar->exit_code != 0 || !std::filesystem::exists(unpacked / "grab.exe", ec)) {
+            error(std::format("cannot extract {}", name));
             return exit_update_failed;
         }
-        auto old = move_self_aside(exe);
-        if (!old) {
-            error(old.error());
-            return exit_update_failed;
+        // Every program in the release (grab, the bundled rclone, grab-gui) is replaced
+        // together, so they stay a tested set. Running ones cannot be overwritten, but they can
+        // be renamed: each is moved aside as <name>.old, deleted on a later run.
+        const auto dir = exe.parent_path();
+        struct Swap {
+            std::filesystem::path target;
+            std::optional<std::filesystem::path> old; // nullopt: newly added file
+        };
+        std::vector<Swap> done;
+        auto rollback = [&] {
+            std::error_code rc;
+            for (auto it = done.rbegin(); it != done.rend(); ++it) {
+                std::filesystem::remove(it->target, rc);
+                if (it->old) std::filesystem::rename(*it->old, it->target, rc);
+            }
+        };
+        std::vector<std::string> replaced;
+        for (const auto& entry : std::filesystem::directory_iterator(unpacked, ec)) {
+            if (!entry.is_regular_file(ec) || entry.path().extension() != ".exe") continue;
+            const auto target = dir / entry.path().filename();
+            Swap swap{target, std::nullopt};
+            if (std::filesystem::exists(target, ec)) {
+                auto old = move_self_aside(target);
+                if (!old) {
+                    rollback();
+                    error(old.error() + "; nothing was changed");
+                    return exit_update_failed;
+                }
+                swap.old = *old;
+            }
+            done.push_back(swap);
+            std::filesystem::copy_file(entry.path(), target, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) {
+                const std::string why = ec.message();
+                rollback();
+                error(std::format("cannot write {}: {}; the previous version was restored",
+                                  util::path_to_utf8(target), why));
+                return exit_update_failed;
+            }
+            replaced.push_back(util::path_to_utf8(entry.path().filename()));
         }
-        std::filesystem::copy_file(fresh, exe, std::filesystem::copy_options::overwrite_existing, ec);
-        if (ec) {
-            restore_self(*old, exe);
-            error(std::format("cannot write {}: {}; the previous version was restored",
-                              util::path_to_utf8(exe), ec.message()));
-            return exit_update_failed;
+        // Third-party notices travel with the programs they cover.
+        if (std::filesystem::is_directory(unpacked / "licenses", ec)) {
+            std::filesystem::create_directories(dir / "licenses", ec);
+            std::filesystem::copy(unpacked / "licenses", dir / "licenses",
+                                  std::filesystem::copy_options::overwrite_existing |
+                                      std::filesystem::copy_options::recursive,
+                                  ec);
         }
-        std::println("updated grab {} -> {} at {}", to_string(current), to_string(latest),
-                     util::path_to_utf8(exe));
-        std::println("(only grab.exe was replaced; the example config and README next to it are "
-                     "unchanged)");
+        std::println("updated grab {} -> {} in {} ({})", to_string(current), to_string(latest),
+                     util::path_to_utf8(dir), util::join(replaced, ", "));
         return 0;
     }
 

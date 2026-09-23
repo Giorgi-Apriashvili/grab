@@ -181,7 +181,7 @@ function renderEmpty() {
   } else if (state.lastQuery && state.resultNote && !state.resultNote.startsWith('Search cancelled')) {
     empty.textContent = `No ${state.mode === 'folder' ? 'folders' : 'files'} matching “${state.lastQuery}” (searched ${state.searchedWhere}).`;
   } else if (!state.remotes.length) {
-    empty.textContent = 'No servers configured. Run “grab --init” or “grab config” in a terminal.';
+    empty.textContent = 'No servers yet. Add one in a terminal with “grab server add”, then restart grab.';
   } else {
     empty.textContent = r && r.error ? r.error : 'Search a server by name. Every word must appear, in any order.';
   }

@@ -44,7 +44,8 @@ add_library(grab_core STATIC
     src/json.cpp
     src/update.cpp
     src/engine.cpp
-    src/gui_state.cpp)
+    src/gui_state.cpp
+    src/servers.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
@@ -63,8 +64,39 @@ endif()
 # ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
-add_executable(grab src/main.cpp)
+add_executable(grab src/main.cpp src/server_cli.cpp)
 target_link_libraries(grab PRIVATE grab_core $<$<PLATFORM_ID:Windows>:shell32>)
+
+# ---------------------------------------------------------------------------
+# Bundled rclone (Windows): a pinned, checksum-verified rclone.exe ships next to grab.exe,
+# and grab prefers it over any rclone on PATH. rclone is MIT-licensed; its notice ships as
+# licenses/rclone.txt. To bump: change the version, take the zip's line from
+# https://downloads.rclone.org/<version>/SHA256SUMS (PGP-signed) and update the hash.
+# ---------------------------------------------------------------------------
+if(WIN32)
+    option(GRAB_BUNDLE_RCLONE "Ship a pinned rclone.exe next to grab.exe" ON)
+endif()
+if(WIN32 AND GRAB_BUNDLE_RCLONE)
+    include(FetchContent)
+    set(GRAB_RCLONE_VERSION v1.75.1)
+    FetchContent_Declare(rclone
+        URL https://downloads.rclone.org/${GRAB_RCLONE_VERSION}/rclone-${GRAB_RCLONE_VERSION}-windows-amd64.zip
+        URL_HASH SHA256=200EB602C126D82AA38B51E0F6B9AE837473FF99B51278D3F6F837574C494D6E
+        SOURCE_SUBDIR no-cmake-here)
+    FetchContent_MakeAvailable(rclone)
+    set(GRAB_RCLONE_EXE "${rclone_SOURCE_DIR}/rclone.exe")
+
+    # Next to the built grab.exe and grab-gui.exe, so development builds use it too.
+    add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/rclone.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GRAB_RCLONE_EXE}" "${CMAKE_BINARY_DIR}/rclone.exe"
+        DEPENDS "${GRAB_RCLONE_EXE}"
+        COMMENT "Bundling rclone ${GRAB_RCLONE_VERSION}"
+        VERBATIM)
+    add_custom_target(bundled_rclone ALL DEPENDS "${CMAKE_BINARY_DIR}/rclone.exe")
+    add_dependencies(grab bundled_rclone)
+    install(PROGRAMS "${GRAB_RCLONE_EXE}" DESTINATION bin)
+    install(FILES licenses/rclone.txt DESTINATION licenses)
+endif()
 
 # ---------------------------------------------------------------------------
 # Install: <prefix>/bin/grab.exe plus the commented example config. On Windows the user
@@ -163,20 +195,28 @@ if(WIN32)
               "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6"
         DOC "Inno Setup compiler (ISCC.exe); enables the installer half of the dist target")
 
+    if(NOT GRAB_BUNDLE_RCLONE)
+        message(STATUS "dist: GRAB_BUNDLE_RCLONE is OFF, so the dist target is not available")
+    else()
     set(GRAB_STAGED
         "${GRAB_STAGE_DIR}/grab.exe"
+        "${GRAB_STAGE_DIR}/rclone.exe"
+        "${GRAB_STAGE_DIR}/licenses/rclone.txt"
         "${GRAB_STAGE_DIR}/grab.conf.example"
         "${GRAB_STAGE_DIR}/README.md"
         "${GRAB_STAGE_DIR}/LICENSE")
     add_custom_command(OUTPUT ${GRAB_STAGED}
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" ${GRAB_EXTRA_FILES} "${GRAB_STAGE_DIR}"
-        DEPENDS grab ${GRAB_EXTRA_FILES}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}/licenses"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "${GRAB_RCLONE_EXE}" ${GRAB_EXTRA_FILES}
+                "${GRAB_STAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
+                "${GRAB_STAGE_DIR}/licenses/rclone.txt"
+        DEPENDS grab "${GRAB_RCLONE_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt" ${GRAB_EXTRA_FILES}
         COMMENT "Staging release files"
         VERBATIM)
     add_custom_command(OUTPUT "${GRAB_ZIP}"
         COMMAND ${CMAKE_COMMAND} -E tar cf "${GRAB_ZIP}" --format=zip --
-                grab.exe grab.conf.example README.md LICENSE
+                grab.exe rclone.exe licenses/rclone.txt grab.conf.example README.md LICENSE
         WORKING_DIRECTORY "${GRAB_STAGE_DIR}"
         DEPENDS ${GRAB_STAGED}
         COMMENT "Packing ${GRAB_ZIP}"
@@ -194,6 +234,7 @@ if(WIN32)
                     "dist: Inno Setup (ISCC.exe) not found, installer skipped; zip written to ${GRAB_DIST_DIR}"
             VERBATIM)
     endif()
+    endif() # GRAB_BUNDLE_RCLONE
 endif()
 
 # ---------------------------------------------------------------------------
