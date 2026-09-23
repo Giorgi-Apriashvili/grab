@@ -20,7 +20,8 @@ TEST_CASE("folder mode with positional target and dest") {
     CHECK(r->action == CliAction::run);
     CHECK(r->opts.mode == Mode::folder);
     CHECK(r->opts.target == "releases");
-    CHECK(util::path_to_utf8(r->opts.dest) == "E:\\Backup\\releases");
+    REQUIRE(r->opts.dest.has_value());
+    CHECK(util::path_to_utf8(*r->opts.dest) == "E:\\Backup\\releases");
     CHECK_FALSE(r->opts.first);
     CHECK_FALSE(r->opts.dry_run);
     CHECK(r->opts.extra.empty());
@@ -32,7 +33,8 @@ TEST_CASE("file mode, long flags and options in any order") {
     REQUIRE(r.has_value());
     CHECK(r->opts.mode == Mode::file);
     CHECK(r->opts.target == "movie.mkv");
-    CHECK(util::path_to_utf8(r->opts.dest) == "E:\\Backup");
+    REQUIRE(r->opts.dest.has_value());
+    CHECK(util::path_to_utf8(*r->opts.dest) == "E:\\Backup");
     CHECK(r->opts.first);
     CHECK(r->opts.dry_run);
     CHECK(r->opts.verbose);
@@ -50,16 +52,36 @@ TEST_CASE("everything after -- goes to rclone verbatim") {
     CHECK(r->opts.extra == std::vector<std::string>{"--bwlimit", "10M", "-f", "--dry-run"});
 }
 
-TEST_CASE("mode is required and exclusive") {
-    CHECK_FALSE(parse_args(args({"releases", "E:\\x"})).has_value());
+TEST_CASE("mode defaults to file and the two mode flags are exclusive") {
+    auto bare = parse_args(args({"lioness"}));
+    REQUIRE(bare.has_value());
+    CHECK(bare->action == CliAction::run);
+    CHECK(bare->opts.mode == Mode::file);
+    CHECK(bare->opts.target == "lioness");
+    CHECK_FALSE(bare->opts.dest.has_value()); // asked for later
+
+    auto with_dest = parse_args(args({"lioness s03e08", "E:\\TV"}));
+    REQUIRE(with_dest.has_value());
+    CHECK(with_dest->opts.mode == Mode::file);
+    REQUIRE(with_dest->opts.dest.has_value());
+
+    auto folder = parse_args(args({"-f", "releases"}));
+    REQUIRE(folder.has_value());
+    CHECK(folder->opts.mode == Mode::folder);
+    CHECK_FALSE(folder->opts.dest.has_value());
+
     CHECK_FALSE(parse_args(args({"-s", "-f", "releases", "E:\\x"})).has_value());
     // Repeating the same mode flag is harmless.
     CHECK(parse_args(args({"-f", "--folder", "releases", "E:\\x"})).has_value());
 }
 
 TEST_CASE("positional count and option values are validated") {
-    CHECK_FALSE(parse_args(args({"-f", "releases"})).has_value());
+    CHECK_FALSE(parse_args(args({})).has_value());
+    CHECK_FALSE(parse_args(args({"-f"})).has_value());
+    CHECK_FALSE(parse_args(args({"  "})).has_value());
+    CHECK_FALSE(parse_args(args({"a", " "})).has_value());
     CHECK_FALSE(parse_args(args({"-f", "a", "b", "c"})).has_value());
+    CHECK_FALSE(parse_args(args({"lioness", "s03e08", "E:\\TV"})).has_value()); // unquoted words
     CHECK_FALSE(parse_args(args({"-f", "a", "b", "--depth"})).has_value());
     CHECK_FALSE(parse_args(args({"-f", "a", "b", "--depth", "x"})).has_value());
     CHECK_FALSE(parse_args(args({"-f", "a", "b", "--bogus"})).has_value());

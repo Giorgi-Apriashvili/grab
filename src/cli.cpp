@@ -15,17 +15,20 @@ std::string usage() {
     return R"(grab )" GRAB_VERSION R"( - fetch a file or folder from a Linux server by name
 
 Usage:
-  grab (-s|--file | -f|--folder) TARGET DEST [options] [-- extra rclone args]
+  grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- extra rclone args]
   grab config [-c PATH]
   grab update [--check]
   grab --init | --help | --version
 
 TARGET is searched for under the remote's search_roots. By default every word must appear
-in the name, ignoring case, in any order: `grab -s "lioness s03e08" E:\TV`. A TARGET with
+in the name, ignoring case, in any order: `grab "lioness s03e08" E:\TV`. A TARGET with
 * ? or [ is a glob (case-insensitive); --exact matches the whole name exactly. A TARGET
 containing '/' is a remote path (absolute, or relative to the login home), checked as-is.
-With several matches you pick from a numbered list: 3, 1-5,8, a = all, Enter = 1.
+Without -s or -f, grab looks for files. With several matches you pick from a numbered
+list: 3, 1-5,8, a = all, Enter = 1.
 DEST is the local parent directory: each item is written as DEST\<name>, created if needed.
+Without DEST, grab asks for one after you have picked (Enter = the current directory).
+`grab config` and `grab update` are commands; to search for a file named that, use -s.
 
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
@@ -34,7 +37,7 @@ Commands:
                        verifying its SHA-256; --check only reports whether one is available.
 
 Options:
-  -s, --file           TARGET is a file   (rclone copyto, single-file tuned flags)
+  -s, --file           TARGET is a file   (default; rclone copyto, single-file tuned flags)
   -f, --folder         TARGET is a folder (rclone copy, many-file tuned flags)
   -r, --remote NAME    grab.conf section to use (default: [grab] default_remote)
   -c, --config PATH    grab.conf path (default: %APPDATA%\grab\grab.conf or $GRAB_CONFIG)
@@ -171,17 +174,20 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         return result;
     }
 
-    if (!mode) return util::fail("specify -s/--file or -f/--folder");
-    if (positionals.size() != 2) {
-        return util::failf("expected TARGET and DEST, got {} positional argument(s)",
+    if (positionals.empty()) return util::fail("expected TARGET: what to search for");
+    if (positionals.size() > 2) {
+        return util::failf("expected TARGET [DEST], got {} arguments; quote a TARGET that has "
+                           "spaces, e.g. \"lioness s03e08\"",
                            positionals.size());
     }
-    if (positionals[0].empty()) return util::fail("TARGET must not be empty");
-    if (positionals[1].empty()) return util::fail("DEST must not be empty");
+    if (util::trim(positionals[0]).empty()) return util::fail("TARGET must not be empty");
 
-    result.opts.mode = *mode;
+    result.opts.mode = mode.value_or(Mode::file); // a bare `grab NAME` looks for files
     result.opts.target = positionals[0];
-    result.opts.dest = util::path_from_utf8(positionals[1]);
+    if (positionals.size() == 2) {
+        if (util::trim(positionals[1]).empty()) return util::fail("DEST must not be empty");
+        result.opts.dest = util::path_from_utf8(positionals[1]);
+    }
     return result;
 }
 

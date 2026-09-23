@@ -143,7 +143,7 @@ Add one `[section]` per server and choose with `-r NAME`.
 ## Usage
 
 ```
-grab (-s|--file | -f|--folder) TARGET DEST [options] [-- extra rclone args]
+grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- extra rclone args]
 grab config [-c PATH]
 
   -r, --remote NAME    grab.conf section to use
@@ -171,9 +171,16 @@ grab config [-c PATH]
   without asking, for scripts.
 - A `TARGET` containing `/` is a path, absolute or relative to the login home, and is
   checked as-is instead of searched for.
+- Without `-s` or `-f`, grab looks for files: `grab lioness` is `grab -s lioness`.
 - `DEST` is the local parent directory and is created if missing. Both modes write
   `DEST\<name>`: folder mode recreates the folder there and copies its contents into it,
   file mode writes the single file. `grab -f releases E:\Backup` yields `E:\Backup\releases\...`.
+- `DEST` is optional. Without it, grab asks where to save after you have picked. Enter
+  means the current directory, and a pasted path in quotes is fine. With no terminal to
+  ask on (piped or redirected input, scheduled tasks), a missing `DEST` is an error before
+  any search runs.
+- `grab config` and `grab update` are commands. To search for a file literally named
+  `config` or `update`, add `-s`.
 - Dot-directories are skipped during the search unless `skip_hidden = false` or the
   target itself starts with a dot.
 - Anything after `--` is appended to the rclone command, e.g. `-- --bwlimit 10M`.
