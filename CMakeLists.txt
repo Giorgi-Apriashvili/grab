@@ -43,7 +43,8 @@ add_library(grab_core STATIC
     src/process.cpp
     src/json.cpp
     src/update.cpp
-    src/engine.cpp)
+    src/engine.cpp
+    src/gui_state.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
@@ -70,6 +71,49 @@ target_link_libraries(grab PRIVATE grab_core $<$<PLATFORM_ID:Windows>:shell32>)
 # PATH gains <prefix>/bin so `grab` works from any new terminal.
 # ---------------------------------------------------------------------------
 install(TARGETS grab RUNTIME DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# GUI (Windows): grab-gui.exe, a WebView2 window over the same engine.
+# ---------------------------------------------------------------------------
+if(WIN32)
+    option(GRAB_BUILD_GUI "Build grab-gui.exe (WebView2)" ON)
+endif()
+if(WIN32 AND GRAB_BUILD_GUI)
+    include(FetchContent)
+    # The WebView2 SDK NuGet package is a zip: headers plus a static loader library, so no
+    # WebView2Loader.dll has to ship next to the exe.
+    set(GRAB_WEBVIEW2_VERSION 1.0.4191.47)
+    FetchContent_Declare(webview2
+        URL https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/${GRAB_WEBVIEW2_VERSION}/microsoft.web.webview2.${GRAB_WEBVIEW2_VERSION}.nupkg
+        URL_HASH SHA256=F492BBF547D0DA329553B6727435B677579B1E9F91CC9E4A1AD029366D5F23D0
+        DOWNLOAD_NAME webview2-${GRAB_WEBVIEW2_VERSION}.zip
+        SOURCE_SUBDIR no-cmake-here)
+    FetchContent_MakeAvailable(webview2)
+    set(GRAB_WEBVIEW2_ARCH x64)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(GRAB_WEBVIEW2_ARCH x86)
+    endif()
+
+    set(GRAB_GUI_UI_FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/index.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/app.css
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/app.js)
+    add_executable(grab-gui WIN32
+        src/gui/main_gui.cpp
+        src/gui/app.cpp
+        src/gui/webview.cpp
+        src/gui/resources.cpp
+        src/gui/grab-gui.rc)
+    # The .rc embeds the UI files; rebuild it whenever one of them changes.
+    set_source_files_properties(src/gui/grab-gui.rc PROPERTIES OBJECT_DEPENDS "${GRAB_GUI_UI_FILES}")
+    target_include_directories(grab-gui PRIVATE src/gui)
+    target_include_directories(grab-gui SYSTEM PRIVATE ${webview2_SOURCE_DIR}/build/native/include)
+    target_link_libraries(grab-gui PRIVATE
+        grab_core
+        ${webview2_SOURCE_DIR}/build/native/${GRAB_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib
+        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32)
+    install(TARGETS grab-gui RUNTIME DESTINATION bin)
+endif()
 install(FILES grab.conf.example DESTINATION .)
 
 if(WIN32)
