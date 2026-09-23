@@ -161,12 +161,6 @@ int do_config(const std::filesystem::path& path) {
     return *code;
 }
 
-std::string describe_roots(const std::vector<std::string>& roots) {
-    std::vector<std::string> shown;
-    for (const auto& r : roots) shown.push_back(r.empty() ? "~" : r);
-    return util::join(shown, ", ");
-}
-
 // Absolute, normalized DEST directory, created if missing (unless `create` is false, as for
 // --dry-run, which must not touch the disk).
 std::expected<std::filesystem::path, std::string> prepare_destination(const std::filesystem::path& in,
@@ -247,7 +241,7 @@ int run(const Options& opts) {
         } else {
             error(std::format("no {} {} '{}' under {} (max depth {}) on {}", mode_noun(opts.mode),
                               query.kind == Query::Kind::words ? "matching" : "named", opts.target,
-                              describe_roots(found->roots), found->max_depth, ctx->remote.host));
+                              search_roots_value(found->roots), found->max_depth, ctx->remote.host));
         }
         return exit_not_found;
     }

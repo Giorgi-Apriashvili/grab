@@ -111,6 +111,15 @@ results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and fol
 download queue with live progress, cancel and retry. It reads the same grab.conf and
 remembers the last server, mode and destination per server in `%APPDATA%\grab\gui.json`.
 
+- **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
+  test, trust, make default and remove. Each server's search folders and depth are edited
+  there too. Adding a server, or changing its address, shows the host key fingerprints
+  and writes nothing until you trust them. "Open grab.conf" covers the rarer settings
+  (rclone flags, ssh options, find method).
+- **Tray:** closing the window while downloads run keeps them going in the notification
+  area, and grab exits by itself when they finish. When the window is idle, closing it
+  quits. A notification reports each finished or failed download while the window isn't in
+  front. Clicking it, or the tray icon, brings the window back.
 - It needs the Microsoft Edge WebView2 Runtime, which ships with Windows 11 and current
   Windows 10. Without it, grab-gui offers the download link.
 - It never prompts for an ssh passphrase, since it has no console. For key-based servers,

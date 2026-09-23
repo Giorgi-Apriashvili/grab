@@ -45,7 +45,8 @@ add_library(grab_core STATIC
     src/update.cpp
     src/engine.cpp
     src/gui_state.cpp
-    src/servers.cpp)
+    src/servers.cpp
+    src/server_ops.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
@@ -129,14 +130,16 @@ if(WIN32 AND GRAB_BUILD_GUI)
     set(GRAB_GUI_UI_FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/index.html
         ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/app.css
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/app.js)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/ui/app.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gui/grab.ico)
     add_executable(grab-gui WIN32
         src/gui/main_gui.cpp
         src/gui/app.cpp
+        src/gui/tray.cpp
         src/gui/webview.cpp
         src/gui/resources.cpp
         src/gui/grab-gui.rc)
-    # The .rc embeds the UI files; rebuild it whenever one of them changes.
+    # The .rc embeds the UI files and the icon; rebuild it whenever one of them changes.
     set_source_files_properties(src/gui/grab-gui.rc PROPERTIES OBJECT_DEPENDS "${GRAB_GUI_UI_FILES}")
     target_include_directories(grab-gui PRIVATE src/gui)
     target_include_directories(grab-gui SYSTEM PRIVATE ${webview2_SOURCE_DIR}/build/native/include)

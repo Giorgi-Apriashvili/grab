@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace grab::servers {
@@ -85,6 +86,11 @@ struct Fingerprint {
                                                    const std::filesystem::path& config,
                                                    const std::string& name, const std::string& key,
                                                    const std::string& value);
+// Several keys in one run; an empty value blanks the key.
+[[nodiscard]] std::vector<std::string> update_argv(const std::string& rclone,
+                                                   const std::filesystem::path& config,
+                                                   const std::string& name,
+                                                   const std::vector<std::pair<std::string, std::string>>& values);
 
 [[nodiscard]] std::vector<std::string> delete_argv(const std::string& rclone,
                                                    const std::filesystem::path& config,
@@ -105,5 +111,9 @@ struct Fingerprint {
 // adds the section at the top when missing.
 [[nodiscard]] std::string set_value(std::string_view text, std::string_view section,
                                     std::string_view key, std::string_view value);
+// Replaces grab's generated comment line right above [section] ("# rclone remote [...]: ...")
+// with `comment`; text without that line is returned unchanged.
+[[nodiscard]] std::string replace_lead_in(std::string_view text, std::string_view section,
+                                          std::string_view comment);
 
 } // namespace grab::servers

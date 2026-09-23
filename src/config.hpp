@@ -63,6 +63,9 @@ struct RcloneRemote {
 // "." and "~" mean the login home and become ""; "/" stays; other roots lose trailing '/'.
 [[nodiscard]] std::string normalize_root(std::string_view root);
 
+// Normalized roots as a grab.conf search_roots value: "~" for the login home, ", " between.
+[[nodiscard]] std::string search_roots_value(const std::vector<std::string>& roots);
+
 // Built-in flag defaults, used when the key is absent from grab.conf.
 inline constexpr std::string_view default_common_flags =
     "-P --sftp-chunk-size 255Ki --sftp-disable-hashcheck";

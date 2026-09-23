@@ -2,7 +2,9 @@
 
 #include "config.hpp"
 #include "engine.hpp"
+#include "ini.hpp"
 #include "process.hpp"
+#include "quote.hpp"
 #include "util.hpp"
 
 #include <knownfolders.h>
@@ -14,6 +16,8 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <memory>
+#include <span>
 #include <utility>
 
 #ifndef GRAB_VERSION
@@ -50,6 +54,15 @@ bool bool_of(const Value& msg, std::string_view key) {
     return v != nullptr && v->kind == Value::Kind::boolean && v->boolean;
 }
 
+const char* auth_name(servers::Auth a) {
+    switch (a) {
+    case servers::Auth::key_file: return "key";
+    case servers::Auth::agent: return "agent";
+    case servers::Auth::password: break;
+    }
+    return "password";
+}
+
 std::string known_folder(REFKNOWNFOLDERID id) {
     PWSTR p = nullptr;
     std::string out;
@@ -69,6 +82,8 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
 
 App::~App() {
     if (search_thread_.joinable()) search_thread_.request_stop();
+    if (settings_thread_.joinable()) settings_thread_.request_stop();
+    cancel_pending();
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
@@ -88,6 +103,19 @@ bool App::downloads_active() const {
     return std::ranges::any_of(items_, [](const auto& i) {
         return i->status == Status::queued || i->status == Status::running;
     });
+}
+
+App::QueueSummary App::summary() const {
+    QueueSummary s;
+    std::lock_guard lock(mutex_);
+    for (const auto& i : items_) {
+        if (i->status == Status::running) ++s.running;
+        else if (i->status == Status::queued) ++s.queued;
+        else continue;
+        s.bytes += i->bytes;
+        s.total += std::max(i->total, i->bytes);
+    }
+    return s;
 }
 
 // ---- messages -----------------------------------------------------------------------------
@@ -122,6 +150,70 @@ void App::on_message(const std::string& text) {
     } else if (type == "openFolder") {
         const int id = int_of(*msg, "id");
         host_.defer([this, id] { open_item_folder(id); });
+    } else if (type == "pickFile") {
+        std::wstring current = util::to_wide(msg->string_of("current").value_or(""));
+        host_.defer([this, current = std::move(current)] { pick_file(current); });
+    } else if (type == "openConfig") {
+        open_config();
+    } else if (type == "servers") {
+        settings_task([this](std::stop_token) {
+            if (auto env = load_env()) post_servers(*env);
+            else settings_error(env.error());
+        });
+    } else if (type == "serverSave") {
+        save_server(*msg);
+    } else if (type == "serverConfirm") {
+        std::optional<Pending> pending;
+        {
+            std::lock_guard lock(settings_mutex_);
+            pending.swap(pending_);
+        }
+        if (!pending || !bool_of(*msg, "trust")) return; // not trusted: the secret is wiped here
+        settings_task([this, p = std::make_shared<Pending>(std::move(*pending))](std::stop_token stop) {
+            apply_pending(std::move(*p), stop);
+        });
+    } else if (type == "serverCancel") {
+        cancel_pending();
+    } else if (type == "serverTrust") {
+        const std::string name = msg->string_of("name").value_or("");
+        settings_task([this, name](std::stop_token stop) {
+            auto env = load_env();
+            if (!env) return settings_error(env.error());
+            const auto list = server_ops::list_servers(*env);
+            auto it = std::ranges::find(list, name, &server_ops::ServerInfo::name);
+            if (it == list.end()) return settings_error("no server called " + name);
+            if (!it->error.empty()) return settings_error(it->error);
+            auto keys = server_ops::scan_host_keys(env->cfg.ssh, it->host, it->port, stop);
+            if (stop.stop_requested()) return;
+            if (!keys) return settings_error(keys.error());
+            Pending p;
+            p.kind = Pending::Kind::trust;
+            p.server.name = name;
+            p.server.host = it->host;
+            p.server.port = it->port;
+            p.keys = std::move(*keys);
+            post_host_keys(p);
+            std::lock_guard lock(settings_mutex_);
+            pending_ = std::move(p);
+        });
+    } else if (type == "serverTest") {
+        const std::string name = msg->string_of("name").value_or("");
+        settings_task([this, name](std::stop_token stop) { test_server(name, stop); });
+    } else if (type == "serverRemove" || type == "serverDefault") {
+        const bool remove = type == "serverRemove";
+        const std::string name = msg->string_of("name").value_or("");
+        settings_task([this, remove, name](std::stop_token) {
+            auto env = load_env();
+            if (!env) return settings_error(env.error());
+            if (remove) {
+                auto note = server_ops::remove_server(*env, name);
+                if (!note) return settings_error(note.error());
+                if (!note->empty()) settings_error(*note);
+            } else if (auto done = server_ops::set_default(*env, name); !done) {
+                return settings_error(done.error());
+            }
+            servers_changed();
+        });
     }
 }
 
@@ -133,7 +225,10 @@ void App::send_init() {
 
     Value remotes = Value::make_array();
     std::string selected;
-    auto cfg = load_grab_config(config_path_);
+    // No grab.conf yet is a first run, not an error: Settings creates it with the first server.
+    std::error_code ec;
+    auto cfg = std::filesystem::exists(config_path_, ec) ? load_grab_config(config_path_)
+                                                          : std::expected<GrabConfig, std::string>(GrabConfig{});
     if (!cfg) {
         init.set("configError", str(cfg.error()));
     } else {
@@ -263,6 +358,288 @@ void App::pick_folder(std::wstring current) {
     CoTaskMemFree(path);
 }
 
+void App::pick_file(std::wstring current) {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dialog)))) {
+        return;
+    }
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    dialog->SetTitle(L"Private key file");
+    // Start next to the current key, else in ~/.ssh when it exists.
+    std::filesystem::path start = std::filesystem::path(current).parent_path();
+    std::error_code ec;
+    if (start.empty() || !std::filesystem::is_directory(start, ec)) {
+        start = util::path_from_utf8(known_folder(FOLDERID_Profile)) / ".ssh";
+    }
+    ComPtr<IShellItem> folder;
+    if (std::filesystem::is_directory(start, ec) &&
+        SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+        dialog->SetFolder(folder.Get());
+    }
+    if (FAILED(dialog->Show(host_.hwnd))) return; // cancelled
+    ComPtr<IShellItem> result;
+    PWSTR path = nullptr;
+    if (SUCCEEDED(dialog->GetResult(&result)) &&
+        SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+        Value v = Value::make_object();
+        v.set("type", str("filePicked"));
+        v.set("path", str(util::to_utf8(path)));
+        post(v);
+    }
+    CoTaskMemFree(path);
+}
+
+// Like `grab config`: [grab] editor, $VISUAL, $EDITOR, else Notepad. Started, not waited for.
+void App::open_config() const {
+    std::error_code ec;
+    if (!std::filesystem::exists(config_path_, ec) &&
+        !server_ops::write_text(config_path_, generate_grab_config(nullptr, ""))) {
+        return settings_error("cannot create " + util::path_to_utf8(config_path_));
+    }
+    std::vector<std::string> candidates;
+    if (auto doc = ini::parse_file(config_path_)) {
+        if (const auto* g = doc->find("grab")) candidates.push_back(g->get("editor").value_or(""));
+    }
+    candidates.push_back(util::getenv_utf8("VISUAL").value_or(""));
+    candidates.push_back(util::getenv_utf8("EDITOR").value_or(""));
+    const auto argv = editor_command(candidates, config_path_);
+    const std::wstring exe = util::to_wide(argv.front());
+    const std::wstring params =
+        util::to_wide(quote::windows_cmdline(std::span<const std::string>(argv).subspan(1)));
+    const auto rc = reinterpret_cast<INT_PTR>(
+        ShellExecuteW(host_.hwnd, L"open", exe.c_str(), params.c_str(), nullptr, SW_SHOWNORMAL));
+    if (rc <= 32) settings_error(std::format("could not start the editor \"{}\"", argv.front()));
+}
+
+// ---- settings: servers ----------------------------------------------------------------------
+
+void App::settings_task(std::function<void(std::stop_token)> task) {
+    if (settings_busy_.exchange(true)) {
+        return settings_error("Another server change is still running; wait for it to finish.");
+    }
+    if (settings_thread_.joinable()) settings_thread_.join(); // finished: busy was false
+    auto busy = [this](bool on) {
+        Value v = Value::make_object();
+        v.set("type", str("settingsBusy"));
+        v.set("busy", Value::make_bool(on));
+        post(v);
+    };
+    busy(true);
+    settings_thread_ = std::jthread([this, task = std::move(task), busy](std::stop_token stop) {
+        task(stop);
+        settings_busy_ = false;
+        busy(false);
+    });
+}
+
+void App::settings_error(const std::string& message) const {
+    Value v = Value::make_object();
+    v.set("type", str("serverError"));
+    v.set("message", str(message));
+    post(v);
+}
+
+std::expected<server_ops::Env, std::string> App::load_env() const {
+    return server_ops::load_env(config_path_, util::self_exe_path().parent_path());
+}
+
+void App::post_servers(const server_ops::Env& env) const {
+    Value items = Value::make_array();
+    for (const auto& s : server_ops::list_servers(env)) {
+        Value v = Value::make_object();
+        v.set("name", str(s.name));
+        v.set("isDefault", Value::make_bool(s.is_default));
+        Value roots = Value::make_array();
+        for (const auto& r : s.search_roots) roots.push(str(r));
+        v.set("roots", std::move(roots));
+        v.set("depth", num(s.max_depth));
+        v.set("error", str(s.error));
+        v.set("host", str(s.host));
+        v.set("user", str(s.user));
+        v.set("port", num(s.port));
+        v.set("auth", str(auth_name(s.auth)));
+        v.set("keyFile", str(s.key_file));
+        v.set("search", str(s.ssh_search ? "ssh" : "rclone"));
+        v.set("pinned", Value::make_bool(s.host_key_pinned));
+        items.push(std::move(v));
+    }
+    Value msg = Value::make_object();
+    msg.set("type", str("servers"));
+    msg.set("configPath", str(util::path_to_utf8(env.grab_conf)));
+    msg.set("items", std::move(items));
+    post(msg);
+}
+
+void App::post_host_keys(const Pending& p) const {
+    Value msg = Value::make_object();
+    msg.set("type", str("hostKeys"));
+    msg.set("kind", str(p.kind == Pending::Kind::add ? "add" : p.kind == Pending::Kind::edit ? "edit" : "trust"));
+    msg.set("name", str(p.server.name));
+    msg.set("host", str(p.server.host));
+    msg.set("port", num(p.server.port));
+    Value prints = Value::make_array();
+    for (const auto& f : p.keys.fingerprints) {
+        Value v = Value::make_object();
+        v.set("type", str(f.type));
+        v.set("hash", str(f.hash));
+        prints.push(std::move(v));
+    }
+    msg.set("fingerprints", std::move(prints));
+    Value lines = Value::make_array();
+    if (p.keys.fingerprints.empty()) {
+        for (const auto& l : p.keys.lines) lines.push(str(l));
+    }
+    msg.set("lines", std::move(lines));
+    post(msg);
+}
+
+void App::servers_changed() {
+    if (auto env = load_env()) post_servers(*env);
+    host_.defer([this] { send_init(); }); // the search view's server list; state_ is UI-thread only
+}
+
+void App::save_server(const Value& msg) {
+    const bool editing = bool_of(msg, "editing");
+    servers::NewServer s;
+    s.name = std::string(util::trim(msg.string_of("name").value_or("")));
+    s.host = std::string(util::trim(msg.string_of("host").value_or("")));
+    s.user = std::string(util::trim(msg.string_of("user").value_or("")));
+    s.port = int_of(msg, "port");
+    s.max_depth = int_of(msg, "depth");
+    const std::string auth = msg.string_of("auth").value_or("password");
+    s.auth = auth == "key" ? servers::Auth::key_file : auth == "agent" ? servers::Auth::agent : servers::Auth::password;
+    if (s.auth == servers::Auth::key_file) s.key_file = std::string(util::trim(msg.string_of("keyFile").value_or("")));
+    if (const Value* roots = msg.find("roots"); roots != nullptr && roots->kind == Value::Kind::array) {
+        for (const auto& r : roots->items) {
+            if (r.kind == Value::Kind::string && !util::trim(r.str).empty()) {
+                s.search_roots.push_back(normalize_root(r.str));
+            }
+        }
+    }
+    // Shared so the task below stays copyable; wiped whichever way this ends.
+    auto secret = std::make_shared<Secret>(msg.string_of("secret").value_or(""));
+
+    auto invalid = [this](const char* field, const std::string& message) {
+        Value v = Value::make_object();
+        v.set("type", str("serverError"));
+        v.set("field", str(field));
+        v.set("message", str(message));
+        post(v);
+    };
+    if (!editing) {
+        if (auto why = servers::validate_name(s.name)) return invalid("name", *why);
+    }
+    if (s.host.empty()) return invalid("host", "required");
+    if (s.port < 1 || s.port > 65535) return invalid("port", "a number from 1 to 65535");
+    if (s.user.empty()) return invalid("user", "required");
+    std::error_code ec;
+    if (s.auth == servers::Auth::key_file && !std::filesystem::is_regular_file(util::path_from_utf8(s.key_file), ec)) {
+        return invalid("keyFile", "no such file");
+    }
+    if (s.max_depth < 1 || s.max_depth > 64) return invalid("depth", "a number from 1 to 64");
+
+    settings_task([this, editing, s, secret, invalid](std::stop_token stop) {
+        auto env = load_env();
+        if (!env) return settings_error(env.error());
+        Pending p;
+        p.server = s;
+        p.secret = std::move(*secret);
+        bool need_keys = true;
+        if (editing) {
+            p.kind = Pending::Kind::edit;
+            const auto list = server_ops::list_servers(*env);
+            auto it = std::ranges::find(list, s.name, &server_ops::ServerInfo::name);
+            if (it == list.end()) return settings_error("no server called " + s.name);
+            if (s.auth == servers::Auth::password && p.secret.empty() && it->auth != servers::Auth::password) {
+                return invalid("secret", "enter the password");
+            }
+            need_keys = it->error.empty() ? server_ops::edit_needs_host_key(*it, s) : true;
+        } else {
+            p.kind = Pending::Kind::add;
+            if (server_ops::find_server(env->cfg, s.name) != nullptr) {
+                return invalid("name", "a server with this name already exists");
+            }
+            auto rclone_doc = ini::parse(util::read_file(env->rclone_conf).value_or(""));
+            if (rclone_doc && rclone_doc->find(s.name) != nullptr) {
+                return invalid("name", "grab's rclone.conf already has a remote with this name");
+            }
+            if (s.auth == servers::Auth::password && p.secret.empty()) return invalid("secret", "enter the password");
+        }
+        if (!need_keys) return apply_pending(std::move(p), stop);
+
+        auto keys = server_ops::scan_host_keys(env->cfg.ssh, s.host, s.port, stop);
+        if (stop.stop_requested()) return;
+        if (!keys) return settings_error(keys.error());
+        p.keys = std::move(*keys);
+        post_host_keys(p);
+        std::lock_guard lock(settings_mutex_);
+        pending_ = std::move(p);
+    });
+}
+
+void App::apply_pending(Pending p, std::stop_token stop) {
+    auto env = load_env();
+    if (!env) return settings_error(env.error());
+    std::optional<std::string> obscured;
+    if (!p.secret.empty()) {
+        auto ob = server_ops::obscure(*env, p.secret.value());
+        p.secret.wipe();
+        if (!ob) return settings_error(ob.error());
+        obscured = std::move(*ob);
+    }
+    std::expected<void, std::string> done;
+    switch (p.kind) {
+    case Pending::Kind::add:
+        done = server_ops::add_server(*env, p.server, obscured, p.keys);
+        break;
+    case Pending::Kind::edit:
+        done = server_ops::update_server(*env, p.server, obscured,
+                                         p.keys.lines.empty() ? std::nullopt : std::optional(p.keys));
+        break;
+    case Pending::Kind::trust:
+        done = server_ops::trust_server(*env, p.server.name, p.keys);
+        break;
+    }
+    if (!done) return settings_error(done.error());
+
+    Value v = Value::make_object();
+    v.set("type", str("serverSaved"));
+    v.set("name", str(p.server.name));
+    post(v);
+    servers_changed();
+    test_server(p.server.name, stop);
+}
+
+void App::test_server(const std::string& name, std::stop_token stop) const {
+    auto env = load_env();
+    if (!env) return settings_error(env.error());
+    Value v = Value::make_object();
+    v.set("type", str("serverTested"));
+    v.set("name", str(name));
+    auto result = server_ops::test_connection(*env, name, stop);
+    if (stop.stop_requested()) return;
+    if (!result) {
+        v.set("ok", Value::make_bool(false));
+        v.set("rcloneError", str(result.error()));
+    } else {
+        v.set("ok", Value::make_bool(result->ok()));
+        v.set("rcloneOk", Value::make_bool(result->rclone_ok));
+        v.set("rcloneError", str(result->rclone_error));
+        v.set("sshOk", result->ssh_ok ? Value::make_bool(*result->ssh_ok) : Value{});
+        v.set("sshError", str(result->ssh_error));
+    }
+    post(v);
+}
+
+void App::cancel_pending() {
+    if (settings_busy_) settings_thread_.request_stop(); // e.g. a host key scan
+    std::lock_guard lock(settings_mutex_);
+    pending_.reset(); // wipes its secret
+}
+
 // ---- download queue -------------------------------------------------------------------------
 
 void App::enqueue(const Value& msg) {
@@ -386,6 +763,19 @@ void App::worker_loop(std::stop_token stop) {
         post_queue();
         run_item(item, stop);
         post_queue();
+
+        Status status{};
+        std::string name;
+        std::string error;
+        {
+            std::lock_guard lock(mutex_);
+            status = item->status;
+            name = item->name;
+            error = item->error;
+        }
+        if ((status == Status::done || status == Status::failed) && host_.on_finished) {
+            host_.on_finished(name, status == Status::done, error);
+        }
     }
 }
 
