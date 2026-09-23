@@ -21,10 +21,11 @@ struct Options {
     bool first = false;
     bool dry_run = false;
     bool verbose = false;
+    bool check = false;              // `grab update --check`
     std::vector<std::string> extra;  // everything after "--", appended to the rclone argv
 };
 
-enum class CliAction { run, help, version, init, config };
+enum class CliAction { run, help, version, init, config, update };
 
 struct CliResult {
     CliAction action = CliAction::run;

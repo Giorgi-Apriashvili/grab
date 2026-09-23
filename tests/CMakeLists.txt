@@ -22,7 +22,9 @@ add_executable(grab_tests
     test_remote.cpp
     test_listing.cpp
     test_rclone.cpp
-    test_process.cpp)
+    test_process.cpp
+    test_json.cpp
+    test_update.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)
 

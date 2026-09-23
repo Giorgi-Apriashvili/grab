@@ -9,6 +9,7 @@
 #include "quote.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
+#include "update.hpp"
 #include "util.hpp"
 
 #include <cstdio>
@@ -333,6 +334,13 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    // A previous `grab update` left the replaced binary as grab.exe.old; it can be deleted
+    // once that process has exited.
+    if (auto self = util::self_exe_path(); !self.empty()) {
+        self += ".old";
+        std::error_code ignored;
+        std::filesystem::remove(self, ignored);
+    }
 #endif
     const auto args = collect_args(argc, argv);
     auto parsed = parse_args(args);
@@ -353,6 +361,8 @@ int main(int argc, char** argv) {
         return do_init(parsed->opts.config.value_or(default_grab_config_path()));
     case CliAction::config:
         return do_config(parsed->opts.config.value_or(default_grab_config_path()));
+    case CliAction::update:
+        return update::run(parsed->opts.check);
     case CliAction::run:
         return run(parsed->opts);
     }

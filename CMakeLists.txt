@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(grab
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Grab a file or folder from a Linux server by name: ssh+find to locate, rclone to download"
     LANGUAGES CXX)
 
@@ -39,9 +39,13 @@ add_library(grab_core STATIC
     src/remote.cpp
     src/listing.cpp
     src/rclone.cpp
-    src/process.cpp)
+    src/process.cpp
+    src/json.cpp
+    src/update.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
+target_link_libraries(grab_core PUBLIC $<$<PLATFORM_ID:Windows>:bcrypt>)
 target_compile_features(grab_core PUBLIC cxx_std_23)
 target_compile_definitions(grab_core PUBLIC
     GRAB_VERSION="${PROJECT_VERSION}"
