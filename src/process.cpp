@@ -4,12 +4,14 @@
 #include "util.hpp"
 
 #include <format>
-#include <vector>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 #else
+#include <cerrno>
 #include <csignal>
+#include <cstring>
+#include <vector>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>

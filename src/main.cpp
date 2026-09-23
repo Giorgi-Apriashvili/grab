@@ -21,7 +21,7 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
 #include <shellapi.h>
 #endif

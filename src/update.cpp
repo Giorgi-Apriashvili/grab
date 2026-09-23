@@ -11,7 +11,7 @@
 #include <print>
 
 #ifdef _WIN32
-#include <windows.h>
+#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 #endif
 
 #ifndef GRAB_VERSION
