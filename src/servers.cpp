@@ -151,6 +151,15 @@ std::vector<std::string> update_argv(const std::string& rclone, const std::files
             "--config", util::path_to_utf8(config)};
 }
 
+std::vector<std::string> update_argv(const std::string& rclone, const std::filesystem::path& config,
+                                     const std::string& name,
+                                     const std::vector<std::pair<std::string, std::string>>& values) {
+    std::vector<std::string> argv{rclone, "config", "update", name};
+    for (const auto& [key, value] : values) argv.push_back(key + "=" + value);
+    argv.insert(argv.end(), {"--no-obscure", "--non-interactive", "--config", util::path_to_utf8(config)});
+    return argv;
+}
+
 std::vector<std::string> delete_argv(const std::string& rclone, const std::filesystem::path& config,
                                      const std::string& name) {
     return {rclone, "config", "delete", name, "--config", util::path_to_utf8(config)};
@@ -296,6 +305,16 @@ std::string set_value(std::string_view text, std::string_view section, std::stri
         }
     }
     l.lines.insert(l.lines.begin() + static_cast<std::ptrdiff_t>(begin + 1), assignment);
+    return join_lines(l);
+}
+
+std::string replace_lead_in(std::string_view text, std::string_view section, std::string_view comment) {
+    Lines l = split_lines(text);
+    auto range = find_section(l.lines, section);
+    if (!range || range->first == 0) return std::string(text);
+    auto& prev = l.lines[range->first - 1];
+    if (!util::trim(prev).starts_with("# rclone remote [")) return std::string(text);
+    prev = comment;
     return join_lines(l);
 }
 

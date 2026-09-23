@@ -112,6 +112,12 @@ std::string normalize_root(std::string_view root) {
     return std::string(r);
 }
 
+std::string search_roots_value(const std::vector<std::string>& roots) {
+    std::vector<std::string> shown;
+    for (const auto& r : roots) shown.push_back(r.empty() ? "~" : r);
+    return util::join(shown, ", ");
+}
+
 FindMethod resolve_find_method(const RemoteSettings& settings, const RcloneRemote& remote) {
     if (settings.find != FindMethod::auto_detect) return settings.find;
     return remote.key_file || remote.key_use_agent ? FindMethod::ssh : FindMethod::rclone;
@@ -456,7 +462,7 @@ std::string remote_section(const RcloneRemote& remote, const std::vector<std::st
     s += "# Where to search: comma-separated absolute (/srv) or home-relative (media) dirs.\n";
     s += "# Blank = the login home. Narrow it to speed up searches on big servers.\n";
     s += search_roots.empty() ? std::string("search_roots =\n")
-                              : std::format("search_roots = {}\n", util::join(search_roots, ", "));
+                              : std::format("search_roots = {}\n", search_roots_value(search_roots));
     s += std::format("max_depth = {}\n", max_depth);
     s += "skip_hidden = true\n";
     s += "# Built-in defaults, shown for reference; uncomment a line to override it here.\n";

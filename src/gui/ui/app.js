@@ -1,8 +1,12 @@
 'use strict';
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, pickFolder, enqueue, cancelItem,
-//                 retryItem, clearFinished, openFolder
-//   from backend: init, searchResult, searchError, folderPicked, queue, error
+//                 retryItem, clearFinished, openFolder,
+//                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
+//                 serverTest, serverRemove, serverDefault, pickFile, openConfig
+//   from backend: init, searchResult, searchError, folderPicked, queue, error,
+//                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
+//                 serverError, filePicked
 
 const $ = (sel) => document.querySelector(sel);
 const ROW = 32; // keep in sync with --row in app.css
@@ -70,12 +74,12 @@ function renderRemotes() {
 function renderRemoteInfo() {
   const info = $('#remote-info');
   const r = currentRemote();
+  $('#dest').value = state.destinations[state.remote] || state.defaultDest;
   if (!r) { info.hidden = true; return; }
   info.hidden = false;
   info.classList.toggle('error', !!r.error);
   info.textContent = r.error ? 'misconfigured' : `${r.user}@${r.host} · ${r.method === 'ssh' ? 'ssh + find' : 'rclone listing'}`;
   info.title = r.error || '';
-  $('#dest').value = state.destinations[state.remote] || state.defaultDest;
 }
 
 function renderMode() {
@@ -181,7 +185,8 @@ function renderEmpty() {
   } else if (state.lastQuery && state.resultNote && !state.resultNote.startsWith('Search cancelled')) {
     empty.textContent = `No ${state.mode === 'folder' ? 'folders' : 'files'} matching “${state.lastQuery}” (searched ${state.searchedWhere}).`;
   } else if (!state.remotes.length) {
-    empty.textContent = 'No servers yet. Add one in a terminal with “grab server add”, then restart grab.';
+    empty.innerHTML = '<div>No servers yet. Add the Linux server you want to download from.<br>' +
+      '<button type="button" class="primary" data-act="add-server">Add a server</button></div>';
   } else {
     empty.textContent = r && r.error ? r.error : 'Search a server by name. Every word must appear, in any order.';
   }
@@ -318,16 +323,297 @@ function renderQueue() {
 // ---- messages from the backend -----------------------------------------------------------
 
 function onInit(msg) {
+  // Sent again after every server change; folders typed here but not used yet win.
+  state.destinations = { ...msg.destinations, ...state.destinations };
   state.remotes = msg.remotes;
   state.remote = msg.remote;
   state.mode = msg.mode;
-  state.destinations = msg.destinations;
   state.defaultDest = msg.defaultDest;
   $('#version').textContent = `v${msg.version}`;
   renderRemotes();
   renderMode();
   renderRows();
-  if (msg.configError) showBanner(`${msg.configError}\n\nConfig file: ${msg.configPath}`);
+  if (msg.configError) {
+    showBanner(`${msg.configError}\n\nConfig file: ${msg.configPath}`);
+    state.configBanner = true;
+  } else if (state.configBanner) {
+    showBanner('');
+    state.configBanner = false;
+  }
+}
+
+// ---- settings: servers -------------------------------------------------------------------
+
+const settings = {
+  open: false,
+  servers: [],
+  form: null,     // null, or { editing, name, origAuth } while the add/edit form is shown
+  auth: 'password',
+  tests: {},      // server name -> serverTested message, or { pending: true }
+  busy: false,
+  status: '',
+};
+
+const AUTH_TEXT = { password: 'password', key: 'key file', agent: 'ssh-agent' };
+
+function showSettingsBanner(text) {
+  const b = $('#settings-banner');
+  b.hidden = !text;
+  b.textContent = text || '';
+}
+
+function setStatus(text) {
+  settings.status = text;
+  renderStatus();
+}
+
+function renderStatus() {
+  const el = $('#settings-status');
+  const text = settings.status || (settings.busy ? 'Working…' : '');
+  el.innerHTML = text ? `${settings.busy ? '<span class="spinner"></span>' : ''}${esc(text)}` : '';
+  $('#settings-cancel').hidden = !settings.busy;
+  $('#form-save').disabled = settings.busy;
+  $('#add-server').disabled = settings.busy || !!settings.form;
+}
+
+function refreshServers() {
+  if (!settings.busy) send({ type: 'servers' });
+}
+
+function openSettings(addFirst = false) {
+  settings.open = true;
+  document.body.classList.add('in-settings');
+  $('#search-view').hidden = true;
+  $('#settings-view').hidden = false;
+  showSettingsBanner('');
+  refreshServers();
+  if (addFirst) openForm(null); else closeForm();
+}
+
+function closeSettings() {
+  settings.form = null;
+  settings.open = false;
+  document.body.classList.remove('in-settings');
+  $('#settings-view').hidden = true;
+  $('#search-view').hidden = false;
+  $('#query').focus();
+}
+
+function testLine(t) {
+  if (!t) return '';
+  if (t.pending) return '<span class="muted"><span class="spinner"></span>Testing the connection…</span>';
+  if (t.ok) return '<span class="good">✓ Connection OK</span>';
+  const parts = [];
+  if (t.rcloneOk) parts.push('<span class="good">✓ Downloads (rclone)</span>');
+  else parts.push(`<span class="bad">✗ Downloads (rclone):</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
+  if (t.sshOk === true) parts.push('<span class="good">✓ Searches (ssh)</span>');
+  else if (t.sshOk === false) parts.push(`<span class="bad">✗ Searches (ssh):</span> <span class="detail">${esc(t.sshError || 'failed')}</span>`);
+  return parts.map((p) => `<span>${p}</span>`).join('');
+}
+
+function serverCard(s) {
+  const btn = (act, label, cls = '') =>
+    `<button type="button" class="${cls}" data-act="${act}" data-name="${esc(s.name)}"${settings.busy ? ' disabled' : ''}>${label}</button>`;
+  const actions = [];
+  if (!s.error) {
+    actions.push(btn('test', 'Test'));
+    if (!s.pinned) actions.push(btn('trust', 'Trust…'));
+    actions.push(btn('edit', 'Edit'));
+    if (!s.isDefault) actions.push(btn('default', 'Make default'));
+  }
+  actions.push(btn('remove', 'Remove', 'danger'));
+
+  const where = s.roots.length ? s.roots.join(', ') : '~';
+  const meta = s.error
+    ? `<span class="bad">${esc(s.error)}</span>`
+    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${AUTH_TEXT[s.auth]} · searched with ${s.search === 'ssh' ? 'ssh + find' : 'rclone listing'} in ${esc(where)}, depth ${s.depth}`;
+  const status = [];
+  if (!s.error) {
+    status.push(s.pinned ? '<span class="good">✓ Host key pinned</span>'
+      : '<span class="warn">⚠ Host key not checked: any server answering at this address is accepted. Use Trust… to pin it.</span>');
+  }
+  const test = testLine(settings.tests[s.name]);
+  return `<div class="server">` +
+    `<div class="server-top"><span class="server-name">${esc(s.name)}</span>` +
+    `${s.isDefault ? '<span class="badge">default</span>' : ''}` +
+    `<span class="server-actions">${actions.join('')}</span></div>` +
+    `<div class="server-meta">${meta}</div>` +
+    `<div class="server-status">${status.map((x) => `<span>${x}</span>`).join('')}${test}</div></div>`;
+}
+
+function renderServers() {
+  const list = $('#server-list');
+  list.hidden = !!settings.form;
+  $('#server-form').hidden = !settings.form;
+  renderStatus();
+  if (settings.form) return;
+  list.innerHTML = settings.servers.length ? settings.servers.map(serverCard).join('')
+    : '<div class="settings-empty">No servers yet. Add the Linux server you want to download from: ' +
+      'grab connects over SFTP/SSH with a password, a key file or ssh-agent.<br>' +
+      '<button type="button" class="primary" data-act="add">Add a server</button></div>';
+}
+
+function setAuth(auth) {
+  settings.auth = auth;
+  for (const b of $('#f-auth').querySelectorAll('button')) b.setAttribute('aria-checked', String(b.dataset.auth === auth));
+  for (const el of document.querySelectorAll('[data-auth-only]')) el.hidden = !el.dataset.authOnly.split(' ').includes(auth);
+  const keep = settings.form && settings.form.editing && settings.form.origAuth === auth;
+  $('#secret-label').textContent = auth === 'key' ? 'Passphrase' : 'Password';
+  $('#f-secret').placeholder = keep ? (auth === 'key' ? 'Leave blank to keep the saved passphrase' : 'Leave blank to keep the saved password')
+    : (auth === 'key' ? 'Only if the key has one' : '');
+  $('#secret-hint').textContent = auth === 'key'
+    ? 'Searches use ssh, which cannot ask for a passphrase here: load such a key into ssh-agent (ssh-add) and choose ssh-agent instead.'
+    : 'Stored obscured in grab\'s rclone.conf, never in plain text on a command line.';
+  $('#auth-hint').textContent = {
+    password: 'Works without a shell (e.g. storage boxes); searches use rclone\'s listing.',
+    key: 'Searches use ssh + find on the server, which is fastest.',
+    agent: 'Uses the keys loaded in the Windows ssh-agent (ssh-add); searches use ssh + find.',
+  }[auth];
+}
+
+function clearFieldErrors() {
+  for (const el of document.querySelectorAll('.field-error')) el.textContent = '';
+}
+
+function openForm(name) {
+  const s = name ? settings.servers.find((x) => x.name === name) : null;
+  settings.form = { editing: !!s, name: s ? s.name : '', origAuth: s ? s.auth : null };
+  $('#form-title').textContent = s ? `Edit ${s.name}` : 'Add a server';
+  $('#f-name').value = s ? s.name : '';
+  $('#f-name').disabled = !!s;
+  $('#f-host').value = s ? s.host : '';
+  $('#f-port').value = s ? s.port : 22;
+  $('#f-user').value = s ? s.user : '';
+  $('#f-key').value = s ? s.keyFile : '';
+  $('#f-secret').value = '';
+  $('#f-roots').value = s ? s.roots.join('\n') : '';
+  $('#f-depth').value = s ? s.depth : 4;
+  setAuth(s ? s.auth : 'password');
+  clearFieldErrors();
+  showSettingsBanner('');
+  renderServers();
+  (s ? $('#f-host') : $('#f-name')).focus();
+}
+
+function closeForm() {
+  settings.form = null;
+  $('#f-secret').value = '';
+  renderServers();
+}
+
+function intOf(id) {
+  const v = $(id).value.trim();
+  return /^\d{1,6}$/.test(v) ? Number(v) : 0;
+}
+
+function submitForm() {
+  if (settings.busy || !settings.form) return;
+  clearFieldErrors();
+  showSettingsBanner('');
+  send({
+    type: 'serverSave',
+    editing: settings.form.editing,
+    name: settings.form.editing ? settings.form.name : $('#f-name').value.trim(),
+    host: $('#f-host').value.trim(),
+    port: intOf('#f-port'),
+    user: $('#f-user').value.trim(),
+    auth: settings.auth,
+    keyFile: $('#f-key').value.trim(),
+    secret: settings.auth === 'agent' ? '' : $('#f-secret').value,
+    roots: $('#f-roots').value.split(/\r?\n/).map((r) => r.trim()).filter(Boolean),
+    depth: intOf('#f-depth'),
+  });
+  $('#f-secret').value = ''; // the backend holds it until the host key is trusted
+  setStatus('Checking the host key…');
+}
+
+// ---- modal -------------------------------------------------------------------------------
+
+let modal = null; // { onOk, onCancel }
+
+function showModal({ title, html, ok, danger = false, onOk, onCancel }) {
+  modal = { onOk, onCancel };
+  $('#modal-title').textContent = title;
+  $('#modal-body').innerHTML = html;
+  const okBtn = $('#modal-ok');
+  okBtn.textContent = ok;
+  okBtn.classList.toggle('danger', danger);
+  $('#modal').hidden = false;
+  $('#modal-cancel').focus(); // the safe choice is the default
+}
+
+function closeModal(accepted) {
+  if (!modal) return;
+  const m = modal;
+  modal = null;
+  $('#modal').hidden = true;
+  if (accepted) m.onOk && m.onOk(); else m.onCancel && m.onCancel();
+}
+
+function onHostKeys(msg) {
+  setStatus('');
+  const rows = msg.fingerprints.length
+    ? msg.fingerprints.map((f) => `<tr><td>${esc(f.type)}</td><td><code>${esc(f.hash)}</code></td></tr>`).join('')
+    : msg.lines.map((l) => `<tr><td>key</td><td><code>${esc(l)}</code></td></tr>`).join('');
+  showModal({
+    title: msg.kind === 'trust' ? `Trust ${msg.name}?` : 'Trust this server?',
+    html: `<p><b>${esc(msg.host)}:${msg.port}</b> presents these host keys:</p>` +
+      `<table class="fingerprints">${rows}</table>` +
+      '<p class="muted">Compare them with the fingerprints your provider shows, or run ' +
+      '<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the server. ' +
+      'If they differ, choose Cancel: something else may be answering at this address.</p>' +
+      '<p class="muted">Once trusted, searches and downloads refuse a server that presents another key.</p>',
+    ok: msg.kind === 'add' ? 'Trust and add' : msg.kind === 'edit' ? 'Trust and save' : 'Trust',
+    onOk: () => { setStatus('Saving…'); send({ type: 'serverConfirm', trust: true }); },
+    onCancel: () => { send({ type: 'serverConfirm', trust: false }); setStatus(''); },
+  });
+}
+
+function onServerError(msg) {
+  setStatus('');
+  const target = msg.field && settings.form && document.querySelector(`.field-error[data-for="${msg.field}"]`);
+  if (target) {
+    target.textContent = msg.message;
+    const input = { name: '#f-name', host: '#f-host', port: '#f-port', user: '#f-user', keyFile: '#f-key',
+      secret: '#f-secret', depth: '#f-depth' }[msg.field];
+    if (input) $(input).focus();
+  } else if (settings.open) {
+    showSettingsBanner(msg.message);
+  } else {
+    showBanner(msg.message);
+  }
+}
+
+function onServerSaved(msg) {
+  if (settings.form) closeForm();
+  settings.tests[msg.name] = { pending: true };
+  setStatus('');
+  renderServers();
+}
+
+function onSettingsAction(act, name) {
+  if (act === 'add') return openForm(null);
+  if (act === 'edit') return openForm(name);
+  if (act === 'test') {
+    settings.tests[name] = { pending: true };
+    renderServers();
+    return send({ type: 'serverTest', name });
+  }
+  if (act === 'trust') {
+    setStatus('Checking the host key…');
+    return send({ type: 'serverTrust', name });
+  }
+  if (act === 'default') return send({ type: 'serverDefault', name });
+  if (act === 'remove') {
+    showModal({
+      title: `Remove ${name}?`,
+      html: '<p>grab forgets this server: its section in grab.conf and its connection in grab\'s ' +
+        'rclone.conf are deleted. Files you already downloaded stay where they are.</p>',
+      ok: 'Remove',
+      danger: true,
+      onOk: () => { delete settings.tests[name]; send({ type: 'serverRemove', name }); },
+    });
+  }
 }
 
 if (webview) {
@@ -340,6 +626,21 @@ if (webview) {
       case 'folderPicked': $('#dest').value = msg.path; state.destinations[state.remote] = msg.path; break;
       case 'queue': state.queue = msg.items; renderQueue(); break;
       case 'error': showBanner(msg.message); break;
+      case 'servers': settings.servers = msg.items; renderServers(); break;
+      case 'settingsBusy':
+        settings.busy = msg.busy;
+        if (!msg.busy) {
+          settings.status = '';
+          // A test still "pending" now was cancelled: its result comes before this message.
+          for (const k of Object.keys(settings.tests)) if (settings.tests[k].pending) delete settings.tests[k];
+        }
+        if (settings.form) renderStatus(); else renderServers();
+        break;
+      case 'hostKeys': onHostKeys(msg); break;
+      case 'serverSaved': onServerSaved(msg); break;
+      case 'serverTested': settings.tests[msg.name] = msg; renderServers(); break;
+      case 'serverError': onServerError(msg); break;
+      case 'filePicked': $('#f-key').value = msg.path; break;
     }
   });
 }
@@ -427,8 +728,51 @@ $('#queue').addEventListener('click', (ev) => {
   send({ type, id });
 });
 
+$('#empty').addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-act="add-server"]')) openSettings(true);
+});
+
+// settings
+$('#settings-btn').addEventListener('click', () => (settings.open ? closeSettings() : openSettings()));
+$('#settings-back').addEventListener('click', closeSettings);
+$('#add-server').addEventListener('click', () => openForm(null));
+$('#open-config').addEventListener('click', () => send({ type: 'openConfig' }));
+$('#server-list').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (btn && !btn.disabled) onSettingsAction(btn.dataset.act, btn.dataset.name);
+});
+$('#server-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitForm(); });
+$('#form-cancel').addEventListener('click', () => {
+  if (settings.busy) send({ type: 'serverCancel' });
+  closeForm();
+});
+$('#settings-cancel').addEventListener('click', () => send({ type: 'serverCancel' }));
+$('#f-auth').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-auth]');
+  if (b) setAuth(b.dataset.auth);
+});
+$('#f-key-browse').addEventListener('click', () => send({ type: 'pickFile', current: $('#f-key').value.trim() }));
+$('#modal-ok').addEventListener('click', () => closeModal(true));
+$('#modal-cancel').addEventListener('click', () => closeModal(false));
+// grab.conf may have been edited in another program ("Open grab.conf").
+window.addEventListener('focus', () => {
+  if (settings.open && !settings.form && !modal) refreshServers();
+});
+
 document.addEventListener('keydown', (ev) => {
-  if ((ev.key === 'f' && ev.ctrlKey) || (ev.key === '/' && document.activeElement.tagName !== 'INPUT')) {
+  if (modal) {
+    if (ev.key === 'Escape') { ev.preventDefault(); closeModal(false); }
+    return;
+  }
+  if (ev.key === ',' && ev.ctrlKey) {
+    ev.preventDefault();
+    if (settings.open) closeSettings(); else openSettings();
+  } else if (settings.open) {
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      if (settings.form) $('#form-cancel').click(); else closeSettings();
+    }
+  } else if ((ev.key === 'f' && ev.ctrlKey) || (ev.key === '/' && document.activeElement.tagName !== 'INPUT')) {
     ev.preventDefault();
     $('#query').focus();
     $('#query').select();

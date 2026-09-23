@@ -17,46 +17,127 @@
   <span id="remote-info" class="chip" hidden></span>
   <span class="spacer"></span>
   <span id="version" class="muted"></span>
+  <button id="settings-btn" type="button" class="subtle icon-btn" title="Settings (Ctrl+,)" aria-label="Settings">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6a.5.5 0 0 0 .1-.7l-2-3.4a.5.5 0 0 0-.6-.2l-2.5 1a7.4 7.4 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.5h-4a.5.5 0 0 0-.5.4l-.4 2.7a7.4 7.4 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.7L4.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.7l2 3.4c.1.2.4.3.6.2l2.5-1a7.4 7.4 0 0 0 1.7 1l.4 2.6c0 .3.2.5.5.5h4c.3 0 .5-.2.5-.4l.4-2.7a7.4 7.4 0 0 0 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.7L19.4 13ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg>
+  </button>
 </header>
 
-<form id="search-form" class="bar search" autocomplete="off">
-  <input id="query" type="search" placeholder="Search by name, e.g. lioness s03e08" spellcheck="false" autofocus>
-  <div class="segmented" role="radiogroup" aria-label="Look for">
-    <button type="button" data-mode="file" role="radio">Files</button>
-    <button type="button" data-mode="folder" role="radio">Folders</button>
-  </div>
-  <label class="check" title="Match the whole name exactly, case-sensitive">
-    <input id="exact" type="checkbox"> Exact
-  </label>
-  <button id="search-btn" type="submit" class="primary">Search</button>
-</form>
+<div id="search-view" class="view">
+  <form id="search-form" class="bar search" autocomplete="off">
+    <input id="query" type="search" placeholder="Search by name, e.g. lioness s03e08" spellcheck="false" autofocus>
+    <div class="segmented" role="radiogroup" aria-label="Look for">
+      <button type="button" data-mode="file" role="radio">Files</button>
+      <button type="button" data-mode="folder" role="radio">Folders</button>
+    </div>
+    <label class="check" title="Match the whole name exactly, case-sensitive">
+      <input id="exact" type="checkbox"> Exact
+    </label>
+    <button id="search-btn" type="submit" class="primary">Search</button>
+  </form>
 
-<div id="banner" class="banner" hidden></div>
+  <div id="banner" class="banner" hidden></div>
 
-<main class="results-wrap">
-  <div class="results-head row">
-    <input id="select-all" type="checkbox" title="Select all" aria-label="Select all">
-    <span class="name">Name</span>
-    <span class="size">Size</span>
-    <span class="dir">Folder</span>
-  </div>
-  <div id="results" class="results" tabindex="0" aria-label="Search results">
-    <div id="spacer"></div>
-    <div id="rows"></div>
-    <div id="empty" class="empty"></div>
-  </div>
-</main>
+  <main class="results-wrap">
+    <div class="results-head row">
+      <input id="select-all" type="checkbox" title="Select all" aria-label="Select all">
+      <span class="name">Name</span>
+      <span class="size">Size</span>
+      <span class="dir">Folder</span>
+    </div>
+    <div id="results" class="results" tabindex="0" aria-label="Search results">
+      <div id="spacer"></div>
+      <div id="rows"></div>
+      <div id="empty" class="empty"></div>
+    </div>
+  </main>
 
-<footer class="bar action">
-  <span id="summary" class="muted"></span>
-  <span class="spacer"></span>
-  <label class="field dest">
-    <span class="label">Save to</span>
-    <input id="dest" type="text" spellcheck="false">
-  </label>
-  <button id="browse" type="button">Browse…</button>
-  <button id="download" type="button" class="primary" disabled>Download</button>
-</footer>
+  <footer class="bar action">
+    <span id="summary" class="muted"></span>
+    <span class="spacer"></span>
+    <label class="field dest">
+      <span class="label">Save to</span>
+      <input id="dest" type="text" spellcheck="false">
+    </label>
+    <button id="browse" type="button">Browse…</button>
+    <button id="download" type="button" class="primary" disabled>Download</button>
+  </footer>
+</div>
+
+<div id="settings-view" class="view settings" hidden>
+  <div class="bar settings-head">
+    <button id="settings-back" type="button" class="subtle">← Back</button>
+    <span class="title">Servers</span>
+    <span id="settings-status" class="muted"></span>
+    <button id="settings-cancel" type="button" class="subtle" hidden>Cancel</button>
+    <span class="spacer"></span>
+    <button id="open-config" type="button" class="subtle" title="Rclone flags, ssh options and the other advanced settings">Open grab.conf</button>
+    <button id="add-server" type="button" class="primary">Add server</button>
+  </div>
+  <div id="settings-banner" class="banner" hidden></div>
+
+  <div class="settings-body">
+    <div id="server-list" class="server-list"></div>
+
+    <form id="server-form" class="server-form" autocomplete="off" hidden>
+      <h2 id="form-title">Add a server</h2>
+      <div class="grid">
+        <label for="f-name">Name</label>
+        <div><input id="f-name" type="text" spellcheck="false" placeholder="e.g. home">
+          <div class="hint">Shown in the server list; also used with <code>grab -r NAME</code>.</div>
+          <div class="field-error" data-for="name"></div></div>
+
+        <label for="f-host">Host</label>
+        <div class="inline">
+          <div class="grow"><input id="f-host" type="text" spellcheck="false" placeholder="server.example.com or 203.0.113.10">
+            <div class="field-error" data-for="host"></div></div>
+          <label for="f-port" class="inner-label">Port</label>
+          <div><input id="f-port" type="text" inputmode="numeric" class="num" value="22">
+            <div class="field-error" data-for="port"></div></div>
+        </div>
+
+        <label for="f-user">User</label>
+        <div><input id="f-user" type="text" spellcheck="false">
+          <div class="field-error" data-for="user"></div></div>
+
+        <span class="grid-label">Log in with</span>
+        <div>
+          <div class="segmented" id="f-auth" role="radiogroup" aria-label="Log in with">
+            <button type="button" data-auth="password" role="radio">Password</button>
+            <button type="button" data-auth="key" role="radio">Key file</button>
+            <button type="button" data-auth="agent" role="radio">ssh-agent</button>
+          </div>
+          <div class="hint" id="auth-hint"></div>
+        </div>
+
+        <label for="f-key" data-auth-only="key">Key file</label>
+        <div class="inline" data-auth-only="key">
+          <div class="grow"><input id="f-key" type="text" spellcheck="false" placeholder="C:\Users\you\.ssh\id_ed25519">
+            <div class="field-error" data-for="keyFile"></div></div>
+          <button id="f-key-browse" type="button">Browse…</button>
+        </div>
+
+        <label for="f-secret" id="secret-label" data-auth-only="password key">Password</label>
+        <div data-auth-only="password key"><input id="f-secret" type="password" spellcheck="false">
+          <div class="hint" id="secret-hint"></div>
+          <div class="field-error" data-for="secret"></div></div>
+
+        <label for="f-roots">Search in</label>
+        <div><textarea id="f-roots" rows="3" spellcheck="false" placeholder="One folder per line, e.g. /srv/media or downloads. Blank = the login home."></textarea></div>
+
+        <label for="f-depth">Depth</label>
+        <div><input id="f-depth" type="text" inputmode="numeric" class="num" value="4">
+          <span class="hint inline-hint">folder levels below each search folder</span>
+          <div class="field-error" data-for="depth"></div></div>
+      </div>
+      <div class="form-actions">
+        <span class="muted small">Saving first checks the server's host key.</span>
+        <span class="spacer"></span>
+        <button id="form-cancel" type="button">Cancel</button>
+        <button id="form-save" type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <section id="downloads" class="downloads" hidden>
   <div class="downloads-head">
@@ -67,6 +148,17 @@
   </div>
   <div id="queue" class="queue"></div>
 </section>
+
+<div id="modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel" type="button">Cancel</button>
+      <button id="modal-ok" type="button" class="primary"></button>
+    </div>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

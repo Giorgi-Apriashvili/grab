@@ -1,6 +1,10 @@
 // UI files for grab-gui, served from memory at https://grab.ui/ (see resources.cpp).
 // Paths are relative to this file's directory, which CMake adds to the RC include path.
 
+// The app icon (window, taskbar, tray); drawn by tools/make_icon.py. First, so Explorer uses it
+// for the exe too.
+APP_ICON ICON "grab.ico"
+
 UI_INDEX_HTML RCDATA "ui/index.html"
 UI_APP_CSS    RCDATA "ui/app.css"
 UI_APP_JS     RCDATA "ui/app.js"
