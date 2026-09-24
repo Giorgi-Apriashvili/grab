@@ -43,6 +43,18 @@ run_capture(std::span<const std::string> argv, const RunOptions& opts = {});
 run_streaming(std::span<const std::string> argv, const std::function<void(std::string_view)>& on_line,
               const RunOptions& opts = {});
 
+struct PipedResult {
+    int exit_code = 0;
+    std::string err; // the child's stderr
+};
+
+// Run argv[0] with no console and stdin on NUL, handing its stdout to `on_data` in binary
+// chunks as they arrive (e.g. `rclone cat` of a byte range) and capturing stderr. `on_data`
+// returning false stops the child, like RunOptions::stop; the result is then exit_stopped.
+[[nodiscard]] std::expected<PipedResult, std::string>
+run_piped(std::span<const std::string> argv, const std::function<bool(std::string_view)>& on_data,
+          const RunOptions& opts = {});
+
 // Run argv[0] with all three streams inherited (live progress output). Returns its exit code.
 // On Windows the child is in a kill-on-close Job object, and by default so is everything it
 // starts. `contain_descendants` false lets the child's own children leave the job, so they

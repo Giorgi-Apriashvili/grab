@@ -1,5 +1,6 @@
 #include "server_ops.hpp"
 
+#include "conn_budget.hpp"
 #include "process.hpp"
 #include "remote.hpp"
 #include "util.hpp"
@@ -157,6 +158,7 @@ std::vector<ServerInfo> list_servers(const Env& env) {
         info.is_default = is_default_server(env.cfg, s.name);
         for (const auto& r : s.search_roots) info.search_roots.push_back(r.empty() ? "~" : r);
         info.max_depth = s.max_depth;
+        info.max_connections = s.max_connections;
         auto remote = load_rclone_remote(env.rclone_conf, s.rclone_remote);
         if (!remote) {
             info.error = remote.error();
@@ -170,6 +172,7 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             info.key_file = remote->key_file.value_or("");
             info.ssh_search = resolve_find_method(s, *remote) == FindMethod::ssh;
             info.host_key_pinned = remote->known_hosts_file.has_value();
+            info.default_connections = budget::default_budget(remote->host);
         }
         out.push_back(std::move(info));
     }
@@ -230,6 +233,9 @@ std::expected<void, std::string> add_server(const Env& env, const servers::NewSe
 
     const RcloneRemote remote = servers::to_remote(s, env.known_hosts);
     std::string text = servers::append_section(env.grab_text, remote_section(remote, s.search_roots, s.max_depth));
+    if (s.max_connections) {
+        text = servers::set_value(text, s.name, "max_connections", std::to_string(*s.max_connections));
+    }
     if (!env.cfg.default_remote || env.cfg.remotes.empty()) {
         text = servers::set_value(text, "grab", "default_remote", s.name);
     }
@@ -310,6 +316,11 @@ std::expected<void, std::string> update_server(const Env& env, const servers::Ne
     std::string text = servers::set_value(env.grab_text, wanted.name, "search_roots",
                                           search_roots_value(wanted.search_roots));
     text = servers::set_value(text, wanted.name, "max_depth", std::to_string(wanted.max_depth));
+    // Blank means automatic; the key is only written once it has been set.
+    if (wanted.max_connections || settings->max_connections) {
+        text = servers::set_value(text, wanted.name, "max_connections",
+                                  wanted.max_connections ? std::to_string(*wanted.max_connections) : "");
+    }
     servers::NewServer described = wanted;
     described.name = settings->rclone_remote;
     RcloneRemote remote = servers::to_remote(described, {});

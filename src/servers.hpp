@@ -30,6 +30,7 @@ struct NewServer {
     std::string key_file;                  // Auth::key_file
     std::vector<std::string> search_roots; // blank = login home
     int max_depth = 4;
+    std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
 };
 
 // nullopt when usable as both a grab.conf section and an rclone remote name, else why not.

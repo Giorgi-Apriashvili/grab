@@ -51,6 +51,8 @@ struct ServerInfo {
     bool is_default = false;
     std::vector<std::string> search_roots; // as written in grab.conf ("~" for the login home)
     int max_depth = 4;
+    std::optional<int> max_connections; // set in grab.conf; nullopt = automatic
+    int default_connections = 12;       // the automatic value for this host
     std::string error;         // non-empty: the rclone remote is missing or unusable
     // From the rclone remote (when error is empty):
     std::string host;

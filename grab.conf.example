@@ -34,6 +34,10 @@ find = auto
 search_roots = /home/alice
 # How deep below each root `find` may look (find -maxdepth).
 max_depth = 4
+# Connections grab-gui's downloads may open to this server at once, shared by all downloads
+# from it. Blank = automatic: 8 on Hetzner Storage Boxes, 12 elsewhere, lowered when the
+# server refuses connections.
+max_connections =
 # Skip dot-directories such as .cache and .config while searching.
 skip_hidden = true
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30

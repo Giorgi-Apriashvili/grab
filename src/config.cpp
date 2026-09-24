@@ -45,6 +45,9 @@ find = auto
 search_roots = /home/alice
 # How deep below each root `find` may look (find -maxdepth).
 max_depth = 4
+# Connections grab-gui's downloads may open to this server at once. Blank = automatic
+# (8 on Hetzner Storage Boxes, 12 elsewhere, lowered when the server refuses connections).
+max_connections =
 # Skip dot-directories such as .cache and .config while searching.
 skip_hidden = true
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
@@ -294,6 +297,14 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
         if (!depth) return util::fail(depth.error());
         if (*depth < 1) return util::failf("[{}] max_depth must be at least 1", s.name);
         r.max_depth = *depth;
+        if (nonblank(s, "max_connections")) {
+            auto conns = int_value(s, "max_connections", 0);
+            if (!conns) return util::fail(conns.error());
+            if (*conns < 1 || *conns > 64) {
+                return util::failf("[{}] max_connections must be from 1 to 64", s.name);
+            }
+            r.max_connections = *conns;
+        }
         auto hidden = bool_value(s, "skip_hidden", true);
         if (!hidden) return util::fail(hidden.error());
         r.skip_hidden = *hidden;
