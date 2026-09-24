@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(grab
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Grab a file or folder from a Linux server by name: ssh+find to locate, rclone to download"
     LANGUAGES CXX)
 
