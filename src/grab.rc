@@ -1,0 +1,7 @@
+// grab.exe: the app icon and version info. The icon is shared with grab-gui (src/gui/grab.ico).
+
+APP_ICON ICON "gui/grab.ico"
+
+#define GRAB_FILE_DESCRIPTION "grab"
+#define GRAB_FILE_NAME "grab.exe"
+#include "version.rc"

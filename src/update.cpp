@@ -114,6 +114,25 @@ bool same_dir(std::string_view a, std::string_view b) {
     return norm(a) == norm(b);
 }
 
+#ifndef GRAB_RELEASE_PROGRAMS
+#define GRAB_RELEASE_PROGRAMS "grab.exe"
+#endif
+
+std::vector<std::string> release_programs() { return util::split(GRAB_RELEASE_PROGRAMS, ','); }
+
+std::vector<std::string> missing_programs(const std::filesystem::path& dir, const std::vector<std::string>& programs) {
+    std::vector<std::string> missing;
+    std::error_code ec;
+    for (const auto& p : programs) {
+        if (!std::filesystem::is_regular_file(dir / util::path_from_utf8(p), ec)) missing.push_back(p);
+    }
+    return missing;
+}
+
+bool needs_install(const Version& current, const Version& latest, bool folder_incomplete) {
+    return latest > current || (latest == current && folder_incomplete);
+}
+
 namespace {
 
 // Keeps our buffered stdout lines ahead of stderr and of child output (curl, the installer)
@@ -176,9 +195,31 @@ void restore_self(const std::filesystem::path& old, const std::filesystem::path&
     if (!std::filesystem::exists(exe, ec)) std::filesystem::rename(old, exe, ec);
 }
 
+// True when `exe_dir` is the bin folder of the Inno Setup installation.
+bool installed_by_installer(const std::filesystem::path& exe_dir) {
+    const auto location = installer_location();
+    return location && same_dir(*location + "\\bin", util::path_to_utf8(exe_dir));
+}
+
+// Whether grab-gui's window exists (the class name is in src/gui/main_gui.cpp).
+bool gui_running() { return FindWindowW(L"grab.gui.window", nullptr) != nullptr; }
+
 #endif
 
 } // namespace
+
+std::optional<std::string> incomplete_folder_note() {
+#ifdef _WIN32
+    const auto exe = util::self_exe_path();
+    if (exe.empty() || installed_by_installer(exe.parent_path())) return std::nullopt;
+    const auto missing = missing_programs(exe.parent_path(), release_programs());
+    if (missing.empty()) return std::nullopt;
+    return std::format("note: {} {} missing next to grab.exe; run `grab update` to add them",
+                       util::join(missing, " and "), missing.size() == 1 ? "is" : "are");
+#else
+    return std::nullopt;
+#endif
+}
 
 int run(bool check_only) {
 #ifndef _WIN32
@@ -208,27 +249,37 @@ int run(bool check_only) {
         return exit_update_failed;
     }
 
-    const auto latest = release->version;
-    if (latest <= current) {
-        std::println("grab {} is up to date (latest release: {})", to_string(current), release->tag);
-        return 0;
-    }
-    if (check_only) {
-        std::println("grab {} is installed, {} is available; run `grab update` to install it",
-                     to_string(current), to_string(latest));
-        return 0;
-    }
-
-    // Decide how this copy was installed.
+    // Decide how this copy was installed. A portable folder may lack programs the release
+    // ships (a v0.2.0 updater extracted only grab.exe); then the current release completes it.
     const auto exe = util::self_exe_path();
     if (exe.empty()) {
         error("cannot determine the path of the running grab.exe");
         return exit_update_failed;
     }
-    const auto location = installer_location();
-    const bool via_installer =
-        location && same_dir(*location + "\\bin", util::path_to_utf8(exe.parent_path()));
+    const bool via_installer = installed_by_installer(exe.parent_path());
     const InstallMode mode = via_installer ? InstallMode::installer : InstallMode::portable;
+    const auto missing =
+        via_installer ? std::vector<std::string>{} : missing_programs(exe.parent_path(), release_programs());
+
+    const auto latest = release->version;
+    if (!needs_install(current, latest, !missing.empty())) {
+        std::println("grab {} is up to date (latest release: {})", to_string(current), release->tag);
+        return 0;
+    }
+    const bool completing = latest == current;
+    if (check_only) {
+        if (completing) {
+            std::println("grab {} is current, but {} lacks {}; run `grab update` to add them", to_string(current),
+                         util::path_to_utf8(exe.parent_path()), util::join(missing, ", "));
+        } else {
+            std::println("grab {} is installed, {} is available; run `grab update` to install it",
+                         to_string(current), to_string(latest));
+        }
+        return 0;
+    }
+    if (completing) {
+        std::println("this folder lacks {}; adding them from {}", util::join(missing, ", "), release->tag);
+    }
 
     const std::string name = asset_name(latest, mode);
     const Asset* asset = find_asset(*release, name);
@@ -353,8 +404,15 @@ int run(bool check_only) {
                                       std::filesystem::copy_options::recursive,
                                   ec);
         }
-        std::println("updated grab {} -> {} in {} ({})", to_string(current), to_string(latest),
-                     util::path_to_utf8(dir), util::join(replaced, ", "));
+        if (completing) {
+            std::println("completed grab {} in {} ({})", to_string(latest), util::path_to_utf8(dir),
+                         util::join(replaced, ", "));
+        } else {
+            std::println("updated grab {} -> {} in {} ({})", to_string(current), to_string(latest),
+                         util::path_to_utf8(dir), util::join(replaced, ", "));
+        }
+        // A running grab-gui keeps running the old program (it was renamed aside) until it restarts.
+        if (gui_running()) std::println("grab-gui is open: restart it to use the new version");
         return 0;
     }
 
@@ -365,10 +423,15 @@ int run(bool check_only) {
         error(old.error());
         return exit_update_failed;
     }
+    // The installer closes grab-gui through the Restart Manager and starts it again afterwards
+    // (grab-gui registers for that); running downloads are cancelled.
+    if (gui_running()) std::println("grab-gui is open: the installer will close it and start it again");
     std::println("running the installer silently...");
     flush();
-    auto code = proc::run_inherit(std::vector<std::string>{
-        util::path_to_utf8(payload), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"});
+    // The grab-gui the installer starts again must not die with this process's job object.
+    auto code = proc::run_inherit(std::vector<std::string>{util::path_to_utf8(payload), "/VERYSILENT",
+                                                           "/SUPPRESSMSGBOXES", "/NORESTART"},
+                                  false);
     if (!code || *code != 0) {
         restore_self(*old, exe);
         error(code ? std::format("the installer failed (exit {}); the previous version was kept", *code)

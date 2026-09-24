@@ -3,8 +3,11 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <vector>
 
 using namespace grab;
 using update::Version;
@@ -101,6 +104,42 @@ TEST_CASE("same_dir normalizes case, separators and trailing slashes") {
 }
 
 #ifdef _WIN32
+TEST_CASE("release programs: grab.exe first, bundled programs when built") {
+    const auto programs = update::release_programs();
+    REQUIRE_FALSE(programs.empty());
+    CHECK(programs.front() == "grab.exe");
+#ifdef _WIN32
+    // The default Windows build bundles rclone and builds the GUI.
+    CHECK(std::ranges::find(programs, "rclone.exe") != programs.end());
+    CHECK(std::ranges::find(programs, "grab-gui.exe") != programs.end());
+#endif
+}
+
+TEST_CASE("missing programs in a portable folder") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-missing-programs";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / "grab.exe") << "x";
+    std::filesystem::create_directories(dir / "grab-gui.exe"); // a folder is not the program
+    const std::vector<std::string> programs{"grab.exe", "rclone.exe", "grab-gui.exe"};
+    CHECK(update::missing_programs(dir, programs) == std::vector<std::string>{"rclone.exe", "grab-gui.exe"});
+    std::ofstream(dir / "rclone.exe") << "x";
+    std::filesystem::remove(dir / "grab-gui.exe");
+    std::ofstream(dir / "grab-gui.exe") << "x";
+    CHECK(update::missing_programs(dir, programs).empty());
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("install when newer, or the same version into an incomplete folder, never older") {
+    const Version v020{0, 2, 0};
+    const Version v030{0, 3, 0};
+    CHECK(update::needs_install(v020, v030, false));
+    CHECK(update::needs_install(v020, v030, true));
+    CHECK_FALSE(update::needs_install(v030, v030, false));
+    CHECK(update::needs_install(v030, v030, true)); // complete this release's folder
+    CHECK_FALSE(update::needs_install(v030, v020, true)); // no downgrade, even if incomplete
+}
+
 TEST_CASE("sha256_file and self_exe_path") {
     const auto path = std::filesystem::temp_directory_path() / "grab_test_sha256.txt";
     {

@@ -358,6 +358,12 @@ int main(int argc, char** argv) {
         return exit_usage;
     }
 
+    // A portable folder updated by v0.2.0's updater got grab.exe only; point at the fix.
+    if (parsed->action != CliAction::help && parsed->action != CliAction::version &&
+        parsed->action != CliAction::update) {
+        if (auto note = update::incomplete_folder_note()) std::println(stderr, "grab: {}", *note);
+    }
+
     switch (parsed->action) {
     case CliAction::help:
         std::print("{}", usage());

@@ -2,8 +2,12 @@
 ; edit installer/grab.iss.in in the source tree, not the generated copy.
 ;
 ; Per-user installer: no admin rights, installs to %USERPROFILE%\programs\grab, adds bin to the
-; user PATH, writes the default config with `grab --init` if none exists. The uninstaller removes
-; the files and the PATH entry but leaves %APPDATA%\grab\grab.conf alone (user data).
+; user PATH, adds a Start-menu entry for grab-gui, writes the default config with `grab --init`
+; if none exists. The uninstaller removes the files, shortcuts, PATH entry and grab-gui's browser
+; cache, but leaves %APPDATA%\grab (config, servers, host keys) alone.
+;
+; `grab update` runs this silently over an existing install. A running grab-gui is closed through
+; the Restart Manager and started again afterwards (it calls RegisterApplicationRestart).
 
 [Setup]
 AppId={{B7E9C1D4-5F2A-4C3E-9A8B-2D6F1E0C7A55}
@@ -24,13 +28,21 @@ LicenseFile=@GRAB_STAGE_DIR_NATIVE@\LICENSE
 OutputDir=@GRAB_DIST_DIR_NATIVE@
 OutputBaseFilename=grab-@PROJECT_VERSION@-windows-x64-setup
 UninstallDisplayName=grab
-UninstallDisplayIcon={app}\bin\grab.exe
+UninstallDisplayIcon={app}\bin\grab-gui.exe
+SetupIconFile=@GRAB_ICON_NATIVE@
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+CloseApplications=yes
+RestartApplications=yes
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [Files]
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+; The window (WebView2); needs the Edge WebView2 Runtime, see WebView2Installed below.
+Source: "@GRAB_STAGE_DIR_NATIVE@\grab-gui.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 ; Bundled rclone (MIT, notice in licenses\rclone.txt); grab prefers it over any on PATH.
 Source: "@GRAB_STAGE_DIR_NATIVE@\rclone.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\rclone.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
@@ -43,20 +55,57 @@ Source: "@GRAB_STAGE_DIR_NATIVE@\LICENSE"; DestDir: "{app}"; Flags: ignoreversio
 ; %VAR% entries unexpanded. ChangesEnvironment=yes makes Inno broadcast the change afterwards.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsAddPath(ExpandConstant('{app}\bin'))
 
+[Icons]
+; Per-user locations, so no admin rights are needed. Windows search finds the Start-menu entry.
+Name: "{userprograms}\grab"; Filename: "{app}\bin\grab-gui.exe"; WorkingDir: "{app}"; Comment: "Find and download files from your servers"
+Name: "{userdesktop}\grab"; Filename: "{app}\bin\grab-gui.exe"; WorkingDir: "{app}"; Comment: "Find and download files from your servers"; Tasks: desktopicon
+
 [UninstallDelete]
 ; Inno removes only directories it created. When {app} pre-existed (a developer ran
 ; `cmake --install` into the same folder) this at least removes the emptied bin folder; {app}
 ; itself still holds unins000.exe while this runs, so an empty {app} stays behind in that case.
-; %APPDATA%\grab is deliberately left alone.
+; %APPDATA%\grab is deliberately left alone; grab-gui's WebView2 profile (browser cache, not
+; settings) in %LOCALAPPDATA%\grab is removed.
 Type: files; Name: "{app}\bin\*.exe.old"
 Type: dirifempty; Name: "{app}\bin"
 Type: dirifempty; Name: "{app}\licenses"
+Type: filesandordirs; Name: "{localappdata}\grab\WebView2"
+Type: dirifempty; Name: "{localappdata}\grab"
 
 [Run]
 Filename: "{app}\bin\grab.exe"; Parameters: "--init"; Flags: runhidden waituntilterminated; StatusMsg: "Writing the default configuration to %APPDATA%\grab\grab.conf..."
-Filename: "{app}\bin\grab.exe"; Parameters: "config"; Description: "Open grab.conf for editing now"; Flags: postinstall nowait skipifsilent unchecked
+Filename: "{app}\bin\grab-gui.exe"; Description: "Launch grab"; Flags: postinstall nowait skipifsilent
 
 [Code]
+// The Edge WebView2 Runtime grab-gui renders with: its version ("pv") under the EdgeUpdate
+// client key, per machine or per user. See Microsoft's "Detect if a WebView2 Runtime is
+// already installed" guidance.
+function WebView2Installed(): Boolean;
+var
+  Version: string;
+  Key: string;
+begin
+  Key := 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  Result := False;
+  if RegQueryStringValue(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'pv', Version) or
+     RegQueryStringValue(HKLM64, Key, 'pv', Version) or
+     RegQueryStringValue(HKCU, Key, 'pv', Version) then
+    Result := (Version <> '') and (Version <> '0.0.0.0');
+#ifdef GRAB_TEST_NO_WEBVIEW2
+  Result := False;
+#endif
+end;
+
+// Without the runtime the grab command still works; say so on the last page instead of failing.
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and not WebView2Installed() then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'The grab window needs the Microsoft Edge WebView2 Runtime, which is not installed on this PC. ' +
+      'Get it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 (grab offers the link when it ' +
+      'starts, too). The grab command in a terminal works without it.';
+end;
+
 // True when Dir is not yet an entry of the user PATH. Whole-entry, case-insensitive match,
 // tolerant of a trailing backslash on the stored entry.
 function NeedsAddPath(Dir: string): Boolean;

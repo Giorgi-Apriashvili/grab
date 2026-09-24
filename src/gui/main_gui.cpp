@@ -260,13 +260,21 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
             if (!g.in_tray) {
                 g.in_tray = true;
                 notify(L"grab is still downloading",
-                              L"The downloads continue in the background, and grab closes when they finish. "
-                              L"Click the grab icon to open it again.",
-                              false);
+                       L"The downloads continue in the background, and grab closes when they finish. "
+                       L"Click the grab icon to open it again.",
+                       false);
             }
             return 0;
         }
         quit(hwnd);
+        return 0;
+    // Logoff, shutdown, or an installer closing grab-gui through the Restart Manager
+    // (ENDSESSION_CLOSEAPP): agree, then exit cleanly. Downloads are cancelled and their
+    // partial files removed; an installer update starts grab-gui again afterwards.
+    case WM_QUERYENDSESSION:
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wparam) quit(hwnd);
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, timer_tray);
@@ -355,6 +363,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     apply_theme(g.hwnd);
     ShowWindow(g.hwnd, show);
     UpdateWindow(g.hwnd);
+
+    // Lets an installer's Restart Manager start grab-gui again after an update; not after a
+    // crash, hang or reboot.
+    RegisterApplicationRestart(L"", RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
 
     g.wm_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     auto icon = [&](int metric) {

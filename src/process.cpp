@@ -151,8 +151,10 @@ struct StdHandles {
     bool exclusive = false;
 };
 
+// `contain_descendants` false: only the child itself is in the job; programs it starts are
+// not, so they outlive it (see RunOptions for run_inherit).
 std::expected<void, std::string> launch(std::span<const std::string> argv, const StdHandles& std_h,
-                                        bool no_window, Child& child) {
+                                        bool no_window, Child& child, bool contain_descendants = true) {
     if (argv.empty()) return util::fail("empty command");
 
     child.job.h = CreateJobObjectW(nullptr, nullptr);
@@ -161,6 +163,7 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!contain_descendants) limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
     SetInformationJobObject(child.job.h, JobObjectExtendedLimitInformation, &limits,
                             sizeof(limits));
 
@@ -310,12 +313,12 @@ std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
     return wait_exit(child); // a stopped job exits with exit_stopped
 }
 
-std::expected<int, std::string> run_inherit(std::span<const std::string> argv) {
+std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool contain_descendants) {
     const StdHandles std_h{GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE),
                            GetStdHandle(STD_ERROR_HANDLE), false};
     CtrlGuard guard;
     Child child;
-    if (auto r = launch(argv, std_h, false, child); !r) return util::fail(r.error());
+    if (auto r = launch(argv, std_h, false, child, contain_descendants); !r) return util::fail(r.error());
     return wait_exit(child);
 }
 
@@ -503,7 +506,7 @@ std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
     return opts.stop.stop_requested() ? exit_stopped : code;
 }
 
-std::expected<int, std::string> run_inherit(std::span<const std::string> argv) {
+std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool /*contain_descendants*/) {
     SigintGuard guard;
     auto pid = spawn(argv, nullptr, false);
     if (!pid) return util::fail(pid.error());
