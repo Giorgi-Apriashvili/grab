@@ -135,8 +135,16 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - If the file changed on the server in the meantime, it starts over.
   - When a stream runs out of work, it splits the busiest remaining range, so the end of a
     file doesn't trickle in over one connection.
-  - Folders are still copied by `rclone copy`: pausing stops it, and resuming skips the files
-    already finished.
+- **Folders** are listed once and shown as a tree under their row, collapsible with ▸/▾.
+  - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
+  - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
+    files.
+  - Files of 64 MiB and more take the resumable path above, up to three at a time.
+  - Smaller files go in one `rclone copy` batch that reuses its connections, since a new SSH
+    login per small file would dominate. Pausing drops the progress of small files that were
+    in flight.
+  - The tree and each file's state survive closing grab. Files already complete on disk are
+    not fetched again.
 - **Connections per server:** every download from a server shares that server's connection
   budget.
   - The budget is 8 for Hetzner Storage Boxes and 12 elsewhere. Set it per server in
@@ -355,6 +363,7 @@ src/util.*      strings, paths, environment src/main.cpp   the five steps
 src/engine.*    search + download for both  src/servers.*  server argv, host keys, conf edits
 src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
+src/folder.*    folder listing, rclone batch lines, which files the tree shows
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)

@@ -228,6 +228,33 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .stepper button { width: 24px; padding: 0; font-size: 14px; line-height: 1; }
 .stepper #parallel { min-width: 14px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
 .st-paused .q-bar > div { background: var(--muted); }
+
+/* a folder's files, as a tree under its row */
+.q-toggle {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1;
+  flex: none;
+}
+.q-toggle:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.q-tree { margin-top: 6px; font-size: 12px; }
+.q-child { display: flex; align-items: center; gap: 8px; min-height: 24px; padding-left: 4px; }
+.q-branch { color: var(--muted); font-family: "Cascadia Mono", Consolas, monospace; white-space: pre; }
+.q-cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+.q-summary .q-cname { color: var(--muted); }
+.q-cbar { width: 70px; height: 3px; background: var(--bar-bg); border-radius: 2px; overflow: hidden; flex: none; }
+.q-cbar > span { display: block; height: 100%; width: 0; background: var(--bar); transition: width 0.25s linear; }
+.cst-paused .q-cbar > span { background: var(--muted); }
+.q-cmeta { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
+.cst-failed .q-cmeta { color: var(--danger); }
+.q-cactions { display: flex; gap: 4px; }
+.q-cactions button { height: 20px; padding: 0 7px; font-size: 11px; }
 .q-note { color: var(--muted); }
 .queue { overflow-y: auto; }
 .q-item { padding: 7px 12px 8px; border-bottom: 1px solid var(--line); }

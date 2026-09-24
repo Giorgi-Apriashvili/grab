@@ -1,5 +1,6 @@
 #include "engine.hpp"
 
+#include "folder.hpp"
 #include "json.hpp"
 #include "listing.hpp"
 #include "match.hpp"
@@ -205,10 +206,13 @@ std::optional<Progress> parse_stats_line(std::string_view line) {
     if (const auto* list = stats->find("transferring");
         list != nullptr && list->kind == json::Value::Kind::array) {
         for (const auto& t : list->items) {
-            transferring_speed += number(t.find("speed")).value_or(0);
-            if (p.current.empty()) {
-                if (auto name = t.string_of("name")) p.current = *name;
-            }
+            const double speed = number(t.find("speed")).value_or(0);
+            transferring_speed += speed;
+            auto name = t.string_of("name");
+            if (!name) continue;
+            if (p.current.empty()) p.current = *name;
+            p.transferring.push_back(Transfer{*name, to_bytes(number(t.find("bytes")).value_or(0)),
+                                              to_bytes(number(t.find("size")).value_or(0)), speed});
         }
     }
     if (p.speed <= 0) p.speed = transferring_speed;
@@ -241,7 +245,7 @@ std::expected<DownloadResult, std::string>
 download(const Context& ctx, Mode mode, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run, std::span<const std::string> extra,
-         const CommandHook& on_command) {
+         const CommandHook& on_command, const std::function<void(const std::string&)>& on_copied) {
     const auto common = without_console_progress(ctx.settings.common_flags);
     const auto mode_flags = without_console_progress(
         mode == Mode::folder ? ctx.settings.folder_flags : ctx.settings.file_flags);
@@ -270,6 +274,8 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
                 if (on_progress) on_progress(*p);
             } else if (auto msg = parse_error_line(line)) {
                 result.last_error = std::move(*msg);
+            } else if (on_copied) {
+                if (auto name = folder::parse_copied_line(line)) on_copied(*name);
             }
         },
         run);

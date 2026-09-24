@@ -37,6 +37,15 @@ struct GuiState {
 
 [[nodiscard]] std::filesystem::path default_gui_state_path(); // <config>/grab/gui.json
 
+// One file of a folder download, as saved.
+struct SavedFile {
+    std::string path; // relative to the folder
+    std::uint64_t size = 0;
+    std::string modtime;
+    std::string state = "queued"; // "queued" | "paused" | "done" | "skipped"
+    bool operator==(const SavedFile&) const = default;
+};
+
 // An unfinished download, kept across restarts in <config>/grab/queue.json.
 struct SavedDownload {
     std::string remote;
@@ -45,6 +54,7 @@ struct SavedDownload {
     std::string name;
     std::string dest;
     std::uint64_t total = 0;
+    std::vector<SavedFile> files; // a folder's files, once it was listed
     bool operator==(const SavedDownload&) const = default;
 };
 

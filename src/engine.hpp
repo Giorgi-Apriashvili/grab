@@ -69,6 +69,14 @@ search(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run
                                                      const std::filesystem::path& dest_dir,
                                                      std::span<const std::string> extra = {});
 
+// One file rclone is transferring right now.
+struct Transfer {
+    std::string name; // relative to the source folder
+    std::uint64_t bytes = 0;
+    std::uint64_t size = 0;
+    double speed = 0;
+};
+
 // Live transfer state, parsed from rclone's --use-json-log stats lines.
 struct Progress {
     std::uint64_t bytes = 0;
@@ -76,6 +84,7 @@ struct Progress {
     double speed = 0;          // bytes per second
     std::optional<double> eta; // seconds
     std::string current;       // name of a file being transferred, if any
+    std::vector<Transfer> transferring;
 };
 
 // A stats line ({"stats":{...}}) as Progress; nullopt for any other line.
@@ -96,11 +105,12 @@ struct DownloadResult {
 std::size_t remove_partials(const std::filesystem::path& local_target, Mode mode);
 
 // Downloads with progress callbacks instead of a console progress bar (for the GUI). A
-// cancelled download's partial files are removed.
+// cancelled download's partial files are removed. `on_copied` gets each file rclone reports
+// copied (relative name); that needs rclone's info level (-v in `extra`).
 [[nodiscard]] std::expected<DownloadResult, std::string>
 download(const Context& ctx, Mode mode, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run = {}, std::span<const std::string> extra = {},
-         const CommandHook& on_command = {});
+         const CommandHook& on_command = {}, const std::function<void(const std::string&)>& on_copied = {});
 
 } // namespace grab::engine

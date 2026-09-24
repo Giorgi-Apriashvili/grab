@@ -548,7 +548,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         return tail;
     };
 
-    connections.join(d.server, d.id);
+    if (!d.joined) connections.join(d.server, d.id);
     auto stream = [&] {
         for (;;) {
             // A connection first: work found while waiting for one could be gone by then.
@@ -685,7 +685,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         }
     }
     streams.clear(); // join
-    connections.leave(d.server, d.id);
+    if (!d.joined) connections.leave(d.server, d.id);
     checkpoint();
 
     if (stop.stop_requested()) return Result{Outcome::stopped, {}, result.note};
