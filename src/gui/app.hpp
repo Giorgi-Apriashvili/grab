@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cli.hpp"
+#include "fetch.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
 #include "server_ops.hpp"
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -42,6 +44,7 @@ public:
     struct QueueSummary {
         int running = 0;
         int queued = 0;
+        int paused = 0;
         std::uint64_t bytes = 0; // of the running and queued items with a known size
         std::uint64_t total = 0;
     };
@@ -95,7 +98,9 @@ private:
         Secret secret;
         server_ops::HostKeys keys;
     };
-    enum class Status { queued, running, done, failed, cancelled };
+    enum class Status { queued, running, paused, done, failed, cancelled };
+    // Why a running download is being stopped.
+    enum class StopReason { none, pause, cancel };
     struct Item {
         int id = 0;
         std::string remote;
@@ -108,18 +113,25 @@ private:
         std::uint64_t total = 0;
         double speed = 0;
         std::optional<double> eta;
+        int connections = 0;
         std::string current;
         std::string error;
+        std::string note;
         std::stop_source stop;
+        StopReason stop_reason = StopReason::none;
     };
 
     void post(const json::Value& message) const;
     void send_init();
     void start_search(const json::Value& msg);
     void enqueue(const json::Value& msg);
-    void cancel_item(int id);
+    // Queue actions; `id` 0 means every item the action applies to.
+    void pause_items(int id);
+    void resume_items(int id);
+    void cancel_items(int id);
     void retry_item(int id);
     void clear_finished();
+    void set_parallel(int n);
     void pick_folder(std::wstring current);
     void pick_file(std::wstring current);
     void open_item_folder(int id);
@@ -139,13 +151,23 @@ private:
 
     void worker_loop(std::stop_token stop);
     void run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop);
+    void run_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
+    void run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
+    // The connection budget for a server, from grab.conf, its host and what grab learned.
+    [[nodiscard]] int connection_budget(const std::string& remote, const std::string& host,
+                                        std::optional<int> configured) const;
+    void on_budget_learned(const std::string& server, int budget); // any thread
     [[nodiscard]] json::Value queue_snapshot() const; // caller holds mutex_
     void post_queue();
+    void restore_queue();
+    void save_queue() const; // any thread; unfinished items, for the next start
 
     Host host_;
     std::filesystem::path config_path_;
     std::filesystem::path state_path_;
+    std::filesystem::path queue_path_;
     GuiState state_;
+    fetch::Connections connections_;
 
     std::jthread search_thread_;
 
@@ -154,12 +176,17 @@ private:
     std::atomic<bool> settings_busy_{false};
     std::jthread settings_thread_;
 
-    mutable std::mutex mutex_; // guards items_, next_id_, last_progress_post_
+    // Guards items_, next_id_, last_progress_post_, parallel_, learned_. Worker threads read the
+    // last two here rather than state_, which belongs to the UI thread.
+    mutable std::mutex mutex_;
     std::condition_variable_any wake_;
     std::vector<std::shared_ptr<Item>> items_;
     int next_id_ = 1;
+    int parallel_ = 4;
+    std::map<std::string, int> learned_;
     std::chrono::steady_clock::time_point last_progress_post_{};
-    std::jthread worker_; // last member: stopped and joined first
+    mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
+    std::vector<std::jthread> workers_; // last member: stopped and joined first
 };
 
 } // namespace grab::gui

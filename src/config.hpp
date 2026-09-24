@@ -25,6 +25,7 @@ struct RemoteSettings {
     std::vector<std::string> search_roots; // normalized; "" = login home; may be empty
     FindMethod find = FindMethod::auto_detect;
     int max_depth = 4;
+    std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
     bool skip_hidden = true;
     std::vector<std::string> ssh_options;
     std::vector<std::string> common_flags;

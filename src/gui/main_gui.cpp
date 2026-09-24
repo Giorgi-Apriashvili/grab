@@ -15,6 +15,8 @@
 #include <windowsx.h>
 
 #include <cstdint>
+#include <cwchar>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -24,7 +26,8 @@ using namespace grab;
 namespace {
 
 constexpr wchar_t window_class[] = L"grab.gui.window";
-constexpr wchar_t instance_mutex[] = L"Local\\grab.gui.single-instance";
+constexpr wchar_t instance_mutex[] = L"Local\\grab.gui.single-instance.";
+constexpr wchar_t instance_slot[] = L"Local\\grab.gui.window-handle.";
 constexpr UINT wm_post_json = WM_APP + 1; // lParam: std::string*
 constexpr UINT wm_run = WM_APP + 2;       // lParam: std::function<void()>*
 constexpr UINT wm_show = WM_APP + 3;      // from a second launch: bring the window back
@@ -57,6 +60,18 @@ bool may_exit_now() {
 void notify(std::wstring_view title, std::wstring_view text, bool error) {
     g.last_notice = GetTickCount64();
     g.tray.notify(title, text, error);
+}
+
+// A short stable name for a configuration folder (FNV-1a of its lower-cased path), so each
+// configuration gets its own single-instance lock.
+std::wstring instance_key(const std::filesystem::path& config_dir) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const wchar_t ch : util::to_wide(util::to_lower(util::path_to_utf8(config_dir)))) {
+        h = (h ^ static_cast<std::uint64_t>(ch)) * 1099511628211ULL;
+    }
+    wchar_t buf[17];
+    swprintf(buf, 17, L"%016llx", static_cast<unsigned long long>(h));
+    return buf;
 }
 
 bool system_uses_dark_theme() {
@@ -131,8 +146,10 @@ std::wstring tray_tip() {
     if (!g.app) return L"grab";
     const auto s = g.app->summary();
     const int active = s.running + s.queued;
-    if (active == 0) return L"grab";
-    std::wstring tip = L"grab: " + std::to_wstring(active) + L" downloading";
+    if (active == 0 && s.paused == 0) return L"grab";
+    std::wstring tip = L"grab:";
+    if (active > 0) tip += L" " + std::to_wstring(active) + L" downloading";
+    if (s.paused > 0) tip += std::wstring(active > 0 ? L"," : L"") + L" " + std::to_wstring(s.paused) + L" paused";
     if (s.total > 0) tip += L", " + std::to_wstring(s.bytes * 100 / s.total) + L"%";
     return tip;
 }
@@ -310,10 +327,20 @@ void place_window(HWND hwnd, const GuiState& state, int& show) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // One window: a second launch brings the first to the front, even from the tray.
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, instance_mutex);
-    if (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindWindowW(window_class, nullptr)) {
+    // One window per configuration (%APPDATA%\grab, or GRAB_CONFIG's folder): a second launch
+    // brings that window to the front, even from the tray. Its handle is published in a small
+    // named shared-memory slot next to the mutex.
+    const std::wstring key = instance_key(default_grab_config_path().parent_path());
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, (std::wstring(instance_mutex) + key).c_str());
+    const bool already_running = mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS;
+    HANDLE slot = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(std::uint64_t),
+                                     (std::wstring(instance_slot) + key).c_str());
+    auto* published = slot != nullptr
+                          ? static_cast<std::uint64_t*>(MapViewOfFile(slot, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(std::uint64_t)))
+                          : nullptr;
+    if (already_running) {
+        if (published != nullptr && *published != 0) {
+            HWND existing = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(*published));
             DWORD pid = 0;
             GetWindowThreadProcessId(existing, &pid);
             AllowSetForegroundWindow(pid); // this launch owns the foreground; hand it over
@@ -341,6 +368,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                              MulDiv(1100, static_cast<int>(dpi), 96), MulDiv(720, static_cast<int>(dpi), 96),
                              nullptr, nullptr, instance, nullptr);
     if (g.hwnd == nullptr) return 1;
+    if (published != nullptr) *published = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(g.hwnd));
 
     gui::App::Host host;
     host.hwnd = g.hwnd;
@@ -398,6 +426,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         DispatchMessageW(&msg);
     }
     CoUninitialize();
+    if (published != nullptr) UnmapViewOfFile(published);
+    if (slot != nullptr) CloseHandle(slot);
     if (mutex != nullptr) CloseHandle(mutex);
     return static_cast<int>(msg.wParam);
 }

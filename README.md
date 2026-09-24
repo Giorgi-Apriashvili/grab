@@ -120,8 +120,34 @@ installed exe has no VC redistributable dependency.
 
 `grab-gui.exe` (the **grab** Start-menu entry) is a window over the same engine: pick a server, search by words, select
 results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the
-download queue with live progress, cancel and retry. It reads the same grab.conf and
-remembers the last server, mode and destination per server in `%APPDATA%\grab\gui.json`.
+download queue with live progress. It reads the same grab.conf and remembers the last server,
+mode and destination per server in `%APPDATA%\grab\gui.json`.
+
+- **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4. Each
+  one can be paused, resumed or cancelled, or all together with Pause all / Resume all and
+  Cancel all.
+- **Resumable file downloads:** grab fetches a file in byte ranges, several `rclone cat`
+  streams at once, into `<name>.grabpart`. It records each range's progress in
+  `<name>.grabpart.json` and renames the file when it is complete.
+  - Pausing keeps both; resuming continues from the last saved bytes.
+  - This survives closing grab: unfinished downloads come back paused (the list is kept in
+    `%APPDATA%\grab\queue.json`).
+  - If the file changed on the server in the meantime, it starts over.
+  - When a stream runs out of work, it splits the busiest remaining range, so the end of a
+    file doesn't trickle in over one connection.
+  - Folders are still copied by `rclone copy`: pausing stops it, and resuming skips the files
+    already finished.
+- **Connections per server:** every download from a server shares that server's connection
+  budget.
+  - The budget is 8 for Hetzner Storage Boxes and 12 elsewhere. Set it per server in
+    Settings, or as `max_connections` in grab.conf.
+  - A lone download uses the whole budget; several split it fairly. A small file that can
+    only use one connection lends the rest to the others.
+  - Connections open slightly staggered. If a server refuses one, grab lowers that server's
+    budget and remembers it.
+  - Measured on a Storage Box, where each connection is capped at about 2.5 MB/s: 1
+    connection gives 2.5 MB/s, 8 give about 14 MB/s, and 14 about 19 MB/s. `rclone copyto`
+    reached about 5 MB/s.
 
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
   test, trust, make default and remove. Each server's search folders and depth are edited
@@ -307,6 +333,11 @@ Defaults (override per remote in grab.conf):
 | `folder_flags` | `--transfers 8 --checkers 8`                                                | more transfers hide per-file round trips on trees of small files; with rclone's default 4 streams that is ≤32 connections, which both test servers accepted without errors |
 | `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
+These flags drive the `grab` command. grab-gui fetches single files with its own ranged
+streams (see [GUI](#gui)) and uses `common_flags` for them; its connection count per server is
+`max_connections` (blank = automatic: 8 on Storage Boxes, 12 elsewhere, lowered when a
+server refuses connections).
+
 Concurrent SFTP connections ≈ `transfers × multi-thread-streams` (+ checkers). If the
 server logs `MaxStartups` drops, lower one of them. `--bwlimit` can be passed after `--`.
 `--sftp-disable-hashcheck` trades end-to-end checksum verification for speed; SSH already
@@ -323,6 +354,7 @@ src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix
 src/util.*      strings, paths, environment src/main.cpp   the five steps
 src/engine.*    search + download for both  src/servers.*  server argv, host keys, conf edits
 src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`
+src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)

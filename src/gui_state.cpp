@@ -3,6 +3,7 @@
 #include "json.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <fstream>
 
 namespace grab {
@@ -40,6 +41,12 @@ GuiState parse_gui_state(std::string_view json_text) {
             }
         }
     }
+    if (auto p = number(doc->find("parallel"))) s.parallel = std::clamp(*p, min_parallel, max_parallel);
+    if (const auto* l = doc->find("serverLimits"); l != nullptr && l->kind == json::Value::Kind::object) {
+        for (std::size_t i = 0; i < l->keys.size(); ++i) {
+            if (auto n = number(&l->items[i]); n && *n >= 1) s.server_limits[l->keys[i]] = *n;
+        }
+    }
     return s;
 }
 
@@ -60,7 +67,52 @@ std::string gui_state_to_json(const GuiState& state) {
     Value dest = Value::make_object();
     for (const auto& [remote, path] : state.destinations) dest.set(remote, Value::make_string(path));
     root.set("destinations", std::move(dest));
+    root.set("parallel", Value::make_number(state.parallel));
+    Value limits = Value::make_object();
+    for (const auto& [remote, n] : state.server_limits) limits.set(remote, Value::make_number(n));
+    root.set("serverLimits", std::move(limits));
     return json::stringify(root);
+}
+
+std::filesystem::path default_queue_path() { return util::config_home() / "grab" / "queue.json"; }
+
+std::vector<SavedDownload> parse_queue(std::string_view json_text) {
+    std::vector<SavedDownload> out;
+    auto doc = json::parse(json_text);
+    if (!doc || doc->kind != json::Value::Kind::array) return out;
+    for (const auto& v : doc->items) {
+        SavedDownload d;
+        auto remote = v.string_of("remote");
+        auto path = v.string_of("path");
+        auto dest = v.string_of("dest");
+        if (!remote || !path || !dest || remote->empty() || path->empty() || dest->empty()) continue;
+        d.remote = *remote;
+        d.path = *path;
+        d.dest = *dest;
+        d.mode = v.string_of("mode") == "folder" ? "folder" : "file";
+        d.name = v.string_of("name").value_or(*path);
+        if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
+            d.total = static_cast<std::uint64_t>(t->number);
+        }
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+std::string queue_to_json(const std::vector<SavedDownload>& items) {
+    using json::Value;
+    Value list = Value::make_array();
+    for (const auto& d : items) {
+        Value v = Value::make_object();
+        v.set("remote", Value::make_string(d.remote));
+        v.set("mode", Value::make_string(d.mode));
+        v.set("path", Value::make_string(d.path));
+        v.set("name", Value::make_string(d.name));
+        v.set("dest", Value::make_string(d.dest));
+        v.set("total", Value::make_number(static_cast<double>(d.total)));
+        list.push(std::move(v));
+    }
+    return json::stringify(list);
 }
 
 GuiState load_gui_state(const std::filesystem::path& p) {

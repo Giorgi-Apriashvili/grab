@@ -38,7 +38,7 @@ Value str(std::string s) { return Value::make_string(std::move(s)); }
 Value num(double n) { return Value::make_number(n); }
 
 const char* status_name(int s) {
-    constexpr const char* names[] = {"queued", "running", "done", "failed", "cancelled"};
+    constexpr const char* names[] = {"queued", "running", "paused", "done", "failed", "cancelled"}; // Status order
     return names[s];
 }
 
@@ -77,20 +77,32 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     : host_(std::move(host)),
       config_path_(std::move(config_path)),
       state_path_(std::move(state_path)),
+      queue_path_(state_path_.parent_path() / "queue.json"),
       state_(load_gui_state(state_path_)),
-      worker_([this](std::stop_token stop) { worker_loop(std::move(stop)); }) {}
+      connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
+    parallel_ = state_.parallel;
+    learned_ = state_.server_limits;
+    restore_queue();
+    // Up to max_parallel downloads at once; parallel_ decides how many actually run.
+    for (int i = 0; i < max_parallel; ++i) {
+        workers_.emplace_back([this](std::stop_token stop) { worker_loop(std::move(stop)); });
+    }
+}
 
 App::~App() {
     if (search_thread_.joinable()) search_thread_.request_stop();
     if (settings_thread_.joinable()) settings_thread_.request_stop();
     cancel_pending();
+    // Running downloads stop where they are: file downloads keep their partial file and come
+    // back paused on the next start (save_queue below records them as unfinished).
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->status == Status::running) item->stop.request_stop();
         }
     }
-    worker_.request_stop();
+    save_queue();
+    for (auto& w : workers_) w.request_stop();
     wake_.notify_all();
 }
 
@@ -111,6 +123,7 @@ App::QueueSummary App::summary() const {
     for (const auto& i : items_) {
         if (i->status == Status::running) ++s.running;
         else if (i->status == Status::queued) ++s.queued;
+        else if (i->status == Status::paused) ++s.paused;
         else continue;
         s.bytes += i->bytes;
         s.total += std::max(i->total, i->bytes);
@@ -142,7 +155,19 @@ void App::on_message(const std::string& text) {
     } else if (type == "enqueue") {
         enqueue(*msg);
     } else if (type == "cancelItem") {
-        cancel_item(int_of(*msg, "id"));
+        cancel_items(int_of(*msg, "id", -1));
+    } else if (type == "pauseItem") {
+        pause_items(int_of(*msg, "id", -1));
+    } else if (type == "resumeItem") {
+        resume_items(int_of(*msg, "id", -1));
+    } else if (type == "cancelAll") {
+        cancel_items(0);
+    } else if (type == "pauseAll") {
+        pause_items(0);
+    } else if (type == "resumeAll") {
+        resume_items(0);
+    } else if (type == "setParallel") {
+        set_parallel(int_of(*msg, "value", state_.parallel));
     } else if (type == "retryItem") {
         retry_item(int_of(*msg, "id"));
     } else if (type == "clearFinished") {
@@ -259,6 +284,7 @@ void App::send_init() {
     for (const auto& [remote, path] : state_.destinations) dests.set(remote, str(path));
     init.set("destinations", std::move(dests));
     init.set("defaultDest", str(known_folder(FOLDERID_Downloads)));
+    init.set("parallel", num(state_.parallel));
     post(init);
     post_queue();
 }
@@ -456,6 +482,15 @@ void App::post_servers(const server_ops::Env& env) const {
         for (const auto& r : s.search_roots) roots.push(str(r));
         v.set("roots", std::move(roots));
         v.set("depth", num(s.max_depth));
+        v.set("maxConnections", s.max_connections ? num(*s.max_connections) : Value{});
+        {
+            // The automatic value, lowered to what grab learned from refusals.
+            std::lock_guard lock(mutex_);
+            const auto it = learned_.find(s.name);
+            v.set("autoConnections",
+                  num(budget::effective_budget(std::nullopt, s.default_connections,
+                                               it == learned_.end() ? std::nullopt : std::optional(it->second))));
+        }
         v.set("error", str(s.error));
         v.set("host", str(s.host));
         v.set("user", str(s.user));
@@ -540,6 +575,10 @@ void App::save_server(const Value& msg) {
         return invalid("keyFile", "no such file");
     }
     if (s.max_depth < 1 || s.max_depth > 64) return invalid("depth", "a number from 1 to 64");
+    if (const int conns = int_of(msg, "connections"); conns != 0) { // 0 or missing: automatic
+        if (conns < 1 || conns > 64) return invalid("connections", "a number from 1 to 64, or blank for automatic");
+        s.max_connections = conns;
+    }
 
     settings_task([this, editing, s, secret, invalid](std::stop_token stop) {
         auto env = load_env();
@@ -604,6 +643,18 @@ void App::apply_pending(Pending p, std::stop_token stop) {
         break;
     }
     if (!done) return settings_error(done.error());
+    // An explicit connection limit replaces whatever grab learned for this server.
+    if (p.server.max_connections) {
+        const std::string name = p.server.name;
+        {
+            std::lock_guard lock(mutex_);
+            learned_.erase(name);
+        }
+        host_.defer([this, name] {
+            state_.server_limits.erase(name);
+            save_state();
+        });
+    }
 
     Value v = Value::make_object();
     v.set("type", str("serverSaved"));
@@ -682,18 +733,61 @@ void App::enqueue(const Value& msg) {
         }
     }
     wake_.notify_all();
+    save_queue();
     post_queue();
 }
 
-void App::cancel_item(int id) {
+void App::pause_items(int id) {
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
-            if (item->id != id) continue;
-            if (item->status == Status::queued) item->status = Status::cancelled;
-            else if (item->status == Status::running) item->stop.request_stop();
+            if (id != 0 && item->id != id) continue;
+            if (item->status == Status::queued) {
+                item->status = Status::paused;
+            } else if (item->status == Status::running && item->stop_reason == StopReason::none) {
+                item->stop_reason = StopReason::pause; // run_item marks it paused once stopped
+                item->stop.request_stop();
+            }
         }
     }
+    save_queue();
+    post_queue();
+}
+
+void App::resume_items(int id) {
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& item : items_) {
+            if ((id == 0 || item->id == id) && item->status == Status::paused) {
+                item->status = Status::queued;
+                item->note.clear();
+            }
+        }
+    }
+    wake_.notify_all();
+    save_queue();
+    post_queue();
+}
+
+void App::cancel_items(int id) {
+    std::vector<std::filesystem::path> discard; // partial files of downloads not running now
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& item : items_) {
+            if (id != 0 && item->id != id) continue;
+            if (item->status == Status::queued || item->status == Status::paused || item->status == Status::failed) {
+                item->status = Status::cancelled;
+                item->speed = 0;
+                item->eta.reset();
+                if (item->mode == Mode::file) discard.push_back(item->dest / util::path_from_utf8(item->name));
+            } else if (item->status == Status::running) {
+                item->stop_reason = StopReason::cancel;
+                item->stop.request_stop();
+            }
+        }
+    }
+    for (const auto& target : discard) fetch::discard(target);
+    save_queue();
     post_queue();
 }
 
@@ -702,17 +796,32 @@ void App::retry_item(int id) {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id == id && (item->status == Status::failed || item->status == Status::cancelled)) {
+                // A failed file download continues from its partial file; a cancelled one's
+                // was deleted, so it starts over.
                 item->status = Status::queued;
                 item->error.clear();
-                item->bytes = 0;
+                if (item->mode == Mode::folder || !fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
+                    item->bytes = 0;
+                }
                 item->speed = 0;
                 item->eta.reset();
-                item->stop = std::stop_source{};
             }
         }
     }
     wake_.notify_all();
+    save_queue();
     post_queue();
+}
+
+void App::set_parallel(int n) {
+    n = std::clamp(n, min_parallel, max_parallel);
+    state_.parallel = n;
+    save_state();
+    {
+        std::lock_guard lock(mutex_);
+        parallel_ = n; // more: waiting workers start now; fewer: running ones finish first
+    }
+    wake_.notify_all();
 }
 
 void App::clear_finished() {
@@ -751,17 +860,34 @@ void App::worker_loop(std::stop_token stop) {
         std::shared_ptr<Item> item;
         {
             std::unique_lock lock(mutex_);
-            auto next_queued = [&] {
-                auto it = std::ranges::find_if(items_, [](const auto& i) { return i->status == Status::queued; });
+            auto next_queued = [&]() -> std::shared_ptr<Item> {
+                const auto running = std::ranges::count_if(items_, [](const auto& i) { return i->status == Status::running; });
+                if (running >= parallel_) return nullptr;
+                // Never two downloads into the same file or folder at once: they would share
+                // one partial file.
+                auto same_target = [](const Item& a, const Item& b) {
+                    return a.name == b.name && a.dest == b.dest;
+                };
+                auto it = std::ranges::find_if(items_, [&](const auto& i) {
+                    return i->status == Status::queued && std::ranges::none_of(items_, [&](const auto& r) {
+                               return r->status == Status::running && same_target(*r, *i);
+                           });
+                });
                 return it == items_.end() ? nullptr : *it;
             };
             wake_.wait(lock, stop, [&] { return next_queued() != nullptr; });
             if (stop.stop_requested()) return;
             item = next_queued();
             item->status = Status::running;
+            item->stop = std::stop_source{};
+            item->stop_reason = StopReason::none;
+            item->error.clear();
         }
+        save_queue();
         post_queue();
         run_item(item, stop);
+        wake_.notify_all(); // a slot is free for the next queued download
+        save_queue();
         post_queue();
 
         Status status{};
@@ -780,65 +906,172 @@ void App::worker_loop(std::stop_token stop) {
 }
 
 void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) {
-    auto finish = [&](Status status, std::string error) {
-        std::lock_guard lock(mutex_);
-        item->status = status;
-        item->error = std::move(error);
-        item->speed = 0;
-        item->eta.reset();
-        item->current.clear();
-        if (status == Status::done && item->total > 0) item->bytes = item->total;
-    };
-
-    auto ctx = engine::load_context(config_path_, item->remote);
-    if (!ctx) return finish(Status::failed, ctx.error());
-    std::error_code ec;
-    std::filesystem::create_directories(item->dest, ec);
-    if (ec) {
-        return finish(Status::failed, std::format("cannot create {}: {}", util::path_to_utf8(item->dest),
-                                                  ec.message()));
-    }
-
     std::stop_token item_stop;
     {
         std::lock_guard lock(mutex_);
         item_stop = item->stop.get_token();
     }
-    // Closing the app cancels the running download too.
+    // Closing the app stops the running download too; it is resumed on the next start.
     std::stop_callback on_app_stop(app_stop, [item] { item->stop.request_stop(); });
 
-    proc::RunOptions run;
-    run.stop = item_stop;
-    run.detached = true;
-    auto result = engine::download(
-        *ctx, item->mode, item->path, item->dest,
-        [&](const engine::Progress& p) {
-            bool post_now = false;
-            {
-                std::lock_guard lock(mutex_);
+    std::error_code ec;
+    std::filesystem::create_directories(item->dest, ec);
+    if (ec) {
+        std::lock_guard lock(mutex_);
+        item->status = Status::failed;
+        item->error = std::format("cannot create {}: {}", util::path_to_utf8(item->dest), ec.message());
+        return;
+    }
+    if (item->mode == Mode::file) run_file(item, item_stop);
+    else run_folder(item, item_stop);
+
+    // A stopped download ends paused or cancelled, as asked; closing the app leaves it paused.
+    std::lock_guard lock(mutex_);
+    item->speed = 0;
+    item->eta.reset();
+    item->connections = 0;
+    item->current.clear();
+    if (item->status == Status::cancelled && item->mode == Mode::file) {
+        fetch::discard(item->dest / util::path_from_utf8(item->name));
+    }
+}
+
+int App::connection_budget(const std::string& remote, const std::string& host, std::optional<int> configured) const {
+    std::optional<int> learned;
+    {
+        std::lock_guard lock(mutex_);
+        if (auto it = learned_.find(remote); it != learned_.end()) learned = it->second;
+    }
+    return budget::effective_budget(configured, budget::default_budget(host), learned);
+}
+
+void App::on_budget_learned(const std::string& server, int budget) {
+    {
+        std::lock_guard lock(mutex_);
+        learned_[server] = budget;
+    }
+    host_.defer([this, server, budget] {
+        state_.server_limits[server] = budget;
+        save_state();
+    });
+}
+
+// Progress for the page, at most every progress_interval across all downloads.
+namespace {
+template <class Update>
+bool update_item(std::mutex& m, std::chrono::steady_clock::time_point& last_post, Update&& update) {
+    std::lock_guard lock(m);
+    update();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_post < progress_interval) return false;
+    last_post = now;
+    return true;
+}
+} // namespace
+
+void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop) {
+    auto set = [&](Status status, std::string error = {}, std::string note = {}) {
+        std::lock_guard lock(mutex_);
+        item->status = status;
+        item->error = std::move(error);
+        if (!note.empty()) item->note = std::move(note);
+    };
+    auto ctx = engine::load_context(config_path_, item->remote);
+    if (!ctx) return set(Status::failed, ctx.error());
+    connections_.configure(item->remote,
+                           connection_budget(item->remote, ctx->remote.host, ctx->settings.max_connections));
+
+    fetch::Download d;
+    d.source = fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, item->path,
+                             engine::without_console_progress(ctx->settings.common_flags)};
+    d.server = item->remote;
+    d.id = item->id;
+    d.target = item->dest / util::path_from_utf8(item->name);
+    const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {
+        if (update_item(mutex_, last_progress_post_, [&] {
                 item->bytes = p.bytes;
                 if (p.total > 0) item->total = p.total;
                 item->speed = p.speed;
                 item->eta = p.eta;
-                item->current = p.current;
-                const auto now = std::chrono::steady_clock::now();
-                if (now - last_progress_post_ >= progress_interval) {
-                    last_progress_post_ = now;
-                    post_now = true;
-                }
-            }
-            if (post_now) post_queue();
-        },
-        run);
+                item->connections = p.connections;
+            })) {
+            post_queue();
+        }
+    }, item_stop);
 
-    if (!result) return finish(Status::failed, result.error());
-    if (result->exit_code == 0) return finish(Status::done, {});
-    if (result->exit_code == proc::exit_stopped && item_stop.stop_requested()) {
-        return finish(Status::cancelled, {});
+    switch (result.outcome) {
+    case fetch::Outcome::done:
+        return set(Status::done, {}, result.note);
+    case fetch::Outcome::failed:
+        return set(Status::failed, result.error, result.note);
+    case fetch::Outcome::stopped:
+        break;
     }
-    finish(Status::failed, result->last_error.empty()
-                               ? std::format("rclone exited with code {}", result->exit_code)
-                               : result->last_error);
+    StopReason reason{};
+    {
+        std::lock_guard lock(mutex_);
+        reason = item->stop_reason;
+    }
+    set(reason == StopReason::cancel ? Status::cancelled : Status::paused);
+}
+
+// Folders still go through rclone copy, limited to this download's share of the server's
+// connections. Pausing stops it; resuming runs it again, and rclone skips the files it already
+// copied.
+void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop) {
+    auto set = [&](Status status, std::string error = {}) {
+        std::lock_guard lock(mutex_);
+        item->status = status;
+        item->error = std::move(error);
+    };
+    auto ctx = engine::load_context(config_path_, item->remote);
+    if (!ctx) return set(Status::failed, ctx.error());
+    connections_.configure(item->remote,
+                           connection_budget(item->remote, ctx->remote.host, ctx->settings.max_connections));
+    connections_.join(item->remote, item->id);
+    const int reserved = connections_.reserve(item->remote, item->id, item_stop);
+    std::optional<engine::DownloadResult> result;
+    std::string error;
+    if (reserved > 0) {
+        const std::vector<std::string> limit{"--transfers", std::to_string(reserved), "--sftp-connections",
+                                             std::to_string(reserved)};
+        proc::RunOptions run;
+        run.stop = item_stop;
+        run.detached = true;
+        {
+            std::lock_guard lock(mutex_);
+            item->connections = reserved;
+        }
+        auto r = engine::download(*ctx, Mode::folder, item->path, item->dest, [&](const engine::Progress& p) {
+            if (update_item(mutex_, last_progress_post_, [&] {
+                    item->bytes = p.bytes;
+                    if (p.total > 0) item->total = p.total;
+                    item->speed = p.speed;
+                    item->eta = p.eta;
+                    item->current = p.current;
+                })) {
+                post_queue();
+            }
+        }, run, limit);
+        if (r) result = *r;
+        else error = r.error();
+        connections_.release(item->remote, item->id, reserved);
+    }
+    connections_.leave(item->remote, item->id);
+
+    if (!error.empty()) return set(Status::failed, error);
+    if (result && result->exit_code == 0) return set(Status::done);
+    if (item_stop.stop_requested()) {
+        StopReason reason{};
+        {
+            std::lock_guard lock(mutex_);
+            reason = item->stop_reason;
+        }
+        return set(reason == StopReason::cancel ? Status::cancelled : Status::paused);
+    }
+    set(Status::failed, !result ? "rclone did not start"
+                        : result->last_error.empty() ? std::format("rclone exited with code {}", result->exit_code)
+                                                     : result->last_error);
 }
 
 json::Value App::queue_snapshot() const {
@@ -858,12 +1091,58 @@ json::Value App::queue_snapshot() const {
         v.set("eta", i->eta ? num(*i->eta) : Value{});
         v.set("current", str(i->current));
         v.set("error", str(i->error));
+        v.set("note", str(i->note));
+        v.set("connections", num(i->connections));
         list.push(std::move(v));
     }
     Value msg = Value::make_object();
     msg.set("type", str("queue"));
     msg.set("items", std::move(list));
+    msg.set("parallel", num(parallel_));
     return msg;
+}
+
+// Unfinished downloads from the last run come back paused, with their progress.
+void App::restore_queue() {
+    auto text = util::read_file(queue_path_);
+    if (!text) return;
+    for (const auto& saved : parse_queue(*text)) {
+        auto item = std::make_shared<Item>();
+        item->id = next_id_++;
+        item->remote = saved.remote;
+        item->mode = saved.mode == "folder" ? Mode::folder : Mode::file;
+        item->path = saved.path;
+        item->name = saved.name;
+        item->dest = util::path_from_utf8(saved.dest);
+        item->total = saved.total;
+        item->status = Status::paused;
+        if (item->mode == Mode::file) {
+            if (auto p = fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
+                item->bytes = p->first;
+                item->total = p->second;
+            }
+        }
+        items_.push_back(std::move(item));
+    }
+}
+
+void App::save_queue() const {
+    std::vector<SavedDownload> unfinished;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& i : items_) {
+            if (i->status == Status::done || i->status == Status::cancelled) continue;
+            unfinished.push_back(SavedDownload{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path,
+                                               i->name, util::path_to_utf8(i->dest), i->total});
+        }
+    }
+    std::lock_guard lock(queue_file_mutex_);
+    std::error_code ec;
+    if (unfinished.empty()) {
+        std::filesystem::remove(queue_path_, ec);
+        return;
+    }
+    (void)server_ops::write_text(queue_path_, queue_to_json(unfinished));
 }
 
 void App::post_queue() {

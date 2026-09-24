@@ -128,6 +128,13 @@
         <div><input id="f-depth" type="text" inputmode="numeric" class="num" value="4">
           <span class="hint inline-hint">folder levels below each search folder</span>
           <div class="field-error" data-for="depth"></div></div>
+
+        <label for="f-conns">Connections</label>
+        <div><input id="f-conns" type="text" inputmode="numeric" class="num">
+          <span class="hint inline-hint" id="conns-hint">blank = automatic</span>
+          <div class="hint">How many connections downloads may open to this server at once. More is faster on
+            servers that limit each connection; too many get refused. Automatic learns from refusals.</div>
+          <div class="field-error" data-for="connections"></div></div>
       </div>
       <div class="form-actions">
         <span class="muted small">Saving first checks the server's host key.</span>
@@ -144,6 +151,14 @@
     <span class="title">Downloads</span>
     <span id="dl-summary" class="muted"></span>
     <span class="spacer"></span>
+    <span class="stepper" title="How many downloads run at the same time (1–8)">
+      <span class="label">At once</span>
+      <button id="parallel-down" type="button" aria-label="Fewer at once">−</button>
+      <span id="parallel" aria-live="polite">4</span>
+      <button id="parallel-up" type="button" aria-label="More at once">+</button>
+    </span>
+    <button id="pause-all" type="button" class="subtle">Pause all</button>
+    <button id="cancel-all" type="button" class="subtle">Cancel all</button>
     <button id="clear-finished" type="button" class="subtle">Clear finished</button>
   </div>
   <div id="queue" class="queue"></div>

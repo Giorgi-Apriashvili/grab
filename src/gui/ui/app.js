@@ -1,7 +1,8 @@
 'use strict';
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, pickFolder, enqueue, cancelItem,
-//                 retryItem, clearFinished, openFolder,
+//                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
+//                 setParallel, clearFinished, openFolder,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, folderPicked, queue, error,
@@ -26,6 +27,7 @@ const state = {
   searchStarted: 0,
   lastQuery: '',
   queue: [],
+  parallel: 4,
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -255,7 +257,7 @@ function download(hits) {
   }
   showBanner('');
   // Skip anything already waiting or running for the same place.
-  const busy = new Set(state.queue.filter((q) => q.status === 'queued' || q.status === 'running')
+  const busy = new Set(state.queue.filter((q) => ['queued', 'running', 'paused'].includes(q.status))
     .map((q) => `${q.remote}|${q.path}|${q.dest}`));
   const items = hits.filter((h) => !busy.has(`${state.remote}|${h.path}|${dest}`))
     .map((h) => ({ path: h.path, name: h.name, size: h.size }));
@@ -287,37 +289,86 @@ function renderQueue() {
     el.querySelector('.q-name').title = `${q.remote}:${q.path}`;
     const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;
     el.querySelector('.q-bar > div').style.width = `${q.status === 'done' ? 100 : pct}%`;
+    const sizes = q.total ? `${fmtSize(q.bytes)} of ${fmtSize(q.total)}` : fmtSize(q.bytes);
     let meta = '';
     if (q.status === 'running') {
-      meta = q.total ? `${fmtSize(q.bytes)} of ${fmtSize(q.total)}` : fmtSize(q.bytes);
+      meta = sizes;
       if (q.speed > 0) meta += ` · ${fmtSize(q.speed)}/s`;
       const eta = fmtEta(q.eta);
       if (eta) meta += ` · ${eta}`;
+      if (q.connections > 0) meta += ` · ${q.connections} connection${q.connections === 1 ? '' : 's'}`;
+    } else if (q.status === 'paused' || (q.status === 'queued' && q.bytes > 0)) {
+      meta = `${q.status === 'paused' ? 'Paused' : 'Queued'} · ${sizes}`;
     } else {
       meta = { queued: 'Queued', done: q.total ? `Done · ${fmtSize(q.total)}` : 'Done', failed: 'Failed', cancelled: 'Cancelled' }[q.status];
     }
     el.querySelector('.q-meta').textContent = meta;
-    const actions = { queued: [['cancel', 'Cancel']], running: [['cancel', 'Cancel']], done: [['open', 'Show in folder']],
-      failed: [['retry', 'Retry']], cancelled: [['retry', 'Retry']] }[q.status];
-    const actionKey = actions.map((a) => a[0]).join(',');
+    const actions = {
+      queued: [['pause', 'Pause'], ['cancel', 'Cancel']],
+      running: [['pause', 'Pause'], ['cancel', 'Cancel']],
+      paused: [['resume', 'Resume'], ['cancel', 'Cancel']],
+      done: [['open', 'Show in folder']],
+      failed: [['retry', q.bytes > 0 ? 'Resume' : 'Retry'], ['cancel', 'Cancel']],
+      cancelled: [['retry', 'Retry']],
+    }[q.status];
+    const actionKey = actions.map((a) => a.join(':')).join(',');
     const actionBox = el.querySelector('.q-actions');
     if (actionBox.dataset.key !== actionKey) {
       actionBox.dataset.key = actionKey;
       actionBox.innerHTML = actions.map(([act, label]) => `<button type="button" data-act="${act}">${label}</button>`).join('');
     }
     const sub = el.querySelector('.q-sub');
-    sub.textContent = q.status === 'failed' && q.error ? q.error : `→ ${q.dest}`;
+    sub.textContent = q.status === 'failed' && q.error ? q.error : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`;
   }
   for (const [id, el] of queueEls) {
     if (!seen.has(id)) { el.remove(); queueEls.delete(id); }
   }
-  const running = state.queue.filter((q) => q.status === 'running').length;
-  const queued = state.queue.filter((q) => q.status === 'queued').length;
+  const count = (st) => state.queue.filter((q) => q.status === st).length;
+  const running = count('running');
+  const queued = count('queued');
+  const paused = count('paused');
   const parts = [];
   if (running) parts.push(`${running} running`);
   if (queued) parts.push(`${queued} queued`);
+  if (paused) parts.push(`${paused} paused`);
   $('#dl-summary').textContent = parts.join(' · ');
+  // Pause all while anything runs or waits; otherwise Resume all for paused ones.
+  const pauseAll = $('#pause-all');
+  const resuming = running + queued === 0 && paused > 0;
+  pauseAll.textContent = resuming ? 'Resume all' : 'Pause all';
+  pauseAll.dataset.act = resuming ? 'resumeAll' : 'pauseAll';
+  pauseAll.disabled = running + queued + paused === 0;
+  $('#cancel-all').disabled = running + queued + paused + count('failed') === 0;
   $('#clear-finished').disabled = !state.queue.some((q) => ['done', 'failed', 'cancelled'].includes(q.status));
+  renderParallel();
+}
+
+function renderParallel() {
+  $('#parallel').textContent = String(state.parallel);
+  $('#parallel-down').disabled = state.parallel <= 1;
+  $('#parallel-up').disabled = state.parallel >= 8;
+}
+
+function setParallel(n) {
+  n = Math.max(1, Math.min(8, n));
+  if (n === state.parallel) return;
+  state.parallel = n;
+  renderParallel();
+  send({ type: 'setParallel', value: n });
+}
+
+function cancelAll() {
+  const started = state.queue.some((q) => ['running', 'paused', 'failed'].includes(q.status) && q.bytes > 0);
+  if (!started) { send({ type: 'cancelAll' }); return; }
+  showModal({
+    title: 'Cancel all downloads?',
+    html: '<p>Every running, queued and paused download stops, and their partly downloaded files are deleted. ' +
+      'Finished downloads are kept.</p>',
+    ok: 'Cancel all',
+    danger: true,
+    cancel: 'Keep downloading',
+    onOk: () => send({ type: 'cancelAll' }),
+  });
 }
 
 // ---- messages from the backend -----------------------------------------------------------
@@ -329,6 +380,7 @@ function onInit(msg) {
   state.remote = msg.remote;
   state.mode = msg.mode;
   state.defaultDest = msg.defaultDest;
+  if (msg.parallel) state.parallel = msg.parallel;
   $('#version').textContent = `v${msg.version}`;
   renderRemotes();
   renderMode();
@@ -426,7 +478,8 @@ function serverCard(s) {
   const where = s.roots.length ? s.roots.join(', ') : '~';
   const meta = s.error
     ? `<span class="bad">${esc(s.error)}</span>`
-    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${AUTH_TEXT[s.auth]} · searched with ${s.search === 'ssh' ? 'ssh + find' : 'rclone listing'} in ${esc(where)}, depth ${s.depth}`;
+    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${AUTH_TEXT[s.auth]} · searched with ${s.search === 'ssh' ? 'ssh + find' : 'rclone listing'} in ${esc(where)}, depth ${s.depth}` +
+      ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}`;
   const status = [];
   if (!s.error) {
     status.push(s.pinned ? '<span class="good">✓ Host key pinned</span>'
@@ -488,6 +541,9 @@ function openForm(name) {
   $('#f-secret').value = '';
   $('#f-roots').value = s ? s.roots.join('\n') : '';
   $('#f-depth').value = s ? s.depth : 4;
+  $('#f-conns').value = s && s.maxConnections ? s.maxConnections : '';
+  $('#f-conns').placeholder = s ? String(s.autoConnections) : '';
+  $('#conns-hint').textContent = s ? `blank = automatic (now ${s.autoConnections})` : 'blank = automatic';
   setAuth(s ? s.auth : 'password');
   clearFieldErrors();
   showSettingsBanner('');
@@ -522,6 +578,7 @@ function submitForm() {
     secret: settings.auth === 'agent' ? '' : $('#f-secret').value,
     roots: $('#f-roots').value.split(/\r?\n/).map((r) => r.trim()).filter(Boolean),
     depth: intOf('#f-depth'),
+    connections: $('#f-conns').value.trim() === '' ? 0 : (intOf('#f-conns') || -1),
   });
   $('#f-secret').value = ''; // the backend holds it until the host key is trusted
   setStatus('Checking the host key…');
@@ -531,10 +588,11 @@ function submitForm() {
 
 let modal = null; // { onOk, onCancel }
 
-function showModal({ title, html, ok, danger = false, onOk, onCancel }) {
+function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel }) {
   modal = { onOk, onCancel };
   $('#modal-title').textContent = title;
   $('#modal-body').innerHTML = html;
+  $('#modal-cancel').textContent = cancel;
   const okBtn = $('#modal-ok');
   okBtn.textContent = ok;
   okBtn.classList.toggle('danger', danger);
@@ -575,7 +633,7 @@ function onServerError(msg) {
   if (target) {
     target.textContent = msg.message;
     const input = { name: '#f-name', host: '#f-host', port: '#f-port', user: '#f-user', keyFile: '#f-key',
-      secret: '#f-secret', depth: '#f-depth' }[msg.field];
+      secret: '#f-secret', depth: '#f-depth', connections: '#f-conns' }[msg.field];
     if (input) $(input).focus();
   } else if (settings.open) {
     showSettingsBanner(msg.message);
@@ -624,7 +682,11 @@ if (webview) {
       case 'searchResult': onSearchResult(msg); break;
       case 'searchError': onSearchError(msg); break;
       case 'folderPicked': $('#dest').value = msg.path; state.destinations[state.remote] = msg.path; break;
-      case 'queue': state.queue = msg.items; renderQueue(); break;
+      case 'queue':
+        state.queue = msg.items;
+        if (msg.parallel) state.parallel = msg.parallel;
+        renderQueue();
+        break;
       case 'error': showBanner(msg.message); break;
       case 'servers': settings.servers = msg.items; renderServers(); break;
       case 'settingsBusy':
@@ -719,12 +781,17 @@ $('#download').addEventListener('click', () => download(selectedHits()));
 $('#browse').addEventListener('click', () => send({ type: 'pickFolder', current: $('#dest').value.trim() }));
 $('#dest').addEventListener('change', (ev) => { state.destinations[state.remote] = ev.target.value.trim(); });
 $('#clear-finished').addEventListener('click', () => send({ type: 'clearFinished' }));
+$('#pause-all').addEventListener('click', (ev) => send({ type: ev.currentTarget.dataset.act || 'pauseAll' }));
+$('#cancel-all').addEventListener('click', cancelAll);
+$('#parallel-down').addEventListener('click', () => setParallel(state.parallel - 1));
+$('#parallel-up').addEventListener('click', () => setParallel(state.parallel + 1));
 
 $('#queue').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button[data-act]');
   if (!btn) return;
   const id = Number(btn.closest('.q-item').dataset.id);
-  const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder' }[btn.dataset.act];
+  const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder', pause: 'pauseItem',
+    resume: 'resumeItem' }[btn.dataset.act];
   send({ type, id });
 });
 

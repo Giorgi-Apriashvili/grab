@@ -2,6 +2,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <stop_token>
@@ -69,6 +70,37 @@ TEST_CASE("run_inherit: grandchildren die with the child unless released") {
     std::filesystem::remove_all(dir);
 }
 #endif
+
+TEST_CASE("run_piped streams stdout in chunks, captures stderr, and can stop early") {
+    // ~200 KB through the pipe, then a stderr line.
+#ifdef _WIN32
+    const char* script = "for /L %i in (1,1,2000) do @echo 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789& echo done 1>&2";
+#else
+    const char* script = "i=0; while [ $i -lt 2000 ]; do echo 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789; i=$((i+1)); done; echo done 1>&2";
+#endif
+    std::size_t bytes = 0;
+    std::size_t lines = 0;
+    auto r = proc::run_piped(shell(script), [&](std::string_view data) {
+        bytes += data.size();
+        lines += static_cast<std::size_t>(std::count(data.begin(), data.end(), '\n'));
+        return true;
+    });
+    REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+    CHECK(r->exit_code == 0);
+    CHECK(lines == 2000);
+    CHECK(bytes >= 2000 * 101);
+    CHECK(r->err.find("done") != std::string::npos);
+
+    // Returning false ends the child at once.
+    std::size_t first = 0;
+    auto stopped = proc::run_piped(shell(script), [&](std::string_view data) {
+        first += data.size();
+        return false;
+    });
+    REQUIRE(stopped.has_value());
+    CHECK(stopped->exit_code == proc::exit_stopped);
+    CHECK(first > 0);
+}
 
 TEST_CASE("detached run_capture captures stderr separately and needs no console") {
     proc::RunOptions opts;

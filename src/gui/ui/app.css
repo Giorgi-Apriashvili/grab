@@ -222,6 +222,13 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
   border-bottom: 1px solid var(--line);
 }
 .downloads-head .title { font-weight: 600; }
+.downloads-head button { height: 26px; font-size: 12px; }
+.stepper { display: inline-flex; align-items: center; gap: 4px; margin-right: 6px; font-size: 12px; }
+.stepper .label { margin-right: 2px; }
+.stepper button { width: 24px; padding: 0; font-size: 14px; line-height: 1; }
+.stepper #parallel { min-width: 14px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
+.st-paused .q-bar > div { background: var(--muted); }
+.q-note { color: var(--muted); }
 .queue { overflow-y: auto; }
 .q-item { padding: 7px 12px 8px; border-bottom: 1px solid var(--line); }
 .q-item:last-child { border-bottom: 0; }

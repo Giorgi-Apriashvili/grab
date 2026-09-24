@@ -219,6 +219,38 @@ TEST_CASE("editing search folders keeps comments and refreshes grab's descriptio
     CHECK(s.read("rclone.conf") == rclone_conf);
 }
 
+TEST_CASE("a server's connection limit is written only once set, and blank means automatic") {
+    Scratch s;
+    s.write("rclone.conf", rclone_conf);
+    s.write("grab.conf", grab_conf(s.dir));
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    CHECK_FALSE(server_ops::list_servers(*env)[0].max_connections.has_value());
+    CHECK(server_ops::list_servers(*env)[0].default_connections == 12);
+
+    auto wanted = server(Auth::password);
+    wanted.search_roots = {"/home/movies"};
+    REQUIRE(server_ops::update_server(*env, wanted, std::nullopt, std::nullopt).has_value());
+    CHECK(s.read("grab.conf").find("max_connections") == std::string::npos); // untouched while automatic
+
+    wanted.max_connections = 5;
+    env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(server_ops::update_server(*env, wanted, std::nullopt, std::nullopt).has_value());
+    CHECK(s.read("grab.conf").find("max_connections = 5\n") != std::string::npos);
+    env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    CHECK(server_ops::list_servers(*env)[0].max_connections == 5);
+
+    wanted.max_connections.reset();
+    REQUIRE(server_ops::update_server(*env, wanted, std::nullopt, std::nullopt).has_value());
+    CHECK(s.read("grab.conf").find("max_connections =\n") != std::string::npos);
+    env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    CHECK_FALSE(server_ops::list_servers(*env)[0].max_connections.has_value());
+
+    // Out of range is a config error.
+    s.write("grab.conf", grab_conf(s.dir) + "max_connections = 0\n");
+    CHECK_FALSE(server_ops::load_env(s.dir / "grab.conf", s.dir).has_value());
+}
+
 TEST_CASE("default server and removal with an explicit rclone.conf") {
     Scratch s;
     s.write("rclone.conf", rclone_conf);

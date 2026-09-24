@@ -110,11 +110,11 @@ struct Pipe {
     Handle write;
 };
 
-std::expected<void, std::string> make_pipe(Pipe& p, bool parent_reads) {
+std::expected<void, std::string> make_pipe(Pipe& p, bool parent_reads, DWORD size = 0) {
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&p.read.h, &p.write.h, &sa, 0)) {
+    if (!CreatePipe(&p.read.h, &p.write.h, &sa, size)) {
         return util::failf("cannot create pipe: {}", last_error_message(GetLastError()));
     }
     SetHandleInformation(parent_reads ? p.read.h : p.write.h, HANDLE_FLAG_INHERIT, 0);
@@ -313,6 +313,40 @@ std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
     return wait_exit(child); // a stopped job exits with exit_stopped
 }
 
+std::expected<PipedResult, std::string> run_piped(std::span<const std::string> argv,
+                                                  const std::function<bool(std::string_view)>& on_data,
+                                                  const RunOptions& opts) {
+    constexpr DWORD pipe_size = 1 << 20; // fewer round trips at full download speed
+    Pipe out;
+    if (auto r = make_pipe(out, true, pipe_size); !r) return util::fail(r.error());
+    Pipe err;
+    if (auto r = make_pipe(err, true); !r) return util::fail(r.error());
+    Handle null_in;
+    if (auto r = open_null(null_in); !r) return util::fail(r.error());
+
+    StdHandles std_h{null_in.h, out.write.h, err.write.h, true};
+    Child child;
+    if (auto r = launch(argv, std_h, true, child); !r) return util::fail(r.error());
+    out.write.close();
+    err.write.close();
+    std::stop_callback on_stop(opts.stop, [&] { TerminateJobObject(child.job.h, exit_stopped); });
+
+    PipedResult result;
+    std::jthread err_reader([&] { drain(err.read.h, [&](std::string_view s) { result.err += s; }); });
+    std::vector<char> buf(pipe_size);
+    DWORD n = 0;
+    while (ReadFile(out.read.h, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) && n > 0) {
+        if (!on_data(std::string_view(buf.data(), n))) {
+            TerminateJobObject(child.job.h, exit_stopped);
+            break;
+        }
+    }
+    out.read.close(); // a child still writing gets a broken pipe instead of blocking
+    err_reader.join();
+    result.exit_code = wait_exit(child);
+    return result;
+}
+
 std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool contain_descendants) {
     const StdHandles std_h{GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE),
                            GetStdHandle(STD_ERROR_HANDLE), false};
@@ -504,6 +538,59 @@ std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
     close(err[0]);
     const int code = wait_pid(*pid);
     return opts.stop.stop_requested() ? exit_stopped : code;
+}
+
+std::expected<PipedResult, std::string> run_piped(std::span<const std::string> argv,
+                                                  const std::function<bool(std::string_view)>& on_data,
+                                                  const RunOptions& opts) {
+    int out[2];
+    int err[2];
+    if (pipe(out) != 0) return util::failf("cannot create pipe: {}", std::strerror(errno));
+    if (pipe(err) != 0) {
+        close(out[0]);
+        close(out[1]);
+        return util::failf("cannot create pipe: {}", std::strerror(errno));
+    }
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
+    for (int fd : {out[0], out[1], err[0], err[1]}) posix_spawn_file_actions_addclose(&actions, fd);
+
+    auto pid = spawn(argv, &actions, true);
+    posix_spawn_file_actions_destroy(&actions);
+    close(out[1]);
+    close(err[1]);
+    if (!pid) {
+        close(out[0]);
+        close(err[0]);
+        return util::fail(pid.error());
+    }
+    bool stopped = false;
+    std::stop_callback on_stop(opts.stop, [&] { kill(-*pid, SIGTERM); });
+
+    PipedResult result;
+    std::jthread err_reader([&] { drain(err[0], [&](std::string_view s) { result.err += s; }); });
+    std::vector<char> buf(1 << 20);
+    for (;;) {
+        const ssize_t n = read(out[0], buf.data(), buf.size());
+        if (n > 0) {
+            if (!on_data(std::string_view(buf.data(), static_cast<std::size_t>(n)))) {
+                stopped = true;
+                kill(-*pid, SIGTERM);
+                break;
+            }
+        } else if (n == 0 || errno != EINTR) {
+            break;
+        }
+    }
+    close(out[0]);
+    err_reader.join();
+    close(err[0]);
+    const int code = wait_pid(*pid);
+    result.exit_code = stopped || opts.stop.stop_requested() ? exit_stopped : code;
+    return result;
 }
 
 std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool /*contain_descendants*/) {
