@@ -2,7 +2,8 @@
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
-//                 setParallel, clearFinished, openFolder,
+//                 setParallel, setLimit, clearFinished, openFolder,
+//                 pauseChild, resumeChild, skipChild,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, folderPicked, queue, error,
@@ -28,6 +29,8 @@ const state = {
   lastQuery: '',
   queue: [],
   parallel: 4,
+  limitOn: false,
+  limitMiBps: 5,
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -439,6 +442,50 @@ function renderQueue() {
   $('#cancel-all').disabled = running + queued + paused + count('failed') === 0;
   $('#clear-finished').disabled = !state.queue.some((q) => ['done', 'failed', 'cancelled'].includes(q.status));
   renderParallel();
+  renderTotalSpeed();
+}
+
+// ---- status bar: total speed and the speed limit -------------------------------------------
+
+function renderTotalSpeed() {
+  const running = state.queue.filter((q) => q.status === 'running');
+  const el = $('#total-speed');
+  if (!running.length) {
+    el.textContent = 'No downloads running';
+    el.classList.remove('limited');
+    return;
+  }
+  const speed = running.reduce((sum, q) => sum + (q.speed || 0), 0);
+  el.textContent = `↓ ${fmtSize(speed)}/s total · ${running.length} running${state.limitOn ? ' (limited)' : ''}`;
+  el.classList.toggle('limited', state.limitOn);
+}
+
+function fmtLimit(v) {
+  return String(Math.round(v * 10) / 10);
+}
+
+function renderLimit() {
+  $('#limit-on').checked = state.limitOn;
+  const box = $('#limit-value');
+  box.disabled = !state.limitOn;
+  if (document.activeElement !== box) box.value = fmtLimit(state.limitMiBps);
+  renderTotalSpeed();
+}
+
+function sendLimit() {
+  send({ type: 'setLimit', on: state.limitOn, mibps: state.limitMiBps });
+}
+
+// A new value from the box; anything that isn't a number from 0.1 to 10000 snaps back.
+function commitLimitValue() {
+  const box = $('#limit-value');
+  const v = Number(box.value.trim().replace(',', '.'));
+  if (Number.isFinite(v) && v >= 0.1 && v <= 10000) {
+    const changed = Math.abs(v - state.limitMiBps) > 1e-9;
+    state.limitMiBps = v;
+    if (changed) sendLimit();
+  }
+  box.value = fmtLimit(state.limitMiBps);
 }
 
 function renderParallel() {
@@ -479,6 +526,9 @@ function onInit(msg) {
   state.mode = msg.mode;
   state.defaultDest = msg.defaultDest;
   if (msg.parallel) state.parallel = msg.parallel;
+  if (typeof msg.limitOn === 'boolean') state.limitOn = msg.limitOn;
+  if (msg.limitMiBps) state.limitMiBps = msg.limitMiBps;
+  renderLimit();
   $('#version').textContent = `v${msg.version}`;
   renderRemotes();
   renderMode();
@@ -899,6 +949,17 @@ $('#dest').addEventListener('change', (ev) => { state.destinations[state.remote]
 $('#clear-finished').addEventListener('click', () => send({ type: 'clearFinished' }));
 $('#pause-all').addEventListener('click', (ev) => send({ type: ev.currentTarget.dataset.act || 'pauseAll' }));
 $('#cancel-all').addEventListener('click', cancelAll);
+$('#limit-on').addEventListener('change', (ev) => {
+  state.limitOn = ev.target.checked;
+  renderLimit();
+  sendLimit();
+  if (state.limitOn) $('#limit-value').focus();
+});
+$('#limit-value').addEventListener('change', commitLimitValue);
+$('#limit-value').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') { ev.preventDefault(); commitLimitValue(); ev.target.blur(); }
+  else if (ev.key === 'Escape') { ev.target.value = fmtLimit(state.limitMiBps); ev.target.blur(); }
+});
 $('#parallel-down').addEventListener('click', () => setParallel(state.parallel - 1));
 $('#parallel-up').addEventListener('click', () => setParallel(state.parallel + 1));
 

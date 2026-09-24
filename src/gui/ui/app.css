@@ -229,6 +229,38 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .stepper #parallel { min-width: 14px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
 .st-paused .q-bar > div { background: var(--muted); }
 
+/* status bar: total speed and the speed limit */
+.bar.status { flex: none; padding: 4px 14px 8px; font-size: 12px; }
+.bar.status #limit-value { width: 64px; height: 26px; text-align: right; }
+.bar.status #limit-value:disabled { opacity: 0.5; }
+.switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch .track {
+  position: relative;
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: var(--bar-bg);
+  border: 1px solid var(--line);
+  transition: background 0.15s;
+}
+.switch .track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--panel);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.3);
+  transition: transform 0.15s;
+}
+.switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(13px); }
+.switch input:focus-visible + .track { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+.limited { color: var(--accent); }
+
 /* a folder's files, as a tree under its row */
 .q-toggle {
   width: 22px;

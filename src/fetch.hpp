@@ -7,6 +7,7 @@
 // restarts. The streams of all downloads share each server's connection budget (conn_budget).
 
 #include "conn_budget.hpp"
+#include "rate.hpp"
 
 #include <condition_variable>
 #include <cstdint>
@@ -89,7 +90,10 @@ struct Source {
     std::vector<std::string> flags; // the remote's common flags, without console progress
 };
 [[nodiscard]] std::vector<std::string> stat_argv(const Source& src);
-[[nodiscard]] std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::uint64_t count);
+// `low_read_ahead`: under a speed limit, keep rclone from downloading far ahead of what grab
+// takes (--buffer-size 0, few SFTP requests in flight), so the network follows the limit.
+[[nodiscard]] std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::uint64_t count,
+                                                bool low_read_ahead = false);
 
 [[nodiscard]] std::filesystem::path part_path(const std::filesystem::path& target);  // <target>.grabpart
 [[nodiscard]] std::filesystem::path state_path(const std::filesystem::path& target); // <target>.grabpart.json
@@ -156,6 +160,8 @@ struct Download {
     // The caller already joined the pool under `id` and leaves it itself: a folder whose files
     // are fetched one after another (or several at once) as one pool user.
     bool joined = false;
+    // A speed limit shared with other downloads; nullptr or rate 0 = unlimited.
+    rate::RateLimiter* limiter = nullptr;
 };
 
 // Fetches `d.source` into `d.target`, continuing a partial download. Stopping keeps the partial

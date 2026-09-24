@@ -164,6 +164,18 @@
   <div id="queue" class="queue"></div>
 </section>
 
+<footer class="bar status">
+  <span id="total-speed" class="muted">No downloads running</span>
+  <span class="spacer"></span>
+  <label class="switch" title="Cap the combined speed of all downloads">
+    <input id="limit-on" type="checkbox" role="switch">
+    <span class="track" aria-hidden="true"></span>
+    <span>Limit speed</span>
+  </label>
+  <input id="limit-value" type="text" inputmode="decimal" class="num" aria-label="Speed limit in MiB/s">
+  <span class="muted">MiB/s</span>
+</footer>
+
 <div id="modal" class="modal-backdrop" hidden>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <h2 id="modal-title"></h2>
