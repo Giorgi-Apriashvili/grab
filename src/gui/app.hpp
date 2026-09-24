@@ -5,6 +5,7 @@
 #include "fetch.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "rate.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 
@@ -160,6 +161,8 @@ private:
     void skip_child(int id, const std::string& path);
     void clear_finished();
     void set_parallel(int n);
+    // The global download speed limit (UI thread).
+    void set_limit(bool on, double mibps);
     void pick_folder(std::wstring current);
     void pick_file(std::wstring current);
     void open_item_folder(int id);
@@ -202,6 +205,7 @@ private:
     std::filesystem::path queue_path_;
     GuiState state_;
     fetch::Connections connections_;
+    rate::RateLimiter limiter_; // shared by every download's streams
 
     std::jthread search_thread_;
 

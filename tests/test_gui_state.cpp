@@ -17,6 +17,8 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
     s.server_limits = {{"arch_guest", 7}};
+    s.limit_on = true;
+    s.limit_mibps = 2.5;
 
     CHECK(parse_gui_state(gui_state_to_json(s)) == s);
 
@@ -43,6 +45,8 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
     CHECK(load_gui_state("Z:\\definitely\\missing\\gui.json") == GuiState{});
 
     // Parallel downloads stay within 1..8; nonsense limits are dropped.
+    CHECK(parse_gui_state(R"({"limitMiBps":0})").limit_mibps == 5.0); // out of range: default
+    CHECK_FALSE(parse_gui_state(R"({"limitOn":"yes"})").limit_on);
     CHECK(parse_gui_state(R"({"parallel":0})").parallel == 1);
     CHECK(parse_gui_state(R"({"parallel":99})").parallel == 8);
     CHECK(parse_gui_state(R"({})").parallel == 4);

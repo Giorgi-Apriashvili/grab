@@ -8,6 +8,7 @@
 #include "match.hpp"
 #include "process.hpp"
 #include "quote.hpp"
+#include "rate.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
 #include "server_cli.hpp"
@@ -294,9 +295,14 @@ int run(const Options& opts) {
     std::vector<std::string> failed;
     bool stopped = false;
 
+    // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
+    std::vector<std::string> extra;
+    if (opts.limit) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
+    extra.insert(extra.end(), opts.extra.begin(), opts.extra.end());
+
     for (std::size_t i = 0; i < total; ++i) {
         const std::string& path = (*chosen)[i];
-        const auto rclone_argv = engine::download_argv(*ctx, opts.mode, path, dest, opts.extra);
+        const auto rclone_argv = engine::download_argv(*ctx, opts.mode, path, dest, extra);
         if (opts.verbose || opts.dry_run) {
             std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
         }

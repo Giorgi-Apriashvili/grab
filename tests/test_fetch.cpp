@@ -239,6 +239,10 @@ TEST_CASE("rclone command lines for ranges") {
     CHECK(has_pair(cat, "--count", "2000"));
     CHECK(has_pair(cat, "--config", "C:\\g\\rclone.conf"));
     CHECK(has_pair(cat, "--sftp-chunk-size", "255Ki"));
+    CHECK_FALSE(has_pair(cat, "--buffer-size", "0"));
+    const auto limited = fetch::cat_argv(src, 1000, 2000, true); // under a speed limit: no read-ahead
+    CHECK(has_pair(limited, "--buffer-size", "0"));
+    CHECK(has_pair(limited, "--sftp-concurrency", "4"));
     const auto stat = fetch::stat_argv(src);
     CHECK(stat[1] == "lsjson");
     CHECK(stat[2] == "--stat");

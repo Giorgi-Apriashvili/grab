@@ -221,9 +221,14 @@ std::vector<std::string> stat_argv(const Source& src) {
     return base_argv(src, {"lsjson", "--stat", remote_spec(src.rclone_remote, src.path)});
 }
 
-std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::uint64_t count) {
-    return base_argv(src, {"cat", remote_spec(src.rclone_remote, src.path), "--offset", std::to_string(offset),
-                           "--count", std::to_string(count)});
+std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::uint64_t count,
+                                  bool low_read_ahead) {
+    auto argv = base_argv(src, {"cat", remote_spec(src.rclone_remote, src.path), "--offset", std::to_string(offset),
+                                "--count", std::to_string(count)});
+    // Under a speed limit grab reads slowly, and rclone would otherwise keep downloading into its
+    // own read-ahead (16 MiB buffer plus 64 requests in flight, ~30 MB per stream) at full speed.
+    if (low_read_ahead) argv.insert(argv.end(), {"--buffer-size", "0", "--sftp-concurrency", "4"});
+    return argv;
 }
 
 fs::path part_path(const fs::path& target) {
@@ -575,11 +580,17 @@ Result run(const Download& d, Connections& connections, const std::function<void
             }
             std::uint64_t got = 0;
             bool write_failed = false;
-            bool yielded = false; // gave the connection to another download mid-range
+            bool yielded = false;  // gave the connection to another download mid-range
+            bool restarted = false; // the speed limit changed: start again with fitting flags
+            // The limit's setting this stream starts under; its read-ahead depends on it.
+            const std::uint64_t limit_generation = d.limiter != nullptr ? d.limiter->generation() : 0;
+            const bool limited = d.limiter != nullptr && d.limiter->rate() > 0;
             proc::RunOptions opts;
             opts.detached = true;
             opts.stop = token;
-            auto run = proc::run_piped(cat_argv(src, offset, count), [&](std::string_view data) {
+            auto run = proc::run_piped(cat_argv(src, offset, count, limited), [&](std::string_view data) {
+                // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
+                if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token)) return false;
                 {
                     // Under the lock: the range may have been shortened by a split meanwhile.
                     std::lock_guard lock(m);
@@ -600,10 +611,15 @@ Result run(const Download& d, Connections& connections, const std::function<void
                     yielded = true;
                     return false;
                 }
+                if (d.limiter != nullptr && d.limiter->generation() != limit_generation) {
+                    restarted = true;
+                    return false;
+                }
                 return true;
             }, opts);
             // A refusal before any data arrived means this server wants fewer connections.
-            const bool refused = run && run->exit_code != 0 && got == 0 && !yielded && !token.stop_requested() &&
+            const bool refused = run && run->exit_code != 0 && got == 0 && !yielded && !restarted &&
+                                 !token.stop_requested() &&
                                  budget::classify_failure(run->err) == budget::Failure::refused;
             if (refused) connections.refused(d.server);
             if (!yielded) connections.release(d.server, d.id);
@@ -612,7 +628,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
             busy[i] = 0;
             wake.notify_all();
             if (token.stop_requested()) return;
-            if (yielded) continue; // not a failure; wait for a connection again
+            if (yielded || restarted) continue; // not a failure; the range goes on from its bytes
             if (write_failed) {
                 error = "cannot write " + util::path_to_utf8(part) + " (disk full?)";
                 inner.request_stop();

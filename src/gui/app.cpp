@@ -103,6 +103,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     parallel_ = state_.parallel;
     learned_ = state_.server_limits;
+    if (state_.limit_on) limiter_.set_rate(static_cast<std::uint64_t>(state_.limit_mibps * 1024 * 1024));
     restore_queue();
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {
@@ -193,6 +194,10 @@ void App::on_message(const std::string& text) {
         if (type == "pauseChild") pause_child(id, path);
         else if (type == "resumeChild") resume_child(id, path);
         else skip_child(id, path);
+    } else if (type == "setLimit") {
+        const Value* mibps = msg->find("mibps");
+        set_limit(bool_of(*msg, "on"),
+                  mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps);
     } else if (type == "setParallel") {
         set_parallel(int_of(*msg, "value", state_.parallel));
     } else if (type == "retryItem") {
@@ -312,6 +317,8 @@ void App::send_init() {
     init.set("destinations", std::move(dests));
     init.set("defaultDest", str(known_folder(FOLDERID_Downloads)));
     init.set("parallel", num(state_.parallel));
+    init.set("limitOn", Value::make_bool(state_.limit_on));
+    init.set("limitMiBps", num(state_.limit_mibps));
     post(init);
     post_queue();
 }
@@ -929,6 +936,21 @@ void App::skip_child(int id, const std::string& path) {
     post_queue();
 }
 
+void App::set_limit(bool on, double mibps) {
+    if (!(mibps >= min_limit_mibps && mibps <= max_limit_mibps)) mibps = state_.limit_mibps; // also NaN
+    state_.limit_on = on;
+    state_.limit_mibps = mibps;
+    save_state();
+    // Streams through grab follow the new rate at once. rclone batches (a folder's small
+    // files) have theirs fixed at start, so running ones restart with the new cap; only their
+    // in-flight small files start over.
+    limiter_.set_rate(on ? static_cast<std::uint64_t>(mibps * 1024 * 1024) : 0);
+    std::lock_guard lock(mutex_);
+    for (auto& item : items_) {
+        if (item->batch_running) item->batch_stop.request_stop();
+    }
+}
+
 void App::set_parallel(int n) {
     n = std::clamp(n, min_parallel, max_parallel);
     state_.parallel = n;
@@ -1103,6 +1125,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.server = item->remote;
     d.id = item->id;
     d.target = item->dest / util::path_from_utf8(item->name);
+    d.limiter = &limiter_;
     const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {
         if (update_item(mutex_, last_progress_post_, [&] {
                 item->bytes = p.bytes;
@@ -1304,8 +1327,10 @@ void App::run_small_batch(const std::shared_ptr<Item>& item, const engine::Conte
 
     std::unordered_map<std::string, std::size_t> index; // path -> child
     std::stop_source batch;
+    int batches = 1; // running rclone batches, this one included: they split the speed limit
     {
         std::lock_guard lock(mutex_);
+        for (const auto& other : items_) batches += other->batch_running ? 1 : 0;
         for (std::size_t i = 0; i < item->children.size(); ++i) index.emplace(item->children[i].path, i);
         for (const auto& p : paths) {
             auto& c = item->children[index[p]];
@@ -1323,12 +1348,21 @@ void App::run_small_batch(const std::shared_ptr<Item>& item, const engine::Conte
     proc::RunOptions run;
     run.detached = true;
     run.stop = batch.get_token();
-    const std::vector<std::string> extra{"--files-from-raw", util::path_to_utf8(list), "--transfers",
-                                         std::to_string(reserved), "--sftp-connections", std::to_string(reserved),
-                                         "-v"};
+    std::vector<std::string> extra{"--files-from-raw", util::path_to_utf8(list), "--transfers",
+                                   std::to_string(reserved), "--sftp-connections", std::to_string(reserved), "-v"};
+    // rclone writes these files itself, so the speed limit reaches it as --bwlimit; its bytes
+    // are also charged to the shared limiter, which slows grab's own streams to match.
+    if (const auto limit = limiter_.rate(); limit > 0) {
+        extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(limit / static_cast<std::uint64_t>(batches))});
+    }
+    std::uint64_t charged = 0;
     auto result = engine::download(
         ctx, Mode::folder, item->path, item->dest,
         [&](const engine::Progress& p) {
+            if (p.bytes > charged) {
+                limiter_.debit(p.bytes - charged);
+                charged = p.bytes;
+            }
             const int conns = connections_.active(item->remote, item->id);
             if (update_item(mutex_, last_progress_post_, [&] {
                     for (const auto& t : p.transferring) {
@@ -1433,6 +1467,7 @@ void App::run_big_files(const std::shared_ptr<Item>& item, const engine::Context
             d.id = item->id;
             d.target = dir / util::path_from_utf8(path);
             d.joined = true;
+            d.limiter = &limiter_;
             std::error_code ec;
             std::filesystem::create_directories(d.target.parent_path(), ec);
             const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {

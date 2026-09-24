@@ -24,6 +24,8 @@ struct WindowPlacement {
 
 inline constexpr int min_parallel = 1;
 inline constexpr int max_parallel = 8;
+inline constexpr double min_limit_mibps = 0.1;
+inline constexpr double max_limit_mibps = 10000;
 
 struct GuiState {
     std::optional<WindowPlacement> window;
@@ -32,6 +34,8 @@ struct GuiState {
     std::map<std::string, std::string> destinations; // remote -> last destination folder
     int parallel = 4;                                // downloads at once, min_parallel..max_parallel
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
+    bool limit_on = false;                           // global download speed limit
+    double limit_mibps = 5.0;                        // its value, kept while switched off
     bool operator==(const GuiState&) const = default;
 };
 

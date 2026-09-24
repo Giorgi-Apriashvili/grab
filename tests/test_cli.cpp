@@ -88,6 +88,19 @@ TEST_CASE("positional count and option values are validated") {
     CHECK_FALSE(parse_args(args({"-f", "a", "b", "-r"})).has_value());
 }
 
+TEST_CASE("--limit takes a speed like rclone's --bwlimit") {
+    auto r = parse_args(args({"movie.mkv", "--limit", "5M"}));
+    REQUIRE(r.has_value());
+    CHECK(r->opts.limit == 5u * 1024 * 1024);
+    auto bare = parse_args(args({"movie.mkv", "--limit=2.5"}));
+    REQUIRE(bare.has_value());
+    CHECK(bare->opts.limit == 5u * 1024 * 1024 / 2); // a bare number is MiB/s
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--limit"})).has_value());
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--limit", "fast"})).has_value());
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--limit", "0"})).has_value());
+    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value());
+}
+
 TEST_CASE("help, version and init short-circuit") {
     auto h = parse_args(args({"--help"}));
     REQUIRE(h.has_value());

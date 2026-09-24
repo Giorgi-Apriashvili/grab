@@ -42,6 +42,13 @@ GuiState parse_gui_state(std::string_view json_text) {
         }
     }
     if (auto p = number(doc->find("parallel"))) s.parallel = std::clamp(*p, min_parallel, max_parallel);
+    if (const auto* on = doc->find("limitOn"); on != nullptr && on->kind == json::Value::Kind::boolean) {
+        s.limit_on = on->boolean;
+    }
+    if (const auto* v = doc->find("limitMiBps"); v != nullptr && v->kind == json::Value::Kind::number &&
+                                                  v->number >= min_limit_mibps && v->number <= max_limit_mibps) {
+        s.limit_mibps = v->number;
+    }
     if (const auto* l = doc->find("serverLimits"); l != nullptr && l->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < l->keys.size(); ++i) {
             if (auto n = number(&l->items[i]); n && *n >= 1) s.server_limits[l->keys[i]] = *n;
@@ -68,6 +75,8 @@ std::string gui_state_to_json(const GuiState& state) {
     for (const auto& [remote, path] : state.destinations) dest.set(remote, Value::make_string(path));
     root.set("destinations", std::move(dest));
     root.set("parallel", Value::make_number(state.parallel));
+    root.set("limitOn", Value::make_bool(state.limit_on));
+    root.set("limitMiBps", Value::make_number(state.limit_mibps));
     Value limits = Value::make_object();
     for (const auto& [remote, n] : state.server_limits) limits.set(remote, Value::make_number(n));
     root.set("serverLimits", std::move(limits));

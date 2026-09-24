@@ -135,6 +135,12 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - If the file changed on the server in the meantime, it starts over.
   - When a stream runs out of work, it splits the busiest remaining range, so the end of a
     file doesn't trickle in over one connection.
+- **Speed limit:** the bar below the downloads shows the total speed. On its right, "Limit
+  speed" caps all downloads together, in MiB/s; the switch keeps the value, and both are
+  remembered.
+  - Changes apply at once. Streams through grab are paced by a shared token bucket, and while
+    limited, rclone is told not to read ahead, so the network really follows the limit.
+  - A folder's small-file batch gets rclone's `--bwlimit` and counts against the same total.
 - **Folders** are listed once and shown as a tree under their row, collapsible with ▸/▾.
   - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
   - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
@@ -268,6 +274,7 @@ grab config [-c PATH]
   -r, --remote NAME    grab.conf section to use
   -c, --config PATH    grab.conf path
       --depth N        override max_depth for this run
+      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s)
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
@@ -364,6 +371,7 @@ src/engine.*    search + download for both  src/servers.*  server argv, host key
 src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    folder listing, rclone batch lines, which files the tree shows
+src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)

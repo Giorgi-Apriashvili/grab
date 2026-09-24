@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <optional>
@@ -18,6 +19,7 @@ struct Options {
     std::optional<std::string> remote;
     std::optional<std::filesystem::path> config;
     std::optional<int> depth;
+    std::optional<std::uint64_t> limit; // --limit: download speed cap, bytes per second
     bool first = false;
     bool all = false;                // --all: take every match without asking
     bool exact = false;              // --exact: whole-name, case-sensitive matching
