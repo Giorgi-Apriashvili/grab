@@ -5,6 +5,11 @@
 // for the exe too.
 APP_ICON ICON "grab.ico"
 
+// "grab" rather than "grab-gui.exe" in notifications, Task Manager and Properties.
+#define GRAB_FILE_DESCRIPTION "grab"
+#define GRAB_FILE_NAME "grab-gui.exe"
+#include "version.rc"
+
 UI_INDEX_HTML RCDATA "ui/index.html"
 UI_APP_CSS    RCDATA "ui/app.css"
 UI_APP_JS     RCDATA "ui/app.js"

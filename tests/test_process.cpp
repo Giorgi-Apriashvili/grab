@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <filesystem>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -44,6 +45,30 @@ TEST_CASE("run_inherit returns the exit code") {
     REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
     CHECK(*r == 3);
 }
+
+#ifdef _WIN32
+TEST_CASE("run_inherit: grandchildren die with the child unless released") {
+    // The child starts a grandchild (start /b) that writes a file about a second later, then
+    // exits at once. An installer relaunching grab-gui is such a grandchild.
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-descendants";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    auto run = [&](const char* name, bool contain) {
+        const auto file = dir / name;
+        // ^-escaped so the inner cmd, not this one, runs the redirections and the &. The temp
+        // path has no spaces (short names on CI), so no quotes are needed.
+        const std::string script =
+            "start /b cmd.exe /d /c ping -n 2 127.0.0.1 ^>nul ^& echo x^>" + file.string();
+        auto r = proc::run_inherit(shell(script.c_str()), contain);
+        REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        return std::filesystem::exists(file);
+    };
+    CHECK_FALSE(run("contained.txt", true));
+    CHECK(run("released.txt", false));
+    std::filesystem::remove_all(dir);
+}
+#endif
 
 TEST_CASE("detached run_capture captures stderr separately and needs no console") {
     proc::RunOptions opts;

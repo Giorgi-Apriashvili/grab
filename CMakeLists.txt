@@ -68,6 +68,16 @@ endif()
 add_executable(grab src/main.cpp src/server_cli.cpp)
 target_link_libraries(grab PRIVATE grab_core $<$<PLATFORM_ID:Windows>:shell32>)
 
+if(WIN32)
+    # Version info (Properties, Task Manager, notifications) for both programs; each .rc
+    # includes the configured <build>/version.rc.
+    configure_file(cmake/version.rc.in "${CMAKE_BINARY_DIR}/version.rc" @ONLY)
+    target_sources(grab PRIVATE src/grab.rc)
+    target_include_directories(grab PRIVATE "${CMAKE_BINARY_DIR}")
+    set_source_files_properties(src/grab.rc PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/version.rc;${CMAKE_CURRENT_SOURCE_DIR}/src/gui/grab.ico")
+endif()
+
 # ---------------------------------------------------------------------------
 # Bundled rclone (Windows): a pinned, checksum-verified rclone.exe ships next to grab.exe,
 # and grab prefers it over any rclone on PATH. rclone is MIT-licensed; its notice ships as
@@ -140,8 +150,9 @@ if(WIN32 AND GRAB_BUILD_GUI)
         src/gui/resources.cpp
         src/gui/grab-gui.rc)
     # The .rc embeds the UI files and the icon; rebuild it whenever one of them changes.
-    set_source_files_properties(src/gui/grab-gui.rc PROPERTIES OBJECT_DEPENDS "${GRAB_GUI_UI_FILES}")
-    target_include_directories(grab-gui PRIVATE src/gui)
+    set_source_files_properties(src/gui/grab-gui.rc PROPERTIES
+        OBJECT_DEPENDS "${GRAB_GUI_UI_FILES};${CMAKE_BINARY_DIR}/version.rc")
+    target_include_directories(grab-gui PRIVATE src/gui "${CMAKE_BINARY_DIR}")
     target_include_directories(grab-gui SYSTEM PRIVATE ${webview2_SOURCE_DIR}/build/native/include)
     target_link_libraries(grab-gui PRIVATE
         grab_core
@@ -175,7 +186,8 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Release artifacts: `cmake --build --preset <p> --target dist` writes to <build>/dist/
-#   grab-<version>-windows-x64.zip        portable: grab.exe, example config, README, LICENSE
+#   grab-<version>-windows-x64.zip        portable: grab.exe, grab-gui.exe, rclone.exe, example
+#                                         config, README, LICENSE
 #   grab-<version>-windows-x64-setup.exe  Inno Setup per-user installer, when ISCC is available
 # ---------------------------------------------------------------------------
 if(WIN32)
@@ -190,6 +202,7 @@ if(WIN32)
     # Inno Setup wants native paths; the script is generated from installer/grab.iss.in.
     file(TO_NATIVE_PATH "${GRAB_DIST_DIR}" GRAB_DIST_DIR_NATIVE)
     file(TO_NATIVE_PATH "${GRAB_STAGE_DIR}" GRAB_STAGE_DIR_NATIVE)
+    file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src/gui/grab.ico" GRAB_ICON_NATIVE)
     configure_file(installer/grab.iss.in "${CMAKE_BINARY_DIR}/installer/grab.iss" @ONLY)
 
     find_program(GRAB_ISCC NAMES iscc ISCC
@@ -198,11 +211,13 @@ if(WIN32)
               "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6"
         DOC "Inno Setup compiler (ISCC.exe); enables the installer half of the dist target")
 
-    if(NOT GRAB_BUNDLE_RCLONE)
-        message(STATUS "dist: GRAB_BUNDLE_RCLONE is OFF, so the dist target is not available")
+    # A release is always the full set, which `grab update` relies on (GRAB_RELEASE_PROGRAMS).
+    if(NOT GRAB_BUNDLE_RCLONE OR NOT GRAB_BUILD_GUI)
+        message(STATUS "dist: needs GRAB_BUNDLE_RCLONE and GRAB_BUILD_GUI, so the dist target is not available")
     else()
     set(GRAB_STAGED
         "${GRAB_STAGE_DIR}/grab.exe"
+        "${GRAB_STAGE_DIR}/grab-gui.exe"
         "${GRAB_STAGE_DIR}/rclone.exe"
         "${GRAB_STAGE_DIR}/licenses/rclone.txt"
         "${GRAB_STAGE_DIR}/grab.conf.example"
@@ -210,16 +225,17 @@ if(WIN32)
         "${GRAB_STAGE_DIR}/LICENSE")
     add_custom_command(OUTPUT ${GRAB_STAGED}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}/licenses"
-        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "${GRAB_RCLONE_EXE}" ${GRAB_EXTRA_FILES}
-                "${GRAB_STAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "$<TARGET_FILE:grab-gui>" "${GRAB_RCLONE_EXE}"
+                ${GRAB_EXTRA_FILES} "${GRAB_STAGE_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
                 "${GRAB_STAGE_DIR}/licenses/rclone.txt"
-        DEPENDS grab "${GRAB_RCLONE_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt" ${GRAB_EXTRA_FILES}
+        DEPENDS grab grab-gui "${GRAB_RCLONE_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
+                ${GRAB_EXTRA_FILES}
         COMMENT "Staging release files"
         VERBATIM)
     add_custom_command(OUTPUT "${GRAB_ZIP}"
         COMMAND ${CMAKE_COMMAND} -E tar cf "${GRAB_ZIP}" --format=zip --
-                grab.exe rclone.exe licenses/rclone.txt grab.conf.example README.md LICENSE
+                grab.exe grab-gui.exe rclone.exe licenses/rclone.txt grab.conf.example README.md LICENSE
         WORKING_DIRECTORY "${GRAB_STAGE_DIR}"
         DEPENDS ${GRAB_STAGED}
         COMMENT "Packing ${GRAB_ZIP}"
@@ -237,8 +253,21 @@ if(WIN32)
                     "dist: Inno Setup (ISCC.exe) not found, installer skipped; zip written to ${GRAB_DIST_DIR}"
             VERBATIM)
     endif()
-    endif() # GRAB_BUNDLE_RCLONE
+    endif() # GRAB_BUNDLE_RCLONE and GRAB_BUILD_GUI
 endif()
+
+# The programs a release ships next to grab.exe. `grab update` completes a portable folder
+# that lacks one (a v0.2.0 updater only extracted grab.exe).
+set(GRAB_RELEASE_PROGRAMS grab.exe)
+if(WIN32 AND GRAB_BUNDLE_RCLONE)
+    list(APPEND GRAB_RELEASE_PROGRAMS rclone.exe)
+endif()
+if(WIN32 AND GRAB_BUILD_GUI)
+    list(APPEND GRAB_RELEASE_PROGRAMS grab-gui.exe)
+endif()
+list(JOIN GRAB_RELEASE_PROGRAMS "," GRAB_RELEASE_PROGRAMS_CSV)
+set_property(SOURCE src/update.cpp APPEND PROPERTY
+    COMPILE_DEFINITIONS "GRAB_RELEASE_PROGRAMS=\"${GRAB_RELEASE_PROGRAMS_CSV}\"")
 
 # ---------------------------------------------------------------------------
 # Tests

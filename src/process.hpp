@@ -44,6 +44,10 @@ run_streaming(std::span<const std::string> argv, const std::function<void(std::s
               const RunOptions& opts = {});
 
 // Run argv[0] with all three streams inherited (live progress output). Returns its exit code.
-[[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv);
+// On Windows the child is in a kill-on-close Job object, and by default so is everything it
+// starts. `contain_descendants` false lets the child's own children leave the job, so they
+// outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
+[[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
+                                                          bool contain_descendants = true);
 
 } // namespace grab::proc

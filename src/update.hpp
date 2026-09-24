@@ -2,6 +2,7 @@
 
 #include <compare>
 #include <expected>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -49,7 +50,7 @@ struct Release {
 
 enum class InstallMode {
     installer, // installed by the Inno Setup installer: update by running the new installer
-    portable   // zip or `cmake --install`: swap grab.exe in place
+    portable   // zip or `cmake --install`: swap the programs in place
 };
 
 // grab-<v>-windows-x64-setup.exe or grab-<v>-windows-x64.zip
@@ -63,6 +64,23 @@ enum class InstallMode {
 // Windows directory equality: case-insensitive, '/' == '\', repeated and trailing separators
 // ignored (Inno stores InstallLocation with a trailing '\', so "<loc>\bin" doubles it).
 [[nodiscard]] bool same_dir(std::string_view a, std::string_view b);
+
+// The programs a release ships next to grab.exe: grab.exe, and rclone.exe and grab-gui.exe
+// when this build bundles them.
+[[nodiscard]] std::vector<std::string> release_programs();
+
+// Those of `programs` that are not files in `dir`, in the same order.
+[[nodiscard]] std::vector<std::string> missing_programs(const std::filesystem::path& dir,
+                                                        const std::vector<std::string>& programs);
+
+// Whether `grab update` should install `latest`: it is newer, or it is this very version and the
+// (portable) folder lacks some of its programs. A v0.2.0 updater extracted only grab.exe, so the
+// folder it updated needs completing. Never a downgrade.
+[[nodiscard]] bool needs_install(const Version& current, const Version& latest, bool folder_incomplete);
+
+// For grab's startup: "note: ... missing next to grab.exe; run `grab update` to add them" when
+// this is a portable copy lacking release programs, else nullopt. Windows only.
+[[nodiscard]] std::optional<std::string> incomplete_folder_note();
 
 // `grab update [--check]`. Prints progress and returns the process exit code.
 [[nodiscard]] int run(bool check_only);

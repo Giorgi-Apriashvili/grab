@@ -61,12 +61,18 @@ In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 
 Download from the [Releases page](https://github.com/Giorgi-Apriashvili/grab/releases):
 
-- `grab-x.y.z-windows-x64-setup.exe`: per-user installer, no admin rights. It puts `grab.exe`
-  in `%USERPROFILE%\programs\grab\bin`, adds that folder to your user PATH, writes a commented
-  default config to `%APPDATA%\grab\grab.conf` if you don't have one, and registers an
-  uninstaller (Settings → Apps) that removes the files and the PATH entry but keeps your config.
-- `grab-x.y.z-windows-x64.zip`: the same files without an installer. Unpack it anywhere,
-  keeping `rclone.exe` next to `grab.exe`, and run `grab server add` to set up a server.
+- `grab-x.y.z-windows-x64-setup.exe`: per-user installer, no admin rights.
+  - Installs `grab.exe`, the `grab-gui.exe` window and the bundled `rclone.exe` in
+    `%USERPROFILE%\programs\grab\bin`, and adds that folder to your user PATH.
+  - Adds a **grab** Start-menu entry (and optionally a desktop shortcut) for the window.
+  - Writes a starter config to `%APPDATA%\grab\grab.conf` if you don't have one.
+  - Registers an uninstaller (Settings → Apps) that removes the files, shortcuts, PATH entry
+    and the window's browser cache, but keeps your config and servers.
+  - If the Microsoft Edge WebView2 Runtime is missing, which is rare, the last page says so
+    and gives the download link. The `grab` command works without it.
+- `grab-x.y.z-windows-x64.zip`: the same programs without an installer. Unpack it anywhere,
+  keeping the three `.exe` files together. Then start `grab-gui.exe` and add a server in
+  Settings, or run `grab server add`.
 
 The installer is not code-signed, so SmartScreen shows "Windows protected your PC" the first
 time; choose "More info → Run anyway". The exe links the C runtime statically and has no other
@@ -83,10 +89,16 @@ grab update           # download, verify and install it over this copy
 asset and checks it against the release's `SHA256SUMS.txt`. It refuses anything that doesn't
 match. Nothing is changed before that check passes. A copy installed with the setup exe is
 upgraded by running the new installer silently, so Add/Remove Programs shows the new version.
-A portable or `cmake --install` copy has its `grab.exe` swapped in place. The replaced binary is
-left as `grab.exe.old` and removed the next time grab runs. It uses the `curl.exe` and `tar.exe`
-that ship with Windows 10 and later. Versions before 0.2.0 have no `update` command; install
-0.2.0 once from the Releases page.
+An open grab window is closed for the update and started again afterwards; downloads running in
+it are cancelled. A portable or `cmake --install` copy has its programs (`grab.exe`,
+`grab-gui.exe`, `rclone.exe`) swapped in place. The replaced files are left as `*.exe.old` and
+removed the next time grab runs. It uses the `curl.exe` and `tar.exe` that ship with Windows 10
+and later. Versions before 0.2.0 have no `update` command; install 0.2.0 once from the Releases
+page.
+
+Portable copies of 0.2.0: that version's updater replaces only `grab.exe`. Afterwards grab
+notices that `grab-gui.exe` and `rclone.exe` are missing and says so. Running `grab update` once
+more adds them, even when the version is already current.
 
 ### From source
 
@@ -94,7 +106,7 @@ that ship with Windows 10 and later. Versions before 0.2.0 have no `update` comm
 cmake --install build\clang-cl-release
 ```
 
-This puts `grab.exe` in `%USERPROFILE%\programs\grab\bin` (no admin rights needed) and
+This puts `grab.exe`, `grab-gui.exe` and `rclone.exe` in `%USERPROFILE%\programs\grab\bin` (no admin rights needed) and
 adds that directory to your user PATH, so `grab` works from any terminal opened afterwards.
 The PATH step is idempotent and keeps existing `%VAR%` entries intact; skip it with
 `-DGRAB_INSTALL_ADD_TO_PATH=OFF` at configure time, or install elsewhere with
@@ -104,9 +116,9 @@ whatever preset is active; "CMake: Install" from the Command Palette installs th
 preset's build instead. The Windows presets link the C runtime statically, so the
 installed exe has no VC redistributable dependency.
 
-## GUI (preview)
+## GUI
 
-`grab-gui.exe` is a window over the same engine: pick a server, search by words, select
+`grab-gui.exe` (the **grab** Start-menu entry) is a window over the same engine: pick a server, search by words, select
 results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the
 download queue with live progress, cancel and retry. It reads the same grab.conf and
 remembers the last server, mode and destination per server in `%APPDATA%\grab\gui.json`.
@@ -130,8 +142,8 @@ remembers the last server, mode and destination per server in `%APPDATA%\grab\gu
 - UI development: set `GRAB_UI_DIR` to `src\gui\ui` and grab-gui serves the page from there,
   so edits need only a reload (Debug builds have DevTools and F5).
 
-The GUI is built with the rest (`GRAB_BUILD_GUI=ON` by default). Installer integration comes
-later; for now run `build\<preset>\grab-gui.exe` directly.
+The GUI is built with the rest (`GRAB_BUILD_GUI=ON` by default); in a source build run
+`build\<preset>\grab-gui.exe`, or `cmake --install` it with grab.
 
 ## Configure
 
@@ -309,6 +321,10 @@ src/ini.*       INI reader (grab + rclone)  src/listing.*  rclone lsf lookup, gl
 src/config.*    grab.conf / rclone.conf     src/rclone.*   rclone argv for both modes
 src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix_spawn wrappers
 src/util.*      strings, paths, environment src/main.cpp   the five steps
+src/engine.*    search + download for both  src/servers.*  server argv, host keys, conf edits
+src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`
+src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
+installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)
 ```
 
@@ -331,7 +347,7 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
 
 - **[rclone](https://rclone.org)** v1.75.1, © Nick Craig-Wood, MIT license
   ([licenses/rclone.txt](licenses/rclone.txt)). `rclone.exe` ships next to `grab.exe`
-  (81 MB, which is why the installer is about 25 MB), and grab uses it rather than any rclone
+  (81 MB, which is why the installer is about 22 MB), and grab uses it rather than any rclone
   on PATH. Set `rclone = <path>` in `[grab]` to use another copy.
   - **Pin:** the build downloads the official Windows zip and checks it against the pinned
     SHA-256, which is rclone's own published `SHA256SUMS` value.
