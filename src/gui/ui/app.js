@@ -270,6 +270,95 @@ function download(hits) {
 }
 
 const queueEls = new Map(); // id -> element; updated in place so buttons don't flicker
+const folderOpen = new Map(); // folder id -> expanded, once the user toggled it
+
+// A folder download's files under its row:
+//   |--- 28 done · 2 skipped
+//   |--- Lecture 13.mp4   40% ...   [Pause][Skip]
+//   |--- …8 more queued
+// Open while the folder is active, folded when it is finished, unless the user toggled it.
+function renderTree(el, q) {
+  const toggle = el.querySelector('.q-toggle');
+  const tree = el.querySelector('.q-tree');
+  if (!q.files) {
+    toggle.hidden = true;
+    tree.hidden = true;
+    return;
+  }
+  const open = folderOpen.has(q.id) ? folderOpen.get(q.id) : !['done', 'cancelled'].includes(q.status);
+  toggle.hidden = false;
+  toggle.textContent = open ? '▾' : '▸';
+  toggle.title = open ? 'Hide files' : 'Show files';
+  tree.hidden = !open;
+  if (!open) return;
+
+  const finished = [];
+  if (q.files.done) finished.push(`${q.files.done} done`);
+  if (q.files.skipped) finished.push(`${q.files.skipped} skipped`);
+  const rows = new Map([...tree.querySelectorAll('.q-child')].map((r) => [r.dataset.key, r]));
+  const wanted = [];
+  if (finished.length) wanted.push({ key: ':done', text: finished.join(' · ') });
+  for (const c of q.children) wanted.push({ key: c.path, child: c });
+  if (q.moreQueued) wanted.push({ key: ':more', text: `…${q.moreQueued} more queued` });
+
+  let prev = null;
+  for (const w of wanted) {
+    let row = rows.get(w.key);
+    if (!row) {
+      row = document.createElement('div');
+      row.dataset.key = w.key;
+      row.innerHTML = '<span class="q-branch">|---</span><span class="q-cname"></span>' +
+        '<span class="q-cbar"><span></span></span><span class="q-cmeta"></span><span class="q-cactions"></span>';
+    }
+    rows.delete(w.key);
+    // Keep the order of `wanted` without re-creating rows (a row being clicked must survive).
+    const at = prev ? prev.nextSibling : tree.firstChild;
+    if (row !== at) tree.insertBefore(row, at);
+    prev = row;
+    if (!w.child) {
+      row.className = 'q-child q-summary';
+      row.querySelector('.q-cname').textContent = w.text;
+      row.querySelector('.q-cmeta').textContent = '';
+      row.querySelector('.q-cbar').hidden = true;
+      row.querySelector('.q-cactions').innerHTML = '';
+      continue;
+    }
+    const c = w.child;
+    row.className = `q-child cst-${c.status}`;
+    row.dataset.path = c.path;
+    const name = row.querySelector('.q-cname');
+    name.textContent = c.path;
+    name.title = c.path;
+    const bar = row.querySelector('.q-cbar');
+    bar.hidden = !(c.status === 'running' || c.status === 'paused' || c.bytes > 0);
+    bar.firstChild.style.width = `${c.size ? Math.min(100, (100 * c.bytes) / c.size) : 0}%`;
+    let meta;
+    if (c.status === 'running') {
+      meta = c.size ? `${fmtSize(c.bytes)} of ${fmtSize(c.size)}` : fmtSize(c.bytes);
+      if (c.speed > 0) meta += ` · ${fmtSize(c.speed)}/s`;
+      const eta = fmtEta(c.eta);
+      if (eta) meta += ` · ${eta}`;
+    } else if (c.status === 'paused') {
+      meta = `Paused · ${fmtSize(c.bytes)} of ${fmtSize(c.size)}`;
+    } else if (c.status === 'failed') {
+      meta = `Failed: ${c.error || 'error'}`;
+    } else {
+      meta = `Queued · ${fmtSize(c.size)}`;
+    }
+    row.querySelector('.q-cmeta').textContent = meta;
+    row.querySelector('.q-cmeta').title = c.status === 'failed' ? c.error : '';
+    const actions = c.status === 'paused' ? [['cresume', 'Resume'], ['cskip', 'Skip']]
+      : c.status === 'failed' ? [['cskip', 'Skip']]
+        : [['cpause', 'Pause'], ['cskip', 'Skip']];
+    const key = actions.map((a) => a[0]).join(',');
+    const box = row.querySelector('.q-cactions');
+    if (box.dataset.key !== key) {
+      box.dataset.key = key;
+      box.innerHTML = actions.map(([act, label]) => `<button type="button" data-act="${act}">${label}</button>`).join('');
+    }
+  }
+  for (const row of rows.values()) row.remove();
+}
 
 function renderQueue() {
   const panel = $('#downloads');
@@ -281,27 +370,32 @@ function renderQueue() {
     let el = queueEls.get(q.id);
     if (!el) {
       el = document.createElement('div');
-      el.innerHTML = '<div class="q-top"><span class="q-name"></span><span class="q-meta"></span><span class="q-actions"></span></div>' +
-        '<div class="q-bar"><div></div></div><div class="q-sub"></div>';
+      el.innerHTML = '<div class="q-top"><button type="button" class="q-toggle" data-act="toggle" hidden></button>' +
+        '<span class="q-name"></span><span class="q-meta"></span><span class="q-actions"></span></div>' +
+        '<div class="q-bar"><div></div></div><div class="q-sub"></div><div class="q-tree" hidden></div>';
       el.dataset.id = q.id;
       queueEls.set(q.id, el);
       box.appendChild(el);
     }
     el.className = `q-item st-${q.status}`;
-    el.querySelector('.q-name').textContent = q.name;
+    el.querySelector('.q-name').textContent = q.mode === 'folder' ? `${q.name}/` : q.name;
     el.querySelector('.q-name').title = `${q.remote}:${q.path}`;
     const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;
     el.querySelector('.q-bar > div').style.width = `${q.status === 'done' ? 100 : pct}%`;
     const sizes = q.total ? `${fmtSize(q.bytes)} of ${fmtSize(q.total)}` : fmtSize(q.bytes);
+    // A listed folder counts its files: "12 of 40 files · 2.1 of 5.6 GiB".
+    const files = q.files ? `${q.files.done} of ${q.files.total - q.files.skipped} files · ` : '';
     let meta = '';
     if (q.status === 'running') {
-      meta = sizes;
+      meta = files + sizes;
       if (q.speed > 0) meta += ` · ${fmtSize(q.speed)}/s`;
       const eta = fmtEta(q.eta);
       if (eta) meta += ` · ${eta}`;
       if (q.connections > 0) meta += ` · ${q.connections} connection${q.connections === 1 ? '' : 's'}`;
     } else if (q.status === 'paused' || (q.status === 'queued' && q.bytes > 0)) {
-      meta = `${q.status === 'paused' ? 'Paused' : 'Queued'} · ${sizes}`;
+      meta = `${q.status === 'paused' ? 'Paused' : 'Queued'} · ${files}${sizes}`;
+    } else if (q.status === 'done' && q.files) {
+      meta = `Done · ${q.files.done} files · ${fmtSize(q.total)}${q.files.skipped ? ` · ${q.files.skipped} skipped` : ''}`;
     } else {
       meta = { queued: 'Queued', done: q.total ? `Done · ${fmtSize(q.total)}` : 'Done', failed: 'Failed', cancelled: 'Cancelled' }[q.status];
     }
@@ -322,9 +416,10 @@ function renderQueue() {
     }
     const sub = el.querySelector('.q-sub');
     sub.textContent = q.status === 'failed' && q.error ? q.error : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`;
+    renderTree(el, q);
   }
   for (const [id, el] of queueEls) {
-    if (!seen.has(id)) { el.remove(); queueEls.delete(id); }
+    if (!seen.has(id)) { el.remove(); queueEls.delete(id); folderOpen.delete(id); }
   }
   const count = (st) => state.queue.filter((q) => q.status === st).length;
   const running = count('running');
@@ -811,8 +906,20 @@ $('#queue').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button[data-act]');
   if (!btn) return;
   const id = Number(btn.closest('.q-item').dataset.id);
+  const act = btn.dataset.act;
+  if (act === 'toggle') {
+    folderOpen.set(id, btn.textContent !== '▾');
+    renderQueue();
+    return;
+  }
+  const child = btn.closest('.q-child');
+  if (child) {
+    const type = { cpause: 'pauseChild', cresume: 'resumeChild', cskip: 'skipChild' }[act];
+    send({ type, id, path: child.dataset.path });
+    return;
+  }
   const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder', pause: 'pauseItem',
-    resume: 'resumeItem' }[btn.dataset.act];
+    resume: 'resumeItem' }[act];
   send({ type, id });
 });
 

@@ -51,8 +51,8 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
 }
 
 TEST_CASE("the download queue round-trips and skips incomplete entries") {
-    std::vector<SavedDownload> q{{"hetzner", "file", "/home/x/a.mkv", "a.mkv", "E:\\TV", 123456789012ULL},
-                                 {"arch_guest", "folder", "/home/music/Album", "Album", "D:\\Music", 0}};
+    std::vector<SavedDownload> q{{"hetzner", "file", "/home/x/a.mkv", "a.mkv", "E:\\TV", 123456789012ULL, {}},
+                                 {"arch_guest", "folder", "/home/music/Album", "Album", "D:\\Music", 0, {}}};
     CHECK(parse_queue(queue_to_json(q)) == q);
     CHECK(parse_queue("nope").empty());
     const auto partial = parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d"},{"remote":"b"},7])");

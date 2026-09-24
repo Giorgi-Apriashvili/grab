@@ -94,6 +94,21 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
         if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
             d.total = static_cast<std::uint64_t>(t->number);
         }
+        if (const auto* files = v.find("files"); files != nullptr && files->kind == json::Value::Kind::array) {
+            for (const auto& f : files->items) {
+                auto file_path = f.string_of("path");
+                if (!file_path || file_path->empty()) continue;
+                SavedFile sf;
+                sf.path = *file_path;
+                if (const auto* s = f.find("size"); s != nullptr && s->kind == json::Value::Kind::number && s->number > 0) {
+                    sf.size = static_cast<std::uint64_t>(s->number);
+                }
+                sf.modtime = f.string_of("modtime").value_or("");
+                const auto state = f.string_of("state").value_or("queued");
+                sf.state = state == "paused" || state == "done" || state == "skipped" ? state : "queued";
+                d.files.push_back(std::move(sf));
+            }
+        }
         out.push_back(std::move(d));
     }
     return out;
@@ -110,6 +125,18 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         v.set("name", Value::make_string(d.name));
         v.set("dest", Value::make_string(d.dest));
         v.set("total", Value::make_number(static_cast<double>(d.total)));
+        if (!d.files.empty()) {
+            Value files = Value::make_array();
+            for (const auto& f : d.files) {
+                Value fv = Value::make_object();
+                fv.set("path", Value::make_string(f.path));
+                fv.set("size", Value::make_number(static_cast<double>(f.size)));
+                fv.set("modtime", Value::make_string(f.modtime));
+                fv.set("state", Value::make_string(f.state));
+                files.push(std::move(fv));
+            }
+            v.set("files", std::move(files));
+        }
         list.push(std::move(v));
     }
     return json::stringify(list);

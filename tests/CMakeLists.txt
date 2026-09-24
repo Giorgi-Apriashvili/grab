@@ -30,6 +30,7 @@ add_executable(grab_tests
     test_servers.cpp
     test_server_ops.cpp
     test_fetch.cpp
+    test_folder.cpp
     test_update.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)

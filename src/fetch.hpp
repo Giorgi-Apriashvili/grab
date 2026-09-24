@@ -153,6 +153,9 @@ struct Download {
     std::string server; // grab.conf section: the connection pool
     int id = 0;         // the download's id in the pools
     std::filesystem::path target; // DEST\<name>
+    // The caller already joined the pool under `id` and leaves it itself: a folder whose files
+    // are fetched one after another (or several at once) as one pool user.
+    bool joined = false;
 };
 
 // Fetches `d.source` into `d.target`, continuing a partial download. Stopping keeps the partial
