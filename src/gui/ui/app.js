@@ -85,9 +85,11 @@ function renderRemoteInfo() {
 }
 
 function renderMode() {
-  for (const b of document.querySelectorAll('.segmented button')) {
+  for (const b of document.querySelectorAll('#search-form .segmented button')) {
     b.setAttribute('aria-checked', String(b.dataset.mode === state.mode));
   }
+  $('#query').placeholder = state.mode === 'folder' ? 'Search folders by name, e.g. lioness season 3'
+    : 'Search files by name, e.g. lioness s03e08';
 }
 
 // ---- banner and search -------------------------------------------------------------------
@@ -127,13 +129,13 @@ function onSearchResult(msg) {
   state.hits = msg.hits;
   state.cursor = state.hits.length ? 0 : -1;
   state.anchor = state.cursor;
-  setSearching(false);
-  $('#results').scrollTop = 0;
-  renderRows();
+  // Before rendering: an empty result shows "No files matching …" from these.
   const secs = (msg.elapsedMs / 1000).toFixed(1);
   state.resultNote = `${msg.hits.length} ${state.mode === 'folder' ? 'folder' : 'file'}${msg.hits.length === 1 ? '' : 's'} in ${secs} s`;
   state.searchedWhere = `${msg.roots.join(', ')}, depth ${msg.maxDepth}`;
-  renderSummary();
+  setSearching(false);
+  $('#results').scrollTop = 0;
+  renderRows(); // also renders the summary
   if (state.hits.length) $('#results').focus();
 }
 
@@ -190,7 +192,8 @@ function renderEmpty() {
     empty.innerHTML = '<div>No servers yet. Add the Linux server you want to download from.<br>' +
       '<button type="button" class="primary" data-act="add-server">Add a server</button></div>';
   } else {
-    empty.textContent = r && r.error ? r.error : 'Search a server by name. Every word must appear, in any order.';
+    empty.textContent = r && r.error ? r.error
+      : `Search ${state.remote || 'a server'} for ${state.mode === 'folder' ? 'folders' : 'files'} by name. Every word must appear, in any order.`;
   }
 }
 
@@ -723,14 +726,32 @@ $('#remote').addEventListener('change', (ev) => {
   send({ type: 'prefs', remote: state.remote });
 });
 
-for (const b of document.querySelectorAll('.segmented button')) {
-  b.addEventListener('click', () => {
-    if (state.mode === b.dataset.mode) return;
-    state.mode = b.dataset.mode;
-    renderMode();
-    send({ type: 'prefs', mode: state.mode });
-    if (state.lastQuery && !state.searching) startSearch(); // same words, other kind
-  });
+// Files and Folders are separate searches: switching starts clean and waits for new words.
+function switchMode(mode) {
+  if (state.mode === mode) return;
+  if (state.searching) {
+    send({ type: 'cancelSearch' });
+    setSearching(false);
+  }
+  state.searchId += 1; // a result still on its way belongs to the other mode: ignore it
+  state.mode = mode;
+  state.hits = [];
+  state.selected.clear();
+  state.cursor = state.anchor = -1;
+  state.lastQuery = '';
+  state.resultNote = '';
+  state.searchedWhere = '';
+  $('#query').value = '';
+  $('#results').scrollTop = 0;
+  showBanner('');
+  renderMode();
+  renderRows();
+  send({ type: 'prefs', mode });
+  $('#query').focus();
+}
+
+for (const b of document.querySelectorAll('#search-form .segmented button')) {
+  b.addEventListener('click', () => switchMode(b.dataset.mode));
 }
 
 $('#results').addEventListener('scroll', scheduleRows, { passive: true });
