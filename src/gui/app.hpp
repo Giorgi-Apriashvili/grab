@@ -138,6 +138,9 @@ private:
         std::string note;
         std::stop_source stop;
         StopReason stop_reason = StopReason::none;
+        // Bandwidth priority as a weight: high 4, normal 2, low 1. Atomic: running streams
+        // read it at every limiter request.
+        std::atomic<int> weight{2};
         // Folders: their files once listed, and the running small-file batch's stop (a file
         // paused or skipped in it restarts the batch without that file).
         bool listed = false;
@@ -161,6 +164,9 @@ private:
     void skip_child(int id, const std::string& path);
     void clear_finished();
     void set_parallel(int n);
+    // Queue order (`before` = another item's id, 0 = the end) and bandwidth priority.
+    void move_item(int id, int before);
+    void set_priority(int id, int weight);
     // The global download speed limit (UI thread).
     void set_limit(bool on, double mibps);
     void pick_folder(std::wstring current);

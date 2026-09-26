@@ -2,7 +2,7 @@
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
-//                 setParallel, setLimit, clearFinished, openFolder,
+//                 setParallel, setLimit, moveItem, setPriority, clearFinished, openFolder,
 //                 pauseChild, resumeChild, skipChild,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
@@ -368,19 +368,32 @@ function renderQueue() {
   panel.hidden = state.queue.length === 0;
   const box = $('#queue');
   const seen = new Set();
+  let prevEl = null;
   for (const q of state.queue) {
     seen.add(q.id);
     let el = queueEls.get(q.id);
     if (!el) {
       el = document.createElement('div');
-      el.innerHTML = '<div class="q-top"><button type="button" class="q-toggle" data-act="toggle" hidden></button>' +
-        '<span class="q-name"></span><span class="q-meta"></span><span class="q-actions"></span></div>' +
+      el.innerHTML = '<div class="q-top"><span class="q-handle" title="Drag to change the order">≡</span>' +
+        '<button type="button" class="q-toggle" data-act="toggle" hidden></button>' +
+        '<span class="q-name"></span>' +
+        '<select class="q-prio" title="Bandwidth priority: how running downloads share the speed" aria-label="Bandwidth priority">' +
+        '<option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select>' +
+        '<span class="q-meta"></span><span class="q-actions"></span></div>' +
         '<div class="q-bar"><div></div></div><div class="q-sub"></div><div class="q-tree" hidden></div>';
       el.dataset.id = q.id;
       queueEls.set(q.id, el);
-      box.appendChild(el);
     }
+    // Rows follow the queue order; moved in place, not re-created (a row may be mid-click).
+    const at = prevEl ? prevEl.nextSibling : box.firstChild;
+    if (el !== at) box.insertBefore(el, at);
+    prevEl = el;
     el.className = `q-item st-${q.status}`;
+    const active = ['queued', 'running', 'paused'].includes(q.status);
+    const prio = el.querySelector('.q-prio');
+    prio.hidden = !active;
+    prio.className = `q-prio prio-${q.priority}`;
+    if (document.activeElement !== prio) prio.value = q.priority;
     el.querySelector('.q-name').textContent = q.mode === 'folder' ? `${q.name}/` : q.name;
     el.querySelector('.q-name').title = `${q.remote}:${q.path}`;
     const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;
@@ -395,18 +408,22 @@ function renderQueue() {
       const eta = fmtEta(q.eta);
       if (eta) meta += ` · ${eta}`;
       if (q.connections > 0) meta += ` · ${q.connections} connection${q.connections === 1 ? '' : 's'}`;
-    } else if (q.status === 'paused' || (q.status === 'queued' && q.bytes > 0)) {
-      meta = `${q.status === 'paused' ? 'Paused' : 'Queued'} · ${files}${sizes}`;
+    } else if (q.status === 'queued') {
+      meta = `Queued · #${q.position}${q.bytes > 0 ? ` · ${files}${sizes}` : ''}`;
+    } else if (q.status === 'paused') {
+      meta = `Paused · ${files}${sizes}`;
     } else if (q.status === 'done' && q.files) {
       meta = `Done · ${q.files.done} files · ${fmtSize(q.total)}${q.files.skipped ? ` · ${q.files.skipped} skipped` : ''}`;
     } else {
       meta = { queued: 'Queued', done: q.total ? `Done · ${fmtSize(q.total)}` : 'Done', failed: 'Failed', cancelled: 'Cancelled' }[q.status];
     }
     el.querySelector('.q-meta').textContent = meta;
+    // Waiting rows can be moved in the queue: up, down, to the top.
+    const move = [['up', '↑', 'Move up'], ['down', '↓', 'Move down'], ['top', '⤒', 'Move to the top']];
     const actions = {
-      queued: [['pause', 'Pause'], ['cancel', 'Cancel']],
+      queued: [...move, ['pause', 'Pause'], ['cancel', 'Cancel']],
       running: [['pause', 'Pause'], ['cancel', 'Cancel']],
-      paused: [['resume', 'Resume'], ['cancel', 'Cancel']],
+      paused: [...move, ['resume', 'Resume'], ['cancel', 'Cancel']],
       done: [['open', 'Show in folder']],
       failed: [['retry', q.bytes > 0 ? 'Resume' : 'Retry'], ['cancel', 'Cancel']],
       cancelled: [['retry', 'Retry']],
@@ -415,7 +432,8 @@ function renderQueue() {
     const actionBox = el.querySelector('.q-actions');
     if (actionBox.dataset.key !== actionKey) {
       actionBox.dataset.key = actionKey;
-      actionBox.innerHTML = actions.map(([act, label]) => `<button type="button" data-act="${act}">${label}</button>`).join('');
+      actionBox.innerHTML = actions.map(([act, label, title]) =>
+        `<button type="button" data-act="${act}"${title ? ` class="q-move" title="${title}" aria-label="${title}"` : ''}>${label}</button>`).join('');
     }
     const sub = el.querySelector('.q-sub');
     sub.textContent = q.status === 'failed' && q.error ? q.error : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`;
@@ -979,9 +997,71 @@ $('#queue').addEventListener('click', (ev) => {
     send({ type, id, path: child.dataset.path });
     return;
   }
+  if (act === 'up' || act === 'down' || act === 'top') {
+    const idx = state.queue.findIndex((q) => q.id === id);
+    const ids = state.queue.map((q) => q.id);
+    const before = act === 'top' ? ids[0]
+      : act === 'up' ? ids[idx - 1]
+        : (idx + 2 < ids.length ? ids[idx + 2] : 0); // down: before the one after next, or the end
+    if (before !== undefined && before !== id && !(act === 'down' && idx === ids.length - 1)) {
+      send({ type: 'moveItem', id, before });
+    }
+    return;
+  }
   const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder', pause: 'pauseItem',
     resume: 'resumeItem' }[act];
   send({ type, id });
+});
+
+$('#queue').addEventListener('change', (ev) => {
+  if (!ev.target.matches('.q-prio')) return;
+  const id = Number(ev.target.closest('.q-item').dataset.id);
+  send({ type: 'setPriority', id, priority: ev.target.value });
+});
+
+// Drag a row by its ≡ handle to change the queue order.
+let dragId = 0;
+function clearDropMarks() {
+  for (const el of document.querySelectorAll('.drop-before, .drop-after')) el.classList.remove('drop-before', 'drop-after');
+}
+$('#queue').addEventListener('mousedown', (ev) => {
+  const handle = ev.target.closest('.q-handle');
+  if (handle) handle.closest('.q-item').draggable = true;
+});
+$('#queue').addEventListener('dragstart', (ev) => {
+  const item = ev.target.closest('.q-item');
+  if (!item || !item.draggable) return;
+  dragId = Number(item.dataset.id);
+  item.classList.add('dragging');
+  ev.dataTransfer.effectAllowed = 'move';
+  ev.dataTransfer.setData('text/plain', String(dragId));
+});
+$('#queue').addEventListener('dragover', (ev) => {
+  const item = ev.target.closest('.q-item');
+  if (!dragId || !item) return;
+  ev.preventDefault();
+  clearDropMarks();
+  const r = item.getBoundingClientRect();
+  item.classList.add(ev.clientY < r.top + r.height / 2 ? 'drop-before' : 'drop-after');
+});
+$('#queue').addEventListener('drop', (ev) => {
+  const item = ev.target.closest('.q-item');
+  if (!dragId || !item) return;
+  ev.preventDefault();
+  const r = item.getBoundingClientRect();
+  let before = Number(item.dataset.id);
+  if (ev.clientY >= r.top + r.height / 2) {
+    const next = item.nextElementSibling;
+    before = next ? Number(next.dataset.id) : 0;
+  }
+  if (before !== dragId) send({ type: 'moveItem', id: dragId, before });
+  clearDropMarks();
+});
+$('#queue').addEventListener('dragend', (ev) => {
+  const item = ev.target.closest('.q-item');
+  if (item) { item.draggable = false; item.classList.remove('dragging'); }
+  dragId = 0;
+  clearDropMarks();
 });
 
 $('#empty').addEventListener('click', (ev) => {

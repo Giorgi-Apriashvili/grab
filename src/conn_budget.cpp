@@ -41,21 +41,34 @@ const ServerPool::User* ServerPool::find(int id) const {
     return it == users_.end() ? nullptr : &*it;
 }
 
-void ServerPool::add_user(int id) {
-    if (find(id) == nullptr) users_.push_back(User{id, 0});
+void ServerPool::add_user(int id, int weight) {
+    if (find(id) == nullptr) users_.push_back(User{id, 0, 0, std::max(weight, 1)});
+}
+
+void ServerPool::set_weight(int id, int weight) {
+    auto it = std::ranges::find(users_, id, &User::id);
+    if (it != users_.end()) it->weight = std::max(weight, 1);
 }
 
 void ServerPool::remove_user(int id) { std::erase_if(users_, [&](const User& u) { return u.id == id; }); }
 
 int ServerPool::share(int id) const {
-    const int n = users();
-    if (n == 0) return 0;
     const auto it = std::ranges::find(users_, id, &User::id);
     if (it == users_.end()) return 0;
-    const int index = static_cast<int>(it - users_.begin());
-    const int base = budget_ / n;
-    const int extra = index < budget_ % n ? 1 : 0;
-    return std::max(1, base + extra);
+    long long total_weight = 0;
+    for (const auto& u : users_) total_weight += u.weight;
+    // Rounded-down weighted shares; what they leave of the budget goes one each to the
+    // heaviest users, oldest first among equals.
+    int given = 0;
+    for (const auto& u : users_) given += static_cast<int>(static_cast<long long>(budget_) * u.weight / total_weight);
+    const int remainder = budget_ - given;
+    int ahead = 0; // users that get a remainder connection before this one
+    const auto index = it - users_.begin();
+    for (auto u = users_.begin(); u != users_.end(); ++u) {
+        if (u->weight > it->weight || (u->weight == it->weight && u - users_.begin() < index)) ++ahead;
+    }
+    const int base = static_cast<int>(static_cast<long long>(budget_) * it->weight / total_weight);
+    return std::max(1, base + (ahead < remainder ? 1 : 0));
 }
 
 int ServerPool::active(int id) const {

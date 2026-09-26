@@ -83,6 +83,18 @@ std::string gui_state_to_json(const GuiState& state) {
     return json::stringify(root);
 }
 
+bool move_before(std::vector<int>& ids, int id, int before) {
+    if (id == before) return false;
+    const auto from = std::ranges::find(ids, id);
+    if (from == ids.end()) return false;
+    if (before != 0 && std::ranges::find(ids, before) == ids.end()) return false;
+    const std::vector<int> old = ids;
+    ids.erase(from);
+    const auto to = before == 0 ? ids.end() : std::ranges::find(ids, before);
+    ids.insert(to, id);
+    return ids != old;
+}
+
 std::filesystem::path default_queue_path() { return util::config_home() / "grab" / "queue.json"; }
 
 std::vector<SavedDownload> parse_queue(std::string_view json_text) {
@@ -100,6 +112,7 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
         d.dest = *dest;
         d.mode = v.string_of("mode") == "folder" ? "folder" : "file";
         d.name = v.string_of("name").value_or(*path);
+        if (auto p = v.string_of("priority"); p == "high" || p == "low") d.priority = *p;
         if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
             d.total = static_cast<std::uint64_t>(t->number);
         }
@@ -134,6 +147,7 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         v.set("name", Value::make_string(d.name));
         v.set("dest", Value::make_string(d.dest));
         v.set("total", Value::make_number(static_cast<double>(d.total)));
+        v.set("priority", Value::make_string(d.priority));
         if (!d.files.empty()) {
             Value files = Value::make_array();
             for (const auto& f : d.files) {

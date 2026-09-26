@@ -54,10 +54,26 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
           std::map<std::string, int>{{"a", 3}});
 }
 
+TEST_CASE("queue order: move an item before another, or to the end") {
+    std::vector<int> ids{1, 2, 3, 4};
+    CHECK(move_before(ids, 4, 1)); // to the top
+    CHECK(ids == std::vector<int>{4, 1, 2, 3});
+    CHECK(move_before(ids, 4, 0)); // to the end
+    CHECK(ids == std::vector<int>{1, 2, 3, 4});
+    CHECK(move_before(ids, 1, 3)); // down, before 3
+    CHECK(ids == std::vector<int>{2, 1, 3, 4});
+    CHECK_FALSE(move_before(ids, 1, 3)); // already there
+    CHECK_FALSE(move_before(ids, 2, 2));
+    CHECK_FALSE(move_before(ids, 9, 1));
+    CHECK_FALSE(move_before(ids, 1, 9));
+    CHECK(ids == std::vector<int>{2, 1, 3, 4});
+}
+
 TEST_CASE("the download queue round-trips and skips incomplete entries") {
-    std::vector<SavedDownload> q{{"hetzner", "file", "/home/x/a.mkv", "a.mkv", "E:\\TV", 123456789012ULL, {}},
-                                 {"arch_guest", "folder", "/home/music/Album", "Album", "D:\\Music", 0, {}}};
+    std::vector<SavedDownload> q{{"hetzner", "file", "/home/x/a.mkv", "a.mkv", "E:\\TV", 123456789012ULL, {}, "high"},
+                                 {"arch_guest", "folder", "/home/music/Album", "Album", "D:\\Music", 0, {}, "low"}};
     CHECK(parse_queue(queue_to_json(q)) == q);
+    CHECK(parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d","priority":"urgent"}])")[0].priority == "normal");
     CHECK(parse_queue("nope").empty());
     const auto partial = parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d"},{"remote":"b"},7])");
     REQUIRE(partial.size() == 1);

@@ -74,6 +74,28 @@ void TokenBucket::debit(std::uint64_t n, Clock::time_point now) {
     tokens_ -= static_cast<double>(n);
 }
 
+// ---- fair queue ------------------------------------------------------------------------------
+
+FairQueue::Ticket FairQueue::add(int flow, std::uint64_t n, int weight) {
+    auto& finish = finish_[flow];
+    Ticket t;
+    t.start = std::max(vtime_, finish);
+    t.seq = seq_++;
+    t.flow = flow;
+    finish = t.start + static_cast<double>(n) / static_cast<double>(std::max(weight, 1));
+    pending_.insert(t);
+    return t;
+}
+
+void FairQueue::serve(const Ticket& t) {
+    pending_.erase(t);
+    vtime_ = std::max(vtime_, t.start);
+    // Flows that have fallen behind the virtual time carry no state worth keeping.
+    std::erase_if(finish_, [&](const auto& f) { return f.second <= vtime_; });
+}
+
+void FairQueue::cancel(const Ticket& t) { pending_.erase(t); }
+
 // ---- shared limiter --------------------------------------------------------------------------
 
 void RateLimiter::set_rate(std::uint64_t bytes_per_s) {
@@ -95,20 +117,35 @@ std::uint64_t RateLimiter::generation() {
     return generation_;
 }
 
-bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop) {
+bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop, int flow, int weight) {
     std::unique_lock lock(mutex_);
     while (n > 0) {
         if (stop.stop_requested()) return false;
         if (bucket_.rate() == 0) return true;
         const auto piece = std::min<std::uint64_t>(n, static_cast<std::uint64_t>(bucket_.burst()));
-        const auto wait = bucket_.take(piece, TokenBucket::Clock::now());
-        if (wait == TokenBucket::Clock::duration::zero()) {
-            n -= piece;
-            continue;
+        // Wait in line by fair-queuing tag; only the head of the line takes tokens.
+        const auto ticket = queue_.add(flow, piece, weight);
+        for (;;) {
+            if (stop.stop_requested() || bucket_.rate() == 0) {
+                queue_.cancel(ticket);
+                changed_.notify_all(); // the next in line may be the head now
+                return !stop.stop_requested();
+            }
+            if (queue_.head() == ticket) {
+                const auto wait = bucket_.take(piece, TokenBucket::Clock::now());
+                if (wait == TokenBucket::Clock::duration::zero()) {
+                    queue_.serve(ticket);
+                    changed_.notify_all();
+                    break;
+                }
+                // Wakes early for a new rate (e.g. the limit switched off) or a stop.
+                const auto seen = generation_;
+                changed_.wait_for(lock, stop, wait, [&] { return generation_ != seen; });
+            } else {
+                changed_.wait(lock, stop, [&] { return queue_.head() == ticket || bucket_.rate() == 0; });
+            }
         }
-        // Wakes early for a new rate (e.g. the limit switched off) or a stop.
-        const auto seen = generation_;
-        changed_.wait_for(lock, stop, wait, [&] { return generation_ != seen; });
+        n -= piece;
     }
     return true;
 }

@@ -59,8 +59,13 @@ struct SavedDownload {
     std::string dest;
     std::uint64_t total = 0;
     std::vector<SavedFile> files; // a folder's files, once it was listed
+    std::string priority = "normal"; // bandwidth priority: "high" | "normal" | "low"
     bool operator==(const SavedDownload&) const = default;
 };
+
+// Queue order: moves `id` to just before `before` (0 = to the end). Unknown ids, or moving an
+// item before itself, change nothing. Returns whether the order changed.
+bool move_before(std::vector<int>& ids, int id, int before);
 
 [[nodiscard]] std::filesystem::path default_queue_path(); // <config>/grab/queue.json
 [[nodiscard]] std::vector<SavedDownload> parse_queue(std::string_view json_text); // bad entries skipped

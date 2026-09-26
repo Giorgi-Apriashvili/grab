@@ -74,6 +74,23 @@ TEST_CASE("a server pool shares its budget fairly and staggers starts") {
     CHECK(pool.share(3) == 4);
 }
 
+TEST_CASE("bandwidth priority weights the connection shares 4:2:1") {
+    budget::ServerPool pool(8);
+    pool.add_user(1, 1); // low, oldest
+    pool.add_user(2, 4); // high
+    CHECK(pool.share(2) == 7); // 6.4 -> 6, plus the remainder: the heaviest first
+    CHECK(pool.share(1) == 1);
+    pool.add_user(3, 2); // normal
+    // 8 x 4/7 = 4.57, 8 x 2/7 = 2.29, 8 x 1/7 = 1.14 -> 4 + 2 + 1, remainder 1 to high
+    CHECK(pool.share(2) == 5);
+    CHECK(pool.share(3) == 2);
+    CHECK(pool.share(1) == 1);
+    pool.set_weight(1, 4); // low raised to high: two highs split evenly, the older first
+    CHECK(pool.share(1) == 4);
+    CHECK(pool.share(2) == 3);
+    CHECK(pool.share(3) == 1);
+}
+
 TEST_CASE("more downloads than connections: each still gets one") {
     budget::ServerPool pool(2);
     auto t = budget::ServerPool::Clock::time_point{} + 10s;

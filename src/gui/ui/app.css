@@ -261,6 +261,17 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .switch input:focus-visible + .track { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .limited { color: var(--accent); }
 
+/* queue order and bandwidth priority */
+.q-handle { color: var(--muted); cursor: grab; padding: 0 2px; font-size: 14px; line-height: 1; user-select: none; flex: none; }
+.q-handle:hover { color: var(--text); }
+.q-item.dragging { opacity: 0.5; }
+.q-item.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.q-item.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.q-prio { height: 22px; padding: 0 4px; font-size: 11px; border-radius: 5px; flex: none; }
+.q-prio.prio-high { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); font-weight: 600; }
+.q-prio.prio-low { color: var(--muted); }
+.q-actions .q-move { width: 24px; padding: 0; }
+
 /* a folder's files, as a tree under its row */
 .q-toggle {
   width: 22px;
