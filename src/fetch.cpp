@@ -269,10 +269,16 @@ void Connections::configure(const std::string& server, int budget) {
     changed_.notify_all();
 }
 
-void Connections::join(const std::string& server, int id) {
+void Connections::join(const std::string& server, int id, int weight) {
     std::lock_guard lock(mutex_);
-    pool(server).add_user(id);
+    pool(server).add_user(id, weight);
     changed_.notify_all();
+}
+
+void Connections::set_weight(const std::string& server, int id, int weight) {
+    std::lock_guard lock(mutex_);
+    pool(server).set_weight(id, weight);
+    changed_.notify_all(); // a raised share may start streams now; a lowered one yields at the next read
 }
 
 void Connections::leave(const std::string& server, int id) {
@@ -553,7 +559,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
         return tail;
     };
 
-    if (!d.joined) connections.join(d.server, d.id);
+    auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
+    if (!d.joined) connections.join(d.server, d.id, weight());
     auto stream = [&] {
         for (;;) {
             // A connection first: work found while waiting for one could be gone by then.
@@ -590,7 +597,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
             opts.stop = token;
             auto run = proc::run_piped(cat_argv(src, offset, count, limited), [&](std::string_view data) {
                 // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
-                if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token)) return false;
+                if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token, d.id, weight())) return false;
                 {
                     // Under the lock: the range may have been shortened by a split meanwhile.
                     std::lock_guard lock(m);

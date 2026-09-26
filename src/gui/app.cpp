@@ -66,6 +66,10 @@ const char* auth_name(servers::Auth a) {
     return "password";
 }
 
+// Bandwidth priority names and weights (4:2:1).
+int weight_of(std::string_view priority) { return priority == "high" ? 4 : priority == "low" ? 1 : 2; }
+const char* priority_name(int weight) { return weight >= 4 ? "high" : weight <= 1 ? "low" : "normal"; }
+
 // A folder download's own local directory: DEST\<folder name>, as rclone copy names it.
 std::filesystem::path folder_dir(const std::filesystem::path& dest, const std::string& remote_path) {
     return dest / util::path_from_utf8(remote_basename(remote_path));
@@ -194,6 +198,10 @@ void App::on_message(const std::string& text) {
         if (type == "pauseChild") pause_child(id, path);
         else if (type == "resumeChild") resume_child(id, path);
         else skip_child(id, path);
+    } else if (type == "moveItem") {
+        move_item(int_of(*msg, "id", -1), int_of(*msg, "before", 0));
+    } else if (type == "setPriority") {
+        set_priority(int_of(*msg, "id", -1), weight_of(msg->string_of("priority").value_or("normal")));
     } else if (type == "setLimit") {
         const Value* mibps = msg->find("mibps");
         set_limit(bool_of(*msg, "on"),
@@ -951,6 +959,44 @@ void App::set_limit(bool on, double mibps) {
     }
 }
 
+void App::move_item(int id, int before) {
+    {
+        std::lock_guard lock(mutex_);
+        std::vector<int> ids;
+        ids.reserve(items_.size());
+        for (const auto& i : items_) ids.push_back(i->id);
+        if (!move_before(ids, id, before)) return;
+        // The list order is the queue order: workers take the first waiting item.
+        std::vector<std::shared_ptr<Item>> reordered;
+        reordered.reserve(items_.size());
+        for (const int k : ids) {
+            reordered.push_back(*std::ranges::find(items_, k, [](const auto& i) { return i->id; }));
+        }
+        items_ = std::move(reordered);
+    }
+    save_queue();
+    post_queue();
+}
+
+void App::set_priority(int id, int weight) {
+    std::string server;
+    bool running = false;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& item : items_) {
+            if (item->id != id || item->weight.load() == weight) continue;
+            item->weight = weight; // the limiter reads it at every request
+            server = item->remote;
+            running = item->status == Status::running;
+            // A folder's rclone batch has its --bwlimit share fixed at start: restart it.
+            if (item->batch_running && limiter_.rate() > 0) item->batch_stop.request_stop();
+        }
+    }
+    if (running) connections_.set_weight(server, id, weight); // shares rebalance at the next reads
+    save_queue();
+    post_queue();
+}
+
 void App::set_parallel(int n) {
     n = std::clamp(n, min_parallel, max_parallel);
     state_.parallel = n;
@@ -1126,6 +1172,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.id = item->id;
     d.target = item->dest / util::path_from_utf8(item->name);
     d.limiter = &limiter_;
+    d.weight = &item->weight;
     const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {
         if (update_item(mutex_, last_progress_post_, [&] {
                 item->bytes = p.bytes;
@@ -1254,7 +1301,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     }
     post_queue();
 
-    connections_.join(item->remote, item->id);
+    connections_.join(item->remote, item->id, item->weight.load());
     while (!item_stop.stop_requested()) {
         // (not "small": windows.h defines that as a macro)
         std::vector<std::string> small_files;
@@ -1327,10 +1374,13 @@ void App::run_small_batch(const std::shared_ptr<Item>& item, const engine::Conte
 
     std::unordered_map<std::string, std::size_t> index; // path -> child
     std::stop_source batch;
-    int batches = 1; // running rclone batches, this one included: they split the speed limit
+    // This download's part of the speed limit: its weight over all running downloads'.
+    int total_weight = 0;
     {
         std::lock_guard lock(mutex_);
-        for (const auto& other : items_) batches += other->batch_running ? 1 : 0;
+        for (const auto& other : items_) {
+            if (other->status == Status::running) total_weight += other->weight.load();
+        }
         for (std::size_t i = 0; i < item->children.size(); ++i) index.emplace(item->children[i].path, i);
         for (const auto& p : paths) {
             auto& c = item->children[index[p]];
@@ -1353,7 +1403,9 @@ void App::run_small_batch(const std::shared_ptr<Item>& item, const engine::Conte
     // rclone writes these files itself, so the speed limit reaches it as --bwlimit; its bytes
     // are also charged to the shared limiter, which slows grab's own streams to match.
     if (const auto limit = limiter_.rate(); limit > 0) {
-        extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(limit / static_cast<std::uint64_t>(batches))});
+        const auto weight = static_cast<std::uint64_t>(item->weight.load());
+        const auto share = limit * weight / static_cast<std::uint64_t>(std::max<int>(total_weight, static_cast<int>(weight)));
+        extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(share)});
     }
     std::uint64_t charged = 0;
     auto result = engine::download(
@@ -1468,6 +1520,7 @@ void App::run_big_files(const std::shared_ptr<Item>& item, const engine::Context
             d.target = dir / util::path_from_utf8(path);
             d.joined = true;
             d.limiter = &limiter_;
+            d.weight = &item->weight;
             std::error_code ec;
             std::filesystem::create_directories(d.target.parent_path(), ec);
             const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {
@@ -1517,6 +1570,7 @@ void App::run_big_files(const std::shared_ptr<Item>& item, const engine::Context
 
 json::Value App::queue_snapshot() const {
     Value list = Value::make_array();
+    int waiting_position = 0;
     for (const auto& i : items_) {
         Value v = Value::make_object();
         v.set("id", num(i->id));
@@ -1534,6 +1588,8 @@ json::Value App::queue_snapshot() const {
         v.set("error", str(i->error));
         v.set("note", str(i->note));
         v.set("connections", num(i->connections));
+        v.set("priority", str(priority_name(i->weight.load())));
+        if (i->status == Status::queued) v.set("position", num(++waiting_position)); // "Queued · #2"
         if (i->mode == Mode::folder && i->listed) {
             // Counts for the folder row, and a bounded list of files for the tree: every
             // active one plus the next few queued, so a 5000-file folder stays cheap to send.
@@ -1594,6 +1650,7 @@ void App::restore_queue() {
         item->dest = util::path_from_utf8(saved.dest);
         item->total = saved.total;
         item->status = Status::paused;
+        item->weight = weight_of(saved.priority);
         if (item->mode == Mode::file) {
             if (auto p = fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
                 item->bytes = p->first;
@@ -1631,7 +1688,7 @@ void App::save_queue() const {
         for (const auto& i : items_) {
             if (i->status == Status::done || i->status == Status::cancelled) continue;
             SavedDownload d{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path, i->name,
-                            util::path_to_utf8(i->dest), i->total, {}};
+                            util::path_to_utf8(i->dest), i->total, {}, priority_name(i->weight.load())};
             for (const auto& c : i->children) {
                 const char* state = c.status == Status::done      ? "done"
                                     : c.status == Status::skipped ? "skipped"

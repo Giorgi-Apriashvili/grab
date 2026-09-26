@@ -37,7 +37,7 @@ TEST_CASE("the bucket holds its rate over time") {
     rate::TokenBucket b;
     auto t = Clock::time_point{} + 100s;
     b.set_rate(MiB, t);
-    CHECK(b.burst() == doctest::Approx(MiB / 4));
+    CHECK(b.burst() == doctest::Approx(static_cast<double>(MiB) / 4.0));
     // Take 64 KiB pieces as fast as allowed for 10 MiB: that takes ~10 s at 1 MiB/s.
     const auto start = t;
     std::uint64_t moved = 0;
@@ -68,6 +68,75 @@ TEST_CASE("bytes moved elsewhere slow the rest down, and unlimited never waits")
     CHECK(std::chrono::duration<double>(wait).count() == doctest::Approx(2.0 - 0.25 + 0.0625).epsilon(0.01));
     b.set_rate(0, t);
     CHECK(b.take(100 * MiB, t) == Clock::duration::zero());
+}
+
+TEST_CASE("fair queuing serves busy flows in proportion to their weights") {
+    rate::FairQueue q;
+    // Flow 1 (high, 4) and flow 2 (low, 1) always have one 64 KiB request waiting.
+    auto a = q.add(1, 64 * KiB, 4);
+    auto b = q.add(2, 64 * KiB, 1);
+    int served[3] = {};
+    for (int i = 0; i < 500; ++i) {
+        const auto head = q.head();
+        q.serve(head);
+        ++served[head.flow];
+        if (head.flow == 1) a = q.add(1, 64 * KiB, 4);
+        else b = q.add(2, 64 * KiB, 1);
+    }
+    CHECK(static_cast<double>(served[1]) / served[2] == doctest::Approx(4.0).epsilon(0.05));
+
+    // Equal weights take turns.
+    rate::FairQueue even;
+    even.add(1, 100, 2);
+    even.add(2, 100, 2);
+    int last = 0;
+    int switches = 0;
+    for (int i = 0; i < 20; ++i) {
+        const auto head = even.head();
+        even.serve(head);
+        if (head.flow != last) ++switches;
+        last = head.flow;
+        even.add(head.flow, 100, 2);
+    }
+    CHECK(switches >= 19);
+}
+
+TEST_CASE("a flow that was idle gains no credit to burst with") {
+    rate::FairQueue q;
+    for (int i = 0; i < 50; ++i) q.serve(q.add(1, 64 * KiB, 2)); // flow 1 alone for a while
+    // Flow 2 arrives: it starts at the current virtual time, not at zero, so it alternates
+    // with flow 1 instead of taking the next 50 turns.
+    q.add(1, 64 * KiB, 2);
+    q.add(2, 64 * KiB, 2);
+    int flow2_first = 0;
+    for (int i = 0; i < 6; ++i) {
+        const auto head = q.head();
+        q.serve(head);
+        flow2_first += head.flow == 2 ? 1 : 0;
+        q.add(head.flow, 64 * KiB, 2);
+    }
+    CHECK(flow2_first == 3);
+}
+
+TEST_CASE("under a limit, a high download gets about four times a low one") {
+    rate::RateLimiter limiter;
+    limiter.set_rate(4 * MiB);
+    std::stop_source stop;
+    std::atomic<std::uint64_t> bytes[3] = {};
+    auto pump = [&](int flow, int weight) {
+        while (limiter.acquire(64 * KiB, stop.get_token(), flow, weight)) bytes[flow] += 64 * KiB;
+    };
+    {
+        std::jthread high([&] { pump(1, 4); });
+        std::jthread low([&] { pump(2, 1); });
+        std::this_thread::sleep_for(1500ms);
+        stop.request_stop();
+    }
+    const double ratio = static_cast<double>(bytes[1].load()) / static_cast<double>(bytes[2].load());
+    CHECK(ratio > 3.0);
+    CHECK(ratio < 5.5);
+    const double total_mib = static_cast<double>(bytes[1] + bytes[2]) / MiB;
+    CHECK(total_mib < 4 * 1.5 + 1.0); // the limit holds (plus the initial burst)
 }
 
 TEST_CASE("waiting streams go on when the limit is lifted, and stop when asked") {

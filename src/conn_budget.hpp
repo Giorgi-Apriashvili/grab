@@ -41,11 +41,14 @@ public:
     [[nodiscard]] int budget() const { return budget_; }
     void set_budget(int budget) { budget_ = budget < 1 ? 1 : budget; }
 
-    void add_user(int id);
+    // `weight`: the download's bandwidth priority (high 4, normal 2, low 1).
+    void add_user(int id, int weight = 2);
+    void set_weight(int id, int weight);
     void remove_user(int id);
     [[nodiscard]] int users() const { return static_cast<int>(users_.size()); }
 
-    // A user's fair share: budget / users, the remainder going to the oldest, at least 1.
+    // A user's weighted share of the budget: budget × weight / total weight, rounded down,
+    // the remainder going one each to the heaviest users (then the oldest), and at least 1.
     [[nodiscard]] int share(int id) const;
     [[nodiscard]] int active(int id) const;
     [[nodiscard]] int total_active() const;
@@ -74,6 +77,7 @@ private:
         int id;
         int active;
         int waiting = 0;
+        int weight = 2;
     };
     [[nodiscard]] const User* find(int id) const;
     [[nodiscard]] bool other_starved(int id) const;

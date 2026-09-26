@@ -9,6 +9,7 @@
 #include "conn_budget.hpp"
 #include "rate.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <expected>
@@ -112,7 +113,9 @@ public:
 
     // Sets a server's budget (creating its pool); running streams above it finish normally.
     void configure(const std::string& server, int budget);
-    void join(const std::string& server, int id);
+    // `weight`: bandwidth priority (high 4, normal 2, low 1); shares follow it.
+    void join(const std::string& server, int id, int weight = 2);
+    void set_weight(const std::string& server, int id, int weight);
     void leave(const std::string& server, int id);
     // Waits until `id` may open one more connection; false when `stop` was requested first.
     bool acquire(const std::string& server, int id, std::stop_token stop);
@@ -162,6 +165,9 @@ struct Download {
     bool joined = false;
     // A speed limit shared with other downloads; nullptr or rate 0 = unlimited.
     rate::RateLimiter* limiter = nullptr;
+    // Bandwidth priority (high 4, normal 2, low 1), read at each stream start and limiter
+    // request, so a change applies while running. nullptr = normal.
+    const std::atomic<int>* weight = nullptr;
 };
 
 // Fetches `d.source` into `d.target`, continuing a partial download. Stopping keeps the partial

@@ -135,6 +135,18 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - If the file changed on the server in the meantime, it starts over.
   - When a stream runs out of work, it splits the busiest remaining range, so the end of a
     file doesn't trickle in over one connection.
+- **Queue order:** the list order is the order in which waiting downloads start. Drag a row
+  by its ≡ handle, or use ↑ / ↓ / ⤒ on waiting rows ("Queued · #1" is next). The order is kept
+  across restarts.
+- **Bandwidth priority** (High / Normal / Low on each download) decides how running downloads
+  share, weighted 4 : 2 : 1. Low always keeps moving, and unused share is lent to the others.
+  - Downloads from the same server split its connections by weight. On a Storage Box, where
+    each connection is capped, that is the bandwidth split: High vs Low measured 7 vs 1
+    connections, about 12 vs 1.4 MiB/s.
+  - Under a speed limit, the limit is split by weight exactly, across servers too (measured
+    3.0 vs 0.8 of 4 MiB/s).
+  - With no limit, downloads from *different* servers compete on your line directly.
+    Priority then acts only through their connection counts.
 - **Speed limit:** the bar below the downloads shows the total speed. On its right, "Limit
   speed" caps all downloads together, in MiB/s; the switch keeps the value, and both are
   remembered.
