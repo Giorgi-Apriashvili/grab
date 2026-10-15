@@ -426,8 +426,13 @@ on your PC in milliseconds, with the same matching and ranking as a live search.
   server deletes its list.
 - A path target, a search for a dot-name, and `--depth` other than the configured one search
   the server live, as before.
-- The lists are in `%LOCALAPPDATA%\grab\lists`, one `<server>.list` each: plain text with
-  every file name on your servers, kept on this PC only. Delete the folder to remove them.
+- The lists are in `%LOCALAPPDATA%\grab\lists`, one `<server>.list` each, kept on this PC only.
+  They are encrypted for your Windows account (DPAPI), so other accounts, backups and anyone
+  with only a copy of the files can't read the file names. Programs running as you can, as
+  grab does, without a password. Saving or loading a 2 MB list takes 15–21 ms.
+  - A list that can't be decrypted (another account's, damaged, or after an admin reset your
+    Windows password) is fetched again.
+  - Delete the folder to remove them.
 
 ## Tuning
 

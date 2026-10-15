@@ -41,6 +41,13 @@ namespace grab::util {
 // Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
 [[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
 
+// Encrypts `data` for the current Windows user with DPAPI: only this user, on this PC, can
+// decrypt it, without being asked for anything. `purpose` is mixed in and must match when
+// decrypting. nullopt when it fails. Without DPAPI (other platforms) `data` comes back as is.
+[[nodiscard]] std::optional<std::string> protect_for_user(std::string_view data, std::string_view purpose);
+// The reverse; nullopt when `data` was not protected by this user for `purpose`, or is damaged.
+[[nodiscard]] std::optional<std::string> unprotect_for_user(std::string_view data, std::string_view purpose);
+
 [[nodiscard]] std::expected<std::string, std::string> read_file(const std::filesystem::path& p);
 
 [[nodiscard]] std::string join(const std::vector<std::string>& items, std::string_view sep);

@@ -1,10 +1,12 @@
 #include "engine.hpp"
 #include "file_list.hpp"
+#include "util.hpp"
 
 #include <doctest/doctest.h>
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -188,4 +190,38 @@ TEST_CASE("hits of several servers rank together") {
     CHECK(hits[1].server == "Box.Guest");
     CHECK(hits[2].hit.path == "downloads/tv/deep/precinct-2.avi"); // starts with the word
     CHECK(hits[3].hit.name == "Sahe AKA The Precinct 2010.avi");
+}
+
+TEST_CASE("saved lists are encrypted for the current user") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-sealed";
+    std::filesystem::remove_all(dir);
+    const auto file = file_list::path_for(dir, "Box");
+    const List l = sample();
+    REQUIRE(file_list::save(file, l));
+    const auto raw = util::read_file(file);
+    REQUIRE(raw.has_value());
+    CHECK(raw->starts_with("grab-file-list-sealed 1\n"));
+#ifdef _WIN32
+    CHECK(raw->find("Precinct") == std::string::npos); // no name readable on disk
+    CHECK(raw->find("movies") == std::string::npos);
+#endif
+    CHECK(file_list::load(file) == l);
+
+    // An unencrypted list, or a damaged one, is not used: grab fetches a new one.
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << file_list::to_text(l);
+    }
+    CHECK_FALSE(file_list::load(file).has_value());
+#ifdef _WIN32
+    REQUIRE(file_list::save(file, l));
+    auto damaged = *util::read_file(file);
+    damaged[damaged.size() / 2] ^= 0x55;
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << damaged;
+    }
+    CHECK_FALSE(file_list::load(file).has_value());
+#endif
+    std::filesystem::remove_all(dir);
 }

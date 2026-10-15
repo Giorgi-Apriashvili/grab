@@ -81,10 +81,13 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 // short hash appended, so different names never share a file.
 [[nodiscard]] std::filesystem::path path_for(const std::filesystem::path& dir, std::string_view server);
 
-// The saved form: a header, then one line per entry, with tabs, line breaks and backslashes in
+// The text form: a header, then one line per entry, with tabs, line breaks and backslashes in
 // names escaped.
 [[nodiscard]] std::string to_text(const List& list);
 [[nodiscard]] std::optional<List> from_text(std::string_view text); // nullopt: not a list
+// A list file holds the text form encrypted for the current Windows user (DPAPI). load()
+// returns nullopt for anything else (an unencrypted or damaged file, another user's), and the
+// list is then fetched again.
 [[nodiscard]] std::optional<List> load(const std::filesystem::path& file);
 bool save(const std::filesystem::path& file, const List& list); // atomically: a sibling, then rename
 

@@ -11,6 +11,7 @@
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
 #include <bcrypt.h>
+#include <dpapi.h>
 #else
 #include <termios.h>
 #include <unistd.h>
@@ -229,6 +230,40 @@ std::expected<std::string, std::string> sha256_file(const std::filesystem::path&
     return hex;
 }
 
+namespace {
+
+DATA_BLOB blob_of(std::string_view s) {
+    return DATA_BLOB{static_cast<DWORD>(s.size()), reinterpret_cast<BYTE*>(const_cast<char*>(s.data()))};
+}
+
+// Copies a blob DPAPI allocated, then wipes and frees it.
+std::string take(DATA_BLOB& b) {
+    std::string out(reinterpret_cast<const char*>(b.pbData), b.cbData);
+    SecureZeroMemory(b.pbData, b.cbData);
+    LocalFree(b.pbData);
+    return out;
+}
+
+} // namespace
+
+std::optional<std::string> protect_for_user(std::string_view data, std::string_view purpose) {
+    DATA_BLOB in = blob_of(data);
+    DATA_BLOB entropy = blob_of(purpose);
+    DATA_BLOB out{};
+    if (!CryptProtectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) return std::nullopt;
+    return take(out);
+}
+
+std::optional<std::string> unprotect_for_user(std::string_view data, std::string_view purpose) {
+    DATA_BLOB in = blob_of(data);
+    DATA_BLOB entropy = blob_of(purpose);
+    DATA_BLOB out{};
+    if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        return std::nullopt;
+    }
+    return take(out);
+}
+
 #else
 
 std::optional<std::string> getenv_utf8(const char* name) {
@@ -272,6 +307,9 @@ std::filesystem::path self_exe_path() {
 std::expected<std::string, std::string> sha256_file(const std::filesystem::path&) {
     return fail("SHA-256 hashing is only implemented on Windows");
 }
+
+std::optional<std::string> protect_for_user(std::string_view data, std::string_view) { return std::string(data); }
+std::optional<std::string> unprotect_for_user(std::string_view data, std::string_view) { return std::string(data); }
 
 #endif
 

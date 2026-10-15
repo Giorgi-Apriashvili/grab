@@ -320,9 +320,19 @@ std::optional<List> from_text(std::string_view text) {
     return list;
 }
 
+namespace {
+// A saved list is this header followed by its text, encrypted for the current Windows user
+// (util::protect_for_user): the file names it holds are unreadable to other accounts and to
+// anyone with only a copy of the file.
+constexpr std::string_view sealed_header = "grab-file-list-sealed 1\n";
+constexpr std::string_view purpose = "grab file list";
+} // namespace
+
 std::optional<List> load(const fs::path& file) {
-    auto text = util::read_file(file);
-    if (!text) return std::nullopt;
+    auto data = util::read_file(file);
+    if (!data || !data->starts_with(sealed_header)) return std::nullopt; // fetched anew
+    auto text = util::unprotect_for_user(std::string_view(*data).substr(sealed_header.size()), purpose);
+    if (!text) return std::nullopt; // another user's, or damaged
     return from_text(*text);
 }
 
@@ -331,10 +341,12 @@ bool save(const fs::path& file, const List& list) {
     fs::create_directories(file.parent_path(), ec);
     auto tmp = file;
     tmp += ".tmp";
+    const auto sealed = util::protect_for_user(to_text(list), purpose);
+    if (!sealed) return false;
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) return false;
-        out << to_text(list);
+        out << sealed_header << *sealed;
         if (!out) return false;
     }
     fs::rename(tmp, file, ec);

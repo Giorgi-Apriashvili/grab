@@ -45,3 +45,16 @@ TEST_CASE("path round-trips through UTF-8") {
     const std::string s = "E:/Backup/Ünïcödé";
     CHECK(util::path_to_utf8(util::path_from_utf8(s)) == s);
 }
+
+TEST_CASE("data protected for the current user comes back only with the same purpose") {
+    const std::string secret = "names of private files";
+    const auto sealed = util::protect_for_user(secret, "grab test");
+    REQUIRE(sealed.has_value());
+    CHECK(util::unprotect_for_user(*sealed, "grab test") == secret);
+#ifdef _WIN32
+    CHECK(sealed->find("private") == std::string::npos);
+    CHECK_FALSE(util::unprotect_for_user(*sealed, "something else").has_value());
+    CHECK_FALSE(util::unprotect_for_user("not protected at all", "grab test").has_value());
+    CHECK(util::unprotect_for_user(*util::protect_for_user("", "p"), "p") == std::string{});
+#endif
+}
