@@ -7,8 +7,7 @@
 
 #include <algorithm>
 #include <format>
-#include <fstream>
-#include <ios>
+#include <functional>
 #include <system_error>
 
 namespace grab::server_ops {
@@ -119,21 +118,49 @@ std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf,
     env.rclone_conf = effective_rclone_config(env.cfg);
     env.known_hosts = grab_known_hosts_path();
     env.rclone = resolve_rclone_exe(env.cfg, exe_dir);
+    if (!env.cfg.rclone_config) {
+        if (auto ready = secrets::prepare(env.rclone_conf); !ready) env.secrets_error = ready.error();
+    }
     return env;
 }
 
-bool write_text(const std::filesystem::path& p, const std::string& text) {
-    std::error_code ec;
-    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
-    auto tmp = p;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out || !(out << text)) return false;
+void apply_auth(secrets::Store& store, const std::string& remote, servers::Auth auth,
+                const std::optional<std::string>& obscured) {
+    auto& values = store[remote];
+    switch (auth) {
+    case servers::Auth::password:
+        values.erase("key_file_pass");
+        values.erase("key_pem");
+        if (obscured) values["pass"] = *obscured;
+        break;
+    case servers::Auth::key_file:
+        values.erase("pass");
+        values.erase("key_pem");
+        if (obscured) values["key_file_pass"] = *obscured;
+        break;
+    case servers::Auth::agent:
+        values.clear();
+        break;
     }
-    std::filesystem::rename(tmp, p, ec);
-    return !ec;
+    if (values.empty()) store.erase(remote);
 }
+
+namespace {
+
+// Changes the encrypted store of grab's own rclone.conf and hands the result to rclone. An
+// unreadable store (another account's, damaged) starts over: it could not be used anyway.
+std::expected<void, std::string> change_secrets(const Env& env, const std::function<void(secrets::Store&)>& change) {
+    const auto file = secrets::path_beside(env.rclone_conf);
+    auto store = secrets::load(file).value_or(secrets::Store{});
+    change(store);
+    if (!secrets::save(file, store)) return util::failf("cannot write {}", util::path_to_utf8(file));
+    secrets::export_to_env(store);
+    return {};
+}
+
+} // namespace
+
+bool write_text(const std::filesystem::path& p, const std::string& text) { return util::write_file_atomic(p, text); }
 
 // ---- lists ---------------------------------------------------------------------------------
 
@@ -226,10 +253,16 @@ std::expected<void, std::string> add_server(const Env& env, const servers::NewSe
     if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return pinned;
     std::error_code ec;
     std::filesystem::create_directories(env.rclone_conf.parent_path(), ec);
-    auto created = proc::run_capture(servers::create_argv(env.rclone, env.rclone_conf, s, obscured_secret,
-                                                          env.known_hosts),
+    // grab's own rclone.conf gets no secret (nor does the command line): the store keeps it.
+    const bool own = !env.cfg.rclone_config;
+    auto created = proc::run_capture(servers::create_argv(env.rclone, env.rclone_conf, s,
+                                                          own ? std::nullopt : obscured_secret, env.known_hosts),
                                      quiet());
     if (!ok(created)) return run_failed("rclone config create", created);
+    if (own) {
+        auto kept = change_secrets(env, [&](secrets::Store& st) { apply_auth(st, s.name, s.auth, obscured_secret); });
+        if (!kept) return kept;
+    }
 
     const RcloneRemote remote = servers::to_remote(s, env.known_hosts);
     std::string text = servers::append_section(env.grab_text, remote_section(remote, s.search_roots, s.max_depth));
@@ -301,7 +334,8 @@ std::expected<void, std::string> update_server(const Env& env, const servers::Ne
         return util::failf("{} has no remote called {}", util::path_to_utf8(env.rclone_conf), settings->rclone_remote);
     }
 
-    auto updates = rclone_edit_updates(*section, wanted, obscured_secret);
+    const bool own = !env.cfg.rclone_config; // own: the secret goes to the store, not rclone.conf
+    auto updates = rclone_edit_updates(*section, wanted, own ? std::nullopt : obscured_secret);
     if (keys) {
         if (auto pinned = pin_host_keys(env.known_hosts, keys->lines); !pinned) return pinned;
         const std::string known = util::path_to_utf8(env.known_hosts);
@@ -311,6 +345,12 @@ std::expected<void, std::string> update_server(const Env& env, const servers::Ne
         auto run = proc::run_capture(servers::update_argv(env.rclone, env.rclone_conf, settings->rclone_remote, updates),
                                      quiet());
         if (!ok(run)) return run_failed("rclone config update", run);
+    }
+    if (own) {
+        auto kept = change_secrets(env, [&](secrets::Store& st) {
+            apply_auth(st, settings->rclone_remote, wanted.auth, obscured_secret);
+        });
+        if (!kept) return kept;
     }
 
     std::string text = servers::set_value(env.grab_text, wanted.name, "search_roots",
@@ -358,6 +398,7 @@ std::expected<std::string, std::string> remove_server(const Env& env, std::strin
     if (auto written = write_grab_conf(env, text); !written) return util::fail(written.error());
     // Only grab's own rclone.conf is edited; an explicitly configured shared one is left alone.
     if (env.cfg.rclone_config) return std::string{};
+    (void)change_secrets(env, [&](secrets::Store& st) { st.erase(rclone_name); });
     auto deleted = proc::run_capture(servers::delete_argv(env.rclone, env.rclone_conf, rclone_name), quiet());
     if (!ok(deleted)) {
         return std::format("rclone config delete {} failed: {}", rclone_name,
@@ -382,7 +423,10 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
     auto probe = proc::run_capture(servers::probe_argv(env.rclone, env.rclone_conf, s->rclone_remote), quiet(stop));
     if (stop.stop_requested()) return util::fail("cancelled");
     result.rclone_ok = ok(probe);
-    if (!result.rclone_ok) result.rclone_error = probe ? clean_rclone_error(probe->err) : probe.error();
+    if (!result.rclone_ok) {
+        result.rclone_error = probe ? clean_rclone_error(probe->err) : probe.error();
+        if (!env.secrets_error.empty()) result.rclone_error += " (" + env.secrets_error + ")";
+    }
 
     if (resolve_find_method(*s, *remote) == FindMethod::ssh) {
         std::vector<std::string> options{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"};

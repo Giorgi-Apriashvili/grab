@@ -36,8 +36,8 @@ grab -f releases E:\Backup
 `file_flags` / `folder_flags`, with rclone's own `-P` progress; Ctrl+C then goes to rclone.
 
 With a key loaded in ssh-agent the ssh step never prompts; otherwise it asks for the key
-passphrase once per run. The rclone step never prompts, since grab's rclone.conf carries the
-obscured password or passphrase.
+passphrase once per run. The rclone step never prompts: grab hands rclone the password or
+passphrase from its encrypted store (see [Servers](#servers)).
 
 ## Requirements
 
@@ -255,8 +255,25 @@ Then it:
 - **tests the connection:** one check through rclone and, for key or agent logins, one
   through ssh.
 
-Passwords and passphrases are never shown and never put on a command line. They are passed
-to `rclone obscure` over stdin and stored obscured, as rclone does.
+Passwords and passphrases are never shown and never put on a command line. They are not kept
+in rclone.conf either, where rclone would store them only "obscured", which anyone who can read
+the file can reverse.
+- grab keeps them in `%APPDATA%\grab\secrets`, encrypted for your Windows account (DPAPI). Other
+  accounts, backups and copies of the file can't read them; programs running as you can, as
+  grab does, without asking you for anything.
+- When grab runs rclone, it hands them over as environment variables
+  (`RCLONE_CONFIG_<SERVER>_PASS`, which rclone reads like its config), never on disk unencrypted
+  or on a command line.
+- A grab.conf `rclone_config =` that points at your own rclone.conf is used as it is: its
+  passwords stay there.
+- If the store can't be read (another Windows account, a damaged file, or a Windows password an
+  admin reset), servers with passwords say so: enter the password again in Settings → Edit, or
+  remove and add the server again. Servers without passwords keep working.
+
+**Upgrading from 0.7.0 or earlier:** the first run moves the passwords out of grab's rclone.conf
+into the encrypted store by itself. They leave the file only after the store holds them. The
+standard `%APPDATA%\rclone\rclone.conf`, which grab only reads, is never changed, so remotes you
+keep there still hold obscured passwords.
 
 The commands also take answers from piped input, one per line, so they can be scripted. When
 the input runs out, the command stops without changing anything.
@@ -474,6 +491,7 @@ src/cli_download.*  the command's downloads: live progress line, Ctrl+C
 src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
+src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)

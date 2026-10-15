@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <charconv>
 #include <format>
-#include <fstream>
 #include <system_error>
 #include <utility>
 
@@ -103,41 +102,6 @@ void split_records(std::string_view text, char sep, Each&& each) {
         each(text.substr(start, end - start));
         start = end + 1;
     }
-}
-
-std::string escape(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (const char c : s) {
-        switch (c) {
-        case '\\': out += "\\\\"; break;
-        case '\t': out += "\\t"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        default: out += c;
-        }
-    }
-    return out;
-}
-
-std::optional<std::string> unescape(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] != '\\') {
-            out += s[i];
-            continue;
-        }
-        if (++i == s.size()) return std::nullopt;
-        switch (s[i]) {
-        case '\\': out += '\\'; break;
-        case 't': out += '\t'; break;
-        case 'n': out += '\n'; break;
-        case 'r': out += '\r'; break;
-        default: return std::nullopt;
-        }
-    }
-    return out;
 }
 
 constexpr std::string_view header = "grab-file-list 1";
@@ -253,14 +217,14 @@ fs::path path_for(const fs::path& dir, std::string_view server) {
 }
 
 std::string to_text(const List& list) {
-    std::string out = std::format("{}\nfetched\t{}\nfingerprint\t{}\n", header, list.fetched, escape(list.fingerprint));
+    std::string out = std::format("{}\nfetched\t{}\nfingerprint\t{}\n", header, list.fetched, util::escape_field(list.fingerprint));
     for (const auto& e : list.entries) {
         if (e.dir) {
             out += "d\t";
         } else {
             out += e.size ? std::format("f\t{}\t", *e.size) : std::string("f\t\t");
         }
-        out += escape(e.path);
+        out += util::escape_field(e.path);
         out += '\n';
     }
     return out;
@@ -291,7 +255,7 @@ std::optional<List> from_text(std::string_view text) {
             ok = t.has_value();
             if (t) list.fetched = static_cast<std::int64_t>(*t);
         } else if (kind == "fingerprint") {
-            auto fp = unescape(rest);
+            auto fp = util::unescape_field(rest);
             ok = fp.has_value();
             if (fp) list.fingerprint = std::move(*fp);
         } else if (kind == "d" || kind == "f") {
@@ -306,7 +270,7 @@ std::optional<List> from_text(std::string_view text) {
                 e.size = number(rest.substr(0, size_end));
                 rest.remove_prefix(size_end + 1);
             }
-            auto path = unescape(rest);
+            auto path = util::unescape_field(rest);
             if (!path || path->empty()) {
                 ok = false;
                 return;
@@ -337,20 +301,8 @@ std::optional<List> load(const fs::path& file) {
 }
 
 bool save(const fs::path& file, const List& list) {
-    std::error_code ec;
-    fs::create_directories(file.parent_path(), ec);
-    auto tmp = file;
-    tmp += ".tmp";
     const auto sealed = util::protect_for_user(to_text(list), purpose);
-    if (!sealed) return false;
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out << sealed_header << *sealed;
-        if (!out) return false;
-    }
-    fs::rename(tmp, file, ec);
-    return !ec;
+    return sealed && util::write_file_atomic(file, std::string(sealed_header) + *sealed);
 }
 
 } // namespace grab::file_list

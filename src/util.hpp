@@ -41,6 +41,15 @@ namespace grab::util {
 // Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
 [[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
 
+// Writes `text` to `p` through a sibling file and a rename, so a crash never leaves it half
+// written. Creates the parent folder.
+bool write_file_atomic(const std::filesystem::path& p, std::string_view text);
+
+// One field of a tab-separated line: backslashes, tabs and line breaks escaped (\\ \t \n \r),
+// and back; nullopt for a stray or unknown escape.
+[[nodiscard]] std::string escape_field(std::string_view s);
+[[nodiscard]] std::optional<std::string> unescape_field(std::string_view s);
+
 // Encrypts `data` for the current Windows user with DPAPI: only this user, on this PC, can
 // decrypt it, without being asked for anything. `purpose` is mixed in and must match when
 // decrypting. nullopt when it fails. Without DPAPI (other platforms) `data` comes back as is.

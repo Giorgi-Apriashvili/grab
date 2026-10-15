@@ -7,6 +7,7 @@
 
 #include "config.hpp"
 #include "ini.hpp"
+#include "secrets.hpp"
 #include "servers.hpp"
 
 #include <expected>
@@ -29,6 +30,7 @@ struct Env {
     GrabConfig cfg;
     std::string grab_text; // grab.conf as it is on disk (or a fresh [grab] block)
     std::vector<std::string> imported; // remotes this load imported from the standard rclone.conf
+    std::string secrets_error;         // why the encrypted secret store could not be read, if so
 };
 
 // Reads grab.conf (a missing file is an empty config), running the one-time import of rclone
@@ -38,6 +40,12 @@ struct Env {
 
 // Writes through a temporary file and a rename, so a reader never sees half a file.
 [[nodiscard]] bool write_text(const std::filesystem::path& p, const std::string& text);
+
+// A server's secrets in the store (secrets.hpp) after choosing `auth`: a password server keeps
+// only its password, a key-file server only its passphrase, an ssh-agent server none. A new
+// `obscured` secret replaces the old one; none keeps the old one of the same kind.
+void apply_auth(secrets::Store& store, const std::string& remote, servers::Auth auth,
+                const std::optional<std::string>& obscured);
 
 // rclone's first stderr line without its log prefix: "2026/09/24 00:38:10 CRITICAL: Failed to
 // create file system ..." -> "Failed to create file system ...".

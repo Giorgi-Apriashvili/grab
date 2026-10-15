@@ -95,6 +95,54 @@ std::string format_size(std::uint64_t bytes) {
     return std::format("{:.1f} {}", value, units[unit]);
 }
 
+bool write_file_atomic(const std::filesystem::path& p, std::string_view text) {
+    std::error_code ec;
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+    auto tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out || !(out << text)) return false;
+    }
+    std::filesystem::rename(tmp, p, ec);
+    return !ec;
+}
+
+std::string escape_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const char c : s) {
+        switch (c) {
+        case '\\': out += "\\\\"; break;
+        case '\t': out += "\\t"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        default: out += c;
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> unescape_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '\\') {
+            out += s[i];
+            continue;
+        }
+        if (++i == s.size()) return std::nullopt;
+        switch (s[i]) {
+        case '\\': out += '\\'; break;
+        case 't': out += '\t'; break;
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        default: return std::nullopt;
+        }
+    }
+    return out;
+}
+
 std::string to_lower(std::string_view s) {
     std::string out(s);
     for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

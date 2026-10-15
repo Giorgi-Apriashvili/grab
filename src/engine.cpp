@@ -6,6 +6,7 @@
 #include "match.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
+#include "secrets.hpp"
 #include "util.hpp"
 
 #include <format>
@@ -24,6 +25,11 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
 
     // Move referenced remotes into grab's own rclone.conf the first time (idempotent).
     auto imported = migrate_rclone_remotes(*cfg);
+    // grab's own rclone.conf keeps no secrets: they come from the encrypted store (secrets.hpp).
+    std::string secrets_error;
+    if (!cfg->rclone_config) {
+        if (auto ready = secrets::prepare(grab_rclone_config_path()); !ready) secrets_error = ready.error();
+    }
 
     cfg->rclone = resolve_rclone_exe(*cfg, util::self_exe_path().parent_path());
     cfg->rclone_config = effective_rclone_config(*cfg); // always passed as --config
@@ -35,6 +41,11 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
         return util::fail(msg);
     }
 
+    if (!secrets_error.empty() && !remote->key_use_agent && !remote->key_file) {
+        return util::failf("{}. Enter the password of {} again: Settings → Edit in grab's window, or `grab server "
+                           "remove {}` and `grab server add {}`",
+                           secrets_error, settings.name, settings.name, settings.name);
+    }
     const FindMethod method = resolve_find_method(settings, *remote);
     return Context{std::move(*cfg), std::move(settings), std::move(*remote), method,
                    std::move(imported.imported)};

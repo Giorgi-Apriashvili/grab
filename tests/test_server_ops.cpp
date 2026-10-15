@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "ini.hpp"
+#include "secrets.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "util.hpp"
@@ -270,4 +271,31 @@ TEST_CASE("default server and removal with an explicit rclone.conf") {
     CHECK(text.find("[agent]") == std::string::npos);
     CHECK(text.find("default_remote = box\n") != std::string::npos); // moved to the next server
     CHECK(s.read("rclone.conf") == rclone_conf); // a shared rclone.conf is never edited
+}
+
+TEST_CASE("grab's own rclone.conf loses its passwords to the encrypted store on load") {
+    // The test runner points APPDATA at a scratch folder (test_main.cpp), so this is grab's
+    // own rclone.conf there, never the real one.
+    const auto own = grab_rclone_config_path();
+    REQUIRE(util::path_to_utf8(own).find("grab-tests-home") != std::string::npos);
+    Scratch s;
+    std::filesystem::create_directories(own.parent_path());
+    std::ofstream(own, std::ios::binary) << rclone_conf;
+    s.write("grab.conf", "[grab]\ndefault_remote = box\n\n[box]\nmax_depth = 4\n\n[agent]\n");
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    CHECK(env->secrets_error.empty());
+    CHECK(util::read_file(own)->find("pass") == std::string::npos);
+    const auto store = secrets::load(secrets::path_beside(own));
+    REQUIRE(store.has_value());
+    CHECK(store->at("box").at("pass") == "OBSCURED");
+    CHECK(util::getenv_utf8("RCLONE_CONFIG_BOX_PASS") == "OBSCURED");
+    // The rest of the server is still read from rclone.conf.
+    const auto list = server_ops::list_servers(*env);
+    REQUIRE(list.size() == 2);
+    CHECK(list[0].host == "box.example.com");
+    CHECK(list[0].auth == Auth::password);
+    secrets::export_to_env({});
+    std::filesystem::remove(own);
+    std::filesystem::remove(secrets::path_beside(own));
 }
