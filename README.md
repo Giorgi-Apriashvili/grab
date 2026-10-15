@@ -131,6 +131,15 @@ results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and fol
 download queue with live progress. It reads the same grab.conf and remembers the last server,
 mode and destination per server in `%APPDATA%\grab\gui.json`.
 
+- **Instant search** from each server's saved file list (see [File lists](#file-lists)):
+  results appear at once, with "from the file list, 3 min old" under them.
+  - A list older than 15 minutes is refreshed in the background, and the results update when
+    the new list arrives; the selection is kept. "Refresh" fetches it at once.
+  - A server without a list yet is searched live the first time while its list is built.
+- **All servers** (at the top of the server picker) searches every server's list at once.
+  Results show their server, and Download sends each pick to its own server, into the same
+  Save-to folder. Two picks with the same name aren't downloaded into one folder.
+
 - **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4. Each
   one can be paused, resumed or cancelled, or all together with Pause all / Resume all and
   Cancel all.
@@ -314,6 +323,7 @@ grab config [-c PATH]
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
+      --fresh          fetch the server's file list now instead of using a saved one
       --rclone         download with plain rclone copyto / copy and rclone's own progress
   -n, --dry-run        resolve the target and show what would be fetched (with --rclone: the
                        rclone command); transfers nothing and creates no folders
@@ -321,6 +331,9 @@ grab config [-c PATH]
       --init           write an example grab.conf
 ```
 
+- Searches use the server's saved [file list](#file-lists) when it is under 15 minutes old,
+  which makes them instant. Otherwise grab fetches a new list first ("fetching the file list
+  of Box…") and saves it. `--fresh` always fetches.
 - `TARGET` is a search: every word must appear in the name, ignoring case, in any order.
   `grab -s lioness E:\TV` lists every file with "lioness" in its name.
   `grab -s "lioness s03e08" E:\TV` narrows that to one episode, and so does
@@ -393,6 +406,29 @@ blank for the home directory; `/` itself is not listable there.
 (`learning`); blank or `.` means the home directory. `known_hosts_file = none` in
 rclone.conf is honoured as "no known_hosts file" and never passed to ssh.
 
+## File lists
+
+A Storage Box has no shell, so every search there walks its folders over SFTP: 8–18 s on the
+test boxes. Instead, grab keeps a list of each server's files and folders and searches that
+on your PC in milliseconds, with the same matching and ranking as a live search.
+
+| Server (depth 4) | live search | list size | fetching the list |
+|------------------|-------------|-----------|-------------------|
+| Storage Box      | 18.2 s      | 6,329 entries, 0.6 MB | 18 s |
+| Storage Box sub-account | 8.4 s | 4,681 entries, 0.4 MB | 8 s |
+| Server with ssh  | 1.2 s       | 17,387 entries, 1.9 MB | 2–4 s |
+
+- A list covers what a search looks at: the search roots down to `max_depth`, dot-names left
+  out as searches leave them out. It is fetched in one go (ssh + find, or `rclone lsf -R`).
+- It is fresh for 15 minutes. The `grab` command then fetches a new one before searching;
+  the window answers from the old one at once and refreshes it in the background.
+- Changing a server's address, login, search roots or depth makes its list stale; removing a
+  server deletes its list.
+- A path target, a search for a dot-name, and `--depth` other than the configured one search
+  the server live, as before.
+- The lists are in `%LOCALAPPDATA%\grab\lists`, one `<server>.list` each: plain text with
+  every file name on your servers, kept on this PC only. Delete the folder to remove them.
+
 ## Tuning
 
 Defaults (override per remote in grab.conf):
@@ -432,6 +468,7 @@ src/folder_job.*    a folder download, shared by the window and the command
 src/cli_download.*  the command's downloads: live progress line, Ctrl+C
 src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
+src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)

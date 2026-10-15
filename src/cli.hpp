@@ -24,6 +24,7 @@ struct Options {
     bool all = false;                // --all: take every match without asking
     bool exact = false;              // --exact: whole-name, case-sensitive matching
     bool rclone = false;             // --rclone: plain rclone copyto / copy instead of grab's engine
+    bool fresh = false;              // --fresh: fetch the server's file list before searching
     bool dry_run = false;
     bool verbose = false;
     bool check = false;              // `grab update --check`

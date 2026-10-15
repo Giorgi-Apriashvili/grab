@@ -1,6 +1,6 @@
 'use strict';
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
-//   to backend:   init, prefs, search, cancelSearch, pickFolder, enqueue, cancelItem,
+//   to backend:   init, prefs, search, cancelSearch, refreshLists, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, moveItem, setPriority, clearFinished, openFolder,
 //                 pauseChild, resumeChild, skipChild,
@@ -33,6 +33,7 @@ const state = {
   limitOn: false,
   limitMiBps: 5,
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing
+  lists: [],             // the last search's sources per server: age, live, refreshing, error
   updateLater: false,    // "Later": hidden until grab starts again
 };
 
@@ -69,12 +70,23 @@ function parentOf(path) {
 }
 
 function currentRemote() { return state.remotes.find((r) => r.name === state.remote); }
+const ALL = '*'; // "All servers" in the server picker
+
+// "45 s", "12 min", "3 h", "2 days"
+function fmtAge(sec) {
+  if (sec < 90) return `${Math.max(0, Math.round(sec))} s`;
+  if (sec < 90 * 60) return `${Math.round(sec / 60)} min`;
+  if (sec < 36 * 3600) return `${Math.round(sec / 3600)} h`;
+  return `${Math.round(sec / 86400)} days`;
+}
 
 // ---- header: remote, mode ----------------------------------------------------------------
 
 function renderRemotes() {
   const sel = $('#remote');
-  sel.innerHTML = state.remotes.map((r) =>
+  const all = state.remotes.length > 1
+    ? `<option value="${ALL}"${state.remote === ALL ? ' selected' : ''}>All servers</option>` : '';
+  sel.innerHTML = all + state.remotes.map((r) =>
     `<option value="${esc(r.name)}"${r.name === state.remote ? ' selected' : ''}>${esc(r.name)}</option>`).join('');
   renderRemoteInfo();
 }
@@ -83,6 +95,14 @@ function renderRemoteInfo() {
   const info = $('#remote-info');
   const r = currentRemote();
   $('#dest').value = state.destinations[state.remote] || state.defaultDest;
+  $('#dir-head').textContent = state.remote === ALL ? 'Server · Folder' : 'Folder';
+  if (state.remote === ALL) {
+    info.hidden = false;
+    info.classList.remove('error');
+    info.textContent = `${state.remotes.length} servers · from their file lists`;
+    info.title = '';
+    return;
+  }
   if (!r) { info.hidden = true; return; }
   info.hidden = false;
   info.classList.toggle('error', !!r.error);
@@ -125,24 +145,66 @@ function startSearch() {
   state.hits = [];
   state.selected.clear();
   state.cursor = state.anchor = -1;
+  state.lists = [];
+  renderListStatus();
   setSearching(true);
   renderRows();
   send({ type: 'search', id: state.searchId, remote: state.remote, query, mode: state.mode, exact: $('#exact').checked });
 }
 
+// Where the results came from: "from the file list, 3 min old · refreshing…", per server under
+// All servers; failures in red.
+function renderListStatus() {
+  const el = $('#list-status');
+  const lists = state.lists;
+  const refreshing = lists.filter((l) => l.refreshing).map((l) => l.remote);
+  const parts = [];
+  if (state.remote === ALL) {
+    const aged = lists.filter((l) => typeof l.age === 'number');
+    if (aged.length) parts.push(`from file lists, up to ${fmtAge(Math.max(...aged.map((l) => l.age)))} old`);
+    const missing = lists.filter((l) => typeof l.age !== 'number' && !l.live && l.refreshing).map((l) => l.remote);
+    if (missing.length) parts.push(`fetching the lists of ${missing.join(', ')}`);
+    else if (refreshing.length) parts.push(`refreshing ${refreshing.join(', ')}`);
+  } else if (lists.length) {
+    const l = lists[0];
+    if (typeof l.age === 'number') parts.push(`from the file list, ${fmtAge(l.age)} old`);
+    if (l.refreshing) parts.push(l.live || typeof l.age !== 'number' ? 'building the file list' : 'refreshing');
+  }
+  const errors = lists.filter((l) => l.error).map((l) => `${state.remote === ALL ? `${l.remote}: ` : ''}${l.error}`);
+  el.innerHTML = (refreshing.length ? '<span class="spinner"></span>' : '') + esc(parts.join(' · ')) +
+    (errors.length ? `${parts.length ? ' · ' : ''}<span class="bad">list refresh failed: ${esc(errors.join('; '))}</span>` : '');
+  el.title = errors.join('\n');
+  $('#refresh-lists').hidden = !lists.some((l) => typeof l.age === 'number') || refreshing.length > 0;
+}
+
 function onSearchResult(msg) {
   if (msg.id !== state.searchId) return;
+  // An update (the same search after a list refresh) keeps the selection and cursor by path.
+  const keyOf = (h) => `${h.remote}|${h.path}`;
+  const selectedKeys = msg.update ? new Set([...state.selected].map((i) => keyOf(state.hits[i]))) : null;
+  const cursorKey = msg.update && state.hits[state.cursor] ? keyOf(state.hits[state.cursor]) : null;
   state.hits = msg.hits;
-  state.cursor = state.hits.length ? 0 : -1;
+  state.lists = msg.lists || [];
+  if (msg.update) {
+    state.selected = new Set();
+    state.hits.forEach((h, i) => { if (selectedKeys.has(keyOf(h))) state.selected.add(i); });
+    const c = cursorKey ? state.hits.findIndex((h) => keyOf(h) === cursorKey) : -1;
+    state.cursor = c >= 0 ? c : (state.hits.length ? 0 : -1);
+  } else {
+    state.cursor = state.hits.length ? 0 : -1;
+  }
   state.anchor = state.cursor;
   // Before rendering: an empty result shows "No files matching …" from these.
-  const secs = (msg.elapsedMs / 1000).toFixed(1);
-  state.resultNote = `${msg.hits.length} ${state.mode === 'folder' ? 'folder' : 'file'}${msg.hits.length === 1 ? '' : 's'} in ${secs} s`;
-  state.searchedWhere = `${msg.roots.join(', ')}, depth ${msg.maxDepth}`;
-  setSearching(false);
-  $('#results').scrollTop = 0;
+  const n = msg.hits.length;
+  const noun = `${state.mode === 'folder' ? 'folder' : 'file'}${n === 1 ? '' : 's'}`;
+  const live = state.lists.length && state.lists.every((l) => l.live);
+  state.resultNote = live ? `${n} ${noun} in ${(msg.elapsedMs / 1000).toFixed(1)} s` : `${n} ${noun}`;
+  state.searchedWhere = state.remote === ALL ? 'every server' : `${msg.roots.join(', ')}, depth ${msg.maxDepth}`;
+  renderListStatus();
+  if (state.searching) setSearching(false);
+  if (!msg.update) $('#results').scrollTop = 0;
   renderRows(); // also renders the summary
-  if (state.hits.length) $('#results').focus();
+  if (!msg.update && state.hits.length) $('#results').focus();
 }
 
 function onSearchError(msg) {
@@ -176,7 +238,7 @@ function renderRows() {
       `<input type="checkbox" tabindex="-1"${sel ? ' checked' : ''}>` +
       `<span class="name" title="${esc(h.path)}">${esc(h.name)}</span>` +
       `<span class="size">${fmtSize(h.size)}</span>` +
-      `<span class="dir">${esc(parentOf(h.path))}</span></div>`;
+      `<span class="dir">${state.remote === ALL ? `<span class="srv">${esc(h.remote)}</span>` : ''}${esc(parentOf(h.path))}</span></div>`;
   }
   const rows = $('#rows');
   rows.style.transform = `translateY(${first * ROW}px)`;
@@ -191,7 +253,7 @@ function renderEmpty() {
   empty.hidden = false;
   const r = currentRemote();
   if (state.searching) {
-    empty.innerHTML = `<span><span class="spinner"></span>Searching ${esc(state.remote)} for “${esc(state.lastQuery)}”…</span>`;
+    empty.innerHTML = `<span><span class="spinner"></span>Searching ${state.remote === ALL ? 'all servers' : esc(state.remote)} for “${esc(state.lastQuery)}”…</span>`;
   } else if (state.lastQuery && state.resultNote && !state.resultNote.startsWith('Search cancelled')) {
     empty.textContent = `No ${state.mode === 'folder' ? 'folders' : 'files'} matching “${state.lastQuery}” (searched ${state.searchedWhere}).`;
   } else if (!state.remotes.length) {
@@ -265,14 +327,30 @@ function download(hits) {
     return;
   }
   showBanner('');
-  // Skip anything already waiting or running for the same place.
-  const busy = new Set(state.queue.filter((q) => ['queued', 'running', 'paused'].includes(q.status))
-    .map((q) => `${q.remote}|${q.path}|${q.dest}`));
-  const items = hits.filter((h) => !busy.has(`${state.remote}|${h.path}|${dest}`))
-    .map((h) => ({ path: h.path, name: h.name, size: h.size }));
-  if (!items.length) return;
+  // Skip anything already waiting or running for the same place, and two downloads into the same
+  // file (the same name from two servers under All servers): they would write it at once.
+  const active = state.queue.filter((q) => ['queued', 'running', 'paused'].includes(q.status));
+  const busy = new Set(active.map((q) => `${q.remote}|${q.path}|${q.dest}`));
+  const targets = new Set(active.map((q) => `${q.dest.toLowerCase()}|${q.name.toLowerCase()}`));
+  const clashes = [];
+  // Each hit goes to its own server's queue (they differ under All servers).
+  const groups = new Map();
+  for (const h of hits) {
+    if (busy.has(`${h.remote}|${h.path}|${dest}`)) continue;
+    const target = `${dest.toLowerCase()}|${h.name.toLowerCase()}`;
+    if (targets.has(target)) { clashes.push(h.name); continue; }
+    targets.add(target);
+    if (!groups.has(h.remote)) groups.set(h.remote, []);
+    groups.get(h.remote).push({ path: h.path, name: h.name, size: h.size });
+  }
+  if (clashes.length) {
+    showBanner(`Not downloaded again into the same folder: ${clashes.join(', ')}. ` +
+      'A download to that name is already in the queue; pick another folder for the other copy.');
+  }
+  if (!groups.size) return;
   state.destinations[state.remote] = dest;
-  send({ type: 'enqueue', remote: state.remote, mode: state.mode, dest, items });
+  for (const [remote, items] of groups) send({ type: 'enqueue', remote, mode: state.mode, dest, items });
+  if (state.remote === ALL) send({ type: 'prefs', remote: ALL }); // stay on All servers next time
 }
 
 const queueEls = new Map(); // id -> element; updated in place so buttons don't flicker
@@ -613,6 +691,12 @@ $('#update-banner').addEventListener('click', (ev) => {
 });
 
 $('#update-auto').addEventListener('change', (ev) => send({ type: 'setUpdateCheck', on: ev.target.checked }));
+
+$('#refresh-lists').addEventListener('click', () => {
+  send({ type: 'refreshLists', remote: state.remote });
+  for (const l of state.lists) if (typeof l.age === 'number') l.refreshing = true;
+  renderListStatus();
+});
 $('#update-now').addEventListener('click', () => {
   $('#update-now').disabled = true;
   const r = $('#update-result');
@@ -956,6 +1040,8 @@ $('#remote').addEventListener('change', (ev) => {
   state.selected.clear();
   state.resultNote = '';
   state.lastQuery = '';
+  state.lists = [];
+  renderListStatus();
   showBanner('');
   renderRemoteInfo();
   renderRows();

@@ -32,9 +32,8 @@ std::vector<std::string> build_lsf_argv(const ListRequest& req) {
     const bool path_target = is_path_target(req.target);
     const std::string base = path_target ? parent_of(req.target) : req.root;
 
-    std::vector<std::string> argv{req.rclone_exe, "lsf", remote_spec(req.rclone_remote, base),
-                                  "--format", "sp",
-                                  req.mode == Mode::folder ? "--dirs-only" : "--files-only"};
+    std::vector<std::string> argv{req.rclone_exe, "lsf", remote_spec(req.rclone_remote, base), "--format", "sp"};
+    if (!req.all_entries) argv.push_back(req.mode == Mode::folder ? "--dirs-only" : "--files-only");
     if (!path_target) {
         argv.insert(argv.end(), {"-R", "--max-depth", std::to_string(req.max_depth)});
         if (req.skip_hidden && !wants_hidden(make_query(req.target, req.exact))) {

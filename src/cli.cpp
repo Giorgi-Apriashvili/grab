@@ -53,6 +53,7 @@ Options:
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
+      --fresh          fetch the server's file list now instead of using a saved one
       --rclone         download with plain rclone copyto / copy and rclone's own progress
                        instead of grab's resumable download over several connections
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
@@ -61,6 +62,8 @@ Options:
   -h, --help           show this help
       --version        show version
 
+Searches use a saved list of the server's files when it is under 15 minutes old (instant);
+otherwise grab fetches a new list first. Path targets and searches for dot-names go live.
 Downloads run over several connections at once and survive interruptions: Ctrl+C keeps
 what is on disk, and the same command later continues from there. A file or folder file
 already on disk (same size, not older than the server's) is not fetched again.
@@ -165,6 +168,8 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             result.opts.exact = true;
         } else if (name == "--rclone") {
             result.opts.rclone = true;
+        } else if (name == "--fresh") {
+            result.opts.fresh = true;
         } else if (name == "-n" || name == "--dry-run") {
             result.opts.dry_run = true;
         } else if (name == "-v" || name == "--verbose") {

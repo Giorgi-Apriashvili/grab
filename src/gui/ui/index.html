@@ -44,7 +44,7 @@
       <input id="select-all" type="checkbox" title="Select all" aria-label="Select all">
       <span class="name">Name</span>
       <span class="size">Size</span>
-      <span class="dir">Folder</span>
+      <span class="dir" id="dir-head">Folder</span>
     </div>
     <div id="results" class="results" tabindex="0" aria-label="Search results">
       <div id="spacer"></div>
@@ -55,6 +55,8 @@
 
   <footer class="bar action">
     <span id="summary" class="muted"></span>
+    <span id="list-status" class="list-status"></span>
+    <button id="refresh-lists" type="button" class="link" title="Fetch the file list again now" hidden>Refresh</button>
     <span class="spacer"></span>
     <label class="field dest">
       <span class="label">Save to</span>

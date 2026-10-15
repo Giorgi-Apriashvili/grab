@@ -6,6 +6,7 @@
 #include "cli.hpp"
 #include "config.hpp"
 #include "process.hpp"
+#include "remote.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -55,6 +56,24 @@ struct SearchResult {
 
 // Called with each external command just before it runs (for --verbose).
 using CommandHook = std::function<void(const std::vector<std::string>&)>;
+
+// The remote's search roots; "" (the login home) when none are set.
+[[nodiscard]] std::vector<std::string> search_roots(const Context& ctx);
+
+// Runs `command` on the server through ssh (never prompting with `batch_ssh`): its stdout, or a
+// readable error when ssh itself failed (exit 255). Other exit codes count as success: find
+// reports unreadable folders that way, and what it printed is still good.
+[[nodiscard]] std::expected<std::string, std::string>
+run_over_ssh(const Context& ctx, const std::string& command, bool batch_ssh, const proc::RunOptions& run = {},
+             const CommandHook& on_command = {});
+
+// Runs an `rclone lsf` command line: its stdout, or a readable error.
+[[nodiscard]] std::expected<std::string, std::string>
+run_listing(std::span<const std::string> argv, const proc::RunOptions& run = {}, const CommandHook& on_command = {});
+
+// A search's result from the entries found: duplicates dropped, ranked best first
+// (rank_matches), sizes kept.
+[[nodiscard]] SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vector<RemoteEntry> entries);
 
 // Runs the lookup the context's method calls for. An error means the lookup itself failed
 // (ssh or rclone exited non-zero); no matches is a successful, empty result.

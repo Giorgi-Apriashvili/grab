@@ -62,34 +62,9 @@ lookup_via_ssh(const Context& ctx, const SearchRequest& req, const std::vector<s
     find.roots = roots;
     find.max_depth = max_depth;
     find.skip_hidden = ctx.settings.skip_hidden;
-
-    std::vector<std::string> ssh_options = ctx.settings.ssh_options;
-    if (req.batch_ssh) ssh_options.insert(ssh_options.end(), {"-o", "BatchMode=yes"});
-    const auto argv =
-        build_ssh_argv(ctx.config.ssh, ctx.remote, ssh_options, build_find_command(find));
-    if (on_command) on_command(argv);
-
-    auto res = proc::run_capture(argv, run);
-    if (!res) return util::fail(res.error());
-    if (res->exit_code == proc::exit_stopped && run.stop.stop_requested()) {
-        return util::fail("search cancelled");
-    }
-    if (res->exit_code == 255) {
-        const std::string detail = run.detached ? last_line(res->err) : std::string{};
-        std::string msg = std::format("ssh to {}@{}:{} failed (exit 255)", ctx.remote.user,
-                                      ctx.remote.host, ctx.remote.port);
-        if (!detail.empty()) msg += ": " + detail;
-        else if (!run.detached) msg += "; see the message above";
-        if (req.batch_ssh) {
-            msg += ". grab cannot answer a passphrase prompt here; load the key into ssh-agent "
-                   "(ssh-add <key file>)";
-        }
-        msg += std::format(". If this host has no shell (e.g. a storage box), set `find = rclone` "
-                           "in [{}]",
-                           ctx.settings.name);
-        return util::fail(msg);
-    }
-    return parse_find_output(res->out, req.mode == Mode::file);
+    auto out = run_over_ssh(ctx, build_find_command(find), req.batch_ssh, run, on_command);
+    if (!out) return util::fail(out.error());
+    return parse_find_output(*out, req.mode == Mode::file);
 }
 
 std::expected<std::vector<RemoteEntry>, std::string>
@@ -112,21 +87,9 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, const std::vecto
         list.rclone_config = ctx.config.rclone_config;
         list.rclone_remote = ctx.settings.rclone_remote;
 
-        const auto argv = build_lsf_argv(list);
-        if (on_command) on_command(argv);
-
-        auto res = proc::run_capture(argv, run);
-        if (!res) return util::fail(res.error());
-        if (res->exit_code == proc::exit_stopped && run.stop.stop_requested()) {
-            return util::fail("search cancelled");
-        }
-        if (res->exit_code != 0) {
-            const std::string detail = run.detached ? last_line(res->err) : std::string{};
-            return util::failf("rclone lsf of '{}' failed (exit {}){}", argv[2], res->exit_code,
-                               detail.empty() ? (run.detached ? "" : "; see the message above")
-                                              : ": " + detail);
-        }
-        auto entries = parse_lsf_output(list, res->out);
+        auto out = run_listing(build_lsf_argv(list), run, on_command);
+        if (!out) return util::fail(out.error());
+        auto entries = parse_lsf_output(list, *out);
         found.insert(found.end(), std::make_move_iterator(entries.begin()),
                      std::make_move_iterator(entries.end()));
     }
@@ -135,24 +98,80 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, const std::vecto
 
 } // namespace
 
+std::vector<std::string> search_roots(const Context& ctx) {
+    auto roots = ctx.settings.search_roots;
+    if (roots.empty()) roots.emplace_back(); // the login home
+    return roots;
+}
+
+std::expected<std::string, std::string> run_over_ssh(const Context& ctx, const std::string& command, bool batch_ssh,
+                                                     const proc::RunOptions& run, const CommandHook& on_command) {
+    std::vector<std::string> ssh_options = ctx.settings.ssh_options;
+    if (batch_ssh) ssh_options.insert(ssh_options.end(), {"-o", "BatchMode=yes"});
+    const auto argv = build_ssh_argv(ctx.config.ssh, ctx.remote, ssh_options, command);
+    if (on_command) on_command(argv);
+
+    auto res = proc::run_capture(argv, run);
+    if (!res) return util::fail(res.error());
+    if (res->exit_code == proc::exit_stopped && run.stop.stop_requested()) {
+        return util::fail("search cancelled");
+    }
+    if (res->exit_code == 255) {
+        const std::string detail = run.detached ? last_line(res->err) : std::string{};
+        std::string msg = std::format("ssh to {}@{}:{} failed (exit 255)", ctx.remote.user,
+                                      ctx.remote.host, ctx.remote.port);
+        if (!detail.empty()) msg += ": " + detail;
+        else if (!run.detached) msg += "; see the message above";
+        if (batch_ssh) {
+            msg += ". grab cannot answer a passphrase prompt here; load the key into ssh-agent "
+                   "(ssh-add <key file>)";
+        }
+        msg += std::format(". If this host has no shell (e.g. a storage box), set `find = rclone` "
+                           "in [{}]",
+                           ctx.settings.name);
+        return util::fail(msg);
+    }
+    return std::move(res->out);
+}
+
+std::expected<std::string, std::string> run_listing(std::span<const std::string> argv, const proc::RunOptions& run,
+                                                    const CommandHook& on_command) {
+    if (on_command) on_command(std::vector<std::string>(argv.begin(), argv.end()));
+    auto res = proc::run_capture(argv, run);
+    if (!res) return util::fail(res.error());
+    if (res->exit_code == proc::exit_stopped && run.stop.stop_requested()) {
+        return util::fail("search cancelled");
+    }
+    if (res->exit_code != 0) {
+        const std::string detail = run.detached ? last_line(res->err) : std::string{};
+        return util::failf("rclone lsf of '{}' failed (exit {}){}", argv[2], res->exit_code,
+                           detail.empty() ? (run.detached ? "" : "; see the message above") : ": " + detail);
+    }
+    return std::move(res->out);
+}
+
 std::expected<SearchResult, std::string> search(const Context& ctx, const SearchRequest& req,
                                                 const proc::RunOptions& run,
                                                 const CommandHook& on_command) {
+    const auto roots = search_roots(ctx);
+    const int max_depth = req.depth.value_or(ctx.settings.max_depth);
+    auto entries = ctx.method == FindMethod::ssh
+                       ? lookup_via_ssh(ctx, req, roots, max_depth, run, on_command)
+                       : lookup_via_rclone(ctx, req, roots, max_depth, run, on_command);
+    if (!entries) return util::fail(entries.error());
+    return make_result(ctx, req, std::move(*entries));
+}
+
+SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vector<RemoteEntry> entries) {
     SearchResult result;
     result.max_depth = req.depth.value_or(ctx.settings.max_depth);
-    result.roots = ctx.settings.search_roots;
-    if (result.roots.empty()) result.roots.emplace_back(); // the login home
-
-    auto entries = ctx.method == FindMethod::ssh
-                       ? lookup_via_ssh(ctx, req, result.roots, result.max_depth, run, on_command)
-                       : lookup_via_rclone(ctx, req, result.roots, result.max_depth, run, on_command);
-    if (!entries) return util::fail(entries.error());
+    result.roots = search_roots(ctx);
 
     // Rank by path, then reattach sizes.
     std::unordered_map<std::string, std::optional<std::uint64_t>> sizes;
     std::vector<std::string> paths;
-    paths.reserve(entries->size());
-    for (auto& e : *entries) {
+    paths.reserve(entries.size());
+    for (auto& e : entries) {
         if (sizes.emplace(e.path, e.size).second) paths.push_back(std::move(e.path));
     }
     rank_matches(paths, make_query(req.target, req.exact));

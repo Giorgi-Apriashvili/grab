@@ -2,6 +2,7 @@
 
 #include "cli.hpp"
 #include "fetch.hpp"
+#include "file_list.hpp"
 #include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
@@ -135,6 +136,21 @@ private:
     void post(const json::Value& message) const;
     void send_init();
     void start_search(const json::Value& msg);
+    // A search of one server, or of all ("*"). `update`: the same search again after a file list
+    // was refreshed; it never starts another refresh.
+    void run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update);
+
+    // Saved file lists (file_list.hpp), one per server, all under lists_mutex_.
+    struct ListSlot {
+        bool loaded = false; // read from disk once
+        std::shared_ptr<const file_list::List> list;
+        bool refreshing = false;
+        std::string error; // why the last refresh failed
+    };
+    ListSlot& list_slot(const std::string& server); // caller holds lists_mutex_
+    void start_refresh(const std::string& server);   // fetches a new list in the background; any thread
+    void on_list_refreshed(const std::string& server); // UI thread: shows the last search again
+    void prune_lists();                                // drops lists of servers no longer configured
     void enqueue(const json::Value& msg);
     // Queue actions; `id` 0 means every item the action applies to.
     void pause_items(int id);
@@ -213,7 +229,19 @@ private:
     fetch::Connections connections_;
     rate::RateLimiter limiter_; // shared by every download's streams
 
+    struct LastSearch {
+        int id = 0;
+        std::string remote;
+        engine::SearchRequest req;
+    };
+    std::filesystem::path lists_dir_;
+    std::mutex lists_mutex_; // guards lists_, refresh_threads_, last_search_
+    std::map<std::string, ListSlot> lists_;
+    std::map<std::string, std::jthread> refresh_threads_;
+    LastSearch last_search_;
+    // After the lists: the search thread uses them and starts refreshes, so it ends first.
     std::jthread search_thread_;
+    std::atomic<bool> search_replaced_{false}; // a stopped search is being replaced: no "cancelled"
 
     UpdateBanner update_;
     bool update_checks_started_ = false;

@@ -51,6 +51,7 @@ add_library(grab_core STATIC
     src/fetch.cpp
     src/folder.cpp
     src/folder_job.cpp
+    src/file_list.cpp
     src/progress_line.cpp
     src/rate.cpp)
 

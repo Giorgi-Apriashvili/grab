@@ -5,6 +5,7 @@
 #include "cli_download.hpp"
 #include "config.hpp"
 #include "engine.hpp"
+#include "file_list.hpp"
 #include "ini.hpp"
 #include "match.hpp"
 #include "process.hpp"
@@ -16,6 +17,8 @@
 #include "update.hpp"
 #include "util.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -227,6 +230,45 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
     return tally;
 }
 
+// "45 s", "12 min", "3 h", "2 days".
+std::string age_text(std::int64_t seconds) {
+    if (seconds < 90) return std::format("{} s", seconds);
+    if (seconds < 90 * 60) return std::format("{} min", (seconds + 30) / 60);
+    if (seconds < 36 * 3600) return std::format("{} h", (seconds + 1800) / 3600);
+    return std::format("{} days", (seconds + 43200) / 86400);
+}
+
+// The search, from the server's saved file list when it can answer it: the list is used while
+// it is fresh, else fetched again first (and saved). Other searches go live.
+std::expected<engine::SearchResult, std::string> search(const engine::Context& ctx, const engine::SearchRequest& req,
+                                                        const Options& opts, const engine::CommandHook& trace) {
+    if (!file_list::can_answer(ctx, req)) {
+        if (opts.verbose) {
+            std::println(stderr, "grab: looking up '{}' via {}", opts.target,
+                         ctx.method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
+        }
+        return engine::search(ctx, req, {}, trace);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto file = file_list::path_for(file_list::default_dir(), ctx.settings.name);
+    auto list = opts.fresh ? std::nullopt : file_list::load(file);
+    if (list && list->fingerprint == file_list::fingerprint(ctx) && file_list::fresh(list->fetched, now)) {
+        if (opts.verbose) {
+            std::println(stderr, "grab: searching the file list of {} ({} old, {} entries)", ctx.settings.name,
+                         age_text(now - list->fetched), list->entries.size());
+        }
+        return file_list::search(ctx, *list, req);
+    }
+    std::println(stderr, "grab: fetching the file list of {}...", ctx.settings.name);
+    auto fetched = file_list::fetch(ctx, now, false, {}, trace);
+    if (!fetched) return util::fail(fetched.error());
+    if (!file_list::save(file, *fetched) && opts.verbose) {
+        std::println(stderr, "grab: could not save the file list to {}", util::path_to_utf8(file));
+    }
+    return file_list::search(ctx, *fetched, req);
+}
+
 int run(const Options& opts) {
     // 2. configuration -------------------------------------------------------------------
     const auto cfg_path = opts.config.value_or(default_grab_config_path());
@@ -261,10 +303,6 @@ int run(const Options& opts) {
     }
 
     // 3. resolve the remote path ---------------------------------------------------------
-    if (opts.verbose) {
-        std::println(stderr, "grab: looking up '{}' via {}", opts.target,
-                     ctx->method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
-    }
     engine::SearchRequest req;
     req.target = opts.target;
     req.mode = opts.mode;
@@ -273,7 +311,7 @@ int run(const Options& opts) {
     const engine::CommandHook trace = [&](const std::vector<std::string>& argv) {
         if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
     };
-    auto found = engine::search(*ctx, req, {}, trace);
+    auto found = search(*ctx, req, opts, trace);
     if (!found) {
         error(found.error());
         return exit_lookup;

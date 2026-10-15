@@ -315,6 +315,21 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .st-failed .q-sub { color: var(--danger); white-space: normal; }
 .st-queued .q-bar > div { width: 0 !important; }
 
+/* file lists ------------------------------------------------------------------------------ */
+.list-status { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.list-status .bad { color: var(--danger); }
+#refresh-lists { color: var(--accent); background: none; border: 0; padding: 0 2px; height: auto; font-size: 12px; cursor: pointer; }
+#refresh-lists:hover { text-decoration: underline; }
+.srv {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+}
+
 /* update banner --------------------------------------------------------------------------- */
 .update-banner {
   display: flex;

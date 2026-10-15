@@ -24,6 +24,8 @@ struct ListRequest {
     std::string rclone_exe;
     std::optional<std::filesystem::path> rclone_config;
     std::string rclone_remote;
+    // Files and folders together (a server's whole file list), instead of `mode`'s kind only.
+    bool all_entries = false;
 };
 
 // ("", "a/b") -> "a/b"   ("/", "a") -> "/a"   ("x/", "a") -> "x/a"

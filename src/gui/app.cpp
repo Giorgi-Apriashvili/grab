@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <set>
 #include <span>
 #include <utility>
 
@@ -70,6 +71,10 @@ const char* auth_name(servers::Auth a) {
 int weight_of(std::string_view priority) { return priority == "high" ? 4 : priority == "low" ? 1 : 2; }
 const char* priority_name(int weight) { return weight >= 4 ? "high" : weight <= 1 ? "low" : "normal"; }
 
+std::int64_t unix_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 const char* file_state_name(folder::State s) {
     constexpr const char* names[] = {"queued", "running", "paused", "done", "failed", "skipped"}; // folder::State order
     return names[static_cast<int>(s)];
@@ -104,6 +109,8 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
         }
     }
     restore_queue();
+    lists_dir_ = file_list::default_dir();
+    prune_lists();
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {
         workers_.emplace_back([this](std::stop_token stop) { worker_loop(std::move(stop)); });
@@ -180,6 +187,15 @@ void App::on_message(const std::string& text) {
         save_state();
     } else if (type == "search") {
         start_search(*msg);
+    } else if (type == "refreshLists") {
+        const std::string remote = msg->string_of("remote").value_or("");
+        if (remote == "*") {
+            if (auto cfg = load_grab_config(config_path_)) {
+                for (const auto& r : cfg->remotes) start_refresh(r.name);
+            }
+        } else if (!remote.empty()) {
+            start_refresh(remote);
+        }
     } else if (type == "cancelSearch") {
         if (search_thread_.joinable()) search_thread_.request_stop();
     } else if (type == "pickFolder") {
@@ -322,7 +338,7 @@ void App::send_init() {
         auto has = [&](const std::string& name) {
             return std::ranges::any_of(cfg->remotes, [&](const auto& r) { return r.name == name; });
         };
-        if (has(state_.last_remote)) selected = state_.last_remote;
+        if (has(state_.last_remote) || (state_.last_remote == "*" && cfg->remotes.size() > 1)) selected = state_.last_remote;
         else if (cfg->default_remote && has(*cfg->default_remote)) selected = *cfg->default_remote;
         else if (!cfg->remotes.empty()) selected = cfg->remotes.front().name;
     }
@@ -341,23 +357,34 @@ void App::send_init() {
 }
 
 void App::start_search(const Value& msg) {
-    // A new search replaces the previous one; stopping kills its ssh/rclone child at once.
-    if (search_thread_.joinable()) {
-        search_thread_.request_stop();
-        search_thread_.join();
-    }
-    const int id = int_of(msg, "id");
-    const std::string remote = msg.string_of("remote").value_or("");
     engine::SearchRequest req;
     req.target = msg.string_of("query").value_or("");
     req.mode = mode_of(msg);
     req.exact = bool_of(msg, "exact");
     req.batch_ssh = true; // no console to answer a prompt: fail fast instead
     if (int depth = int_of(msg, "depth"); depth > 0) req.depth = depth;
+    run_search(int_of(msg, "id"), msg.string_of("remote").value_or(""), req, false);
+}
 
-    search_thread_ = std::jthread([this, id, remote, req](std::stop_token stop) {
+// A server's search answers from its saved file list when it has one that fits; a list older
+// than file_list::fresh_for is refreshed in the background, and the search then runs again. A
+// server without a list is searched live (one server) while its list is fetched for next time.
+void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update) {
+    // A new search replaces the previous one; stopping kills its ssh/rclone child at once.
+    if (search_thread_.joinable()) {
+        search_replaced_ = true;
+        search_thread_.request_stop();
+        search_thread_.join();
+        search_replaced_ = false;
+    }
+    {
+        std::lock_guard lock(lists_mutex_);
+        last_search_ = LastSearch{id, remote, req};
+    }
+    search_thread_ = std::jthread([this, id, remote, req, update](std::stop_token stop) {
         const auto t0 = std::chrono::steady_clock::now();
         auto fail = [&](const std::string& message, bool cancelled) {
+            if (cancelled && search_replaced_) return; // the next search reports instead
             Value v = Value::make_object();
             v.set("type", str("searchError"));
             v.set("id", num(id));
@@ -367,36 +394,164 @@ void App::start_search(const Value& msg) {
         };
         if (util::trim(req.target).empty()) return fail("type something to search for", false);
 
-        auto ctx = engine::load_context(config_path_, remote);
-        if (!ctx) return fail(ctx.error(), false);
+        const bool all = remote == "*";
+        std::vector<std::string> servers;
+        if (all) {
+            auto cfg = load_grab_config(config_path_);
+            if (!cfg) return fail(cfg.error(), false);
+            for (const auto& r : cfg->remotes) servers.push_back(r.name);
+        } else {
+            servers.push_back(remote);
+        }
         proc::RunOptions run;
         run.stop = stop;
         run.detached = true;
-        auto found = engine::search(*ctx, req, run);
-        if (stop.stop_requested()) return fail("search cancelled", true);
-        if (!found) return fail(found.error(), false);
-
+        const auto now = unix_now();
+        std::vector<file_list::ServerHit> hits;
+        Value lists = Value::make_array(); // per server: where the answer came from
         Value v = Value::make_object();
+        for (const auto& server : servers) {
+            if (stop.stop_requested()) return fail("search cancelled", true);
+            Value status = Value::make_object();
+            status.set("remote", str(server));
+            auto ctx = engine::load_context(config_path_, server);
+            if (!ctx) {
+                if (!all) return fail(ctx.error(), false);
+                status.set("error", str(ctx.error()));
+                lists.push(std::move(status));
+                continue;
+            }
+            std::optional<engine::SearchResult> found;
+            const bool listable = file_list::can_answer(*ctx, req);
+            if (listable) {
+                std::shared_ptr<const file_list::List> list;
+                {
+                    std::lock_guard lock(lists_mutex_);
+                    auto& s = list_slot(server);
+                    if (s.list && s.list->fingerprint == file_list::fingerprint(*ctx)) list = s.list;
+                }
+                if (!update && (!list || !file_list::fresh(list->fetched, now))) start_refresh(server);
+                if (list) {
+                    found = file_list::search(*ctx, *list, req);
+                    status.set("age", num(static_cast<double>(now - list->fetched)));
+                }
+                std::lock_guard lock(lists_mutex_);
+                const auto& s = list_slot(server);
+                status.set("refreshing", Value::make_bool(s.refreshing));
+                if (!s.error.empty()) status.set("error", str(s.error));
+            }
+            // One server without a usable list, or a search lists can't answer: live, as before.
+            if (!found && (!all || !listable)) {
+                auto live = engine::search(*ctx, req, run);
+                if (stop.stop_requested()) return fail("search cancelled", true);
+                if (!live) {
+                    if (!all) return fail(live.error(), false);
+                    status.set("error", str(live.error()));
+                } else {
+                    found = std::move(*live);
+                    status.set("live", Value::make_bool(true));
+                }
+            }
+            if (found) {
+                if (!all) {
+                    v.set("maxDepth", num(found->max_depth));
+                    Value roots = Value::make_array();
+                    for (const auto& r : found->roots) roots.push(str(r.empty() ? "~" : r));
+                    v.set("roots", std::move(roots));
+                }
+                for (auto& h : found->hits) hits.push_back(file_list::ServerHit{server, std::move(h)});
+            }
+            lists.push(std::move(status));
+        }
+        if (all) file_list::rank_across(hits, req);
+
         v.set("type", str("searchResult"));
         v.set("id", num(id));
-        v.set("method", str(ctx->method == FindMethod::ssh ? "ssh" : "rclone"));
-        v.set("maxDepth", num(found->max_depth));
-        Value roots = Value::make_array();
-        for (const auto& r : found->roots) roots.push(str(r.empty() ? "~" : r));
-        v.set("roots", std::move(roots));
-        Value hits = Value::make_array();
-        for (const auto& h : found->hits) {
+        v.set("update", Value::make_bool(update));
+        if (all) {
+            v.set("maxDepth", num(0));
+            v.set("roots", Value::make_array());
+        }
+        v.set("lists", std::move(lists));
+        Value out = Value::make_array();
+        for (const auto& [server, h] : hits) {
             Value hit = Value::make_object();
+            hit.set("remote", str(server));
             hit.set("path", str(h.path));
             hit.set("name", str(h.name));
             hit.set("size", h.size ? num(static_cast<double>(*h.size)) : Value{});
-            hits.push(std::move(hit));
+            out.push(std::move(hit));
         }
-        v.set("hits", std::move(hits));
+        v.set("hits", std::move(out));
         v.set("elapsedMs", num(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                        std::chrono::steady_clock::now() - t0)
                                                        .count())));
         post(v);
+    });
+}
+
+App::ListSlot& App::list_slot(const std::string& server) {
+    auto& s = lists_[server];
+    if (!s.loaded) {
+        s.loaded = true;
+        if (auto list = file_list::load(file_list::path_for(lists_dir_, server))) {
+            s.list = std::make_shared<const file_list::List>(std::move(*list));
+        }
+    }
+    return s;
+}
+
+void App::start_refresh(const std::string& server) {
+    std::lock_guard lock(lists_mutex_);
+    auto& s = list_slot(server);
+    if (s.refreshing) return;
+    s.refreshing = true;
+    // The previous refresh of this server, if any, has finished: replacing it joins it at once.
+    refresh_threads_[server] = std::jthread([this, server](std::stop_token stop) {
+        proc::RunOptions run;
+        run.stop = stop;
+        run.detached = true;
+        auto ctx = engine::load_context(config_path_, server);
+        auto fetched = ctx ? file_list::fetch(*ctx, unix_now(), true, run)
+                           : std::expected<file_list::List, std::string>(std::unexpected(ctx.error()));
+        if (fetched) (void)file_list::save(file_list::path_for(lists_dir_, server), *fetched);
+        {
+            std::lock_guard inner(lists_mutex_);
+            auto& slot = list_slot(server);
+            slot.refreshing = false;
+            if (stop.stop_requested()) return;
+            if (fetched) {
+                slot.list = std::make_shared<const file_list::List>(std::move(*fetched));
+                slot.error.clear();
+            } else {
+                slot.error = fetched.error();
+            }
+        }
+        host_.defer([this, server] { on_list_refreshed(server); });
+    });
+}
+
+void App::on_list_refreshed(const std::string& server) {
+    LastSearch last;
+    {
+        std::lock_guard lock(lists_mutex_);
+        last = last_search_;
+    }
+    if (last.id != 0 && (last.remote == server || last.remote == "*")) run_search(last.id, last.remote, last.req, true);
+}
+
+void App::prune_lists() {
+    auto cfg = load_grab_config(config_path_);
+    if (!cfg) return;
+    std::set<std::filesystem::path> keep;
+    for (const auto& r : cfg->remotes) keep.insert(file_list::path_for(lists_dir_, r.name).filename());
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(lists_dir_, ec)) {
+        if (e.path().extension() == L".list" && !keep.contains(e.path().filename())) std::filesystem::remove(e.path(), ec);
+    }
+    std::lock_guard lock(lists_mutex_);
+    std::erase_if(lists_, [&](const auto& kv) {
+        return !kv.second.refreshing && !keep.contains(file_list::path_for(lists_dir_, kv.first).filename());
     });
 }
 
@@ -583,6 +738,7 @@ void App::post_host_keys(const Pending& p) const {
 }
 
 void App::servers_changed() {
+    prune_lists();
     if (auto env = load_env()) post_servers(*env);
     host_.defer([this] { send_init(); }); // the search view's server list; state_ is UI-thread only
 }
@@ -1407,12 +1563,6 @@ void App::save_queue() const {
 }
 
 // ---- updates ------------------------------------------------------------------------------
-
-namespace {
-std::int64_t unix_now() {
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-}
-} // namespace
 
 void App::post_update() const {
     Value v = Value::make_object();
