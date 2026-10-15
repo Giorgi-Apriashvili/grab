@@ -50,6 +50,8 @@ add_library(grab_core STATIC
     src/conn_budget.cpp
     src/fetch.cpp
     src/folder.cpp
+    src/folder_job.cpp
+    src/progress_line.cpp
     src/rate.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -69,7 +71,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
-add_executable(grab src/main.cpp src/server_cli.cpp)
+add_executable(grab src/main.cpp src/server_cli.cpp src/cli_download.cpp)
 target_link_libraries(grab PRIVATE grab_core $<$<PLATFORM_ID:Windows>:shell32>)
 
 if(WIN32)

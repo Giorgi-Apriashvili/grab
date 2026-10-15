@@ -82,6 +82,15 @@ struct RemoteStat {
 // RFC 3339 time ("2023-10-15T11:22:33.123456789+02:00", "...Z") as nanoseconds since 1970 UTC.
 [[nodiscard]] std::optional<std::int64_t> parse_rfc3339(std::string_view text);
 
+// Whether a local copy already holds the server's file: the same size, and modified no earlier
+// than the server's copy (2 s slack for coarse file systems). grab and rclone give a finished
+// file the server's time; a later one is a copy made after the server's last change, e.g. by an
+// older grab. Times in nanoseconds since 1970 UTC; without the server's time, size decides.
+[[nodiscard]] bool up_to_date(std::uint64_t local_size, std::int64_t local_mtime, std::uint64_t size,
+                              std::optional<std::int64_t> modtime);
+// The same for a file on disk (false when there is none); `modtime` as rclone reports it.
+[[nodiscard]] bool up_to_date(const std::filesystem::path& local, std::uint64_t size, std::string_view modtime);
+
 // Where a file comes from and how rclone reaches it.
 struct Source {
     std::string rclone; // executable
@@ -153,6 +162,7 @@ struct Result {
     Outcome outcome = Outcome::failed;
     std::string error;
     std::string note; // e.g. "the file changed on the server; started over"
+    bool present = false; // done because the target already held the file (up_to_date); nothing fetched
 };
 
 struct Download {
@@ -168,10 +178,13 @@ struct Download {
     // Bandwidth priority (high 4, normal 2, low 1), read at each stream start and limiter
     // request, so a change applies while running. nullptr = normal.
     const std::atomic<int>* weight = nullptr;
+    // Sees every rclone command line before it runs (`grab -v`); called from several threads.
+    std::function<void(const std::vector<std::string>&)> on_command;
 };
 
-// Fetches `d.source` into `d.target`, continuing a partial download. Stopping keeps the partial
-// file and its state (Outcome::stopped); a failure keeps them too, so a retry continues.
+// Fetches `d.source` into `d.target`, continuing a partial download. A target that is already
+// up_to_date with no partial download in progress is kept (Result::present). Stopping keeps the
+// partial file and its state (Outcome::stopped); a failure keeps them too, so a retry continues.
 [[nodiscard]] Result run(const Download& d, Connections& connections,
                          const std::function<void(const Progress&)>& on_progress, std::stop_token stop);
 

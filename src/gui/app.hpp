@@ -1,8 +1,8 @@
 #pragma once
 
 #include "cli.hpp"
-#include "engine.hpp"
 #include "fetch.hpp"
+#include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
 #include "rate.hpp"
@@ -101,25 +101,8 @@ private:
         server_ops::HostKeys keys;
     };
     enum class Status { queued, running, paused, done, failed, cancelled, skipped };
-    // Why a running download (or a file of a folder) is being stopped.
-    enum class StopReason { none, pause, cancel, skip };
-    // One file of a folder download. Files of folder::big_file_threshold and up are fetched
-    // like single files (resumable); smaller ones go in the folder's rclone batch.
-    struct Child {
-        std::string path; // relative to the folder, '/'-separated
-        std::uint64_t size = 0;
-        std::string modtime;
-        bool big = false;
-        Status status = Status::queued; // queued, running, paused, done, failed or skipped
-        std::uint64_t bytes = 0;
-        double speed = 0;
-        std::optional<double> eta;
-        std::string error;
-        std::stop_source stop; // a running big file's own stop
-        StopReason stop_reason = StopReason::none;
-        // In the running rclone batch: queued until rclone starts it, then running.
-        bool in_batch = false;
-    };
+    // Why a running download is being stopped.
+    enum class StopReason { none, pause, cancel };
     struct Item {
         int id = 0;
         std::string remote;
@@ -141,12 +124,7 @@ private:
         // Bandwidth priority as a weight: high 4, normal 2, low 1. Atomic: running streams
         // read it at every limiter request.
         std::atomic<int> weight{2};
-        // Folders: their files once listed, and the running small-file batch's stop (a file
-        // paused or skipped in it restarts the batch without that file).
-        bool listed = false;
-        std::vector<Child> children;
-        std::stop_source batch_stop;
-        bool batch_running = false;
+        folder::Tree tree; // folders: their files once listed (under mutex_)
     };
 
     void post(const json::Value& message) const;
@@ -190,10 +168,7 @@ private:
     void run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop);
     void run_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
     void run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
-    void run_small_batch(const std::shared_ptr<Item>& item, const engine::Context& ctx,
-                         const std::vector<std::string>& paths, const std::stop_token& item_stop);
-    void run_big_files(const std::shared_ptr<Item>& item, const engine::Context& ctx,
-                       const std::stop_token& item_stop);
+    void folder_event(Item& item, folder::Event e); // a running folder's progress, for the page
     void folder_totals(Item& item) const;          // caller holds mutex_
     void discard_folder_partials(const Item& item) const; // cancelled folder: big files' .grabpart
     // The connection budget for a server, from grab.conf, its host and what grab learned.

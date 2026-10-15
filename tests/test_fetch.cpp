@@ -285,3 +285,27 @@ TEST_CASE("saved progress and discard") {
     CHECK_FALSE(std::filesystem::exists(fetch::part_path(target)));
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("a local copy is up to date with the same size and a time not older than the server's") {
+    constexpr std::int64_t sec = 1'000'000'000;
+    const std::int64_t server = std::int64_t{1'700'000'000} * sec;
+    CHECK(fetch::up_to_date(100, server, 100, server));                // what grab and rclone leave
+    CHECK(fetch::up_to_date(100, server + 3600 * sec, 100, server));   // copied after the server's last change
+    CHECK(fetch::up_to_date(100, server - 1 * sec, 100, server));      // within the slack of coarse file systems
+    CHECK_FALSE(fetch::up_to_date(100, server - 60 * sec, 100, server)); // the server's file changed since
+    CHECK_FALSE(fetch::up_to_date(99, server, 100, server));
+    CHECK(fetch::up_to_date(100, 0, 100, std::nullopt)); // no server time: the size decides
+
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-uptodate";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "a.bin";
+    std::ofstream(file, std::ios::binary) << "12345"; // written now
+    CHECK(fetch::up_to_date(file, 5, "2000-01-01T00:00:00Z"));
+    CHECK_FALSE(fetch::up_to_date(file, 5, "2100-01-01T00:00:00Z")); // older than the server's copy
+    CHECK_FALSE(fetch::up_to_date(file, 6, "2000-01-01T00:00:00Z"));
+    CHECK(fetch::up_to_date(file, 5, "")); // unknown server time
+    CHECK_FALSE(fetch::up_to_date(dir / "missing.bin", 5, ""));
+    CHECK_FALSE(fetch::up_to_date(dir, 0, "")); // a directory is not a copy of a file
+    std::filesystem::remove_all(dir);
+}

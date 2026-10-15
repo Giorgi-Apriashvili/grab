@@ -3,8 +3,8 @@
 [![build](https://github.com/Giorgi-Apriashvili/grab/actions/workflows/build.yml/badge.svg)](https://github.com/Giorgi-Apriashvili/grab/actions/workflows/build.yml)
 
 Fetch a file or folder from a Linux server **by name**. `grab` finds it over ssh, then
-downloads it with rclone using flags tuned for either one big file or a tree of files,
-with rclone's live progress in your terminal.
+downloads it over several connections at once. Downloads are resumable: Ctrl+C keeps what is
+on disk, and running the same command again continues from there.
 
 ```
 grab -f releases  E:\Backup     # folder: E:\Backup\releases\...
@@ -24,10 +24,16 @@ grab -f releases E:\Backup
   ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -print0"
   │                     (or `rclone lsf -R` for remotes without a key / shell, see Lookup methods)
   │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick, several allowed
-  ├─ 4. build rclone    rclone copy   hetzner:/home/alice/releases E:\Backup\releases  + flags
-  │                     rclone copyto hetzner:/path/movie.mkv      E:\Backup\movie.mkv  + flags
-  └─ 5. run rclone      console inherited (live -P progress), Ctrl+C goes to rclone
+  ├─ 4. download        file:   byte ranges over up to 14 connections, `rclone cat --offset N
+  │                             --count M` each, into movie.mkv.grabpart (progress in
+  │                             movie.mkv.grabpart.json); renamed when complete
+  │                     folder: listed once (rclone lsjson -R); files of 64 MiB and more as
+  │                             above, the rest in one `rclone copy --files-from-raw` batch
+  └─ 5. progress        one live line; Ctrl+C stops and keeps the partial files for next time
 ```
+
+`--rclone` replaces steps 4 and 5 with a plain `rclone copyto` / `rclone copy` using
+`file_flags` / `folder_flags`, with rclone's own `-P` progress; Ctrl+C then goes to rclone.
 
 With a key loaded in ssh-agent the ssh step never prompts; otherwise it asks for the key
 passphrase once per run. The rclone step never prompts, since grab's rclone.conf carries the
@@ -133,6 +139,8 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - This survives closing grab: unfinished downloads come back paused (the list is kept in
     `%APPDATA%\grab\queue.json`).
   - If the file changed on the server in the meantime, it starts over.
+  - A file already in the destination, with the same size and not older than the server's
+    copy, is not fetched again ("already there, nothing fetched").
   - When a stream runs out of work, it splits the busiest remaining range, so the end of a
     file doesn't trickle in over one connection.
 - **Queue order:** the list order is the order in which waiting downloads start. Drag a row
@@ -293,8 +301,9 @@ grab config [-c PATH]
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
-  -n, --dry-run        resolve the target and print the rclone command; transfers nothing and
-                       creates no folders
+      --rclone         download with plain rclone copyto / copy and rclone's own progress
+  -n, --dry-run        resolve the target and show what would be fetched (with --rclone: the
+                       rclone command); transfers nothing and creates no folders
   -v, --verbose        echo the ssh and rclone command lines
       --init           write an example grab.conf
 ```
@@ -328,11 +337,29 @@ grab config [-c PATH]
   `config` or `update`, add `-s`.
 - Dot-directories are skipped during the search unless `skip_hidden = false` or the
   target itself starts with a dot.
-- Anything after `--` is appended to the rclone command, e.g. `-- --bwlimit 10M`.
+- Downloads use the same engine as the window: a file in byte ranges over the server's
+  connection budget (`max_connections`; 14 on Storage Boxes, 12 elsewhere), a folder listed
+  once with big files fetched the same way and small ones in one rclone batch. Picks run one
+  after another, each with the whole budget.
+  - Progress is one line, redrawn in place:
+    `412.0 MiB / 898.0 MiB  45%  18.0 MiB/s  14 conns  ETA 0:26` (folders add `4/13 files`).
+    When stderr is not a console (a log file, a script), only the start and end lines appear.
+  - Ctrl+C stops cleanly and keeps the partial files: `stopped at 35%; run the same command
+    again to continue`. A second Ctrl+C ends grab at once.
+  - A file already in DEST with the same size, and not older than the server's copy, is not
+    fetched again (`already there, nothing fetched`); in a folder, the same goes per file.
+  - `--limit` caps all connections together, exactly.
+  - Measured on a Storage Box: one 898 MiB file took 1:09 this way and 1:50 with `--rclone`,
+    minutes apart.
+- `--rclone` downloads with plain `rclone copyto` / `rclone copy` instead, with rclone's own
+  progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`.
+- Anything after `--` is added to every rclone call grab makes. For speed, use `--limit`
+  rather than `-- --bwlimit`, which rclone would apply to each connection separately.
 
 Exit codes: `0` ok, `1` usage, `2` config, `3` target not found or pick aborted,
-`4` remote lookup failed (ssh or rclone listing), `5` `grab update` failed, otherwise
-rclone's own code.
+`4` remote lookup failed (ssh or rclone listing), `5` `grab update` failed, `6` a download
+failed, `130` stopped by Ctrl+C. With `--rclone`, a failed download exits with rclone's own
+code.
 
 ## Lookup methods
 
@@ -363,13 +390,15 @@ Defaults (override per remote in grab.conf):
 | `folder_flags` | `--transfers 8 --checkers 8`                                                | more transfers hide per-file round trips on trees of small files; with rclone's default 4 streams that is ≤32 connections, which both test servers accepted without errors |
 | `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
-These flags drive the `grab` command. grab-gui fetches single files with its own ranged
-streams (see [GUI](#gui)) and uses `common_flags` for them; its connection count per server is
-`max_connections` (blank = automatic: 14 on Storage Boxes, 12 elsewhere, lowered when a
-server refuses connections).
+`common_flags` go to every rclone call (`-P` is dropped where grab shows its own progress).
+`folder_flags` apply to a folder's small-file batch, whose `--transfers` grab sets to the
+connections it may use. `file_flags` only matter with `--rclone`: grab's own engine fetches
+a file in byte ranges over `max_connections` (blank = automatic: 14 on Storage Boxes, 12
+elsewhere, lowered when a server refuses connections), in the window and in the `grab`
+command alike.
 
-Concurrent SFTP connections ≈ `transfers × multi-thread-streams` (+ checkers). If the
-server logs `MaxStartups` drops, lower one of them. `--bwlimit` can be passed after `--`.
+With `--rclone`, concurrent SFTP connections ≈ `transfers × multi-thread-streams`
+(+ checkers). If the server logs `MaxStartups` drops, lower one of them.
 `--sftp-disable-hashcheck` trades end-to-end checksum verification for speed; SSH already
 protects the bytes in flight, so what remains undetected is disk-level corruption. Remove it
 from `common_flags` if that matters more than minutes saved on large files.
@@ -386,6 +415,9 @@ src/engine.*    search + download for both  src/servers.*  server argv, host key
 src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    folder listing, rclone batch lines, which files the tree shows
+src/folder_job.*    a folder download, shared by the window and the command
+src/cli_download.*  the command's downloads: live progress line, Ctrl+C
+src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)

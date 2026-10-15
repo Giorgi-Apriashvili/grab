@@ -32,6 +32,7 @@ add_executable(grab_tests
     test_fetch.cpp
     test_folder.cpp
     test_rate.cpp
+    test_progress_line.cpp
     test_update.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)

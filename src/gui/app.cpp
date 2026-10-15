@@ -6,7 +6,6 @@
 #include "ini.hpp"
 #include "process.hpp"
 #include "quote.hpp"
-#include "rclone.hpp"
 #include "util.hpp"
 
 #include <knownfolders.h>
@@ -20,7 +19,6 @@
 #include <format>
 #include <memory>
 #include <span>
-#include <unordered_map>
 #include <utility>
 
 #ifndef GRAB_VERSION
@@ -70,22 +68,9 @@ const char* auth_name(servers::Auth a) {
 int weight_of(std::string_view priority) { return priority == "high" ? 4 : priority == "low" ? 1 : 2; }
 const char* priority_name(int weight) { return weight >= 4 ? "high" : weight <= 1 ? "low" : "normal"; }
 
-// A folder download's own local directory: DEST\<folder name>, as rclone copy names it.
-std::filesystem::path folder_dir(const std::filesystem::path& dest, const std::string& remote_path) {
-    return dest / util::path_from_utf8(remote_basename(remote_path));
-}
-
-std::string child_remote_path(const std::string& folder, const std::string& rel) {
-    return folder.empty() || folder.ends_with('/') ? folder + rel : folder + "/" + rel;
-}
-
-// For folder::visible; `status` in App::Status order: queued, running, paused, done, failed,
-// cancelled, skipped.
-folder::State folder_state(int status) {
-    constexpr folder::State map[] = {folder::State::queued, folder::State::running, folder::State::paused,
-                                     folder::State::done,   folder::State::failed,  folder::State::skipped,
-                                     folder::State::skipped};
-    return map[status];
+const char* file_state_name(folder::State s) {
+    constexpr const char* names[] = {"queued", "running", "paused", "done", "failed", "skipped"}; // folder::State order
+    return names[static_cast<int>(s)];
 }
 
 std::string known_folder(REFKNOWNFOLDERID id) {
@@ -803,10 +788,7 @@ void App::resume_items(int id) {
             if ((id == 0 || item->id == id) && item->status == Status::paused) {
                 item->status = Status::queued;
                 item->note.clear();
-                // A folder's Resume covers its files paused one by one too.
-                for (auto& c : item->children) {
-                    if (c.status == Status::paused) c.status = Status::queued;
-                }
+                folder::resume_paused(item->tree); // a folder's Resume covers its files paused one by one too
             }
         }
     }
@@ -849,13 +831,7 @@ void App::retry_item(int id) {
                 item->status = Status::queued;
                 item->error.clear();
                 if (item->mode == Mode::folder) {
-                    // Failed files are tried again; after a cancel, everything not finished.
-                    for (auto& c : item->children) {
-                        if (c.status == Status::failed || (cancelled && c.status != Status::done && c.status != Status::skipped)) {
-                            c.status = Status::queued;
-                            c.error.clear();
-                        }
-                    }
+                    folder::retry_files(item->tree, cancelled); // after a cancel, everything not finished
                 } else if (!fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
                     item->bytes = 0;
                 }
@@ -874,21 +850,8 @@ void App::pause_child(int id, const std::string& path) {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id) continue;
-            for (auto& c : item->children) {
-                if (c.path != path) continue;
-                if (c.status == Status::queued) {
-                    c.status = Status::paused;
-                    if (c.in_batch) item->batch_stop.request_stop(); // rclone would still fetch it
-                } else if (c.status == Status::running && c.big) {
-                    c.stop_reason = StopReason::pause; // run_big_files marks it paused once stopped
-                    c.stop.request_stop();
-                } else if (c.status == Status::running) {
-                    c.status = Status::paused; // in the small batch: restart it without this file
-                    c.speed = 0;
-                    c.bytes = 0; // rclone keeps no partial small file; it starts over on resume
-                    item->batch_stop.request_stop();
-                }
-            }
+            folder::pause_file(item->tree, path);
+            folder_totals(*item);
         }
     }
     save_queue();
@@ -900,9 +863,7 @@ void App::resume_child(int id, const std::string& path) {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id) continue;
-            for (auto& c : item->children) {
-                if (c.path == path && c.status == Status::paused) c.status = Status::queued;
-            }
+            folder::resume_file(item->tree, path);
             // A folder that stopped waiting for this file runs again.
             if (item->status != Status::running && item->status != Status::queued) {
                 item->status = Status::queued;
@@ -921,21 +882,7 @@ void App::skip_child(int id, const std::string& path) {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id) continue;
-            for (auto& c : item->children) {
-                if (c.path != path) continue;
-                if (c.status == Status::queued || c.status == Status::paused || c.status == Status::failed) {
-                    if (c.status == Status::queued && c.in_batch) item->batch_stop.request_stop(); // rclone would still fetch it
-                    c.status = Status::skipped;
-                    if (c.big) discard = folder_dir(item->dest, item->path) / util::path_from_utf8(c.path);
-                } else if (c.status == Status::running && c.big) {
-                    c.stop_reason = StopReason::skip; // run_big_files discards its partial file
-                    c.stop.request_stop();
-                } else if (c.status == Status::running) {
-                    c.status = Status::skipped; // restart the batch without it
-                    c.speed = 0;
-                    item->batch_stop.request_stop();
-                }
-            }
+            discard = folder::skip_file(item->tree, folder::local_dir(item->dest, item->path), path);
             folder_totals(*item);
         }
     }
@@ -955,7 +902,7 @@ void App::set_limit(bool on, double mibps) {
     limiter_.set_rate(on ? static_cast<std::uint64_t>(mibps * 1024 * 1024) : 0);
     std::lock_guard lock(mutex_);
     for (auto& item : items_) {
-        if (item->batch_running) item->batch_stop.request_stop();
+        if (item->tree.batch_running) item->tree.batch_stop.request_stop();
     }
 }
 
@@ -989,7 +936,7 @@ void App::set_priority(int id, int weight) {
             server = item->remote;
             running = item->status == Status::running;
             // A folder's rclone batch has its --bwlimit share fixed at start: restart it.
-            if (item->batch_running && limiter_.rate() > 0) item->batch_stop.request_stop();
+            if (item->tree.batch_running && limiter_.rate() > 0) item->tree.batch_stop.request_stop();
         }
     }
     if (running) connections_.set_weight(server, id, weight); // shares rebalance at the next reads
@@ -1187,7 +1134,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
 
     switch (result.outcome) {
     case fetch::Outcome::done:
-        return set(Status::done, {}, result.note);
+        return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
     case fetch::Outcome::failed:
         return set(Status::failed, result.error, result.note);
     case fetch::Outcome::stopped:
@@ -1202,32 +1149,35 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
 }
 
 void App::folder_totals(Item& item) const {
-    std::uint64_t bytes = 0;
-    std::uint64_t total = 0;
-    double speed = 0;
-    for (const auto& c : item.children) {
-        if (c.status == Status::skipped) continue;
-        total += c.size;
-        bytes += c.status == Status::done ? c.size : std::min(c.bytes, c.size);
-        if (c.status == Status::running) speed += c.speed;
-    }
-    item.bytes = bytes;
-    item.total = total;
-    item.speed = speed;
-    item.eta = speed > 0 && total > bytes ? std::optional(static_cast<double>(total - bytes) / speed) : std::nullopt;
+    const auto t = folder::totals(item.tree);
+    item.bytes = t.bytes;
+    item.total = t.total;
+    item.speed = t.speed;
+    item.eta = t.eta;
+    item.connections = item.tree.connections;
 }
 
 void App::discard_folder_partials(const Item& item) const {
-    const auto dir = folder_dir(item.dest, item.path);
-    for (const auto& c : item.children) {
-        if (c.big && c.status != Status::done) fetch::discard(dir / util::path_from_utf8(c.path));
-    }
-    engine::remove_partials(dir, Mode::folder); // rclone's own .partial files
+    folder::discard_partials(folder::local_dir(item.dest, item.path), item.tree);
 }
 
-// A folder is listed once, then its files are fetched: small ones in one rclone copy batch
-// that reuses its connections, big ones with grab's resumable ranged download. The whole
-// folder is one user of its server's connection budget.
+void App::folder_event(Item& item, folder::Event e) {
+    bool post = e != folder::Event::progress;
+    {
+        std::lock_guard lock(mutex_);
+        folder_totals(item);
+        const auto now = std::chrono::steady_clock::now();
+        if (!post && now - last_progress_post_ >= progress_interval) {
+            post = true;
+            last_progress_post_ = now;
+        }
+    }
+    if (e == folder::Event::checkpoint) save_queue();
+    if (post) post_queue();
+}
+
+// A folder is listed once, then its files are fetched by folder::run (shared with the grab
+// command). The whole folder is one user of its server's connection budget.
 void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop) {
     auto fail = [&](std::string error) {
         std::lock_guard lock(mutex_);
@@ -1238,334 +1188,57 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     if (!ctx) return fail(ctx.error());
     connections_.configure(item->remote,
                            connection_budget(item->remote, ctx->remote.host, ctx->settings.max_connections));
-    const auto dir = folder_dir(item->dest, item->path);
 
-    bool listed = false;
-    {
-        std::lock_guard lock(mutex_);
-        listed = item->listed;
-    }
-    if (!listed && !item_stop.stop_requested()) {
-        std::vector<std::string> argv{ctx->config.rclone, "lsjson", "-R", "--files-only",
-                                      remote_spec(ctx->settings.rclone_remote, item->path)};
-        if (ctx->config.rclone_config) {
-            argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx->config.rclone_config)});
-        }
-        const auto flags = engine::without_console_progress(ctx->settings.common_flags);
-        argv.insert(argv.end(), flags.begin(), flags.end());
-        proc::RunOptions quiet;
-        quiet.detached = true;
-        quiet.stop = item_stop;
-        auto run = proc::run_capture(argv, quiet);
-        if (!item_stop.stop_requested()) {
-            if (!run) return fail(run.error());
-            if (run->exit_code != 0) return fail("cannot list the folder: " + server_ops::clean_rclone_error(run->err));
-            auto files = folder::parse_listing(run->out);
-            if (!files) return fail(files.error());
-            {
-                std::lock_guard lock(mutex_);
-                item->children.clear();
-                for (auto& f : *files) {
-                    Child c;
-                    c.path = std::move(f.path);
-                    c.size = f.size;
-                    c.modtime = std::move(f.modtime);
-                    c.big = folder::is_big(c.size);
-                    item->children.push_back(std::move(c));
-                }
-                item->listed = true;
-                folder_totals(*item);
-            }
-            save_queue();
-            post_queue();
-        }
-    }
-
-    // Files already complete on disk (an earlier run, or downloaded before) are not fetched
-    // again; big ones with a partial file continue from it.
-    {
-        std::lock_guard lock(mutex_);
-        for (auto& c : item->children) {
-            if (c.status != Status::queued) continue;
-            const auto local = dir / util::path_from_utf8(c.path);
-            std::error_code ec;
-            const bool partial = c.big && std::filesystem::exists(fetch::state_path(local), ec);
-            if (!partial && std::filesystem::is_regular_file(local, ec) && std::filesystem::file_size(local, ec) == c.size) {
-                c.status = Status::done;
-                c.bytes = c.size;
-            } else if (partial) {
-                if (auto p = fetch::saved_progress(local)) c.bytes = p->first;
-            }
-        }
-        folder_totals(*item);
-    }
-    post_queue();
-
-    connections_.join(item->remote, item->id, item->weight.load());
-    while (!item_stop.stop_requested()) {
-        // (not "small": windows.h defines that as a macro)
-        std::vector<std::string> small_files;
-        bool big_waiting = false;
+    folder::Job job;
+    job.ctx = &*ctx;
+    job.connections = &connections_;
+    job.limiter = &limiter_;
+    job.server = item->remote;
+    job.id = item->id;
+    job.weight = &item->weight;
+    job.remote_path = item->path;
+    job.dest = item->dest;
+    // The batch's part of the speed limit: this download's weight over all running downloads'.
+    job.batch_limit = [this, item]() -> std::uint64_t {
+        const auto limit = limiter_.rate();
+        if (limit == 0) return 0;
+        int total_weight = 0;
         {
             std::lock_guard lock(mutex_);
-            for (const auto& c : item->children) {
-                if (c.status != Status::queued) continue;
-                if (c.big) big_waiting = true;
-                else small_files.push_back(c.path);
+            for (const auto& other : items_) {
+                if (other->status == Status::running) total_weight += other->weight.load();
             }
         }
-        if (!small_files.empty()) run_small_batch(item, *ctx, small_files, item_stop);
-        else if (big_waiting) run_big_files(item, *ctx, item_stop);
-        else break;
-        save_queue();
-    }
-    connections_.leave(item->remote, item->id);
+        const int weight = item->weight.load();
+        return limit * static_cast<std::uint64_t>(weight) / static_cast<std::uint64_t>(std::max(total_weight, weight));
+    };
+    job.on_event = [this, item](folder::Event e) { folder_event(*item, e); };
+
+    if (auto listed = folder::list(job, item->tree, mutex_, item_stop); !listed) return fail(listed.error());
+    // Files already complete on disk (an earlier run, or downloaded before) are not fetched
+    // again; big ones with a partial file continue from it.
+    folder::mark_existing(job, item->tree, mutex_);
+    folder::run(job, item->tree, mutex_, item_stop);
 
     bool cancelled = false;
     {
         std::lock_guard lock(mutex_);
-        item->connections = 0;
-        for (auto& c : item->children) {
-            if (c.status != Status::running) continue;
-            c.status = Status::queued; // stopped with the folder: picked up again on resume
-            c.speed = 0;
-            c.eta.reset();
-        }
         folder_totals(*item);
         if (item_stop.stop_requested()) {
             cancelled = item->stop_reason == StopReason::cancel;
             item->status = cancelled ? Status::cancelled : Status::paused;
+        } else if (const auto o = folder::outcome(item->tree); o.failed > 0) {
+            item->status = Status::failed;
+            item->error = std::format("{} file{} failed. {}", o.failed, o.failed == 1 ? "" : "s", o.first_error);
         } else {
-            std::size_t failed = 0;
-            std::size_t waiting = 0;
-            std::string first_error;
-            for (const auto& c : item->children) {
-                if (c.status == Status::failed) {
-                    if (failed++ == 0) first_error = c.path + ": " + c.error;
-                } else if (c.status == Status::paused || c.status == Status::queued) {
-                    ++waiting;
-                }
-            }
-            if (failed > 0) {
-                item->status = Status::failed;
-                item->error = std::format("{} file{} failed. {}", failed, failed == 1 ? "" : "s", first_error);
-            } else {
-                // Files paused one by one keep the folder paused until they are resumed or skipped.
-                item->status = waiting > 0 ? Status::paused : Status::done;
-            }
+            // Files paused one by one keep the folder paused until they are resumed or skipped.
+            item->status = o.waiting > 0 ? Status::paused : Status::done;
         }
     }
     if (cancelled) {
         std::lock_guard lock(mutex_);
         discard_folder_partials(*item);
     }
-}
-
-// The queued small files in one rclone copy: its connection pool is reused for every file,
-// where a new SSH login per small file would dominate. Pausing or skipping one of them
-// restarts the batch without it.
-void App::run_small_batch(const std::shared_ptr<Item>& item, const engine::Context& ctx,
-                          const std::vector<std::string>& paths, const std::stop_token& item_stop) {
-    const int reserved = connections_.reserve(item->remote, item->id, item_stop);
-    if (reserved == 0) return; // stopped while waiting
-    const auto list = std::filesystem::temp_directory_path() /
-                      std::format("grab-files-{}-{}.txt", GetCurrentProcessId(), item->id);
-    (void)server_ops::write_text(list, folder::files_from_text(paths));
-
-    std::unordered_map<std::string, std::size_t> index; // path -> child
-    std::stop_source batch;
-    // This download's part of the speed limit: its weight over all running downloads'.
-    int total_weight = 0;
-    {
-        std::lock_guard lock(mutex_);
-        for (const auto& other : items_) {
-            if (other->status == Status::running) total_weight += other->weight.load();
-        }
-        for (std::size_t i = 0; i < item->children.size(); ++i) index.emplace(item->children[i].path, i);
-        for (const auto& p : paths) {
-            auto& c = item->children[index[p]];
-            if (c.status != Status::queued) continue;
-            c.in_batch = true; // stays queued until rclone starts it
-            c.bytes = 0;
-            c.error.clear();
-        }
-        item->batch_stop = batch;
-        item->batch_running = true;
-        item->connections = connections_.active(item->remote, item->id);
-    }
-    post_queue();
-    std::stop_callback forward(item_stop, [&batch] { batch.request_stop(); });
-    proc::RunOptions run;
-    run.detached = true;
-    run.stop = batch.get_token();
-    std::vector<std::string> extra{"--files-from-raw", util::path_to_utf8(list), "--transfers",
-                                   std::to_string(reserved), "--sftp-connections", std::to_string(reserved), "-v"};
-    // rclone writes these files itself, so the speed limit reaches it as --bwlimit; its bytes
-    // are also charged to the shared limiter, which slows grab's own streams to match.
-    if (const auto limit = limiter_.rate(); limit > 0) {
-        const auto weight = static_cast<std::uint64_t>(item->weight.load());
-        const auto share = limit * weight / static_cast<std::uint64_t>(std::max<int>(total_weight, static_cast<int>(weight)));
-        extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(share)});
-    }
-    std::uint64_t charged = 0;
-    auto result = engine::download(
-        ctx, Mode::folder, item->path, item->dest,
-        [&](const engine::Progress& p) {
-            if (p.bytes > charged) {
-                limiter_.debit(p.bytes - charged);
-                charged = p.bytes;
-            }
-            const int conns = connections_.active(item->remote, item->id);
-            if (update_item(mutex_, last_progress_post_, [&] {
-                    for (const auto& t : p.transferring) {
-                        auto it = index.find(t.name);
-                        if (it == index.end()) continue;
-                        auto& c = item->children[it->second];
-                        if (!c.in_batch || (c.status != Status::queued && c.status != Status::running)) continue;
-                        c.status = Status::running;
-                        c.bytes = t.bytes;
-                        c.speed = t.speed;
-                        c.eta = t.speed > 0 && t.size > t.bytes ? std::optional(static_cast<double>(t.size - t.bytes) / t.speed)
-                                                                : std::nullopt;
-                    }
-                    item->connections = conns;
-                    folder_totals(*item);
-                })) {
-                post_queue();
-            }
-        },
-        run, extra, {},
-        [&](const std::string& name) {
-            std::lock_guard lock(mutex_);
-            auto it = index.find(name);
-            if (it == index.end()) return;
-            auto& c = item->children[it->second];
-            if (!c.in_batch || (c.status != Status::queued && c.status != Status::running)) return;
-            c.status = Status::done;
-            c.bytes = c.size;
-            c.speed = 0;
-            c.eta.reset();
-            folder_totals(*item);
-        });
-    std::error_code ec;
-    std::filesystem::remove(list, ec);
-    connections_.release(item->remote, item->id, reserved);
-
-    const auto dir = folder_dir(item->dest, item->path);
-    std::lock_guard lock(mutex_);
-    item->batch_running = false;
-    const bool finished = result && result->exit_code == 0;
-    for (const auto& p : paths) {
-        auto& c = item->children[index[p]];
-        const bool was_in_batch = c.in_batch;
-        c.in_batch = false;
-        if (!was_in_batch || (c.status != Status::running && c.status != Status::queued)) continue; // done, paused, skipped
-        c.speed = 0;
-        c.eta.reset();
-        if (finished) {
-            const auto local = dir / util::path_from_utf8(c.path);
-            if (std::filesystem::file_size(local, ec) == c.size && !ec) {
-                c.status = Status::done;
-                c.bytes = c.size;
-            } else {
-                c.status = Status::failed;
-                c.error = "missing after the copy";
-            }
-        } else if (batch.stop_requested()) {
-            c.status = Status::queued; // restarted without a paused/skipped file, or the folder stopped
-            c.bytes = 0;               // and rclone starts it over
-        } else {
-            c.status = Status::failed;
-            c.error = !result ? result.error()
-                      : result->last_error.empty() ? std::format("rclone exited with code {}", result->exit_code)
-                                                   : result->last_error;
-        }
-    }
-    folder_totals(*item);
-}
-
-// The queued big files, up to three at a time, each resumable like a single-file download.
-// They share the folder's connections (same pool id) and split ranges to keep them busy.
-void App::run_big_files(const std::shared_ptr<Item>& item, const engine::Context& ctx,
-                        const std::stop_token& item_stop) {
-    constexpr int at_once = 3;
-    const auto dir = folder_dir(item->dest, item->path);
-    auto worker = [&] {
-        for (;;) {
-            if (item_stop.stop_requested()) return;
-            std::size_t i = 0;
-            std::stop_source child_stop;
-            std::string path;
-            {
-                std::lock_guard lock(mutex_);
-                auto it = std::ranges::find_if(item->children, [](const Child& c) {
-                    return c.big && c.status == Status::queued;
-                });
-                if (it == item->children.end()) return;
-                i = static_cast<std::size_t>(it - item->children.begin());
-                it->status = Status::running;
-                it->error.clear();
-                it->stop = child_stop;
-                it->stop_reason = StopReason::none;
-                path = it->path;
-            }
-            post_queue();
-            std::stop_callback forward(item_stop, [&child_stop] { child_stop.request_stop(); });
-            fetch::Download d;
-            d.source = fetch::Source{ctx.config.rclone, ctx.config.rclone_config, ctx.settings.rclone_remote,
-                                     child_remote_path(item->path, path),
-                                     engine::without_console_progress(ctx.settings.common_flags)};
-            d.server = item->remote;
-            d.id = item->id;
-            d.target = dir / util::path_from_utf8(path);
-            d.joined = true;
-            d.limiter = &limiter_;
-            d.weight = &item->weight;
-            std::error_code ec;
-            std::filesystem::create_directories(d.target.parent_path(), ec);
-            const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {
-                if (update_item(mutex_, last_progress_post_, [&] {
-                        auto& c = item->children[i];
-                        c.bytes = p.bytes;
-                        c.speed = p.speed;
-                        c.eta = p.eta;
-                        item->connections = p.connections;
-                        folder_totals(*item);
-                    })) {
-                    post_queue();
-                }
-            }, child_stop.get_token());
-
-            bool discard = false;
-            {
-                std::lock_guard lock(mutex_);
-                auto& c = item->children[i];
-                c.speed = 0;
-                c.eta.reset();
-                switch (result.outcome) {
-                case fetch::Outcome::done:
-                    c.status = Status::done;
-                    c.bytes = c.size;
-                    break;
-                case fetch::Outcome::failed:
-                    c.status = Status::failed;
-                    c.error = result.error;
-                    break;
-                case fetch::Outcome::stopped:
-                    c.status = c.stop_reason == StopReason::pause  ? Status::paused
-                               : c.stop_reason == StopReason::skip ? Status::skipped
-                                                                   : Status::queued; // the folder stopped
-                    discard = c.status == Status::skipped;
-                    break;
-                }
-                folder_totals(*item);
-            }
-            if (discard) fetch::discard(d.target);
-            post_queue();
-        }
-    };
-    std::vector<std::jthread> workers;
-    for (int k = 0; k < at_once; ++k) workers.emplace_back(worker);
 }
 
 json::Value App::queue_snapshot() const {
@@ -1590,32 +1263,34 @@ json::Value App::queue_snapshot() const {
         v.set("connections", num(i->connections));
         v.set("priority", str(priority_name(i->weight.load())));
         if (i->status == Status::queued) v.set("position", num(++waiting_position)); // "Queued · #2"
-        if (i->mode == Mode::folder && i->listed) {
+        if (i->mode == Mode::folder && i->tree.listed) {
             // Counts for the folder row, and a bounded list of files for the tree: every
             // active one plus the next few queued, so a 5000-file folder stays cheap to send.
+            const auto& tree_files = i->tree.files;
             std::vector<folder::State> states;
-            states.reserve(i->children.size());
-            int counts[7] = {};
-            for (const auto& c : i->children) {
-                states.push_back(folder_state(static_cast<int>(c.status)));
+            states.reserve(tree_files.size());
+            int counts[6] = {}; // by folder::State
+            for (const auto& c : tree_files) {
+                states.push_back(c.status);
                 ++counts[static_cast<int>(c.status)];
             }
+            auto count = [&](folder::State s) { return num(counts[static_cast<int>(s)]); };
             Value files = Value::make_object();
-            files.set("total", num(static_cast<double>(i->children.size())));
-            files.set("queued", num(counts[static_cast<int>(Status::queued)]));
-            files.set("running", num(counts[static_cast<int>(Status::running)]));
-            files.set("paused", num(counts[static_cast<int>(Status::paused)]));
-            files.set("done", num(counts[static_cast<int>(Status::done)]));
-            files.set("failed", num(counts[static_cast<int>(Status::failed)]));
-            files.set("skipped", num(counts[static_cast<int>(Status::skipped)]));
+            files.set("total", num(static_cast<double>(tree_files.size())));
+            files.set("queued", count(folder::State::queued));
+            files.set("running", count(folder::State::running));
+            files.set("paused", count(folder::State::paused));
+            files.set("done", count(folder::State::done));
+            files.set("failed", count(folder::State::failed));
+            files.set("skipped", count(folder::State::skipped));
             v.set("files", std::move(files));
             constexpr std::size_t queued_shown = 20;
             Value children = Value::make_array();
             for (const auto k : folder::visible(states, queued_shown)) {
-                const auto& c = i->children[k];
+                const auto& c = tree_files[k];
                 Value cv = Value::make_object();
                 cv.set("path", str(c.path));
-                cv.set("status", str(status_name(static_cast<int>(c.status))));
+                cv.set("status", str(file_state_name(c.status)));
                 cv.set("bytes", num(static_cast<double>(c.bytes)));
                 cv.set("size", num(static_cast<double>(c.size)));
                 cv.set("speed", num(c.speed));
@@ -1624,7 +1299,7 @@ json::Value App::queue_snapshot() const {
                 children.push(std::move(cv));
             }
             v.set("children", std::move(children));
-            const auto queued = static_cast<std::size_t>(counts[static_cast<int>(Status::queued)]);
+            const auto queued = static_cast<std::size_t>(counts[static_cast<int>(folder::State::queued)]);
             v.set("moreQueued", num(static_cast<double>(queued > queued_shown ? queued - queued_shown : 0)));
         }
         list.push(std::move(v));
@@ -1657,24 +1332,20 @@ void App::restore_queue() {
                 item->total = p->second;
             }
         } else if (!saved.files.empty()) {
-            const auto dir = folder_dir(item->dest, item->path);
+            const auto dir = folder::local_dir(item->dest, item->path);
             for (const auto& f : saved.files) {
-                Child c;
-                c.path = f.path;
-                c.size = f.size;
-                c.modtime = f.modtime;
-                c.big = folder::is_big(f.size);
-                c.status = f.state == "done"      ? Status::done
-                           : f.state == "skipped" ? Status::skipped
-                           : f.state == "paused"  ? Status::paused
-                                                  : Status::queued;
-                if (c.status == Status::done) c.bytes = c.size;
+                auto c = folder::make_file(f.path, f.size, f.modtime);
+                c.status = f.state == "done"      ? folder::State::done
+                           : f.state == "skipped" ? folder::State::skipped
+                           : f.state == "paused"  ? folder::State::paused
+                                                  : folder::State::queued;
+                if (c.status == folder::State::done) c.bytes = c.size;
                 else if (c.big) {
                     if (auto p = fetch::saved_progress(dir / util::path_from_utf8(c.path))) c.bytes = p->first;
                 }
-                item->children.push_back(std::move(c));
+                item->tree.files.push_back(std::move(c));
             }
-            item->listed = true;
+            item->tree.listed = true;
             folder_totals(*item);
         }
         items_.push_back(std::move(item));
@@ -1689,11 +1360,11 @@ void App::save_queue() const {
             if (i->status == Status::done || i->status == Status::cancelled) continue;
             SavedDownload d{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path, i->name,
                             util::path_to_utf8(i->dest), i->total, {}, priority_name(i->weight.load())};
-            for (const auto& c : i->children) {
-                const char* state = c.status == Status::done      ? "done"
-                                    : c.status == Status::skipped ? "skipped"
-                                    : c.status == Status::paused  ? "paused"
-                                                                  : "queued"; // running and failed retry
+            for (const auto& c : i->tree.files) {
+                const char* state = c.status == folder::State::done      ? "done"
+                                    : c.status == folder::State::skipped ? "skipped"
+                                    : c.status == folder::State::paused  ? "paused"
+                                                                         : "queued"; // running and failed retry
                 d.files.push_back(SavedFile{c.path, c.size, c.modtime, state});
             }
             unfinished.push_back(std::move(d));

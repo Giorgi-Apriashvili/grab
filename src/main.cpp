@@ -1,7 +1,8 @@
-// grab: locate a file or folder on a Linux server by name (ssh + find), then download it
-// with rclone using mode-specific flags. See README.md.
+// grab: locate a file or folder on a Linux server by name (ssh + find), then download it with
+// grab's resumable engine (cli_download.hpp), or with plain rclone (--rclone). See README.md.
 
 #include "cli.hpp"
+#include "cli_download.hpp"
 #include "config.hpp"
 #include "engine.hpp"
 #include "ini.hpp"
@@ -182,6 +183,50 @@ std::expected<std::filesystem::path, std::string> prepare_destination(const std:
     return dest;
 }
 
+// --rclone: one `rclone copyto` / `rclone copy` per item with rclone's own progress, as before
+// grab had its own download engine. Ctrl+C goes to rclone.
+DownloadTally download_with_rclone(const engine::Context& ctx, const Options& opts,
+                                   const std::vector<std::string>& paths, const std::filesystem::path& dest) {
+    // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
+    std::vector<std::string> extra;
+    if (opts.limit) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
+    extra.insert(extra.end(), opts.extra.begin(), opts.extra.end());
+
+    DownloadTally tally;
+    const std::size_t total = paths.size();
+    for (std::size_t i = 0; i < total; ++i) {
+        const std::string& path = paths[i];
+        const auto rclone_argv = engine::download_argv(ctx, opts.mode, path, dest, extra);
+        if (opts.verbose || opts.dry_run) {
+            std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
+        }
+        if (opts.dry_run) continue;
+
+        const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
+        std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
+                     remote_spec(ctx.settings.rclone_remote, path),
+                     util::path_to_utf8(dest / util::path_from_utf8(remote_basename(path))));
+        auto code = proc::run_inherit(rclone_argv);
+        if (!code) {
+            error(code.error());
+            tally.code = exit_config;
+            tally.failed.push_back(path);
+            break;
+        }
+        if (*code == 0) {
+            ++tally.done;
+            continue;
+        }
+        if (tally.code == 0) tally.code = *code;
+        tally.failed.push_back(path);
+        if (*code == proc::exit_stopped) {
+            tally.stopped = i + 1 < total;
+            break;
+        }
+    }
+    return tally;
+}
+
 int run(const Options& opts) {
     // 2. configuration -------------------------------------------------------------------
     const auto cfg_path = opts.config.value_or(default_grab_config_path());
@@ -288,55 +333,18 @@ int run(const Options& opts) {
         }
     }
 
-    // 4 + 5. one rclone run per chosen item ----------------------------------------------
-    const std::size_t total = chosen->size();
-    std::size_t done = 0;
-    int first_failure = 0;
-    std::vector<std::string> failed;
-    bool stopped = false;
-
-    // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
-    std::vector<std::string> extra;
-    if (opts.limit) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
-    extra.insert(extra.end(), opts.extra.begin(), opts.extra.end());
-
-    for (std::size_t i = 0; i < total; ++i) {
-        const std::string& path = (*chosen)[i];
-        const auto rclone_argv = engine::download_argv(*ctx, opts.mode, path, dest, extra);
-        if (opts.verbose || opts.dry_run) {
-            std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
-        }
-        if (opts.dry_run) continue;
-
-        const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
-        std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
-                     remote_spec(ctx->settings.rclone_remote, path),
-                     util::path_to_utf8(dest / util::path_from_utf8(remote_basename(path))));
-        auto code = proc::run_inherit(rclone_argv);
-        if (!code) {
-            error(code.error());
-            return exit_config;
-        }
-        if (*code == 0) {
-            ++done;
-            continue;
-        }
-        if (first_failure == 0) first_failure = *code;
-        failed.push_back(path);
-        if (*code == proc::exit_stopped) {
-            stopped = i + 1 < total;
-            break;
-        }
-    }
+    // 4 + 5. download each chosen item -------------------------------------------------
+    const DownloadTally tally = opts.rclone ? download_with_rclone(*ctx, opts, *chosen, dest)
+                                            : download_with_grab(*ctx, opts, *chosen, sizes, dest);
     if (opts.dry_run) return exit_ok;
 
-    if (total > 1) {
-        std::string summary = std::format("grab: {} of {} done", done, total);
-        if (!failed.empty()) summary += std::format("; failed: {}", util::join(failed, ", "));
-        if (stopped) summary += "; stopped after Ctrl+C";
+    if (const std::size_t total = chosen->size(); total > 1) {
+        std::string summary = std::format("grab: {} of {} done", tally.done, total);
+        if (!tally.failed.empty()) summary += std::format("; failed: {}", util::join(tally.failed, ", "));
+        if (tally.stopped) summary += "; stopped after Ctrl+C";
         std::println(stderr, "{}", summary);
     }
-    return first_failure;
+    return tally.code;
 }
 
 } // namespace

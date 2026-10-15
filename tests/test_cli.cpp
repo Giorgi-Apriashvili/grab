@@ -101,6 +101,13 @@ TEST_CASE("--limit takes a speed like rclone's --bwlimit") {
     CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value());
 }
 
+TEST_CASE("--rclone downloads with plain rclone, as before") {
+    auto r = parse_args(args({"movie.mkv", "--rclone"}));
+    REQUIRE(r.has_value());
+    CHECK(r->opts.rclone);
+    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.rclone);
+}
+
 TEST_CASE("help, version and init short-circuit") {
     auto h = parse_args(args({"--help"}));
     REQUIRE(h.has_value());

@@ -1,8 +1,9 @@
 #pragma once
 
-// Pieces of grab-gui's folder downloads that need no process or window: the folder's file
-// listing, which files take the resumable path, the list handed to rclone, rclone's per-file
-// log lines, and which of a big folder's files the page is shown.
+// Pieces of folder downloads that need no process or window: the folder's file listing,
+// which files take the resumable path, the list handed to rclone, rclone's per-file log lines,
+// and which of a big folder's files grab-gui's page is shown. The download itself is in
+// folder_job.hpp.
 
 #include <cstdint>
 #include <expected>

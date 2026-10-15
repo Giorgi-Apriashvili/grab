@@ -203,6 +203,24 @@ std::optional<std::int64_t> parse_rfc3339(std::string_view t) {
     return secs * 1'000'000'000 + nanos;
 }
 
+bool up_to_date(std::uint64_t local_size, std::int64_t local_mtime, std::uint64_t size,
+                std::optional<std::int64_t> modtime) {
+    constexpr std::int64_t slack = 2'000'000'000; // FAT keeps times to 2 s
+    return local_size == size && (!modtime || local_mtime >= *modtime - slack);
+}
+
+bool up_to_date(const fs::path& local, std::uint64_t size, std::string_view modtime) {
+    std::error_code ec;
+    if (!fs::is_regular_file(local, ec)) return false;
+    const auto local_size = fs::file_size(local, ec);
+    if (ec) return false;
+    const auto written = fs::last_write_time(local, ec);
+    if (ec) return false;
+    const auto since_1970 = std::chrono::clock_cast<std::chrono::system_clock>(written).time_since_epoch();
+    return up_to_date(local_size, std::chrono::duration_cast<std::chrono::nanoseconds>(since_1970).count(), size,
+                      parse_rfc3339(modtime));
+}
+
 namespace {
 
 std::vector<std::string> base_argv(const Source& src, std::initializer_list<std::string> head) {
@@ -486,7 +504,9 @@ Result run(const Download& d, Connections& connections, const std::function<void
     proc::RunOptions quiet;
     quiet.detached = true;
     quiet.stop = stop;
-    auto stat_run = proc::run_capture(stat_argv(src), quiet);
+    const auto stat = stat_argv(src);
+    if (d.on_command) d.on_command(stat);
+    auto stat_run = proc::run_capture(stat, quiet);
     if (stop.stop_requested()) return Result{Outcome::stopped, {}, {}};
     if (!stat_run) return failed(stat_run.error());
     if (stat_run->exit_code != 0) return failed(server_ops::clean_rclone_error(stat_run->err));
@@ -497,9 +517,15 @@ Result run(const Download& d, Connections& connections, const std::function<void
     Result result;
     const auto part = part_path(d.target);
     const auto state_file = state_path(d.target);
+    std::error_code ec;
+    if (!fs::exists(state_file, ec) && up_to_date(d.target, remote->size, remote->modtime)) {
+        if (on_progress) on_progress(Progress{remote->size, remote->size, 0, std::nullopt, 0});
+        result.outcome = Outcome::done;
+        result.present = true;
+        return result;
+    }
     std::optional<State> saved;
     if (auto text = util::read_file(state_file)) saved = state_from_json(*text);
-    std::error_code ec;
     const bool reuse = saved && saved->rclone_remote == src.rclone_remote && saved->path == src.path &&
                        saved->size == remote->size && saved->modtime == remote->modtime &&
                        fs::file_size(part, ec) == remote->size && !ec;
@@ -595,7 +621,9 @@ Result run(const Download& d, Connections& connections, const std::function<void
             proc::RunOptions opts;
             opts.detached = true;
             opts.stop = token;
-            auto run = proc::run_piped(cat_argv(src, offset, count, limited), [&](std::string_view data) {
+            const auto cat = cat_argv(src, offset, count, limited);
+            if (d.on_command) d.on_command(cat);
+            auto run = proc::run_piped(cat, [&](std::string_view data) {
                 // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
                 if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token, d.id, weight())) return false;
                 {

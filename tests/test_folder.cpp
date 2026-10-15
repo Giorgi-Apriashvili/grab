@@ -1,10 +1,12 @@
 #include "engine.hpp"
 #include "folder.hpp"
+#include "folder_job.hpp"
 #include "gui_state.hpp"
 
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -82,4 +84,90 @@ TEST_CASE("a folder's files survive a restart in queue.json") {
     REQUIRE(odd.size() == 1);
     REQUIRE(odd[0].files.size() == 1);
     CHECK(odd[0].files[0].state == "queued");
+}
+
+TEST_CASE("folder totals count finished and running files, not skipped ones") {
+    folder::Tree t;
+    t.files.push_back(folder::make_file("a", 100, ""));
+    t.files.push_back(folder::make_file("b", 200, ""));
+    t.files.push_back(folder::make_file("c", 300, ""));
+    t.files.push_back(folder::make_file("d", 400, ""));
+    t.files[0].status = State::done;
+    t.files[1].status = State::running;
+    t.files[1].bytes = 50;
+    t.files[1].speed = 10;
+    t.files[2].status = State::skipped;
+    t.files[3].bytes = 40; // a big file's partial download from an earlier run
+    const auto tot = folder::totals(t);
+    CHECK(tot.total == 700);
+    CHECK(tot.bytes == 190);
+    CHECK(tot.files == 3);
+    CHECK(tot.files_done == 1);
+    CHECK(tot.speed == 10);
+    REQUIRE(tot.eta.has_value());
+    CHECK(*tot.eta == doctest::Approx(51.0));
+    CHECK(folder::make_file("x", folder::big_file_threshold, "").big);
+    CHECK_FALSE(folder::make_file("x", 10, "").big);
+}
+
+TEST_CASE("single files of a folder: pause, resume, skip and retry") {
+    folder::Tree t;
+    t.files.push_back(folder::make_file("waiting", 10, ""));
+    t.files.push_back(folder::make_file("copying", 10, ""));
+    t.files.push_back(folder::make_file("big", folder::big_file_threshold, ""));
+    t.files.push_back(folder::make_file("broken", folder::big_file_threshold, ""));
+    t.files[0].in_batch = true;
+    t.files[1].in_batch = true;
+    t.files[1].status = State::running;
+    t.files[1].bytes = 5;
+    t.files[2].status = State::running;
+    t.files[3].status = State::failed;
+    t.files[3].error = "oops";
+
+    folder::pause_file(t, "waiting"); // still queued in the batch: rclone would fetch it
+    CHECK(t.files[0].status == State::paused);
+    CHECK(t.batch_stop.stop_requested());
+    t.batch_stop = {};
+    folder::pause_file(t, "copying"); // in the batch: restarts it without the file
+    CHECK(t.files[1].status == State::paused);
+    CHECK(t.files[1].bytes == 0);
+    CHECK(t.batch_stop.stop_requested());
+    folder::pause_file(t, "big"); // its own stop; it is marked paused once stopped
+    CHECK(t.files[2].status == State::running);
+    CHECK(t.files[2].stop_reason == folder::StopReason::pause);
+    CHECK(t.files[2].stop.stop_requested());
+
+    folder::resume_file(t, "waiting");
+    CHECK(t.files[0].status == State::queued);
+    folder::resume_paused(t);
+    CHECK(t.files[1].status == State::queued);
+
+    const auto dir = std::filesystem::path("D") / "Limits";
+    const auto discard = folder::skip_file(t, dir, "broken");
+    CHECK(t.files[3].status == State::skipped);
+    REQUIRE(discard.has_value());
+    CHECK(*discard == dir / "broken");
+    CHECK_FALSE(folder::skip_file(t, dir, "big").has_value()); // running: stopped, then discarded
+    CHECK(t.files[2].stop_reason == folder::StopReason::skip);
+
+    t.files[1].status = State::failed;
+    t.files[1].error = "x";
+    auto o = folder::outcome(t);
+    CHECK(o.failed == 1);
+    CHECK(o.first_error == "copying: x");
+    CHECK(o.waiting == 1); // "waiting" is queued
+    folder::retry_files(t, false);
+    CHECK(t.files[1].status == State::queued);
+    CHECK(t.files[1].error.empty());
+    CHECK(t.files[3].status == State::skipped); // skipped files stay skipped
+    t.files[0].status = State::paused;
+    folder::retry_files(t, true); // after a cancel: everything not done or skipped
+    CHECK(t.files[0].status == State::queued);
+}
+
+TEST_CASE("a folder's local directory and its files' remote paths") {
+    CHECK(folder::local_dir("Backup", "/home/x/Limits") == std::filesystem::path("Backup") / "Limits");
+    CHECK(folder::child_remote_path("/a", "b/c.mkv") == "/a/b/c.mkv");
+    CHECK(folder::child_remote_path("/a/", "b") == "/a/b");
+    CHECK(folder::child_remote_path("", "b") == "b");
 }

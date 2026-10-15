@@ -44,8 +44,8 @@ Commands:
                        verifying its SHA-256; --check only reports whether one is available.
 
 Options:
-  -s, --file           TARGET is a file   (default; rclone copyto, single-file tuned flags)
-  -f, --folder         TARGET is a folder (rclone copy, many-file tuned flags)
+  -s, --file           TARGET is a file (default)
+  -f, --folder         TARGET is a folder
   -r, --remote NAME    grab.conf section to use (default: [grab] default_remote)
   -c, --config PATH    grab.conf path (default: %APPDATA%\grab\grab.conf or $GRAB_CONFIG)
       --depth N        override max_depth for this run
@@ -53,14 +53,21 @@ Options:
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
-  -n, --dry-run        resolve the target and print the rclone command, transfer nothing
+      --rclone         download with plain rclone copyto / copy and rclone's own progress
+                       instead of grab's resumable download over several connections
+  -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
   -v, --verbose        echo the ssh and rclone command lines before running them
       --init           write a commented example grab.conf to the config path if absent
   -h, --help           show this help
       --version        show version
 
+Downloads run over several connections at once and survive interruptions: Ctrl+C keeps
+what is on disk, and the same command later continues from there. A file or folder file
+already on disk (same size, not older than the server's) is not fetched again.
+
 Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
-(ssh or rclone listing) failed, 5 update failed, otherwise rclone's own exit code.
+(ssh or rclone listing) failed, 5 update failed, 6 download failed, 130 stopped by Ctrl+C.
+With --rclone, a failed download exits with rclone's own code.
 )";
 }
 
@@ -156,6 +163,8 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             result.opts.all = true;
         } else if (name == "--exact") {
             result.opts.exact = true;
+        } else if (name == "--rclone") {
+            result.opts.rclone = true;
         } else if (name == "-n" || name == "--dry-run") {
             result.opts.dry_run = true;
         } else if (name == "-v" || name == "--verbose") {
