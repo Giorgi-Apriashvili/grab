@@ -22,6 +22,8 @@
   </button>
 </header>
 
+<div id="update-banner" class="update-banner" role="status" hidden></div>
+
 <div id="search-view" class="view">
   <form id="search-form" class="bar search" autocomplete="off">
     <input id="query" type="search" placeholder="Search by name, e.g. lioness s03e08" spellcheck="false" autofocus>
@@ -77,6 +79,20 @@
 
   <div class="settings-body">
     <div id="server-list" class="server-list"></div>
+
+    <section id="updates-panel" class="updates-panel">
+      <div class="updates-row">
+        <span class="section-title">Updates</span>
+        <label class="switch" title="Ask GitHub for the latest release at most once a day, when grab starts">
+          <input id="update-auto" type="checkbox" role="switch">
+          <span class="track" aria-hidden="true"></span>
+          <span>Check for updates once a day</span>
+        </label>
+        <span class="spacer"></span>
+        <span id="update-result" class="muted"></span>
+        <button id="update-now" type="button">Check now</button>
+      </div>
+    </section>
 
     <form id="server-form" class="server-form" autocomplete="off" hidden>
       <h2 id="form-title">Add a server</h2>

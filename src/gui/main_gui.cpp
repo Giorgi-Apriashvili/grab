@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "gui_state.hpp"
 #include "tray.hpp"
+#include "update.hpp"
 #include "util.hpp"
 #include "webview.hpp"
 
@@ -19,7 +20,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <cwchar>
 #include <string>
+#include <string_view>
 
 using namespace grab;
 
@@ -286,8 +289,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         quit(hwnd);
         return 0;
     // Logoff, shutdown, or an installer closing grab-gui through the Restart Manager
-    // (ENDSESSION_CLOSEAPP): agree, then exit cleanly. Downloads are cancelled and their
-    // partial files removed; an installer update starts grab-gui again afterwards.
+    // (ENDSESSION_CLOSEAPP): agree, then exit cleanly. Running downloads stop where they are and
+    // keep their partial files; an installer update starts grab-gui again afterwards.
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
@@ -324,7 +327,7 @@ void place_window(HWND hwnd, const GuiState& state, int& show) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     // One window per configuration (%APPDATA%\grab, or GRAB_CONFIG's folder): a second launch
@@ -332,7 +335,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     // named shared-memory slot next to the mutex.
     const std::wstring key = instance_key(default_grab_config_path().parent_path());
     HANDLE mutex = CreateMutexW(nullptr, TRUE, (std::wstring(instance_mutex) + key).c_str());
-    const bool already_running = mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS;
+    bool already_running = mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS;
+    // "--restart PID": started by an update's "Restart grab" while the old window (PID) is
+    // closing. Wait until that process is gone, not merely its lock, so the programs it ran can
+    // be deleted next, instead of handing over to it.
+    if (const auto restart = std::wstring_view(command_line).find(L"--restart"); restart != std::wstring_view::npos) {
+        const DWORD old_pid = static_cast<DWORD>(std::wcstoul(command_line + restart + 9, nullptr, 10));
+        if (HANDLE old = old_pid != 0 ? OpenProcess(SYNCHRONIZE, FALSE, old_pid) : nullptr; old != nullptr) {
+            WaitForSingleObject(old, 30000);
+            CloseHandle(old);
+        }
+        if (already_running) {
+            const DWORD waited = WaitForSingleObject(mutex, 30000);
+            already_running = waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED;
+        }
+    }
     HANDLE slot = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(std::uint64_t),
                                      (std::wstring(instance_slot) + key).c_str());
     auto* published = slot != nullptr
@@ -348,6 +365,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         }
         return 0;
     }
+
+    // An update replaced programs while they ran; the old ones can go now that this is the only
+    // grab-gui (one restarted after a portable update waited for the old window above).
+    update::remove_replaced_programs();
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
 
@@ -384,6 +405,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         defer([name, ok, error] {
             if (g.hwnd != nullptr) on_download_finished(g.hwnd, name, ok, error);
         });
+    };
+    host.quit = [] {
+        if (g.hwnd != nullptr) quit(g.hwnd);
     };
     g.app = std::make_unique<gui::App>(std::move(host), default_grab_config_path(), default_gui_state_path());
 

@@ -36,6 +36,10 @@ struct GuiState {
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
     bool limit_on = false;                           // global download speed limit
     double limit_mibps = 5.0;                        // its value, kept while switched off
+    bool update_check = true;                        // look for a new release once a day
+    std::int64_t last_update_check = 0;              // Unix seconds; 0 = never
+    std::string latest_version;                      // the newest release seen ("0.7.0"), if any
+    std::string latest_page;                         // its release page
     bool operator==(const GuiState&) const = default;
 };
 
@@ -60,6 +64,9 @@ struct SavedDownload {
     std::uint64_t total = 0;
     std::vector<SavedFile> files; // a folder's files, once it was listed
     std::string priority = "normal"; // bandwidth priority: "high" | "normal" | "low"
+    // Saved for an update's restart while it was running or queued: it continues by itself
+    // instead of coming back paused.
+    bool resume = false;
     bool operator==(const SavedDownload&) const = default;
 };
 

@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -157,3 +158,47 @@ TEST_CASE("sha256_file and self_exe_path") {
     CHECK(self.filename() == "grab_tests.exe");
 }
 #endif
+
+TEST_CASE("the release page is kept only when it is a github.com page") {
+    auto r = update::parse_release(
+        R"({"tag_name":"v0.7.0","html_url":"https://github.com/Giorgi-Apriashvili/grab/releases/tag/v0.7.0","assets":[]})");
+    REQUIRE(r.has_value());
+    CHECK(r->page == "https://github.com/Giorgi-Apriashvili/grab/releases/tag/v0.7.0");
+    auto other = update::parse_release(R"({"tag_name":"v0.7.0","html_url":"https://evil.example/x","assets":[]})");
+    REQUIRE(other.has_value());
+    CHECK(other->page.empty());
+    CHECK_FALSE(update::is_release_page("https://github.com/"));
+    CHECK_FALSE(update::is_release_page("http://github.com/x"));
+    CHECK_FALSE(update::is_release_page("https://github.com.evil.example/x"));
+    CHECK_FALSE(update::is_release_page("https://github.com/x\" onclick=\"y"));
+    CHECK_FALSE(update::is_release_page("https://github.com/x y"));
+    CHECK_FALSE(update::is_release_page("https://github.com/x\n"));
+    CHECK(update::is_release_page("https://github.com/a/b/releases/tag/v1.0.0"));
+}
+
+TEST_CASE("each line grab update prints maps to its step") {
+    using update::Phase;
+    namespace t = update::text;
+    CHECK(update::phase_of(std::string("grab 0.6.0: ") + std::string(t::checking)) == Phase::checking);
+    CHECK(update::phase_of(std::string(t::downloading) + "grab-0.7.0-windows-x64-setup.exe (installer install)") ==
+          Phase::downloading);
+    CHECK(update::phase_of(std::string(t::verified) + "9131229c") == Phase::verified);
+    CHECK(update::phase_of(t::installing) == Phase::installing);
+    CHECK(update::phase_of(std::string(t::updated) + "0.6.0 -> 0.7.0") == Phase::done);
+    CHECK(update::phase_of(std::string(t::completed) + "0.6.0 in C:\\grab (rclone.exe)") == Phase::done);
+    CHECK(update::phase_of(std::string("grab 0.6.0") + std::string(t::up_to_date) + " (latest release: v0.6.0)") ==
+          Phase::up_to_date);
+    CHECK(update::phase_of(std::string(t::error) + "checksum mismatch") == Phase::failed);
+    CHECK(update::phase_of("grab-gui is open: restart it to use the new version") == Phase::other);
+    CHECK(update::phase_of("  \r") == Phase::other);
+}
+
+TEST_CASE("an update check is due once a day") {
+    constexpr std::int64_t day = 24 * 60 * 60;
+    const std::int64_t now = 1'760'000'000;
+    CHECK(update::update_due(0, now)); // never checked
+    CHECK(update::update_due(now - day, now));
+    CHECK_FALSE(update::update_due(now - day + 60, now));
+    CHECK_FALSE(update::update_due(now, now));
+    CHECK(update::update_due(now + 3600, now)); // the clock went back
+}

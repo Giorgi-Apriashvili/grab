@@ -1,9 +1,11 @@
 #pragma once
 
 #include <compare>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -42,10 +44,13 @@ struct Release {
     std::string tag;
     Version version;
     std::vector<Asset> assets;
+    std::string page; // the release's web page (html_url), only when is_release_page()
 };
 
 // A GitHub `releases/latest` JSON payload.
 [[nodiscard]] std::expected<Release, std::string> parse_release(std::string_view json_text);
+// Whether `url` is a page on github.com, the only kind grab-gui opens for "What's new".
+[[nodiscard]] bool is_release_page(std::string_view url);
 [[nodiscard]] const Asset* find_asset(const Release& release, std::string_view name);
 
 enum class InstallMode {
@@ -81,6 +86,47 @@ enum class InstallMode {
 // For grab's startup: "note: ... missing next to grab.exe; run `grab update` to add them" when
 // this is a portable copy lacking release programs, else nullopt. Windows only.
 [[nodiscard]] std::optional<std::string> incomplete_folder_note();
+
+// Deletes the "<name>.exe.old" files an update left next to the running program: grab.exe,
+// rclone.exe or grab-gui.exe it replaced while they ran. Each goes once nothing runs it.
+void remove_replaced_programs();
+
+// GRAB_UPDATE_API, else default_api_url.
+[[nodiscard]] std::string api_url();
+
+// What `grab update` and grab-gui know after asking for the latest release.
+struct Check {
+    Version current; // this build
+    Release release;
+    InstallMode mode = InstallMode::portable; // how the folder of the running program was installed
+    std::vector<std::string> missing;         // programs a portable folder lacks
+    // A newer release, or this one completing a portable folder (needs_install).
+    [[nodiscard]] bool available() const { return needs_install(current, release.version, !missing.empty()); }
+};
+// Asks api_url() for the latest release (curl). `detached`: curl runs without a console window,
+// for grab-gui, which can also `stop` it. Windows only.
+[[nodiscard]] std::expected<Check, std::string> check(bool detached = false, std::stop_token stop = {});
+
+// grab-gui checks at most once a day: whether a check last made at `last` (Unix seconds, 0 =
+// never) is due at `now`. A clock that went backwards makes it due.
+[[nodiscard]] bool update_due(std::int64_t last, std::int64_t now);
+
+// The lines `grab update` prints at each step start with these; grab-gui follows the steps by
+// them (phase_of), so they are defined once.
+namespace text {
+inline constexpr std::string_view checking = "checking for updates...";  // after "grab X.Y.Z: "
+inline constexpr std::string_view downloading = "downloading ";
+inline constexpr std::string_view verified = "verified SHA-256 ";
+inline constexpr std::string_view installing = "running the installer silently...";
+inline constexpr std::string_view updated = "updated grab ";
+inline constexpr std::string_view completed = "completed grab ";
+inline constexpr std::string_view up_to_date = " is up to date";         // "grab X.Y.Z is up to date ..."
+inline constexpr std::string_view error = "grab: error: ";
+} // namespace text
+
+enum class Phase { other, checking, downloading, verified, installing, done, up_to_date, failed };
+// Which step a line of `grab update` output reports.
+[[nodiscard]] Phase phase_of(std::string_view line);
 
 // `grab update [--check]`. Prints progress and returns the process exit code.
 [[nodiscard]] int run(bool check_only);

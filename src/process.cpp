@@ -4,6 +4,7 @@
 #include "util.hpp"
 
 #include <format>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -356,6 +357,77 @@ std::expected<int, std::string> run_inherit(std::span<const std::string> argv, b
     return wait_exit(child);
 }
 
+Independent::~Independent() {
+    if (handle_ != nullptr) CloseHandle(handle_);
+}
+
+Independent& Independent::operator=(Independent&& o) noexcept {
+    if (this != &o) {
+        if (handle_ != nullptr) CloseHandle(handle_);
+        handle_ = std::exchange(o.handle_, nullptr);
+    }
+    return *this;
+}
+
+std::optional<int> Independent::wait(std::chrono::milliseconds timeout) {
+    if (handle_ == nullptr) return -1;
+    if (WaitForSingleObject(handle_, static_cast<DWORD>(timeout.count())) != WAIT_OBJECT_0) return std::nullopt;
+    DWORD code = 0;
+    GetExitCodeProcess(handle_, &code);
+    return static_cast<int>(code);
+}
+
+std::expected<Independent, std::string> start_independent(std::span<const std::string> argv,
+                                                         const std::filesystem::path& output) {
+    if (argv.empty()) return util::fail("empty command");
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    Handle out(CreateFileW(output.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (out.h == INVALID_HANDLE_VALUE) {
+        return util::failf("cannot create {}: {}", util::path_to_utf8(output), last_error_message(GetLastError()));
+    }
+    Handle in;
+    if (auto r = open_null(in); !r) return util::fail(r.error());
+
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = in.h;
+    si.StartupInfo.hStdOutput = out.h;
+    si.StartupInfo.hStdError = out.h;
+    // Only these two are inherited, not whatever else this process has open.
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<char> attr_storage(size);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_storage.data());
+    HANDLE inherit_list[2] = {in.h, out.h};
+    if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &size) ||
+        !UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list,
+                                   sizeof(inherit_list), nullptr, nullptr)) {
+        return util::failf("cannot set up handle inheritance: {}", last_error_message(GetLastError()));
+    }
+
+    std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
+    const DWORD flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+    PROCESS_INFORMATION pi{};
+    // Out of a job this process may be in (if that job allows it), so the program outlives it.
+    BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags | CREATE_BREAKAWAY_FROM_JOB,
+                             nullptr, nullptr, &si.StartupInfo, &pi);
+    if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
+        ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags, nullptr, nullptr,
+                            &si.StartupInfo, &pi);
+    }
+    const DWORD create_error = GetLastError();
+    DeleteProcThreadAttributeList(si.lpAttributeList);
+    if (!ok) return util::failf("cannot start '{}': {}", argv[0], last_error_message(create_error));
+    CloseHandle(pi.hThread);
+    Independent started;
+    started.handle_ = pi.hProcess;
+    return started;
+}
+
 #else // POSIX
 
 namespace {
@@ -598,6 +670,20 @@ std::expected<int, std::string> run_inherit(std::span<const std::string> argv, b
     auto pid = spawn(argv, nullptr, false);
     if (!pid) return util::fail(pid.error());
     return wait_pid(*pid);
+}
+
+Independent::~Independent() = default;
+
+Independent& Independent::operator=(Independent&& o) noexcept {
+    handle_ = std::exchange(o.handle_, nullptr);
+    return *this;
+}
+
+std::optional<int> Independent::wait(std::chrono::milliseconds /*timeout*/) { return -1; }
+
+std::expected<Independent, std::string> start_independent(std::span<const std::string> /*argv*/,
+                                                         const std::filesystem::path& /*output*/) {
+    return util::fail("starting an independent program is only implemented on Windows");
 }
 
 #endif

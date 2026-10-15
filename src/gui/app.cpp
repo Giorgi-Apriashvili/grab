@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <span>
 #include <utility>
@@ -93,6 +95,14 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     parallel_ = state_.parallel;
     learned_ = state_.server_limits;
     if (state_.limit_on) limiter_.set_rate(static_cast<std::uint64_t>(state_.limit_mibps * 1024 * 1024));
+    // Output of an earlier update: an installer update outlives the window that followed it.
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(std::filesystem::temp_directory_path(ec), ec)) {
+        const auto name = e.path().filename().wstring();
+        if ((name.starts_with(L"grab-update-") && name.ends_with(L".log")) || name == L"grab-gui-restart.log") {
+            std::filesystem::remove(e.path(), ec);
+        }
+    }
     restore_queue();
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {
@@ -151,6 +161,19 @@ void App::on_message(const std::string& text) {
 
     if (type == "init") {
         send_init();
+        post_update(); // the page may have been reloaded
+        maybe_check_updates();
+    } else if (type == "updateCheckNow") {
+        start_update_check(true);
+    } else if (type == "setUpdateCheck") {
+        state_.update_check = bool_of(*msg, "on");
+        save_state();
+    } else if (type == "updateStart") {
+        start_update();
+    } else if (type == "updateRestart") {
+        restart_for_update();
+    } else if (type == "openReleasePage") {
+        open_release_page();
     } else if (type == "prefs") {
         if (auto remote = msg->string_of("remote")) state_.last_remote = *remote;
         if (auto mode = msg->string_of("mode"); mode == "file" || mode == "folder") state_.mode = *mode;
@@ -271,6 +294,7 @@ void App::send_init() {
     Value init = Value::make_object();
     init.set("type", str("init"));
     init.set("version", str(GRAB_VERSION));
+    init.set("updateCheck", Value::make_bool(state_.update_check));
     init.set("configPath", str(util::path_to_utf8(config_path_)));
 
     Value remotes = Value::make_array();
@@ -773,6 +797,7 @@ void App::pause_items(int id) {
                 item->status = Status::paused;
             } else if (item->status == Status::running && item->stop_reason == StopReason::none) {
                 item->stop_reason = StopReason::pause; // run_item marks it paused once stopped
+                item->resume_mark = false;
                 item->stop.request_stop();
             }
         }
@@ -1324,7 +1349,8 @@ void App::restore_queue() {
         item->name = saved.name;
         item->dest = util::path_from_utf8(saved.dest);
         item->total = saved.total;
-        item->status = Status::paused;
+        // Saved for an update's restart while running or queued: it goes on by itself.
+        item->status = saved.resume ? Status::queued : Status::paused;
         item->weight = weight_of(saved.priority);
         if (item->mode == Mode::file) {
             if (auto p = fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
@@ -1360,6 +1386,7 @@ void App::save_queue() const {
             if (i->status == Status::done || i->status == Status::cancelled) continue;
             SavedDownload d{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path, i->name,
                             util::path_to_utf8(i->dest), i->total, {}, priority_name(i->weight.load())};
+            d.resume = resume_after_restart_ && i->resume_mark;
             for (const auto& c : i->tree.files) {
                 const char* state = c.status == folder::State::done      ? "done"
                                     : c.status == folder::State::skipped ? "skipped"
@@ -1377,6 +1404,206 @@ void App::save_queue() const {
         return;
     }
     (void)server_ops::write_text(queue_path_, queue_to_json(unfinished));
+}
+
+// ---- updates ------------------------------------------------------------------------------
+
+namespace {
+std::int64_t unix_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+void App::post_update() const {
+    Value v = Value::make_object();
+    v.set("type", str("update"));
+    v.set("state", str(update_.state));
+    v.set("version", str(update_.version));
+    v.set("page", str(update_.page));
+    v.set("phase", str(update_.phase));
+    v.set("error", str(update_.error));
+    v.set("completing", Value::make_bool(update_.completing));
+    post(v);
+}
+
+void App::maybe_check_updates() {
+    if (update_checks_started_) return;
+    update_checks_started_ = true;
+    const auto current = update::parse_version(GRAB_VERSION).value_or(update::Version{});
+    // A newer release an earlier check found shows at once, without asking GitHub again.
+    if (auto seen = update::parse_version(state_.latest_version); seen && *seen > current) {
+        update_ = UpdateBanner{"available", update::to_string(*seen),
+                               update::is_release_page(state_.latest_page) ? state_.latest_page : "", {}, {}, false};
+        post_update();
+    }
+    if (state_.update_check && update::update_due(state_.last_update_check, unix_now())) start_update_check(false);
+}
+
+void App::start_update_check(bool manual) {
+    if (update_check_busy_.exchange(true)) return;
+    update_check_thread_ = std::jthread([this, manual](std::stop_token stop) {
+        auto result = update::check(true, stop);
+        update_check_busy_ = false;
+        if (stop.stop_requested()) return;
+        host_.defer([this, manual, result = std::move(result)] { on_update_checked(result, manual); });
+    });
+}
+
+void App::on_update_checked(const std::expected<update::Check, std::string>& result, bool manual) {
+    Value msg = Value::make_object();
+    msg.set("type", str("updateChecked"));
+    if (!result) { // a failed automatic check stays silent; the next start tries again
+        msg.set("ok", Value::make_bool(false));
+        msg.set("text", str("Could not check: " + result.error()));
+        if (manual) post(msg);
+        return;
+    }
+    const auto& c = *result;
+    const std::string latest = update::to_string(c.release.version);
+    state_.last_update_check = unix_now();
+    state_.latest_version = latest;
+    state_.latest_page = c.release.page;
+    save_state();
+    if (update_.state != "running" && update_.state != "installed") {
+        if (c.available()) {
+            update_ = UpdateBanner{"available", latest, c.release.page, {}, {}, c.release.version == c.current};
+        } else if (update_.state == "available") {
+            update_ = {};
+        }
+        post_update();
+    }
+    if (manual) {
+        msg.set("ok", Value::make_bool(true));
+        msg.set("available", Value::make_bool(c.available()));
+        msg.set("text", str(!c.available()                  ? std::format("grab {} is up to date", update::to_string(c.current))
+                            : c.release.version == c.current ? std::format("This folder lacks {}", util::join(c.missing, ", "))
+                                                             : std::format("grab {} is available", latest)));
+        post(msg);
+    }
+}
+
+// `grab update` does the work (verify, then the installer or the portable swap). It runs on its
+// own, outside grab-gui's job, because the installer closes grab-gui; its output, written to a
+// file, tells the banner how far it got.
+void App::start_update() {
+    if (update_.state == "running") return;
+    auto fail = [this](std::string why) {
+        update_.state = "failed";
+        update_.error = std::move(why);
+        post_update();
+    };
+    std::error_code ec;
+    const auto grab_exe = util::self_exe_path().parent_path() / L"grab.exe";
+    if (!std::filesystem::is_regular_file(grab_exe, ec)) {
+        return fail("grab.exe is missing next to grab-gui.exe; get grab from the release page");
+    }
+    const auto log = std::filesystem::temp_directory_path(ec) / std::format("grab-update-{}.log", GetCurrentProcessId());
+    auto started = proc::start_independent(std::vector<std::string>{util::path_to_utf8(grab_exe), "update"}, log);
+    if (!started) return fail(started.error());
+    update_.state = "running";
+    update_.phase = "checking";
+    update_.error.clear();
+    post_update();
+
+    update_thread_ = std::jthread([this, child = std::move(*started), log](std::stop_token stop) mutable {
+        std::uint64_t offset = 0;
+        std::string pending; // output after the last line break
+        std::string last_error;
+        auto take = [&](std::string line) {
+            if (line.ends_with('\r')) line.pop_back();
+            if (const auto cr = line.rfind('\r'); cr != std::string::npos) line.erase(0, cr + 1); // curl's progress redraws
+            if (update::phase_of(line) == update::Phase::failed) last_error = line.substr(update::text::error.size());
+            host_.defer([this, line = std::move(line)] { on_update_line(line); });
+        };
+        auto read_new = [&] {
+            std::ifstream in(log, std::ios::binary);
+            if (!in) return;
+            in.seekg(static_cast<std::streamoff>(offset));
+            const std::string chunk((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            offset += chunk.size();
+            pending += chunk;
+            for (std::size_t nl; (nl = pending.find('\n')) != std::string::npos;) {
+                take(pending.substr(0, nl));
+                pending.erase(0, nl + 1);
+            }
+        };
+        std::optional<int> code;
+        while (!(code = child.wait(std::chrono::milliseconds(250)))) {
+            if (stop.stop_requested()) return; // grab-gui is closing; grab update carries on
+            read_new();
+        }
+        read_new();
+        if (!pending.empty()) take(pending);
+        std::error_code rm;
+        std::filesystem::remove(log, rm);
+        host_.defer([this, exit_code = *code, last_error] { on_update_finished(exit_code, last_error); });
+    });
+}
+
+void App::on_update_line(const std::string& line) {
+    switch (update::phase_of(line)) {
+    case update::Phase::checking: update_.phase = "checking"; break;
+    case update::Phase::downloading: update_.phase = "downloading"; break;
+    case update::Phase::verified: update_.phase = "verified"; break;
+    case update::Phase::installing:
+        // The installer closes grab-gui next and starts it again afterwards: running downloads
+        // stop there (partial files kept) and continue in the new one.
+        update_.phase = "installing";
+        mark_for_restart(true);
+        break;
+    case update::Phase::done: update_.phase = "done"; break;
+    case update::Phase::up_to_date: update_.phase = "up_to_date"; break;
+    case update::Phase::failed:
+    case update::Phase::other: return;
+    }
+    if (update_.state == "running") post_update();
+}
+
+void App::on_update_finished(int exit_code, const std::string& last_error) {
+    if (resume_after_restart_) mark_for_restart(false); // still here: nothing to continue after
+    if (exit_code == 0 && update_.phase == "done") {
+        update_.state = "installed"; // a portable swap, or an installer that left this window open
+    } else if (exit_code == 0) {
+        update_ = {}; // nothing newer after all
+    } else {
+        update_.state = "failed";
+        update_.error = !last_error.empty() ? last_error : std::format("grab update exited with code {}", exit_code);
+    }
+    post_update();
+}
+
+void App::restart_for_update() {
+    std::error_code ec;
+    const auto gui_exe = util::self_exe_path().parent_path() / L"grab-gui.exe";
+    const auto log = std::filesystem::temp_directory_path(ec) / "grab-gui-restart.log";
+    mark_for_restart(true);
+    // "--restart PID": the new grab-gui waits for this one to exit instead of handing over to it.
+    auto started = proc::start_independent(
+        std::vector<std::string>{util::path_to_utf8(gui_exe), "--restart", std::to_string(GetCurrentProcessId())}, log);
+    if (!started) {
+        mark_for_restart(false);
+        update_.state = "failed";
+        update_.error = "cannot start grab again: " + started.error();
+        post_update();
+        return;
+    }
+    if (host_.quit) host_.quit(); // saves the queue again on the way out, still marked
+}
+
+void App::mark_for_restart(bool on) {
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& item : items_) {
+            item->resume_mark = on && (item->status == Status::running || item->status == Status::queued);
+        }
+    }
+    resume_after_restart_ = on;
+    save_queue();
+}
+
+void App::open_release_page() const {
+    if (!update::is_release_page(update_.page)) return;
+    ShellExecuteW(host_.hwnd, L"open", util::to_wide(update_.page).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void App::post_queue() {

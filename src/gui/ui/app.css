@@ -315,11 +315,42 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .st-failed .q-sub { color: var(--danger); white-space: normal; }
 .st-queued .q-bar > div { width: 0 !important; }
 
+/* update banner --------------------------------------------------------------------------- */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 14px 8px;
+  padding: 6px 8px 6px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--panel));
+}
+.update-banner .text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.update-banner button { height: 26px; padding: 0 10px; }
+.update-banner .link { color: var(--accent); cursor: pointer; background: none; border: 0; padding: 0 2px; }
+.update-banner .link:hover { text-decoration: underline; }
+.update-banner.failed {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel));
+}
+.update-banner.failed .text { color: var(--danger); white-space: normal; user-select: text; }
+
 /* settings ------------------------------------------------------------------------------ */
 .in-settings .remote, .in-settings #remote-info { visibility: hidden; } /* search-only controls */
 .settings-head .title { font-weight: 600; font-size: 14px; }
 .settings-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 14px 12px; }
 .server-list { display: flex; flex-direction: column; gap: 8px; }
+.updates-panel {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.updates-row { display: flex; align-items: center; gap: 14px; }
+.updates-row .section-title { font-weight: 600; font-size: 14px; }
+.updates-row button { height: 26px; padding: 0 10px; font-size: 12px; }
 .server {
   padding: 10px 12px;
   background: var(--panel);

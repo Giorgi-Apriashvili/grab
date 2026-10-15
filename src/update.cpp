@@ -4,6 +4,7 @@
 #include "process.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
@@ -55,6 +56,7 @@ std::expected<Release, std::string> parse_release(std::string_view json_text) {
     if (!version) return util::failf("latest release tag '{}' is not a version like v1.2.3", r.tag);
     r.version = *version;
 
+    if (auto page = doc->string_of("html_url"); page && is_release_page(*page)) r.page = *page;
     if (const auto* assets = doc->find("assets"); assets && assets->kind == json::Value::Kind::array) {
         for (const auto& a : assets->items) {
             auto name = a.string_of("name");
@@ -63,6 +65,14 @@ std::expected<Release, std::string> parse_release(std::string_view json_text) {
         }
     }
     return r;
+}
+
+bool is_release_page(std::string_view url) {
+    constexpr std::string_view prefix = "https://github.com/";
+    // Nothing that could leave the page or reach a shell: no quotes, spaces or control bytes.
+    return url.starts_with(prefix) && url.size() > prefix.size() &&
+           url.find_first_of(" \"'<>\\`") == std::string_view::npos &&
+           std::ranges::none_of(url, [](char c) { return static_cast<unsigned char>(c) < 0x20; });
 }
 
 const Asset* find_asset(const Release& release, std::string_view name) {
@@ -133,6 +143,34 @@ bool needs_install(const Version& current, const Version& latest, bool folder_in
     return latest > current || (latest == current && folder_incomplete);
 }
 
+void remove_replaced_programs() {
+    const auto self = util::self_exe_path();
+    if (self.empty()) return;
+    std::error_code ignored;
+    for (const auto& e : std::filesystem::directory_iterator(self.parent_path(), ignored)) {
+        if (e.path().filename().wstring().ends_with(L".exe.old")) std::filesystem::remove(e.path(), ignored);
+    }
+}
+
+std::string api_url() { return util::getenv_utf8("GRAB_UPDATE_API").value_or(std::string(default_api_url)); }
+
+bool update_due(std::int64_t last, std::int64_t now) {
+    constexpr std::int64_t day = 24 * 60 * 60;
+    return last <= 0 || now < last || now - last >= day;
+}
+
+Phase phase_of(std::string_view line) {
+    line = util::trim(line);
+    if (line.starts_with(text::error)) return Phase::failed;
+    if (line.ends_with(text::checking)) return Phase::checking;
+    if (line.starts_with(text::downloading)) return Phase::downloading;
+    if (line.starts_with(text::verified)) return Phase::verified;
+    if (line.starts_with(text::installing)) return Phase::installing;
+    if (line.starts_with(text::updated) || line.starts_with(text::completed)) return Phase::done;
+    if (line.find(text::up_to_date) != std::string_view::npos) return Phase::up_to_date;
+    return Phase::other;
+}
+
 namespace {
 
 // Keeps our buffered stdout lines ahead of stderr and of child output (curl, the installer)
@@ -141,7 +179,7 @@ void flush() { std::fflush(stdout); }
 
 void error(std::string_view msg) {
     flush();
-    std::println(stderr, "grab: error: {}", msg);
+    std::println(stderr, "{}{}", text::error, msg);
 }
 
 #ifdef _WIN32
@@ -221,6 +259,38 @@ std::optional<std::string> incomplete_folder_note() {
 #endif
 }
 
+std::expected<Check, std::string> check(bool detached, std::stop_token stop) {
+#ifndef _WIN32
+    (void)detached;
+    (void)stop;
+    return util::fail("updates are only available on Windows");
+#else
+    Check c;
+    c.current = parse_version(GRAB_VERSION).value_or(Version{});
+    const std::string api = api_url();
+    proc::RunOptions run;
+    run.detached = detached;
+    run.stop = std::move(stop);
+    auto meta = proc::run_capture(std::vector<std::string>{"curl", "-fsSL", "--connect-timeout", "15", "--max-time", "60",
+                                                           "-H", "Accept: application/vnd.github+json", api},
+                                  run);
+    if (run.stop.stop_requested()) return util::fail("stopped");
+    if (!meta) return util::failf("{} (curl ships with Windows 10 1803 and later)", meta.error());
+    if (meta->exit_code != 0) return util::failf("could not fetch {} (curl exit {})", api, meta->exit_code);
+    auto release = parse_release(meta->out);
+    if (!release) return util::fail(release.error());
+    c.release = std::move(*release);
+
+    // How this copy was installed. A portable folder may lack programs the release ships (a
+    // v0.2.0 updater extracted only grab.exe); then the current release completes it.
+    const auto exe = util::self_exe_path();
+    if (exe.empty()) return util::fail("cannot determine the path of the running program");
+    c.mode = installed_by_installer(exe.parent_path()) ? InstallMode::installer : InstallMode::portable;
+    if (c.mode == InstallMode::portable) c.missing = missing_programs(exe.parent_path(), release_programs());
+    return c;
+#endif
+}
+
 int run(bool check_only) {
 #ifndef _WIN32
     (void)check_only;
@@ -229,41 +299,22 @@ int run(bool check_only) {
     return 1;
 #else
     const auto current = parse_version(GRAB_VERSION).value_or(Version{});
-    const std::string api = util::getenv_utf8("GRAB_UPDATE_API").value_or(std::string(default_api_url));
-
-    std::println("grab {}: checking for updates...", to_string(current));
+    std::println("grab {}: {}", to_string(current), text::checking);
     flush();
-    auto meta = proc::run_capture(
-        std::vector<std::string>{"curl", "-fsSL", "-H", "Accept: application/vnd.github+json", api});
-    if (!meta) {
-        error(std::format("{} (curl ships with Windows 10 1803 and later)", meta.error()));
+    auto checked = check();
+    if (!checked) {
+        error(checked.error());
         return exit_update_failed;
     }
-    if (meta->exit_code != 0) {
-        error(std::format("could not fetch {} (curl exit {})", api, meta->exit_code));
-        return exit_update_failed;
-    }
-    auto release = parse_release(meta->out);
-    if (!release) {
-        error(release.error());
-        return exit_update_failed;
-    }
-
-    // Decide how this copy was installed. A portable folder may lack programs the release
-    // ships (a v0.2.0 updater extracted only grab.exe); then the current release completes it.
     const auto exe = util::self_exe_path();
-    if (exe.empty()) {
-        error("cannot determine the path of the running grab.exe");
-        return exit_update_failed;
-    }
-    const bool via_installer = installed_by_installer(exe.parent_path());
-    const InstallMode mode = via_installer ? InstallMode::installer : InstallMode::portable;
-    const auto missing =
-        via_installer ? std::vector<std::string>{} : missing_programs(exe.parent_path(), release_programs());
+    const Release* release = &checked->release;
+    const InstallMode mode = checked->mode;
+    const bool via_installer = mode == InstallMode::installer;
+    const auto& missing = checked->missing;
 
     const auto latest = release->version;
-    if (!needs_install(current, latest, !missing.empty())) {
-        std::println("grab {} is up to date (latest release: {})", to_string(current), release->tag);
+    if (!checked->available()) {
+        std::println("grab {}{} (latest release: {})", to_string(current), text::up_to_date, release->tag);
         return 0;
     }
     const bool completing = latest == current;
@@ -311,7 +362,7 @@ int run(bool check_only) {
         }
     } cleanup{tmp};
 
-    std::println("downloading {} ({} install)", name, via_installer ? "installer" : "portable");
+    std::println("{}{} ({} install)", text::downloading, name, via_installer ? "installer" : "portable");
     const auto sums_file = tmp / std::string(sums_asset_name);
     const auto payload = tmp / name;
     if (auto r = download(sums->url, sums_file, false); !r) {
@@ -344,7 +395,7 @@ int run(bool check_only) {
                           name, *expected, *actual));
         return exit_update_failed;
     }
-    std::println("verified SHA-256 {}", *actual);
+    std::println("{}{}", text::verified, *actual);
 
     if (mode == InstallMode::portable) {
         const auto unpacked = tmp / "unpacked";
@@ -405,10 +456,10 @@ int run(bool check_only) {
                                   ec);
         }
         if (completing) {
-            std::println("completed grab {} in {} ({})", to_string(latest), util::path_to_utf8(dir),
+            std::println("{}{} in {} ({})", text::completed, to_string(latest), util::path_to_utf8(dir),
                          util::join(replaced, ", "));
         } else {
-            std::println("updated grab {} -> {} in {} ({})", to_string(current), to_string(latest),
+            std::println("{}{} -> {} in {} ({})", text::updated, to_string(current), to_string(latest),
                          util::path_to_utf8(dir), util::join(replaced, ", "));
         }
         // A running grab-gui keeps running the old program (it was renamed aside) until it restarts.
@@ -426,7 +477,7 @@ int run(bool check_only) {
     // The installer closes grab-gui through the Restart Manager and starts it again afterwards
     // (grab-gui registers for that); running downloads are cancelled.
     if (gui_running()) std::println("grab-gui is open: the installer will close it and start it again");
-    std::println("running the installer silently...");
+    std::println("{}", text::installing);
     flush();
     // The grab-gui the installer starts again must not die with this process's job object.
     auto code = proc::run_inherit(std::vector<std::string>{util::path_to_utf8(payload), "/VERYSILENT",
@@ -443,7 +494,7 @@ int run(bool check_only) {
         error("the installer finished but grab.exe is missing; the previous version was restored");
         return exit_update_failed;
     }
-    std::println("updated grab {} -> {}", to_string(current), to_string(latest));
+    std::println("{}{} -> {}", text::updated, to_string(current), to_string(latest));
     return 0;
 #endif
 }

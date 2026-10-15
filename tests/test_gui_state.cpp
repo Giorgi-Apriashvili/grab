@@ -19,8 +19,13 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.server_limits = {{"arch_guest", 7}};
     s.limit_on = true;
     s.limit_mibps = 2.5;
+    s.update_check = false;
+    s.last_update_check = 1760000000;
+    s.latest_version = "0.7.0";
+    s.latest_page = "https://github.com/Giorgi-Apriashvili/grab/releases/tag/v0.7.0";
 
     CHECK(parse_gui_state(gui_state_to_json(s)) == s);
+    CHECK(parse_gui_state("{}").update_check); // on unless switched off
 
     const auto file = std::filesystem::temp_directory_path() / "grab_test_gui" / "gui.json";
     std::filesystem::remove_all(file.parent_path());
@@ -73,6 +78,9 @@ TEST_CASE("the download queue round-trips and skips incomplete entries") {
     std::vector<SavedDownload> q{{"hetzner", "file", "/home/x/a.mkv", "a.mkv", "E:\\TV", 123456789012ULL, {}, "high"},
                                  {"arch_guest", "folder", "/home/music/Album", "Album", "D:\\Music", 0, {}, "low"}};
     CHECK(parse_queue(queue_to_json(q)) == q);
+    q[0].resume = true; // saved for an update's restart
+    CHECK(parse_queue(queue_to_json(q)) == q);
+    CHECK_FALSE(parse_queue(queue_to_json(q))[1].resume);
     CHECK(parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d","priority":"urgent"}])")[0].priority == "normal");
     CHECK(parse_queue("nope").empty());
     const auto partial = parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d"},{"remote":"b"},7])");

@@ -353,16 +353,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-    // A previous `grab update` left the replaced binary as grab.exe.old; it can be deleted
-    // once that process has exited.
-    if (auto self = util::self_exe_path(); !self.empty()) {
-        // grab.exe, rclone.exe or grab-gui.exe replaced by an update: delete once unused.
-        std::error_code ignored;
-        for (const auto& e : std::filesystem::directory_iterator(self.parent_path(), ignored)) {
-            const auto name = e.path().filename().wstring();
-            if (name.ends_with(L".exe.old")) std::filesystem::remove(e.path(), ignored);
-        }
-    }
+    update::remove_replaced_programs();
 #endif
     const auto args = collect_args(argc, argv);
     auto parsed = parse_args(args);

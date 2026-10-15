@@ -4,9 +4,10 @@
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, moveItem, setPriority, clearFinished, openFolder,
 //                 pauseChild, resumeChild, skipChild,
+//                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
-//   from backend: init, searchResult, searchError, folderPicked, queue, error,
+//   from backend: init, searchResult, searchError, folderPicked, queue, error, update, updateChecked,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked
 
@@ -31,6 +32,8 @@ const state = {
   parallel: 4,
   limitOn: false,
   limitMiBps: 5,
+  update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing
+  updateLater: false,    // "Later": hidden until grab starts again
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -548,6 +551,7 @@ function onInit(msg) {
   if (msg.limitMiBps) state.limitMiBps = msg.limitMiBps;
   renderLimit();
   $('#version').textContent = `v${msg.version}`;
+  if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
   renderRemotes();
   renderMode();
   renderRows();
@@ -558,6 +562,71 @@ function onInit(msg) {
     showBanner('');
     state.configBanner = false;
   }
+}
+
+// ---- updates ------------------------------------------------------------------------------
+
+const UPDATE_PHASE = {
+  checking: 'checking the release…',
+  downloading: 'downloading…',
+  verified: 'verified, installing…',
+  installing: 'installing; grab closes and opens again by itself…',
+  done: 'finishing…',
+};
+
+function renderUpdate() {
+  const u = state.update;
+  const b = $('#update-banner');
+  const show = !!u.state && !(u.state === 'available' && state.updateLater);
+  b.hidden = !show;
+  b.classList.toggle('failed', u.state === 'failed');
+  if (!show) return;
+  const v = `<b>${esc(u.version)}</b>`;
+  if (u.state === 'available') {
+    b.innerHTML = `<span class="text">${u.completing ? `This folder lacks programs grab ${v} comes with` : `grab ${v} is available`}</span>` +
+      (u.page ? '<button type="button" class="link" data-act="notes">What\'s new</button>' : '') +
+      `<button type="button" class="primary" data-act="update">${u.completing ? 'Add them' : 'Update'}</button>` +
+      '<button type="button" class="subtle" data-act="later">Later</button>';
+  } else if (u.state === 'running') {
+    b.innerHTML = `<span class="text"><span class="spinner"></span>Updating to ${v}: ${UPDATE_PHASE[u.phase] || 'starting…'}</span>`;
+  } else if (u.state === 'installed') {
+    const active = state.queue.some((q) => q.status === 'running' || q.status === 'queued');
+    b.innerHTML = `<span class="text">grab ${v} is installed. Restart grab to use it` +
+      `${active ? '; running downloads continue after the restart' : ''}.</span>` +
+      '<button type="button" class="primary" data-act="restart">Restart grab</button>';
+  } else if (u.state === 'failed') {
+    b.innerHTML = `<span class="text">Update failed: ${esc(u.error)}</span>` +
+      '<button type="button" data-act="update">Try again</button>' +
+      '<button type="button" class="subtle" data-act="dismiss">Close</button>';
+  }
+}
+
+$('#update-banner').addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-act]');
+  if (!el) return;
+  const act = el.dataset.act;
+  if (act === 'update') send({ type: 'updateStart' });
+  else if (act === 'notes') send({ type: 'openReleasePage' });
+  else if (act === 'restart') { el.disabled = true; send({ type: 'updateRestart' }); }
+  else if (act === 'later') { state.updateLater = true; renderUpdate(); }
+  else if (act === 'dismiss') { state.update = { state: '' }; renderUpdate(); }
+});
+
+$('#update-auto').addEventListener('change', (ev) => send({ type: 'setUpdateCheck', on: ev.target.checked }));
+$('#update-now').addEventListener('click', () => {
+  $('#update-now').disabled = true;
+  const r = $('#update-result');
+  r.className = 'muted';
+  r.innerHTML = '<span class="spinner"></span>Checking…';
+  send({ type: 'updateCheckNow' });
+});
+
+function onUpdateChecked(msg) {
+  $('#update-now').disabled = false;
+  const r = $('#update-result');
+  r.className = msg.ok ? (msg.available ? 'good' : 'muted') : 'bad';
+  r.textContent = msg.text;
+  if (msg.available) { state.updateLater = false; renderUpdate(); }
 }
 
 // ---- settings: servers -------------------------------------------------------------------
@@ -663,6 +732,7 @@ function serverCard(s) {
 function renderServers() {
   const list = $('#server-list');
   list.hidden = !!settings.form;
+  $('#updates-panel').hidden = !!settings.form;
   $('#server-form').hidden = !settings.form;
   renderStatus();
   if (settings.form) return;
@@ -852,7 +922,10 @@ if (webview) {
         state.queue = msg.items;
         if (msg.parallel) state.parallel = msg.parallel;
         renderQueue();
+        if (state.update.state === 'installed') renderUpdate();
         break;
+      case 'update': state.update = msg; renderUpdate(); break;
+      case 'updateChecked': onUpdateChecked(msg); break;
       case 'error': showBanner(msg.message); break;
       case 'servers': settings.servers = msg.items; renderServers(); break;
       case 'settingsBusy':

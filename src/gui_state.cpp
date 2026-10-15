@@ -54,6 +54,14 @@ GuiState parse_gui_state(std::string_view json_text) {
             if (auto n = number(&l->items[i]); n && *n >= 1) s.server_limits[l->keys[i]] = *n;
         }
     }
+    if (const auto* on = doc->find("updateCheck"); on != nullptr && on->kind == json::Value::Kind::boolean) {
+        s.update_check = on->boolean;
+    }
+    if (const auto* t = doc->find("lastUpdateCheck"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
+        s.last_update_check = static_cast<std::int64_t>(t->number);
+    }
+    s.latest_version = doc->string_of("latestVersion").value_or("");
+    s.latest_page = doc->string_of("latestPage").value_or("");
     return s;
 }
 
@@ -80,6 +88,12 @@ std::string gui_state_to_json(const GuiState& state) {
     Value limits = Value::make_object();
     for (const auto& [remote, n] : state.server_limits) limits.set(remote, Value::make_number(n));
     root.set("serverLimits", std::move(limits));
+    root.set("updateCheck", Value::make_bool(state.update_check));
+    root.set("lastUpdateCheck", Value::make_number(static_cast<double>(state.last_update_check)));
+    if (!state.latest_version.empty()) {
+        root.set("latestVersion", Value::make_string(state.latest_version));
+        root.set("latestPage", Value::make_string(state.latest_page));
+    }
     return json::stringify(root);
 }
 
@@ -113,6 +127,7 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
         d.mode = v.string_of("mode") == "folder" ? "folder" : "file";
         d.name = v.string_of("name").value_or(*path);
         if (auto p = v.string_of("priority"); p == "high" || p == "low") d.priority = *p;
+        if (const auto* r = v.find("resume"); r != nullptr && r->kind == json::Value::Kind::boolean) d.resume = r->boolean;
         if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
             d.total = static_cast<std::uint64_t>(t->number);
         }
@@ -148,6 +163,7 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         v.set("dest", Value::make_string(d.dest));
         v.set("total", Value::make_number(static_cast<double>(d.total)));
         v.set("priority", Value::make_string(d.priority));
+        if (d.resume) v.set("resume", Value::make_bool(true));
         if (!d.files.empty()) {
             Value files = Value::make_array();
             for (const auto& f : d.files) {

@@ -8,6 +8,7 @@
 #include "rate.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
+#include "update.hpp"
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
@@ -41,6 +42,7 @@ public:
         // Worker thread: a download finished (ok) or failed (error says why); not called for
         // cancelled ones.
         std::function<void(const std::string& name, bool ok, const std::string& error)> on_finished;
+        std::function<void()> quit; // UI thread: close the window and exit, even with downloads running
     };
 
     struct QueueSummary {
@@ -124,6 +126,9 @@ private:
         // Bandwidth priority as a weight: high 4, normal 2, low 1. Atomic: running streams
         // read it at every limiter request.
         std::atomic<int> weight{2};
+        // Running or queued when an update decided to restart grab-gui: saved to continue by
+        // itself afterwards (it may be paused by the shutdown before the last save).
+        bool resume_mark = false;
         folder::Tree tree; // folders: their files once listed (under mutex_)
     };
 
@@ -164,6 +169,26 @@ private:
     void test_server(const std::string& name, std::stop_token stop) const;
     void cancel_pending();
 
+    // Updates (UI thread unless noted). The banner's state, sent to the page as "update".
+    struct UpdateBanner {
+        std::string state;   // "" (none), "available", "running", "installed", "failed"
+        std::string version; // of the release ("0.7.0")
+        std::string page;    // its release page, for "What's new"
+        std::string phase;   // while running: "checking", "downloading", "verified", "installing"
+        std::string error;
+        bool completing = false; // the same version, adding programs a portable folder lacks
+    };
+    void maybe_check_updates(); // once, at the page's first init
+    void start_update_check(bool manual);
+    void on_update_checked(const std::expected<update::Check, std::string>& result, bool manual);
+    void start_update();        // runs `grab.exe update` from this program's folder
+    void on_update_line(const std::string& line);
+    void on_update_finished(int exit_code, const std::string& last_error);
+    void restart_for_update();  // starts the new grab-gui, which waits for this one, and exits
+    void mark_for_restart(bool on); // marks (or unmarks) running and queued downloads, then saves
+    void post_update() const;
+    void open_release_page() const;
+
     void worker_loop(std::stop_token stop);
     void run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop);
     void run_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
@@ -189,6 +214,15 @@ private:
     rate::RateLimiter limiter_; // shared by every download's streams
 
     std::jthread search_thread_;
+
+    UpdateBanner update_;
+    bool update_checks_started_ = false;
+    std::atomic<bool> update_check_busy_{false};
+    std::jthread update_check_thread_;
+    std::jthread update_thread_; // follows a running `grab update`
+    // Set while an update is about to restart grab-gui: save_queue() then saves the marked
+    // downloads (Item::resume_mark) to continue by themselves after the restart.
+    std::atomic<bool> resume_after_restart_{false};
 
     std::mutex settings_mutex_; // guards pending_
     std::optional<Pending> pending_;

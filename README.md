@@ -96,11 +96,13 @@ asset and checks it against the release's `SHA256SUMS.txt`. It refuses anything 
 match. Nothing is changed before that check passes. A copy installed with the setup exe is
 upgraded by running the new installer silently, so Add/Remove Programs shows the new version.
 An open grab window is closed for the update and started again afterwards; downloads running in
-it are cancelled. A portable or `cmake --install` copy has its programs (`grab.exe`,
-`grab-gui.exe`, `rclone.exe`) swapped in place. The replaced files are left as `*.exe.old` and
-removed the next time grab runs. It uses the `curl.exe` and `tar.exe` that ship with Windows 10
+it stop with their partial files kept. A portable or `cmake --install` copy has its programs
+(`grab.exe`, `grab-gui.exe`, `rclone.exe`) swapped in place. The replaced files are left as
+`*.exe.old` and removed the next time grab or its window starts. It uses the `curl.exe` and `tar.exe` that ship with Windows 10
 and later. Versions before 0.2.0 have no `update` command; install 0.2.0 once from the Releases
 page.
+
+The window offers the same update: see [GUI](#gui) → Updates.
 
 Portable copies of 0.2.0: that version's updater replaces only `grab.exe`. Afterwards grab
 notices that `grab-gui.exe` and `rclone.exe` are missing and says so. Running `grab update` once
@@ -186,6 +188,17 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
     account, and 28 across a main account and its sub-account at once. 14 leaves two for
     searches while downloads run.
 
+- **Updates:** once a day, when the window opens, grab asks GitHub for the latest release (one
+  request; a failure stays silent). A newer one shows a banner: `grab 0.7.0 is available ·
+  What's new · Update · Later`.
+  - Update runs `grab update` (the same SHA-256 check) and the banner follows it:
+    downloading, verifying, installing.
+  - An installed copy: the installer closes the window and opens it again. A portable copy:
+    the programs are swapped, then "Restart grab" opens the new version.
+  - Downloads running at that moment continue by themselves in the new version; paused ones
+    stay paused.
+  - Later hides the banner until the window opens again. Settings → Updates has the daily
+    check's switch and "Check now".
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
   test, trust, make default and remove. Each server's search folders and depth are edited
   there too. Adding a server, or changing its address, shows the host key fingerprints
@@ -412,7 +425,7 @@ src/config.*    grab.conf / rclone.conf     src/rclone.*   rclone argv for both 
 src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix_spawn wrappers
 src/util.*      strings, paths, environment src/main.cpp   the five steps
 src/engine.*    search + download for both  src/servers.*  server argv, host keys, conf edits
-src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`
+src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`, the window's check
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    folder listing, rclone batch lines, which files the tree shows
 src/folder_job.*    a folder download, shared by the window and the command

@@ -1,12 +1,15 @@
 #pragma once
 
+#include <chrono>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace grab::proc {
 
@@ -61,5 +64,29 @@ run_piped(std::span<const std::string> argv, const std::function<bool(std::strin
 // outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
 [[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
                                                           bool contain_descendants = true);
+
+// A program started by start_independent. Dropping this object leaves it running.
+class Independent {
+public:
+    Independent() = default;
+    ~Independent();
+    Independent(Independent&& o) noexcept : handle_(std::exchange(o.handle_, nullptr)) {}
+    Independent& operator=(Independent&& o) noexcept;
+    Independent(const Independent&) = delete;
+    Independent& operator=(const Independent&) = delete;
+    // Its exit code once it has ended, waiting up to `timeout`; nullopt while it still runs.
+    [[nodiscard]] std::optional<int> wait(std::chrono::milliseconds timeout);
+
+private:
+    friend std::expected<Independent, std::string> start_independent(std::span<const std::string> argv,
+                                                                     const std::filesystem::path& output);
+    void* handle_ = nullptr; // the process handle (Windows)
+};
+
+// Starts argv[0] on its own: no console, stdin on NUL, stdout and stderr written to `output`
+// (created or emptied), and outside grab's job objects, so it keeps running when this process
+// ends. For grab-gui starting `grab update`, whose installer closes grab-gui. Windows only.
+[[nodiscard]] std::expected<Independent, std::string> start_independent(std::span<const std::string> argv,
+                                                                       const std::filesystem::path& output);
 
 } // namespace grab::proc
