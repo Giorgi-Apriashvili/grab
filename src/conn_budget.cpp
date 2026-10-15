@@ -11,7 +11,7 @@ bool is_storage_box(std::string_view host) {
     return util::to_lower(util::trim(host)).ends_with(".your-storagebox.de");
 }
 
-int default_budget(std::string_view host) { return is_storage_box(host) ? 8 : 12; }
+int default_budget(std::string_view host) { return is_storage_box(host) ? 14 : 12; }
 
 int effective_budget(std::optional<int> configured, int default_value, std::optional<int> learned) {
     if (configured && *configured >= 1) return *configured;

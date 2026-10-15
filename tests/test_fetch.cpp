@@ -22,7 +22,7 @@ TEST_CASE("connection budgets: known limits, overrides, learned values") {
     CHECK(budget::is_storage_box("u443987-sub1.your-storagebox.de"));
     CHECK(budget::is_storage_box("U1.YOUR-STORAGEBOX.DE"));
     CHECK_FALSE(budget::is_storage_box("65.21.224.123"));
-    CHECK(budget::default_budget("u1.your-storagebox.de") == 8);
+    CHECK(budget::default_budget("u1.your-storagebox.de") == 14);
     CHECK(budget::default_budget("example.com") == 12);
     CHECK(budget::effective_budget(std::nullopt, 12, std::nullopt) == 12);
     CHECK(budget::effective_budget(std::nullopt, 12, 7) == 7);

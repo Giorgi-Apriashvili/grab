@@ -2,8 +2,8 @@
 
 // How many SSH/SFTP connections grab may open to one server, and how the downloads running on
 // that server share them. A server cannot be asked for its limit, so grab starts from a known
-// value (Hetzner Storage Boxes allow 10 per account), staggers connection starts so logins don't
-// pile up (OpenSSH's MaxStartups), and lowers the budget when the server refuses one.
+// value (see default_budget), staggers connection starts so logins don't pile up (OpenSSH's
+// MaxStartups), and lowers the budget when the server refuses one.
 
 #include <chrono>
 #include <optional>
@@ -15,7 +15,9 @@ namespace grab::budget {
 // Hetzner Storage Box hosts (<user>.your-storagebox.de).
 [[nodiscard]] bool is_storage_box(std::string_view host);
 
-// 8 for Storage Boxes (their limit is 10; two stay free for searches), 12 elsewhere.
+// 14 for Storage Boxes, 12 elsewhere. Hetzner documents 10 connections per Storage Box account,
+// but boxes accepted 16 on one account and 28 across a main account and its sub-account at
+// once (2026-09 and 2026-10); 14 leaves two for searches. A refusal still lowers the budget.
 [[nodiscard]] int default_budget(std::string_view host);
 
 // [server] max_connections when set, else the default lowered to what grab learned.

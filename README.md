@@ -165,7 +165,7 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
     not fetched again.
 - **Connections per server:** every download from a server shares that server's connection
   budget.
-  - The budget is 8 for Hetzner Storage Boxes and 12 elsewhere. Set it per server in
+  - The budget is 14 for Hetzner Storage Boxes and 12 elsewhere. Set it per server in
     Settings, or as `max_connections` in grab.conf.
   - A lone download uses the whole budget; several split it fairly. A small file that can
     only use one connection lends the rest to the others.
@@ -174,6 +174,9 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - Measured on a Storage Box, where each connection is capped at about 2.5 MB/s: 1
     connection gives 2.5 MB/s, 8 give about 14 MB/s, and 14 about 19 MB/s. `rclone copyto`
     reached about 5 MB/s.
+  - Hetzner documents 10 connections per Storage Box account, but boxes accepted 16 on one
+    account, and 28 across a main account and its sub-account at once. 14 leaves two for
+    searches while downloads run.
 
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
   test, trust, make default and remove. Each server's search folders and depth are edited
@@ -362,7 +365,7 @@ Defaults (override per remote in grab.conf):
 
 These flags drive the `grab` command. grab-gui fetches single files with its own ranged
 streams (see [GUI](#gui)) and uses `common_flags` for them; its connection count per server is
-`max_connections` (blank = automatic: 8 on Storage Boxes, 12 elsewhere, lowered when a
+`max_connections` (blank = automatic: 14 on Storage Boxes, 12 elsewhere, lowered when a
 server refuses connections).
 
 Concurrent SFTP connections ≈ `transfers × multi-thread-streams` (+ checkers). If the
