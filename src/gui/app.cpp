@@ -3,7 +3,9 @@
 #include "browse.hpp"
 #include "config.hpp"
 #include "engine.hpp"
+#include "file_list.hpp"
 #include "folder.hpp"
+#include "gui_state.hpp"
 #include "ini.hpp"
 #include "process.hpp"
 #include "quote.hpp"
@@ -192,6 +194,11 @@ void App::on_message(const std::string& text) {
     } else if (type == "prefs") {
         if (auto remote = msg->string_of("remote")) state_.last_remote = *remote;
         if (auto mode = msg->string_of("mode"); mode == "file" || mode == "folder" || mode == "browse") state_.mode = *mode;
+        // The results' sort: null for the default order; an invalid one changes nothing.
+        if (const Value* sort = msg->find("sort")) {
+            if (sort->kind == Value::Kind::null) state_.sort.reset();
+            else if (auto order = sort_from_json(*sort)) state_.sort = std::move(order);
+        }
         save_state();
     } else if (type == "search") {
         start_search(*msg);
@@ -375,6 +382,7 @@ void App::send_init() {
     init.set("remotes", std::move(remotes));
     init.set("remote", str(selected));
     init.set("mode", str(state_.mode));
+    if (state_.sort) init.set("sort", sort_to_json(*state_.sort));
     Value dests = Value::make_object();
     for (const auto& [remote, path] : state_.destinations) dests.set(remote, str(path));
     init.set("destinations", std::move(dests));
@@ -403,8 +411,9 @@ void App::start_search(const Value& msg) {
 }
 
 // A server's search answers from its saved file list when it has one that fits; a list older
-// than file_list::fresh_for is refreshed in the background, and the search then runs again. A
-// server without a list is searched live (one server) while its list is fetched for next time.
+// than file_list::fresh_for, or an older grab's without dates, is refreshed in the background,
+// and the search then runs again. A server without a list is searched live (one server) while
+// its list is fetched for next time.
 void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update,
                      const std::optional<std::string>& under) {
     // A new search replaces the previous one; stopping kills its ssh/rclone child at once.
@@ -475,7 +484,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
                     auto& s = list_slot(server);
                     if (s.list && s.list->fingerprint == file_list::fingerprint(*ctx)) list = s.list;
                 }
-                if (!update && (!list || !file_list::fresh(list->fetched, now))) start_refresh(server);
+                if (!update && (!list || !file_list::fresh(*list, now))) start_refresh(server);
                 if (list) {
                     found = file_list::search(*ctx, *list, req);
                     status.set("age", num(static_cast<double>(now - list->fetched)));
@@ -527,6 +536,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             hit.set("name", str(h.name));
             hit.set("size", h.size ? num(static_cast<double>(*h.size)) : Value{});
             if (h.dir) hit.set("dir", Value::make_bool(true));
+            if (h.modified) hit.set("modified", num(static_cast<double>(*h.modified)));
             out.push(std::move(hit));
         }
         v.set("hits", std::move(out));
@@ -631,7 +641,7 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
     const auto now = unix_now();
     const auto view = file_list::can_answer(ctx, req) ? list_view(server, ctx) : ListView{};
     if (view.index && view.index->folder(under)) {
-        if (!update && !file_list::fresh(view.list->fetched, now)) start_refresh(server);
+        if (!update && !file_list::fresh(*view.list, now)) start_refresh(server);
         for (const Mode m : {Mode::folder, Mode::file}) {
             auto r = req;
             r.mode = m;
@@ -663,6 +673,7 @@ Value item_value(const browse::Item& it) {
     if (it.dir) v.set("dir", Value::make_bool(true));
     if (it.size) v.set("size", num(static_cast<double>(*it.size)));
     if (it.items) v.set("items", num(static_cast<double>(*it.items)));
+    if (it.modified) v.set("modified", num(static_cast<double>(*it.modified)));
     return v;
 }
 
@@ -700,7 +711,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
         const auto roots = engine::search_roots(*ctx);
         const auto now = unix_now();
         const auto view = list_view(remote, *ctx);
-        if (!update && (!view.list || !file_list::fresh(view.list->fetched, now))) start_refresh(remote);
+        if (!update && (!view.list || !file_list::fresh(*view.list, now))) start_refresh(remote);
         {
             std::lock_guard lock(lists_mutex_);
             const auto& s = list_slot(remote);

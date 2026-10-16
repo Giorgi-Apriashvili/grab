@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <charconv>
 #include <format>
+#include <string>
 #include <system_error>
 #include <utility>
 
@@ -29,6 +30,8 @@ bool fresh(std::int64_t fetched, std::int64_t now) {
     return fetched > 0 && now >= fetched && now - fetched < max_age;
 }
 
+bool fresh(const List& list, std::int64_t now) { return list.dated && fresh(list.fetched, now); }
+
 bool can_answer(const engine::Context& ctx, const engine::SearchRequest& req) {
     if (is_path_target(req.target)) return false;
     if (ctx.settings.skip_hidden && wants_hidden(make_query(req.target, req.exact))) return false;
@@ -41,7 +44,7 @@ engine::SearchResult search(const engine::Context& ctx, const List& list, const 
     std::vector<RemoteEntry> found;
     for (const auto& e : list.entries) {
         if (e.dir != folders || !matches(query, e.path)) continue;
-        found.push_back(RemoteEntry{e.path, folders ? std::nullopt : e.size});
+        found.push_back(RemoteEntry{e.path, folders ? std::nullopt : e.size, e.modified});
     }
     return engine::make_result(ctx, req, std::move(found));
 }
@@ -79,7 +82,7 @@ std::string find_command(const std::vector<std::string>& roots, int max_depth, b
     cmd += std::format(" -mindepth 1 -maxdepth {}", max_depth);
     // Dot-entries are pruned as searches prune them (see build_find_command).
     if (skip_hidden) cmd += " \\( -name '.*' -prune \\) -o";
-    cmd += " \\( -type d -printf 'd\\t%p\\0' -o -type f -printf 'f\\t%s\\t%p\\0' \\) 2>/dev/null";
+    cmd += " \\( -type d -printf 'd\\t%T@\\t%p\\0' -o -type f -printf 'f\\t%s\\t%T@\\t%p\\0' \\) 2>/dev/null";
     return cmd;
 }
 
@@ -104,7 +107,18 @@ void split_records(std::string_view text, char sep, Each&& each) {
     }
 }
 
-constexpr std::string_view header = "grab-file-list 1";
+// Takes the field before the next tab off `rec`; nullopt when there is no tab.
+std::optional<std::string_view> take_field(std::string_view& rec) {
+    const auto tab = rec.find('\t');
+    if (tab == std::string_view::npos) return std::nullopt;
+    const auto field = rec.substr(0, tab);
+    rec.remove_prefix(tab + 1);
+    return field;
+}
+
+// Version 1 had no modification times; grab still reads it.
+constexpr std::string_view header = "grab-file-list 2";
+constexpr std::string_view header_v1 = "grab-file-list 1";
 
 } // namespace
 
@@ -117,13 +131,15 @@ std::vector<Entry> parse_find(std::string_view out) {
             rec.remove_prefix(2);
         } else if (rec.starts_with("f\t")) {
             rec.remove_prefix(2);
-            const auto tab = rec.find('\t');
-            if (tab == std::string_view::npos) return;
-            e.size = number(rec.substr(0, tab));
-            rec.remove_prefix(tab + 1);
+            const auto size = take_field(rec);
+            if (!size) return;
+            e.size = number(*size);
         } else {
             return;
         }
+        const auto time = take_field(rec);
+        if (!time) return;
+        e.modified = util::known_time(util::parse_unix_time(*time));
         if (rec.starts_with("./")) rec.remove_prefix(2);
         if (rec.empty()) return;
         e.path = std::string(rec);
@@ -136,17 +152,14 @@ std::vector<Entry> parse_lsf(std::string_view out, std::string_view root) {
     std::vector<Entry> entries;
     split_records(out, '\n', [&](std::string_view line) {
         if (line.ends_with('\r')) line.remove_suffix(1);
-        // "<size>;<path>": the size comes first, so a ';' inside the path is harmless.
-        const auto semi = line.find(';');
-        if (semi == std::string_view::npos) return;
+        const auto fields = parse_lsf_line(line);
+        if (!fields) return;
         Entry e;
-        e.size = number(line.substr(0, semi));
-        line.remove_prefix(semi + 1);
+        line = fields->path;
         e.dir = line.ends_with('/');
-        if (e.dir) {
-            line.remove_suffix(1);
-            e.size.reset();
-        }
+        if (e.dir) line.remove_suffix(1);
+        else e.size = fields->size;
+        e.modified = fields->modified;
         if (line.empty()) return;
         e.path = join_remote(root, line);
         entries.push_back(std::move(e));
@@ -224,6 +237,8 @@ std::string to_text(const List& list) {
         } else {
             out += e.size ? std::format("f\t{}\t", *e.size) : std::string("f\t\t");
         }
+        if (e.modified) out += std::to_string(*e.modified);
+        out += '\t';
         out += util::escape_field(e.path);
         out += '\n';
     }
@@ -239,7 +254,8 @@ std::optional<List> from_text(std::string_view text) {
         if (line.ends_with('\r')) line.remove_suffix(1);
         const int n = line_no++;
         if (n == 0) {
-            ok = line == header;
+            ok = line == header || line == header_v1;
+            list.dated = line == header;
             return;
         }
         if (line.empty()) return;
@@ -262,13 +278,20 @@ std::optional<List> from_text(std::string_view text) {
             Entry e;
             e.dir = kind == "d";
             if (!e.dir) {
-                const auto size_end = rest.find('\t');
-                if (size_end == std::string_view::npos) {
+                const auto size = take_field(rest);
+                if (!size) {
                     ok = false;
                     return;
                 }
-                e.size = number(rest.substr(0, size_end));
-                rest.remove_prefix(size_end + 1);
+                e.size = number(*size);
+            }
+            if (list.dated) {
+                const auto time = take_field(rest);
+                if (!time) {
+                    ok = false;
+                    return;
+                }
+                e.modified = util::known_time(util::parse_unix_time(*time));
             }
             auto path = util::unescape_field(rest);
             if (!path || path->empty()) {

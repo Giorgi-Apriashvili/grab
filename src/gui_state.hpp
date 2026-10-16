@@ -3,6 +3,7 @@
 // What grab-gui remembers between runs (%APPDATA%\grab\gui.json). Pure data + JSON, so it
 // lives in grab_core and is unit-tested.
 
+#include "json.hpp"
 #include "schedule.hpp"
 
 #include <cstdint>
@@ -24,6 +25,16 @@ struct WindowPlacement {
     bool operator==(const WindowPlacement&) const = default;
 };
 
+// The results' order chosen with a column header.
+struct SortOrder {
+    std::string key; // "name" | "size" | "modified"
+    std::string dir; // "asc" | "desc"
+    bool operator==(const SortOrder&) const = default;
+};
+// {"key":"modified","dir":"desc"}; nullopt for anything else.
+[[nodiscard]] std::optional<SortOrder> sort_from_json(const json::Value& v);
+[[nodiscard]] json::Value sort_to_json(const SortOrder& s);
+
 inline constexpr int min_parallel = 1;
 inline constexpr int max_parallel = 8;
 inline constexpr double min_limit_mibps = schedule::min_mibps;
@@ -37,7 +48,8 @@ struct GuiState {
     // Browse mode: server -> the folder last open (absent: its top); "*" -> the server All servers
     // had open ("" for the servers themselves).
     std::map<std::string, std::string> browse_paths;
-    int parallel = 4;                                // downloads at once, min_parallel..max_parallel
+    std::optional<SortOrder> sort;                   // absent: the default order
+    int parallel = 4;                               // downloads at once, min_parallel..max_parallel
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
     bool verify_downloads = false;                   // check each download against the server's checksum
     bool limit_on = false;                           // global download speed limit

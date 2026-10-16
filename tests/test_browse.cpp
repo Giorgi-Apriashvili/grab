@@ -5,6 +5,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,8 +18,12 @@ using file_list::Entry;
 
 namespace {
 
-Entry dir(std::string path) { return Entry{std::move(path), true, std::nullopt}; }
-Entry file(std::string path, std::uint64_t size) { return Entry{std::move(path), false, size}; }
+Entry dir(std::string path, std::optional<std::int64_t> modified = {}) {
+    return Entry{std::move(path), true, std::nullopt, modified};
+}
+Entry file(std::string path, std::uint64_t size, std::optional<std::int64_t> modified = {}) {
+    return Entry{std::move(path), false, size, modified};
+}
 
 std::shared_ptr<const file_list::List> list_of(std::vector<Entry> entries) {
     auto list = std::make_shared<file_list::List>();
@@ -46,6 +51,19 @@ TEST_CASE("folders come first, then files, in natural order ignoring case") {
     CHECK_FALSE(browse::natural_less("same", "same"));
 }
 
+TEST_CASE("names in other scripts sort after digits and ASCII letters") {
+    const std::string umlaut = "\xC3\x84pfel";     // Äpfel
+    const std::string georgian = "\xE1\x83\x90.mkv"; // ა.mkv
+    CHECK(browse::natural_less("2 Fast", umlaut));
+    CHECK(browse::natural_less("zebra", umlaut));
+    CHECK_FALSE(browse::natural_less(umlaut, "zebra"));
+    CHECK(browse::natural_less(umlaut, georgian));
+    std::vector<Item> items{{georgian, "x", false, 1, {}}, {"b.mkv", "x", false, 1, {}}, {umlaut, "x", false, 1, {}},
+                            {"10.mkv", "x", false, 1, {}}, {"Z.mkv", "x", false, 1, {}}};
+    browse::sort_items(items);
+    CHECK(names(items) == std::vector<std::string>{"10.mkv", "b.mkv", "Z.mkv", umlaut, georgian});
+}
+
 TEST_CASE("what lies below a folder") {
     CHECK(browse::is_below("movies/a.avi", "movies"));
     CHECK(browse::is_below("movies/x/a.avi", "movies"));
@@ -62,20 +80,20 @@ TEST_CASE("what lies below a folder") {
 
 TEST_CASE("a server's folders from its file list, down to the list's depth") {
     // The login home, max_depth 3: movies/georgian/2014 is in the list, its contents are not.
-    const browse::Index index(list_of({dir("movies"), dir("movies/georgian"), file("movies/georgian/b.avi", 50),
-                                       file("movies/georgian/a.avi", 100), dir("movies/georgian/2014"), dir("tv"),
-                                       file("tv/x.mkv", 10), file("top.txt", 5)}),
+    const browse::Index index(list_of({dir("movies", 1697000000), dir("movies/georgian"), file("movies/georgian/b.avi", 50),
+                                       file("movies/georgian/a.avi", 100, 1697354553), dir("movies/georgian/2014", 1600000000),
+                                       dir("tv"), file("tv/x.mkv", 10), file("top.txt", 5, 1700000000)}),
                               {""}, 3);
     const auto top = index.top();
     REQUIRE(top.size() == 3);
-    CHECK(top[0] == Item{"movies", "movies", true, std::nullopt, 1}); // something below is unknown: no size
-    CHECK(top[1] == Item{"tv", "tv", true, 10, 1});                    // all known: its size
-    CHECK(top[2] == Item{"top.txt", "top.txt", false, 5, std::nullopt});
+    CHECK(top[0] == Item{"movies", "movies", true, std::nullopt, 1, 1697000000}); // something below unknown: no size
+    CHECK(top[1] == Item{"tv", "tv", true, 10, 1});                                // all known: its size
+    CHECK(top[2] == Item{"top.txt", "top.txt", false, 5, std::nullopt, 1700000000});
 
     const auto georgian = index.folder("movies/georgian");
     REQUIRE(georgian.has_value());
-    CHECK(*georgian == std::vector<Item>{{"2014", "movies/georgian/2014", true, std::nullopt, std::nullopt},
-                                         {"a.avi", "movies/georgian/a.avi", false, 100, std::nullopt},
+    CHECK(*georgian == std::vector<Item>{{"2014", "movies/georgian/2014", true, std::nullopt, std::nullopt, 1600000000},
+                                         {"a.avi", "movies/georgian/a.avi", false, 100, std::nullopt, 1697354553},
                                          {"b.avi", "movies/georgian/b.avi", false, 50, std::nullopt}});
     CHECK_FALSE(index.folder("movies/georgian/2014").has_value()); // listed live instead
     CHECK_FALSE(index.folder("missing").has_value());
@@ -84,9 +102,11 @@ TEST_CASE("a server's folders from its file list, down to the list's depth") {
 }
 
 TEST_CASE("several search roots are the server's top folders") {
-    const browse::Index index(list_of({dir("/srv/media/a"), file("/srv/media/a/f.mkv", 7), file("/home/x/n.txt", 1)}),
+    const browse::Index index(list_of({dir("/srv/media/a", 5), file("/srv/media/a/f.mkv", 7, 6), file("/home/x/n.txt", 1, 7)}),
                               {"/srv/media", "/home/x"}, 4);
+    // The roots themselves are not in the list: no date.
     CHECK(index.top() == std::vector<Item>{{"/srv/media", "/srv/media", true, 7, 1}, {"/home/x", "/home/x", true, 1, 1}});
+    CHECK((*index.folder("/srv/media"))[0].modified == 5);
     CHECK(names(*index.folder("/srv/media/a")) == std::vector<std::string>{"f.mkv"});
     const browse::Index empty(list_of({}), {}, 4); // no list entries: the home is known and empty
     CHECK(empty.top().empty());
@@ -104,16 +124,18 @@ TEST_CASE("the path bar from the server's top") {
 }
 
 TEST_CASE("a folder listed live") {
-    const std::string json = R"([{"Path":"Season 1","Name":"Season 1","Size":-1,"IsDir":true},
+    const std::string json = R"([{"Path":"Season 1","Name":"Season 1","Size":-1,"ModTime":"2023-10-15T09:22:33Z","IsDir":true},
         {"Path":".hidden","Name":".hidden","Size":3,"IsDir":false},
-        {"Path":"Ep 10.mkv","Name":"Ep 10.mkv","Size":10,"IsDir":false},
-        {"Path":"Ep 2.mkv","Name":"Ep 2.mkv","Size":2,"IsDir":false}])";
+        {"Path":"Ep 10.mkv","Name":"Ep 10.mkv","Size":10,"ModTime":"2023-10-15T11:22:33.987654321+02:00","IsDir":false},
+        {"Path":"Ep 2.mkv","Name":"Ep 2.mkv","Size":2,"ModTime":"0001-01-01T00:00:00Z","IsDir":false},
+        {"Path":"Ep 3.mkv","Name":"Ep 3.mkv","Size":3,"ModTime":"soon","IsDir":false}])";
     const auto items = browse::parse_lsjson(json, "tv/show", true);
     REQUIRE(items.has_value());
-    CHECK(*items == std::vector<Item>{{"Season 1", "tv/show/Season 1", true, std::nullopt, std::nullopt},
-                                      {"Ep 2.mkv", "tv/show/Ep 2.mkv", false, 2, std::nullopt},
-                                      {"Ep 10.mkv", "tv/show/Ep 10.mkv", false, 10, std::nullopt}});
-    CHECK(browse::parse_lsjson(json, "", false)->size() == 4); // dot-entries kept when not skipped
+    CHECK(*items == std::vector<Item>{{"Season 1", "tv/show/Season 1", true, std::nullopt, std::nullopt, 1697361753},
+                                      {"Ep 2.mkv", "tv/show/Ep 2.mkv", false, 2, std::nullopt}, // before 1970: unknown
+                                      {"Ep 3.mkv", "tv/show/Ep 3.mkv", false, 3, std::nullopt},
+                                      {"Ep 10.mkv", "tv/show/Ep 10.mkv", false, 10, std::nullopt, 1697361753}});
+    CHECK(browse::parse_lsjson(json, "", false)->size() == 5); // dot-entries kept when not skipped
     CHECK((*browse::parse_lsjson(json, "", false))[0].path == "Season 1");
     CHECK_FALSE(browse::parse_lsjson("not json", "x", true).has_value());
 
@@ -123,6 +145,6 @@ TEST_CASE("a folder listed live") {
     ctx.settings.rclone_remote = "Box";
     ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki"};
     CHECK(browse::listing_argv(ctx, "tv/show") ==
-          std::vector<std::string>{"rclone", "lsjson", "Box:tv/show", "--no-mimetype", "--no-modtime", "--config",
+          std::vector<std::string>{"rclone", "lsjson", "Box:tv/show", "--no-mimetype", "--config",
                                    util::path_to_utf8(*ctx.config.rclone_config), "--sftp-chunk-size", "255Ki"});
 }

@@ -79,9 +79,6 @@ struct RemoteStat {
 // `rclone lsjson --stat` output.
 [[nodiscard]] std::expected<RemoteStat, std::string> parse_stat(std::string_view json_text);
 
-// RFC 3339 time ("2023-10-15T11:22:33.123456789+02:00", "...Z") as nanoseconds since 1970 UTC.
-[[nodiscard]] std::optional<std::int64_t> parse_rfc3339(std::string_view text);
-
 // Whether a local copy already holds the server's file: the same size, and modified no earlier
 // than the server's copy (2 s slack for coarse file systems). grab and rclone give a finished
 // file the server's time; a later one is a copy made after the server's last change, e.g. by an

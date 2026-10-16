@@ -14,7 +14,8 @@ namespace grab::browse {
 
 namespace {
 
-char lower(char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
+// As a byte from 0 to 255, so names in other scripts (UTF-8) sort after digits and ASCII letters.
+unsigned char lower(char c) { return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(c))); }
 bool digit(char c) { return c >= '0' && c <= '9'; }
 
 // How deep a folder path is, for ordering children before their parents: "" and "/" first.
@@ -54,8 +55,8 @@ bool natural_less(std::string_view a, std::string_view b) {
             j = be;
             continue;
         }
-        const char x = lower(a[i]);
-        const char y = lower(b[j]);
+        const unsigned char x = lower(a[i]);
+        const unsigned char y = lower(b[j]);
         if (x != y) return x < y;
         ++i;
         ++j;
@@ -128,7 +129,7 @@ Index::Index(std::shared_ptr<const file_list::List> list, std::vector<std::strin
 }
 
 Item Index::item(const file_list::Entry& e) const {
-    Item it{remote_basename(e.path), e.path, e.dir, e.size, std::nullopt};
+    Item it{remote_basename(e.path), e.path, e.dir, e.size, std::nullopt, e.modified};
     if (e.dir) {
         it.size.reset();
         if (const auto f = folders_.find(e.path); f != folders_.end()) {
@@ -185,7 +186,7 @@ std::vector<Crumb> crumbs(const std::vector<std::string>& roots, std::string_vie
 
 std::vector<std::string> listing_argv(const engine::Context& ctx, std::string_view path) {
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", remote_spec(ctx.settings.rclone_remote, path),
-                                  "--no-mimetype", "--no-modtime"};
+                                  "--no-mimetype"};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
     const auto flags = engine::without_console_progress(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
@@ -210,6 +211,7 @@ std::expected<std::vector<Item>, std::string> parse_lsjson(std::string_view json
         if (!it.dir && size != nullptr && size->kind == json::Value::Kind::number && size->number >= 0) {
             it.size = static_cast<std::uint64_t>(size->number);
         }
+        if (const auto time = v.string_of("ModTime")) it.modified = util::known_time(util::parse_rfc3339_seconds(*time));
         items.push_back(std::move(it));
     }
     sort_items(items);

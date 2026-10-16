@@ -27,6 +27,7 @@ struct Item {
     bool dir = false;
     std::optional<std::uint64_t> size;  // files; folders when everything below them is known
     std::optional<std::size_t> items;   // folders whose contents are known: how many entries
+    std::optional<std::int64_t> modified{}; // Unix seconds; a folder's own
     bool operator==(const Item&) const = default;
 };
 

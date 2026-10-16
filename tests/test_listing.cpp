@@ -42,8 +42,8 @@ ListRequest base_request() {
 
 TEST_CASE("lsf argv for a name search under the home root prunes dot-dirs") {
     CHECK(build_lsf_argv(base_request()) ==
-          std::vector<std::string>{"rclone", "lsf", "arch_guest:", "--format", "sp", "--dirs-only", "-R",
-                                   "--max-depth", "3", "--exclude", ".*/**", "--exclude", ".*"});
+          std::vector<std::string>{"rclone", "lsf", "arch_guest:", "--format", "tsp", "--time-format", "unix",
+                                   "--dirs-only", "-R", "--max-depth", "3", "--exclude", ".*/**", "--exclude", ".*"});
 }
 
 TEST_CASE("lsf argv for a file search with hidden allowed and --config") {
@@ -53,8 +53,8 @@ TEST_CASE("lsf argv for a file search with hidden allowed and --config") {
     r.skip_hidden = false;
     r.rclone_config = util::path_from_utf8("C:\\cfg\\rclone.conf");
     CHECK(build_lsf_argv(r) ==
-          std::vector<std::string>{"rclone", "lsf", "arch_guest:/home", "--format", "sp", "--files-only", "-R",
-                                   "--max-depth", "3", "--config",
+          std::vector<std::string>{"rclone", "lsf", "arch_guest:/home", "--format", "tsp", "--time-format", "unix",
+                                   "--files-only", "-R", "--max-depth", "3", "--config",
                                    util::path_to_utf8(*r.rclone_config)});
 }
 
@@ -62,7 +62,8 @@ TEST_CASE("lsf argv for a path target lists only the parent, one level") {
     auto r = base_request();
     r.target = "learning/Course - Intro to Testing - Jane Doe";
     CHECK(build_lsf_argv(r) ==
-          std::vector<std::string>{"rclone", "lsf", "arch_guest:learning", "--format", "sp", "--dirs-only"});
+          std::vector<std::string>{"rclone", "lsf", "arch_guest:learning", "--format", "tsp", "--time-format",
+                                   "unix", "--dirs-only"});
     r.target = "/x";
     CHECK(build_lsf_argv(r)[2] == "arch_guest:/");
 }
@@ -127,19 +128,48 @@ TEST_CASE("a dot target disables hidden pruning") {
           std::vector<std::string>{".config", "x/.config"});
 }
 
-TEST_CASE("lsf --format sp: sizes for files, none for directories, ';' inside names") {
+TEST_CASE("lsf --format tsp: times, sizes for files, none for directories, ';' inside names") {
     auto r = base_request();
     r.mode = Mode::file;
     r.target = "knight";
     r.root = "/home";
-    const std::string out = "2859284292;tv/A.Knight.S01E01.mkv\n"
-                            "-1;tv/knight/\n"
-                            "17;tv/knight;notes.txt\n";
+    const std::string out = "1697354553;2859284292;tv/A.Knight.S01E01.mkv\n"
+                            "1697000000;-1;tv/knight/\n"
+                            "-62135596800;17;tv/knight;notes.txt\n";
     CHECK(parse_lsf_output(r, out) ==
-          std::vector<RemoteEntry>{{"/home/tv/A.Knight.S01E01.mkv", 2859284292ULL},
-                                   {"/home/tv/knight;notes.txt", 17ULL}});
+          std::vector<RemoteEntry>{{"/home/tv/A.Knight.S01E01.mkv", 2859284292ULL, 1697354553},
+                                   {"/home/tv/knight;notes.txt", 17ULL, std::nullopt}}); // a time before 1970: unknown
 
     r.mode = Mode::folder;
     CHECK(parse_lsf_output(r, out) ==
-          std::vector<RemoteEntry>{{"/home/tv/knight", std::nullopt}});
+          std::vector<RemoteEntry>{{"/home/tv/knight", std::nullopt, 1697000000}});
+}
+
+TEST_CASE("one lsf line: both fields first, or none; a time that doesn't parse is only unknown") {
+    const auto file = parse_lsf_line("1697354553;12;a;b.mkv");
+    REQUIRE(file.has_value());
+    CHECK(file->path == "a;b.mkv");
+    CHECK(file->size == 12ULL);
+    CHECK(file->modified == 1697354553);
+    const auto dir = parse_lsf_line("0;-1;tv/");
+    REQUIRE(dir.has_value());
+    CHECK(dir->path == "tv/");
+    CHECK_FALSE(dir->size.has_value());
+    CHECK_FALSE(dir->modified.has_value());
+    CHECK_FALSE(parse_lsf_line("tv/").has_value());
+    CHECK_FALSE(parse_lsf_line("12;tv/a.mkv").has_value());      // the old "sp" form
+    CHECK_FALSE(parse_lsf_line("5;size;tv/a.mkv").has_value());  // not a size
+    // An rclone without --time-format's "unix" prints the format's name: right path and size,
+    // no date.
+    const auto no_time = parse_lsf_line("unix;3;tv/a.mkv");
+    REQUIRE(no_time.has_value());
+    CHECK(no_time->path == "tv/a.mkv");
+    CHECK(no_time->size == 3ULL);
+    CHECK_FALSE(no_time->modified.has_value());
+
+    ListRequest r;
+    r.root = "/home";
+    r.target = "a";
+    r.mode = Mode::file;
+    CHECK(parse_lsf_output(r, "unix;3;tv/a.mkv\n") == std::vector<RemoteEntry>{{"/home/tv/a.mkv", 3ULL, std::nullopt}});
 }

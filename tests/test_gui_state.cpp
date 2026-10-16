@@ -1,4 +1,5 @@
 #include "gui_state.hpp"
+#include "json.hpp"
 
 #include <doctest/doctest.h>
 
@@ -15,6 +16,7 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.last_remote = "hetzner";
     s.mode = "browse";
     s.browse_paths = {{"Box.Guest", "movies/georgian.movies"}, {"*", "Main"}};
+    s.sort = SortOrder{"modified", "desc"};
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
     s.server_limits = {{"arch_guest", 7}};
@@ -71,6 +73,31 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":0,"until":1760003600}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5,"until":1e300}})").limit_change);
+}
+
+TEST_CASE("the results' sort is kept when valid, and absent for the default order") {
+    CHECK_FALSE(parse_gui_state("{}").sort.has_value());
+    CHECK(gui_state_to_json(GuiState{}).find("\"sort\"") == std::string::npos);
+    for (const char* key : {"name", "size", "modified"}) {
+        for (const char* dir : {"asc", "desc"}) {
+            GuiState s;
+            s.sort = SortOrder{key, dir};
+            CHECK(parse_gui_state(gui_state_to_json(s)).sort == s.sort);
+        }
+    }
+    CHECK(parse_gui_state(R"({"sort":{"key":"size","dir":"asc"}})").sort == SortOrder{"size", "asc"});
+    CHECK_FALSE(parse_gui_state(R"({"sort":{"key":"date","dir":"desc"}})").sort.has_value());
+    CHECK_FALSE(parse_gui_state(R"({"sort":{"key":"size","dir":"up"}})").sort.has_value());
+    CHECK_FALSE(parse_gui_state(R"({"sort":{"key":"size"}})").sort.has_value());
+    CHECK_FALSE(parse_gui_state(R"({"sort":"name"})").sort.has_value());
+    CHECK_FALSE(parse_gui_state(R"({"sort":null})").sort.has_value());
+
+    // As the page sends it in "prefs".
+    const auto msg = json::parse(R"({"type":"prefs","sort":{"key":"modified","dir":"desc"}})");
+    REQUIRE(msg.has_value());
+    CHECK(sort_from_json(*msg->find("sort")) == SortOrder{"modified", "desc"});
+    CHECK_FALSE(sort_from_json(json::Value{}).has_value()); // null: the default order
+    CHECK(json::stringify(sort_to_json(SortOrder{"name", "asc"})) == R"({"key":"name","dir":"asc"})");
 }
 
 TEST_CASE("queue order: move an item before another, or to the end") {

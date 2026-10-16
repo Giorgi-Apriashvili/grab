@@ -5,11 +5,27 @@
 
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include <utility>
 
 namespace grab {
 
 std::filesystem::path default_gui_state_path() { return util::config_home() / "grab" / "gui.json"; }
+
+std::optional<SortOrder> sort_from_json(const json::Value& v) {
+    auto key = v.string_of("key");
+    auto dir = v.string_of("dir");
+    if (key != "name" && key != "size" && key != "modified") return std::nullopt;
+    if (dir != "asc" && dir != "desc") return std::nullopt;
+    return SortOrder{std::move(*key), std::move(*dir)};
+}
+
+json::Value sort_to_json(const SortOrder& s) {
+    json::Value v = json::Value::make_object();
+    v.set("key", json::Value::make_string(s.key));
+    v.set("dir", json::Value::make_string(s.dir));
+    return v;
+}
 
 GuiState parse_gui_state(std::string_view json_text) {
     GuiState s;
@@ -40,6 +56,7 @@ GuiState parse_gui_state(std::string_view json_text) {
             if (b->items[i].kind == json::Value::Kind::string) s.browse_paths[b->keys[i]] = b->items[i].str;
         }
     }
+    if (const auto* sort = doc->find("sort")) s.sort = sort_from_json(*sort);
     if (const auto* d = doc->find("destinations"); d != nullptr && d->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < d->keys.size(); ++i) {
             if (d->items[i].kind == json::Value::Kind::string && !d->items[i].str.empty()) {
@@ -110,6 +127,7 @@ std::string gui_state_to_json(const GuiState& state) {
     Value browse = Value::make_object();
     for (const auto& [server, path] : state.browse_paths) browse.set(server, Value::make_string(path));
     root.set("browsePaths", std::move(browse));
+    if (state.sort) root.set("sort", sort_to_json(*state.sort));
     root.set("parallel", Value::make_number(state.parallel));
     root.set("verifyDownloads", Value::make_bool(state.verify_downloads));
     root.set("limitOn", Value::make_bool(state.limit_on));

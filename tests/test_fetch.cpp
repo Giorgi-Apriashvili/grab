@@ -222,7 +222,7 @@ TEST_CASE("splitting a busy range hands its second half to an idle stream") {
     CHECK(small.ranges.size() == 1);
 }
 
-TEST_CASE("rclone lsjson --stat and RFC 3339 times") {
+TEST_CASE("rclone lsjson --stat") {
     auto st = fetch::parse_stat(R"({"Path":"a.mkv","Name":"a.mkv","Size":9165966961,"MimeType":"video/x-matroska",)"
                                 R"("ModTime":"2025-11-02T14:03:05.123456789+01:00","IsDir":false})");
     REQUIRE(st.has_value());
@@ -230,13 +230,6 @@ TEST_CASE("rclone lsjson --stat and RFC 3339 times") {
     CHECK(st->modtime == "2025-11-02T14:03:05.123456789+01:00");
     CHECK_FALSE(st->is_dir);
     CHECK_FALSE(fetch::parse_stat("[]").has_value());
-
-    CHECK(fetch::parse_rfc3339("1970-01-01T00:00:00Z") == 0);
-    CHECK(fetch::parse_rfc3339("2000-01-01T00:00:00Z") == std::int64_t{946684800} * 1'000'000'000);
-    CHECK(fetch::parse_rfc3339("2000-01-01T01:00:00+01:00") == std::int64_t{946684800} * 1'000'000'000);
-    CHECK(fetch::parse_rfc3339("2000-01-01T00:00:00.5Z") == std::int64_t{946684800} * 1'000'000'000 + 500'000'000);
-    CHECK_FALSE(fetch::parse_rfc3339("2000-01-01 garbage").has_value());
-    CHECK_FALSE(fetch::parse_rfc3339("2000-01-01T00:00:00").has_value()); // no zone
 }
 
 TEST_CASE("rclone command lines for ranges") {

@@ -1,10 +1,13 @@
 #include "engine.hpp"
+#include "listing.hpp"
+#include "remote.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -105,6 +108,55 @@ TEST_CASE("remove_partials deletes only the interrupted item's temp files") {
 
     CHECK(engine::remove_partials(dir / "missing", Mode::folder) == 0); // no throw
     fs::remove_all(dir);
+}
+
+TEST_CASE("a search's result keeps each hit's size and date through ranking and duplicates") {
+    engine::Context ctx;
+    ctx.settings.max_depth = 4;
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.mode = Mode::file;
+    const auto r = engine::make_result(ctx, req,
+                                       {{"tv/Lioness.S03E08.mkv", 300, 1697354553},
+                                        {"tv/Lioness.S03E02.mkv", 200, std::nullopt},
+                                        {"tv/Lioness.S03E08.mkv", 1, 5}}); // a duplicate: the first one counts
+    REQUIRE(r.hits.size() == 2);
+    CHECK(r.hits[0].path == "tv/Lioness.S03E02.mkv");
+    CHECK(r.hits[0].size == 200ULL);
+    CHECK_FALSE(r.hits[0].modified.has_value());
+    CHECK(r.hits[1].name == "Lioness.S03E08.mkv");
+    CHECK(r.hits[1].size == 300ULL);
+    CHECK(r.hits[1].modified == 1697354553);
+}
+
+TEST_CASE("live searches return dates: find over ssh and rclone lsf") {
+    engine::Context ctx;
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.mode = Mode::file;
+    const std::string find_out = std::string("200\t1697354553.25\t./tv/Lioness.S03E02.mkv") + '\0';
+    const auto by_find = engine::make_result(ctx, req, parse_find_output(find_out, true));
+    REQUIRE(by_find.hits.size() == 1);
+    CHECK(by_find.hits[0].path == "tv/Lioness.S03E02.mkv");
+    CHECK(by_find.hits[0].size == 200ULL);
+    CHECK(by_find.hits[0].modified == 1697354553);
+
+    ListRequest list;
+    list.mode = Mode::file;
+    list.target = "lioness";
+    list.root = "/home";
+    const auto by_lsf = engine::make_result(ctx, req, parse_lsf_output(list, "1697354554;300;tv/Lioness.S03E08.mkv\n"));
+    REQUIRE(by_lsf.hits.size() == 1);
+    CHECK(by_lsf.hits[0].path == "/home/tv/Lioness.S03E08.mkv");
+    CHECK(by_lsf.hits[0].size == 300ULL);
+    CHECK(by_lsf.hits[0].modified == 1697354554);
+
+    req.mode = Mode::folder;
+    list.mode = Mode::folder;
+    const auto folder = engine::make_result(ctx, req, parse_lsf_output(list, "1697000000;-1;tv/Lioness/\n"));
+    REQUIRE(folder.hits.size() == 1);
+    CHECK_FALSE(folder.hits[0].size.has_value());
+    CHECK(folder.hits[0].modified == 1697000000);
 }
 
 TEST_CASE("format_size") {

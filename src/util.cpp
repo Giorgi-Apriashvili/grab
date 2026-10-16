@@ -1,11 +1,15 @@
 #include "util.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <system_error>
 
 #ifdef _WIN32
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
@@ -147,6 +151,109 @@ std::string to_lower(std::string_view s) {
     std::string out(s);
     for (auto& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return out;
+}
+
+std::optional<std::int64_t> parse_unix_time(std::string_view text) {
+    if (const auto dot = text.find('.'); dot != std::string_view::npos) {
+        const auto fraction = text.substr(dot + 1);
+        if (fraction.empty() || !std::ranges::all_of(fraction, [](char c) { return c >= '0' && c <= '9'; })) {
+            return std::nullopt;
+        }
+        text = text.substr(0, dot);
+    }
+    std::int64_t n = 0;
+    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), n); // a '-', no '+'
+    if (ec != std::errc{} || ptr != text.data() + text.size()) return std::nullopt;
+    return n;
+}
+
+namespace {
+
+struct Rfc3339 {
+    int year = 0;
+    std::int64_t seconds = 0; // since 1970 UTC
+    std::int64_t nanos = 0;   // within the second
+};
+
+std::optional<Rfc3339> split_rfc3339(std::string_view t) {
+    auto digits = [&](std::size_t pos, std::size_t n) -> std::optional<int> {
+        if (pos + n > t.size()) return std::nullopt;
+        int v = 0;
+        for (std::size_t i = pos; i < pos + n; ++i) {
+            if (t[i] < '0' || t[i] > '9') return std::nullopt;
+            v = v * 10 + (t[i] - '0');
+        }
+        return v;
+    };
+    // YYYY-MM-DDTHH:MM:SS
+    if (t.size() < 20 || t[4] != '-' || t[7] != '-' || (t[10] != 'T' && t[10] != 't' && t[10] != ' ') ||
+        t[13] != ':' || t[16] != ':') {
+        return std::nullopt;
+    }
+    auto y = digits(0, 4), mo = digits(5, 2), d = digits(8, 2), h = digits(11, 2), mi = digits(14, 2),
+         s = digits(17, 2);
+    if (!y || !mo || !d || !h || !mi || !s || *mo < 1 || *mo > 12 || *d < 1 || *d > 31) return std::nullopt;
+    std::size_t pos = 19;
+    std::int64_t nanos = 0;
+    if (pos < t.size() && t[pos] == '.') {
+        ++pos;
+        int n = 0;
+        while (pos < t.size() && t[pos] >= '0' && t[pos] <= '9') {
+            if (n < 9) {
+                nanos = nanos * 10 + (t[pos] - '0');
+                ++n;
+            }
+            ++pos;
+        }
+        for (; n < 9; ++n) nanos *= 10;
+    }
+    std::int64_t offset_s = 0;
+    if (pos < t.size() && (t[pos] == 'Z' || t[pos] == 'z')) {
+        ++pos;
+    } else if (pos < t.size() && (t[pos] == '+' || t[pos] == '-')) {
+        auto oh = digits(pos + 1, 2), om = digits(pos + 4, 2);
+        if (!oh || !om || pos + 3 >= t.size() || t[pos + 3] != ':') return std::nullopt;
+        offset_s = (*oh * 3600 + *om * 60) * (t[pos] == '-' ? -1 : 1);
+        pos += 6;
+    } else {
+        return std::nullopt;
+    }
+    if (pos != t.size()) return std::nullopt;
+    // Days since 1970-01-01 (civil calendar, H. Hinnant's days_from_civil).
+    const int yy = *y - (*mo <= 2 ? 1 : 0);
+    const int era = (yy >= 0 ? yy : yy - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(yy - era * 400);
+    const unsigned mp = static_cast<unsigned>((*mo + 9) % 12);
+    const unsigned doy = (153 * mp + 2) / 5 + static_cast<unsigned>(*d) - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const std::int64_t days = static_cast<std::int64_t>(era) * 146097 + static_cast<std::int64_t>(doe) - 719468;
+    return Rfc3339{*y, days * 86400 + *h * 3600 + *mi * 60 + *s - offset_s, nanos};
+}
+
+} // namespace
+
+std::optional<std::int64_t> parse_rfc3339(std::string_view text) {
+    const auto t = split_rfc3339(text);
+    // int64 nanoseconds reach from 1677-09-21 to 2262-04-11; whole years, with any offset, fit.
+    if (!t || t->year < 1678 || t->year > 2261) return std::nullopt;
+    return t->seconds * 1'000'000'000 + t->nanos;
+}
+
+std::optional<std::int64_t> parse_rfc3339_seconds(std::string_view text) {
+    const auto t = split_rfc3339(text);
+    if (!t) return std::nullopt;
+    return t->seconds;
+}
+
+std::string local_date(std::int64_t unix_seconds) {
+    const auto t = static_cast<std::time_t>(unix_seconds);
+    std::tm tm{};
+#ifdef _WIN32
+    if (localtime_s(&tm, &t) != 0) return {};
+#else
+    if (localtime_r(&t, &tm) == nullptr) return {};
+#endif
+    return std::format("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 }
 
 std::string path_to_utf8(const std::filesystem::path& p) {

@@ -42,13 +42,13 @@ List sample() {
     l.fetched = 1'760'000'000;
     l.fingerprint = "fp";
     l.entries = {
-        {"movies", true, std::nullopt},
-        {"movies/Sahe AKA The Precinct 2010.avi", false, 941563904},
-        {"movies/precinct", true, std::nullopt},
-        {"movies/precinct/precinct.srt", false, 12},
-        {"tv/Lioness.S03E01.mkv", false, 100},
-        {"tv/Lioness.S03E02.mkv", false, 200},
-        {"tv/lioness extras/Lioness Making Of.mkv", false, 300},
+        {"movies", true, std::nullopt, 1'700'000'000},
+        {"movies/Sahe AKA The Precinct 2010.avi", false, 941563904, 1'697'354'553},
+        {"movies/precinct", true, std::nullopt, 1'697'000'000},
+        {"movies/precinct/precinct.srt", false, 12, std::nullopt},
+        {"tv/Lioness.S03E01.mkv", false, 100, 1'750'000'001},
+        {"tv/Lioness.S03E02.mkv", false, 200, 1'750'000'002},
+        {"tv/lioness extras/Lioness Making Of.mkv", false, 300, 1'750'000'003},
     };
     return l;
 }
@@ -74,10 +74,13 @@ TEST_CASE("a file list survives its saved form, odd names included") {
 
     CHECK_FALSE(file_list::from_text("").has_value());
     CHECK_FALSE(file_list::from_text("something else\n").has_value());
-    CHECK_FALSE(file_list::from_text("grab-file-list 1\nd\tbad\\q\n").has_value()); // unknown escape
-    const auto later = file_list::from_text("grab-file-list 1\nfetched\t5\nnewfield\tx\nd\ta\n");
+    CHECK_FALSE(file_list::from_text("grab-file-list 3\n").has_value());
+    CHECK_FALSE(file_list::from_text("grab-file-list 2\nd\t\tbad\\q\n").has_value()); // unknown escape
+    CHECK_FALSE(file_list::from_text("grab-file-list 2\nd\tno-date-field\n").has_value());
+    const auto later = file_list::from_text("grab-file-list 2\nfetched\t5\nnewfield\tx\nd\t\ta\n");
     REQUIRE(later.has_value()); // fields a later version adds are skipped
     CHECK(later->fetched == 5);
+    CHECK(later->dated);
     CHECK(later->entries == std::vector<Entry>{{"a", true, std::nullopt}});
 
     const auto dir = std::filesystem::temp_directory_path() / "grab-test-lists";
@@ -86,6 +89,47 @@ TEST_CASE("a file list survives its saved form, odd names included") {
     CHECK(file_list::save(file, l)); // creates the folder
     CHECK(file_list::load(file) == l);
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("the list's text, version 2: dates after sizes, empty when unknown") {
+    List l;
+    l.fetched = 5;
+    l.fingerprint = "fp";
+    l.entries = {{"movies", true, std::nullopt, 1697354553},
+                 {"movies/a.mkv", false, 12, 1697354554},
+                 {"movies/b.mkv", false, std::nullopt, std::nullopt},
+                 {"tv", true, std::nullopt, std::nullopt}};
+    const std::string text = "grab-file-list 2\nfetched\t5\nfingerprint\tfp\n"
+                             "d\t1697354553\tmovies\nf\t12\t1697354554\tmovies/a.mkv\nf\t\t\tmovies/b.mkv\nd\t\ttv\n";
+    CHECK(file_list::to_text(l) == text);
+    CHECK(file_list::from_text(text) == l);
+    // A date that doesn't parse, or is 0 or before, is unknown.
+    const auto odd = file_list::from_text("grab-file-list 2\nf\t1\tx\ta\nf\t2\t0\tb\nd\t-5\tc\n");
+    REQUIRE(odd.has_value());
+    CHECK(odd->entries == std::vector<Entry>{{"a", false, 1}, {"b", false, 2}, {"c", true, std::nullopt}});
+}
+
+TEST_CASE("a list saved by an older grab answers at once, without dates, and is due for a refresh") {
+    const auto old = file_list::from_text("grab-file-list 1\nfetched\t1760000000\nfingerprint\tfp\n"
+                                          "d\tmovies\nf\t12\tmovies/a.mkv\nf\t\tmovies/b.mkv\n");
+    REQUIRE(old.has_value());
+    CHECK_FALSE(old->dated);
+    CHECK(old->fetched == 1760000000); // kept: the window shows the list's age
+    CHECK(old->entries == std::vector<Entry>{{"movies", true, std::nullopt},
+                                             {"movies/a.mkv", false, 12},
+                                             {"movies/b.mkv", false, std::nullopt}});
+    CHECK_FALSE(file_list::fresh(*old, 1760000000));
+    CHECK(file_list::fresh(old->fetched, 1760000000)); // only its missing dates make it stale
+    const auto found = file_list::search(box_context(), *old, request("a.mkv"));
+    REQUIRE(found.hits.size() == 1);
+    CHECK(found.hits[0].size == 12);
+    CHECK_FALSE(found.hits[0].modified.has_value());
+
+    List current = sample();
+    CHECK(current.dated);
+    CHECK(file_list::fresh(current, current.fetched + 60));
+    current.dated = false;
+    CHECK_FALSE(file_list::fresh(current, current.fetched + 60));
 }
 
 TEST_CASE("list files are named after their server, safely") {
@@ -109,20 +153,29 @@ TEST_CASE("a list is fresh for 15 minutes") {
 TEST_CASE("listing commands and their output") {
     CHECK(file_list::find_command({"", "learning"}, 4, true) ==
           "find . 'learning' -mindepth 1 -maxdepth 4 \\( -name '.*' -prune \\) -o "
-          "\\( -type d -printf 'd\\t%p\\0' -o -type f -printf 'f\\t%s\\t%p\\0' \\) 2>/dev/null");
+          "\\( -type d -printf 'd\\t%T@\\t%p\\0' -o -type f -printf 'f\\t%s\\t%T@\\t%p\\0' \\) 2>/dev/null");
     CHECK(file_list::find_command({"/srv"}, 2, false).find("-prune") == std::string::npos);
 
     using namespace std::string_literals;
-    const auto found = file_list::parse_find("d\t./movies\0f\t12\t./movies/a b.mkv\0f\t7\tlearning/x\0junk\0"s);
-    CHECK(found == std::vector<Entry>{{"movies", true, std::nullopt},
-                                      {"movies/a b.mkv", false, 12},
-                                      {"learning/x", false, 7}});
+    const auto found = file_list::parse_find("d\t1697354553.1234567000\t./movies\0"
+                                             "f\t12\t1697354554.0000000000\t./movies/a b.mkv\0"
+                                             "f\t7\t0.0000000000\tlearning/x\0"
+                                             "d\tnot-a-time\tlearning/tab\there\0"
+                                             "d\t./no-time-field\0junk\0"s);
+    CHECK(found == std::vector<Entry>{{"movies", true, std::nullopt, 1697354553},
+                                      {"movies/a b.mkv", false, 12, 1697354554},
+                                      {"learning/x", false, 7, std::nullopt},
+                                      {"learning/tab\there", true, std::nullopt, std::nullopt}});
 
-    const auto listed = file_list::parse_lsf("-1;movies/\r\n941563904;movies/a;b.avi\n-1;tv/\n", "/home");
-    CHECK(listed == std::vector<Entry>{{"/home/movies", true, std::nullopt},
-                                       {"/home/movies/a;b.avi", false, 941563904},
-                                       {"/home/tv", true, std::nullopt}});
-    CHECK(file_list::parse_lsf("3;x\n", "")[0].path == "x");
+    const auto listed = file_list::parse_lsf("1697354553;-1;movies/\r\n1697354554;941563904;movies/a;b.avi\n"
+                                             "-62135596800;-1;tv/\nmissing-fields\n5;x;y\n",
+                                             "/home");
+    CHECK(listed == std::vector<Entry>{{"/home/movies", true, std::nullopt, 1697354553},
+                                       {"/home/movies/a;b.avi", false, 941563904, 1697354554},
+                                       {"/home/tv", true, std::nullopt, std::nullopt}});
+    CHECK(file_list::parse_lsf("5;3;x\n", "")[0] == Entry{"x", false, 3, 5});
+    // An rclone without --time-format's "unix" prints its name: the entry stays, undated.
+    CHECK(file_list::parse_lsf("unix;3;x\n", "") == std::vector<Entry>{{"x", false, 3, std::nullopt}});
 }
 
 TEST_CASE("searching a list matches and ranks like a live search") {
@@ -140,8 +193,13 @@ TEST_CASE("searching a list matches and ranks like a live search") {
     const auto sized = file_list::search(ctx, l, request("sahe"));
     REQUIRE(sized.hits.size() == 1);
     CHECK(sized.hits[0].size == 941563904);
+    CHECK(sized.hits[0].modified == 1697354553);
     CHECK(sized.hits[0].name == "Sahe AKA The Precinct 2010.avi");
-    CHECK_FALSE(file_list::search(ctx, l, request("movies", Mode::folder)).hits[0].size.has_value());
+    const auto folder = file_list::search(ctx, l, request("movies", Mode::folder));
+    REQUIRE(folder.hits.size() == 1);
+    CHECK_FALSE(folder.hits[0].size.has_value());
+    CHECK(folder.hits[0].modified == 1700000000); // a folder's own date
+    CHECK_FALSE(file_list::search(ctx, l, request("precinct.srt")).hits[0].modified.has_value());
 }
 
 TEST_CASE("what a list can't answer goes live") {

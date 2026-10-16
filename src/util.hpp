@@ -67,6 +67,21 @@ bool write_file_atomic(const std::filesystem::path& p, std::string_view text);
 // ASCII lower-casing, for case-insensitive keywords.
 [[nodiscard]] std::string to_lower(std::string_view s);
 
+// Unix seconds as find's %T@ or rclone's --time-format unix print them: an optional '-', digits
+// and an optional fraction ("1697354553.1234567000"), which is dropped. nullopt for anything else.
+[[nodiscard]] std::optional<std::int64_t> parse_unix_time(std::string_view text);
+// A listed modification time: one of 0 or less is unknown.
+[[nodiscard]] inline std::optional<std::int64_t> known_time(std::optional<std::int64_t> t) {
+    return t && *t > 0 ? t : std::nullopt;
+}
+// RFC 3339 time ("2023-10-15T11:22:33.123456789+02:00", "...Z") as nanoseconds since 1970 UTC;
+// nullopt outside the years 1678-2261, which 64 bits of nanoseconds cannot hold.
+[[nodiscard]] std::optional<std::int64_t> parse_rfc3339(std::string_view text);
+// The same in whole seconds (the fraction dropped), for any year.
+[[nodiscard]] std::optional<std::int64_t> parse_rfc3339_seconds(std::string_view text);
+// "2023-10-15" in local time; "" when the time cannot be shown.
+[[nodiscard]] std::string local_date(std::int64_t unix_seconds);
+
 #ifdef _WIN32
 [[nodiscard]] std::wstring to_wide(std::string_view utf8);
 [[nodiscard]] std::string to_utf8(std::wstring_view wide);

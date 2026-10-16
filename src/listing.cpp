@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cstdint>
 #include <optional>
+#include <system_error>
 
 #include "match.hpp"
 #include "rclone.hpp"
@@ -32,7 +33,8 @@ std::vector<std::string> build_lsf_argv(const ListRequest& req) {
     const bool path_target = is_path_target(req.target);
     const std::string base = path_target ? parent_of(req.target) : req.root;
 
-    std::vector<std::string> argv{req.rclone_exe, "lsf", remote_spec(req.rclone_remote, base), "--format", "sp"};
+    std::vector<std::string> argv{req.rclone_exe, "lsf", remote_spec(req.rclone_remote, base),
+                                  "--format", "tsp", "--time-format", "unix"};
     if (!req.all_entries) argv.push_back(req.mode == Mode::folder ? "--dirs-only" : "--files-only");
     if (!path_target) {
         argv.insert(argv.end(), {"-R", "--max-depth", std::to_string(req.max_depth)});
@@ -46,6 +48,22 @@ std::vector<std::string> build_lsf_argv(const ListRequest& req) {
         argv.push_back(util::path_to_utf8(*req.rclone_config));
     }
     return argv;
+}
+
+std::optional<LsfLine> parse_lsf_line(std::string_view line) {
+    const auto time_end = line.find(';');
+    const auto size_end = time_end == std::string_view::npos ? time_end : line.find(';', time_end + 1);
+    if (size_end == std::string_view::npos) return std::nullopt;
+    const auto time = util::parse_unix_time(line.substr(0, time_end));
+    const auto digits = line.substr(time_end + 1, size_end - time_end - 1);
+    std::optional<std::uint64_t> size;
+    std::uint64_t n = 0;
+    const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), n);
+    if (ec == std::errc{} && ptr == digits.data() + digits.size()) size = n;
+    // A time that doesn't parse only leaves the date unknown: an rclone without the "unix" format
+    // prints the format's name there, and its paths and sizes are still right.
+    if (!size && digits != "-1") return std::nullopt;
+    return LsfLine{line.substr(size_end + 1), size, util::known_time(time)};
 }
 
 std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req, std::string_view out) {
@@ -66,14 +84,12 @@ std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req, std::string_vi
         if (line.ends_with('\r')) line.remove_suffix(1);
         if (line.empty()) continue;
 
-        // "<size>;<path>": the size comes first, so a ';' inside the path is harmless.
         std::optional<std::uint64_t> size;
-        if (const auto semi = line.find(';'); semi != std::string_view::npos) {
-            const auto digits = line.substr(0, semi);
-            std::uint64_t n = 0;
-            const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), n);
-            if (ec == std::errc{} && ptr == digits.data() + digits.size() && !digits.empty()) size = n;
-            if (digits == "-1" || size) line.remove_prefix(semi + 1);
+        std::optional<std::int64_t> modified;
+        if (const auto fields = parse_lsf_line(line)) {
+            line = fields->path;
+            size = fields->size;
+            modified = fields->modified;
         }
         const bool is_dir = line.ends_with('/');
         if (is_dir) line.remove_suffix(1);
@@ -92,7 +108,7 @@ std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req, std::string_vi
 
         const std::string name = remote_basename(line);
         const bool hit = path_target ? name == want : matches(query, name);
-        if (hit) found.push_back(RemoteEntry{join_remote(base, line), size});
+        if (hit) found.push_back(RemoteEntry{join_remote(base, line), size, modified});
     }
     return found;
 }

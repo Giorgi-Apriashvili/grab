@@ -9,7 +9,9 @@
 #include "secrets.hpp"
 #include "util.hpp"
 
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -178,19 +180,23 @@ SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vect
     result.max_depth = req.depth.value_or(ctx.settings.max_depth);
     result.roots = search_roots(ctx);
 
-    // Rank by path, then reattach sizes.
-    std::unordered_map<std::string, std::optional<std::uint64_t>> sizes;
+    // Rank by path, then reattach sizes and dates.
+    struct Known {
+        std::optional<std::uint64_t> size;
+        std::optional<std::int64_t> modified;
+    };
+    std::unordered_map<std::string, Known> known;
     std::vector<std::string> paths;
     paths.reserve(entries.size());
     for (auto& e : entries) {
-        if (sizes.emplace(e.path, e.size).second) paths.push_back(std::move(e.path));
+        if (known.emplace(e.path, Known{e.size, e.modified}).second) paths.push_back(std::move(e.path));
     }
     rank_matches(paths, make_query(req.target, req.exact));
     result.hits.reserve(paths.size());
     for (auto& p : paths) {
-        const auto size = sizes[p];
+        const auto k = known[p];
         std::string name = remote_basename(p);
-        result.hits.push_back(Hit{std::move(p), std::move(name), size});
+        result.hits.push_back(Hit{std::move(p), std::move(name), k.size, false, k.modified});
     }
     return result;
 }

@@ -4,7 +4,9 @@
 #include <doctest/doctest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <format>
 #include <sstream>
 #include <string>
@@ -21,7 +23,7 @@ TEST_CASE("find command: words become one -iname per word, over several roots") 
     req.skip_hidden = true;
     CHECK(build_find_command(req) ==
           "find '/home/alice' '/srv/my data' -mindepth 1 -maxdepth 4 "
-          "\\( -name '.*' -prune \\) -o -iname '*lioness*' -iname '*s03e08*' -type f -printf '%s\\t%p\\0' "
+          "\\( -name '.*' -prune \\) -o -iname '*lioness*' -iname '*s03e08*' -type f -printf '%s\\t%T@\\t%p\\0' "
           "2>/dev/null");
 }
 
@@ -34,7 +36,7 @@ TEST_CASE("find command: words are glob-escaped and shell-quoted") {
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
           "find '/home/alice' -mindepth 1 -maxdepth 2 -iname '*movie'\\''s*' -iname '*50%\\]*' "
-          "-type f -printf '%s\\t%p\\0' 2>/dev/null");
+          "-type f -printf '%s\\t%T@\\t%p\\0' 2>/dev/null");
 }
 
 TEST_CASE("find command: glob gets -iname, --exact gets -name") {
@@ -45,12 +47,12 @@ TEST_CASE("find command: glob gets -iname, --exact gets -name") {
     req.max_depth = 3;
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
-          "find '/home/alice' -mindepth 1 -maxdepth 3 -iname 'Release*' -type d -print0 2>/dev/null");
+          "find '/home/alice' -mindepth 1 -maxdepth 3 -iname 'Release*' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 
     req.target = "releases";
     req.exact = true;
     CHECK(build_find_command(req) ==
-          "find '/home/alice' -mindepth 1 -maxdepth 3 -name 'releases' -type d -print0 2>/dev/null");
+          "find '/home/alice' -mindepth 1 -maxdepth 3 -name 'releases' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 }
 
 TEST_CASE("looking for a dot-name disables pruning") {
@@ -70,12 +72,16 @@ TEST_CASE("a path target only validates existence and type") {
     req.target = "/home/alice/releases";
     req.roots = {"/ignored"};
     CHECK(build_find_command(req) ==
-          "find '/home/alice/releases' -maxdepth 0 -type d -print0 2>/dev/null");
+          "find '/home/alice/releases' -maxdepth 0 -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 
     req.target = "learning/Course - Intro to Testing - Jane Doe";
     CHECK(build_find_command(req) ==
           "find 'learning/Course - Intro to Testing - Jane Doe' -maxdepth 0 "
-          "-type d -print0 2>/dev/null");
+          "-type d -printf '%T@\\t%p\\0' 2>/dev/null");
+
+    req.mode = Mode::file;
+    req.target = "/srv/a.mkv";
+    CHECK(build_find_command(req) == "find '/srv/a.mkv' -maxdepth 0 -type f -printf '%s\\t%T@\\t%p\\0' 2>/dev/null");
 
     CHECK(is_path_target("/x"));
     CHECK(is_path_target("a/b"));
@@ -90,7 +96,7 @@ TEST_CASE("a blank root searches the login home") {
     req.max_depth = 2;
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
-          "find . 'projects' -mindepth 1 -maxdepth 2 -iname '*releases*' -type d -print0 2>/dev/null");
+          "find . 'projects' -mindepth 1 -maxdepth 2 -iname '*releases*' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 }
 
 TEST_CASE("ssh argv: options, identity, known_hosts, extras, host, command") {
@@ -129,16 +135,39 @@ TEST_CASE("find output is NUL separated, trailing NUL tolerated") {
           V{{"learning/x", {}}, {"y", {}}});
 }
 
-TEST_CASE("sized find output: <size>\\t<path>, from -printf") {
+TEST_CASE("find output from -printf: [<size>\\t]<mtime>\\t<path>") {
     using V = std::vector<RemoteEntry>;
-    const std::string out = std::string("13367823676\t./downloads/tv/Lioness.S03E08.mkv") + '\0' +
-                            "0\t/srv/empty.txt" + '\0' + "not-a-size\t/weird\tname" + '\0';
+    const std::string out = std::string("13367823676\t1697354553.1234567000\t./downloads/tv/Lioness.S03E08.mkv") + '\0' +
+                            "0\t0.0000000000\t/srv/empty.txt" + '\0' + "not-a-size\t/weird\tname" + '\0' +
+                            "5\t/no/time" + '\0';
     CHECK(parse_find_output(out, true) ==
-          V{{"downloads/tv/Lioness.S03E08.mkv", 13367823676ULL},
-            {"/srv/empty.txt", 0ULL},
-            {"not-a-size\t/weird\tname", {}}});
-    // A folder listing is never split on tabs.
-    CHECK(parse_find_output(std::string("12\tdir") + '\0', false) == V{{"12\tdir", {}}});
+          V{{"downloads/tv/Lioness.S03E08.mkv", 13367823676ULL, 1697354553},
+            {"/srv/empty.txt", 0ULL, std::nullopt}, // a time of 0 is unknown
+            {"not-a-size\t/weird\tname", {}},       // fields are taken off only when they parse
+            {"/no/time", 5ULL}});
+    // Folders have a time only; a tab in the name stays.
+    const std::string folders = std::string("1697354553.5\t./tv/dir") + '\0' + "1697000000.0\tname\twith tab" + '\0' +
+                                "x\ty" + '\0';
+    CHECK(parse_find_output(folders, false) ==
+          V{{"tv/dir", {}, 1697354553}, {"name\twith tab", {}, 1697000000}, {"x\ty", {}}});
+}
+
+TEST_CASE("the pick list shows sizes and local dates") {
+    const std::int64_t t = 1697346000; // 2023-10-15 05:00 UTC
+    const auto date = util::local_date(t);
+    REQUIRE(date.size() == 10);
+    CHECK(pick_note(941563904, t) == "  (897.9 MiB, " + date + ")");
+    CHECK(pick_note(std::nullopt, t) == "  (" + date + ")"); // a folder
+    CHECK(pick_note(12, std::nullopt) == "  (12 B)");
+    CHECK(pick_note(std::nullopt, std::nullopt).empty());
+
+    std::istringstream in;
+    std::ostringstream err;
+    const auto r = choose_matches({"/r/b-releases", "/r/a-releases"}, make_query("releases", false), PickOptions{}, in,
+                                  err, [&](const std::string& path) { return pick_note(path == "/r/a-releases" ? 5 : 7, t); });
+    CHECK_FALSE(r.has_value()); // no terminal to ask
+    CHECK(err.str().find("[1] /r/a-releases  (5 B, " + date + ")\n") != std::string::npos);
+    CHECK(err.str().find("[2] /r/b-releases  (7 B, " + date + ")\n") != std::string::npos);
 }
 
 TEST_CASE("ranking: exact name, then prefix, then depth, then case-insensitive path") {

@@ -147,62 +147,6 @@ std::expected<RemoteStat, std::string> parse_stat(std::string_view json_text) {
     return s;
 }
 
-std::optional<std::int64_t> parse_rfc3339(std::string_view t) {
-    auto digits = [&](std::size_t pos, std::size_t n) -> std::optional<int> {
-        if (pos + n > t.size()) return std::nullopt;
-        int v = 0;
-        for (std::size_t i = pos; i < pos + n; ++i) {
-            if (t[i] < '0' || t[i] > '9') return std::nullopt;
-            v = v * 10 + (t[i] - '0');
-        }
-        return v;
-    };
-    // YYYY-MM-DDTHH:MM:SS
-    if (t.size() < 20 || t[4] != '-' || t[7] != '-' || (t[10] != 'T' && t[10] != 't' && t[10] != ' ') ||
-        t[13] != ':' || t[16] != ':') {
-        return std::nullopt;
-    }
-    auto y = digits(0, 4), mo = digits(5, 2), d = digits(8, 2), h = digits(11, 2), mi = digits(14, 2),
-         s = digits(17, 2);
-    if (!y || !mo || !d || !h || !mi || !s || *mo < 1 || *mo > 12 || *d < 1 || *d > 31) return std::nullopt;
-    std::size_t pos = 19;
-    std::int64_t nanos = 0;
-    if (pos < t.size() && t[pos] == '.') {
-        ++pos;
-        int n = 0;
-        while (pos < t.size() && t[pos] >= '0' && t[pos] <= '9') {
-            if (n < 9) {
-                nanos = nanos * 10 + (t[pos] - '0');
-                ++n;
-            }
-            ++pos;
-        }
-        for (; n < 9; ++n) nanos *= 10;
-    }
-    std::int64_t offset_s = 0;
-    if (pos < t.size() && (t[pos] == 'Z' || t[pos] == 'z')) {
-        ++pos;
-    } else if (pos < t.size() && (t[pos] == '+' || t[pos] == '-')) {
-        auto oh = digits(pos + 1, 2), om = digits(pos + 4, 2);
-        if (!oh || !om || pos + 3 >= t.size() || t[pos + 3] != ':') return std::nullopt;
-        offset_s = (*oh * 3600 + *om * 60) * (t[pos] == '-' ? -1 : 1);
-        pos += 6;
-    } else {
-        return std::nullopt;
-    }
-    if (pos != t.size()) return std::nullopt;
-    // Days since 1970-01-01 (civil calendar, H. Hinnant's days_from_civil).
-    const int yy = *y - (*mo <= 2 ? 1 : 0);
-    const int era = (yy >= 0 ? yy : yy - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(yy - era * 400);
-    const unsigned mp = static_cast<unsigned>((*mo + 9) % 12);
-    const unsigned doy = (153 * mp + 2) / 5 + static_cast<unsigned>(*d) - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    const std::int64_t days = static_cast<std::int64_t>(era) * 146097 + static_cast<std::int64_t>(doe) - 719468;
-    const std::int64_t secs = days * 86400 + *h * 3600 + *mi * 60 + *s - offset_s;
-    return secs * 1'000'000'000 + nanos;
-}
-
 bool up_to_date(std::uint64_t local_size, std::int64_t local_mtime, std::uint64_t size,
                 std::optional<std::int64_t> modtime) {
     constexpr std::int64_t slack = 2'000'000'000; // FAT keeps times to 2 s
@@ -218,7 +162,7 @@ bool up_to_date(const fs::path& local, std::uint64_t size, std::string_view modt
     if (ec) return false;
     const auto since_1970 = std::chrono::clock_cast<std::chrono::system_clock>(written).time_since_epoch();
     return up_to_date(local_size, std::chrono::duration_cast<std::chrono::nanoseconds>(since_1970).count(), size,
-                      parse_rfc3339(modtime));
+                      util::parse_rfc3339(modtime));
 }
 
 namespace {
@@ -743,7 +687,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
     if (!error.empty()) return Result{Outcome::failed, error, result.note};
     if (!state.complete()) return Result{Outcome::failed, "the download ended incomplete", result.note};
 
-    if (auto t = parse_rfc3339(state.modtime)) file.set_mtime(*t);
+    if (auto t = util::parse_rfc3339(state.modtime)) file.set_mtime(*t);
     file.close();
     if (fs::file_size(part, ec) != state.size || ec) {
         return Result{Outcome::failed, "the downloaded file has the wrong size", result.note};

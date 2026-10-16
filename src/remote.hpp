@@ -18,11 +18,12 @@
 
 namespace grab {
 
-// One lookup result: a remote path and, when the lookup reports it, its size in bytes
-// (files only; folders have no cheap size).
+// One lookup result: a remote path and, when the lookup reports them, its size in bytes
+// (files only; folders have no cheap size) and modification time.
 struct RemoteEntry {
     std::string path;
     std::optional<std::uint64_t> size;
+    std::optional<std::int64_t> modified{}; // Unix seconds
     bool operator==(const RemoteEntry&) const = default;
 };
 
@@ -41,7 +42,8 @@ struct FindRequest {
 
 // The `find` command run by the remote shell. Name matching happens on the server: one
 // `-iname '*word*'` per word, `-iname` for a glob, `-name` for --exact. Files are printed
-// as "<size>\t<path>\0" (GNU find -printf), folders as "<path>\0".
+// as "<size>\t<mtime>\t<path>\0" (GNU find -printf), folders as "<mtime>\t<path>\0"; <mtime>
+// is %T@, Unix seconds with a fraction.
 [[nodiscard]] std::string build_find_command(const FindRequest& req);
 
 // ssh argv: options first, then user@host, then the remote command as one argument.
@@ -50,8 +52,9 @@ struct FindRequest {
                                                       std::span<const std::string> ssh_options,
                                                       const std::string& remote_command);
 
-// Split NUL-separated find output into entries; `sized` records are "<size>\t<path>". A
-// leading "./" (from a home-relative search) is dropped.
+// Split NUL-separated find output into entries: "[<size>\t]<mtime>\t<path>", the size when
+// `sized` (files). A field is taken off only when it parses; a leading "./" (from a
+// home-relative search) is dropped.
 [[nodiscard]] std::vector<RemoteEntry> parse_find_output(std::string_view out, bool sized);
 
 // Best first: match tier (exact name, then name starting with the first word), then
@@ -69,9 +72,13 @@ struct PickOptions {
     bool interactive = false; // stdin is a terminal, so asking is possible
 };
 
+// The text after a listed match: "  (897.9 MiB, 2023-10-15)", "  (2023-10-15)" for a folder,
+// "" when neither is known. The date is local.
+[[nodiscard]] std::string pick_note(std::optional<std::uint64_t> size, std::optional<std::int64_t> modified);
+
 // Choose what to download from the (unranked) matches: the only one, --first, --all, or ask
 // on `err`/`in` with a numbered list. Enter picks [1]. `describe`, if set, returns extra text
-// shown after each listed path (e.g. its size).
+// shown after each listed path (e.g. its pick_note).
 [[nodiscard]] std::expected<std::vector<std::string>, std::string>
 choose_matches(std::vector<std::string> matches, const Query& query, const PickOptions& pick,
                std::istream& in, std::ostream& err,

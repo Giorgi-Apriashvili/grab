@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <istream>
+#include <optional>
 #include <ostream>
 #include <utility>
 
@@ -20,8 +22,8 @@ bool is_path_target(std::string_view target) {
 std::string build_find_command(const FindRequest& req) {
     const bool folder = req.mode == Mode::folder;
     const char* type = folder ? "d" : "f";
-    // Folder sizes would need du; files report theirs cheaply.
-    const char* print = folder ? "-print0" : "-printf '%s\\t%p\\0'";
+    // Folder sizes would need du; files report theirs cheaply. Both report when they changed.
+    const char* print = folder ? "-printf '%T@\\t%p\\0'" : "-printf '%s\\t%T@\\t%p\\0'";
     std::string cmd = "find";
 
     if (is_path_target(req.target)) {
@@ -99,6 +101,12 @@ std::vector<RemoteEntry> parse_find_output(std::string_view out, bool sized) {
                     e.size = size;
                     item.remove_prefix(tab + 1);
                 }
+            }
+        }
+        if (const auto tab = item.find('\t'); tab != std::string_view::npos) {
+            if (const auto t = util::parse_unix_time(item.substr(0, tab))) {
+                e.modified = util::known_time(t);
+                item.remove_prefix(tab + 1);
             }
         }
         if (item.starts_with("./")) item.remove_prefix(2);
@@ -181,6 +189,15 @@ std::expected<std::vector<std::size_t>, std::string> parse_selection(std::string
     }
     if (picked.empty()) return util::fail("nothing selected");
     return picked;
+}
+
+std::string pick_note(std::optional<std::uint64_t> size, std::optional<std::int64_t> modified) {
+    std::vector<std::string> parts;
+    if (size) parts.push_back(util::format_size(*size));
+    if (modified) {
+        if (auto date = util::local_date(*modified); !date.empty()) parts.push_back(std::move(date));
+    }
+    return parts.empty() ? std::string{} : std::format("  ({})", util::join(parts, ", "));
 }
 
 std::expected<std::vector<std::string>, std::string>

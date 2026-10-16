@@ -265,7 +265,7 @@ std::expected<engine::SearchResult, std::string> search(const engine::Context& c
                          std::chrono::system_clock::now().time_since_epoch()).count();
     const auto file = file_list::path_for(file_list::default_dir(), ctx.settings.name);
     auto list = opts.fresh ? std::nullopt : file_list::load(file);
-    if (list && list->fingerprint == file_list::fingerprint(ctx) && file_list::fresh(list->fetched, now)) {
+    if (list && list->fingerprint == file_list::fingerprint(ctx) && file_list::fresh(*list, now)) {
         if (opts.verbose) {
             std::println(stderr, "grab: searching the file list of {} ({} old, {} entries)", ctx.settings.name,
                          age_text(now - list->fetched), list->entries.size());
@@ -344,9 +344,11 @@ int run(const Options& opts) {
 
     std::vector<std::string> paths;
     std::unordered_map<std::string, std::uint64_t> sizes;
+    std::unordered_map<std::string, const engine::Hit*> hit_at;
     for (const auto& hit : found->hits) {
         paths.push_back(hit.path);
         if (hit.size) sizes.emplace(hit.path, *hit.size);
+        hit_at.emplace(hit.path, &hit);
     }
     PickOptions pick;
     pick.first = opts.first;
@@ -354,10 +356,9 @@ int run(const Options& opts) {
     pick.interactive = interactive;
     auto chosen = choose_matches(std::move(paths), query, pick, std::cin, std::cerr,
                                  [&](const std::string& path) {
-                                     const auto it = sizes.find(path);
-                                     return it == sizes.end()
-                                                ? std::string{}
-                                                : std::format("  ({})", util::format_size(it->second));
+                                     const auto it = hit_at.find(path);
+                                     return it == hit_at.end() ? std::string{}
+                                                               : pick_note(it->second->size, it->second->modified);
                                  });
     if (!chosen) {
         error(chosen.error());

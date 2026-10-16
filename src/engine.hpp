@@ -47,6 +47,7 @@ struct Hit {
     std::string name;                  // last path component
     std::optional<std::uint64_t> size; // files only
     bool dir = false;                  // a folder, where one search returns both kinds (browse)
+    std::optional<std::int64_t> modified{}; // Unix seconds
 };
 
 struct SearchResult {
@@ -73,7 +74,7 @@ run_over_ssh(const Context& ctx, const std::string& command, bool batch_ssh, con
 run_listing(std::span<const std::string> argv, const proc::RunOptions& run = {}, const CommandHook& on_command = {});
 
 // A search's result from the entries found: duplicates dropped, ranked best first
-// (rank_matches), sizes kept.
+// (rank_matches), sizes and dates kept.
 [[nodiscard]] SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vector<RemoteEntry> entries);
 
 // Runs the lookup the context's method calls for. An error means the lookup itself failed
