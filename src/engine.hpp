@@ -46,6 +46,7 @@ struct Hit {
     std::string path;                  // remote path, as given to rclone
     std::string name;                  // last path component
     std::optional<std::uint64_t> size; // files only
+    bool dir = false;                  // a folder, where one search returns both kinds (browse)
 };
 
 struct SearchResult {

@@ -15,6 +15,7 @@
   --bar: #2563eb;
   --bar-bg: #e4e8ef;
   --input: #ffffff;
+  --folder: #d29b1f;
   --row: 32px;
   color-scheme: light;
 }
@@ -36,6 +37,7 @@
     --bar: #4c8dff;
     --bar-bg: #333841;
     --input: #1f2226;
+    --folder: #e3b341;
     color-scheme: dark;
   }
 }
@@ -96,6 +98,9 @@ select:focus, input[type=text]:focus, input[type=search]:focus, input[type=passw
 }
 #query { flex: 1; min-width: 200px; height: 34px; font-size: 14px; }
 .dest input { width: 300px; }
+.dest .label { white-space: nowrap; }
+/* the results' summary: cut short in a narrow window rather than wrapping the bar */
+#summary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 button {
   height: 30px;
@@ -175,6 +180,34 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent); }
 .results:focus #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
 .name, .dir { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .ico { width: 16px; height: 16px; margin-right: 7px; vertical-align: -3px; fill: var(--folder); }
+.row .go { color: inherit; cursor: pointer; }
+.row .go:hover { color: var(--accent); text-decoration: underline; }
+
+/* browse mode: the path bar above the results */
+.browse-bar { flex: none; padding: 0 14px 6px; gap: 6px; }
+.browse-bar button { height: 26px; font-size: 12px; }
+.browse-bar .icon-btn { width: 26px; font-size: 14px; }
+.crumbs { display: flex; align-items: center; gap: 2px; min-width: 0; overflow: hidden; }
+.crumb {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 240px;
+  padding: 0 6px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.crumb:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.crumb.here, .crumb.here:disabled { color: var(--text); font-weight: 600; cursor: default; opacity: 1; }
+.crumb.here:hover { background: none; }
+.crumbs .sep { flex: none; color: var(--muted); }
+.browse-status { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.browse-status .bad { color: var(--danger); }
+.browse-status .below { color: var(--text); }
+.browse-status .link { height: auto; padding: 0 4px; border: 0; background: none; color: var(--accent); cursor: pointer; }
 .size { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
 .dir { color: var(--muted); }
 .empty {

@@ -1,5 +1,6 @@
 #include "app.hpp"
 
+#include "browse.hpp"
 #include "config.hpp"
 #include "engine.hpp"
 #include "folder.hpp"
@@ -189,10 +190,22 @@ void App::on_message(const std::string& text) {
         open_release_page();
     } else if (type == "prefs") {
         if (auto remote = msg->string_of("remote")) state_.last_remote = *remote;
-        if (auto mode = msg->string_of("mode"); mode == "file" || mode == "folder") state_.mode = *mode;
+        if (auto mode = msg->string_of("mode"); mode == "file" || mode == "folder" || mode == "browse") state_.mode = *mode;
         save_state();
     } else if (type == "search") {
         start_search(*msg);
+    } else if (type == "browse") {
+        run_browse(int_of(*msg, "id"), msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""),
+                   bool_of(*msg, "top"), bool_of(*msg, "live"), false);
+    } else if (type == "browseAt") {
+        // Where browse mode is, to reopen there: per server, and which server All servers had open.
+        const std::string server = msg->string_of("server").value_or("");
+        if (msg->string_of("remote") == "*") state_.browse_paths["*"] = server;
+        if (!server.empty()) {
+            if (bool_of(*msg, "top")) state_.browse_paths.erase(server);
+            else state_.browse_paths[server] = msg->string_of("path").value_or("");
+        }
+        save_state();
     } else if (type == "refreshLists") {
         const std::string remote = msg->string_of("remote").value_or("");
         if (remote == "*") {
@@ -361,6 +374,9 @@ void App::send_init() {
     Value dests = Value::make_object();
     for (const auto& [remote, path] : state_.destinations) dests.set(remote, str(path));
     init.set("destinations", std::move(dests));
+    Value browse_paths = Value::make_object();
+    for (const auto& [server, path] : state_.browse_paths) browse_paths.set(server, str(path));
+    init.set("browsePaths", std::move(browse_paths));
     init.set("defaultDest", str(known_folder(FOLDERID_Downloads)));
     init.set("parallel", num(state_.parallel));
     Value limit = limit_message(schedule::local_now());
@@ -377,13 +393,16 @@ void App::start_search(const Value& msg) {
     req.exact = bool_of(msg, "exact");
     req.batch_ssh = true; // no console to answer a prompt: fail fast instead
     if (int depth = int_of(msg, "depth"); depth > 0) req.depth = depth;
-    run_search(int_of(msg, "id"), msg.string_of("remote").value_or(""), req, false);
+    std::optional<std::string> under;
+    if (const Value* u = msg.find("under"); u != nullptr && u->kind == Value::Kind::string) under = u->str;
+    run_search(int_of(msg, "id"), msg.string_of("remote").value_or(""), req, false, under);
 }
 
 // A server's search answers from its saved file list when it has one that fits; a list older
 // than file_list::fresh_for is refreshed in the background, and the search then runs again. A
 // server without a list is searched live (one server) while its list is fetched for next time.
-void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update) {
+void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update,
+                     const std::optional<std::string>& under) {
     // A new search replaces the previous one; stopping kills its ssh/rclone child at once.
     if (search_thread_.joinable()) {
         search_replaced_ = true;
@@ -393,9 +412,9 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
     }
     {
         std::lock_guard lock(lists_mutex_);
-        last_search_ = LastSearch{id, remote, req};
+        last_search_ = LastSearch{id, remote, req, under};
     }
-    search_thread_ = std::jthread([this, id, remote, req, update](std::stop_token stop) {
+    search_thread_ = std::jthread([this, id, remote, req, update, under](std::stop_token stop) {
         const auto t0 = std::chrono::steady_clock::now();
         auto fail = [&](const std::string& message, bool cancelled) {
             if (cancelled && search_replaced_) return; // the next search reports instead
@@ -408,7 +427,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
         };
         if (util::trim(req.target).empty()) return fail("type something to search for", false);
 
-        const bool all = remote == "*";
+        const bool all = remote == "*" && !under;
         std::vector<std::string> servers;
         if (all) {
             auto cfg = load_grab_config(config_path_);
@@ -432,6 +451,14 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             if (!ctx) {
                 if (!all) return fail(ctx.error(), false);
                 status.set("error", str(ctx.error()));
+                lists.push(std::move(status));
+                continue;
+            }
+            if (under) {
+                auto below = search_below(*ctx, server, req, *under, update, run, status);
+                if (stop.stop_requested()) return fail("search cancelled", true);
+                if (!below) return fail(below.error(), false);
+                for (auto& h : *below) hits.push_back(file_list::ServerHit{server, std::move(h)});
                 lists.push(std::move(status));
                 continue;
             }
@@ -477,12 +504,13 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             lists.push(std::move(status));
         }
-        if (all) file_list::rank_across(hits, req);
+        if (all || under) file_list::rank_across(hits, req); // under: folders and files together
 
         v.set("type", str("searchResult"));
         v.set("id", num(id));
         v.set("update", Value::make_bool(update));
-        if (all) {
+        if (under) v.set("under", str(*under));
+        if (all || under) {
             v.set("maxDepth", num(0));
             v.set("roots", Value::make_array());
         }
@@ -494,6 +522,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             hit.set("path", str(h.path));
             hit.set("name", str(h.name));
             hit.set("size", h.size ? num(static_cast<double>(*h.size)) : Value{});
+            if (h.dir) hit.set("dir", Value::make_bool(true));
             out.push(std::move(hit));
         }
         v.set("hits", std::move(out));
@@ -536,6 +565,7 @@ void App::start_refresh(const std::string& server) {
             if (stop.stop_requested()) return;
             if (fetched) {
                 slot.list = std::make_shared<const file_list::List>(std::move(*fetched));
+                slot.index.reset(); // built again from the new list on the next browse
                 slot.error.clear();
             } else {
                 slot.error = fetched.error();
@@ -551,7 +581,196 @@ void App::on_list_refreshed(const std::string& server) {
         std::lock_guard lock(lists_mutex_);
         last = last_search_;
     }
-    if (last.id != 0 && (last.remote == server || last.remote == "*")) run_search(last.id, last.remote, last.req, true);
+    if (last.id != 0 && (last.remote == server || last.remote == "*")) {
+        run_search(last.id, last.remote, last.req, true, last.under);
+    }
+    LastBrowse browsed;
+    {
+        std::lock_guard lock(browse_mutex_);
+        browsed = last_browse_;
+    }
+    if (browsed.id != 0 && browsed.remote == server) {
+        run_browse(browsed.id, browsed.remote, browsed.path, browsed.top, false, true);
+    }
+}
+
+App::ListView App::list_view(const std::string& server, const engine::Context& ctx) {
+    ListView view;
+    {
+        std::lock_guard lock(lists_mutex_);
+        auto& s = list_slot(server);
+        if (!s.list || s.list->fingerprint != file_list::fingerprint(ctx)) return view;
+        view.list = s.list;
+        view.index = s.index;
+    }
+    if (view.index) return view;
+    // Built outside the lock (a few ms for a large list), then kept unless the list changed.
+    view.index = std::make_shared<const browse::Index>(view.list, engine::search_roots(ctx), ctx.settings.max_depth);
+    std::lock_guard lock(lists_mutex_);
+    auto& s = list_slot(server);
+    if (s.list == view.list) s.index = view.index;
+    return view;
+}
+
+std::expected<std::vector<engine::Hit>, std::string> App::search_below(const engine::Context& ctx, const std::string& server,
+                                                                       const engine::SearchRequest& req,
+                                                                       const std::string& under, bool update,
+                                                                       const proc::RunOptions& run, Value& status) {
+    std::vector<engine::Hit> hits;
+    auto add = [&](engine::SearchResult found, bool dir) {
+        for (auto& h : found.hits) {
+            if (!browse::is_below(h.path, under)) continue;
+            h.dir = dir;
+            hits.push_back(std::move(h));
+        }
+    };
+    const auto now = unix_now();
+    const auto view = file_list::can_answer(ctx, req) ? list_view(server, ctx) : ListView{};
+    if (view.index && view.index->folder(under)) {
+        if (!update && !file_list::fresh(view.list->fetched, now)) start_refresh(server);
+        for (const Mode m : {Mode::folder, Mode::file}) {
+            auto r = req;
+            r.mode = m;
+            add(file_list::search(ctx, *view.list, r), m == Mode::folder);
+        }
+        status.set("age", num(static_cast<double>(now - view.list->fetched)));
+        return hits;
+    }
+    // Deeper than the list (or a search lists can't answer): live, the folder the only root.
+    engine::Context below = ctx;
+    below.settings.search_roots = {under};
+    for (const Mode m : {Mode::folder, Mode::file}) {
+        auto r = req;
+        r.mode = m;
+        auto found = engine::search(below, r, run);
+        if (!found) return util::fail(found.error());
+        add(std::move(*found), m == Mode::folder);
+    }
+    status.set("live", Value::make_bool(true));
+    return hits;
+}
+
+namespace {
+
+Value item_value(const browse::Item& it) {
+    Value v = Value::make_object();
+    v.set("name", str(it.name));
+    v.set("path", str(it.path));
+    if (it.dir) v.set("dir", Value::make_bool(true));
+    if (it.size) v.set("size", num(static_cast<double>(*it.size)));
+    if (it.items) v.set("items", num(static_cast<double>(*it.items)));
+    return v;
+}
+
+} // namespace
+
+void App::run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update) {
+    if (browse_thread_.joinable()) {
+        browse_thread_.request_stop();
+        browse_thread_.join();
+    }
+    {
+        std::lock_guard lock(browse_mutex_);
+        last_browse_ = LastBrowse{id, remote, path, top};
+    }
+    browse_thread_ = std::jthread([this, id, remote, path, top, live, update](std::stop_token stop) {
+        const auto t0 = std::chrono::steady_clock::now();
+        Value v = Value::make_object();
+        v.set("type", str("browseResult"));
+        v.set("id", num(id));
+        v.set("remote", str(remote));
+        v.set("top", Value::make_bool(top));
+        v.set("update", Value::make_bool(update));
+        auto send = [&] {
+            v.set("elapsedMs", num(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                           std::chrono::steady_clock::now() - t0)
+                                                           .count())));
+            post(v);
+        };
+        auto ctx = engine::load_context(config_path_, remote);
+        if (!ctx) {
+            v.set("path", str(path));
+            v.set("error", str(ctx.error()));
+            return send();
+        }
+        const auto roots = engine::search_roots(*ctx);
+        const auto now = unix_now();
+        const auto view = list_view(remote, *ctx);
+        if (!update && (!view.list || !file_list::fresh(view.list->fetched, now))) start_refresh(remote);
+        {
+            std::lock_guard lock(lists_mutex_);
+            const auto& s = list_slot(remote);
+            v.set("refreshing", Value::make_bool(s.refreshing));
+            if (!s.error.empty()) v.set("listError", str(s.error));
+        }
+
+        // Several roots make a top of their own; with one, the top is that root's folder.
+        const bool roots_top = top && roots.size() > 1;
+        const std::string folder = top && !roots_top ? roots.front() : path;
+        v.set("path", str(roots_top ? std::string() : folder));
+        std::vector<browse::Item> items;
+        std::string source;
+        std::int64_t listed = now;
+        if (roots_top) {
+            if (view.index) {
+                items = view.index->top();
+                source = "list";
+                listed = view.list->fetched;
+            } else {
+                for (const auto& r : roots) items.push_back(browse::Item{r.empty() ? "~" : r, r, true, {}, {}});
+                source = "roots";
+            }
+        } else {
+            std::optional<LiveFolder> cached;
+            if (!live) {
+                std::lock_guard lock(browse_mutex_);
+                if (const auto it = live_folders_.find({remote, folder}); it != live_folders_.end()) cached = it->second;
+            }
+            auto from_list = !live && view.index ? view.index->folder(folder) : std::nullopt;
+            // A live listing made after the list was fetched is newer; otherwise the list wins,
+            // which also knows the sub-folders' sizes and item counts.
+            if (cached && (!from_list || cached->listed > view.list->fetched)) {
+                items = std::move(cached->items);
+                source = "live";
+                listed = cached->listed;
+            } else if (from_list) {
+                items = std::move(*from_list);
+                source = "list";
+                listed = view.list->fetched;
+            } else {
+                proc::RunOptions run;
+                run.stop = stop;
+                run.detached = true;
+                auto got = browse::list_live(*ctx, folder, run);
+                if (stop.stop_requested()) return; // the next request answers instead
+                if (!got) {
+                    v.set("error", str(got.error()));
+                    return send();
+                }
+                {
+                    std::lock_guard lock(browse_mutex_);
+                    live_folders_[{remote, folder}] = LiveFolder{*got, now};
+                }
+                items = std::move(*got);
+                source = "live";
+            }
+            Value crumbs = Value::make_array();
+            for (const auto& c : browse::crumbs(roots, folder)) {
+                Value cv = Value::make_object();
+                cv.set("name", str(c.name));
+                cv.set("path", str(c.path));
+                crumbs.push(std::move(cv));
+            }
+            v.set("crumbs", std::move(crumbs));
+        }
+        v.set("source", str(source));
+        v.set("age", num(static_cast<double>(now - listed)));
+        v.set("severalRoots", Value::make_bool(roots.size() > 1));
+        Value list = Value::make_array();
+        for (const auto& it : items) list.push(item_value(it));
+        v.set("items", std::move(list));
+        send();
+    });
 }
 
 void App::prune_lists() {

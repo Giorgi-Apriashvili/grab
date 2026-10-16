@@ -1,13 +1,13 @@
 'use strict';
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
-//   to backend:   init, prefs, search, cancelSearch, refreshLists, pickFolder, enqueue, cancelItem,
+//   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, browseAt, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder,
 //                 pauseChild, resumeChild, skipChild,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
-//   from backend: init, searchResult, searchError, folderPicked, queue, error, update, updateChecked, limit,
+//   from backend: init, searchResult, searchError, browseResult, folderPicked, queue, error, update, updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked
 
@@ -37,6 +37,15 @@ const state = {
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing
   lists: [],             // the last search's sources per server: age, live, refreshing, error
   updateLater: false,    // "Later": hidden until grab starts again
+  // Browse mode: the folder shown, and what it holds. `server` '' is All servers' own top (the
+  // servers themselves); `top` a server's top; `under` a search below the folder, while its
+  // results show.
+  browse: {
+    id: 0, server: '', path: '', top: true, crumbs: [], items: [], severalRoots: false,
+    source: '', age: 0, refreshing: false, listError: '', error: '', loading: false,
+    under: null, pendingSelect: null, keepSelection: false,
+  },
+  browsePaths: {},       // server -> its last folder (absent: its top); '*' -> All servers' server
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -116,8 +125,10 @@ function renderMode() {
   for (const b of document.querySelectorAll('#search-form .segmented button')) {
     b.setAttribute('aria-checked', String(b.dataset.mode === state.mode));
   }
-  $('#query').placeholder = state.mode === 'folder' ? 'Search folders by name, e.g. lioness season 3'
-    : 'Search files by name, e.g. lioness s03e08';
+  $('#query').placeholder = state.mode === 'browse' ? 'Filter this folder; Enter searches everything below it'
+    : state.mode === 'folder' ? 'Search folders by name, e.g. lioness season 3'
+      : 'Search files by name, e.g. lioness s03e08';
+  renderBrowseBar();
 }
 
 // ---- banner and search -------------------------------------------------------------------
@@ -140,6 +151,7 @@ function startSearch() {
   if (state.searching) { send({ type: 'cancelSearch' }); return; }
   const query = $('#query').value.trim();
   if (!query) { $('#query').focus(); return; }
+  if (inBrowse()) { searchBelow(query); return; }
   showBanner('');
   state.searchId += 1;
   state.lastQuery = query;
@@ -181,6 +193,8 @@ function renderListStatus() {
 
 function onSearchResult(msg) {
   if (msg.id !== state.searchId) return;
+  if (inBrowse() && typeof msg.under !== 'string') return; // a search of another mode
+  if (typeof msg.under === 'string' && !state.browse.under) return; // the search below was closed
   // An update (the same search after a list refresh) keeps the selection and cursor by path.
   const keyOf = (h) => `${h.remote}|${h.path}`;
   const selectedKeys = msg.update ? new Set([...state.selected].map((i) => keyOf(state.hits[i]))) : null;
@@ -198,10 +212,12 @@ function onSearchResult(msg) {
   state.anchor = state.cursor;
   // Before rendering: an empty result shows "No files matching …" from these.
   const n = msg.hits.length;
-  const noun = `${state.mode === 'folder' ? 'folder' : 'file'}${n === 1 ? '' : 's'}`;
+  const noun = typeof msg.under === 'string' ? `result${n === 1 ? '' : 's'}`
+    : `${state.mode === 'folder' ? 'folder' : 'file'}${n === 1 ? '' : 's'}`;
   const live = state.lists.length && state.lists.every((l) => l.live);
   state.resultNote = live ? `${n} ${noun} in ${(msg.elapsedMs / 1000).toFixed(1)} s` : `${n} ${noun}`;
   state.searchedWhere = state.remote === ALL ? 'every server' : `${msg.roots.join(', ')}, depth ${msg.maxDepth}`;
+  if (typeof msg.under === 'string') renderBrowseBar();
   renderListStatus();
   if (state.searching) setSearching(false);
   if (!msg.update) $('#results').scrollTop = 0;
@@ -233,14 +249,31 @@ function renderRows() {
   const first = Math.max(0, Math.floor(list.scrollTop / ROW) - 10);
   const last = Math.min(n, Math.ceil((list.scrollTop + list.clientHeight) / ROW) + 10);
   let html = '';
+  const browsing = inBrowse();
+  const under = browsing && state.browse.under;
+  $('#dir-head').textContent = !browsing ? (state.remote === ALL ? 'Server · Folder' : 'Folder')
+    : under ? 'Folder' : state.browse.server ? 'Contents' : 'Login';
   for (let i = first; i < last; ++i) {
     const h = state.hits[i];
     const sel = state.selected.has(i);
-    html += `<div class="row${sel ? ' sel' : ''}${i === state.cursor ? ' cursor' : ''}" data-i="${i}">` +
-      `<input type="checkbox" tabindex="-1"${sel ? ' checked' : ''}>` +
-      `<span class="name" title="${esc(h.path)}">${esc(h.name)}</span>` +
+    let third;
+    if (!browsing) {
+      // The hit's folder: a link that opens it in Browse.
+      const parent = parentOf(h.path);
+      third = `${state.remote === ALL ? `<span class="srv">${esc(h.remote)}</span>` : ''}` +
+        `<span class="go" data-go="${i}" title="Open in Browse">${esc(parent || '~')}</span>`;
+    } else if (under) {
+      third = esc(relativeTo(parentOf(h.path), under.path));
+    } else if (h.server) {
+      third = esc(h.info);
+    } else {
+      third = h.items != null ? `${h.items} item${h.items === 1 ? '' : 's'}` : '';
+    }
+    html += `<div class="row${sel ? ' sel' : ''}${i === state.cursor ? ' cursor' : ''}${h.dir ? ' folder' : ''}" data-i="${i}">` +
+      `<input type="checkbox" tabindex="-1"${sel ? ' checked' : ''}${h.server ? ' disabled' : ''}>` +
+      `<span class="name" title="${esc(h.path || h.name)}">${h.dir ? FOLDER_ICON : ''}${esc(h.name)}</span>` +
       `<span class="size">${fmtSize(h.size)}</span>` +
-      `<span class="dir">${state.remote === ALL ? `<span class="srv">${esc(h.remote)}</span>` : ''}${esc(parentOf(h.path))}</span></div>`;
+      `<span class="dir">${third}</span></div>`;
   }
   const rows = $('#rows');
   rows.style.transform = `translateY(${first * ROW}px)`;
@@ -254,6 +287,27 @@ function renderEmpty() {
   if (state.hits.length) { empty.hidden = true; return; }
   empty.hidden = false;
   const r = currentRemote();
+  if (inBrowse()) {
+    const b = state.browse;
+    const filter = $('#query').value.trim();
+    if (state.searching) {
+      empty.innerHTML = `<span><span class="spinner"></span>Searching below ${esc(browseHere())} for “${esc(state.lastQuery)}”…</span>`;
+    } else if (b.under) {
+      empty.textContent = `Nothing below ${browseHere()} matches “${b.under.query}”.`;
+    } else if (b.loading) {
+      empty.innerHTML = `<span><span class="spinner"></span>Opening ${esc(browseHere())}…</span>`;
+    } else if (b.error) {
+      empty.textContent = b.error;
+    } else if (!state.remotes.length) {
+      empty.innerHTML = '<div>No servers yet. Add the Linux server you want to download from.<br>' +
+        '<button type="button" class="primary" data-act="add-server">Add a server</button></div>';
+    } else if (filter) {
+      empty.textContent = `Nothing in ${browseHere()} matches “${filter}”.`;
+    } else {
+      empty.textContent = 'This folder is empty.';
+    }
+    return;
+  }
   if (state.searching) {
     empty.innerHTML = `<span><span class="spinner"></span>Searching ${state.remote === ALL ? 'all servers' : esc(state.remote)} for “${esc(state.lastQuery)}”…</span>`;
   } else if (state.lastQuery && state.resultNote && !state.resultNote.startsWith('Search cancelled')) {
@@ -269,14 +323,15 @@ function renderEmpty() {
 
 function selectedHits() {
   const idx = state.selected.size ? [...state.selected].sort((a, b) => a - b) : (state.cursor >= 0 ? [state.cursor] : []);
-  return idx.map((i) => state.hits[i]);
+  return idx.map((i) => state.hits[i]).filter((h) => h && !h.server); // a server row is not downloadable
 }
 
 function renderSummary() {
   const sel = [...state.selected].map((i) => state.hits[i]);
   const bytes = sel.reduce((sum, h) => sum + (h.size || 0), 0);
+  const unknown = sel.some((h) => h.size == null); // folders deeper than the list: at least this much
   let text = state.resultNote || '';
-  if (sel.length) text += `${text ? ' · ' : ''}${sel.length} selected${bytes ? ` (${fmtSize(bytes)})` : ''}`;
+  if (sel.length) text += `${text ? ' · ' : ''}${sel.length} selected${bytes ? ` (${fmtSize(bytes)}${unknown ? '+' : ''})` : ''}`;
   $('#summary').textContent = text;
   const count = selectedHits().length;
   const btn = $('#download');
@@ -317,13 +372,271 @@ function rowIndex(ev) {
   return row ? Number(row.dataset.i) : -1;
 }
 
+// ---- browse mode: a server's folders -----------------------------------------------------
+
+const FOLDER_ICON = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 3.5C1 2.7 1.7 2 2.5 2h3.6l1.6 1.6h5.8c.8 0 1.5.7 1.5 1.5v7.4c0 .8-.7 1.5-1.5 1.5h-11C1.7 14 1 13.3 1 12.5z"/></svg>';
+
+function inBrowse() { return state.mode === 'browse'; }
+
+// `path` without its `folder` prefix, for search results below a folder ('' for the folder itself).
+function relativeTo(path, folder) {
+  if (path === folder) return '';
+  if (!folder) return path;
+  const base = folder.endsWith('/') ? folder : `${folder}/`;
+  return path.startsWith(base) ? path.slice(base.length) : path;
+}
+
+// The folder's name for messages: "movies", the server at its top, "All servers".
+function browseHere() {
+  const b = state.browse;
+  if (!b.server) return 'All servers';
+  return b.crumbs.length ? b.crumbs[b.crumbs.length - 1].name : b.server;
+}
+
+// The folder's rows: its items, filtered by the words typed (every word, in any order).
+function filteredItems() {
+  const words = $('#query').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return state.browse.items;
+  return state.browse.items.filter((it) => {
+    const name = it.name.toLowerCase();
+    return words.every((w) => name.includes(w));
+  });
+}
+
+// Shows the folder in the results table. `keep`: the selection and cursor stay on the same
+// items (a filter change, a refreshed list); `select`: the item with that path (or server)
+// gets the cursor.
+function showFolder({ keep = false, select = null } = {}) {
+  const keyOf = (h) => (h.server ? `srv:${h.server}` : h.path);
+  const picked = keep ? new Set([...state.selected].map((i) => state.hits[i] && keyOf(state.hits[i]))) : new Set();
+  const cursorKey = keep && state.hits[state.cursor] ? keyOf(state.hits[state.cursor]) : null;
+  state.hits = filteredItems();
+  state.selected = new Set();
+  state.hits.forEach((h, i) => { if (picked.has(keyOf(h))) state.selected.add(i); });
+  let cursor = cursorKey ? state.hits.findIndex((h) => keyOf(h) === cursorKey) : -1;
+  if (select !== null) {
+    const i = state.hits.findIndex((h) => (h.server ? h.server === select : h.path === select));
+    if (i >= 0) {
+      cursor = i;
+      state.selected = new Set([i]);
+    }
+  }
+  state.cursor = cursor >= 0 ? cursor : (state.hits.length ? 0 : -1);
+  state.anchor = state.cursor;
+  const folders = state.hits.filter((h) => h.dir).length;
+  const files = state.hits.length - folders;
+  const count = (n, one) => `${n} ${one}${n === 1 ? '' : 's'}`;
+  state.resultNote = state.browse.server ? `${count(folders, 'folder')}, ${count(files, 'file')}` : '';
+  const list = $('#results');
+  if (state.cursor >= 0 && select !== null) {
+    list.scrollTop = Math.max(0, state.cursor * ROW - list.clientHeight / 2);
+  } else if (!keep) {
+    list.scrollTop = 0;
+  }
+  renderRows();
+}
+
+// Opens a folder: `server` '' is All servers' own top; `top` a server's top. The answer comes
+// as "browseResult"; the old rows stay until then.
+function browseTo(server, path, top, { select = null, live = false, keep = false } = {}) {
+  const b = state.browse;
+  b.inited = true;
+  b.under = null;
+  if (!server) {
+    Object.assign(b, { server: '', path: '', top: true, crumbs: [], error: '', loading: false, source: '' });
+    b.items = state.remotes.map((r) => ({ name: r.name, path: '', dir: true, server: r.name, remote: r.name,
+      info: r.error ? 'misconfigured' : `${r.user}@${r.host}` }));
+    remember();
+    renderBrowseBar();
+    showFolder({ select });
+    return;
+  }
+  b.id += 1;
+  const sameFolder = b.server === server && b.path === path && b.top === top;
+  if (b.server !== server || top) b.crumbs = []; // the bar shows the new place's path when it opens
+  Object.assign(b, { server, path, top, loading: true, error: '', pendingSelect: select, keepSelection: keep || (live && sameFolder) });
+  renderBrowseBar();
+  renderEmpty();
+  send({ type: 'browse', id: b.id, remote: server, path, top, live });
+}
+
+// Where browse is, kept for the next time (also across restarts).
+function remember() {
+  const b = state.browse;
+  if (state.remote === ALL) state.browsePaths[ALL] = b.server;
+  if (b.server) {
+    if (b.top) delete state.browsePaths[b.server];
+    else state.browsePaths[b.server] = b.path;
+  }
+  send({ type: 'browseAt', remote: state.remote, server: b.server, path: b.path, top: b.top });
+}
+
+// Browse mode starts where it last was for the server picked (All servers: in the server it had
+// open, else its list of servers).
+function enterBrowse() {
+  const all = state.remote === ALL;
+  const server = all ? (state.browsePaths[ALL] || '') : state.remote;
+  if (!server || !state.remotes.some((r) => r.name === server)) { browseTo('', '', true); return; }
+  const path = state.browsePaths[server];
+  browseTo(server, path === undefined ? '' : path, path === undefined);
+}
+
+function onBrowseResult(msg) {
+  const b = state.browse;
+  if (msg.id !== b.id || msg.remote !== b.server) return; // an older request
+  const wasLoading = b.loading;
+  Object.assign(b, {
+    loading: false, error: msg.error || '', path: msg.path, top: msg.top, crumbs: msg.crumbs || [],
+    source: msg.source || '', age: msg.age || 0, refreshing: !!msg.refreshing, listError: msg.listError || '',
+    severalRoots: !!msg.severalRoots,
+  });
+  b.items = (msg.items || []).map((it) => ({ ...it, remote: msg.remote }));
+  if (!b.under) {
+    showFolder({ keep: msg.update || b.keepSelection, select: b.pendingSelect });
+    if (!msg.error && wasLoading) remember();
+  }
+  b.pendingSelect = null;
+  b.keepSelection = false;
+  renderBrowseBar();
+}
+
+function openRow(h) {
+  if (h.server) browseTo(h.server, '', true);
+  else if (h.dir) browseTo(state.browse.server || h.remote, h.path, false);
+}
+
+function browseUp() {
+  const b = state.browse;
+  if (b.under) { closeBelow(); return; }
+  if (!b.server) return;
+  if (b.top) {
+    if (state.remote === ALL) browseTo('', '', true, { select: b.server });
+    return;
+  }
+  const c = b.crumbs;
+  if (c.length >= 2) browseTo(b.server, c[c.length - 2].path, false, { select: b.path });
+  else browseTo(b.server, '', true, { select: b.path });
+}
+
+// A search hit's folder, from the Files or Folders results: Browse opens it with the hit picked.
+function openHitFolder(h) {
+  const server = h.remote || state.remote;
+  switchMode('browse', false);
+  if (state.remote === ALL) state.browsePaths[ALL] = server;
+  browseTo(server, parentOf(h.path), false, { select: h.path });
+}
+
+// Enter while browsing: everything below the folder, folders and files, from the server's list
+// (or live, for a folder deeper than the list).
+function searchBelow(query) {
+  const b = state.browse;
+  if (!b.server || (b.top && b.severalRoots)) {
+    showBanner('Open a server’s folder first; Enter then searches everything below it.');
+    return;
+  }
+  showBanner('');
+  b.under = { query, path: b.path };
+  state.searchId += 1;
+  state.lastQuery = query;
+  state.searchStarted = performance.now();
+  state.hits = [];
+  state.selected.clear();
+  state.cursor = state.anchor = -1;
+  state.lists = [];
+  renderListStatus();
+  renderBrowseBar();
+  setSearching(true);
+  renderRows();
+  send({ type: 'search', id: state.searchId, remote: b.server, query, mode: 'any', exact: $('#exact').checked, under: b.path });
+}
+
+// Back from search results to the folder.
+function closeBelow() {
+  const b = state.browse;
+  if (!b.under) return;
+  if (state.searching) {
+    send({ type: 'cancelSearch' });
+    setSearching(false);
+  }
+  state.searchId += 1;
+  b.under = null;
+  state.lists = [];
+  renderListStatus();
+  $('#query').value = '';
+  showFolder();
+  renderBrowseBar();
+}
+
+function renderBrowseBar() {
+  const bar = $('#browse-bar');
+  bar.hidden = !inBrowse();
+  if (bar.hidden) return;
+  const b = state.browse;
+  // The path: [All servers ›] server › folder › folder; every step but the last opens.
+  const steps = [];
+  if (state.remote === ALL) steps.push({ name: 'All servers', server: '' });
+  if (b.server) {
+    steps.push({ name: b.server, server: b.server, top: true });
+    for (const c of b.crumbs) steps.push({ name: c.name, server: b.server, path: c.path });
+  }
+  b.steps = steps;
+  $('#crumbs').innerHTML = steps.map((s, i) => (i === steps.length - 1
+    ? `<button type="button" class="crumb here" disabled title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`
+    : `<button type="button" class="crumb" data-step="${i}" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`))
+    .join('<span class="sep">›</span>');
+  $('#browse-up').disabled = !b.under && (!b.server || (b.top && state.remote !== ALL));
+  $('#browse-refresh').hidden = !b.server || !!b.under;
+  $('#browse-refresh').disabled = b.loading;
+  const status = $('#browse-status');
+  if (b.under) {
+    status.innerHTML = `<span class="below">Results for “${esc(b.under.query)}” below ${esc(browseHere())}</span>` +
+      '<button type="button" class="link" data-act="close-below" title="Back to the folder (Esc)">✕</button>';
+  } else if (b.loading) {
+    status.innerHTML = '<span class="spinner"></span>opening…';
+  } else if (!b.server) {
+    status.textContent = '';
+  } else {
+    const parts = [];
+    if (b.source === 'list') parts.push(`from the file list, ${fmtAge(b.age)} old`);
+    else if (b.source === 'live') parts.push(b.age < 5 ? 'listed from the server' : `listed from the server ${fmtAge(b.age)} ago`);
+    if (b.refreshing) parts.push('refreshing the list');
+    status.innerHTML = (b.refreshing ? '<span class="spinner"></span>' : '') + esc(parts.join(' · ')) +
+      (b.listError ? ` · <span class="bad" title="${esc(b.listError)}">list refresh failed</span>` : '');
+  }
+}
+
+$('#crumbs').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-step]');
+  if (!btn) return;
+  const s = state.browse.steps[Number(btn.dataset.step)];
+  if (!s.server) browseTo('', '', true, { select: state.browse.server });
+  else if (s.top) browseTo(s.server, '', true);
+  else browseTo(s.server, s.path, false);
+});
+$('#browse-up').addEventListener('click', browseUp);
+$('#browse-refresh').addEventListener('click', () => {
+  const b = state.browse;
+  if (b.server) browseTo(b.server, b.path, b.top, { live: true });
+});
+$('#browse-status').addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-act=close-below]')) closeBelow();
+});
+$('#query').addEventListener('input', () => {
+  if (inBrowse() && !state.browse.under) showFolder({ keep: true });
+});
+$('#query').addEventListener('keydown', (ev) => {
+  if (!inBrowse() || ev.key !== 'Escape') return;
+  if (state.browse.under) { ev.preventDefault(); closeBelow(); }
+  else if ($('#query').value) { ev.preventDefault(); $('#query').value = ''; showFolder({ keep: true }); }
+});
+
 // ---- downloads ---------------------------------------------------------------------------
 
 function download(hits) {
   if (!hits.length) return;
   const dest = $('#dest').value.trim();
   if (!/^[a-zA-Z]:[\\/]|^\\\\[^\\]/.test(dest)) {
-    showBanner(dest ? `“${dest}” is not a full folder path. Use something like C:\\Users\\you\\Downloads, or pick one with Browse.`
+    showBanner(dest ? `“${dest}” is not a full folder path. Use something like C:\\Users\\you\\Downloads, or pick one with Choose.`
                     : 'Choose a folder to save to.');
     $('#dest').focus();
     return;
@@ -342,8 +655,11 @@ function download(hits) {
     const target = `${dest.toLowerCase()}|${h.name.toLowerCase()}`;
     if (targets.has(target)) { clashes.push(h.name); continue; }
     targets.add(target);
-    if (!groups.has(h.remote)) groups.set(h.remote, []);
-    groups.get(h.remote).push({ path: h.path, name: h.name, size: h.size });
+    // Browse mixes folders and files: each goes as its own kind of download.
+    const mode = inBrowse() ? (h.dir ? 'folder' : 'file') : state.mode;
+    const key = `${h.remote}|${mode}`;
+    if (!groups.has(key)) groups.set(key, { remote: h.remote, mode, items: [] });
+    groups.get(key).items.push({ path: h.path, name: h.name, size: h.size });
   }
   if (clashes.length) {
     showBanner(`Not downloaded again into the same folder: ${clashes.join(', ')}. ` +
@@ -351,7 +667,7 @@ function download(hits) {
   }
   if (!groups.size) return;
   state.destinations[state.remote] = dest;
-  for (const [remote, items] of groups) send({ type: 'enqueue', remote, mode: state.mode, dest, items });
+  for (const { remote, mode, items } of groups.values()) send({ type: 'enqueue', remote, mode, dest, items });
   if (state.remote === ALL) send({ type: 'prefs', remote: ALL }); // stay on All servers next time
 }
 
@@ -656,12 +972,17 @@ function onInit(msg) {
   state.mode = msg.mode;
   state.defaultDest = msg.defaultDest;
   if (msg.parallel) state.parallel = msg.parallel;
+  if (msg.browsePaths) state.browsePaths = { ...msg.browsePaths, ...state.browsePaths };
   if (msg.limit) onLimit(msg.limit);
   $('#version').textContent = `v${msg.version}`;
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
   if (typeof msg.verifyDownloads === 'boolean') $('#verify-on').checked = msg.verifyDownloads;
   renderRemotes();
   renderMode();
+  // Sent again after a server change: browse goes on where it is, if that server still exists.
+  if (inBrowse() && (!state.browse.inited || (state.browse.server && !state.remotes.some((r) => r.name === state.browse.server)))) {
+    enterBrowse();
+  }
   renderRows();
   if (msg.configError) {
     showBanner(`${msg.configError}\n\nConfig file: ${msg.configPath}`);
@@ -1169,6 +1490,7 @@ if (webview) {
       case 'init': onInit(msg); break;
       case 'searchResult': onSearchResult(msg); break;
       case 'searchError': onSearchError(msg); break;
+      case 'browseResult': onBrowseResult(msg); break;
       case 'folderPicked': $('#dest').value = msg.path; state.destinations[state.remote] = msg.path; break;
       case 'queue':
         state.queue = msg.items;
@@ -1213,12 +1535,17 @@ $('#remote').addEventListener('change', (ev) => {
   renderListStatus();
   showBanner('');
   renderRemoteInfo();
+  if (inBrowse()) {
+    $('#query').value = '';
+    enterBrowse();
+  }
   renderRows();
   send({ type: 'prefs', remote: state.remote });
 });
 
 // Files and Folders are separate searches: switching starts clean and waits for new words.
-function switchMode(mode) {
+// `enter`: browse opens its remembered folder (not when a search hit's folder opens instead).
+function switchMode(mode, enter = true) {
   if (state.mode === mode) return;
   if (state.searching) {
     send({ type: 'cancelSearch' });
@@ -1232,10 +1559,14 @@ function switchMode(mode) {
   state.lastQuery = '';
   state.resultNote = '';
   state.searchedWhere = '';
+  state.lists = [];
+  state.browse.under = null;
+  renderListStatus();
   $('#query').value = '';
   $('#results').scrollTop = 0;
   showBanner('');
   renderMode();
+  if (mode === 'browse' && enter) enterBrowse();
   renderRows();
   send({ type: 'prefs', mode });
   $('#query').focus();
@@ -1252,22 +1583,37 @@ $('#rows').addEventListener('mousedown', (ev) => {
   const i = rowIndex(ev);
   if (i < 0) return;
   ev.preventDefault();
+  const go = ev.target.closest('[data-go]');
+  if (go && ev.button === 0) { openHitFolder(state.hits[Number(go.dataset.go)]); return; }
   $('#results').focus();
   const onBox = ev.target.matches('input[type=checkbox]');
   setCursor(i, { extend: ev.shiftKey, toggle: onBox || ev.ctrlKey });
 });
 $('#rows').addEventListener('dblclick', (ev) => {
   const i = rowIndex(ev);
-  if (i >= 0) download([state.hits[i]]);
+  if (i < 0 || ev.target.closest('[data-go]')) return;
+  const h = state.hits[i];
+  if (inBrowse() && (h.dir || h.server)) openRow(h);
+  else download([h]);
 });
 
 $('#select-all').addEventListener('change', (ev) => {
   state.selected.clear();
-  if (ev.target.checked) state.hits.forEach((_, i) => state.selected.add(i));
+  if (ev.target.checked) state.hits.forEach((h, i) => { if (!h.server) state.selected.add(i); });
   renderRows();
 });
 
 $('#results').addEventListener('keydown', (ev) => {
+  if (inBrowse() && (ev.key === 'Backspace' || (ev.key === 'ArrowUp' && ev.altKey))) {
+    ev.preventDefault();
+    browseUp();
+    return;
+  }
+  if (inBrowse() && ev.key === 'Escape' && state.browse.under) {
+    ev.preventDefault();
+    closeBelow();
+    return;
+  }
   const page = Math.max(1, Math.floor($('#results').clientHeight / ROW) - 1);
   const move = { ArrowDown: 1, ArrowUp: -1, PageDown: page, PageUp: -page }[ev.key];
   if (move !== undefined) {
@@ -1285,12 +1631,15 @@ $('#results').addEventListener('keydown', (ev) => {
     renderRows();
   } else if (ev.key === 'Enter') {
     ev.preventDefault();
-    download(selectedHits());
+    // Browse: Enter opens the folder under the cursor, unless several rows are picked.
+    const h = state.hits[state.cursor];
+    if (inBrowse() && h && (h.dir || h.server) && state.selected.size <= 1) openRow(h);
+    else download(selectedHits());
   }
 });
 
 $('#download').addEventListener('click', () => download(selectedHits()));
-$('#browse').addEventListener('click', () => send({ type: 'pickFolder', current: $('#dest').value.trim() }));
+$('#choose-dest').addEventListener('click', () => send({ type: 'pickFolder', current: $('#dest').value.trim() }));
 $('#dest').addEventListener('change', (ev) => { state.destinations[state.remote] = ev.target.value.trim(); });
 $('#clear-finished').addEventListener('click', () => send({ type: 'clearFinished' }));
 $('#pause-all').addEventListener('click', (ev) => send({ type: ev.currentTarget.dataset.act || 'pauseAll' }));

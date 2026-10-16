@@ -1,5 +1,6 @@
 #pragma once
 
+#include "browse.hpp"
 #include "cli.hpp"
 #include "fetch.hpp"
 #include "file_list.hpp"
@@ -144,17 +145,47 @@ private:
     void send_init();
     void start_search(const json::Value& msg);
     // A search of one server, or of all ("*"). `update`: the same search again after a file list
-    // was refreshed; it never starts another refresh.
-    void run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update);
+    // was refreshed; it never starts another refresh. `under`: browse mode's search below a
+    // folder, of one server, for folders and files at once.
+    void run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update,
+                    const std::optional<std::string>& under);
+    // Folders and files below `under`: from the server's list when it holds that folder, else
+    // live with the folder as the only root. Notes where the answer came from in `status`.
+    [[nodiscard]] std::expected<std::vector<engine::Hit>, std::string> search_below(
+        const engine::Context& ctx, const std::string& server, const engine::SearchRequest& req,
+        const std::string& under, bool update, const proc::RunOptions& run, json::Value& status);
+
+    // Browse mode: a folder of one server, from its file list when the list holds the folder's
+    // contents, else listed live (kept for the session per server and folder). One request at a
+    // time on browse_thread_; a new one stops the last. `top`: the server's top; `live`: list it
+    // live now (Refresh); `update`: the same folder again after its list was refreshed.
+    void run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update);
+    struct LastBrowse {
+        int id = 0;
+        std::string remote;
+        std::string path;
+        bool top = false;
+    };
+    struct LiveFolder {
+        std::vector<browse::Item> items;
+        std::int64_t listed = 0; // Unix seconds
+    };
 
     // Saved file lists (file_list.hpp), one per server, all under lists_mutex_.
     struct ListSlot {
         bool loaded = false; // read from disk once
         std::shared_ptr<const file_list::List> list;
+        std::shared_ptr<const browse::Index> index; // the list's folders, built on the first browse
         bool refreshing = false;
         std::string error; // why the last refresh failed
     };
     ListSlot& list_slot(const std::string& server); // caller holds lists_mutex_
+    // The server's list, if it fits `ctx`, with its browse index; any thread.
+    struct ListView {
+        std::shared_ptr<const file_list::List> list;
+        std::shared_ptr<const browse::Index> index;
+    };
+    [[nodiscard]] ListView list_view(const std::string& server, const engine::Context& ctx);
     void start_refresh(const std::string& server);   // fetches a new list in the background; any thread
     void on_list_refreshed(const std::string& server); // UI thread: shows the last search again
     void prune_lists();                                // drops lists of servers no longer configured
@@ -248,6 +279,7 @@ private:
         int id = 0;
         std::string remote;
         engine::SearchRequest req;
+        std::optional<std::string> under;
     };
     std::filesystem::path lists_dir_;
     std::mutex lists_mutex_; // guards lists_, refresh_threads_, last_search_
@@ -257,6 +289,10 @@ private:
     // After the lists: the search thread uses them and starts refreshes, so it ends first.
     std::jthread search_thread_;
     std::atomic<bool> search_replaced_{false}; // a stopped search is being replaced: no "cancelled"
+    std::mutex browse_mutex_; // guards last_browse_ and live_folders_
+    LastBrowse last_browse_;
+    std::map<std::pair<std::string, std::string>, LiveFolder> live_folders_; // (server, folder)
+    std::jthread browse_thread_; // after the lists, which it uses
 
     UpdateBanner update_;
     bool update_checks_started_ = false;

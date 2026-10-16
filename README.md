@@ -139,6 +139,18 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
 - **All servers** (at the top of the server picker) searches every server's list at once.
   Results show their server, and Download sends each pick to its own server, into the same
   Save-to folder. Two picks with the same name aren't downloaded into one folder.
+- **Browse** (next to Files and Folders) clicks through a server's folders instead of searching:
+  `Box.Guest › movies › georgian.movies`, with ↑ (Backspace) to go up.
+  - Folders open instantly from the server's file list, with their item count, and their size
+    when the list holds everything inside them. Folders deeper than the list (past
+    `max_depth`) are listed from the server (`rclone lsjson`, about 2 s on a Storage Box) and
+    remembered while the window is open; Refresh lists the current folder again.
+  - Typing filters the folder; Enter searches everything below it, folders and files together,
+    and Esc goes back.
+  - Download takes any mix of folders and files. "Choose…" picks the Save-to folder.
+  - All servers starts with one folder per server. Each server reopens where you left it, also
+    after a restart. A search result's folder (the Folder column) opens it in Browse with the
+    result picked.
 
 - **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4. Each
   one can be paused, resumed or cancelled, or all together with Pause all / Resume all and
@@ -527,6 +539,7 @@ src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
 src/verify.*    checking downloads against the server's checksum (rclone check)
+src/browse.*    browse mode: a server's folders from its file list, deeper ones live
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)

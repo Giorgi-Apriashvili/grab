@@ -32,8 +32,11 @@ inline constexpr double max_limit_mibps = schedule::max_mibps;
 struct GuiState {
     std::optional<WindowPlacement> window;
     std::string last_remote;
-    std::string mode = "file"; // "file" | "folder"
+    std::string mode = "file"; // "file" | "folder" | "browse"
     std::map<std::string, std::string> destinations; // remote -> last destination folder
+    // Browse mode: server -> the folder last open (absent: its top); "*" -> the server All servers
+    // had open ("" for the servers themselves).
+    std::map<std::string, std::string> browse_paths;
     int parallel = 4;                                // downloads at once, min_parallel..max_parallel
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
     bool verify_downloads = false;                   // check each download against the server's checksum

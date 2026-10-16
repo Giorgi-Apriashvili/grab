@@ -13,7 +13,8 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     GuiState s;
     s.window = WindowPlacement{-8, 20, 1280, 800, true};
     s.last_remote = "hetzner";
-    s.mode = "folder";
+    s.mode = "browse";
+    s.browse_paths = {{"Box.Guest", "movies/georgian.movies"}, {"*", "Main"}};
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
     s.server_limits = {{"arch_guest", 7}};
