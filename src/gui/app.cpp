@@ -221,7 +221,8 @@ void App::on_message(const std::string& text) {
     } else if (type == "pickFolder") {
         // Not from inside WebView2's event handler: the dialog runs its own message loop.
         std::wstring current = util::to_wide(msg->string_of("current").value_or(""));
-        host_.defer([this, current = std::move(current)] { pick_folder(current); });
+        std::string purpose = msg->string_of("purpose").value_or("dest");
+        host_.defer([this, current = std::move(current), purpose = std::move(purpose)] { pick_folder(current, purpose); });
     } else if (type == "enqueue") {
         enqueue(*msg);
     } else if (type == "cancelItem") {
@@ -791,7 +792,7 @@ void App::prune_lists() {
     });
 }
 
-void App::pick_folder(std::wstring current) {
+void App::pick_folder(std::wstring current, std::string purpose) {
     ComPtr<IFileOpenDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&dialog)))) {
@@ -800,7 +801,7 @@ void App::pick_folder(std::wstring current) {
     DWORD options = 0;
     dialog->GetOptions(&options);
     dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    dialog->SetTitle(L"Save downloads to");
+    dialog->SetTitle(purpose == "downloadTo" ? L"Download to" : L"Save downloads to");
     // Start in the current folder, or its nearest existing parent.
     std::filesystem::path start(current);
     std::error_code ec;
@@ -821,6 +822,7 @@ void App::pick_folder(std::wstring current) {
         Value v = Value::make_object();
         v.set("type", str("folderPicked"));
         v.set("path", str(util::to_utf8(path)));
+        v.set("purpose", str(purpose));
         post(v);
     }
     CoTaskMemFree(path);

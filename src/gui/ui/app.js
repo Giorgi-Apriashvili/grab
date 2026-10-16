@@ -711,6 +711,23 @@ document.addEventListener('wheel', () => closeMenu(), { passive: true });
 window.addEventListener('blur', () => closeMenu());
 window.addEventListener('resize', () => closeMenu());
 
+// Download to...: the folder picker first (from the Save-to folder); Save to itself stays.
+let downloadToPicks = null;
+function downloadTo(picks) {
+  downloadToPicks = picks;
+  send({ type: 'pickFolder', current: $('#dest').value.trim(), purpose: 'downloadTo' });
+}
+
+function onFolderPicked(msg) {
+  if (msg.purpose === 'downloadTo') {
+    if (downloadToPicks) download(downloadToPicks, msg.path);
+    downloadToPicks = null;
+    return;
+  }
+  $('#dest').value = msg.path;
+  state.destinations[state.remote] = msg.path;
+}
+
 function copyText(lines) {
   send({ type: 'copyText', text: lines.join('\n') });
 }
@@ -733,6 +750,7 @@ function resultMenu() {
   if (opens) items.push({ label: 'Open', key: 'Enter', act: () => openRow(one) });
   items.push({ label: picks.length > 1 ? `Download ${picks.length}` : 'Download', key: opens ? '' : 'Enter',
     act: () => download(picks) });
+  items.push({ label: 'Download to…', act: () => downloadTo(picks) });
   // In a Browse folder the row is already where it lives.
   if (one && (!inBrowse() || state.browse.under)) items.push({ label: 'Show in Browse', act: () => openHitFolder(one) });
   items.push('-');
@@ -806,9 +824,10 @@ $('#queue').addEventListener('contextmenu', (ev) => {
 
 // ---- downloads ---------------------------------------------------------------------------
 
-function download(hits) {
+// To the Save-to folder, or with `to` (Download to...) to that folder this once.
+function download(hits, to = null) {
   if (!hits.length) return;
-  const dest = $('#dest').value.trim();
+  const dest = to || $('#dest').value.trim();
   if (!/^[a-zA-Z]:[\\/]|^\\\\[^\\]/.test(dest)) {
     showBanner(dest ? `“${dest}” is not a full folder path. Use something like C:\\Users\\you\\Downloads, or pick one with Choose.`
                     : 'Choose a folder to save to.');
@@ -840,7 +859,7 @@ function download(hits) {
       'A download to that name is already in the queue; pick another folder for the other copy.');
   }
   if (!groups.size) return;
-  state.destinations[state.remote] = dest;
+  if (!to) state.destinations[state.remote] = dest;
   for (const { remote, mode, items } of groups.values()) send({ type: 'enqueue', remote, mode, dest, items });
   if (state.remote === ALL) send({ type: 'prefs', remote: ALL }); // stay on All servers next time
 }
@@ -1665,7 +1684,7 @@ if (webview) {
       case 'searchResult': onSearchResult(msg); break;
       case 'searchError': onSearchError(msg); break;
       case 'browseResult': onBrowseResult(msg); break;
-      case 'folderPicked': $('#dest').value = msg.path; state.destinations[state.remote] = msg.path; break;
+      case 'folderPicked': onFolderPicked(msg); break;
       case 'queue':
         state.queue = msg.items;
         if (msg.parallel) state.parallel = msg.parallel;

@@ -153,8 +153,9 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
     result picked.
 
 - **Right-click menus:**
-  - **On a result or Browse row:** Open (folders), Download, Show in Browse, Copy path (the
-    server path) and Copy name. With several rows selected, they act on all of them.
+  - **On a result or Browse row:** Open (folders), Download, Download to… (pick a folder for
+    this download only; Save to stays), Show in Browse, Copy path (the server path) and Copy
+    name. With several rows selected, they act on all of them.
   - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move to top, Show in folder and
     Copy path (where it lands on this PC). A file inside a folder download has Pause, Resume,
     Skip and Copy path.

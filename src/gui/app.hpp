@@ -212,7 +212,9 @@ private:
     void update_limit(); // applies what holds now and tells the page about any change
     void set_rate(std::uint64_t bytes_per_s);
     [[nodiscard]] json::Value limit_message(const schedule::Now& now) const;
-    void pick_folder(std::wstring current);
+    // The folder picker. Its answer ("folderPicked") carries `purpose` back: "dest" for Save to,
+    // "downloadTo" for the menu's Download to....
+    void pick_folder(std::wstring current, std::string purpose);
     void pick_file(std::wstring current);
     void open_item_folder(int id);
     void copy_text(const std::string& text) const; // to the Windows clipboard, lines ending in CR LF
