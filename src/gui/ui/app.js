@@ -1587,14 +1587,16 @@ $('#rows').addEventListener('mousedown', (ev) => {
   if (go && ev.button === 0) { openHitFolder(state.hits[Number(go.dataset.go)]); return; }
   $('#results').focus();
   const onBox = ev.target.matches('input[type=checkbox]');
+  // A double-click: every press draws the rows anew, so the browser's own dblclick event never
+  // reaches a row; the second press's click count says it instead. A folder opens (Browse), a
+  // file downloads.
+  if (ev.detail === 2 && ev.button === 0 && !onBox && !ev.shiftKey && !ev.ctrlKey) {
+    const h = state.hits[i];
+    if (inBrowse() && (h.dir || h.server)) openRow(h);
+    else download([h]);
+    return;
+  }
   setCursor(i, { extend: ev.shiftKey, toggle: onBox || ev.ctrlKey });
-});
-$('#rows').addEventListener('dblclick', (ev) => {
-  const i = rowIndex(ev);
-  if (i < 0 || ev.target.closest('[data-go]')) return;
-  const h = state.hits[i];
-  if (inBrowse() && (h.dir || h.server)) openRow(h);
-  else download([h]);
 });
 
 $('#select-all').addEventListener('change', (ev) => {
