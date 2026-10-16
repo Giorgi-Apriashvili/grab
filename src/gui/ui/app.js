@@ -648,7 +648,15 @@ let menuReturn = null; // where the focus goes back to
 
 // items: { label, act, key, disabled, checked } entries, '-' for a separator, { heading }.
 // `checked` true or false makes an entry one of a group (a check mark on the current one).
-function showMenu(x, y, items) {
+function showMenu(x, y, entries) {
+  // Separators only between entries: none first, last or twice in a row (a finished download has
+  // no actions before "Show in folder", say).
+  const items = [];
+  for (const it of entries) {
+    if (it === '-' && (!items.length || items[items.length - 1] === '-')) continue;
+    items.push(it);
+  }
+  while (items[items.length - 1] === '-') items.pop();
   const menu = $('#menu');
   menuItems = items;
   menuReturn = document.activeElement;
