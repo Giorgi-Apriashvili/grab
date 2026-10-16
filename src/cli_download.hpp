@@ -7,10 +7,12 @@
 
 #include "cli.hpp"
 #include "engine.hpp"
+#include "schedule.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,6 +27,11 @@ struct DownloadTally {
     bool stopped = false;            // Ctrl+C
     int code = 0;                    // the first failure's exit code, 0 if none
 };
+
+// "speed limited to 5 MiB/s until 24:00 by the speed schedule (...)" when the speed schedule set
+// in grab's window limits the speed now.
+[[nodiscard]] std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules,
+                                                       const schedule::Now& now);
 
 // Downloads `paths` (picked search hits, files or folders by opts.mode) into `dest`. `sizes` are
 // the hits' sizes, for --dry-run.

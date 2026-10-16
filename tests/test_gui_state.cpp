@@ -19,6 +19,8 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.server_limits = {{"arch_guest", 7}};
     s.limit_on = true;
     s.limit_mibps = 2.5;
+    s.speed_schedule = {{0x1F, 18 * 60, 0, 5}, {0x60, 22 * 60, 6 * 60, 2.5}};
+    s.limit_change = schedule::Override{{false, 5}, 5, 1760003600};
     s.update_check = false;
     s.last_update_check = 1760000000;
     s.latest_version = "0.7.0";
@@ -57,6 +59,15 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
     CHECK(parse_gui_state(R"({})").parallel == 4);
     CHECK(parse_gui_state(R"({"serverLimits":{"a":3,"b":0,"c":"x"}})").server_limits ==
           std::map<std::string, int>{{"a", 3}});
+
+    // The speed schedule keeps its valid rules; a broken change of the limit is dropped.
+    CHECK(parse_gui_state(R"({"speedSchedule":[{"days":["sat"],"from":"10:00","to":"12:00","mibps":8},{"days":[]}]})")
+              .speed_schedule == std::vector<schedule::Rule>{{0x20, 10 * 60, 12 * 60, 8}});
+    CHECK(parse_gui_state(R"({"speedSchedule":"weekends"})").speed_schedule.empty());
+    CHECK(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5,"until":1760003600}})").limit_change);
+    CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":0,"until":1760003600}})").limit_change);
+    CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5}})").limit_change);
+    CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5,"until":1e300}})").limit_change);
 }
 
 TEST_CASE("queue order: move an item before another, or to the end") {

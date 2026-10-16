@@ -233,6 +233,8 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .bar.status { flex: none; padding: 4px 14px 8px; font-size: 12px; }
 .bar.status #limit-value { width: 64px; height: 26px; text-align: right; }
 .bar.status #limit-value:disabled { opacity: 0.5; }
+.bar.status #limit-hint { height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); font-size: 12px; }
+.bar.status #limit-hint:hover { text-decoration: underline; background: none; }
 .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
 .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
 .switch .track {
@@ -366,6 +368,18 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .updates-row { display: flex; align-items: center; gap: 14px; }
 .updates-row .section-title { font-weight: 600; font-size: 14px; }
 .updates-row button { height: 26px; padding: 0 10px; font-size: 12px; }
+.schedule-rules { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.schedule-rules:empty { display: none; }
+.rule { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.rule .days button { height: 26px; min-width: 30px; padding: 0 6px; font-size: 12px; color: var(--muted); }
+.rule .days button[aria-pressed=true] { background: var(--sel); color: var(--text); font-weight: 600; }
+.rule input[type=text] { height: 26px; padding: 0 6px; }
+.rule input.time { width: 56px; text-align: center; font-variant-numeric: tabular-nums; }
+.rule input.num { width: 52px; text-align: right; }
+.rule .next-day { font-size: 12px; min-width: 50px; }
+.rule .next-day.off { visibility: hidden; } /* keeps its place, so the rows line up */
+.rule .icon-btn { width: 26px; height: 26px; }
+.schedule-panel .hint { margin-top: 8px; max-width: 720px; }
 .server {
   padding: 10px 12px;
   background: var(--panel);

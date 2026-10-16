@@ -99,7 +99,11 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     parallel_ = state_.parallel;
     learned_ = state_.server_limits;
-    if (state_.limit_on) limiter_.set_rate(static_cast<std::uint64_t>(state_.limit_mibps * 1024 * 1024));
+    // The speed limit that holds now; the first tick() tells the page and drops a change that
+    // no longer holds.
+    if (const auto applied = current_limit(schedule::local_now()); applied.limit.on) {
+        limiter_.set_rate(schedule::bytes_per_s(applied.limit.mibps));
+    }
     // Output of an earlier update: an installer update outlives the window that followed it.
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(std::filesystem::temp_directory_path(ec), ec)) {
@@ -230,6 +234,8 @@ void App::on_message(const std::string& text) {
         const Value* mibps = msg->find("mibps");
         set_limit(bool_of(*msg, "on"),
                   mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps);
+    } else if (type == "setSchedule") {
+        if (const Value* rules = msg->find("rules")) set_schedule(*rules);
     } else if (type == "setParallel") {
         set_parallel(int_of(*msg, "value", state_.parallel));
     } else if (type == "retryItem") {
@@ -350,8 +356,9 @@ void App::send_init() {
     init.set("destinations", std::move(dests));
     init.set("defaultDest", str(known_folder(FOLDERID_Downloads)));
     init.set("parallel", num(state_.parallel));
-    init.set("limitOn", Value::make_bool(state_.limit_on));
-    init.set("limitMiBps", num(state_.limit_mibps));
+    Value limit = limit_message(schedule::local_now());
+    limit_posted_ = json::stringify(limit);
+    init.set("limit", std::move(limit));
     post(init);
     post_queue();
 }
@@ -1074,17 +1081,85 @@ void App::skip_child(int id, const std::string& path) {
 
 void App::set_limit(bool on, double mibps) {
     if (!(mibps >= min_limit_mibps && mibps <= max_limit_mibps)) mibps = state_.limit_mibps; // also NaN
-    state_.limit_on = on;
-    state_.limit_mibps = mibps;
+    const auto now = schedule::local_now();
+    const auto scheduled = schedule::limit_at(state_.speed_schedule, now.minute);
+    const schedule::Limit wanted{on, mibps};
+    if (!scheduled) {
+        state_.limit_on = on;
+        state_.limit_mibps = mibps;
+        state_.limit_change.reset();
+    } else if (wanted == schedule::Limit{true, *scheduled}) {
+        state_.limit_change.reset(); // back to what the schedule says
+    } else {
+        // Without a next change (one limit all week) it holds for a year, i.e. until undone.
+        const auto next = schedule::next_change(state_.speed_schedule, now.minute);
+        const std::int64_t until = next ? now.unix + std::int64_t{next->minutes} * 60 - now.second
+                                        : now.unix + std::int64_t{365} * 24 * 3600;
+        state_.limit_change = schedule::Override{wanted, *scheduled, until};
+    }
     save_state();
+    update_limit();
+}
+
+void App::set_schedule(const Value& rules) {
+    state_.speed_schedule = schedule::from_json(rules);
+    state_.limit_change.reset(); // the new rules apply at once
+    save_state();
+    update_limit();
+}
+
+void App::tick() { update_limit(); }
+
+schedule::Applied App::current_limit(const schedule::Now& now) const {
+    return schedule::apply({state_.limit_on, state_.limit_mibps}, schedule::limit_at(state_.speed_schedule, now.minute),
+                           state_.limit_change, now.unix);
+}
+
+void App::update_limit() {
+    const auto now = schedule::local_now();
+    if (state_.limit_change &&
+        !schedule::holds(*state_.limit_change, schedule::limit_at(state_.speed_schedule, now.minute), now.unix)) {
+        state_.limit_change.reset();
+        save_state();
+    }
+    const auto applied = current_limit(now);
+    set_rate(applied.limit.on ? schedule::bytes_per_s(applied.limit.mibps) : 0);
+    Value message = limit_message(now);
+    if (auto text = json::stringify(message); text != limit_posted_) {
+        limit_posted_ = std::move(text);
+        post(message);
+    }
+}
+
+void App::set_rate(std::uint64_t bytes_per_s) {
+    if (bytes_per_s == limiter_.rate()) return;
     // Streams through grab follow the new rate at once. rclone batches (a folder's small
     // files) have theirs fixed at start, so running ones restart with the new cap; only their
     // in-flight small files start over.
-    limiter_.set_rate(on ? static_cast<std::uint64_t>(mibps * 1024 * 1024) : 0);
+    limiter_.set_rate(bytes_per_s);
     std::lock_guard lock(mutex_);
     for (auto& item : items_) {
         if (item->tree.batch_running) item->tree.batch_stop.request_stop();
     }
+}
+
+// What the status bar and Settings show: the limit that applies and why, when the schedule
+// next changes ("until") and to what, and the rules.
+Value App::limit_message(const schedule::Now& now) const {
+    const auto applied = current_limit(now);
+    Value m = Value::make_object();
+    m.set("type", str("limit"));
+    m.set("on", Value::make_bool(applied.limit.on));
+    m.set("mibps", num(applied.limit.mibps));
+    m.set("source", str(applied.source == schedule::Source::schedule ? "schedule"
+                        : applied.source == schedule::Source::change ? "change"
+                                                                     : "own"));
+    if (const auto next = schedule::next_change(state_.speed_schedule, now.minute)) {
+        m.set("until", str(schedule::when_text(now.minute, next->minutes)));
+        if (next->limit) m.set("nextMiBps", num(*next->limit));
+    }
+    m.set("rules", schedule::to_json(state_.speed_schedule));
+    return m;
 }
 
 void App::move_item(int id, int before) {

@@ -2,12 +2,12 @@
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
-//                 setParallel, setLimit, moveItem, setPriority, clearFinished, openFolder,
+//                 setParallel, setLimit, setSchedule, moveItem, setPriority, clearFinished, openFolder,
 //                 pauseChild, resumeChild, skipChild,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
-//   from backend: init, searchResult, searchError, folderPicked, queue, error, update, updateChecked,
+//   from backend: init, searchResult, searchError, folderPicked, queue, error, update, updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked
 
@@ -30,8 +30,10 @@ const state = {
   lastQuery: '',
   queue: [],
   parallel: 4,
-  limitOn: false,
+  limitOn: false,        // the limit that applies now: own setting, speed schedule or a change
   limitMiBps: 5,
+  limit: {},             // the backend's "limit" message: source, until, nextMiBps
+  schedule: [],          // speed schedule rules, as the backend keeps them
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing
   lists: [],             // the last search's sources per server: age, live, refreshing, error
   updateLater: false,    // "Later": hidden until grab starts again
@@ -559,6 +561,16 @@ function renderTotalSpeed() {
   el.classList.toggle('limited', state.limitOn);
 }
 
+// The speed schedule's part in the status bar: why the limit is what it is, and until when.
+function renderLimitHint() {
+  const l = state.limit;
+  const hint = $('#limit-hint');
+  const until = l.until ? ` until ${l.until}` : '';
+  if (l.source === 'schedule') hint.textContent = `Scheduled${until}`;
+  else if (l.source === 'change') hint.textContent = l.until ? `Schedule resumes at ${l.until}` : 'Schedule paused';
+  hint.hidden = l.source !== 'schedule' && l.source !== 'change';
+}
+
 function fmtLimit(v) {
   return String(Math.round(v * 10) / 10);
 }
@@ -568,7 +580,24 @@ function renderLimit() {
   const box = $('#limit-value');
   box.disabled = !state.limitOn;
   if (document.activeElement !== box) box.value = fmtLimit(state.limitMiBps);
+  renderLimitHint();
   renderTotalSpeed();
+}
+
+function onLimit(msg) {
+  state.limitOn = msg.on;
+  state.limitMiBps = msg.mibps;
+  state.limit = msg;
+  // Re-rendered only when they differ (by field: WebView2 hands over objects with sorted keys),
+  // so the echo of an edit doesn't take the focus from the next field.
+  const rules = msg.rules || [];
+  const key = (list) => JSON.stringify(list.map((r) => [r.days, r.from, r.to, r.mibps]));
+  if (key(rules) !== key(state.schedule)) {
+    state.schedule = rules;
+    renderSchedule();
+  }
+  renderLimit();
+  renderScheduleNow();
 }
 
 function sendLimit() {
@@ -625,9 +654,7 @@ function onInit(msg) {
   state.mode = msg.mode;
   state.defaultDest = msg.defaultDest;
   if (msg.parallel) state.parallel = msg.parallel;
-  if (typeof msg.limitOn === 'boolean') state.limitOn = msg.limitOn;
-  if (msg.limitMiBps) state.limitMiBps = msg.limitMiBps;
-  renderLimit();
+  if (msg.limit) onLimit(msg.limit);
   $('#version').textContent = `v${msg.version}`;
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
   renderRemotes();
@@ -712,6 +739,141 @@ function onUpdateChecked(msg) {
   r.textContent = msg.text;
   if (msg.available) { state.updateLater = false; renderUpdate(); }
 }
+
+// ---- settings: speed schedule -------------------------------------------------------------
+
+const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+const DAY_LABELS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+const MAX_RULES = 20; // schedule::max_rules
+
+function fmtSpeed(mibps) { return `${fmtLimit(mibps)} MiB/s`; }
+
+// "18", "1830", "18:30" or "8:30" as "HH:MM"; "24:00" only where `allow24`. null if not a time.
+function parseTime(text, allow24) {
+  const m = /^(\d{1,2})(?::?(\d{2}))?$/.exec(text.trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = m[2] === undefined ? 0 : Number(m[2]);
+  if (min > 59 || h > 24 || (h === 24 && (min !== 0 || !allow24))) return null;
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+// The end as people say it: midnight is "24:00" (kept as "00:00", the way the backend does).
+function toText(to) { return to === '00:00' ? '24:00' : to; }
+
+function ruleRow(r, i) {
+  const days = DAYS.map((d, k) =>
+    `<button type="button" data-day="${d}" aria-pressed="${r.days.includes(d)}" title="${DAY_NAMES[k]}">${DAY_LABELS[k]}</button>`).join('');
+  const nextDay = r.to !== '00:00' && r.to <= r.from;
+  return `<div class="rule" data-i="${i}">` +
+    `<span class="segmented days" role="group" aria-label="Days">${days}</span>` +
+    `<input type="text" class="time" data-field="from" value="${r.from}" aria-label="From" spellcheck="false">` +
+    '<span class="muted">–</span>' +
+    `<input type="text" class="time" data-field="to" value="${toText(r.to)}" aria-label="To" spellcheck="false">` +
+    `<span class="next-day muted${nextDay ? '' : ' off'}">next day</span>` +
+    `<input type="text" class="num" data-field="mibps" value="${fmtLimit(r.mibps)}" inputmode="decimal" aria-label="Speed in MiB/s">` +
+    '<span class="muted">MiB/s</span>' +
+    '<button type="button" class="subtle icon-btn" data-act="remove" title="Remove this time" aria-label="Remove this time">✕</button>' +
+    '</div>';
+}
+
+function renderSchedule() {
+  $('#schedule-rules').innerHTML = state.schedule.map(ruleRow).join('');
+  $('#schedule-add').disabled = state.schedule.length >= MAX_RULES;
+}
+
+function renderScheduleNow() {
+  const l = state.limit;
+  const el = $('#schedule-now');
+  const until = l.until ? ` until ${l.until}` : '';
+  if (!state.schedule.length) el.textContent = '';
+  else if (l.source === 'schedule') el.textContent = `Now: ${fmtSpeed(l.mibps)}${l.until ? until : ', all week'}`;
+  else if (l.source === 'change') el.textContent = `Now: ${l.on ? fmtSpeed(l.mibps) : 'no limit'} (your change)${until}`;
+  else if (l.until && l.nextMiBps) el.textContent = `No scheduled limit now; next: ${l.until} at ${fmtSpeed(l.nextMiBps)}`;
+  else el.textContent = 'No scheduled limit now';
+}
+
+function sendSchedule() {
+  send({ type: 'setSchedule', rules: state.schedule });
+}
+
+// A field of a rule was edited: a valid value is kept and sent, anything else snaps back.
+function commitRuleField(input) {
+  const i = Number(input.closest('.rule').dataset.i);
+  const r = state.schedule[i];
+  if (!r) return;
+  const field = input.dataset.field;
+  let changed = false;
+  if (field === 'mibps') {
+    const v = Number(input.value.trim().replace(',', '.'));
+    if (Number.isFinite(v) && v >= 0.1 && v <= 10000) {
+      changed = Math.abs(v - r.mibps) > 1e-9;
+      r.mibps = v;
+    }
+    input.value = fmtLimit(r.mibps);
+  } else {
+    const t = parseTime(input.value, field === 'to');
+    if (t) {
+      const kept = field === 'to' && t === '24:00' ? '00:00' : t;
+      changed = kept !== r[field];
+      r[field] = kept;
+    }
+    input.value = field === 'to' ? toText(r.to) : r.from;
+    input.closest('.rule').querySelector('.next-day').classList.toggle('off', !(r.to !== '00:00' && r.to <= r.from));
+  }
+  if (changed) sendSchedule();
+}
+
+$('#schedule-add').addEventListener('click', () => {
+  if (state.schedule.length >= MAX_RULES) return;
+  state.schedule.push({ days: [...DAYS], from: '18:00', to: '00:00', mibps: 5 });
+  renderSchedule();
+  sendSchedule();
+  const rows = document.querySelectorAll('#schedule-rules .rule');
+  rows[rows.length - 1].querySelector('[data-field=from]').focus();
+});
+
+$('#schedule-rules').addEventListener('click', (ev) => {
+  const row = ev.target.closest('.rule');
+  if (!row) return;
+  const i = Number(row.dataset.i);
+  const r = state.schedule[i];
+  const day = ev.target.closest('[data-day]');
+  if (day && r) {
+    const d = day.dataset.day;
+    const on = r.days.includes(d);
+    if (on && r.days.length === 1) return; // a time needs at least one day
+    r.days = on ? r.days.filter((x) => x !== d) : DAYS.filter((x) => x === d || r.days.includes(x));
+    day.setAttribute('aria-pressed', String(!on));
+    sendSchedule();
+  } else if (ev.target.closest('[data-act=remove]')) {
+    state.schedule.splice(i, 1);
+    renderSchedule();
+    sendSchedule();
+  }
+});
+
+$('#schedule-rules').addEventListener('change', (ev) => {
+  if (ev.target.matches('input[data-field]')) commitRuleField(ev.target);
+});
+$('#schedule-rules').addEventListener('keydown', (ev) => {
+  const input = ev.target.closest('input[data-field]');
+  if (!input) return;
+  if (ev.key === 'Enter') { ev.preventDefault(); commitRuleField(input); input.blur(); }
+  else if (ev.key === 'Escape') {
+    const r = state.schedule[Number(input.closest('.rule').dataset.i)];
+    const f = input.dataset.field;
+    input.value = f === 'mibps' ? fmtLimit(r.mibps) : f === 'to' ? toText(r.to) : r.from;
+    input.blur();
+  }
+});
+
+$('#limit-hint').addEventListener('click', () => {
+  if (!settings.open) openSettings();
+  else if (settings.form) closeForm();
+  $('#schedule-panel').scrollIntoView({ block: 'nearest' });
+});
 
 // ---- settings: servers -------------------------------------------------------------------
 
@@ -817,6 +979,7 @@ function renderServers() {
   const list = $('#server-list');
   list.hidden = !!settings.form;
   $('#updates-panel').hidden = !!settings.form;
+  $('#schedule-panel').hidden = !!settings.form;
   $('#server-form').hidden = !settings.form;
   renderStatus();
   if (settings.form) return;
@@ -1010,6 +1173,7 @@ if (webview) {
         break;
       case 'update': state.update = msg; renderUpdate(); break;
       case 'updateChecked': onUpdateChecked(msg); break;
+      case 'limit': onLimit(msg); break;
       case 'error': showBanner(msg.message); break;
       case 'servers': settings.servers = msg.items; renderServers(); break;
       case 'settingsBusy':

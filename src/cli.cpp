@@ -49,7 +49,8 @@ Options:
   -r, --remote NAME    grab.conf section to use (default: [grab] default_remote)
   -c, --config PATH    grab.conf path (default: %APPDATA%\grab\grab.conf or $GRAB_CONFIG)
       --depth N        override max_depth for this run
-      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s)
+      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s), or
+                       off. Without --limit, the speed schedule set in grab's window applies
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
@@ -157,8 +158,8 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         } else if (name == "--limit") {
             auto v = take_value();
             if (!v) return util::fail(v.error());
-            auto bytes = rate::parse_rate(*v);
-            if (!bytes) return util::failf("--limit takes a rate like 5M, 800K or 2.5 (MiB/s), got '{}'", *v);
+            auto bytes = *v == "off" || *v == "0" ? std::optional<std::uint64_t>(0) : rate::parse_rate(*v);
+            if (!bytes) return util::failf("--limit takes a rate like 5M, 800K or 2.5 (MiB/s), or off; got '{}'", *v);
             result.opts.limit = *bytes;
         } else if (name == "--first") {
             result.opts.first = true;

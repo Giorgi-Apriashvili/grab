@@ -6,6 +6,7 @@
 #include "config.hpp"
 #include "engine.hpp"
 #include "file_list.hpp"
+#include "gui_state.hpp"
 #include "ini.hpp"
 #include "match.hpp"
 #include "process.hpp"
@@ -13,6 +14,7 @@
 #include "rate.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
+#include "schedule.hpp"
 #include "server_cli.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -191,8 +193,14 @@ std::expected<std::filesystem::path, std::string> prepare_destination(const std:
 DownloadTally download_with_rclone(const engine::Context& ctx, const Options& opts,
                                    const std::vector<std::string>& paths, const std::filesystem::path& dest) {
     // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
+    // Without it, rclone follows the speed schedule by itself, as a weekly timetable.
     std::vector<std::string> extra;
-    if (opts.limit) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
+    if (opts.limit) {
+        if (*opts.limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
+    } else if (const auto rules = load_gui_state(default_gui_state_path()).speed_schedule; !rules.empty()) {
+        extra.insert(extra.end(), {"--bwlimit", schedule::rclone_bwlimit(rules)});
+        if (auto note = schedule_note(rules, schedule::local_now())) std::println(stderr, "grab: {}", *note);
+    }
     extra.insert(extra.end(), opts.extra.begin(), opts.extra.end());
 
     DownloadTally tally;

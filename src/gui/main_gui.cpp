@@ -34,7 +34,7 @@ constexpr wchar_t instance_slot[] = L"Local\\grab.gui.window-handle.";
 constexpr UINT wm_post_json = WM_APP + 1; // lParam: std::string*
 constexpr UINT wm_run = WM_APP + 2;       // lParam: std::function<void()>*
 constexpr UINT wm_show = WM_APP + 3;      // from a second launch: bring the window back
-constexpr UINT_PTR timer_tray = 1;        // refreshes the tray tooltip
+constexpr UINT_PTR timer_tray = 1;        // every second: the tray tooltip and the speed schedule
 constexpr UINT_PTR timer_exit = 2;        // fallback exit when a notification never reports back
 constexpr UINT id_show = 1;               // tray menu
 constexpr UINT id_quit = 2;
@@ -237,6 +237,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     case WM_TIMER:
         if (wparam == timer_tray) {
             refresh_tray_tip();
+            if (g.app) g.app->tick();
         } else if (wparam == timer_exit) {
             KillTimer(hwnd, timer_exit);
             if (may_exit_now()) quit(hwnd);

@@ -3,6 +3,8 @@
 // What grab-gui remembers between runs (%APPDATA%\grab\gui.json). Pure data + JSON, so it
 // lives in grab_core and is unit-tested.
 
+#include "schedule.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -24,8 +26,8 @@ struct WindowPlacement {
 
 inline constexpr int min_parallel = 1;
 inline constexpr int max_parallel = 8;
-inline constexpr double min_limit_mibps = 0.1;
-inline constexpr double max_limit_mibps = 10000;
+inline constexpr double min_limit_mibps = schedule::min_mibps;
+inline constexpr double max_limit_mibps = schedule::max_mibps;
 
 struct GuiState {
     std::optional<WindowPlacement> window;
@@ -36,6 +38,10 @@ struct GuiState {
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
     bool limit_on = false;                           // global download speed limit
     double limit_mibps = 5.0;                        // its value, kept while switched off
+    // Outside the schedule's times the limit above applies; a change made during them holds
+    // until the schedule's next change.
+    std::vector<schedule::Rule> speed_schedule;
+    std::optional<schedule::Override> limit_change;
     bool update_check = true;                        // look for a new release once a day
     std::int64_t last_update_check = 0;              // Unix seconds; 0 = never
     std::string latest_version;                      // the newest release seen ("0.7.0"), if any

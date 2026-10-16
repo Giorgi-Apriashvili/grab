@@ -49,6 +49,22 @@ GuiState parse_gui_state(std::string_view json_text) {
                                                   v->number >= min_limit_mibps && v->number <= max_limit_mibps) {
         s.limit_mibps = v->number;
     }
+    if (const auto* rules = doc->find("speedSchedule")) s.speed_schedule = schedule::from_json(*rules);
+    if (const auto* c = doc->find("limitChange"); c != nullptr && c->kind == json::Value::Kind::object) {
+        const auto* on = c->find("on");
+        const auto* mibps = c->find("mibps");
+        const auto* scheduled = c->find("scheduled");
+        const auto* until = c->find("until");
+        auto in_range = [](const json::Value* v) {
+            return v != nullptr && v->kind == json::Value::Kind::number && v->number >= min_limit_mibps &&
+                   v->number <= max_limit_mibps;
+        };
+        if (on != nullptr && on->kind == json::Value::Kind::boolean && in_range(mibps) && in_range(scheduled) &&
+            until != nullptr && until->kind == json::Value::Kind::number && until->number > 0 && until->number < 1e15) {
+            s.limit_change = schedule::Override{{on->boolean, mibps->number}, scheduled->number,
+                                                static_cast<std::int64_t>(until->number)};
+        }
+    }
     if (const auto* l = doc->find("serverLimits"); l != nullptr && l->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < l->keys.size(); ++i) {
             if (auto n = number(&l->items[i]); n && *n >= 1) s.server_limits[l->keys[i]] = *n;
@@ -85,6 +101,15 @@ std::string gui_state_to_json(const GuiState& state) {
     root.set("parallel", Value::make_number(state.parallel));
     root.set("limitOn", Value::make_bool(state.limit_on));
     root.set("limitMiBps", Value::make_number(state.limit_mibps));
+    root.set("speedSchedule", schedule::to_json(state.speed_schedule));
+    if (state.limit_change) {
+        Value c = Value::make_object();
+        c.set("on", Value::make_bool(state.limit_change->limit.on));
+        c.set("mibps", Value::make_number(state.limit_change->limit.mibps));
+        c.set("scheduled", Value::make_number(state.limit_change->scheduled));
+        c.set("until", Value::make_number(static_cast<double>(state.limit_change->until)));
+        root.set("limitChange", std::move(c));
+    }
     Value limits = Value::make_object();
     for (const auto& [remote, n] : state.server_limits) limits.set(remote, Value::make_number(n));
     root.set("serverLimits", std::move(limits));

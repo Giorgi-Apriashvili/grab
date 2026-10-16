@@ -97,8 +97,13 @@ TEST_CASE("--limit takes a speed like rclone's --bwlimit") {
     CHECK(bare->opts.limit == 5u * 1024 * 1024 / 2); // a bare number is MiB/s
     CHECK_FALSE(parse_args(args({"movie.mkv", "--limit"})).has_value());
     CHECK_FALSE(parse_args(args({"movie.mkv", "--limit", "fast"})).has_value());
-    CHECK_FALSE(parse_args(args({"movie.mkv", "--limit", "0"})).has_value());
-    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value());
+    auto off = parse_args(args({"movie.mkv", "--limit", "off"})); // no limit, not even the speed schedule
+    REQUIRE(off.has_value());
+    CHECK(off->opts.limit == 0u);
+    auto zero = parse_args(args({"movie.mkv", "--limit", "0"}));
+    REQUIRE(zero.has_value());
+    CHECK(zero->opts.limit == 0u);
+    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value()); // the speed schedule decides
 }
 
 TEST_CASE("--rclone downloads with plain rclone, as before") {

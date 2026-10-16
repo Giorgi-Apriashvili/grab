@@ -7,6 +7,7 @@
 #include "gui_state.hpp"
 #include "json.hpp"
 #include "rate.hpp"
+#include "schedule.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "update.hpp"
@@ -66,6 +67,8 @@ public:
     [[nodiscard]] QueueSummary summary() const;
     [[nodiscard]] GuiState& state() { return state_; }
     void save_state() const;
+    // UI thread, every second: follows the speed schedule.
+    void tick();
 
 private:
     // A plaintext password or passphrase, overwritten when it is dropped.
@@ -166,8 +169,14 @@ private:
     // Queue order (`before` = another item's id, 0 = the end) and bandwidth priority.
     void move_item(int id, int before);
     void set_priority(int id, int weight);
-    // The global download speed limit (UI thread).
+    // The global download speed limit (UI thread): the user's own setting, the speed schedule,
+    // or a change made while the schedule limits the speed, which holds until its next change.
     void set_limit(bool on, double mibps);
+    void set_schedule(const json::Value& rules);
+    [[nodiscard]] schedule::Applied current_limit(const schedule::Now& now) const;
+    void update_limit(); // applies what holds now and tells the page about any change
+    void set_rate(std::uint64_t bytes_per_s);
+    [[nodiscard]] json::Value limit_message(const schedule::Now& now) const;
     void pick_folder(std::wstring current);
     void pick_file(std::wstring current);
     void open_item_folder(int id);
@@ -228,6 +237,7 @@ private:
     GuiState state_;
     fetch::Connections connections_;
     rate::RateLimiter limiter_; // shared by every download's streams
+    std::string limit_posted_;  // the last "limit" message, so only changes are sent
 
     struct LastSearch {
         int id = 0;

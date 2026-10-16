@@ -9,11 +9,13 @@
 #include "quote.hpp"
 #include "rate.hpp"
 #include "rclone.hpp"
+#include "schedule.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <format>
 #include <mutex>
@@ -21,6 +23,7 @@
 #include <print>
 #include <stop_token>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #ifdef _WIN32
@@ -28,7 +31,6 @@
 #else
 #include <csignal>
 #include <sys/ioctl.h>
-#include <thread>
 #include <unistd.h>
 #endif
 
@@ -186,6 +188,81 @@ private:
 #endif
 };
 
+// Follows the speed schedule while downloads run: when the scheduled limit changes, the
+// limiter switches (grab's streams follow at once) and a folder's rclone batch, whose cap is
+// fixed when it starts, starts again with the new one.
+class ScheduleFollower {
+public:
+    ScheduleFollower(std::vector<schedule::Rule> rules, rate::RateLimiter& limiter, LiveLine& line)
+        : rules_(std::move(rules)), limiter_(limiter), line_(line),
+          current_(schedule::limit_at(rules_, schedule::local_now().minute)) {
+        if (current_) limiter_.set_rate(schedule::bytes_per_s(*current_));
+        thread_ = std::jthread([this](const std::stop_token& stop) { run(stop); });
+    }
+    ScheduleFollower(const ScheduleFollower&) = delete;
+    ScheduleFollower& operator=(const ScheduleFollower&) = delete;
+
+    // While alive, the folder being downloaded: its batch restarts on a change.
+    class Watch {
+    public:
+        Watch(ScheduleFollower* f, folder::Tree& tree, std::mutex& m) : f_(f) {
+            if (f_ != nullptr) f_->watch(&tree, &m);
+        }
+        ~Watch() {
+            if (f_ != nullptr) f_->watch(nullptr, nullptr);
+        }
+        Watch(const Watch&) = delete;
+        Watch& operator=(const Watch&) = delete;
+
+    private:
+        ScheduleFollower* f_;
+    };
+
+private:
+    void watch(folder::Tree* tree, std::mutex* m) {
+        std::lock_guard lock(m_);
+        tree_ = tree;
+        tree_mutex_ = m;
+    }
+
+    void run(const std::stop_token& stop) {
+        std::mutex sleep_m;
+        std::condition_variable_any sleep;
+        for (;;) {
+            {
+                std::unique_lock lock(sleep_m);
+                sleep.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+            }
+            if (stop.stop_requested()) return;
+            const auto now = schedule::local_now();
+            const auto limit = schedule::limit_at(rules_, now.minute);
+            if (limit == current_) continue;
+            current_ = limit;
+            limiter_.set_rate(limit ? schedule::bytes_per_s(*limit) : 0);
+            {
+                std::lock_guard lock(m_);
+                if (tree_ != nullptr) {
+                    std::lock_guard tree_lock(*tree_mutex_);
+                    if (tree_->batch_running) tree_->batch_stop.request_stop();
+                }
+            }
+            const auto next = schedule::next_change(rules_, now.minute);
+            const std::string until = next ? " until " + schedule::when_text(now.minute, next->minutes) : "";
+            line_.message(limit ? std::format("grab: speed schedule: limited to {}{}", schedule::speed_text(*limit), until)
+                                : std::format("grab: speed schedule: no limit{}", until));
+        }
+    }
+
+    const std::vector<schedule::Rule> rules_;
+    rate::RateLimiter& limiter_;
+    LiveLine& line_;
+    std::optional<double> current_; // the follower thread's
+    std::mutex m_;                  // guards tree_ and tree_mutex_
+    folder::Tree* tree_ = nullptr;
+    std::mutex* tree_mutex_ = nullptr;
+    std::jthread thread_; // last: stops and joins first
+};
+
 struct Session {
     const engine::Context& ctx;
     const Options& opts;
@@ -196,6 +273,7 @@ struct Session {
     std::vector<std::string> flags; // common flags without console progress, plus `-- extra`
     engine::CommandHook trace;      // -v
     std::stop_token stop;
+    ScheduleFollower* follower = nullptr; // when the speed schedule applies
 };
 
 int fetch_file(const Session& s, const std::string& path, int id) {
@@ -252,6 +330,7 @@ int fetch_file(const Session& s, const std::string& path, int id) {
 int fetch_folder(const Session& s, const std::string& path, int id) {
     folder::Tree tree;
     std::mutex m;
+    const ScheduleFollower::Watch watch(s.follower, tree, m);
     folder::Job job;
     job.ctx = &s.ctx;
     job.connections = &s.connections;
@@ -358,6 +437,14 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
 
 } // namespace
 
+std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules, const schedule::Now& now) {
+    const auto limit = schedule::limit_at(rules, now.minute);
+    if (!limit) return std::nullopt;
+    const auto next = schedule::next_change(rules, now.minute);
+    return std::format("speed limited to {}{} by the speed schedule (--limit off ignores it)",
+                       schedule::speed_text(*limit), next ? " until " + schedule::when_text(now.minute, next->minutes) : "");
+}
+
 DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts, const std::vector<std::string>& paths,
                                  const std::unordered_map<std::string, std::uint64_t>& sizes,
                                  const std::filesystem::path& dest) {
@@ -375,10 +462,16 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     connections.configure(server, budget);
     rate::RateLimiter limiter;
     if (opts.limit) limiter.set_rate(*opts.limit);
+    // Without --limit, the speed schedule set in grab's window decides, also mid-download.
+    const auto rules = opts.limit ? std::vector<schedule::Rule>{} : gui.speed_schedule;
+    if (auto note = schedule_note(rules, schedule::local_now())) std::println(stderr, "grab: {}", *note);
+    std::optional<ScheduleFollower> follower;
+    if (!opts.dry_run && !rules.empty()) follower.emplace(rules, limiter, line);
 
     StopOnCtrlC ctrl_c;
     Session s{ctx, opts, dest, line, connections, limiter, engine::without_console_progress(ctx.settings.common_flags), {},
               ctrl_c.token()};
+    if (follower) s.follower = &*follower;
     s.flags.insert(s.flags.end(), opts.extra.begin(), opts.extra.end());
     if (opts.verbose) {
         s.trace = [&line](const std::vector<std::string>& argv) { line.message("+ " + quote::display_cmdline(argv)); };

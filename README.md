@@ -172,6 +172,19 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - Changes apply at once. Streams through grab are paced by a shared token bucket, and while
     limited, rclone is told not to read ahead, so the network really follows the limit.
   - A folder's small-file batch gets rclone's `--bwlimit` and counts against the same total.
+- **Speed schedule** (Settings → Speed schedule) caps the speed at set times, for example 5
+  MiB/s on weekdays from 18:00 to 24:00.
+  - Each time has its days, a from–to time and a speed. A time that ends at or before its
+    start runs into the next day ("22:00–06:00", marked "next day"), and equal times are a
+    whole day. Where times overlap, the lower speed wins.
+  - When a time starts, Limit speed switches on at its speed, and the status bar says
+    "Scheduled until 24:00". When it ends, your own Limit speed setting applies again.
+  - Changing Limit speed during a scheduled time lasts until the schedule's next change
+    ("Schedule resumes at 24:00"), also across a restart. Editing the schedule ends it.
+  - The `grab` command follows the same schedule (see [Usage](#usage)). Each program caps its
+    own downloads.
+  - At each change, a folder's small-file batch starts again with the new cap; the files it
+    had in flight start over.
 - **Folders** are listed once and shown as a tree under their row, collapsible with ▸/▾.
   - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
   - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
@@ -336,7 +349,8 @@ grab config [-c PATH]
   -r, --remote NAME    grab.conf section to use
   -c, --config PATH    grab.conf path
       --depth N        override max_depth for this run
-      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s)
+      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s), or
+                       off. Without --limit, the speed schedule set in grab's window applies
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
@@ -392,10 +406,14 @@ grab config [-c PATH]
   - A file already in DEST with the same size, and not older than the server's copy, is not
     fetched again (`already there, nothing fetched`); in a folder, the same goes per file.
   - `--limit` caps all connections together, exactly.
+  - Without `--limit`, grab follows the window's [speed schedule](#gui), also mid-download:
+    `grab: speed limited to 5 MiB/s until 24:00 by the speed schedule`, and a line at each
+    change. `--limit RATE` replaces the schedule, and `--limit off` downloads without a limit.
   - Measured on a Storage Box: one 898 MiB file took 1:09 this way and 1:50 with `--rclone`,
     minutes apart.
 - `--rclone` downloads with plain `rclone copyto` / `rclone copy` instead, with rclone's own
-  progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`.
+  progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`, and the
+  speed schedule a weekly `--bwlimit` timetable ("Mon-18:00,5120K Tue-00:00,off ...").
 - Anything after `--` is added to every rclone call grab makes. For speed, use `--limit`
   rather than `-- --bwlimit`, which rclone would apply to each connection separately.
 
@@ -490,6 +508,7 @@ src/folder_job.*    a folder download, shared by the window and the command
 src/cli_download.*  the command's downloads: live progress line, Ctrl+C
 src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
+src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)

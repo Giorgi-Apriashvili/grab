@@ -96,6 +96,19 @@
       </div>
     </section>
 
+    <section id="schedule-panel" class="updates-panel schedule-panel">
+      <div class="updates-row">
+        <span class="section-title">Speed schedule</span>
+        <span id="schedule-now" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="schedule-add" type="button">Add a time</button>
+      </div>
+      <div id="schedule-rules" class="schedule-rules"></div>
+      <div class="hint">Caps the speed of all downloads at these times, in this window and the grab
+        command. Where times overlap, the lower speed wins. Outside them, Limit speed in the status bar
+        applies; a change there during these times lasts until the schedule's next change.</div>
+    </section>
+
     <form id="server-form" class="server-form" autocomplete="off" hidden>
       <h2 id="form-title">Add a server</h2>
       <div class="grid">
@@ -192,6 +205,7 @@
   </label>
   <input id="limit-value" type="text" inputmode="decimal" class="num" aria-label="Speed limit in MiB/s">
   <span class="muted">MiB/s</span>
+  <button id="limit-hint" type="button" class="link" title="Speed schedule (Settings)" hidden></button>
 </footer>
 
 <div id="modal" class="modal-backdrop" hidden>
