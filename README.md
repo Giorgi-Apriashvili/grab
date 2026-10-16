@@ -21,7 +21,7 @@ grab -f releases E:\Backup
   ├─ 1. parse args      mode=folder, target="releases", dest="E:\Backup"
   ├─ 2. load config     grab.conf  ->  which rclone remote, where to search, which flags
   │                     rclone.conf -> host / user / port / key for the ssh step
-  ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -print0"
+  ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -printf '%T@\t%p\0'"
   │                     (or `rclone lsf -R` for remotes without a key / shell, see Lookup methods)
   │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick, several allowed
   ├─ 4. download        file:   byte ranges over up to 14 connections, `rclone cat --offset N
@@ -129,7 +129,7 @@ installed exe has no VC redistributable dependency.
 `grab-gui.exe` (the **grab** Start-menu entry) is a window over the same engine: pick a server, search by words, select
 results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the
 download queue with live progress. It reads the same grab.conf and remembers the last server,
-mode and destination per server in `%APPDATA%\grab\gui.json`.
+mode, destination per server and the results' sort in `%APPDATA%\grab\gui.json`.
 
 - **Instant search** from each server's saved file list (see [File lists](#file-lists)):
   results appear at once, with "from the file list, 3 min old" under them.
@@ -139,10 +139,22 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
 - **All servers** (at the top of the server picker) searches every server's list at once.
   Results show their server, and Download sends each pick to its own server, into the same
   Save-to folder. Two picks with the same name aren't downloaded into one folder.
+- **Modified and sorting:** results and Browse rows show when each file or folder was last
+  modified (`2026-10-16 14:32`, your local time; hovering adds the seconds and the age). A
+  folder's date is its own, as file managers show it: it changes when something directly
+  inside it is added, removed or renamed.
+  - Click Name, Size or Modified to sort: the first click gives A→Z, largest first or newest
+    first, the second reverses it, the third goes back to the default order (best match for a
+    search, folders first A→Z in Browse). An arrow marks the sorted column; Tab to a header and
+    press Enter or Space from the keyboard.
+  - Browse keeps folders above files in every sort, and rows without a size or date go last.
+    Size is off in Folders mode, where no row has a size. The selection stays on the same
+    items.
+  - The sort stays, across searches, folders and restarts, until you change it.
 - **Browse** (next to Files and Folders) clicks through a server's folders instead of searching:
   `Box.Guest › movies › georgian.movies`, with ↑ (Backspace) to go up.
-  - Folders open instantly from the server's file list, with their item count, and their size
-    when the list holds everything inside them. Folders deeper than the list (past
+  - Folders open instantly from the server's file list, with their date and item count, and
+    their size when the list holds everything inside them. Folders deeper than the list (past
     `max_depth`) are listed from the server (`rclone lsjson`, about 2 s on a Storage Box) and
     remembered while the window is open; Refresh lists the current folder again.
   - Typing filters the folder; Enter searches everything below it, folders and files together,
@@ -404,9 +416,10 @@ grab config [-c PATH]
   (`find -iname`), so only hits travel back.
 - A `TARGET` containing `*`, `?` or `[` is a glob instead, also case-insensitive:
   `grab -f 'Season.0[1-3]*' E:\Backup`. `--exact` matches the whole name, case-sensitive.
-- File matches show their size in the list. The ssh lookup gets sizes from GNU find's `-printf`,
-  which any mainstream Linux server has; a server without it finds no files over ssh, so use
-  `find = rclone` for it.
+- Matches show their size and date in the list, folders their date:
+  `[3] movies/x.avi  (897.9 MiB, 2023-10-15)`. The ssh lookup gets sizes and dates from GNU
+  find's `-printf`, which any mainstream Linux server has; a server without it finds nothing
+  over ssh, so use `find = rclone` for it.
 - With several matches you get a numbered list, best first. Exact names rank first, then
   names starting with your first word, then the shallowest, then alphabetical, so a
   season lists in episode order. Answer `3`, `1-5,8`, `a` for all, Enter for `[1]`, or `q`.
@@ -498,6 +511,10 @@ on your PC in milliseconds, with the same matching and ranking as a live search.
   server deletes its list.
 - A path target, a search for a dot-name, and `--depth` other than the configured one search
   the server live, as before.
+- Lists carry each entry's date. Lists saved by grab 0.10.0 or earlier have none and are
+  fetched again once: the window answers from them at once and fills in the dates after its
+  background refresh, the command fetches first. An older grab fetches its own list again
+  rather than misread a newer one.
 - The lists are in `%LOCALAPPDATA%\grab\lists`, one `<server>.list` each, kept on this PC only.
   They are encrypted for your Windows account (DPAPI), so other accounts, backups and anyone
   with only a copy of the files can't read the file names. Programs running as you can, as
@@ -575,7 +592,9 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
 - **[rclone](https://rclone.org)** v1.75.1, © Nick Craig-Wood, MIT license
   ([licenses/rclone.txt](licenses/rclone.txt)). `rclone.exe` ships next to `grab.exe`
   (81 MB, which is why the installer is about 22 MB), and grab uses it rather than any rclone
-  on PATH. Set `rclone = <path>` in `[grab]` to use another copy.
+  on PATH. Set `rclone = <path>` in `[grab]` to use another copy; for dates in rclone
+  listings its `lsf` must accept `--time-format unix`, as the bundled 1.75.1 does (without
+  the flag listings fail; with it but not `unix`, rows show no date).
   - **Pin:** the build downloads the official Windows zip and checks it against the pinned
     SHA-256, which is rclone's own published `SHA256SUMS` value.
   - **To bump:** change `GRAB_RCLONE_VERSION` and the hash in `CMakeLists.txt`, then rebuild.

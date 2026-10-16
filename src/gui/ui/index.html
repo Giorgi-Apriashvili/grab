@@ -53,8 +53,9 @@
   <main class="results-wrap">
     <div class="results-head row">
       <input id="select-all" type="checkbox" title="Select all" aria-label="Select all">
-      <span class="name">Name</span>
-      <span class="size">Size</span>
+      <button type="button" class="sort name" data-sort="name" title="Sort by name">Name</button>
+      <button type="button" class="sort size" data-sort="size" title="Sort by size">Size</button>
+      <button type="button" class="sort modified" data-sort="modified" title="Sort by date modified">Modified</button>
       <span class="dir" id="dir-head">Folder</span>
     </div>
     <div id="results" class="results" tabindex="0" aria-label="Search results">

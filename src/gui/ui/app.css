@@ -159,19 +159,42 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 }
 .row {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) 90px minmax(0, 0.55fr);
+  grid-template-columns: 22px minmax(0, 1fr) 80px 108px minmax(0, 0.55fr);
   align-items: center;
   gap: 10px;
   height: var(--row);
   padding: 0 12px;
 }
+/* The header keeps the list's scrollbar space too, so it stays over the columns. */
 .results-head {
   flex: none;
   color: var(--muted);
   font-size: 12px;
   border-bottom: 1px solid var(--line);
+  overflow: hidden;
+  scrollbar-gutter: stable;
 }
-.results { position: relative; flex: 1; overflow-y: auto; outline: none; }
+/* Name, Size and Modified sort the rows: text, not buttons; an arrow on the sorted one. */
+.results-head .sort {
+  width: 100%;
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  text-align: left;
+}
+.results-head .sort.size { text-align: right; }
+.results-head .sort:hover:not(:disabled) { background: none; color: var(--text); }
+.results-head .sort:disabled { pointer-events: none; } /* a press on it leaves the focus too */
+.results-head .sort[data-dir] { color: var(--text); font-weight: 600; }
+.results-head .sort[data-dir=asc]::after { content: "\25B4"; margin-left: 4px; }
+.results-head .sort[data-dir=desc]::after { content: "\25BE"; margin-left: 4px; }
+/* Size is right-aligned: its arrow goes first, so the word stays over the sizes. */
+.results-head .sort.size[data-dir]::after { content: none; }
+.results-head .sort.size[data-dir=asc]::before { content: "\25B4"; margin-right: 4px; }
+.results-head .sort.size[data-dir=desc]::before { content: "\25BE"; margin-right: 4px; }
+.results { position: relative; flex: 1; overflow-y: auto; outline: none; scrollbar-gutter: stable; }
 #spacer { width: 1px; }
 #rows { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
 #rows .row { cursor: default; border-bottom: 1px solid transparent; }
@@ -179,7 +202,7 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 #rows .row.sel { background: var(--sel); }
 #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent); }
 .results:focus #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
-.name, .dir { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.name, .dir, .modified { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .ico { width: 16px; height: 16px; margin-right: 7px; vertical-align: -3px; fill: var(--folder); }
 .row .go { color: inherit; cursor: pointer; }
 .row .go:hover { color: var(--accent); text-decoration: underline; }
@@ -209,6 +232,7 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .browse-status .below { color: var(--text); }
 .browse-status .link { height: auto; padding: 0 4px; border: 0; background: none; color: var(--accent); cursor: pointer; }
 .size { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.modified { font-variant-numeric: tabular-nums; color: var(--muted); }
 .dir { color: var(--muted); }
 .empty {
   position: absolute;

@@ -24,6 +24,7 @@ const state = {
   selected: new Set(),
   cursor: -1,
   anchor: -1,
+  sort: { key: '', dir: 'asc' }, // the rows' order: key '' (the default), name, size or modified
   searchId: 0,
   searching: false,
   searchStarted: 0,
@@ -91,6 +92,18 @@ function fmtAge(sec) {
   return `${Math.round(sec / 86400)} days`;
 }
 
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// A last-modified time (Unix seconds) in local time: "2026-10-16 14:32", with `seconds`
+// "2026-10-16 14:32:05"; '' when unknown.
+function fmtDate(sec, seconds = false) {
+  if (!Number.isFinite(sec) || sec <= 0) return '';
+  const d = new Date(sec * 1000);
+  if (Number.isNaN(d.getTime())) return '';
+  const text = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return seconds ? `${text}:${pad2(d.getSeconds())}` : text;
+}
+
 // ---- header: remote, mode ----------------------------------------------------------------
 
 function renderRemotes() {
@@ -129,6 +142,7 @@ function renderMode() {
     : state.mode === 'folder' ? 'Search folders by name, e.g. lioness season 3'
       : 'Search files by name, e.g. lioness s03e08';
   renderBrowseBar();
+  renderSortHead();
 }
 
 // ---- banner and search -------------------------------------------------------------------
@@ -196,15 +210,16 @@ function onSearchResult(msg) {
   if (inBrowse() && typeof msg.under !== 'string') return; // a search of another mode
   if (typeof msg.under === 'string' && !state.browse.under) return; // the search below was closed
   // An update (the same search after a list refresh) keeps the selection and cursor by path.
-  const keyOf = (h) => `${h.remote}|${h.path}`;
-  const selectedKeys = msg.update ? new Set([...state.selected].map((i) => keyOf(state.hits[i]))) : null;
-  const cursorKey = msg.update && state.hits[state.cursor] ? keyOf(state.hits[state.cursor]) : null;
-  state.hits = msg.hits;
+  const selectedKeys = msg.update ? new Set([...state.selected].map((i) => rowKey(state.hits[i]))) : null;
+  const cursorKey = msg.update && state.hits[state.cursor] ? rowKey(state.hits[state.cursor]) : null;
+  const shown = msg.update && cursorShown(); // a sorted update can move the cursor row far away
+  msg.hits.forEach((h, i) => { h.ord = i; }); // best match first: the default order
+  state.hits = sortRows(msg.hits);
   state.lists = msg.lists || [];
   if (msg.update) {
     state.selected = new Set();
-    state.hits.forEach((h, i) => { if (selectedKeys.has(keyOf(h))) state.selected.add(i); });
-    const c = cursorKey ? state.hits.findIndex((h) => keyOf(h) === cursorKey) : -1;
+    state.hits.forEach((h, i) => { if (selectedKeys.has(rowKey(h))) state.selected.add(i); });
+    const c = cursorKey ? state.hits.findIndex((h) => rowKey(h) === cursorKey) : -1;
     state.cursor = c >= 0 ? c : (state.hits.length ? 0 : -1);
   } else {
     state.cursor = state.hits.length ? 0 : -1;
@@ -222,6 +237,7 @@ function onSearchResult(msg) {
   if (state.searching) setSearching(false);
   if (!msg.update) $('#results').scrollTop = 0;
   renderRows(); // also renders the summary
+  if (shown) keepInView(state.cursor); // after renderRows sized the list; scrolling draws again
   if (!msg.update && state.hits.length) $('#results').focus();
 }
 
@@ -253,6 +269,7 @@ function renderRows() {
   const under = browsing && state.browse.under;
   $('#dir-head').textContent = !browsing ? (state.remote === ALL ? 'Server · Folder' : 'Folder')
     : under ? 'Folder' : state.browse.server ? 'Contents' : 'Login';
+  const now = Date.now() / 1000;
   for (let i = first; i < last; ++i) {
     const h = state.hits[i];
     const sel = state.selected.has(i);
@@ -269,10 +286,16 @@ function renderRows() {
     } else {
       third = h.items != null ? `${h.items} item${h.items === 1 ? '' : 's'}` : '';
     }
+    // The date; its title adds the seconds and the age: "2026-10-16 14:32:05 · 3 days ago" (a
+    // date ahead of this PC's clock: "in 2 days").
+    const date = fmtDate(h.modified);
+    const age = now - h.modified;
+    const dateTitle = date ? ` title="${fmtDate(h.modified, true)} · ${age >= 0 ? `${fmtAge(age)} ago` : `in ${fmtAge(-age)}`}"` : '';
     html += `<div class="row${sel ? ' sel' : ''}${i === state.cursor ? ' cursor' : ''}${h.dir ? ' folder' : ''}" data-i="${i}">` +
       `<input type="checkbox" tabindex="-1"${sel ? ' checked' : ''}${h.server ? ' disabled' : ''}>` +
       `<span class="name" title="${esc(h.path || h.name)}">${h.dir ? FOLDER_ICON : ''}${esc(h.name)}</span>` +
       `<span class="size">${fmtSize(h.size)}</span>` +
+      `<span class="modified"${dateTitle}>${date}</span>` +
       `<span class="dir">${third}</span></div>`;
   }
   const rows = $('#rows');
@@ -359,18 +382,177 @@ function setCursor(i, { extend = false, toggle = false, keep = false } = {}) {
     state.anchor = i;
   }
   state.cursor = i;
-  // Keep the cursor row in view.
+  keepInView(i);
+  renderRows();
+}
+
+// Scrolls the list just enough to show row `i`.
+// Whether the cursor row is on screen now: an update that moves it keeps it there, but a list
+// scrolled away from it stays where the user put it.
+function cursorShown() {
+  const list = $('#results');
+  return state.cursor >= 0 && state.cursor * ROW >= list.scrollTop &&
+    (state.cursor + 1) * ROW <= list.scrollTop + list.clientHeight;
+}
+
+function keepInView(i) {
   const list = $('#results');
   const top = i * ROW;
   if (top < list.scrollTop) list.scrollTop = top;
   else if (top + ROW > list.scrollTop + list.clientHeight) list.scrollTop = top + ROW - list.clientHeight;
-  renderRows();
 }
 
 function rowIndex(ev) {
   const row = ev.target.closest('.row');
   return row ? Number(row.dataset.i) : -1;
 }
+
+// A row's identity across a new order or a refreshed list: its server's row in All servers' top,
+// else its server and path.
+function rowKey(h) {
+  return h.server ? `srv:${h.server}` : `${h.remote || ''}|${h.path}`;
+}
+
+// ---- sorting: a click on Name, Size or Modified ------------------------------------------
+
+// The first click's direction: names A to Z, the largest and the newest first. The second click
+// reverses it; the third returns to the default order.
+const SORT_FIRST = { name: 'asc', size: 'desc', modified: 'desc' };
+
+// The column the rows are sorted by, '' for the default order (best match, or folders first A
+// to Z in Browse). No row has a size in Folders mode: a Size sort leaves its rows as they are.
+function sortKey() {
+  return state.sort.key === 'size' && state.mode === 'folder' ? '' : state.sort.key;
+}
+
+// A saved sort from the backend; anything else is the default order.
+function sortFrom(v) {
+  const ok = v && typeof v === 'object' && typeof v.key === 'string' && Object.hasOwn(SORT_FIRST, v.key) &&
+    (v.dir === 'asc' || v.dir === 'desc');
+  return ok ? { key: v.key, dir: v.dir } : { key: '', dir: 'asc' };
+}
+
+// `s` with A to Z in lower case, and nothing else changed (as browse::natural_less compares).
+function asciiLower(s) {
+  return /[A-Z]/.test(s) ? s.replace(/[A-Z]+/g, (m) => m.toLowerCase()) : s;
+}
+
+const isDigit = (c) => c >= 48 && c <= 57; // '0' to '9'
+
+// browse::natural_less as a three-way compare: digit runs as whole numbers ("file 9" before
+// "file 10"), A to Z without case, any other character by code unit. `la` and `lb` are `a` and
+// `b` through asciiLower (the same length).
+function naturalCompare(a, b, la = asciiLower(a), lb = asciiLower(b)) {
+  let i = 0;
+  let j = 0;
+  while (i < la.length && j < lb.length) {
+    const x = la.charCodeAt(i);
+    const y = lb.charCodeAt(j);
+    if (isDigit(x) && isDigit(y)) {
+      // Whole numbers: without leading zeros, the longer one is bigger.
+      let ai = i;
+      let bj = j;
+      while (ai < la.length && la.charCodeAt(ai) === 48) ++ai;
+      while (bj < lb.length && lb.charCodeAt(bj) === 48) ++bj;
+      let ae = ai;
+      let be = bj;
+      while (ae < la.length && isDigit(la.charCodeAt(ae))) ++ae;
+      while (be < lb.length && isDigit(lb.charCodeAt(be))) ++be;
+      if (ae - ai !== be - bj) return (ae - ai) - (be - bj);
+      for (let k = 0; k < ae - ai; ++k) {
+        const d = la.charCodeAt(ai + k) - lb.charCodeAt(bj + k);
+        if (d) return d;
+      }
+      i = ae;
+      j = be;
+      continue;
+    }
+    // Code points, as the backend's UTF-8 byte order has them (UTF-16 units differ above U+FFFF).
+    if (x !== y) return la.codePointAt(i) - lb.codePointAt(j);
+    ++i;
+    ++j;
+  }
+  const rest = (la.length - i) - (lb.length - j);
+  if (rest) return rest;
+  return a < b ? -1 : a > b ? 1 : 0; // only case or leading zeros differ: still a strict order
+}
+
+// The rows in the chosen order, as a new array (`rows` may be the folder's own items). Browse
+// keeps folders above files; rows without a size or date go last both ways; ties keep the
+// default order (`ord`, stamped where the rows arrive).
+function sortRows(rows) {
+  const key = sortKey();
+  if (!key) return rows.slice().sort((x, y) => x.ord - y.ord);
+  const folders = inBrowse();
+  const desc = state.sort.dir === 'desc';
+  // What each row is compared by, worked out once rather than in every comparison.
+  const value = key === 'name' ? (h) => asciiLower(h.name)
+    : key === 'size' ? (h) => (Number.isFinite(h.size) ? h.size : null)
+      : (h) => (Number.isFinite(h.modified) && h.modified > 0 ? h.modified : null);
+  const items = rows.map((h) => ({ h, folder: folders && !!h.dir, v: value(h) }));
+  items.sort((x, y) => {
+    if (x.folder !== y.folder) return x.folder ? -1 : 1;
+    let c = 0;
+    if (key === 'name') c = naturalCompare(x.h.name, y.h.name, x.v, y.v);
+    else if (x.v !== null && y.v !== null) c = x.v - y.v;
+    else if (x.v !== y.v) return x.v === null ? 1 : -1; // unknown last, both ways
+    if (c) return desc ? -c : c;
+    return x.h.ord - y.h.ord;
+  });
+  return items.map((x) => x.h);
+}
+
+// The header's arrow on the sorted column. Size is off in Folders mode, where no row has one.
+function renderSortHead() {
+  const key = sortKey();
+  for (const b of document.querySelectorAll('.results-head [data-sort]')) {
+    if (b.dataset.sort === key) b.dataset.dir = state.sort.dir;
+    else delete b.dataset.dir;
+    b.disabled = b.dataset.sort === 'size' && state.mode === 'folder';
+  }
+}
+
+// The rows in the current order: the selection, cursor and anchor stay on the same rows, and the
+// cursor row in view.
+function resort() {
+  const keyAt = (i) => (state.hits[i] ? rowKey(state.hits[i]) : null);
+  const picked = new Set([...state.selected].map(keyAt));
+  const cursorKey = keyAt(state.cursor);
+  const anchorKey = keyAt(state.anchor);
+  state.hits = sortRows(state.hits);
+  state.selected = new Set();
+  state.cursor = state.anchor = -1;
+  state.hits.forEach((h, i) => {
+    const k = rowKey(h);
+    if (picked.has(k)) state.selected.add(i);
+    if (k === cursorKey && state.cursor < 0) state.cursor = i;
+    if (k === anchorKey && state.anchor < 0) state.anchor = i;
+  });
+  if (state.cursor >= 0) keepInView(state.cursor);
+  renderSortHead();
+  renderRows();
+}
+
+// A click on a column: its first direction, then the other, then the default order; kept in
+// gui.json for the next searches, folders and starts.
+function clickSort(key) {
+  const s = state.sort;
+  if (s.key !== key) state.sort = { key, dir: SORT_FIRST[key] };
+  else if (s.dir === SORT_FIRST[key]) state.sort = { key, dir: s.dir === 'asc' ? 'desc' : 'asc' };
+  else state.sort = { key: '', dir: 'asc' };
+  resort();
+  send({ type: 'prefs', sort: state.sort.key ? { key: state.sort.key, dir: state.sort.dir } : null });
+}
+
+// The mouse leaves the focus where it was (the arrow keys go on moving in the results); Tab
+// reaches the headers, and Enter or Space clicks them.
+$('.results-head').addEventListener('mousedown', (ev) => {
+  if (!ev.target.closest('#select-all')) ev.preventDefault();
+});
+$('.results-head').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-sort]');
+  if (b && !b.disabled) clickSort(b.dataset.sort);
+});
 
 // ---- browse mode: a server's folders -----------------------------------------------------
 
@@ -407,13 +589,13 @@ function filteredItems() {
 // items (a filter change, a refreshed list); `select`: the item with that path (or server)
 // gets the cursor.
 function showFolder({ keep = false, select = null } = {}) {
-  const keyOf = (h) => (h.server ? `srv:${h.server}` : h.path);
-  const picked = keep ? new Set([...state.selected].map((i) => state.hits[i] && keyOf(state.hits[i]))) : new Set();
-  const cursorKey = keep && state.hits[state.cursor] ? keyOf(state.hits[state.cursor]) : null;
-  state.hits = filteredItems();
+  const picked = keep ? new Set([...state.selected].map((i) => state.hits[i] && rowKey(state.hits[i]))) : new Set();
+  const cursorKey = keep && state.hits[state.cursor] ? rowKey(state.hits[state.cursor]) : null;
+  const shown = keep && select === null && cursorShown();
+  state.hits = sortRows(filteredItems());
   state.selected = new Set();
-  state.hits.forEach((h, i) => { if (picked.has(keyOf(h))) state.selected.add(i); });
-  let cursor = cursorKey ? state.hits.findIndex((h) => keyOf(h) === cursorKey) : -1;
+  state.hits.forEach((h, i) => { if (picked.has(rowKey(h))) state.selected.add(i); });
+  let cursor = cursorKey ? state.hits.findIndex((h) => rowKey(h) === cursorKey) : -1;
   if (select !== null) {
     const i = state.hits.findIndex((h) => (h.server ? h.server === select : h.path === select));
     if (i >= 0) {
@@ -434,6 +616,7 @@ function showFolder({ keep = false, select = null } = {}) {
     list.scrollTop = 0;
   }
   renderRows();
+  if (shown && state.cursor >= 0) keepInView(state.cursor);
 }
 
 // Opens a folder: `server` '' is All servers' own top; `top` a server's top. The answer comes
@@ -444,8 +627,8 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   b.under = null;
   if (!server) {
     Object.assign(b, { server: '', path: '', top: true, crumbs: [], error: '', loading: false, source: '' });
-    b.items = state.remotes.map((r) => ({ name: r.name, path: '', dir: true, server: r.name, remote: r.name,
-      info: r.error ? 'misconfigured' : `${r.user}@${r.host}` }));
+    b.items = state.remotes.map((r, i) => ({ name: r.name, path: '', dir: true, server: r.name, remote: r.name,
+      info: r.error ? 'misconfigured' : `${r.user}@${r.host}`, ord: i }));
     remember();
     renderBrowseBar();
     showFolder({ select });
@@ -490,7 +673,8 @@ function onBrowseResult(msg) {
     source: msg.source || '', age: msg.age || 0, refreshing: !!msg.refreshing, listError: msg.listError || '',
     severalRoots: !!msg.severalRoots,
   });
-  b.items = (msg.items || []).map((it) => ({ ...it, remote: msg.remote }));
+  // `ord`: the backend's order (folders first, A to Z), the default one.
+  b.items = (msg.items || []).map((it, i) => ({ ...it, remote: msg.remote, ord: i }));
   if (!b.under) {
     showFolder({ keep: msg.update || b.keepSelection, select: b.pendingSelect });
     if (!msg.error && wasLoading) remember();
@@ -1171,6 +1355,11 @@ function onInit(msg) {
   state.remotes = msg.remotes;
   state.remote = msg.remote;
   state.mode = msg.mode;
+  const sort = sortFrom(msg.sort);
+  if (sort.key !== state.sort.key || sort.dir !== state.sort.dir) {
+    state.sort = sort;
+    resort();
+  }
   state.defaultDest = msg.defaultDest;
   if (msg.parallel) state.parallel = msg.parallel;
   if (msg.browsePaths) state.browsePaths = { ...msg.browsePaths, ...state.browsePaths };
