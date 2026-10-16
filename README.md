@@ -172,6 +172,16 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
   - Changes apply at once. Streams through grab are paced by a shared token bucket, and while
     limited, rclone is told not to read ahead, so the network really follows the limit.
   - A folder's small-file batch gets rclone's `--bwlimit` and counts against the same total.
+- **Verify downloads** (Settings → Downloads, off by default): after each download, the server
+  computes an MD5 checksum of its copy (`md5sum` over SSH, one `rclone check`) and grab compares
+  it with yours. The row shows "Verifying the checksum…", then "checksum verified (MD5)".
+  - Both sides read the file once more: about 3 seconds per GB in tests (898 MiB from a Storage
+    Box and 440 MiB from a VPS each took 3 s; a 13-file, 570 MiB folder 5 s).
+  - A copy that differs is deleted and the download fails; Retry downloads it again. In a
+    folder, only the files that differ are deleted and fetched again.
+  - Files that were already there are not checked, since nothing was downloaded. A server that
+    can't compute checksums leaves the download done, marked "not verified".
+  - The `grab` command follows the same setting (see [Usage](#usage)).
 - **Speed schedule** (Settings → Speed schedule) caps the speed at set times, for example 5
   MiB/s on weekdays from 18:00 to 24:00.
   - Each time has its days, a from–to time and a speed. A time that ends at or before its
@@ -355,6 +365,8 @@ grab config [-c PATH]
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
       --fresh          fetch the server's file list now instead of using a saved one
+      --verify         check each download against the server's checksum (MD5) afterwards;
+      --no-verify      don't. Without either, the setting in grab's window applies (off at first)
       --rclone         download with plain rclone copyto / copy and rclone's own progress
   -n, --dry-run        resolve the target and show what would be fetched (with --rclone: the
                        rclone command); transfers nothing and creates no folders
@@ -406,6 +418,10 @@ grab config [-c PATH]
   - A file already in DEST with the same size, and not older than the server's copy, is not
     fetched again (`already there, nothing fetched`); in a folder, the same goes per file.
   - `--limit` caps all connections together, exactly.
+  - `--verify` (or the window's Verify downloads setting) checks each download against the
+    server's MD5 afterwards: `checksum verified (MD5) in 0:03`. A copy that differs is deleted
+    and grab exits with 6; the same command again downloads it again. `--no-verify` skips the
+    check for one run.
   - Without `--limit`, grab follows the window's [speed schedule](#gui), also mid-download:
     `grab: speed limited to 5 MiB/s until 24:00 by the speed schedule`, and a line at each
     change. `--limit RATE` replaces the schedule, and `--limit off` downloads without a limit.
@@ -413,7 +429,8 @@ grab config [-c PATH]
     minutes apart.
 - `--rclone` downloads with plain `rclone copyto` / `rclone copy` instead, with rclone's own
   progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`, and the
-  speed schedule a weekly `--bwlimit` timetable ("Mon-18:00,5120K Tue-00:00,off ...").
+  speed schedule a weekly `--bwlimit` timetable ("Mon-18:00,5120K Tue-00:00,off ..."). With
+  `--verify`, rclone compares checksums after each transfer itself.
 - Anything after `--` is added to every rclone call grab makes. For speed, use `--limit`
   rather than `-- --bwlimit`, which rclone would apply to each connection separately.
 
@@ -509,6 +526,7 @@ src/cli_download.*  the command's downloads: live progress line, Ctrl+C
 src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
+src/verify.*    checking downloads against the server's checksum (rclone check)
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)

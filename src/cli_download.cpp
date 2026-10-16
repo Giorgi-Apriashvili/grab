@@ -11,6 +11,7 @@
 #include "rclone.hpp"
 #include "schedule.hpp"
 #include "util.hpp"
+#include "verify.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -274,6 +275,7 @@ struct Session {
     engine::CommandHook trace;      // -v
     std::stop_token stop;
     ScheduleFollower* follower = nullptr; // when the speed schedule applies
+    bool verify = false;                  // check downloads against the server's checksum
 };
 
 int fetch_file(const Session& s, const std::string& path, int id) {
@@ -302,11 +304,38 @@ int fetch_file(const Session& s, const std::string& path, int id) {
     case fetch::Outcome::done: {
         if (result.present) {
             s.line.finish("already there, nothing fetched");
-        } else {
-            std::error_code ec;
-            const auto size = std::filesystem::file_size(target, ec);
-            s.line.finish(progress::done(size, size - std::min(before, size), secs));
+            return 0;
         }
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(target, ec);
+        s.line.finish(progress::done(size, size - std::min(before, size), secs));
+        if (!s.verify) return 0;
+        s.line.show("verifying against the server's checksum...", true);
+        const auto check_start = Clock::now();
+        verify::Request base;
+        base.ctx = &s.ctx;
+        base.connections = &s.connections;
+        base.server = s.ctx.settings.name;
+        base.id = id;
+        base.extra = s.opts.extra;
+        base.on_command = s.trace;
+        const auto checked = verify::file(base, path, target, s.stop);
+        if (s.stop.stop_requested()) {
+            s.line.finish("stopped while verifying: the file is complete, but not verified");
+            return proc::exit_stopped;
+        }
+        if (!checked) {
+            s.line.finish("not verified: " + checked.error());
+            return 0;
+        }
+        if (!checked->differ.empty()) {
+            std::filesystem::remove(target, ec); // not the server's file
+            s.line.clear();
+            std::println(stderr, "grab: error: the download {}; it was deleted", verify::summary(*checked, 1));
+            std::println(stderr, "grab: run the same command again to download it again");
+            return exit_download_failed;
+        }
+        s.line.finish(std::format("{} in {}", verify::summary(*checked, 1), progress::duration(seconds_since(check_start))));
         return 0;
     }
     case fetch::Outcome::stopped: {
@@ -374,6 +403,17 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
         already = t.files_done;
     }
     folder::run(job, tree, m, s.stop);
+    // --verify: what this run fetched, against the server's checksums. Copies that differ are
+    // deleted and count as failed below.
+    std::string checked_text;
+    if (s.verify && !s.stop.stop_requested()) {
+        s.line.show("verifying against the server's checksums...", true);
+        const auto check_start = Clock::now();
+        const auto checked = folder::verify_files(job, tree, m, s.stop);
+        if (checked.files > 0 && !s.stop.stop_requested()) {
+            checked_text = std::format("{} in {}", checked.summary(), progress::duration(seconds_since(check_start)));
+        }
+    }
 
     folder::Totals t;
     folder::Outcome o;
@@ -401,6 +441,7 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
     std::string text = progress::done(t.total, t.bytes - std::min(before, t.bytes), seconds_since(start), t.files);
     if (already > 0) text += std::format("; {} {} already there", already, already == 1 ? "was" : "were");
     s.line.finish(text);
+    if (!checked_text.empty()) s.line.finish(checked_text);
     return 0;
 }
 
@@ -467,11 +508,17 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     if (auto note = schedule_note(rules, schedule::local_now())) std::println(stderr, "grab: {}", *note);
     std::optional<ScheduleFollower> follower;
     if (!opts.dry_run && !rules.empty()) follower.emplace(rules, limiter, line);
+    const bool verify = opts.verify.value_or(gui.verify_downloads);
+    if (verify) {
+        std::println(stderr, "grab: downloads are checked against the server's checksum afterwards{}",
+                     opts.verify ? "" : " (the window's setting; --no-verify skips it)");
+    }
 
     StopOnCtrlC ctrl_c;
     Session s{ctx, opts, dest, line, connections, limiter, engine::without_console_progress(ctx.settings.common_flags), {},
               ctrl_c.token()};
     if (follower) s.follower = &*follower;
+    s.verify = verify;
     s.flags.insert(s.flags.end(), opts.extra.begin(), opts.extra.end());
     if (opts.verbose) {
         s.trace = [&line](const std::vector<std::string>& argv) { line.message("+ " + quote::display_cmdline(argv)); };

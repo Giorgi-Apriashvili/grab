@@ -36,6 +36,7 @@ struct GuiState {
     std::map<std::string, std::string> destinations; // remote -> last destination folder
     int parallel = 4;                                // downloads at once, min_parallel..max_parallel
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
+    bool verify_downloads = false;                   // check each download against the server's checksum
     bool limit_on = false;                           // global download speed limit
     double limit_mibps = 5.0;                        // its value, kept while switched off
     // Outside the schedule's times the limit above applies; a change made during them holds
@@ -57,6 +58,8 @@ struct SavedFile {
     std::uint64_t size = 0;
     std::string modtime;
     std::string state = "queued"; // "queued" | "paused" | "done" | "skipped"
+    bool fetched = false;  // done by the download, not found on disk already
+    bool verified = false; // checked against the server's checksum
     bool operator==(const SavedFile&) const = default;
 };
 

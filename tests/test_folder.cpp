@@ -71,7 +71,9 @@ TEST_CASE("a big folder shows its active files and the first few queued") {
 
 TEST_CASE("a folder's files survive a restart in queue.json") {
     SavedDownload d{"hetzner", "folder", "/home/x/Limits", "Limits", "E:\\Learn", 597330609,
-                    {{"a.mp4", 100, "2023-05-06T15:18:12+04:00", "done"},
+                    {{"a.mp4", 100, "2023-05-06T15:18:12+04:00", "done", true, true}, // fetched and verified
+                     {"e.mp4", 50, "", "done", true, false},                            // fetched, not checked yet
+                     {"f.mp4", 60, "", "done"},                                         // was there already
                      {"b.mp4", 200, "", "paused"},
                      {"sub/c.mp4", 300, "", "skipped"},
                      {"d.mp4", 400, "", "queued"}}};

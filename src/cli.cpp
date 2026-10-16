@@ -55,6 +55,8 @@ Options:
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
       --fresh          fetch the server's file list now instead of using a saved one
+      --verify         check each download against the server's checksum (MD5) afterwards;
+      --no-verify      don't. Without either, the setting in grab's window applies (off at first)
       --rclone         download with plain rclone copyto / copy and rclone's own progress
                        instead of grab's resumable download over several connections
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
@@ -161,6 +163,8 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             auto bytes = *v == "off" || *v == "0" ? std::optional<std::uint64_t>(0) : rate::parse_rate(*v);
             if (!bytes) return util::failf("--limit takes a rate like 5M, 800K or 2.5 (MiB/s), or off; got '{}'", *v);
             result.opts.limit = *bytes;
+        } else if (name == "--verify" || name == "--no-verify") {
+            result.opts.verify = name == "--verify";
         } else if (name == "--first") {
             result.opts.first = true;
         } else if (name == "--all") {

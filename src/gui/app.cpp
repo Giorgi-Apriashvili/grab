@@ -7,6 +7,7 @@
 #include "process.hpp"
 #include "quote.hpp"
 #include "util.hpp"
+#include "verify.hpp"
 
 #include <knownfolders.h>
 #include <shellapi.h>
@@ -99,6 +100,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     parallel_ = state_.parallel;
     learned_ = state_.server_limits;
+    verify_downloads_ = state_.verify_downloads;
     // The speed limit that holds now; the first tick() tells the page and drops a change that
     // no longer holds.
     if (const auto applied = current_limit(schedule::local_now()); applied.limit.on) {
@@ -234,6 +236,10 @@ void App::on_message(const std::string& text) {
         const Value* mibps = msg->find("mibps");
         set_limit(bool_of(*msg, "on"),
                   mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps);
+    } else if (type == "setVerify") {
+        state_.verify_downloads = bool_of(*msg, "on");
+        verify_downloads_ = state_.verify_downloads;
+        save_state();
     } else if (type == "setSchedule") {
         if (const Value* rules = msg->find("rules")) set_schedule(*rules);
     } else if (type == "setParallel") {
@@ -317,6 +323,7 @@ void App::send_init() {
     init.set("type", str("init"));
     init.set("version", str(GRAB_VERSION));
     init.set("updateCheck", Value::make_bool(state_.update_check));
+    init.set("verifyDownloads", Value::make_bool(state_.verify_downloads));
     init.set("configPath", str(util::path_to_utf8(config_path_)));
 
     Value remotes = Value::make_array();
@@ -1388,13 +1395,48 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         }
     }, item_stop);
 
-    switch (result.outcome) {
-    case fetch::Outcome::done:
-        return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
-    case fetch::Outcome::failed:
-        return set(Status::failed, result.error, result.note);
-    case fetch::Outcome::stopped:
-        break;
+    if (result.outcome == fetch::Outcome::failed) return set(Status::failed, result.error, result.note);
+    if (result.outcome == fetch::Outcome::done) {
+        // Settings → Downloads: check the copy against the server's checksum.
+        bool check = false;
+        {
+            std::lock_guard lock(mutex_);
+            check = verify_downloads_ && (!result.present || item->verify_pending);
+            if (check) {
+                item->verify_pending = true;
+                item->verifying = true;
+                item->speed = 0;
+                item->eta.reset();
+                item->connections = 0;
+            }
+        }
+        if (!check) return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
+        post_queue();
+        verify::Request base;
+        base.ctx = &*ctx;
+        base.connections = &connections_;
+        base.server = item->remote;
+        base.id = item->id;
+        const auto checked = verify::file(base, item->path, d.target, item_stop);
+        {
+            std::lock_guard lock(mutex_);
+            item->verifying = false;
+            if (!item_stop.stop_requested()) item->verify_pending = false;
+        }
+        if (!item_stop.stop_requested()) {
+            if (!checked) return set(Status::done, {}, "not verified: " + checked.error());
+            if (!checked->differ.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(d.target, ec); // not the server's file
+                {
+                    std::lock_guard lock(mutex_);
+                    item->bytes = 0; // starts over: the row offers Retry, not Resume
+                }
+                return set(Status::failed, std::format("The downloaded copy {}, so it was deleted. Retry downloads it again.",
+                                                       verify::summary(*checked, 1)));
+            }
+            return set(Status::done, {}, verify::summary(*checked, 1));
+        }
     }
     StopReason reason{};
     {
@@ -1476,6 +1518,28 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     folder::mark_existing(job, item->tree, mutex_);
     folder::run(job, item->tree, mutex_, item_stop);
 
+    // Settings → Downloads: check what this download fetched against the server's checksums.
+    std::string checked_note;
+    if (!item_stop.stop_requested() && verify_downloads_) {
+        bool any = false;
+        {
+            std::lock_guard lock(mutex_);
+            any = std::ranges::any_of(item->tree.files, [](const folder::File& f) {
+                return f.status == folder::State::done && f.fetched && !f.verified;
+            });
+            item->verifying = any;
+        }
+        if (any) {
+            post_queue();
+            const auto checked = folder::verify_files(job, item->tree, mutex_, item_stop);
+            {
+                std::lock_guard lock(mutex_);
+                item->verifying = false;
+            }
+            if (checked.files > 0 && !item_stop.stop_requested()) checked_note = checked.summary();
+        }
+    }
+
     bool cancelled = false;
     {
         std::lock_guard lock(mutex_);
@@ -1489,6 +1553,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
         } else {
             // Files paused one by one keep the folder paused until they are resumed or skipped.
             item->status = o.waiting > 0 ? Status::paused : Status::done;
+            if (!checked_note.empty()) item->note = checked_note;
         }
     }
     if (cancelled) {
@@ -1517,6 +1582,7 @@ json::Value App::queue_snapshot() const {
         v.set("error", str(i->error));
         v.set("note", str(i->note));
         v.set("connections", num(i->connections));
+        if (i->verifying) v.set("verifying", Value::make_bool(true));
         v.set("priority", str(priority_name(i->weight.load())));
         if (i->status == Status::queued) v.set("position", num(++waiting_position)); // "Queued · #2"
         if (i->mode == Mode::folder && i->tree.listed) {
@@ -1596,6 +1662,8 @@ void App::restore_queue() {
                            : f.state == "skipped" ? folder::State::skipped
                            : f.state == "paused"  ? folder::State::paused
                                                   : folder::State::queued;
+                c.fetched = f.fetched;
+                c.verified = f.verified;
                 if (c.status == folder::State::done) c.bytes = c.size;
                 else if (c.big) {
                     if (auto p = fetch::saved_progress(dir / util::path_from_utf8(c.path))) c.bytes = p->first;
@@ -1623,7 +1691,8 @@ void App::save_queue() const {
                                     : c.status == folder::State::skipped ? "skipped"
                                     : c.status == folder::State::paused  ? "paused"
                                                                          : "queued"; // running and failed retry
-                d.files.push_back(SavedFile{c.path, c.size, c.modtime, state});
+                const bool done = c.status == folder::State::done;
+                d.files.push_back(SavedFile{c.path, c.size, c.modtime, state, done && c.fetched, done && c.verified});
             }
             unfinished.push_back(std::move(d));
         }

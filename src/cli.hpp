@@ -21,6 +21,7 @@ struct Options {
     std::optional<int> depth;
     // --limit: download speed cap in bytes per second; 0 = off. Without it, the speed schedule.
     std::optional<std::uint64_t> limit;
+    std::optional<bool> verify;      // --verify / --no-verify; without either, the window's setting
     bool first = false;
     bool all = false;                // --all: take every match without asking
     bool exact = false;              // --exact: whole-name, case-sensitive matching

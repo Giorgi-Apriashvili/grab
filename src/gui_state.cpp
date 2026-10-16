@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <utility>
 
 namespace grab {
 
@@ -42,6 +43,9 @@ GuiState parse_gui_state(std::string_view json_text) {
         }
     }
     if (auto p = number(doc->find("parallel"))) s.parallel = std::clamp(*p, min_parallel, max_parallel);
+    if (const auto* on = doc->find("verifyDownloads"); on != nullptr && on->kind == json::Value::Kind::boolean) {
+        s.verify_downloads = on->boolean;
+    }
     if (const auto* on = doc->find("limitOn"); on != nullptr && on->kind == json::Value::Kind::boolean) {
         s.limit_on = on->boolean;
     }
@@ -99,6 +103,7 @@ std::string gui_state_to_json(const GuiState& state) {
     for (const auto& [remote, path] : state.destinations) dest.set(remote, Value::make_string(path));
     root.set("destinations", std::move(dest));
     root.set("parallel", Value::make_number(state.parallel));
+    root.set("verifyDownloads", Value::make_bool(state.verify_downloads));
     root.set("limitOn", Value::make_bool(state.limit_on));
     root.set("limitMiBps", Value::make_number(state.limit_mibps));
     root.set("speedSchedule", schedule::to_json(state.speed_schedule));
@@ -168,6 +173,10 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
                 sf.modtime = f.string_of("modtime").value_or("");
                 const auto state = f.string_of("state").value_or("queued");
                 sf.state = state == "paused" || state == "done" || state == "skipped" ? state : "queued";
+                for (auto [key, flag] : {std::pair{"fetched", &sf.fetched}, std::pair{"verified", &sf.verified}}) {
+                    const auto* b = f.find(key);
+                    *flag = b != nullptr && b->kind == json::Value::Kind::boolean && b->boolean;
+                }
                 d.files.push_back(std::move(sf));
             }
         }
@@ -197,6 +206,8 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
                 fv.set("size", Value::make_number(static_cast<double>(f.size)));
                 fv.set("modtime", Value::make_string(f.modtime));
                 fv.set("state", Value::make_string(f.state));
+                if (f.fetched) fv.set("fetched", Value::make_bool(true));
+                if (f.verified) fv.set("verified", Value::make_bool(true));
                 files.push(std::move(fv));
             }
             v.set("files", std::move(files));

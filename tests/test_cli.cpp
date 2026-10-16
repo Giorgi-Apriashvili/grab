@@ -106,6 +106,13 @@ TEST_CASE("--limit takes a speed like rclone's --bwlimit") {
     CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value()); // the speed schedule decides
 }
 
+TEST_CASE("--verify and --no-verify override the window's setting for one run") {
+    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.verify.has_value());
+    CHECK(parse_args(args({"movie.mkv", "--verify"}))->opts.verify == true);
+    CHECK(parse_args(args({"movie.mkv", "--no-verify"}))->opts.verify == false);
+    CHECK(parse_args(args({"movie.mkv", "--no-verify", "--verify"}))->opts.verify == true); // the last one wins
+}
+
 TEST_CASE("--rclone downloads with plain rclone, as before") {
     auto r = parse_args(args({"movie.mkv", "--rclone"}));
     REQUIRE(r.has_value());

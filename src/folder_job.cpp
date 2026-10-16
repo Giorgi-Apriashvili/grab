@@ -11,6 +11,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #ifdef _WIN32
@@ -110,6 +111,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
                 auto& f = tree.files[it->second];
                 if (!f.in_batch || (f.status != State::queued && f.status != State::running)) return;
                 f.status = State::done;
+                f.fetched = true;
                 f.bytes = f.size;
                 f.speed = 0;
                 f.eta.reset();
@@ -135,6 +137,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
             const auto local = dir / util::path_from_utf8(f.path);
             if (fs::file_size(local, ec) == f.size && !ec) {
                 f.status = State::done;
+                f.fetched = true;
                 f.bytes = f.size;
             } else {
                 f.status = State::failed;
@@ -211,6 +214,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                 switch (result.outcome) {
                 case fetch::Outcome::done:
                     f.status = State::done;
+                    f.fetched = f.fetched || !result.present;
                     f.bytes = f.size;
                     break;
                 case fetch::Outcome::failed:
@@ -458,6 +462,59 @@ void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
         }
     }
     notify(job, Event::changed);
+}
+
+std::string Checked::summary() const {
+    if (!error.empty()) return "not verified: " + error;
+    return verify::summary(report, files, true);
+}
+
+Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
+    Checked c;
+    verify::Request r;
+    {
+        std::lock_guard lock(m);
+        for (const auto& f : tree.files) {
+            if (f.status == State::done && f.fetched && !f.verified) r.paths.push_back(f.path);
+        }
+    }
+    if (r.paths.empty()) return c;
+    c.files = r.paths.size();
+    r.ctx = job.ctx;
+    r.remote_dir = job.remote_path;
+    r.local_dir = local_dir(job.dest, job.remote_path);
+    r.extra = job.extra;
+    r.connections = job.connections;
+    r.server = job.server;
+    r.id = job.id;
+    r.many = true;
+    r.on_command = job.on_command;
+    auto report = verify::run(r, stop);
+    if (!report) {
+        c.error = report.error();
+        return c;
+    }
+    c.report = std::move(*report);
+    {
+        std::lock_guard lock(m);
+        const std::unordered_set<std::string> differ(c.report.differ.begin(), c.report.differ.end());
+        const std::unordered_set<std::string> same(c.report.same.begin(), c.report.same.end());
+        for (auto& f : tree.files) {
+            if (f.status != State::done || !f.fetched || f.verified) continue;
+            if (differ.contains(f.path)) {
+                std::error_code ec;
+                fs::remove(r.local_dir / util::path_from_utf8(f.path), ec); // not the server's file
+                f.status = State::failed;
+                f.error = "differs from the server's copy; deleted";
+                f.fetched = false;
+                f.bytes = 0;
+            } else if (same.contains(f.path)) {
+                f.verified = true;
+            }
+        }
+    }
+    notify(job, Event::changed);
+    return c;
 }
 
 } // namespace grab::folder

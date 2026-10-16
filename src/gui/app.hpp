@@ -133,6 +133,10 @@ private:
         // Running or queued when an update decided to restart grab-gui: saved to continue by
         // itself afterwards (it may be paused by the shutdown before the last save).
         bool resume_mark = false;
+        // Being checked against the server's checksum; a file whose check was stopped (paused)
+        // is checked when it resumes, although it is complete on disk.
+        bool verifying = false;
+        bool verify_pending = false;
         folder::Tree tree; // folders: their files once listed (under mutex_)
     };
 
@@ -237,6 +241,7 @@ private:
     GuiState state_;
     fetch::Connections connections_;
     rate::RateLimiter limiter_; // shared by every download's streams
+    std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers
     std::string limit_posted_;  // the last "limit" message, so only changes are sent
 
     struct LastSearch {

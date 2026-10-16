@@ -2,7 +2,7 @@
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
-//                 setParallel, setLimit, setSchedule, moveItem, setPriority, clearFinished, openFolder,
+//                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder,
 //                 pauseChild, resumeChild, skipChild,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
@@ -480,12 +480,14 @@ function renderQueue() {
     el.querySelector('.q-name').textContent = q.mode === 'folder' ? `${q.name}/` : q.name;
     el.querySelector('.q-name').title = `${q.remote}:${q.path}`;
     const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;
-    el.querySelector('.q-bar > div').style.width = `${q.status === 'done' ? 100 : pct}%`;
+    el.querySelector('.q-bar > div').style.width = `${q.status === 'done' || q.verifying ? 100 : pct}%`;
     const sizes = q.total ? `${fmtSize(q.bytes)} of ${fmtSize(q.total)}` : fmtSize(q.bytes);
     // A listed folder counts its files: "12 of 40 files · 2.1 of 5.6 GiB".
     const files = q.files ? `${q.files.done} of ${q.files.total - q.files.skipped} files · ` : '';
     let meta = '';
-    if (q.status === 'running') {
+    if (q.status === 'running' && q.verifying) {
+      meta = `${files}Verifying the checksum…`;
+    } else if (q.status === 'running') {
       meta = files + sizes;
       if (q.speed > 0) meta += ` · ${fmtSize(q.speed)}/s`;
       const eta = fmtEta(q.eta);
@@ -657,6 +659,7 @@ function onInit(msg) {
   if (msg.limit) onLimit(msg.limit);
   $('#version').textContent = `v${msg.version}`;
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
+  if (typeof msg.verifyDownloads === 'boolean') $('#verify-on').checked = msg.verifyDownloads;
   renderRemotes();
   renderMode();
   renderRows();
@@ -718,6 +721,7 @@ $('#update-banner').addEventListener('click', (ev) => {
 });
 
 $('#update-auto').addEventListener('change', (ev) => send({ type: 'setUpdateCheck', on: ev.target.checked }));
+$('#verify-on').addEventListener('change', (ev) => send({ type: 'setVerify', on: ev.target.checked }));
 
 $('#refresh-lists').addEventListener('click', () => {
   send({ type: 'refreshLists', remote: state.remote });
@@ -980,6 +984,7 @@ function renderServers() {
   list.hidden = !!settings.form;
   $('#updates-panel').hidden = !!settings.form;
   $('#schedule-panel').hidden = !!settings.form;
+  $('#downloads-panel').hidden = !!settings.form;
   $('#server-form').hidden = !settings.form;
   renderStatus();
   if (settings.form) return;

@@ -13,6 +13,7 @@
 #include "fetch.hpp"
 #include "folder.hpp"
 #include "rate.hpp"
+#include "verify.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -44,6 +45,8 @@ struct File {
     std::stop_source stop; // a running big file's own stop
     StopReason stop_reason = StopReason::none;
     bool in_batch = false; // in the running batch: queued until rclone starts it, then running
+    bool fetched = false;  // done by this download, not found on disk already
+    bool verified = false; // checked against the server's checksum (verify_files)
 };
 [[nodiscard]] File make_file(std::string path, std::uint64_t size, std::string modtime);
 
@@ -125,5 +128,16 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m);
 // Fetches the queued files until none is left or `stop`. Files still running at a stop are
 // queued again, ready for the next run.
 void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop);
+
+// After run(): checks the files this download fetched, and has not checked yet, against the
+// server's checksums in one rclone check. Copies that differ are deleted and marked failed, so a
+// retry fetches them again.
+struct Checked {
+    std::size_t files = 0; // checked; 0 when there was nothing to check
+    verify::Report report;
+    std::string error;     // the check could not run
+    [[nodiscard]] std::string summary() const; // for the row and the command
+};
+[[nodiscard]] Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop);
 
 } // namespace grab::folder

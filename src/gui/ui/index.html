@@ -96,6 +96,21 @@
       </div>
     </section>
 
+    <section id="downloads-panel" class="updates-panel">
+      <div class="updates-row">
+        <span class="section-title">Downloads</span>
+        <label class="switch">
+          <input id="verify-on" type="checkbox" role="switch">
+          <span class="track" aria-hidden="true"></span>
+          <span>Verify downloads against the server's checksum</span>
+        </label>
+      </div>
+      <div class="hint">After each download, the server computes an MD5 checksum of its copy and grab
+        compares it with yours, here and in the grab command. Both sides read the file once more: about
+        3 seconds per GB in tests. A copy that differs is deleted and the download fails, so Retry gets it
+        again.</div>
+    </section>
+
     <section id="schedule-panel" class="updates-panel schedule-panel">
       <div class="updates-row">
         <span class="section-title">Speed schedule</span>

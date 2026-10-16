@@ -379,7 +379,7 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .rule .next-day { font-size: 12px; min-width: 50px; }
 .rule .next-day.off { visibility: hidden; } /* keeps its place, so the rows line up */
 .rule .icon-btn { width: 26px; height: 26px; }
-.schedule-panel .hint { margin-top: 8px; max-width: 720px; }
+.schedule-panel .hint, #downloads-panel .hint { margin-top: 8px; max-width: 720px; }
 .server {
   padding: 10px 12px;
   background: var(--panel);

@@ -21,6 +21,7 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.limit_mibps = 2.5;
     s.speed_schedule = {{0x1F, 18 * 60, 0, 5}, {0x60, 22 * 60, 6 * 60, 2.5}};
     s.limit_change = schedule::Override{{false, 5}, 5, 1760003600};
+    s.verify_downloads = true;
     s.update_check = false;
     s.last_update_check = 1760000000;
     s.latest_version = "0.7.0";
@@ -28,6 +29,7 @@ TEST_CASE("gui state round-trips through JSON and a file") {
 
     CHECK(parse_gui_state(gui_state_to_json(s)) == s);
     CHECK(parse_gui_state("{}").update_check); // on unless switched off
+    CHECK_FALSE(parse_gui_state("{}").verify_downloads); // off unless switched on
 
     const auto file = std::filesystem::temp_directory_path() / "grab_test_gui" / "gui.json";
     std::filesystem::remove_all(file.parent_path());
