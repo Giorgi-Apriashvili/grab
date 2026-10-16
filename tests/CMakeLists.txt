@@ -37,6 +37,7 @@ add_executable(grab_tests
     test_secrets.cpp
     test_schedule.cpp
     test_verify.cpp
+    test_browse.cpp
     test_update.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)
