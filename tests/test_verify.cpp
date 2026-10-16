@@ -31,14 +31,6 @@ TEST_CASE("which checksum rclone compared, from its log") {
     CHECK(verify::unhashed(log) == 0);
 }
 
-TEST_CASE("the server folder a file is checked in") {
-    CHECK(verify::remote_parent("/home/dragon/a.mkv") == "/home/dragon");
-    CHECK(verify::remote_parent("movies/x/a.avi") == "movies/x");
-    CHECK(verify::remote_parent("a.avi").empty()); // the login's home
-    CHECK(verify::remote_parent("/a.avi") == "/");
-    CHECK(verify::remote_parent("movies/x/") == "movies");
-}
-
 TEST_CASE("the check asks the server for checksums, whatever the common flags say") {
     engine::Context ctx;
     ctx.config.rclone = "rclone";

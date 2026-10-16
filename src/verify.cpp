@@ -1,5 +1,6 @@
 #include "verify.hpp"
 
+#include "listing.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
 #include "server_ops.hpp"
@@ -76,14 +77,6 @@ std::size_t unhashed(std::string_view log) {
     std::size_t n = 0;
     for (std::size_t i = start; i < at; ++i) n = n * 10 + static_cast<std::size_t>(log[i] - '0');
     return n;
-}
-
-std::string remote_parent(std::string_view remote_path) {
-    while (remote_path.size() > 1 && remote_path.back() == '/') remote_path.remove_suffix(1);
-    const auto slash = remote_path.rfind('/');
-    if (slash == std::string_view::npos) return "";
-    if (slash == 0) return "/";
-    return std::string(remote_path.substr(0, slash));
 }
 
 std::vector<std::string> check_argv(const Request& r, const fs::path& list_file, int connections) {
@@ -176,7 +169,7 @@ std::expected<Report, std::string> file(Request base, const std::string& remote_
     // rclone check pairs files by name, so the copy must carry the server's.
     const std::string name = remote_basename(remote_path);
     if (util::path_from_utf8(name) != target.filename()) return util::fail("the copy has another name than the server's file");
-    base.remote_dir = remote_parent(remote_path);
+    base.remote_dir = parent_of(remote_path);
     base.local_dir = target.parent_path();
     base.paths = {name};
     base.many = false;

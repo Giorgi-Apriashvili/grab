@@ -32,8 +32,6 @@ struct Line {
 [[nodiscard]] std::string hash_used(std::string_view log);
 [[nodiscard]] std::size_t unhashed(std::string_view log);
 
-[[nodiscard]] std::string remote_parent(std::string_view remote_path); // "/a/b/c" -> "/a/b", "c" -> ""
-
 struct Request {
     const engine::Context* ctx = nullptr;
     std::string remote_dir;           // the server folder the paths are relative to
