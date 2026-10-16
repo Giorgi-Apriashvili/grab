@@ -2,7 +2,7 @@
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, browseAt, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
-//                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder,
+//                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 pauseChild, resumeChild, skipChild,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
@@ -521,6 +521,17 @@ function browseUp() {
 // A search hit's folder, from the Files or Folders results: Browse opens it with the hit picked.
 function openHitFolder(h) {
   const server = h.remote || state.remote;
+  if (inBrowse() && state.browse.under) {
+    // From the results of a search below a folder: they close, and so does their query.
+    if (state.searching) {
+      send({ type: 'cancelSearch' });
+      setSearching(false);
+    }
+    state.searchId += 1;
+    state.lists = [];
+    renderListStatus();
+    $('#query').value = '';
+  }
   switchMode('browse', false);
   if (state.remote === ALL) state.browsePaths[ALL] = server;
   browseTo(server, parentOf(h.path), false, { select: h.path });
@@ -628,6 +639,169 @@ $('#query').addEventListener('keydown', (ev) => {
   if (!inBrowse() || ev.key !== 'Escape') return;
   if (state.browse.under) { ev.preventDefault(); closeBelow(); }
   else if ($('#query').value) { ev.preventDefault(); $('#query').value = ''; showFolder({ keep: true }); }
+});
+
+// ---- right-click menus -------------------------------------------------------------------
+
+let menuItems = null;  // the open menu's entries
+let menuReturn = null; // where the focus goes back to
+
+// items: { label, act, key, disabled, checked } entries, '-' for a separator, { heading }.
+// `checked` true or false makes an entry one of a group (a check mark on the current one).
+function showMenu(x, y, items) {
+  const menu = $('#menu');
+  menuItems = items;
+  menuReturn = document.activeElement;
+  menu.innerHTML = items.map((it, i) => {
+    if (it === '-') return '<hr>';
+    if (it.heading) return `<div class="heading">${esc(it.heading)}</div>`;
+    const radio = it.checked !== undefined;
+    return `<button type="button" role="${radio ? 'menuitemradio' : 'menuitem'}" data-i="${i}"` +
+      `${radio ? ` aria-checked="${it.checked}"` : ''}${it.disabled ? ' disabled' : ''}>` +
+      `<span class="check">${it.checked ? '✓' : ''}</span><span class="text">${esc(it.label)}</span>` +
+      `${it.key ? `<span class="key">${esc(it.key)}</span>` : ''}</button>`;
+  }).join('');
+  menu.hidden = false;
+  // Inside the window: to the left of the pointer near the right edge, above it near the bottom.
+  const r = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 4))}px`;
+  menu.style.top = `${Math.max(4, y + r.height > innerHeight - 4 ? y - r.height : y)}px`;
+  const first = menu.querySelector('button:not(:disabled)');
+  if (first) first.focus();
+}
+
+function closeMenu(restoreFocus = false) {
+  const menu = $('#menu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  menu.innerHTML = '';
+  menuItems = null;
+  if (restoreFocus && menuReturn) menuReturn.focus();
+  menuReturn = null;
+}
+
+$('#menu').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-i]');
+  if (!b || b.disabled) return;
+  const it = menuItems[Number(b.dataset.i)];
+  closeMenu(true);
+  it.act();
+});
+$('#menu').addEventListener('keydown', (ev) => {
+  const buttons = [...$('#menu').querySelectorAll('button:not(:disabled)')];
+  const at = buttons.indexOf(document.activeElement);
+  const n = buttons.length;
+  let to = -1;
+  if (ev.key === 'ArrowDown') to = (at + 1) % n;
+  else if (ev.key === 'ArrowUp') to = (at + n - 1) % n;
+  else if (ev.key === 'Home') to = 0;
+  else if (ev.key === 'End') to = n - 1;
+  if (to >= 0) {
+    buttons[to].focus();
+  } else if (ev.key === 'Escape' || ev.key === 'Tab' || (ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
+    closeMenu(true);
+  } else {
+    return; // Enter and Space press the focused entry
+  }
+  ev.preventDefault();
+  ev.stopPropagation(); // not also the window's keys (Escape closes Settings, say)
+});
+document.addEventListener('mousedown', (ev) => { if (!ev.target.closest('#menu')) closeMenu(); }, true);
+document.addEventListener('wheel', () => closeMenu(), { passive: true });
+window.addEventListener('blur', () => closeMenu());
+window.addEventListener('resize', () => closeMenu());
+
+function copyText(lines) {
+  send({ type: 'copyText', text: lines.join('\n') });
+}
+
+// The rows a menu acts on: the selection, or the row under the cursor.
+function menuRows() {
+  const idx = state.selected.size ? [...state.selected].sort((a, b) => a - b) : (state.cursor >= 0 ? [state.cursor] : []);
+  return idx.map((i) => state.hits[i]).filter(Boolean);
+}
+
+// A search result or Browse row: open, download, show it in Browse, copy its path or name.
+function resultMenu() {
+  const rows = menuRows();
+  const one = rows.length === 1 ? rows[0] : null;
+  if (one && one.server) return [{ label: 'Open', key: 'Enter', act: () => openRow(one) }];
+  const picks = rows.filter((h) => !h.server);
+  if (!picks.length) return [];
+  const opens = inBrowse() && one && one.dir;
+  const items = [];
+  if (opens) items.push({ label: 'Open', key: 'Enter', act: () => openRow(one) });
+  items.push({ label: picks.length > 1 ? `Download ${picks.length}` : 'Download', key: opens ? '' : 'Enter',
+    act: () => download(picks) });
+  // In a Browse folder the row is already where it lives.
+  if (one && (!inBrowse() || state.browse.under)) items.push({ label: 'Show in Browse', act: () => openHitFolder(one) });
+  items.push('-');
+  items.push({ label: picks.length > 1 ? `Copy ${picks.length} paths` : 'Copy path', act: () => copyText(picks.map((h) => h.path)) });
+  items.push({ label: picks.length > 1 ? `Copy ${picks.length} names` : 'Copy name', act: () => copyText(picks.map((h) => h.name)) });
+  return items;
+}
+
+$('#rows').addEventListener('contextmenu', (ev) => {
+  if (rowIndex(ev) < 0) return;
+  ev.preventDefault();
+  const items = resultMenu();
+  if (items.length) showMenu(ev.clientX, ev.clientY, items);
+});
+
+// Where a download lands on this PC: DEST\<name>, and a folder's files below that.
+function localPath(q, child) {
+  const base = `${q.dest.replace(/[\\/]+$/, '')}\\${q.name}`;
+  return child ? `${base}\\${child.replace(/\//g, '\\')}` : base;
+}
+
+// A download: pause, resume or retry, cancel, priority, move to the top, show it, copy its path.
+function queueMenu(q) {
+  const items = [];
+  const active = ['queued', 'running', 'paused'].includes(q.status);
+  if (q.status === 'queued' || q.status === 'running') items.push({ label: 'Pause', act: () => send({ type: 'pauseItem', id: q.id }) });
+  if (q.status === 'paused') items.push({ label: 'Resume', act: () => send({ type: 'resumeItem', id: q.id }) });
+  if (q.status === 'failed' || q.status === 'cancelled') {
+    items.push({ label: q.status === 'failed' && q.bytes > 0 ? 'Resume' : 'Retry', act: () => send({ type: 'retryItem', id: q.id }) });
+  }
+  if (active || q.status === 'failed') items.push({ label: 'Cancel', act: () => send({ type: 'cancelItem', id: q.id }) });
+  if (active || q.status === 'failed') {
+    items.push('-', { heading: 'Priority' });
+    for (const [p, label] of [['high', 'High'], ['normal', 'Normal'], ['low', 'Low']]) {
+      items.push({ label, checked: q.priority === p, act: () => send({ type: 'setPriority', id: q.id, priority: p }) });
+    }
+  }
+  if (q.status === 'queued' || q.status === 'paused') {
+    const first = state.queue[0] && state.queue[0].id === q.id;
+    items.push('-', { label: 'Move to top', disabled: first, act: () => send({ type: 'moveItem', id: q.id, before: state.queue[0].id }) });
+  }
+  items.push('-');
+  items.push({ label: 'Show in folder', act: () => send({ type: 'openFolder', id: q.id }) });
+  items.push({ label: 'Copy path', act: () => copyText([localPath(q)]) });
+  return items;
+}
+
+// A file of a folder download: its own pause, resume and skip, and its path.
+function childMenu(q, path) {
+  const c = (q.children || []).find((x) => x.path === path);
+  const items = [];
+  if (c) {
+    const act = (type) => () => send({ type, id: q.id, path });
+    if (c.status === 'paused') items.push({ label: 'Resume', act: act('resumeChild') });
+    else if (c.status !== 'failed') items.push({ label: 'Pause', act: act('pauseChild') });
+    items.push({ label: 'Skip', act: act('skipChild') }, '-');
+  }
+  items.push({ label: 'Copy path', act: () => copyText([localPath(q, path)]) });
+  return items;
+}
+
+$('#queue').addEventListener('contextmenu', (ev) => {
+  const el = ev.target.closest('.q-item');
+  if (!el) return;
+  const q = state.queue.find((x) => x.id === Number(el.dataset.id));
+  if (!q) return;
+  ev.preventDefault();
+  const child = ev.target.closest('.q-child[data-path]');
+  showMenu(ev.clientX, ev.clientY, child ? childMenu(q, child.dataset.path) : queueMenu(q));
 });
 
 // ---- downloads ---------------------------------------------------------------------------
@@ -1583,6 +1757,13 @@ $('#rows').addEventListener('mousedown', (ev) => {
   const i = rowIndex(ev);
   if (i < 0) return;
   ev.preventDefault();
+  if (ev.button === 2) {
+    // As in Explorer: a row outside the selection becomes the selection; inside, it stays.
+    $('#results').focus();
+    if (state.selected.has(i)) setCursor(i, { keep: true });
+    else setCursor(i);
+    return;
+  }
   const go = ev.target.closest('[data-go]');
   if (go && ev.button === 0) { openHitFolder(state.hits[Number(go.dataset.go)]); return; }
   $('#results').focus();
@@ -1631,6 +1812,12 @@ $('#results').addEventListener('keydown', (ev) => {
     ev.preventDefault();
     state.hits.forEach((_, i) => state.selected.add(i));
     renderRows();
+  } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
+    ev.preventDefault();
+    const row = document.querySelector(`#rows .row[data-i="${state.cursor}"]`);
+    if (!row) return;
+    const r = row.getBoundingClientRect();
+    showMenu(r.left + 40, r.bottom, resultMenu());
   } else if (ev.key === 'Enter') {
     ev.preventDefault();
     // Browse: Enter opens the folder under the cursor, unless several rows are picked.

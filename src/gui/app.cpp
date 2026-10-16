@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <iterator>
@@ -267,6 +268,8 @@ void App::on_message(const std::string& text) {
     } else if (type == "pickFile") {
         std::wstring current = util::to_wide(msg->string_of("current").value_or(""));
         host_.defer([this, current = std::move(current)] { pick_file(current); });
+    } else if (type == "copyText") {
+        copy_text(msg->string_of("text").value_or(""));
     } else if (type == "openConfig") {
         open_config();
     } else if (type == "servers") {
@@ -1466,6 +1469,27 @@ void App::open_item_folder(int id) {
         ShellExecuteW(host_.hwnd, L"open", target.parent_path().c_str(), nullptr, nullptr,
                       SW_SHOWNORMAL);
     }
+}
+
+void App::copy_text(const std::string& text) const {
+    std::wstring w;
+    for (const wchar_t c : util::to_wide(text)) {
+        if (c == L'\n') w += L'\r';
+        w += c;
+    }
+    if (!OpenClipboard(host_.hwnd)) return;
+    EmptyClipboard();
+    const std::size_t bytes = (w.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* p = GlobalLock(mem)) {
+            std::memcpy(p, w.c_str(), bytes);
+            GlobalUnlock(mem);
+            if (SetClipboardData(CF_UNICODETEXT, mem) == nullptr) GlobalFree(mem); // else the clipboard owns it
+        } else {
+            GlobalFree(mem);
+        }
+    }
+    CloseClipboard();
 }
 
 void App::worker_loop(std::stop_token stop) {

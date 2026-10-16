@@ -152,6 +152,13 @@ mode and destination per server in `%APPDATA%\grab\gui.json`.
     after a restart. A search result's folder (the Folder column) opens it in Browse with the
     result picked.
 
+- **Right-click menus:**
+  - **On a result or Browse row:** Open (folders), Download, Show in Browse, Copy path (the
+    server path) and Copy name. With several rows selected, they act on all of them.
+  - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move to top, Show in folder and
+    Copy path (where it lands on this PC). A file inside a folder download has Pause, Resume,
+    Skip and Copy path.
+  - Shift+F10 or the menu key opens the menu for the row under the cursor.
 - **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4. Each
   one can be paused, resumed or cancelled, or all together with Pause all / Resume all and
   Cancel all.

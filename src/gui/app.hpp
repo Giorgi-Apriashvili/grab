@@ -215,6 +215,7 @@ private:
     void pick_folder(std::wstring current);
     void pick_file(std::wstring current);
     void open_item_folder(int id);
+    void copy_text(const std::string& text) const; // to the Windows clipboard, lines ending in CR LF
     void open_config() const;
 
     // Settings: server operations run one at a time on settings_thread_.
