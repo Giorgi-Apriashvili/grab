@@ -59,11 +59,13 @@ TokenBucket::Clock::duration TokenBucket::take(std::uint64_t n, Clock::time_poin
     if (rate_ == 0) return Clock::duration::zero();
     refill(now);
     const double need = static_cast<double>(n);
-    if (tokens_ >= need) {
+    // A request asked for under a higher rate can exceed the bucket after the rate was lowered:
+    // it passes once the bucket is full, leaving it in debt, rather than never.
+    if (tokens_ >= need || tokens_ >= burst()) {
         tokens_ -= need;
         return Clock::duration::zero();
     }
-    const double seconds = (need - tokens_) / static_cast<double>(rate_);
+    const double seconds = (std::min(need, burst()) - tokens_) / static_cast<double>(rate_);
     return std::max<Clock::duration>(std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds)),
                                      std::chrono::microseconds(100));
 }

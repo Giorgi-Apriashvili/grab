@@ -36,8 +36,9 @@ public:
     [[nodiscard]] std::uint64_t rate() const { return rate_; }
     [[nodiscard]] double burst() const;
 
-    // Takes `n` bytes (n <= burst()) when available and returns zero; otherwise takes nothing
-    // and returns how long until they will be.
+    // Takes `n` bytes when available and returns zero; otherwise takes nothing and returns how
+    // long until they will be. More than burst() (asked for before the rate was lowered) passes
+    // once the bucket is full, leaving it in debt.
     [[nodiscard]] Clock::duration take(std::uint64_t n, Clock::time_point now);
     // Bytes that moved without asking (an rclone batch capped by its own --bwlimit).
     void debit(std::uint64_t n, Clock::time_point now);

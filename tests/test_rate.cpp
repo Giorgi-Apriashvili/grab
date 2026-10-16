@@ -70,6 +70,26 @@ TEST_CASE("bytes moved elsewhere slow the rest down, and unlimited never waits")
     CHECK(b.take(100 * MiB, t) == Clock::duration::zero());
 }
 
+TEST_CASE("a request asked for before the rate was lowered still passes, and is paid back") {
+    rate::TokenBucket b;
+    auto t = Clock::time_point{} + 100s;
+    b.set_rate(6 * MiB, t);
+    t += 1s;
+    CHECK(b.take(MiB, t) == Clock::duration::zero());
+    b.set_rate(3 * MiB / 2, t); // the burst is 384 KiB now, less than one 1 MiB pipe read
+    const auto start = t;
+    std::uint64_t moved = 0;
+    while (moved < 10 * MiB) { // in 1 MiB pieces: each waits for a full bucket, then pays back
+        const auto wait = b.take(MiB, t);
+        REQUIRE(wait < 10s);
+        if (wait == Clock::duration::zero()) moved += MiB;
+        else t += wait;
+    }
+    // The first piece passes at once (a full bucket, the rest on debt); every further MiB waits
+    // until it is paid for at 1.5 MiB/s.
+    CHECK(std::chrono::duration<double>(t - start).count() == doctest::Approx(9.0 / 1.5).epsilon(0.01));
+}
+
 TEST_CASE("fair queuing serves busy flows in proportion to their weights") {
     rate::FairQueue q;
     // Flow 1 (high, 4) and flow 2 (low, 1) always have one 64 KiB request waiting.
