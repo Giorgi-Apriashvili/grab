@@ -224,9 +224,33 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
   text-overflow: ellipsis;
 }
 .crumb:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.crumb.here, .crumb.here:disabled { color: var(--text); font-weight: 600; cursor: default; opacity: 1; }
+.crumb.here, .crumb.here:disabled { color: var(--text); font-weight: 600; cursor: text; opacity: 1; }
 .crumb.here:hover { background: none; }
 .crumbs .sep { flex: none; color: var(--muted); }
+/* A click on the bar's empty part, its separators or the current folder types a path there. */
+.crumbs, #browse-blank { cursor: text; }
+.address-box { position: relative; flex: 1 1 60%; min-width: 0; }
+.address-box:not([hidden]) ~ .browse-status { flex-shrink: 20; } /* gives way to the field first */
+.address-box input[type=text] { width: 100%; height: 26px; padding: 0 8px; font-size: 12px; }
+.suggest {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  max-height: 340px;
+  padding: 4px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+}
+.suggest .opt { display: flex; align-items: center; height: 26px; padding: 0 8px; border-radius: 5px; white-space: nowrap; }
+.suggest .opt:hover { background: var(--hover); }
+.suggest .opt.on { background: var(--sel); }
+.suggest .opt span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.suggest .ico { flex: none; width: 16px; height: 16px; margin-right: 7px; fill: var(--folder); }
 .browse-status { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .browse-status .bad { color: var(--danger); }
 .browse-status .below { color: var(--text); }

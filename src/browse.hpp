@@ -39,6 +39,14 @@ void sort_items(std::vector<Item>& items);
 // Whether `path` lies below `folder` ("" being the login home, which holds every relative path).
 [[nodiscard]] bool is_below(std::string_view path, std::string_view folder);
 
+// A path typed in the window's address bar, as browse uses it: spaces around it and repeated or
+// trailing slashes go; "~" is the login home ("") and "~/x" a path in it.
+[[nodiscard]] std::string address_path(std::string_view text);
+
+// Whether `rclone lsjson <path>`'s answer may be `path` itself as a file: lsjson lists a file as
+// that one file. A folder holding just a file of its own name looks the same.
+[[nodiscard]] bool maybe_file(const std::vector<Item>& items, std::string_view path);
+
 // A server's folders as its saved file list knows them: every folder under its search roots
 // down to max_depth. A folder at max_depth is in the list, but its contents are not.
 class Index {
@@ -50,6 +58,8 @@ public:
     [[nodiscard]] std::optional<std::vector<Item>> folder(std::string_view path) const;
     // The server's top: its one root's contents, or with several roots, the roots as folders.
     [[nodiscard]] std::vector<Item> top() const;
+    // The list's file or folder at `path`, when the list holds its folder's contents.
+    [[nodiscard]] std::optional<Item> entry(std::string_view path) const;
     [[nodiscard]] const std::vector<std::string>& roots() const { return roots_; }
 
 private:
@@ -70,7 +80,7 @@ private:
 
 // The path bar from a server's top to `path`: each step's name and path. With one root the
 // root itself is the top and has no step; with several it is the first step ("~" for the
-// login home).
+// login home). A path outside the roots starts from "/", or "~" when it is relative.
 struct Crumb {
     std::string name;
     std::string path;

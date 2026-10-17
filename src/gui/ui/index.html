@@ -45,7 +45,12 @@
       <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>
     </button>
     <nav id="crumbs" class="crumbs" aria-label="Folder"></nav>
-    <span class="spacer"></span>
+    <span id="browse-blank" class="spacer" title="Type a path (Ctrl+L)"></span>
+    <div id="address-box" class="address-box" hidden>
+      <input id="address" type="text" spellcheck="false" autocomplete="off" aria-label="Folder path"
+             role="combobox" aria-autocomplete="list" aria-controls="suggest" aria-expanded="false">
+      <div id="suggest" class="suggest" role="listbox" hidden></div>
+    </div>
     <span id="browse-status" class="browse-status"></span>
     <button id="browse-refresh" type="button" class="subtle" title="List this folder from the server again">Refresh</button>
   </div>

@@ -71,6 +71,23 @@ bool is_below(std::string_view path, std::string_view folder) {
     return path.size() > folder.size() + 1 && path.starts_with(folder) && path[folder.size()] == '/';
 }
 
+std::string address_path(std::string_view text) {
+    text = util::trim(text);
+    std::string out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        if (c != '/' || !out.ends_with('/')) out += c;
+    }
+    if (out == "~") return {};
+    if (out.starts_with("~/")) out.erase(0, 2);
+    while (out.size() > 1 && out.ends_with('/')) out.pop_back();
+    return out;
+}
+
+bool maybe_file(const std::vector<Item>& items, std::string_view path) {
+    return items.size() == 1 && !items.front().dir && items.front().name == remote_basename(path);
+}
+
 std::optional<std::string> root_of(const std::vector<std::string>& roots, std::string_view path) {
     std::optional<std::string> best;
     for (const auto& r : roots) {
@@ -124,6 +141,15 @@ std::optional<std::vector<Item>> Index::folder(std::string_view path) const {
     return items;
 }
 
+std::optional<Item> Index::entry(std::string_view path) const {
+    const auto f = folders_.find(parent_of(path));
+    if (f == folders_.end() || !f->second.known) return std::nullopt;
+    for (const auto c : f->second.children) {
+        if (list_->entries[c].path == path) return item(list_->entries[c]);
+    }
+    return std::nullopt;
+}
+
 std::vector<Item> Index::top() const {
     if (roots_.size() == 1) return folder(roots_.front()).value_or(std::vector<Item>{});
     std::vector<Item> items;
@@ -135,10 +161,10 @@ std::vector<Crumb> crumbs(const std::vector<std::string>& roots, std::string_vie
     std::vector<Crumb> out;
     const std::vector<std::string> all = roots.empty() ? std::vector<std::string>{""} : roots;
     const auto root = root_of(all, path);
-    if (!root) return out;
-    if (all.size() > 1) out.push_back(Crumb{root->empty() ? "~" : *root, *root});
-    std::string at = *root;
-    std::string_view rel = relative(path, *root);
+    const std::string base = root ? *root : (path.starts_with('/') ? "/" : "");
+    if (!root || all.size() > 1) out.push_back(Crumb{base.empty() ? "~" : base, base});
+    std::string at = base;
+    std::string_view rel = relative(path, base);
     while (!rel.empty()) {
         const auto slash = rel.find('/');
         const auto name = rel.substr(0, slash);

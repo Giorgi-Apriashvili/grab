@@ -7,8 +7,10 @@
 #include "folder.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
+#include "listing.hpp"
 #include "process.hpp"
 #include "quote.hpp"
+#include "rclone.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -204,7 +206,9 @@ void App::on_message(const std::string& text) {
         start_search(*msg);
     } else if (type == "browse") {
         run_browse(int_of(*msg, "id"), msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""),
-                   bool_of(*msg, "top"), bool_of(*msg, "live"), false);
+                   bool_of(*msg, "top"), bool_of(*msg, "live"), false, bool_of(*msg, "typed"));
+    } else if (type == "suggest") {
+        suggest(msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""));
     } else if (type == "refreshLists") {
         const std::string remote = msg->string_of("remote").value_or("");
         if (remote == "*") {
@@ -592,7 +596,7 @@ void App::on_list_refreshed(const std::string& server) {
         browsed = last_browse_;
     }
     if (browsed.id != 0 && browsed.remote == server) {
-        run_browse(browsed.id, browsed.remote, browsed.path, browsed.top, false, true);
+        run_browse(browsed.id, browsed.remote, browsed.path, browsed.top, false, true, browsed.typed);
     }
 }
 
@@ -667,35 +671,49 @@ Value item_value(const browse::Item& it) {
 
 } // namespace
 
-void App::run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update) {
+void App::run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update,
+                     bool typed) {
     if (browse_thread_.joinable()) {
         browse_thread_.request_stop();
         browse_thread_.join();
     }
     {
         std::lock_guard lock(browse_mutex_);
-        last_browse_ = LastBrowse{id, remote, path, top};
+        last_browse_ = LastBrowse{id, remote, path, top, typed};
     }
-    browse_thread_ = std::jthread([this, id, remote, path, top, live, update](std::stop_token stop) {
+    browse_thread_ = std::jthread([this, id, remote, path, top, live, update, typed](std::stop_token stop) {
         const auto t0 = std::chrono::steady_clock::now();
         Value v = Value::make_object();
         v.set("type", str("browseResult"));
         v.set("id", num(id));
         v.set("remote", str(remote));
-        v.set("top", Value::make_bool(top));
         v.set("update", Value::make_bool(update));
+        if (typed) v.set("typed", Value::make_bool(true));
         auto send = [&] {
             v.set("elapsedMs", num(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                            std::chrono::steady_clock::now() - t0)
                                                            .count())));
             post(v);
         };
-        auto ctx = engine::load_context(config_path_, remote);
-        if (!ctx) {
+        // A typed path that fails leaves the window where it was, and so does a list refresh
+        // after it; any other failure is shown as the folder's.
+        auto fail = [&](const std::string& error) {
             v.set("path", str(path));
-            v.set("error", str(ctx.error()));
-            return send();
-        }
+            v.set("top", Value::make_bool(top));
+            v.set("error", str(error));
+            {
+                std::lock_guard lock(browse_mutex_);
+                if (!typed) {
+                    shown_browse_ = LastBrowse{id, remote, path, top, false};
+                } else if (last_browse_.id == id) {
+                    last_browse_ = shown_browse_;
+                    last_browse_.id = id;
+                }
+            }
+            send();
+        };
+        auto ctx = engine::load_context(config_path_, remote);
+        if (!ctx) return fail(ctx.error());
         const auto roots = engine::search_roots(*ctx);
         const auto now = unix_now();
         const auto view = list_view(remote, *ctx);
@@ -707,10 +725,43 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             if (!s.error.empty()) v.set("listError", str(s.error));
         }
 
+        // A typed path as browse uses it; a server's one root is its top.
+        std::string folder = typed ? browse::address_path(path) : path;
+        const bool at_top = top || (typed && roots.size() == 1 && folder == roots.front());
         // Several roots make a top of their own; with one, the top is that root's folder.
-        const bool roots_top = top && roots.size() > 1;
-        const std::string folder = top && !roots_top ? roots.front() : path;
-        v.set("path", str(roots_top ? std::string() : folder));
+        const bool roots_top = at_top && roots.size() > 1;
+        if (at_top && !roots_top) folder = roots.front();
+        std::string select; // a typed file's path: its folder opens with it picked
+
+        // A folder's rows: this session's live listing or the list, whichever is newer, else
+        // listed live now.
+        struct Rows {
+            std::vector<browse::Item> items;
+            std::string source;
+            std::int64_t listed = 0;
+            bool new_listing = false; // listed live just now, not kept yet
+        };
+        auto rows_of = [&](const std::string& at) -> std::expected<Rows, std::string> {
+            std::optional<LiveFolder> cached;
+            if (!live) {
+                std::lock_guard lock(browse_mutex_);
+                if (const auto it = live_folders_.find({remote, at}); it != live_folders_.end()) cached = it->second;
+            }
+            auto from_list = !live && view.index ? view.index->folder(at) : std::nullopt;
+            // A live listing made after the list was fetched is newer; otherwise the list wins,
+            // which also knows the sub-folders' item counts.
+            if (cached && (!from_list || cached->listed > view.list->fetched)) {
+                return Rows{std::move(cached->items), "live", cached->listed};
+            }
+            if (from_list) return Rows{std::move(*from_list), "list", view.list->fetched};
+            proc::RunOptions run;
+            run.stop = stop;
+            run.detached = true;
+            auto got = browse::list_live(*ctx, at, run);
+            if (!got) return std::unexpected(got.error());
+            return Rows{std::move(*got), "live", now, true};
+        };
+
         std::vector<browse::Item> items;
         std::string source;
         std::int64_t listed = now;
@@ -724,39 +775,46 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
                 source = "roots";
             }
         } else {
-            std::optional<LiveFolder> cached;
-            if (!live) {
+            // A file the list holds: its folder.
+            if (typed && view.index) {
+                if (const auto e = view.index->entry(folder); e && !e->dir) {
+                    select = folder;
+                    folder = parent_of(folder);
+                }
+            }
+            auto rows = rows_of(folder);
+            if (stop.stop_requested()) return; // the next request answers instead
+            if (rows && typed && select.empty() && rows->new_listing && browse::maybe_file(rows->items, folder)) {
+                // lsjson lists a file as that one file: its folder opens instead, when the file is
+                // there (rather than a folder of the same name holding just that file).
+                const std::string parent = parent_of(folder);
+                if (auto up = rows_of(parent)) {
+                    const auto name = remote_basename(folder);
+                    const auto it = std::ranges::find(up->items, name, &browse::Item::name);
+                    if (it != up->items.end() && !it->dir) {
+                        select = folder;
+                        folder = parent;
+                        rows = std::move(up);
+                    }
+                }
+                if (stop.stop_requested()) return;
+            }
+            if (!rows) {
+                if (typed && rows.error().find("directory not found") != std::string::npos) {
+                    return fail(std::format("Not found on {}: {}", remote, folder.empty() ? "~" : folder));
+                }
+                if (typed && rows.error().find("permission denied") != std::string::npos) {
+                    return fail(std::format("{} doesn't let you list {}", remote, folder.empty() ? "~" : folder));
+                }
+                return fail(rows.error());
+            }
+            if (rows->new_listing) {
                 std::lock_guard lock(browse_mutex_);
-                if (const auto it = live_folders_.find({remote, folder}); it != live_folders_.end()) cached = it->second;
+                live_folders_[{remote, folder}] = LiveFolder{rows->items, rows->listed};
             }
-            auto from_list = !live && view.index ? view.index->folder(folder) : std::nullopt;
-            // A live listing made after the list was fetched is newer; otherwise the list wins,
-            // which also knows the sub-folders' sizes and item counts.
-            if (cached && (!from_list || cached->listed > view.list->fetched)) {
-                items = std::move(cached->items);
-                source = "live";
-                listed = cached->listed;
-            } else if (from_list) {
-                items = std::move(*from_list);
-                source = "list";
-                listed = view.list->fetched;
-            } else {
-                proc::RunOptions run;
-                run.stop = stop;
-                run.detached = true;
-                auto got = browse::list_live(*ctx, folder, run);
-                if (stop.stop_requested()) return; // the next request answers instead
-                if (!got) {
-                    v.set("error", str(got.error()));
-                    return send();
-                }
-                {
-                    std::lock_guard lock(browse_mutex_);
-                    live_folders_[{remote, folder}] = LiveFolder{*got, now};
-                }
-                items = std::move(*got);
-                source = "live";
-            }
+            items = std::move(rows->items);
+            source = std::move(rows->source);
+            listed = rows->listed;
             Value crumbs = Value::make_array();
             for (const auto& c : browse::crumbs(roots, folder)) {
                 Value cv = Value::make_object();
@@ -766,6 +824,16 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             }
             v.set("crumbs", std::move(crumbs));
         }
+        const std::string at = roots_top ? std::string() : folder;
+        {
+            // Where the window now is (a typed path resolved), also for the next list refresh.
+            std::lock_guard lock(browse_mutex_);
+            shown_browse_ = LastBrowse{id, remote, at, at_top, false};
+            if (typed && last_browse_.id == id) last_browse_ = shown_browse_;
+        }
+        v.set("path", str(at));
+        v.set("top", Value::make_bool(at_top));
+        if (!select.empty()) v.set("select", str(select));
         v.set("source", str(source));
         v.set("age", num(static_cast<double>(now - listed)));
         v.set("severalRoots", Value::make_bool(roots.size() > 1));
@@ -774,6 +842,40 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
         v.set("items", std::move(list));
         send();
     });
+}
+
+void App::suggest(const std::string& remote, const std::string& path) {
+    Value v = Value::make_object();
+    v.set("type", str("suggestions"));
+    v.set("remote", str(remote));
+    v.set("path", str(path));
+    Value names = Value::make_array();
+    if (auto ctx = engine::load_context(config_path_, remote)) {
+        const std::string folder = browse::address_path(path);
+        const auto view = list_view(remote, *ctx);
+        if (!view.list) {
+            // No list yet (a server not used since grab started): fetched now, for the next ask.
+            start_refresh(remote);
+            v.set("later", Value::make_bool(true));
+        }
+        std::optional<LiveFolder> cached;
+        {
+            std::lock_guard lock(browse_mutex_);
+            if (const auto it = live_folders_.find({remote, folder}); it != live_folders_.end()) cached = it->second;
+        }
+        const auto from_list = view.index ? view.index->folder(folder) : std::nullopt;
+        // As browse picks: the newer of the two.
+        const std::vector<browse::Item>* items = nullptr;
+        if (cached && (!from_list || cached->listed > view.list->fetched)) items = &cached->items;
+        else if (from_list) items = &*from_list;
+        if (items != nullptr) {
+            for (const auto& it : *items) {
+                if (it.dir) names.push(str(it.name));
+            }
+        }
+    }
+    v.set("folders", std::move(names));
+    post(v);
 }
 
 void App::prune_lists() {

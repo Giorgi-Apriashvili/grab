@@ -100,6 +100,16 @@ TEST_CASE("a server's folders from its file list, down to the list's depth") {
     CHECK_FALSE(index.folder("missing").has_value());
     CHECK_FALSE(index.folder("/etc").has_value()); // outside the roots
     CHECK(index.folder("")->size() == 3);
+
+    // One entry by its path, when the list holds its folder's contents.
+    CHECK(index.entry("movies/georgian/a.avi") == Item{"a.avi", "movies/georgian/a.avi", false, 100, std::nullopt, 1697354553});
+    CHECK(index.entry("movies/georgian/2014") ==
+          Item{"2014", "movies/georgian/2014", true, std::nullopt, std::nullopt, 1600000000});
+    CHECK(index.entry("tv")->dir);
+    CHECK_FALSE(index.entry("movies/georgian/2014/x.avi").has_value()); // below the list's depth
+    CHECK_FALSE(index.entry("movies/nope.avi").has_value());
+    CHECK_FALSE(index.entry("").has_value());
+    CHECK_FALSE(index.entry("/etc/passwd").has_value());
 }
 
 TEST_CASE("several search roots are the server's top folders") {
@@ -122,7 +132,36 @@ TEST_CASE("the path bar from the server's top") {
           std::vector<Crumb>{{"/srv/media", "/srv/media"}, {"a", "/srv/media/a"}, {"b", "/srv/media/a/b"}});
     CHECK(browse::crumbs({"", "/srv"}, "") == std::vector<Crumb>{{"~", ""}});
     CHECK(browse::crumbs({"/"}, "/etc/x") == std::vector<Crumb>{{"etc", "/etc"}, {"x", "/etc/x"}});
-    CHECK(browse::crumbs({""}, "/elsewhere").empty());
+    // Outside the roots: from "/", or "~" for a relative path.
+    CHECK(browse::crumbs({""}, "/etc/ssh") == std::vector<Crumb>{{"/", "/"}, {"etc", "/etc"}, {"ssh", "/etc/ssh"}});
+    CHECK(browse::crumbs({""}, "/") == std::vector<Crumb>{{"/", "/"}});
+    CHECK(browse::crumbs({"/srv/media"}, "movies/x") ==
+          std::vector<Crumb>{{"~", ""}, {"movies", "movies"}, {"x", "movies/x"}});
+    CHECK(browse::crumbs({"/srv/media", "/home/x"}, "/etc") == std::vector<Crumb>{{"/", "/"}, {"etc", "/etc"}});
+}
+
+TEST_CASE("a path typed in the address bar") {
+    CHECK(browse::address_path("  movies/georgian/ ") == "movies/georgian");
+    CHECK(browse::address_path("movies//georgian///") == "movies/georgian");
+    CHECK(browse::address_path("~") == "");
+    CHECK(browse::address_path("~/") == "");
+    CHECK(browse::address_path("~/movies") == "movies");
+    CHECK(browse::address_path("~//movies/") == "movies");
+    CHECK(browse::address_path("/") == "/");
+    CHECK(browse::address_path("//etc//ssh/") == "/etc/ssh");
+    CHECK(browse::address_path("") == "");
+    CHECK(browse::address_path("~x/y") == "~x/y"); // only "~" alone or "~/" is the home
+    CHECK(browse::address_path("Star Wars: A New Hope") == "Star Wars: A New Hope");
+}
+
+TEST_CASE("lsjson's answer for a file's path is that one file") {
+    const std::vector<Item> file{{"a.avi", "movies/a.avi/a.avi", false, 5, {}}};
+    CHECK(browse::maybe_file(file, "movies/a.avi"));
+    CHECK(browse::maybe_file(file, "movies/a.avi/")); // a trailing slash still names it
+    CHECK_FALSE(browse::maybe_file(file, "movies/b.avi"));
+    CHECK_FALSE(browse::maybe_file({{"a.avi", "x", true, {}, {}}}, "movies/a.avi")); // a folder inside
+    CHECK_FALSE(browse::maybe_file({{"a.avi", "x", false, 5, {}}, {"b", "y", false, 1, {}}}, "movies/a.avi"));
+    CHECK_FALSE(browse::maybe_file({}, "movies/a.avi"));
 }
 
 TEST_CASE("a folder listed live") {

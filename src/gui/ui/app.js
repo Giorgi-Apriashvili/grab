@@ -1,13 +1,14 @@
 'use strict';
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
-//   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, pickFolder, enqueue, cancelItem,
+//   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, suggest, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 pauseChild, resumeChild, skipChild,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
-//   from backend: init, searchResult, searchError, browseResult, folderPicked, queue, error, update, updateChecked, limit,
+//   from backend: init, searchResult, searchError, browseResult, suggestions, folderPicked, queue, error, update,
+//                 updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked
 
@@ -42,12 +43,17 @@ const state = {
   updateLater: false,    // "Later": hidden until grab starts again
   // Browse mode: the folder shown, and what it holds. `server` '' is All servers' own top (the
   // servers themselves); `top` a server's top; `under` a search below the folder, while its
-  // results show.
+  // results show; `typed` the server of an address typed in the path bar, until its answer.
   browse: {
     id: 0, server: '', path: '', top: true, crumbs: [], items: [], severalRoots: false,
     source: '', age: 0, refreshing: false, listError: '', error: '', loading: false,
-    under: null, pendingSelect: null, keepSelection: false,
+    under: null, pendingSelect: null, keepSelection: false, typed: null,
   },
+  // The path bar as a field (the address bar): `typed` the text typed (the suggestions follow
+  // it), `shown` the suggestions ({ label, text, server }), `sel` the highlighted one, `cache`
+  // the folder names per "server\nparent" (null while asked), `want` the key last needed,
+  // `error` why the last address failed.
+  addr: { editing: false, typed: '', shown: [], sel: -1, cache: new Map(), want: '', error: '' },
   // Browse's last folder per server while the window runs (absent: its top); '*' -> the server
   // All servers had open. Not kept across starts: each start opens a server at its top.
   browsePaths: {},
@@ -653,6 +659,9 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   const b = state.browse;
   b.inited = true;
   b.under = null;
+  b.typed = null;
+  state.addr.error = '';
+  if (state.addr.editing) endEdit(false);
   if (!server) {
     Object.assign(b, { server: '', path: '', top: true, crumbs: [], error: '', loading: false, source: '' });
     b.items = state.remotes.map((r, i) => ({ name: r.name, path: '', dir: true, server: r.name, remote: r.name,
@@ -693,8 +702,26 @@ function enterBrowse() {
 
 function onBrowseResult(msg) {
   const b = state.browse;
-  if (msg.id !== b.id || msg.remote !== b.server) return; // an older request
+  if (msg.id !== b.id) return; // an older request
   const wasLoading = b.loading;
+  if (msg.typed) {
+    // An address typed in the path bar: a failure leaves the folder on screen as it was.
+    if (!b.typed || b.typed.server !== msg.remote) return;
+    b.typed = null;
+    b.loading = false;
+    if (msg.error) {
+      state.addr.error = msg.error;
+      renderBrowseBar();
+      return;
+    }
+    if (msg.remote !== state.remote && state.remote !== ALL) pickRemote(msg.remote, false);
+    b.server = msg.remote;
+    b.pendingSelect = msg.select || null;
+    b.keepSelection = false;
+    if (state.addr.editing) endEdit(document.activeElement === $('#address'));
+  } else if (msg.remote !== b.server || b.typed) {
+    return;
+  }
   Object.assign(b, {
     loading: false, error: msg.error || '', path: msg.path, top: msg.top, crumbs: msg.crumbs || [],
     source: msg.source || '', age: msg.age || 0, refreshing: !!msg.refreshing, listError: msg.listError || '',
@@ -758,6 +785,7 @@ function searchBelow(query) {
   }
   showBanner('');
   b.under = { query, path: b.path };
+  state.addr.error = ''; // a failed address is behind us
   state.searchId += 1;
   state.lastQuery = query;
   state.searchStarted = performance.now();
@@ -791,8 +819,18 @@ function closeBelow() {
 
 function renderBrowseBar() {
   const bar = $('#browse-bar');
+  const a = state.addr;
   bar.hidden = !inBrowse();
-  if (bar.hidden) return;
+  if (bar.hidden) {
+    if (a.editing) {
+      a.editing = false;
+      renderSuggest();
+    }
+    return;
+  }
+  $('#crumbs').hidden = a.editing;
+  $('#browse-blank').hidden = a.editing;
+  $('#address-box').hidden = !a.editing;
   const b = state.browse;
   // The path: [All servers ›] server › folder › folder; every step but the last opens.
   const steps = [];
@@ -803,14 +841,16 @@ function renderBrowseBar() {
   }
   b.steps = steps;
   $('#crumbs').innerHTML = steps.map((s, i) => (i === steps.length - 1
-    ? `<button type="button" class="crumb here" disabled title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`
+    ? `<button type="button" class="crumb here" data-edit tabindex="-1" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`
     : `<button type="button" class="crumb" data-step="${i}" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`))
     .join('<span class="sep">›</span>');
   $('#browse-up').disabled = !b.under && (!b.server || (b.top && state.remote !== ALL));
   $('#browse-refresh').hidden = !b.server || !!b.under;
   $('#browse-refresh').disabled = b.loading;
   const status = $('#browse-status');
-  if (b.under) {
+  if (a.error && !b.under) {
+    status.innerHTML = `<span class="bad" title="${esc(a.error)}">${esc(a.error)}</span>`;
+  } else if (b.under) {
     status.innerHTML = `<span class="below">Results for “${esc(b.under.query)}” below ${esc(browseHere())}</span>` +
       '<button type="button" class="link" data-act="close-below" title="Back to the folder (Esc)">✕</button>';
   } else if (b.loading) {
@@ -827,9 +867,225 @@ function renderBrowseBar() {
   }
 }
 
+// ---- the address bar: the path bar turned into a field ------------------------------------
+
+// The place shown, as an address: the folder's path ('' at a server's top); in All servers
+// "Server:path".
+function currentAddress() {
+  const b = state.browse;
+  const path = b.top ? '' : b.path;
+  if (state.remote !== ALL) return path;
+  return b.server ? `${b.server}:${path}` : '';
+}
+
+// A configured server's name, matched without case; '' when there is none.
+function findRemote(name) {
+  const n = name.trim().toLowerCase();
+  const r = state.remotes.find((x) => x.name.toLowerCase() === n);
+  return r ? r.name : '';
+}
+
+// The server and path a typed address names: "Server:path" when the part before the first ':'
+// is a server's name (so "Star Wars: x" stays a path), else a path on the server on screen.
+function parseAddress(text) {
+  const t = text.trim();
+  const colon = t.indexOf(':');
+  const named = colon > 0 ? findRemote(t.slice(0, colon)) : '';
+  if (named) return { server: named, path: t.slice(colon + 1).trim() };
+  return { server: state.remote === ALL ? state.browse.server : state.remote, path: t };
+}
+
+// A click on the path bar's empty part or its current folder, Ctrl+L, Alt+D or F4: the path as
+// text, all of it selected.
+function startEdit() {
+  if (!inBrowse() || settings.open || modal) return;
+  const a = state.addr;
+  const input = $('#address');
+  if (!a.editing) {
+    Object.assign(a, { editing: true, typed: '', shown: [], sel: -1, cache: new Map(), want: '', error: '' });
+    input.value = currentAddress();
+    const example = state.remotes.length ? state.remotes[0].name : 'Main';
+    input.placeholder = state.remote === ALL ? `A server and a path, e.g. ${example}:downloads`
+      : `Type a path on ${state.remote}`;
+    renderBrowseBar();
+    renderSuggest();
+  }
+  input.focus();
+  input.select();
+}
+
+// The path bar again; `focus`: the results take the keyboard (Esc, a folder opened). An error
+// shown goes with the field; one for an address still being opened shows when it comes.
+function endEdit(focus = true) {
+  const a = state.addr;
+  if (!a.editing) return;
+  Object.assign(a, { editing: false, shown: [], sel: -1 });
+  if (!state.browse.typed) a.error = '';
+  renderSuggest();
+  renderBrowseBar();
+  if (focus) $('#results').focus();
+}
+
+// Enter: opens the typed address. A server's top opens at once; a path goes to the backend,
+// which also opens a file's folder with it picked. The folder on screen stays until the answer.
+function goAddress() {
+  const a = state.addr;
+  const { server, path } = parseAddress($('#address').value);
+  a.shown = [];
+  a.sel = -1;
+  renderSuggest();
+  if (!server) {
+    const example = state.remotes.length ? state.remotes[0].name : 'Main';
+    a.error = `Start with a server's name, e.g. ${example}:downloads`;
+    renderBrowseBar();
+    return;
+  }
+  const b = state.browse;
+  if (b.under) closeBelow();
+  if (!path) {
+    endEdit();
+    if (server !== state.remote && state.remote !== ALL) pickRemote(server, false);
+    browseTo(server, '', true);
+    return;
+  }
+  a.error = '';
+  b.id += 1;
+  b.typed = { server };
+  b.loading = true;
+  renderBrowseBar();
+  send({ type: 'browse', id: b.id, remote: server, path, typed: true });
+}
+
+// The suggestions for the text typed: the folders of its parent that start with its last part
+// (from the list and this session's live listings, asked once per folder), up to 12; in All
+// servers' own top, the servers.
+function updateSuggest() {
+  const a = state.addr;
+  a.sel = -1;
+  a.shown = [];
+  const text = a.typed;
+  const colon = text.indexOf(':');
+  const named = colon > 0 ? findRemote(text.slice(0, colon)) : '';
+  if (!named && state.remote === ALL && !state.browse.server) {
+    const word = text.trim().toLowerCase();
+    if (word) {
+      a.shown = state.remotes.filter((r) => r.name.toLowerCase().startsWith(word))
+        .map((r) => ({ label: r.name, text: `${r.name}:`, server: true }));
+    }
+    renderSuggest();
+    return;
+  }
+  const server = named || (state.remote === ALL ? state.browse.server : state.remote);
+  const rest = (named ? text.slice(colon + 1) : text).trimStart();
+  const slash = rest.lastIndexOf('/');
+  const parent = rest.slice(0, slash + 1);
+  const word = rest.slice(slash + 1).toLowerCase();
+  if (!server || (slash < 0 && !word)) {
+    renderSuggest();
+    return;
+  }
+  const key = `${server}\n${parent}`;
+  a.want = key;
+  if (!a.cache.has(key)) {
+    a.cache.set(key, null);
+    send({ type: 'suggest', remote: server, path: parent });
+  }
+  const prefix = named ? `${named}:` : '';
+  a.shown = (a.cache.get(key) || []).filter((n) => n.toLowerCase().startsWith(word)).slice(0, 12)
+    .map((n) => ({ label: n, text: `${prefix}${parent}${n}` }));
+  renderSuggest();
+}
+
+function onSuggestions(msg) {
+  const a = state.addr;
+  const key = `${msg.remote}\n${msg.path}`;
+  if (!a.cache.has(key)) return; // asked during an earlier edit
+  a.cache.set(key, msg.folders || []);
+  if (a.editing && a.want === key && a.sel < 0) updateSuggest();
+  // The server's list is being fetched: the next keystroke asks again.
+  if (msg.later) a.cache.delete(key);
+}
+
+function renderSuggest() {
+  const a = state.addr;
+  const box = $('#suggest');
+  const open = a.editing && a.shown.length > 0;
+  box.hidden = !open;
+  $('#address').setAttribute('aria-expanded', String(open));
+  if (!open) {
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = a.shown.map((s, i) => `<div class="opt${i === a.sel ? ' on' : ''}" role="option" data-i="${i}"` +
+    ` aria-selected="${i === a.sel}">${s.server ? '' : FOLDER_ICON}<span>${esc(s.label)}</span></div>`).join('');
+  const on = box.querySelector('.on');
+  if (on) on.scrollIntoView({ block: 'nearest' });
+}
+
+$('#browse-bar').addEventListener('click', (ev) => {
+  if (state.addr.editing) return;
+  const t = ev.target;
+  if (t.closest('[data-edit]') || ['crumbs', 'browse-blank', 'browse-bar'].includes(t.id) || t.classList.contains('sep')) {
+    startEdit();
+  }
+});
+$('#address').addEventListener('input', () => {
+  const a = state.addr;
+  a.typed = $('#address').value;
+  if (a.error) {
+    a.error = '';
+    renderBrowseBar();
+  }
+  updateSuggest();
+});
+$('#address').addEventListener('keydown', (ev) => {
+  const a = state.addr;
+  const input = $('#address');
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    goAddress();
+  } else if (ev.key === 'Escape') {
+    // The suggestions close first (the text typed comes back), then the field.
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (a.shown.length) {
+      if (a.sel >= 0) input.value = a.typed;
+      a.shown = [];
+      a.sel = -1;
+      renderSuggest();
+    } else {
+      endEdit();
+    }
+  } else if ((ev.key === 'ArrowDown' || ev.key === 'ArrowUp') && a.shown.length) {
+    // Through the suggestions and back to the text typed; the field shows the one highlighted.
+    ev.preventDefault();
+    const n = a.shown.length;
+    if (ev.key === 'ArrowDown') a.sel = a.sel + 1 >= n ? -1 : a.sel + 1;
+    else a.sel = a.sel < 0 ? n - 1 : a.sel - 1;
+    input.value = a.sel >= 0 ? a.shown[a.sel].text : a.typed;
+    renderSuggest();
+  } else if (ev.key === 'Tab' && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && a.shown.length) {
+    // Completes the highlighted (or first) folder and goes on into it.
+    ev.preventDefault();
+    const pick = a.shown[Math.max(a.sel, 0)];
+    input.value = pick.server ? pick.text : `${pick.text}/`;
+    a.typed = input.value;
+    updateSuggest();
+  }
+});
+$('#address').addEventListener('blur', () => endEdit(false));
+$('#suggest').addEventListener('mousedown', (ev) => ev.preventDefault()); // the field keeps the focus
+$('#suggest').addEventListener('click', (ev) => {
+  const o = ev.target.closest('[data-i]');
+  if (!o) return;
+  $('#address').value = state.addr.shown[Number(o.dataset.i)].text;
+  goAddress();
+});
+
 $('#crumbs').addEventListener('click', (ev) => {
   const btn = ev.target.closest('[data-step]');
   if (!btn) return;
+  $('#results').focus(); // the crumbs are drawn again: the keyboard goes on in the folder
   const s = state.browse.steps[Number(btn.dataset.step)];
   if (!s.server) browseTo('', '', true, { select: state.browse.server });
   else if (s.top) browseTo(s.server, '', true);
@@ -1907,6 +2163,7 @@ if (webview) {
       case 'searchResult': onSearchResult(msg); break;
       case 'searchError': onSearchError(msg); break;
       case 'browseResult': onBrowseResult(msg); break;
+      case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
       case 'queue':
         state.queue = msg.items;
@@ -1941,8 +2198,11 @@ if (webview) {
 
 $('#search-form').addEventListener('submit', (ev) => { ev.preventDefault(); startSearch(); });
 
-$('#remote').addEventListener('change', (ev) => {
-  state.remote = ev.target.value;
+// The server picked (also by an address typed for another server); `enter`: Browse opens its
+// folder (not when a typed address opens one instead).
+function pickRemote(name, enter = true) {
+  state.remote = name;
+  $('#remote').value = name;
   state.hits = [];
   state.selected.clear();
   state.resultNote = '';
@@ -1953,11 +2213,12 @@ $('#remote').addEventListener('change', (ev) => {
   renderRemoteInfo();
   if (inBrowse()) {
     $('#query').value = '';
-    enterBrowse();
+    if (enter) enterBrowse();
   }
   renderRows();
   send({ type: 'prefs', remote: state.remote });
-});
+}
+$('#remote').addEventListener('change', (ev) => pickRemote(ev.target.value));
 
 // Files and Folders are separate searches: switching starts clean and waits for new words.
 // `enter`: browse opens its remembered folder (not when a search hit's folder opens instead).
@@ -2216,6 +2477,11 @@ document.addEventListener('keydown', (ev) => {
       ev.preventDefault();
       if (settings.form) $('#form-cancel').click(); else closeSettings();
     }
+  } else if (inBrowse() && ((ev.ctrlKey && !ev.altKey && (ev.key === 'l' || ev.key === 'L')) ||
+    (ev.altKey && !ev.ctrlKey && (ev.key === 'd' || ev.key === 'D')) || (ev.key === 'F4' && !ev.altKey && !ev.ctrlKey))) {
+    // To the address bar, as in Explorer.
+    ev.preventDefault();
+    startEdit();
   } else if ((ev.key === 'f' && ev.ctrlKey) || (ev.key === '/' && document.activeElement.tagName !== 'INPUT')) {
     ev.preventDefault();
     $('#query').focus();

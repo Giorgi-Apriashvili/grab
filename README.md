@@ -162,6 +162,19 @@ mode, destination per server and the results' sort in `%APPDATA%\grab\gui.json`.
     the current folder again.
   - Typing filters the folder; Enter searches everything below it, folders and files together,
     and Esc goes back.
+  - **The path bar is also an address bar, as in Explorer.** Click its empty part or the
+    current folder, or press Ctrl+L, Alt+D or F4, then type or paste a path and press Enter;
+    Esc cancels.
+    - You can type `downloads/tv`, `/etc/ssh`, `~` or `~/movies`. `Box.Guest:movies` opens
+      another server, and in All servers the address always starts with the server.
+    - The path can be anywhere the server lets you list, not only inside the searched folders.
+      Such folders are listed live, and the path bar shows them from `/`.
+    - A file's path (from Copy path, say) opens its folder with the file picked.
+    - A path that doesn't exist leaves the field open with a message, and the folder on screen
+      stays as it was.
+    - While you type, a list suggests the folders that start with what you typed. ↑/↓ pick
+      one; Tab completes it and adds `/` to go on into it. The suggestions come from the file
+      list and from folders already opened, so they never wait on the server.
   - Download takes any mix of folders and files. "Choose…" picks the Save-to folder.
   - All servers starts with one folder per server. While the window is open, each server
     reopens where you left it; a new start opens it at its top. A search result's folder (the

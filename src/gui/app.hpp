@@ -158,13 +158,20 @@ private:
     // Browse mode: a folder of one server, from its file list when the list holds the folder's
     // contents, else listed live (kept for the session per server and folder). One request at a
     // time on browse_thread_; a new one stops the last. `top`: the server's top; `live`: list it
-    // live now (Refresh); `update`: the same folder again after its list was refreshed.
-    void run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update);
+    // live now (Refresh); `update`: the same folder again after its list was refreshed; `typed`:
+    // `path` was typed in the address bar (a file's path opens its folder; an error leaves the
+    // folder on screen as it was).
+    void run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update,
+                    bool typed);
+    // Folder names for the address bar's suggestions, from the list and this session's live
+    // listings; never from the server. Without a list it starts fetching one ("later": ask again).
+    void suggest(const std::string& remote, const std::string& path);
     struct LastBrowse {
         int id = 0;
         std::string remote;
         std::string path;
         bool top = false;
+        bool typed = false;
     };
     struct LiveFolder {
         std::vector<browse::Item> items;
@@ -292,8 +299,9 @@ private:
     // After the lists: the search thread uses them and starts refreshes, so it ends first.
     std::jthread search_thread_;
     std::atomic<bool> search_replaced_{false}; // a stopped search is being replaced: no "cancelled"
-    std::mutex browse_mutex_; // guards last_browse_ and live_folders_
-    LastBrowse last_browse_;
+    std::mutex browse_mutex_; // guards last_browse_, shown_browse_ and live_folders_
+    LastBrowse last_browse_;  // the last request, again after a list refresh
+    LastBrowse shown_browse_; // the folder the window shows: where a failed typed path leaves it
     std::map<std::pair<std::string, std::string>, LiveFolder> live_folders_; // (server, folder)
     std::jthread browse_thread_; // after the lists, which it uses
 
