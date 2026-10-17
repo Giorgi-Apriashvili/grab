@@ -59,11 +59,6 @@ GuiState parse_gui_state(std::string_view json_text) {
     }
     s.last_remote = doc->string_of("lastRemote").value_or("");
     if (auto mode = doc->string_of("mode"); mode == "file" || mode == "folder" || mode == "browse") s.mode = *mode;
-    if (const auto* b = doc->find("browsePaths"); b != nullptr && b->kind == json::Value::Kind::object) {
-        for (std::size_t i = 0; i < b->keys.size(); ++i) {
-            if (b->items[i].kind == json::Value::Kind::string) s.browse_paths[b->keys[i]] = b->items[i].str;
-        }
-    }
     if (const auto* sort = doc->find("sort")) s.sort = sort_from_json(*sort);
     if (const auto* d = doc->find("destinations"); d != nullptr && d->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < d->keys.size(); ++i) {
@@ -132,9 +127,6 @@ std::string gui_state_to_json(const GuiState& state) {
     Value dest = Value::make_object();
     for (const auto& [remote, path] : state.destinations) dest.set(remote, Value::make_string(path));
     root.set("destinations", std::move(dest));
-    Value browse = Value::make_object();
-    for (const auto& [server, path] : state.browse_paths) browse.set(server, Value::make_string(path));
-    root.set("browsePaths", std::move(browse));
     if (state.sort) root.set("sort", sort_to_json(*state.sort));
     root.set("parallel", Value::make_number(state.parallel));
     root.set("verifyDownloads", Value::make_bool(state.verify_downloads));

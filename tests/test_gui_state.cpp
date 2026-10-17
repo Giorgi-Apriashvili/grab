@@ -15,7 +15,6 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.window = WindowPlacement{-8, 20, 1280, 800, true};
     s.last_remote = "hetzner";
     s.mode = "browse";
-    s.browse_paths = {{"Box.Guest", "movies/georgian.movies"}, {"*", "Main"}};
     s.sort = SortOrder{"modified", "desc"};
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
@@ -73,6 +72,13 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":0,"until":1760003600}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5,"until":1e300}})").limit_change);
+}
+
+TEST_CASE("Browse's folders are not kept: a start opens each server at its top") {
+    // gui.json from 0.10 and 0.11 held the folder last open per server; it is dropped on the next save.
+    const auto s = parse_gui_state(R"({"mode":"browse","browsePaths":{"Box.Guest":"movies","*":"Main"}})");
+    CHECK(s.mode == "browse");
+    CHECK(gui_state_to_json(s).find("browsePaths") == std::string::npos);
 }
 
 TEST_CASE("the results' sort is kept when valid, and absent for the default order") {

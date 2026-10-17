@@ -163,9 +163,9 @@ mode, destination per server and the results' sort in `%APPDATA%\grab\gui.json`.
   - Typing filters the folder; Enter searches everything below it, folders and files together,
     and Esc goes back.
   - Download takes any mix of folders and files. "Choose…" picks the Save-to folder.
-  - All servers starts with one folder per server. Each server reopens where you left it, also
-    after a restart. A search result's folder (the Folder column) opens it in Browse with the
-    result picked.
+  - All servers starts with one folder per server. While the window is open, each server
+    reopens where you left it; a new start opens it at its top. A search result's folder (the
+    Folder column) opens it in Browse with the result picked.
 
 - **Right-click menus:**
   - **On a result or Browse row:** Open (folders), Download, Download to… (pick a folder for

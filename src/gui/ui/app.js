@@ -1,6 +1,6 @@
 'use strict';
 // grab-gui front end. Talks to the C++ backend (src/gui/app.cpp) with JSON messages:
-//   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, browseAt, pickFolder, enqueue, cancelItem,
+//   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 pauseChild, resumeChild, skipChild,
@@ -48,7 +48,9 @@ const state = {
     source: '', age: 0, refreshing: false, listError: '', error: '', loading: false,
     under: null, pendingSelect: null, keepSelection: false,
   },
-  browsePaths: {},       // server -> its last folder (absent: its top); '*' -> All servers' server
+  // Browse's last folder per server while the window runs (absent: its top); '*' -> the server
+  // All servers had open. Not kept across starts: each start opens a server at its top.
+  browsePaths: {},
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -669,7 +671,7 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   send({ type: 'browse', id: b.id, remote: server, path, top, live });
 }
 
-// Where browse is, kept for the next time (also across restarts).
+// Where browse is, to reopen there while the window runs.
 function remember() {
   const b = state.browse;
   if (state.remote === ALL) state.browsePaths[ALL] = b.server;
@@ -677,11 +679,10 @@ function remember() {
     if (b.top) delete state.browsePaths[b.server];
     else state.browsePaths[b.server] = b.path;
   }
-  send({ type: 'browseAt', remote: state.remote, server: b.server, path: b.path, top: b.top });
 }
 
-// Browse mode starts where it last was for the server picked (All servers: in the server it had
-// open, else its list of servers).
+// Browse mode starts where it last was for the server picked in this run (All servers: in the
+// server it had open, else its list of servers); the first time, at the server's top.
 function enterBrowse() {
   const all = state.remote === ALL;
   const server = all ? (state.browsePaths[ALL] || '') : state.remote;
@@ -1388,7 +1389,6 @@ function onInit(msg) {
   }
   state.defaultDest = msg.defaultDest;
   if (msg.parallel) state.parallel = msg.parallel;
-  if (msg.browsePaths) state.browsePaths = { ...msg.browsePaths, ...state.browsePaths };
   if (msg.limit) onLimit(msg.limit);
   $('#version').textContent = `v${msg.version}`;
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;

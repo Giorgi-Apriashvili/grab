@@ -205,15 +205,6 @@ void App::on_message(const std::string& text) {
     } else if (type == "browse") {
         run_browse(int_of(*msg, "id"), msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""),
                    bool_of(*msg, "top"), bool_of(*msg, "live"), false);
-    } else if (type == "browseAt") {
-        // Where browse mode is, to reopen there: per server, and which server All servers had open.
-        const std::string server = msg->string_of("server").value_or("");
-        if (msg->string_of("remote") == "*") state_.browse_paths["*"] = server;
-        if (!server.empty()) {
-            if (bool_of(*msg, "top")) state_.browse_paths.erase(server);
-            else state_.browse_paths[server] = msg->string_of("path").value_or("");
-        }
-        save_state();
     } else if (type == "refreshLists") {
         const std::string remote = msg->string_of("remote").value_or("");
         if (remote == "*") {
@@ -386,9 +377,6 @@ void App::send_init() {
     Value dests = Value::make_object();
     for (const auto& [remote, path] : state_.destinations) dests.set(remote, str(path));
     init.set("destinations", std::move(dests));
-    Value browse_paths = Value::make_object();
-    for (const auto& [server, path] : state_.browse_paths) browse_paths.set(server, str(path));
-    init.set("browsePaths", std::move(browse_paths));
     init.set("defaultDest", str(known_folder(FOLDERID_Downloads)));
     init.set("parallel", num(state_.parallel));
     Value limit = limit_message(schedule::local_now());

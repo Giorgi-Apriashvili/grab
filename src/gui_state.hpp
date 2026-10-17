@@ -50,9 +50,6 @@ struct GuiState {
     std::string last_remote;
     std::string mode = "file"; // "file" | "folder" | "browse"
     std::map<std::string, std::string> destinations; // remote -> last destination folder
-    // Browse mode: server -> the folder last open (absent: its top); "*" -> the server All servers
-    // had open ("" for the servers themselves).
-    std::map<std::string, std::string> browse_paths;
     std::optional<SortOrder> sort;                   // absent: the default order
     int parallel = 4;                               // downloads at once, min_parallel..max_parallel
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
