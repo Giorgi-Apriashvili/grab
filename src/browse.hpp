@@ -25,7 +25,7 @@ struct Item {
     std::string name;
     std::string path; // ready for rclone
     bool dir = false;
-    std::optional<std::uint64_t> size;  // files; folders when everything below them is known
+    std::optional<std::uint64_t> size;  // files only: a folder's total isn't known
     std::optional<std::size_t> items;   // folders whose contents are known: how many entries
     std::optional<std::int64_t> modified{}; // Unix seconds; a folder's own
     bool operator==(const Item&) const = default;
@@ -56,8 +56,6 @@ private:
     struct Folder {
         std::vector<std::size_t> children; // indexes into the list's entries
         bool known = false;                // its children are all in the list
-        bool complete = false;             // everything below it is, so `size` is exact
-        std::uint64_t size = 0;
     };
     [[nodiscard]] Item item(const file_list::Entry& e) const;
     [[nodiscard]] Item root_item(const std::string& root) const;

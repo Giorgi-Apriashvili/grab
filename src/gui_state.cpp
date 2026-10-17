@@ -17,13 +17,21 @@ std::optional<SortOrder> sort_from_json(const json::Value& v) {
     auto dir = v.string_of("dir");
     if (key != "name" && key != "size" && key != "modified") return std::nullopt;
     if (dir != "asc" && dir != "desc") return std::nullopt;
-    return SortOrder{std::move(*key), std::move(*dir)};
+    SortOrder order{std::move(*key), std::move(*dir)};
+    if (const auto* then = v.find("then"); then != nullptr && order.key == "size") {
+        if (auto before = sort_from_json(*then); before && before->key != "size") {
+            order.then_key = std::move(before->key);
+            order.then_dir = std::move(before->dir);
+        }
+    }
+    return order;
 }
 
 json::Value sort_to_json(const SortOrder& s) {
     json::Value v = json::Value::make_object();
     v.set("key", json::Value::make_string(s.key));
     v.set("dir", json::Value::make_string(s.dir));
+    if (!s.then_key.empty()) v.set("then", sort_to_json(SortOrder{s.then_key, s.then_dir}));
     return v;
 }
 

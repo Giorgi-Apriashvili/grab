@@ -29,9 +29,14 @@ struct WindowPlacement {
 struct SortOrder {
     std::string key; // "name" | "size" | "modified"
     std::string dir; // "asc" | "desc"
+    // With a Size sort, the sort before it ("name" or "modified"), which orders the folders after
+    // the files (folders have no size); empty for their default order.
+    std::string then_key{};
+    std::string then_dir{};
     bool operator==(const SortOrder&) const = default;
 };
-// {"key":"modified","dir":"desc"}; nullopt for anything else.
+// {"key":"modified","dir":"desc"}, or {"key":"size","dir":"desc","then":{"key":"name","dir":"asc"}};
+// nullopt for anything else. A `then` that isn't a Name or Modified sort is dropped.
 [[nodiscard]] std::optional<SortOrder> sort_from_json(const json::Value& v);
 [[nodiscard]] json::Value sort_to_json(const SortOrder& s);
 

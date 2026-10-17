@@ -147,16 +147,19 @@ mode, destination per server and the results' sort in `%APPDATA%\grab\gui.json`.
     first, the second reverses it, the third goes back to the default order (best match for a
     search, folders first A→Z in Browse). An arrow marks the sorted column; Tab to a header and
     press Enter or Space from the keyboard.
-  - Browse keeps folders above files in every sort, and rows without a size or date go last.
-    Size is off in Folders mode, where no row has a size. The selection stays on the same
-    items.
+  - Browse keeps folders above files when sorting by name or date, and rows without a size or
+    date go last. The selection stays on the same items.
+  - Folders have no size (a folder's total isn't known without listing everything inside it).
+    Size sorts the files, and the folders follow them in the order you had before: sort by
+    Modified, then Size, and the files go largest first with the folders after them, newest
+    first. Size is off in Folders mode, where no row has a size.
   - The sort stays, across searches, folders and restarts, until you change it.
 - **Browse** (next to Files and Folders) clicks through a server's folders instead of searching:
   `Box.Guest › movies › georgian.movies`, with ↑ (Backspace) to go up.
-  - Folders open instantly from the server's file list, with their date and item count, and
-    their size when the list holds everything inside them. Folders deeper than the list (past
-    `max_depth`) are listed from the server (`rclone lsjson`, about 2 s on a Storage Box) and
-    remembered while the window is open; Refresh lists the current folder again.
+  - Folders open instantly from the server's file list, with their date and item count.
+    Folders deeper than the list (past `max_depth`) are listed from the server (`rclone
+    lsjson`, about 2 s on a Storage Box) and remembered while the window is open; Refresh lists
+    the current folder again.
   - Typing filters the folder; Enter searches everything below it, folders and files together,
     and Esc goes back.
   - Download takes any mix of folders and files. "Choose…" picks the Save-to folder.

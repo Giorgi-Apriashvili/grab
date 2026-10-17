@@ -24,7 +24,9 @@ const state = {
   selected: new Set(),
   cursor: -1,
   anchor: -1,
-  sort: { key: '', dir: 'asc' }, // the rows' order: key '' (the default), name, size or modified
+  // The rows' order: key '' (the default), name, size or modified. A Size sort's `then` is the
+  // sort before it, which orders the folders (they have no size); null for their default order.
+  sort: { key: '', dir: 'asc', then: null },
   searchId: 0,
   searching: false,
   searchStarted: 0,
@@ -352,7 +354,7 @@ function selectedHits() {
 function renderSummary() {
   const sel = [...state.selected].map((i) => state.hits[i]);
   const bytes = sel.reduce((sum, h) => sum + (h.size || 0), 0);
-  const unknown = sel.some((h) => h.size == null); // folders deeper than the list: at least this much
+  const unknown = sel.some((h) => h.size == null); // folders have no size: at least this much
   let text = state.resultNote || '';
   if (sel.length) text += `${text ? ' · ' : ''}${sel.length} selected${bytes ? ` (${fmtSize(bytes)}${unknown ? '+' : ''})` : ''}`;
   $('#summary').textContent = text;
@@ -425,11 +427,20 @@ function sortKey() {
   return state.sort.key === 'size' && state.mode === 'folder' ? '' : state.sort.key;
 }
 
-// A saved sort from the backend; anything else is the default order.
+// A saved sort from the backend; anything else is the default order. A Size sort's `then` must
+// be a Name or Modified sort; another is dropped.
 function sortFrom(v) {
-  const ok = v && typeof v === 'object' && typeof v.key === 'string' && Object.hasOwn(SORT_FIRST, v.key) &&
-    (v.dir === 'asc' || v.dir === 'desc');
-  return ok ? { key: v.key, dir: v.dir } : { key: '', dir: 'asc' };
+  const ok = (s) => s && typeof s === 'object' && typeof s.key === 'string' && Object.hasOwn(SORT_FIRST, s.key) &&
+    (s.dir === 'asc' || s.dir === 'desc');
+  if (!ok(v)) return { key: '', dir: 'asc', then: null };
+  const then = v.key === 'size' && ok(v.then) && v.then.key !== 'size' ? { key: v.then.key, dir: v.then.dir } : null;
+  return { key: v.key, dir: v.dir, then };
+}
+
+// The sort as gui.json keeps it: null for the default order.
+function sortToSave(s) {
+  if (!s.key) return null;
+  return s.then ? { key: s.key, dir: s.dir, then: { key: s.then.key, dir: s.then.dir } } : { key: s.key, dir: s.dir };
 }
 
 // `s` with A to Z in lower case, and nothing else changed (as browse::natural_less compares).
@@ -478,13 +489,22 @@ function naturalCompare(a, b, la = asciiLower(a), lb = asciiLower(b)) {
 }
 
 // The rows in the chosen order, as a new array (`rows` may be the folder's own items). Browse
-// keeps folders above files; rows without a size or date go last both ways; ties keep the
-// default order (`ord`, stamped where the rows arrive).
+// keeps folders above files. Folders have no size, so a Size sort puts the files first, by size,
+// and the folders after them in the sort before it (`then`), or in their default order.
 function sortRows(rows) {
   const key = sortKey();
+  if (key !== 'size') return ordered(rows, key, state.sort.dir, inBrowse());
+  const then = state.sort.then || { key: '', dir: 'asc' };
+  return [...ordered(rows.filter((h) => !h.dir), 'size', state.sort.dir, false),
+    ...ordered(rows.filter((h) => h.dir), then.key, then.dir, false)];
+}
+
+// `rows` by `key` ('' for the default order) in direction `dir`, as a new array; folders above
+// files when `folders`. Rows without a size or date go last both ways; ties keep the default
+// order (`ord`, stamped where the rows arrive).
+function ordered(rows, key, dir, folders) {
   if (!key) return rows.slice().sort((x, y) => x.ord - y.ord);
-  const folders = inBrowse();
-  const desc = state.sort.dir === 'desc';
+  const desc = dir === 'desc';
   // What each row is compared by, worked out once rather than in every comparison.
   const value = key === 'name' ? (h) => asciiLower(h.name)
     : key === 'size' ? (h) => (Number.isFinite(h.size) ? h.size : null)
@@ -537,11 +557,17 @@ function resort() {
 // gui.json for the next searches, folders and starts.
 function clickSort(key) {
   const s = state.sort;
-  if (s.key !== key) state.sort = { key, dir: SORT_FIRST[key] };
-  else if (s.dir === SORT_FIRST[key]) state.sort = { key, dir: s.dir === 'asc' ? 'desc' : 'asc' };
-  else state.sort = { key: '', dir: 'asc' };
+  if (s.key !== key) {
+    // Size orders the files; the folders after them keep the sort before it.
+    const then = key === 'size' && s.key ? { key: s.key, dir: s.dir } : null;
+    state.sort = { key, dir: SORT_FIRST[key], then };
+  } else if (s.dir === SORT_FIRST[key]) {
+    state.sort = { ...s, dir: s.dir === 'asc' ? 'desc' : 'asc' };
+  } else {
+    state.sort = { key: '', dir: 'asc', then: null };
+  }
   resort();
-  send({ type: 'prefs', sort: state.sort.key ? { key: state.sort.key, dir: state.sort.dir } : null });
+  send({ type: 'prefs', sort: sortToSave(state.sort) });
 }
 
 // The mouse leaves the focus where it was (the arrow keys go on moving in the results); Tab
@@ -1356,7 +1382,7 @@ function onInit(msg) {
   state.remote = msg.remote;
   state.mode = msg.mode;
   const sort = sortFrom(msg.sort);
-  if (sort.key !== state.sort.key || sort.dir !== state.sort.dir) {
+  if (JSON.stringify(sortToSave(sort)) !== JSON.stringify(sortToSave(state.sort))) {
     state.sort = sort;
     resort();
   }

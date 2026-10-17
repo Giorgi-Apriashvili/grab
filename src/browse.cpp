@@ -18,13 +18,6 @@ namespace {
 unsigned char lower(char c) { return static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(c))); }
 bool digit(char c) { return c >= '0' && c <= '9'; }
 
-// How deep a folder path is, for ordering children before their parents: "" and "/" first.
-int nesting(std::string_view path) {
-    if (path.empty()) return -1;
-    if (path == "/") return 0;
-    return static_cast<int>(std::ranges::count(path, '/')) + 1;
-}
-
 // `path` relative to `root`, which holds it.
 std::string_view relative(std::string_view path, std::string_view root) {
     if (path == root) return {};
@@ -102,39 +95,14 @@ Index::Index(std::shared_ptr<const file_list::List> list, std::vector<std::strin
             folders_[e.path].known = depth < max_depth; // one at max_depth is listed, not its contents
         }
     }
-    // Sizes from the bottom up: a folder is complete when everything below it is in the list.
-    std::vector<std::pair<int, std::string_view>> order;
-    order.reserve(folders_.size());
-    for (const auto& [path, f] : folders_) order.emplace_back(nesting(path), path);
-    std::ranges::sort(order, std::greater<>{}, &std::pair<int, std::string_view>::first);
-    for (const auto& [depth, path] : order) {
-        auto& f = folders_.find(path)->second;
-        bool complete = f.known;
-        std::uint64_t size = 0;
-        for (const auto c : f.children) {
-            const auto& e = entries[c];
-            if (e.dir) {
-                const auto it = folders_.find(e.path);
-                if (it != folders_.end() && it->second.complete) size += it->second.size;
-                else complete = false;
-            } else if (e.size) {
-                size += *e.size;
-            } else {
-                complete = false;
-            }
-        }
-        f.complete = complete;
-        f.size = size;
-    }
 }
 
 Item Index::item(const file_list::Entry& e) const {
     Item it{remote_basename(e.path), e.path, e.dir, e.size, std::nullopt, e.modified};
     if (e.dir) {
         it.size.reset();
-        if (const auto f = folders_.find(e.path); f != folders_.end()) {
-            if (f->second.known) it.items = f->second.children.size();
-            if (f->second.complete) it.size = f->second.size;
+        if (const auto f = folders_.find(e.path); f != folders_.end() && f->second.known) {
+            it.items = f->second.children.size();
         }
     }
     return it;
@@ -142,10 +110,7 @@ Item Index::item(const file_list::Entry& e) const {
 
 Item Index::root_item(const std::string& root) const {
     Item it{root.empty() ? "~" : root, root, true, std::nullopt, std::nullopt};
-    if (const auto f = folders_.find(root); f != folders_.end()) {
-        it.items = f->second.children.size();
-        if (f->second.complete) it.size = f->second.size;
-    }
+    if (const auto f = folders_.find(root); f != folders_.end()) it.items = f->second.children.size();
     return it;
 }
 

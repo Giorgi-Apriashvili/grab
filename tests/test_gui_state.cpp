@@ -100,6 +100,26 @@ TEST_CASE("the results' sort is kept when valid, and absent for the default orde
     CHECK(json::stringify(sort_to_json(SortOrder{"name", "asc"})) == R"({"key":"name","dir":"asc"})");
 }
 
+TEST_CASE("a Size sort keeps the sort before it, which orders the folders") {
+    const auto then = R"({"sort":{"key":"size","dir":"desc","then":{"key":"modified","dir":"asc"}}})";
+    CHECK(parse_gui_state(then).sort == SortOrder{"size", "desc", "modified", "asc"});
+    GuiState s;
+    s.sort = SortOrder{"size", "asc", "name", "desc"};
+    CHECK(parse_gui_state(gui_state_to_json(s)).sort == s.sort);
+    CHECK(json::stringify(sort_to_json(SortOrder{"size", "desc", "name", "asc"})) ==
+          R"({"key":"size","dir":"desc","then":{"key":"name","dir":"asc"}})");
+    // A `then` that isn't a Name or Modified sort is dropped; the Size sort stays.
+    CHECK(parse_gui_state(R"({"sort":{"key":"size","dir":"desc","then":{"key":"size","dir":"asc"}}})").sort ==
+          SortOrder{"size", "desc"});
+    CHECK(parse_gui_state(R"({"sort":{"key":"size","dir":"desc","then":{"key":"name","dir":"up"}}})").sort ==
+          SortOrder{"size", "desc"});
+    CHECK(parse_gui_state(R"({"sort":{"key":"size","dir":"desc","then":"name"}})").sort == SortOrder{"size", "desc"});
+    CHECK(parse_gui_state(R"({"sort":{"key":"size","dir":"desc","then":null}})").sort == SortOrder{"size", "desc"});
+    // Only a Size sort has one.
+    CHECK(parse_gui_state(R"({"sort":{"key":"name","dir":"asc","then":{"key":"modified","dir":"asc"}}})").sort ==
+          SortOrder{"name", "asc"});
+}
+
 TEST_CASE("queue order: move an item before another, or to the end") {
     std::vector<int> ids{1, 2, 3, 4};
     CHECK(move_before(ids, 4, 1)); // to the top

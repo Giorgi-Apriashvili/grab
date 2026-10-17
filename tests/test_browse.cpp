@@ -86,8 +86,9 @@ TEST_CASE("a server's folders from its file list, down to the list's depth") {
                               {""}, 3);
     const auto top = index.top();
     REQUIRE(top.size() == 3);
-    CHECK(top[0] == Item{"movies", "movies", true, std::nullopt, 1, 1697000000}); // something below unknown: no size
-    CHECK(top[1] == Item{"tv", "tv", true, 10, 1});                                // all known: its size
+    // Folders have no size, even when everything below them is known.
+    CHECK(top[0] == Item{"movies", "movies", true, std::nullopt, 1, 1697000000});
+    CHECK(top[1] == Item{"tv", "tv", true, std::nullopt, 1});
     CHECK(top[2] == Item{"top.txt", "top.txt", false, 5, std::nullopt, 1700000000});
 
     const auto georgian = index.folder("movies/georgian");
@@ -105,7 +106,8 @@ TEST_CASE("several search roots are the server's top folders") {
     const browse::Index index(list_of({dir("/srv/media/a", 5), file("/srv/media/a/f.mkv", 7, 6), file("/home/x/n.txt", 1, 7)}),
                               {"/srv/media", "/home/x"}, 4);
     // The roots themselves are not in the list: no date.
-    CHECK(index.top() == std::vector<Item>{{"/srv/media", "/srv/media", true, 7, 1}, {"/home/x", "/home/x", true, 1, 1}});
+    CHECK(index.top() == std::vector<Item>{{"/srv/media", "/srv/media", true, std::nullopt, 1},
+                                           {"/home/x", "/home/x", true, std::nullopt, 1}});
     CHECK((*index.folder("/srv/media"))[0].modified == 5);
     CHECK(names(*index.folder("/srv/media/a")) == std::vector<std::string>{"f.mkv"});
     const browse::Index empty(list_of({}), {}, 4); // no list entries: the home is known and empty
