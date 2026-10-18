@@ -195,7 +195,6 @@ void App::on_message(const std::string& text) {
         open_release_page();
     } else if (type == "prefs") {
         if (auto remote = msg->string_of("remote")) state_.last_remote = *remote;
-        if (auto mode = msg->string_of("mode"); mode == "file" || mode == "folder" || mode == "browse") state_.mode = *mode;
         // The results' sort: null for the default order; an invalid one changes nothing.
         if (const Value* sort = msg->find("sort")) {
             if (sort->kind == Value::Kind::null) state_.sort.reset();
@@ -376,7 +375,6 @@ void App::send_init() {
     }
     init.set("remotes", std::move(remotes));
     init.set("remote", str(selected));
-    init.set("mode", str(state_.mode));
     if (state_.sort) init.set("sort", sort_to_json(*state_.sort));
     Value dests = Value::make_object();
     for (const auto& [remote, path] : state_.destinations) dests.set(remote, str(path));
@@ -399,14 +397,15 @@ void App::start_search(const Value& msg) {
     if (int depth = int_of(msg, "depth"); depth > 0) req.depth = depth;
     std::optional<std::string> under;
     if (const Value* u = msg.find("under"); u != nullptr && u->kind == Value::Kind::string) under = u->str;
-    run_search(int_of(msg, "id"), msg.string_of("remote").value_or(""), req, false, under);
+    run_search(int_of(msg, "id"), msg.string_of("remote").value_or(""), req, false, msg.string_of("mode") == "any",
+               under);
 }
 
 // A server's search answers from its saved file list when it has one that fits; a list older
 // than file_list::fresh_for, or an older grab's without dates, is refreshed in the background,
 // and the search then runs again. A server without a list is searched live (one server) while
 // its list is fetched for next time.
-void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update,
+void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update, bool both,
                      const std::optional<std::string>& under) {
     // A new search replaces the previous one; stopping kills its ssh/rclone child at once.
     if (search_thread_.joinable()) {
@@ -417,9 +416,9 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
     }
     {
         std::lock_guard lock(lists_mutex_);
-        last_search_ = LastSearch{id, remote, req, under};
+        last_search_ = LastSearch{id, remote, req, both, under};
     }
-    search_thread_ = std::jthread([this, id, remote, req, update, under](std::stop_token stop) {
+    search_thread_ = std::jthread([this, id, remote, req, update, both, under](std::stop_token stop) {
         const auto t0 = std::chrono::steady_clock::now();
         auto fail = [&](const std::string& message, bool cancelled) {
             if (cancelled && search_replaced_) return; // the next search reports instead
@@ -448,6 +447,18 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
         std::vector<file_list::ServerHit> hits;
         Value lists = Value::make_array(); // per server: where the answer came from
         Value v = Value::make_object();
+        // The kinds asked for: one, or folders and files (`both`; folder hits marked).
+        const std::vector<Mode> kinds = both ? std::vector<Mode>{Mode::folder, Mode::file} : std::vector<Mode>{req.mode};
+        auto add = [&](std::optional<engine::SearchResult>& into, engine::SearchResult got, Mode kind) {
+            if (both) {
+                for (auto& h : got.hits) h.dir = kind == Mode::folder;
+            }
+            if (!into) {
+                into = std::move(got);
+                return;
+            }
+            std::ranges::move(got.hits, std::back_inserter(into->hits));
+        };
         for (const auto& server : servers) {
             if (stop.stop_requested()) return fail("search cancelled", true);
             Value status = Value::make_object();
@@ -478,7 +489,11 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
                 }
                 if (!update && (!list || !file_list::fresh(*list, now))) start_refresh(server);
                 if (list) {
-                    found = file_list::search(*ctx, *list, req);
+                    for (const Mode kind : kinds) {
+                        auto r = req;
+                        r.mode = kind;
+                        add(found, file_list::search(*ctx, *list, r), kind);
+                    }
                     status.set("age", num(static_cast<double>(now - list->fetched)));
                 }
                 std::lock_guard lock(lists_mutex_);
@@ -488,13 +503,18 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             // One server without a usable list, or a search lists can't answer: live, as before.
             if (!found && (!all || !listable)) {
-                auto live = engine::search(*ctx, req, run);
-                if (stop.stop_requested()) return fail("search cancelled", true);
-                if (!live) {
-                    if (!all) return fail(live.error(), false);
-                    status.set("error", str(live.error()));
-                } else {
-                    found = std::move(*live);
+                for (const Mode kind : kinds) {
+                    auto r = req;
+                    r.mode = kind;
+                    auto live = engine::search(*ctx, r, run);
+                    if (stop.stop_requested()) return fail("search cancelled", true);
+                    if (!live) {
+                        if (!all) return fail(live.error(), false);
+                        status.set("error", str(live.error()));
+                        found.reset();
+                        break;
+                    }
+                    add(found, std::move(*live), kind);
                     status.set("live", Value::make_bool(true));
                 }
             }
@@ -509,12 +529,13 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             lists.push(std::move(status));
         }
-        if (all || under) file_list::rank_across(hits, req); // under: folders and files together
+        if (all || both || under) file_list::rank_across(hits, req); // folders and files together
 
         v.set("type", str("searchResult"));
         v.set("id", num(id));
         v.set("update", Value::make_bool(update));
         if (under) v.set("under", str(*under));
+        if (both) v.set("both", Value::make_bool(true));
         if (all || under) {
             v.set("maxDepth", num(0));
             v.set("roots", Value::make_array());
@@ -588,7 +609,7 @@ void App::on_list_refreshed(const std::string& server) {
         last = last_search_;
     }
     if (last.id != 0 && (last.remote == server || last.remote == "*")) {
-        run_search(last.id, last.remote, last.req, true, last.under);
+        run_search(last.id, last.remote, last.req, true, last.both, last.under);
     }
     LastBrowse browsed;
     {

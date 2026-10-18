@@ -18,7 +18,6 @@ const ROW = 32; // keep in sync with --row in app.css
 const state = {
   remotes: [],
   remote: '',
-  mode: 'file',
   destinations: {},
   defaultDest: '',
   hits: [],
@@ -118,7 +117,7 @@ function fmtDate(sec, seconds = false) {
   return seconds ? `${text}:${pad2(d.getSeconds())}` : text;
 }
 
-// ---- header: remote, mode ----------------------------------------------------------------
+// ---- header: the server ------------------------------------------------------------------
 
 function renderRemotes() {
   const sel = $('#remote');
@@ -133,7 +132,6 @@ function renderRemoteInfo() {
   const info = $('#remote-info');
   const r = currentRemote();
   $('#dest').value = state.destinations[state.remote] || state.defaultDest;
-  $('#dir-head').textContent = state.remote === ALL ? 'Server · Folder' : 'Folder';
   if (state.remote === ALL) {
     info.hidden = false;
     info.classList.remove('error');
@@ -148,16 +146,17 @@ function renderRemoteInfo() {
   info.title = r.error || '';
 }
 
-function renderMode() {
-  for (const b of document.querySelectorAll('#search-form .segmented button')) {
-    b.setAttribute('aria-checked', String(b.dataset.mode === state.mode));
-  }
-  $('#query').placeholder = state.mode === 'browse' ? 'Filter this folder; Enter searches everything below it'
-    : state.mode === 'folder' ? 'Search folders by name, e.g. lioness season 3'
-      : 'Search files by name, e.g. lioness s03e08';
-  renderBrowseBar();
-  renderSortHead();
+// The search box: its placeholder names the folder; ✕ shows with words typed, results shown or
+// a search running, and a spinner while one runs.
+function renderSearchBox() {
+  const q = $('#query');
+  q.placeholder = `Search ${browseHere()}`;
+  q.title = 'Typing filters this folder. Enter searches it and every folder below it; Esc goes back.';
+  $('#search-clear').hidden = !q.value && !state.browse.under && !state.searching;
+  $('#search-spin').hidden = !state.searching;
 }
+
+function exactOn() { return $('#exact').getAttribute('aria-pressed') === 'true'; }
 
 // ---- banner and search -------------------------------------------------------------------
 
@@ -169,29 +168,29 @@ function showBanner(text) {
 
 function setSearching(on) {
   state.searching = on;
-  const btn = $('#search-btn');
-  btn.textContent = on ? 'Cancel' : 'Search';
-  btn.classList.toggle('primary', !on);
+  renderSearchBox();
   renderEmpty();
 }
 
-function startSearch() {
-  if (state.searching) { send({ type: 'cancelSearch' }); return; }
-  const query = $('#query').value.trim();
-  if (!query) { $('#query').focus(); return; }
-  if (inBrowse()) { searchBelow(query); return; }
-  showBanner('');
+// A search still running stops, and its answer, still on its way, is ignored.
+function stopSearch() {
+  if (state.searching) {
+    send({ type: 'cancelSearch' });
+    setSearching(false);
+  }
   state.searchId += 1;
-  state.lastQuery = query;
-  state.searchStarted = performance.now();
-  state.hits = [];
-  state.selected.clear();
-  state.cursor = state.anchor = -1;
-  state.lists = [];
-  renderListStatus();
-  setSearching(true);
-  renderRows();
-  send({ type: 'search', id: state.searchId, remote: state.remote, query, mode: state.mode, exact: $('#exact').checked });
+}
+
+// Enter in the search box: this folder and every folder below it (searchBelow); with no words,
+// back to the folder.
+function startSearch() {
+  const query = $('#query').value.trim();
+  if (!query) {
+    closeBelow();
+    $('#query').focus();
+    return;
+  }
+  searchBelow(query);
 }
 
 // Where the results came from: "from the file list, 3 min old · refreshing…", per server under
@@ -221,8 +220,7 @@ function renderListStatus() {
 
 function onSearchResult(msg) {
   if (msg.id !== state.searchId) return;
-  if (inBrowse() && typeof msg.under !== 'string') return; // a search of another mode
-  if (typeof msg.under === 'string' && !state.browse.under) return; // the search below was closed
+  if (!state.browse.under) return; // the results were closed
   // An update (the same search after a list refresh) keeps the selection and cursor by path.
   const selectedKeys = msg.update ? new Set([...state.selected].map((i) => rowKey(state.hits[i]))) : null;
   const cursorKey = msg.update && state.hits[state.cursor] ? rowKey(state.hits[state.cursor]) : null;
@@ -241,12 +239,10 @@ function onSearchResult(msg) {
   state.anchor = state.cursor;
   // Before rendering: an empty result shows "No files matching …" from these.
   const n = msg.hits.length;
-  const noun = typeof msg.under === 'string' ? `result${n === 1 ? '' : 's'}`
-    : `${state.mode === 'folder' ? 'folder' : 'file'}${n === 1 ? '' : 's'}`;
+  const noun = `result${n === 1 ? '' : 's'}`;
   const live = state.lists.length && state.lists.every((l) => l.live);
   state.resultNote = live ? `${n} ${noun} in ${(msg.elapsedMs / 1000).toFixed(1)} s` : `${n} ${noun}`;
-  state.searchedWhere = state.remote === ALL ? 'every server' : `${msg.roots.join(', ')}, depth ${msg.maxDepth}`;
-  if (typeof msg.under === 'string') renderBrowseBar();
+  renderBrowseBar();
   renderListStatus();
   if (state.searching) setSearching(false);
   if (!msg.update) $('#results').scrollTop = 0;
@@ -257,9 +253,11 @@ function onSearchResult(msg) {
 
 function onSearchError(msg) {
   if (msg.id !== state.searchId) return;
+  const u = state.browse.under;
+  if (u) u.error = msg.cancelled ? 'Search stopped.' : msg.message; // shown where results would be
+  else if (!msg.cancelled) showBanner(msg.message);
+  state.resultNote = msg.cancelled ? 'Search stopped' : '';
   setSearching(false);
-  if (!msg.cancelled) showBanner(msg.message);
-  state.resultNote = msg.cancelled ? 'Search cancelled' : '';
   renderSummary();
 }
 
@@ -279,22 +277,20 @@ function renderRows() {
   const first = Math.max(0, Math.floor(list.scrollTop / ROW) - 10);
   const last = Math.min(n, Math.ceil((list.scrollTop + list.clientHeight) / ROW) + 10);
   let html = '';
-  const browsing = inBrowse();
-  const under = browsing && state.browse.under;
-  $('#dir-head').textContent = !browsing ? (state.remote === ALL ? 'Server · Folder' : 'Folder')
-    : under ? 'Folder' : state.browse.server ? 'Contents' : 'Login';
+  const under = state.browse.under;
+  $('#dir-head').textContent = under ? (under.all ? 'Server · Folder' : 'Folder') : state.browse.server ? 'Contents' : 'Login';
   const now = Date.now() / 1000;
   for (let i = first; i < last; ++i) {
     const h = state.hits[i];
     const sel = state.selected.has(i);
     let third;
-    if (!browsing) {
-      // The hit's folder: a link that opens it in Browse.
+    if (under) {
+      // A search result's folder, from the folder searched (its own name when the hit is right
+      // in it), with its server under All servers: a link that opens it with the hit picked.
       const parent = parentOf(h.path);
-      third = `${state.remote === ALL ? `<span class="srv">${esc(h.remote)}</span>` : ''}` +
-        `<span class="go" data-go="${i}" title="Open in Browse">${esc(parent || '~')}</span>`;
-    } else if (under) {
-      third = esc(relativeTo(parentOf(h.path), under.path));
+      const shown = under.whole ? (parent || '~') : (relativeTo(parent, under.path) || under.name);
+      third = `${under.all ? `<span class="srv">${esc(h.remote)}</span>` : ''}` +
+        `<span class="go" data-go="${i}" title="Open ${esc(parent || '~')}">${esc(shown)}</span>`;
     } else if (h.server) {
       third = esc(h.info);
     } else {
@@ -323,38 +319,27 @@ function renderEmpty() {
   const empty = $('#empty');
   if (state.hits.length) { empty.hidden = true; return; }
   empty.hidden = false;
-  const r = currentRemote();
-  if (inBrowse()) {
-    const b = state.browse;
-    const filter = $('#query').value.trim();
-    if (state.searching) {
-      empty.innerHTML = `<span><span class="spinner"></span>Searching below ${esc(browseHere())} for “${esc(state.lastQuery)}”…</span>`;
-    } else if (b.under) {
-      empty.textContent = `Nothing below ${browseHere()} matches “${b.under.query}”.`;
-    } else if (b.loading) {
-      empty.innerHTML = `<span><span class="spinner"></span>Opening ${esc(browseHere())}…</span>`;
-    } else if (b.error) {
-      empty.textContent = b.error;
-    } else if (!state.remotes.length) {
-      empty.innerHTML = '<div>No servers yet. Add the Linux server you want to download from.<br>' +
-        '<button type="button" class="primary" data-act="add-server">Add a server</button></div>';
-    } else if (filter) {
-      empty.textContent = `Nothing in ${browseHere()} matches “${filter}”.`;
-    } else {
-      empty.textContent = 'This folder is empty.';
-    }
-    return;
-  }
-  if (state.searching) {
-    empty.innerHTML = `<span><span class="spinner"></span>Searching ${state.remote === ALL ? 'all servers' : esc(state.remote)} for “${esc(state.lastQuery)}”…</span>`;
-  } else if (state.lastQuery && state.resultNote && !state.resultNote.startsWith('Search cancelled')) {
-    empty.textContent = `No ${state.mode === 'folder' ? 'folders' : 'files'} matching “${state.lastQuery}” (searched ${state.searchedWhere}).`;
+  const b = state.browse;
+  const filter = $('#query').value.trim();
+  const u = b.under;
+  if (state.searching && u) {
+    empty.innerHTML = `<span><span class="spinner"></span>Searching ${u.all ? 'every server' : `${esc(u.name)} and its folders`}` +
+      ` for “${esc(state.lastQuery)}”…</span>`;
+  } else if (u && u.error) {
+    empty.textContent = u.error;
+  } else if (u) {
+    empty.textContent = `Nothing ${u.all ? 'on any server' : `in ${u.name} or its folders`} matches “${u.query}”.`;
+  } else if (b.loading) {
+    empty.innerHTML = `<span><span class="spinner"></span>Opening ${esc(browseHere())}…</span>`;
+  } else if (b.error) {
+    empty.textContent = b.error;
   } else if (!state.remotes.length) {
     empty.innerHTML = '<div>No servers yet. Add the Linux server you want to download from.<br>' +
       '<button type="button" class="primary" data-act="add-server">Add a server</button></div>';
+  } else if (filter) {
+    empty.textContent = `Nothing in ${browseHere()} matches “${filter}”. Enter searches its folders too.`;
   } else {
-    empty.textContent = r && r.error ? r.error
-      : `Search ${state.remote || 'a server'} for ${state.mode === 'folder' ? 'folders' : 'files'} by name. Every word must appear, in any order.`;
+    empty.textContent = 'This folder is empty.';
   }
 }
 
@@ -433,10 +418,10 @@ function rowKey(h) {
 // reverses it; the third returns to the default order.
 const SORT_FIRST = { name: 'asc', size: 'desc', modified: 'desc' };
 
-// The column the rows are sorted by, '' for the default order (best match, or folders first A
-// to Z in Browse). No row has a size in Folders mode: a Size sort leaves its rows as they are.
+// The column the rows are sorted by, '' for the default order (best match for search results,
+// folders first A to Z in a folder).
 function sortKey() {
-  return state.sort.key === 'size' && state.mode === 'folder' ? '' : state.sort.key;
+  return state.sort.key;
 }
 
 // A saved sort from the backend; anything else is the default order. A Size sort's `then` must
@@ -505,7 +490,7 @@ function naturalCompare(a, b, la = asciiLower(a), lb = asciiLower(b)) {
 // and the folders after them in the sort before it (`then`), or in their default order.
 function sortRows(rows) {
   const key = sortKey();
-  if (key !== 'size') return ordered(rows, key, state.sort.dir, inBrowse());
+  if (key !== 'size') return ordered(rows, key, state.sort.dir, true);
   const then = state.sort.then || { key: '', dir: 'asc' };
   return [...ordered(rows.filter((h) => !h.dir), 'size', state.sort.dir, false),
     ...ordered(rows.filter((h) => h.dir), then.key, then.dir, false)];
@@ -534,13 +519,12 @@ function ordered(rows, key, dir, folders) {
   return items.map((x) => x.h);
 }
 
-// The header's arrow on the sorted column. Size is off in Folders mode, where no row has one.
+// The header's arrow on the sorted column.
 function renderSortHead() {
   const key = sortKey();
   for (const b of document.querySelectorAll('.results-head [data-sort]')) {
     if (b.dataset.sort === key) b.dataset.dir = state.sort.dir;
     else delete b.dataset.dir;
-    b.disabled = b.dataset.sort === 'size' && state.mode === 'folder';
   }
 }
 
@@ -595,8 +579,6 @@ $('.results-head').addEventListener('click', (ev) => {
 // ---- browse mode: a server's folders -----------------------------------------------------
 
 const FOLDER_ICON = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 3.5C1 2.7 1.7 2 2.5 2h3.6l1.6 1.6h5.8c.8 0 1.5.7 1.5 1.5v7.4c0 .8-.7 1.5-1.5 1.5h-11C1.7 14 1 13.3 1 12.5z"/></svg>';
-
-function inBrowse() { return state.mode === 'browse'; }
 
 // `path` without its `folder` prefix, for search results below a folder ('' for the folder itself).
 function relativeTo(path, folder) {
@@ -664,6 +646,7 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   const b = state.browse;
   if (!history) navTo({ remote: state.remote, server, path: top ? '' : path, top: !server || top });
   b.inited = true;
+  if (b.under) stopSearch();
   b.under = null;
   b.typed = null;
   b.pendingScroll = scroll;
@@ -762,7 +745,7 @@ function samePlace(a, b) {
 // search's results below it show, nor when its rows were just cleared (a server switch).
 function navNote() {
   const c = state.nav.cur;
-  if (!c || !c.shown || !inBrowse() || state.browse.under || !state.hits.length) return;
+  if (!c || !c.shown || state.browse.under || !state.hits.length) return;
   const h = state.hits[state.cursor];
   c.cursorKey = h ? (h.server || h.path) : null;
   c.scroll = $('#results').scrollTop;
@@ -796,11 +779,11 @@ function navShown() {
   b.pendingScroll = null;
 }
 
-// Back (-1) or Forward (+1), in Browse only. Back first closes the results of a search below the
-// folder, as Esc does; Forward closes them and goes on. Another server's place switches the
-// server picker to it; a place on a server no longer configured is skipped.
+// Back (-1) or Forward (+1). Back first closes the results of a search, as Esc does; Forward
+// closes them and goes on. Another server's place switches the server picker to it; a place on
+// a server no longer configured is skipped.
 function navGo(dir) {
-  if (!inBrowse() || settings.open || modal) return;
+  if (settings.open || modal) return;
   const n = state.nav;
   if (state.browse.under) {
     closeBelow();
@@ -850,35 +833,30 @@ function browseUp() {
   else browseTo(b.server, '', true, { select: b.path });
 }
 
-// A search hit's folder, from the Files or Folders results: Browse opens it with the hit picked.
+// A search result's folder: it opens with the result picked, and the results close, with their
+// words.
 function openHitFolder(h) {
   const server = h.remote || state.remote;
-  if (inBrowse() && state.browse.under) {
-    // From the results of a search below a folder: they close, and so does their query.
-    if (state.searching) {
-      send({ type: 'cancelSearch' });
-      setSearching(false);
-    }
-    state.searchId += 1;
+  if (state.browse.under) {
+    stopSearch();
     state.lists = [];
     renderListStatus();
     $('#query').value = '';
   }
-  switchMode('browse', false);
   if (state.remote === ALL) state.browsePaths[ALL] = server;
   browseTo(server, parentOf(h.path), false, { select: h.path });
 }
 
-// Enter while browsing: everything below the folder, folders and files, from the server's list
-// (or live, for a folder deeper than the list).
+// Enter in the search box: the folder and everything below it, folders and files, from the
+// server's list (or live, for a folder deeper than the list). At All servers' top that is every
+// server, and at the top of a server with several search roots, all of them (`whole`: no one
+// folder holds them).
 function searchBelow(query) {
   const b = state.browse;
-  if (!b.server || (b.top && b.severalRoots)) {
-    showBanner('Open a server’s folder first; Enter then searches everything below it.');
-    return;
-  }
+  const all = !b.server;
+  const whole = all || (b.top && b.severalRoots);
   showBanner('');
-  b.under = { query, path: b.path };
+  b.under = { query, path: b.path, all, whole, name: browseHere() };
   state.addr.error = ''; // a failed address is behind us
   state.searchId += 1;
   state.lastQuery = query;
@@ -891,18 +869,16 @@ function searchBelow(query) {
   renderBrowseBar();
   setSearching(true);
   renderRows();
-  send({ type: 'search', id: state.searchId, remote: b.server, query, mode: 'any', exact: $('#exact').checked, under: b.path });
+  const msg = { type: 'search', id: state.searchId, remote: all ? ALL : b.server, query, mode: 'any', exact: exactOn() };
+  if (!whole) msg.under = b.path;
+  send(msg);
 }
 
 // Back from search results to the folder.
 function closeBelow() {
   const b = state.browse;
   if (!b.under) return;
-  if (state.searching) {
-    send({ type: 'cancelSearch' });
-    setSearching(false);
-  }
-  state.searchId += 1;
+  stopSearch();
   b.under = null;
   state.lists = [];
   renderListStatus();
@@ -912,16 +888,7 @@ function closeBelow() {
 }
 
 function renderBrowseBar() {
-  const bar = $('#browse-bar');
   const a = state.addr;
-  bar.hidden = !inBrowse();
-  if (bar.hidden) {
-    if (a.editing) {
-      a.editing = false;
-      renderSuggest();
-    }
-    return;
-  }
   $('#crumbs').hidden = a.editing;
   $('#browse-blank').hidden = a.editing;
   $('#address-box').hidden = !a.editing;
@@ -933,8 +900,12 @@ function renderBrowseBar() {
     steps.push({ name: b.server, server: b.server, top: true });
     for (const c of b.crumbs) steps.push({ name: c.name, server: b.server, path: c.path });
   }
+  // Search results end the path, as in Explorer.
+  if (b.under) steps.push({ name: `Search results for “${b.under.query}”`, results: true });
   b.steps = steps;
-  $('#crumbs').innerHTML = steps.map((s, i) => (i === steps.length - 1
+  $('#crumbs').innerHTML = steps.map((s, i) => (s.results
+    ? `<button type="button" class="crumb here results" data-edit tabindex="-1">${esc(s.name)}</button>`
+    : i === steps.length - 1
     ? `<button type="button" class="crumb here" data-edit tabindex="-1" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`
     : `<button type="button" class="crumb" data-step="${i}" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`))
     .join('<span class="sep">›</span>');
@@ -949,12 +920,13 @@ function renderBrowseBar() {
   fwd.title = n.fwd.length ? `Forward to ${placeName(n.fwd[n.fwd.length - 1])} (Alt+→)` : 'Forward (Alt+→)';
   $('#browse-refresh').hidden = !b.server || !!b.under;
   $('#browse-refresh').disabled = b.loading;
+  renderSearchBox();
+  // Where the folder's rows came from, in the footer (search results have their own, beside it).
   const status = $('#browse-status');
-  if (a.error && !b.under) {
+  if (a.error && !b.under && !a.editing) {
     status.innerHTML = `<span class="bad" title="${esc(a.error)}">${esc(a.error)}</span>`;
   } else if (b.under) {
-    status.innerHTML = `<span class="below">Results for “${esc(b.under.query)}” below ${esc(browseHere())}</span>` +
-      '<button type="button" class="link" data-act="close-below" title="Back to the folder (Esc)">✕</button>';
+    status.textContent = '';
   } else if (b.loading) {
     status.innerHTML = '<span class="spinner"></span>opening…';
   } else if (!b.server) {
@@ -967,6 +939,7 @@ function renderBrowseBar() {
     status.innerHTML = (b.refreshing ? '<span class="spinner"></span>' : '') + esc(parts.join(' · ')) +
       (b.listError ? ` · <span class="bad" title="${esc(b.listError)}">list refresh failed</span>` : '');
   }
+  status.title = status.textContent; // in full, when a narrow window cuts it short
 }
 
 // ---- the address bar: the path bar turned into a field ------------------------------------
@@ -1000,7 +973,7 @@ function parseAddress(text) {
 // A click on the path bar's empty part or its current folder, Ctrl+L, Alt+D or F4: the path as
 // text, all of it selected.
 function startEdit() {
-  if (!inBrowse() || settings.open || modal) return;
+  if (settings.open || modal) return;
   const a = state.addr;
   const input = $('#address');
   if (!a.editing) {
@@ -1127,7 +1100,8 @@ function renderSuggest() {
 $('#browse-bar').addEventListener('click', (ev) => {
   if (state.addr.editing) return;
   const t = ev.target;
-  if (t.closest('[data-edit]') || ['crumbs', 'browse-blank', 'browse-bar'].includes(t.id) || t.classList.contains('sep')) {
+  if (t.closest('[data-edit], .address-ico') || ['crumbs', 'browse-blank', 'browse-bar'].includes(t.id) ||
+    t.classList.contains('sep')) {
     startEdit();
   }
 });
@@ -1207,16 +1181,41 @@ $('#browse-refresh').addEventListener('click', () => {
   const b = state.browse;
   if (b.server) browseTo(b.server, b.path, b.top, { live: true });
 });
-$('#browse-status').addEventListener('click', (ev) => {
-  if (ev.target.closest('[data-act=close-below]')) closeBelow();
-});
 $('#query').addEventListener('input', () => {
-  if (inBrowse() && !state.browse.under) showFolder({ keep: true });
+  if (!state.browse.under) showFolder({ keep: true });
+  renderSearchBox();
 });
-$('#query').addEventListener('keydown', (ev) => {
-  if (!inBrowse() || ev.key !== 'Escape') return;
-  if (state.browse.under) { ev.preventDefault(); closeBelow(); }
-  else if ($('#query').value) { ev.preventDefault(); $('#query').value = ''; showFolder({ keep: true }); }
+// Esc anywhere in the search box: a search running stops, then the results close, then the
+// words go.
+$('#search-form').addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape') return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  clearSearch();
+});
+// Exact and ✕ leave the typing where it is.
+for (const id of ['#exact', '#search-clear']) $(id).addEventListener('mousedown', (ev) => ev.preventDefault());
+function clearSearch() {
+  if (state.searching) {
+    stopSearch();
+    if (state.browse.under) state.browse.under.error = 'Search stopped. Enter searches again; Esc goes back to the folder.';
+    renderEmpty();
+  } else if (state.browse.under) {
+    closeBelow();
+  } else if ($('#query').value) {
+    $('#query').value = '';
+    showFolder({ keep: true });
+    renderSearchBox();
+  }
+}
+$('#search-clear').addEventListener('click', () => {
+  clearSearch();
+  $('#query').focus();
+});
+// Exact: on until turned off; results on screen are searched again with it.
+$('#exact').addEventListener('click', () => {
+  $('#exact').setAttribute('aria-pressed', String(!exactOn()));
+  if (state.browse.under && $('#query').value.trim()) startSearch();
 });
 
 // ---- right-click menus -------------------------------------------------------------------
@@ -1331,14 +1330,14 @@ function resultMenu() {
   if (one && one.server) return [{ label: 'Open', key: 'Enter', act: () => openRow(one) }];
   const picks = rows.filter((h) => !h.server);
   if (!picks.length) return [];
-  const opens = inBrowse() && one && one.dir;
+  const opens = one && one.dir;
   const items = [];
   if (opens) items.push({ label: 'Open', key: 'Enter', act: () => openRow(one) });
   items.push({ label: picks.length > 1 ? `Download ${picks.length}` : 'Download', key: opens ? '' : 'Enter',
     act: () => download(picks) });
   items.push({ label: 'Download to…', act: () => downloadTo(picks) });
-  // In a Browse folder the row is already where it lives.
-  if (one && (!inBrowse() || state.browse.under)) items.push({ label: 'Show in Browse', act: () => openHitFolder(one) });
+  // In a folder the row is already where it lives.
+  if (one && state.browse.under) items.push({ label: 'Open folder location', act: () => openHitFolder(one) });
   items.push('-');
   items.push({ label: picks.length > 1 ? `Copy ${picks.length} paths` : 'Copy path', act: () => copyText(picks.map((h) => h.path)) });
   items.push({ label: picks.length > 1 ? `Copy ${picks.length} names` : 'Copy name', act: () => copyText(picks.map((h) => h.name)) });
@@ -1434,8 +1433,8 @@ function download(hits, to = null) {
     const target = `${dest.toLowerCase()}|${h.name.toLowerCase()}`;
     if (targets.has(target)) { clashes.push(h.name); continue; }
     targets.add(target);
-    // Browse mixes folders and files: each goes as its own kind of download.
-    const mode = inBrowse() ? (h.dir ? 'folder' : 'file') : state.mode;
+    // Folders and files mix: each goes as its own kind of download.
+    const mode = h.dir ? 'folder' : 'file';
     const key = `${h.remote}|${mode}`;
     if (!groups.has(key)) groups.set(key, { remote: h.remote, mode, items: [] });
     groups.get(key).items.push({ path: h.path, name: h.name, size: h.size });
@@ -1748,7 +1747,6 @@ function onInit(msg) {
   state.destinations = { ...msg.destinations, ...state.destinations };
   state.remotes = msg.remotes;
   state.remote = msg.remote;
-  state.mode = msg.mode;
   const sort = sortFrom(msg.sort);
   if (JSON.stringify(sortToSave(sort)) !== JSON.stringify(sortToSave(state.sort))) {
     state.sort = sort;
@@ -1761,9 +1759,9 @@ function onInit(msg) {
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
   if (typeof msg.verifyDownloads === 'boolean') $('#verify-on').checked = msg.verifyDownloads;
   renderRemotes();
-  renderMode();
+  renderSortHead();
   // Sent again after a server change: browse goes on where it is, if that server still exists.
-  if (inBrowse() && (!state.browse.inited || (state.browse.server && !state.remotes.some((r) => r.name === state.browse.server)))) {
+  if (!state.browse.inited || (state.browse.server && !state.remotes.some((r) => r.name === state.browse.server))) {
     enterBrowse();
   }
   renderRows();
@@ -2313,6 +2311,8 @@ $('#search-form').addEventListener('submit', (ev) => { ev.preventDefault(); star
 // folder (not when a typed address opens one instead).
 function pickRemote(name, enter = true) {
   navNote();
+  if (state.browse.under) stopSearch();
+  state.browse.under = null;
   state.remote = name;
   $('#remote').value = name;
   state.hits = [];
@@ -2323,47 +2323,12 @@ function pickRemote(name, enter = true) {
   renderListStatus();
   showBanner('');
   renderRemoteInfo();
-  if (inBrowse()) {
-    $('#query').value = '';
-    if (enter) enterBrowse();
-  }
+  $('#query').value = '';
+  if (enter) enterBrowse();
   renderRows();
   send({ type: 'prefs', remote: state.remote });
 }
 $('#remote').addEventListener('change', (ev) => pickRemote(ev.target.value));
-
-// Files and Folders are separate searches: switching starts clean and waits for new words.
-// `enter`: browse opens its remembered folder (not when a search hit's folder opens instead).
-function switchMode(mode, enter = true) {
-  if (state.mode === mode) return;
-  if (state.searching) {
-    send({ type: 'cancelSearch' });
-    setSearching(false);
-  }
-  state.searchId += 1; // a result still on its way belongs to the other mode: ignore it
-  state.mode = mode;
-  state.hits = [];
-  state.selected.clear();
-  state.cursor = state.anchor = -1;
-  state.lastQuery = '';
-  state.resultNote = '';
-  state.searchedWhere = '';
-  state.lists = [];
-  state.browse.under = null;
-  renderListStatus();
-  $('#query').value = '';
-  $('#results').scrollTop = 0;
-  showBanner('');
-  renderMode();
-  if (mode === 'browse' && enter) enterBrowse();
-  renderRows();
-  send({ type: 'prefs', mode });
-  $('#query').focus();
-}
-
-for (const b of document.querySelectorAll('#search-form .segmented button')) {
-  b.addEventListener('click', () => switchMode(b.dataset.mode));
-}
 
 $('#results').addEventListener('scroll', scheduleRows, { passive: true });
 window.addEventListener('resize', scheduleRows);
@@ -2388,7 +2353,7 @@ $('#rows').addEventListener('mousedown', (ev) => {
   // file downloads.
   if (ev.detail === 2 && ev.button === 0 && !onBox && !ev.shiftKey && !ev.ctrlKey) {
     const h = state.hits[i];
-    if (inBrowse() && (h.dir || h.server)) openRow(h);
+    if (h.dir || h.server) openRow(h);
     else download([h]);
     return;
   }
@@ -2402,12 +2367,12 @@ $('#select-all').addEventListener('change', (ev) => {
 });
 
 $('#results').addEventListener('keydown', (ev) => {
-  if (inBrowse() && (ev.key === 'Backspace' || (ev.key === 'ArrowUp' && ev.altKey))) {
+  if (ev.key === 'Backspace' || (ev.key === 'ArrowUp' && ev.altKey)) {
     ev.preventDefault();
     browseUp();
     return;
   }
-  if (inBrowse() && ev.key === 'Escape' && state.browse.under) {
+  if (ev.key === 'Escape' && state.browse.under) {
     ev.preventDefault();
     closeBelow();
     return;
@@ -2435,9 +2400,9 @@ $('#results').addEventListener('keydown', (ev) => {
     showMenu(r.left + 40, r.bottom, resultMenu());
   } else if (ev.key === 'Enter') {
     ev.preventDefault();
-    // Browse: Enter opens the folder under the cursor, unless several rows are picked.
+    // Enter opens the folder under the cursor, unless several rows are picked.
     const h = state.hits[state.cursor];
-    if (inBrowse() && h && (h.dir || h.server) && state.selected.size <= 1) openRow(h);
+    if (h && (h.dir || h.server) && state.selected.size <= 1) openRow(h);
     else download(selectedHits());
   }
 });
@@ -2589,13 +2554,13 @@ document.addEventListener('keydown', (ev) => {
       ev.preventDefault();
       if (settings.form) $('#form-cancel').click(); else closeSettings();
     }
-  } else if (inBrowse() && ((ev.ctrlKey && !ev.altKey && (ev.key === 'l' || ev.key === 'L')) ||
-    (ev.altKey && !ev.ctrlKey && (ev.key === 'd' || ev.key === 'D')) || (ev.key === 'F4' && !ev.altKey && !ev.ctrlKey))) {
+  } else if ((ev.ctrlKey && !ev.altKey && (ev.key === 'l' || ev.key === 'L')) ||
+    (ev.altKey && !ev.ctrlKey && (ev.key === 'd' || ev.key === 'D')) || (ev.key === 'F4' && !ev.altKey && !ev.ctrlKey)) {
     // To the address bar, as in Explorer.
     ev.preventDefault();
     startEdit();
-  } else if (inBrowse() && ((ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) ||
-    ev.key === 'BrowserBack' || ev.key === 'BrowserForward')) {
+  } else if ((ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) ||
+    ev.key === 'BrowserBack' || ev.key === 'BrowserForward') {
     ev.preventDefault();
     navGo(ev.key === 'ArrowLeft' || ev.key === 'BrowserBack' ? -1 : 1);
   } else if ((ev.key === 'f' && ev.ctrlKey) || (ev.key === '/' && document.activeElement.tagName !== 'INPUT')) {
@@ -2614,5 +2579,6 @@ if (webview) {
 } else {
   showBanner('This page is the grab-gui interface; open it through grab-gui.exe.');
 }
-renderMode();
+renderSearchBox();
+renderSortHead();
 renderRows();

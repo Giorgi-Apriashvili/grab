@@ -126,69 +126,74 @@ installed exe has no VC redistributable dependency.
 
 ## GUI
 
-`grab-gui.exe` (the **grab** Start-menu entry) is a window over the same engine: pick a server, search by words, select
-results (click, Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the
-download queue with live progress. It reads the same grab.conf and remembers the last server,
-mode, destination per server and the results' sort in `%APPDATA%\grab\gui.json`.
+`grab-gui.exe` (the **grab** Start-menu entry) is a window over the same engine, laid out like
+Explorer: pick a server, click through its folders or search them, select rows (click,
+Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the download queue with
+live progress. It reads the same grab.conf and remembers the last server, the destination per
+server and the rows' sort in `%APPDATA%\grab\gui.json`.
 
-- **Instant search** from each server's saved file list (see [File lists](#file-lists)):
-  results appear at once, with "from the file list, 3 min old" under them.
-  - A list older than 15 minutes is refreshed in the background, and the results update when
-    the new list arrives; the selection is kept. "Refresh" fetches it at once.
-  - A server without a list yet is searched live the first time while its list is built.
-- **All servers** (at the top of the server picker) searches every server's list at once.
-  Results show their server, and Download sends each pick to its own server, into the same
-  Save-to folder. Two picks with the same name aren't downloaded into one folder.
-- **Modified and sorting:** results and Browse rows show when each file or folder was last
-  modified (`2026-10-16 14:32`, your local time; hovering adds the seconds and the age). A
-  folder's date is its own, as file managers show it: it changes when something directly
-  inside it is added, removed or renamed.
-  - Click Name, Size or Modified to sort: the first click gives A→Z, largest first or newest
-    first, the second reverses it, the third goes back to the default order (best match for a
-    search, folders first A→Z in Browse). An arrow marks the sorted column; Tab to a header and
-    press Enter or Space from the keyboard.
-  - Browse keeps folders above files when sorting by name or date, and rows without a size or
-    date go last. The selection stays on the same items.
-  - Folders have no size (a folder's total isn't known without listing everything inside it).
-    Size sorts the files, and the folders follow them in the order you had before: sort by
-    Modified, then Size, and the files go largest first with the folders after them, newest
-    first. Size is off in Folders mode, where no row has a size.
-  - The sort stays, across searches, folders and restarts, until you change it.
-- **Browse** (next to Files and Folders) clicks through a server's folders instead of searching:
-  `Box.Guest › movies › georgian.movies`, with ↑ (Backspace) to go up.
+- **Folders:** the address bar shows where you are (`Box.Guest › movies › georgian.movies`),
+  with ↑ (Backspace) to go up and ⟳ to list the folder from the server again.
+  - Folders open instantly from the server's saved file list (see [File lists](#file-lists)),
+    with their date and item count. Folders deeper than the list (past `max_depth`) are listed
+    from the server (`rclone lsjson`, about 2 s on a Storage Box) and remembered while the
+    window is open.
+  - Each start opens the server at its top; while the window is open, each server reopens
+    where you left it.
   - **Back and Forward**, as in Explorer: the mouse's side buttons, Alt+← and Alt+→, or the ←
-    and → buttons beside ↑ (hovering names where they go). Back returns to the folder before,
-    with the same row picked and the same scroll. With a search's results below a folder
-    showing, Back closes them first.
-  - One history covers every server while the window is open: going back to another server's
+    and → buttons (hovering names where they go). Back returns to the folder before, with the
+    same row picked and the same scroll; with search results showing, it closes them first.
+    One history covers every server while the window is open: going back to another server's
     folder switches the server picker too. It keeps up to 50 folders.
-  - Folders open instantly from the server's file list, with their date and item count.
-    Folders deeper than the list (past `max_depth`) are listed from the server (`rclone
-    lsjson`, about 2 s on a Storage Box) and remembered while the window is open; Refresh lists
-    the current folder again.
-  - Typing filters the folder; Enter searches everything below it, folders and files together,
-    and Esc goes back.
-  - **The path bar is also an address bar, as in Explorer.** Click its empty part or the
-    current folder, or press Ctrl+L, Alt+D or F4, then type or paste a path and press Enter;
-    Esc cancels.
+  - **The address bar takes a typed path.** Click its empty part or the current folder, or
+    press Ctrl+L, Alt+D or F4, then type or paste a path and press Enter; Esc cancels.
     - You can type `downloads/tv`, `/etc/ssh`, `~` or `~/movies`. `Box.Guest:movies` opens
       another server, and in All servers the address always starts with the server.
     - The path can be anywhere the server lets you list, not only inside the searched folders.
-      Such folders are listed live, and the path bar shows them from `/`.
+      Such folders are listed live, and the address bar shows them from `/`.
     - A file's path (from Copy path, say) opens its folder with the file picked.
     - A path that doesn't exist leaves the field open with a message, and the folder on screen
       stays as it was.
     - While you type, a list suggests the folders that start with what you typed. ↑/↓ pick
       one; Tab completes it and adds `/` to go on into it. The suggestions come from the file
       list and from folders already opened, so they never wait on the server.
-  - Download takes any mix of folders and files. "Choose…" picks the Save-to folder.
-  - All servers starts with one folder per server. While the window is open, each server
-    reopens where you left it; a new start opens it at its top. A search result's folder (the
-    Folder column) opens it in Browse with the result picked.
+- **Search** (the box beside the address bar):
+  - Typing filters the folder at once. Enter searches the folder and every folder below it,
+    folders and files together; at a server's top that is the whole server. The address bar
+    then ends with "Search results for …", and Esc or ✕ goes back to the folder (or stops a
+    search still running).
+  - **Exact** (in the box) matches the whole name, case-sensitive. It stays on until you turn
+    it off, and results on screen are searched again when you switch it.
+  - Results come from the saved file lists, so they appear at once, with "from the file list,
+    3 min old" at the bottom. A list older than 15 minutes is refreshed in the background, and
+    the results update when the new list arrives; the selection is kept. "Refresh" fetches it
+    at once. A server without a list yet is searched live the first time while its list is
+    built, and so is a folder deeper than the list.
+  - A result's Folder column opens its folder with the result picked.
+- **All servers** (at the top of the server picker) starts with one folder per server, and a
+  search there covers every server's list at once. Results show their server, and Download
+  sends each pick to its own server, into the same Save-to folder. Two picks with the same name
+  aren't downloaded into one folder.
+- **Modified and sorting:** every row shows when the file or folder was last modified
+  (`2026-10-16 14:32`, your local time; hovering adds the seconds and the age). A folder's date
+  is its own, as file managers show it: it changes when something directly inside it is added,
+  removed or renamed.
+  - Click Name, Size or Modified to sort: the first click gives A→Z, largest first or newest
+    first, the second reverses it, the third goes back to the default order (folders first A→Z
+    in a folder, best match for search results). An arrow marks the sorted column; Tab to a
+    header and press Enter or Space from the keyboard.
+  - Folders stay above files when sorting by name or date, and rows without a size or date go
+    last. The selection stays on the same items.
+  - Folders have no size (a folder's total isn't known without listing everything inside it).
+    Size sorts the files, and the folders follow them in the order you had before: sort by
+    Modified, then Size, and the files go largest first with the folders after them, newest
+    first.
+  - The sort stays, across searches, folders and restarts, until you change it.
+- **Download** takes any mix of folders and files. "Choose…" picks the Save-to folder.
 
 - **Right-click menus:**
-  - **On a result or Browse row:** Open (folders), Download, Download to… (pick a folder for
-    this download only; Save to stays), Show in Browse, Copy path (the server path) and Copy
+  - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
+    Save to stays), Open folder location (search results), Copy path (the server path) and Copy
     name. With several rows selected, they act on all of them.
   - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move to top, Show in folder and
     Copy path (where it lands on this PC). A file inside a folder download has Pause, Resume,

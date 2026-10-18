@@ -48,7 +48,6 @@ inline constexpr double max_limit_mibps = schedule::max_mibps;
 struct GuiState {
     std::optional<WindowPlacement> window;
     std::string last_remote;
-    std::string mode = "file"; // "file" | "folder" | "browse"
     std::map<std::string, std::string> destinations; // remote -> last destination folder
     std::optional<SortOrder> sort;                   // absent: the default order
     int parallel = 4;                               // downloads at once, min_parallel..max_parallel

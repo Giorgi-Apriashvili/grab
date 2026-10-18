@@ -58,7 +58,6 @@ GuiState parse_gui_state(std::string_view json_text) {
         }
     }
     s.last_remote = doc->string_of("lastRemote").value_or("");
-    if (auto mode = doc->string_of("mode"); mode == "file" || mode == "folder" || mode == "browse") s.mode = *mode;
     if (const auto* sort = doc->find("sort")) s.sort = sort_from_json(*sort);
     if (const auto* d = doc->find("destinations"); d != nullptr && d->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < d->keys.size(); ++i) {
@@ -123,7 +122,6 @@ std::string gui_state_to_json(const GuiState& state) {
         root.set("window", std::move(w));
     }
     root.set("lastRemote", Value::make_string(state.last_remote));
-    root.set("mode", Value::make_string(state.mode));
     Value dest = Value::make_object();
     for (const auto& [remote, path] : state.destinations) dest.set(remote, Value::make_string(path));
     root.set("destinations", std::move(dest));

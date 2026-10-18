@@ -14,7 +14,6 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     GuiState s;
     s.window = WindowPlacement{-8, 20, 1280, 800, true};
     s.last_remote = "hetzner";
-    s.mode = "browse";
     s.sort = SortOrder{"modified", "desc"};
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
@@ -49,7 +48,6 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
         R"({"window":{"x":1,"y":2,"width":0,"height":5},"mode":"sideways","lastRemote":"box",)"
         R"("destinations":{"box":"C:\\x","bad":7,"empty":""}})");
     CHECK_FALSE(partial.window.has_value()); // zero width is not a usable placement
-    CHECK(partial.mode == "file");
     CHECK(partial.last_remote == "box");
     CHECK(partial.destinations == std::map<std::string, std::string>{{"box", "C:\\x"}});
 
@@ -76,9 +74,18 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
 
 TEST_CASE("Browse's folders are not kept: a start opens each server at its top") {
     // gui.json from 0.10 and 0.11 held the folder last open per server; it is dropped on the next save.
-    const auto s = parse_gui_state(R"({"mode":"browse","browsePaths":{"Box.Guest":"movies","*":"Main"}})");
-    CHECK(s.mode == "browse");
+    const auto s = parse_gui_state(R"({"lastRemote":"Main","browsePaths":{"Box.Guest":"movies","*":"Main"}})");
+    CHECK(s.last_remote == "Main");
     CHECK(gui_state_to_json(s).find("browsePaths") == std::string::npos);
+}
+
+TEST_CASE("the window has one view: an older gui.json's mode is dropped") {
+    // Files, Folders or Browse, up to 0.13; the window is Browse only since.
+    for (const char* mode : {"file", "folder", "browse"}) {
+        const auto s = parse_gui_state(std::string(R"({"lastRemote":"Box","mode":")") + mode + R"("})");
+        CHECK(s.last_remote == "Box");
+        CHECK(gui_state_to_json(s).find("\"mode\"") == std::string::npos);
+    }
 }
 
 TEST_CASE("the results' sort is kept when valid, and absent for the default order") {

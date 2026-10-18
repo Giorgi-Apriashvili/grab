@@ -145,9 +145,10 @@ private:
     void send_init();
     void start_search(const json::Value& msg);
     // A search of one server, or of all ("*"). `update`: the same search again after a file list
-    // was refreshed; it never starts another refresh. `under`: browse mode's search below a
-    // folder, of one server, for folders and files at once.
-    void run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update,
+    // was refreshed; it never starts another refresh. `under`: a search below a folder, of one
+    // server, for folders and files at once. `both`: folders and files at once (req.mode unused),
+    // from a server's top or All servers'.
+    void run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update, bool both,
                     const std::optional<std::string>& under);
     // Folders and files below `under`: from the server's list when it holds that folder, else
     // live with the folder as the only root. Notes where the answer came from in `status`.
@@ -289,6 +290,7 @@ private:
         int id = 0;
         std::string remote;
         engine::SearchRequest req;
+        bool both = false;
         std::optional<std::string> under;
     };
     std::filesystem::path lists_dir_;
