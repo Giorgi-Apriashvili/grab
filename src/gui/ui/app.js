@@ -57,6 +57,10 @@ const state = {
   // Browse's last folder per server while the window runs (absent: its top); '*' -> the server
   // All servers had open. Not kept across starts: each start opens a server at its top.
   browsePaths: {},
+  // Back and Forward: one history for the window (all servers) while it runs. `cur` the place
+  // Browse is at or opening; `back` and `fwd` the places before and after it, nearest last. A
+  // place: { remote (the server picker's choice), server, path, top, cursorKey, scroll, shown }.
+  nav: { back: [], fwd: [], cur: null },
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -655,11 +659,14 @@ function showFolder({ keep = false, select = null } = {}) {
 
 // Opens a folder: `server` '' is All servers' own top; `top` a server's top. The answer comes
 // as "browseResult"; the old rows stay until then.
-function browseTo(server, path, top, { select = null, live = false, keep = false } = {}) {
+// `history`: a move Back or Forward (not a new place), with the `scroll` the place had.
+function browseTo(server, path, top, { select = null, live = false, keep = false, history = false, scroll = null } = {}) {
   const b = state.browse;
+  if (!history) navTo({ remote: state.remote, server, path: top ? '' : path, top: !server || top });
   b.inited = true;
   b.under = null;
   b.typed = null;
+  b.pendingScroll = scroll;
   state.addr.error = '';
   if (state.addr.editing) endEdit(false);
   if (!server) {
@@ -667,8 +674,9 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
     b.items = state.remotes.map((r, i) => ({ name: r.name, path: '', dir: true, server: r.name, remote: r.name,
       info: r.error ? 'misconfigured' : `${r.user}@${r.host}`, ord: i }));
     remember();
-    renderBrowseBar();
     showFolder({ select });
+    navShown();
+    renderBrowseBar();
     return;
   }
   b.id += 1;
@@ -714,9 +722,12 @@ function onBrowseResult(msg) {
       renderBrowseBar();
       return;
     }
+    navNote(); // the place on screen, before it goes
     if (msg.remote !== state.remote && state.remote !== ALL) pickRemote(msg.remote, false);
+    navTo({ remote: state.remote, server: msg.remote, path: msg.top ? '' : msg.path, top: msg.top });
     b.server = msg.remote;
     b.pendingSelect = msg.select || null;
+    b.pendingScroll = null;
     b.keepSelection = false;
     if (state.addr.editing) endEdit(document.activeElement === $('#address'));
   } else if (msg.remote !== b.server || b.typed) {
@@ -732,10 +743,93 @@ function onBrowseResult(msg) {
   if (!b.under) {
     showFolder({ keep: msg.update || b.keepSelection, select: b.pendingSelect });
     if (!msg.error && wasLoading) remember();
+    navShown();
   }
   b.pendingSelect = null;
   b.keepSelection = false;
   renderBrowseBar();
+}
+
+// ---- back and forward: the places Browse opened -------------------------------------------
+
+const NAV_MAX = 50; // places kept behind
+
+function samePlace(a, b) {
+  return !!a && !!b && a.remote === b.remote && a.server === b.server && a.top === b.top && (a.top || a.path === b.path);
+}
+
+// Notes the row picked and the scroll of the place on screen, to come back to them. Not while a
+// search's results below it show, nor when its rows were just cleared (a server switch).
+function navNote() {
+  const c = state.nav.cur;
+  if (!c || !c.shown || !inBrowse() || state.browse.under || !state.hits.length) return;
+  const h = state.hits[state.cursor];
+  c.cursorKey = h ? (h.server || h.path) : null;
+  c.scroll = $('#results').scrollTop;
+}
+
+// A new place opens (not by Back or Forward): the one before goes on the back list, and Forward
+// empties. The same place again (Refresh, back to Browse from Files) changes nothing.
+function navTo(place) {
+  const n = state.nav;
+  if (samePlace(n.cur, place)) return;
+  navNote();
+  if (n.cur) {
+    n.back.push(n.cur);
+    if (n.back.length > NAV_MAX) n.back.shift();
+  }
+  n.fwd = [];
+  n.cur = { ...place, cursorKey: null, scroll: null, shown: false };
+}
+
+// The place opened is on screen: its row and scroll can be noted from now on. A move Back or
+// Forward gets its scroll back (and its row, picked when it opened).
+function navShown() {
+  const b = state.browse;
+  const c = state.nav.cur;
+  if (c && samePlace(c, { remote: state.remote, server: b.server, path: b.path, top: b.top })) c.shown = true;
+  if (b.pendingScroll != null) {
+    $('#results').scrollTop = b.pendingScroll;
+    if (state.cursor >= 0) keepInView(state.cursor);
+    renderRows();
+  }
+  b.pendingScroll = null;
+}
+
+// Back (-1) or Forward (+1), in Browse only. Back first closes the results of a search below the
+// folder, as Esc does; Forward closes them and goes on. Another server's place switches the
+// server picker to it; a place on a server no longer configured is skipped.
+function navGo(dir) {
+  if (!inBrowse() || settings.open || modal) return;
+  const n = state.nav;
+  if (state.browse.under) {
+    closeBelow();
+    if (dir < 0) return;
+  }
+  const from = dir < 0 ? n.back : n.fwd;
+  const to = dir < 0 ? n.fwd : n.back;
+  let place = null;
+  while (from.length && !place) {
+    const p = from.pop();
+    if (!p.server || state.remotes.some((r) => r.name === p.server)) place = p;
+  }
+  if (!place) {
+    renderBrowseBar();
+    return;
+  }
+  navNote();
+  if (n.cur) to.push(n.cur);
+  n.cur = { ...place, shown: false };
+  if (place.remote !== state.remote) pickRemote(place.remote, false);
+  browseTo(place.server, place.path, place.top, { select: place.cursorKey, history: true, scroll: place.scroll });
+}
+
+// A place's name for the buttons' hints: the folder, the server at its top, "All servers"; with
+// the server added when it isn't the one on screen.
+function placeName(p) {
+  if (!p.server) return 'All servers';
+  const name = p.top ? p.server : (p.path.split('/').filter(Boolean).pop() || '/');
+  return p.server === state.browse.server || p.top ? name : `${name} on ${p.server}`;
 }
 
 function openRow(h) {
@@ -845,6 +939,14 @@ function renderBrowseBar() {
     : `<button type="button" class="crumb" data-step="${i}" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`))
     .join('<span class="sep">›</span>');
   $('#browse-up').disabled = !b.under && (!b.server || (b.top && state.remote !== ALL));
+  const n = state.nav;
+  const back = $('#browse-back');
+  const fwd = $('#browse-fwd');
+  back.disabled = !b.under && !n.back.length;
+  back.title = b.under ? 'Back to the folder (Alt+←)'
+    : n.back.length ? `Back to ${placeName(n.back[n.back.length - 1])} (Alt+←)` : 'Back (Alt+←)';
+  fwd.disabled = !n.fwd.length;
+  fwd.title = n.fwd.length ? `Forward to ${placeName(n.fwd[n.fwd.length - 1])} (Alt+→)` : 'Forward (Alt+→)';
   $('#browse-refresh').hidden = !b.server || !!b.under;
   $('#browse-refresh').disabled = b.loading;
   const status = $('#browse-status');
@@ -1092,6 +1194,15 @@ $('#crumbs').addEventListener('click', (ev) => {
   else browseTo(s.server, s.path, false);
 });
 $('#browse-up').addEventListener('click', browseUp);
+$('#browse-back').addEventListener('click', () => navGo(-1));
+$('#browse-fwd').addEventListener('click', () => navGo(1));
+// The mouse's side buttons: Back and Forward, on release as in browsers (the press does nothing).
+document.addEventListener('mousedown', (ev) => { if (ev.button === 3 || ev.button === 4) ev.preventDefault(); }, true);
+document.addEventListener('mouseup', (ev) => {
+  if (ev.button !== 3 && ev.button !== 4) return;
+  ev.preventDefault();
+  navGo(ev.button === 3 ? -1 : 1);
+}, true);
 $('#browse-refresh').addEventListener('click', () => {
   const b = state.browse;
   if (b.server) browseTo(b.server, b.path, b.top, { live: true });
@@ -2201,6 +2312,7 @@ $('#search-form').addEventListener('submit', (ev) => { ev.preventDefault(); star
 // The server picked (also by an address typed for another server); `enter`: Browse opens its
 // folder (not when a typed address opens one instead).
 function pickRemote(name, enter = true) {
+  navNote();
   state.remote = name;
   $('#remote').value = name;
   state.hits = [];
@@ -2258,7 +2370,7 @@ window.addEventListener('resize', scheduleRows);
 
 $('#rows').addEventListener('mousedown', (ev) => {
   const i = rowIndex(ev);
-  if (i < 0) return;
+  if (i < 0 || ev.button === 3 || ev.button === 4) return; // the side buttons are Back and Forward
   ev.preventDefault();
   if (ev.button === 2) {
     // As in Explorer: a row outside the selection becomes the selection; inside, it stays.
@@ -2482,6 +2594,10 @@ document.addEventListener('keydown', (ev) => {
     // To the address bar, as in Explorer.
     ev.preventDefault();
     startEdit();
+  } else if (inBrowse() && ((ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) ||
+    ev.key === 'BrowserBack' || ev.key === 'BrowserForward')) {
+    ev.preventDefault();
+    navGo(ev.key === 'ArrowLeft' || ev.key === 'BrowserBack' ? -1 : 1);
   } else if ((ev.key === 'f' && ev.ctrlKey) || (ev.key === '/' && document.activeElement.tagName !== 'INPUT')) {
     ev.preventDefault();
     $('#query').focus();

@@ -156,6 +156,12 @@ mode, destination per server and the results' sort in `%APPDATA%\grab\gui.json`.
   - The sort stays, across searches, folders and restarts, until you change it.
 - **Browse** (next to Files and Folders) clicks through a server's folders instead of searching:
   `Box.Guest › movies › georgian.movies`, with ↑ (Backspace) to go up.
+  - **Back and Forward**, as in Explorer: the mouse's side buttons, Alt+← and Alt+→, or the ←
+    and → buttons beside ↑ (hovering names where they go). Back returns to the folder before,
+    with the same row picked and the same scroll. With a search's results below a folder
+    showing, Back closes them first.
+  - One history covers every server while the window is open: going back to another server's
+    folder switches the server picker too. It keeps up to 50 folders.
   - Folders open instantly from the server's file list, with their date and item count.
     Folders deeper than the list (past `max_depth`) are listed from the server (`rclone
     lsjson`, about 2 s on a Storage Box) and remembered while the window is open; Refresh lists
