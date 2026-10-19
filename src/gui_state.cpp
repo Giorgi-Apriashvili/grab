@@ -182,6 +182,7 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
         d.name = v.string_of("name").value_or(*path);
         if (auto p = v.string_of("priority"); p == "high" || p == "low") d.priority = *p;
         if (const auto* r = v.find("resume"); r != nullptr && r->kind == json::Value::Kind::boolean) d.resume = r->boolean;
+        if (const auto* o = v.find("spaceOk"); o != nullptr && o->kind == json::Value::Kind::boolean) d.space_ok = o->boolean;
         if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
             d.total = static_cast<std::uint64_t>(t->number);
         }
@@ -222,6 +223,7 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         v.set("total", Value::make_number(static_cast<double>(d.total)));
         v.set("priority", Value::make_string(d.priority));
         if (d.resume) v.set("resume", Value::make_bool(true));
+        if (d.space_ok) v.set("spaceOk", Value::make_bool(true));
         if (!d.files.empty()) {
             Value files = Value::make_array();
             for (const auto& f : d.files) {

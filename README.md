@@ -194,6 +194,14 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     first.
   - The sort stays, across searches, folders and restarts, until you change it.
 - **Download** takes any mix of folders and files. "Choose…" picks the Save-to folder.
+  - **Free space is checked first.** What the selection still needs on the Save-to drive
+    (files less what's already there, folders as the file list holds them), plus what the
+    downloads already queued for that drive still need, is compared with the free space. If it
+    won't fit, a dialog says so before anything is queued: "Not enough space on E:", with the
+    numbers, and Download anyway or Cancel.
+  - A folder deeper than the file list is checked once it's listed, before anything is fetched:
+    if it can't fit, it waits paused with the reason. Resume goes ahead (after freeing space,
+    or anyway).
 
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
@@ -477,6 +485,9 @@ grab config [-c PATH]
   - Progress is one line, redrawn in place:
     `412.0 MiB / 898.0 MiB  45%  18.0 MiB/s  14 conns  ETA 0:26` (folders add `4/13 files`).
     When stderr is not a console (a log file, a script), only the start and end lines appear.
+  - Free space is checked before fetching: the files picked together, and each folder right
+    after it's listed. If it won't fit, grab stops with `grab: error: not enough free space on
+    E: (48.2 GiB needed, 31.0 GiB free)` (exit code `6`), keeping any partial files.
   - Ctrl+C stops cleanly and keeps the partial files: `stopped at 35%; run the same command
     again to continue`. A second Ctrl+C ends grab at once.
   - A file already in DEST with the same size, and not older than the server's copy, is not

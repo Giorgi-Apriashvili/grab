@@ -1445,8 +1445,29 @@ function download(hits, to = null) {
   }
   if (!groups.size) return;
   if (!to) state.destinations[state.remote] = dest;
-  for (const { remote, mode, items } of groups.values()) send({ type: 'enqueue', remote, mode, dest, items });
+  // One request: the backend checks the free space for all of it (see onSpaceShort).
+  send({ type: 'enqueue', dest, groups: [...groups.values()], remember: !to });
   if (state.remote === ALL) send({ type: 'prefs', remote: ALL }); // stay on All servers next time
+  lastDownload = { dest, groups: [...groups.values()], remember: !to };
+}
+
+let lastDownload = null; // the last Download, to send again with "Download anyway"
+
+// The selection won't fit on its drive (with what downloads already queued there still need):
+// nothing was queued; "Download anyway" queues it without the check.
+function onSpaceShort(msg) {
+  const d = lastDownload;
+  if (!d) return;
+  const queued = msg.queued > 0 ? `, and downloads already queued there still need ${fmtSize(msg.queued)}` : '';
+  const atLeast = msg.partial ? ' (at least: the file list doesn’t hold all of a folder)' : '';
+  showModal({
+    title: `Not enough space on ${msg.drive}`,
+    html: `<p>${d.groups.reduce((n, g) => n + g.items.length, 0) > 1 ? 'These downloads need' : 'This download needs'}` +
+      ` about ${esc(fmtSize(msg.need))}${esc(atLeast)}${esc(queued)}. ${esc(msg.drive)} has ${esc(fmtSize(msg.free))} free.</p>` +
+      '<p class="muted">Free some space first, or download anyway if you’ll make room before it’s needed.</p>',
+    ok: 'Download anyway',
+    onOk: () => send({ type: 'enqueue', dest: d.dest, groups: d.groups, remember: d.remember, force: true }),
+  });
 }
 
 const queueEls = new Map(); // id -> element; updated in place so buttons don't flicker
@@ -1615,7 +1636,11 @@ function renderQueue() {
         `<button type="button" data-act="${act}"${title ? ` class="q-move" title="${title}" aria-label="${title}"` : ''}>${label}</button>`).join('');
     }
     const sub = el.querySelector('.q-sub');
-    sub.textContent = q.status === 'failed' && q.error ? q.error : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`;
+    // A paused download's reason (the free-space check) comes first; the whole line shows on hover.
+    sub.textContent = q.status === 'failed' && q.error ? q.error
+      : q.note && q.status === 'paused' ? `${q.note} · → ${q.dest}`
+        : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`;
+    sub.title = sub.textContent;
     renderTree(el, q);
   }
   for (const [id, el] of queueEls) {
@@ -2272,6 +2297,7 @@ if (webview) {
       case 'searchResult': onSearchResult(msg); break;
       case 'searchError': onSearchError(msg); break;
       case 'browseResult': onBrowseResult(msg); break;
+      case 'spaceShort': onSpaceShort(msg); break;
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
       case 'queue':

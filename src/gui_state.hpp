@@ -92,6 +92,8 @@ struct SavedDownload {
     // Saved for an update's restart while it was running or queued: it continues by itself
     // instead of coming back paused.
     bool resume = false;
+    // The free-space check is done: "Download anyway" was chosen, or Resume after it paused it.
+    bool space_ok = false;
     bool operator==(const SavedDownload&) const = default;
 };
 

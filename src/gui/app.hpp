@@ -138,6 +138,9 @@ private:
         // is checked when it resumes, although it is complete on disk.
         bool verifying = false;
         bool verify_pending = false;
+        // The free-space check is done: "Download anyway" was chosen, or Resume after the check
+        // paused it (a folder too big for the drive once listed).
+        bool space_ok = false;
         folder::Tree tree; // folders: their files once listed (under mutex_)
     };
 
@@ -197,7 +200,18 @@ private:
     void start_refresh(const std::string& server);   // fetches a new list in the background; any thread
     void on_list_refreshed(const std::string& server); // UI thread: shows the last search again
     void prune_lists();                                // drops lists of servers no longer configured
+    // Download (or Download to…): {dest, groups: [{remote, mode, items}], force, remember}. Unless
+    // `force`, a selection that won't fit on the drive, with what downloads already queued there
+    // still need, comes back as "spaceShort" instead of being queued.
     void enqueue(const json::Value& msg);
+    // What the selection in `groups` still needs on disk in `dest`: files less what is there
+    // already; folders as their server's saved list holds them (`partial` when it doesn't hold
+    // all of one).
+    struct Needed {
+        std::uint64_t bytes = 0;
+        bool partial = false;
+    };
+    [[nodiscard]] Needed needed_for(const json::Value& groups, const std::filesystem::path& dest);
     // Queue actions; `id` 0 means every item the action applies to.
     void pause_items(int id);
     void resume_items(int id);

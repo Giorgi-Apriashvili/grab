@@ -11,6 +11,7 @@
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
+#include "space.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -1261,13 +1262,13 @@ void App::cancel_pending() {
 // ---- download queue -------------------------------------------------------------------------
 
 void App::enqueue(const Value& msg) {
-    const std::string remote = msg.string_of("remote").value_or("");
     const std::string dest = std::string(util::trim(msg.string_of("dest").value_or("")));
-    const Value* items = msg.find("items");
-    if (remote.empty() || items == nullptr || items->kind != Value::Kind::array) return;
+    const Value* groups = msg.find("groups");
+    if (groups == nullptr || groups->kind != Value::Kind::array) return;
     // A GUI's working directory is arbitrary, so a relative folder would land somewhere
     // unexpected; insist on a full path.
-    if (!util::path_from_utf8(dest).is_absolute()) {
+    const auto dest_path = util::path_from_utf8(dest);
+    if (!dest_path.is_absolute()) {
         Value v = Value::make_object();
         v.set("type", str("error"));
         v.set("message", str(std::format("\"{}\" is not a full folder path. Use something like "
@@ -1276,32 +1277,121 @@ void App::enqueue(const Value& msg) {
         post(v);
         return;
     }
+    const bool force = bool_of(msg, "force");
 
-    state_.destinations[remote] = dest;
-    state_.last_remote = remote;
-    save_state();
+    // Free space: what this selection still needs on the drive, with what the downloads already
+    // queued there still need (partial files fill in as data arrives).
+    if (!force) {
+        const auto need = needed_for(*groups, dest_path);
+        const auto drive = space::drive_of(dest_path);
+        std::vector<std::pair<std::filesystem::path, std::uint64_t>> pending;
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& i : items_) {
+                if (i->status == Status::queued || i->status == Status::running || i->status == Status::paused) {
+                    pending.emplace_back(i->dest, i->total > i->bytes ? i->total - i->bytes : 0);
+                }
+            }
+        }
+        std::uint64_t queued = 0;
+        for (const auto& [where, left] : pending) {
+            if (left > 0 && util::to_lower(space::drive_of(where)) == util::to_lower(drive)) queued += left;
+        }
+        if (const auto free = space::free_bytes(dest_path); free && need.bytes > 0 && !space::fits(need.bytes, queued, *free)) {
+            Value v = Value::make_object();
+            v.set("type", str("spaceShort"));
+            v.set("drive", str(drive));
+            v.set("need", num(static_cast<double>(need.bytes)));
+            v.set("queued", num(static_cast<double>(queued)));
+            v.set("free", num(static_cast<double>(*free)));
+            if (need.partial) v.set("partial", Value::make_bool(true));
+            post(v);
+            return;
+        }
+    }
 
     {
         std::lock_guard lock(mutex_);
-        for (const auto& it : items->items) {
-            auto path = it.string_of("path");
-            if (!path) continue;
-            auto item = std::make_shared<Item>();
-            item->id = next_id_++;
-            item->remote = remote;
-            item->mode = mode_of(msg);
-            item->path = *path;
-            item->name = it.string_of("name").value_or(*path);
-            item->dest = util::path_from_utf8(dest);
-            if (const Value* size = it.find("size"); size && size->kind == Value::Kind::number) {
-                item->total = static_cast<std::uint64_t>(size->number);
+        for (const auto& group : groups->items) {
+            const std::string remote = group.string_of("remote").value_or("");
+            const Value* items = group.find("items");
+            if (remote.empty() || items == nullptr || items->kind != Value::Kind::array) continue;
+            // Download to… leaves the Save-to folder remembered as it was.
+            if (bool_of(msg, "remember")) state_.destinations[remote] = dest;
+            state_.last_remote = remote;
+            for (const auto& it : items->items) {
+                auto path = it.string_of("path");
+                if (!path) continue;
+                auto item = std::make_shared<Item>();
+                item->id = next_id_++;
+                item->remote = remote;
+                item->mode = mode_of(group);
+                item->path = *path;
+                item->name = it.string_of("name").value_or(*path);
+                item->dest = dest_path;
+                item->space_ok = force;
+                if (const Value* size = it.find("size"); size && size->kind == Value::Kind::number) {
+                    item->total = static_cast<std::uint64_t>(size->number);
+                }
+                items_.push_back(std::move(item));
             }
-            items_.push_back(std::move(item));
         }
     }
+    save_state();
     wake_.notify_all();
     save_queue();
     post_queue();
+}
+
+App::Needed App::needed_for(const Value& groups, const std::filesystem::path& dest) {
+    Needed need;
+    for (const auto& group : groups.items) {
+        const std::string remote = group.string_of("remote").value_or("");
+        const Value* items = group.find("items");
+        if (items == nullptr || items->kind != Value::Kind::array) continue;
+        const bool folders = mode_of(group) == Mode::folder;
+        std::optional<ListView> view; // the server's list, for folders' sizes
+        for (const auto& it : items->items) {
+            const auto path = it.string_of("path");
+            if (!path) continue;
+            if (!folders) {
+                const Value* size = it.find("size");
+                if (size == nullptr || size->kind != Value::Kind::number) {
+                    need.partial = true;
+                    continue;
+                }
+                const auto name = it.string_of("name").value_or(remote_basename(*path));
+                need.bytes += space::still_needed(dest / util::path_from_utf8(name), static_cast<std::uint64_t>(size->number));
+                continue;
+            }
+            if (!view) {
+                auto ctx = engine::load_context(config_path_, remote);
+                view = ctx ? list_view(remote, *ctx) : ListView{};
+            }
+            if (!view->index) {
+                need.partial = true; // no list: the folder checks once it is listed
+                continue;
+            }
+            const auto below = view->index->below(*path);
+            if (!below.complete) need.partial = true;
+            // Files already there count only when the folder was downloaded before.
+            const auto local = folder::local_dir(dest, *path);
+            std::error_code ec;
+            const bool started = std::filesystem::exists(local, ec);
+            for (const auto* e : below.files) {
+                const auto size = e->size.value_or(0);
+                if (!started) {
+                    need.bytes += size;
+                    continue;
+                }
+                std::string_view rel = e->path;
+                rel.remove_prefix(std::min(rel.size(), path->size()));
+                while (rel.starts_with('/')) rel.remove_prefix(1);
+                need.bytes += space::still_needed(local / util::path_from_utf8(rel), size);
+            }
+        }
+    }
+    return need;
 }
 
 void App::pause_items(int id) {
@@ -1883,6 +1973,28 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     // Files already complete on disk (an earlier run, or downloaded before) are not fetched
     // again; big ones with a partial file continue from it.
     folder::mark_existing(job, item->tree, mutex_);
+    // Free space, now that the folder's size is known: one that can't fit waits, paused, before
+    // anything is fetched. Resume goes ahead (after freeing space, or anyway).
+    if (!item_stop.stop_requested()) {
+        bool check = false;
+        std::uint64_t needed = 0;
+        {
+            std::lock_guard lock(mutex_);
+            check = !item->space_ok && item->tree.listed;
+            const auto t = folder::totals(item->tree);
+            needed = t.total > t.bytes ? t.total - t.bytes : 0;
+        }
+        if (const auto free = check ? space::free_bytes(item->dest) : std::nullopt; free && needed > *free) {
+            auto text = space::shortage(space::drive_of(item->dest), needed, *free);
+            text[0] = 'N';
+            std::lock_guard lock(mutex_);
+            folder_totals(*item);
+            item->status = Status::paused;
+            item->space_ok = true;
+            item->note = text + ". Free some space and Resume, or Resume to download anyway.";
+            return;
+        }
+    }
     folder::run(job, item->tree, mutex_, item_stop);
 
     // Settings → Downloads: check what this download fetched against the server's checksums.
@@ -2013,6 +2125,7 @@ void App::restore_queue() {
         item->name = saved.name;
         item->dest = util::path_from_utf8(saved.dest);
         item->total = saved.total;
+        item->space_ok = saved.space_ok;
         // Saved for an update's restart while running or queued: it goes on by itself.
         item->status = saved.resume ? Status::queued : Status::paused;
         item->weight = weight_of(saved.priority);
@@ -2053,6 +2166,7 @@ void App::save_queue() const {
             SavedDownload d{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path, i->name,
                             util::path_to_utf8(i->dest), i->total, {}, priority_name(i->weight.load())};
             d.resume = resume_after_restart_ && i->resume_mark;
+            d.space_ok = i->space_ok;
             for (const auto& c : i->tree.files) {
                 const char* state = c.status == folder::State::done      ? "done"
                                     : c.status == folder::State::skipped ? "skipped"

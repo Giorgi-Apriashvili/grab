@@ -150,6 +150,30 @@ std::optional<Item> Index::entry(std::string_view path) const {
     return std::nullopt;
 }
 
+Index::Below Index::below(std::string_view path) const {
+    Below out;
+    const auto f = folders_.find(path);
+    if (f == folders_.end() || !f->second.known) return out;
+    out.complete = true;
+    std::vector<const Folder*> todo{&f->second};
+    while (!todo.empty()) {
+        const Folder* at = todo.back();
+        todo.pop_back();
+        for (const auto c : at->children) {
+            const auto& e = list_->entries[c];
+            if (!e.dir) {
+                out.files.push_back(&e);
+                if (!e.size) out.complete = false;
+                continue;
+            }
+            const auto sub = folders_.find(e.path);
+            if (sub == folders_.end() || !sub->second.known) out.complete = false; // deeper than the list
+            else todo.push_back(&sub->second);
+        }
+    }
+    return out;
+}
+
 std::vector<Item> Index::top() const {
     if (roots_.size() == 1) return folder(roots_.front()).value_or(std::vector<Item>{});
     std::vector<Item> items;

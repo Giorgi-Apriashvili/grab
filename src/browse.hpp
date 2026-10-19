@@ -60,6 +60,14 @@ public:
     [[nodiscard]] std::vector<Item> top() const;
     // The list's file or folder at `path`, when the list holds its folder's contents.
     [[nodiscard]] std::optional<Item> entry(std::string_view path) const;
+    // The files the list holds below `path`, at any depth; `complete` when it holds them all (no
+    // folder below is deeper than the list). None, and not complete, when the list doesn't hold
+    // the folder's own contents. The entries live as long as the index.
+    struct Below {
+        std::vector<const file_list::Entry*> files;
+        bool complete = false;
+    };
+    [[nodiscard]] Below below(std::string_view path) const;
     [[nodiscard]] const std::vector<std::string>& roots() const { return roots_; }
 
 private:

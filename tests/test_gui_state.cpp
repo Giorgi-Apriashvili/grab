@@ -155,6 +155,9 @@ TEST_CASE("the download queue round-trips and skips incomplete entries") {
     q[0].resume = true; // saved for an update's restart
     CHECK(parse_queue(queue_to_json(q)) == q);
     CHECK_FALSE(parse_queue(queue_to_json(q))[1].resume);
+    q[1].space_ok = true; // "Download anyway", or Resume after the free-space check paused it
+    CHECK(parse_queue(queue_to_json(q)) == q);
+    CHECK_FALSE(parse_queue(queue_to_json(q))[0].space_ok);
     CHECK(parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d","priority":"urgent"}])")[0].priority == "normal");
     CHECK(parse_queue("nope").empty());
     const auto partial = parse_queue(R"([{"remote":"a","path":"/x","dest":"C:\\d"},{"remote":"b"},7])");

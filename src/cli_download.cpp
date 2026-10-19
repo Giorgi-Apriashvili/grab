@@ -10,6 +10,7 @@
 #include "rate.hpp"
 #include "rclone.hpp"
 #include "schedule.hpp"
+#include "space.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -396,11 +397,19 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
     folder::mark_existing(job, tree, m);
     std::uint64_t before = 0;    // on disk already: finished files, partial big ones
     std::size_t already = 0;     // files that were complete
+    std::uint64_t needed = 0;    // what is left to fetch
     {
         std::lock_guard lock(m);
         const auto t = folder::totals(tree);
         before = t.bytes;
         already = t.files_done;
+        needed = t.total > t.bytes ? t.total - t.bytes : 0;
+    }
+    // Free space, now that the folder's size is known: before fetching anything.
+    if (const auto free = space::free_bytes(s.dest); free && needed > *free) {
+        s.line.clear();
+        std::println(stderr, "grab: error: {}", space::shortage(space::drive_of(s.dest), needed, *free));
+        return exit_download_failed;
     }
     folder::run(job, tree, m, s.stop);
     // --verify: what this run fetched, against the server's checksums. Copies that differ are
@@ -527,6 +536,22 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
 
     DownloadTally tally;
     const std::size_t total = paths.size();
+    // Free space for the files picked, all together, before fetching any (a folder checks once
+    // it is listed).
+    if (!opts.dry_run && opts.mode == Mode::file) {
+        std::uint64_t needed = 0;
+        for (const auto& path : paths) {
+            if (const auto it = sizes.find(path); it != sizes.end()) {
+                needed += space::still_needed(dest / util::path_from_utf8(remote_basename(path)), it->second);
+            }
+        }
+        if (const auto free = space::free_bytes(dest); free && needed > *free) {
+            std::println(stderr, "grab: error: {}", space::shortage(space::drive_of(dest), needed, *free));
+            tally.code = exit_download_failed;
+            tally.failed = paths;
+            return tally;
+        }
+    }
     for (std::size_t i = 0; i < total; ++i) {
         const std::string& path = paths[i];
         const int id = static_cast<int>(i) + 1;

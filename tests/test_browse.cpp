@@ -112,6 +112,31 @@ TEST_CASE("a server's folders from its file list, down to the list's depth") {
     CHECK_FALSE(index.entry("/etc/passwd").has_value());
 }
 
+TEST_CASE("the files the list holds below a folder, for the free-space check") {
+    // max_depth 3: movies/georgian/2014 is listed, its contents are not.
+    const browse::Index index(list_of({dir("movies"), dir("movies/georgian"), file("movies/georgian/b.avi", 50),
+                                       file("movies/georgian/a.avi", 100), dir("movies/georgian/2014"), dir("tv"),
+                                       dir("tv/s1"), file("tv/s1/e1.mkv", 10), file("tv/s1/e2.mkv", 20), file("top.txt", 5)}),
+                              {""}, 3);
+    auto total = [](const browse::Index::Below& b) {
+        std::uint64_t n = 0;
+        for (const auto* e : b.files) n += e->size.value_or(0);
+        return n;
+    };
+    const auto tv = index.below("tv");
+    CHECK(tv.complete);
+    CHECK(tv.files.size() == 2);
+    CHECK(total(tv) == 30);
+    const auto movies = index.below("movies"); // holds a folder deeper than the list
+    CHECK_FALSE(movies.complete);
+    CHECK(total(movies) == 150);
+    const auto deep = index.below("movies/georgian/2014");
+    CHECK_FALSE(deep.complete);
+    CHECK(deep.files.empty());
+    CHECK_FALSE(index.below("/etc").complete); // outside the roots
+    CHECK(total(index.below("")) == 185);
+}
+
 TEST_CASE("several search roots are the server's top folders") {
     const browse::Index index(list_of({dir("/srv/media/a", 5), file("/srv/media/a/f.mkv", 7, 6), file("/home/x/n.txt", 1, 7)}),
                               {"/srv/media", "/home/x"}, 4);
