@@ -11,8 +11,18 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 
 namespace grab::gui {
+
+// An answer to a request the page made, e.g. for a preview: the status, the content type, extra
+// response headers ("Name: value" lines) and the body.
+struct WebResource {
+    int status = 200;
+    std::string content_type;
+    std::string headers;
+    std::string body;
+};
 
 // Hosts the WebView2 control that renders the UI. All methods run on the UI thread.
 class WebViewHost {
@@ -22,6 +32,9 @@ public:
         std::wstring dev_ui_dir;      // non-empty: serve the UI from this folder (live edits)
         bool dev_tools = false;       // DevTools, context menu, browser accelerator keys
         COLORREF background = RGB(255, 255, 255); // shown until the page paints
+        // Requests for https://grab.ui/preview/...: `reply` answers, later and from any thread.
+        std::function<void(const std::string& url, std::function<void(WebResource)> reply)> on_preview;
+        std::function<void(std::function<void()>)> defer; // any thread: run on the UI thread
     };
     using OnMessage = std::function<void(const std::string& json)>;
     // Called once: S_OK when the UI is navigating, or the failure (e.g. no WebView2 runtime).

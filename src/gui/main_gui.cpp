@@ -437,6 +437,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     options.dev_tools = true;
 #endif
     options.background = background_color(dark);
+    // The viewer's previews come from the app, which answers on a worker thread.
+    options.on_preview = [](const std::string& url, std::function<void(gui::WebResource)> reply) {
+        if (g.app) g.app->preview_request(url, std::move(reply));
+        else reply(gui::WebResource{503, "text/plain; charset=utf-8", {}, "not ready"});
+    };
+    options.defer = [](std::function<void()> fn) {
+        auto* payload = new std::function<void()>(std::move(fn));
+        post_to_ui(wm_run, payload, [payload] { delete payload; });
+    };
     g.webview.start(
         g.hwnd, std::move(options), [](const std::string& json) {
             if (g.app) g.app->on_message(json);

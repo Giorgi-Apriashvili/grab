@@ -17,6 +17,17 @@ namespace grab::gui {
 namespace {
 
 constexpr std::wstring_view ui_origin = L"https://grab.ui";
+constexpr std::wstring_view preview_prefix = L"https://grab.ui/preview/";
+
+std::wstring reason(int status) {
+    switch (status) {
+    case 200: return L"OK";
+    case 404: return L"Not Found";
+    case 413: return L"Too Large";
+    case 415: return L"Unsupported";
+    default: return status >= 500 ? L"Error" : L"Bad Request";
+    }
+}
 
 // Frees a string WebView2 allocated with CoTaskMemAlloc.
 struct CoString {
@@ -143,21 +154,50 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
         &token);
 
     ComPtr<ICoreWebView2_3> webview3;
-    if (!options_.dev_ui_dir.empty() && SUCCEEDED(webview_.As(&webview3))) {
+    const bool dev_ui = !options_.dev_ui_dir.empty() && SUCCEEDED(webview_.As(&webview3));
+    if (dev_ui) {
         // Development: serve the UI straight from the source tree so edits need only a reload.
         webview3->SetVirtualHostNameToFolderMapping(L"grab.ui", options_.dev_ui_dir.c_str(),
                                                     COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+        webview_->AddWebResourceRequestedFilter(L"https://grab.ui/preview/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
     } else {
         // Normal: the UI files are resources inside the exe, served from memory.
         webview_->AddWebResourceRequestedFilter(L"https://grab.ui/*",
                                                 COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    }
+    {
         webview_->add_WebResourceRequested(
             Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-                [this](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+                [this, dev_ui](ICoreWebView2*, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
                     ComPtr<ICoreWebView2WebResourceRequest> request;
                     if (FAILED(args->get_Request(&request))) return S_OK;
                     CoString uri;
                     request->get_Uri(&uri.p);
+                    // A preview: answered later, from a worker thread, through the deferral.
+                    if (uri.view().starts_with(preview_prefix) && options_.on_preview && options_.defer) {
+                        ComPtr<ICoreWebView2Deferral> deferral;
+                        if (FAILED(args->GetDeferral(&deferral))) return S_OK;
+                        ComPtr<ICoreWebView2WebResourceRequestedEventArgs> held(args);
+                        ComPtr<ICoreWebView2Environment> env = env_;
+                        auto defer = options_.defer;
+                        options_.on_preview(util::to_utf8(uri.view()), [defer, deferral, held, env](WebResource r) {
+                            defer([deferral, held, env, r = std::move(r)] {
+                                ComPtr<IStream> stream;
+                                stream.Attach(SHCreateMemStream(reinterpret_cast<const BYTE*>(r.body.data()),
+                                                                static_cast<UINT>(r.body.size())));
+                                std::wstring headers = L"Content-Type: " + util::to_wide(r.content_type) +
+                                                       L"\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff";
+                                if (!r.headers.empty()) headers += L"\r\n" + util::to_wide(r.headers);
+                                ComPtr<ICoreWebView2WebResourceResponse> response;
+                                env->CreateWebResourceResponse(stream.Get(), r.status, reason(r.status).c_str(),
+                                                               headers.c_str(), &response);
+                                held->put_Response(response.Get());
+                                deferral->Complete();
+                            });
+                        });
+                        return S_OK;
+                    }
+                    if (dev_ui) return S_OK; // the folder mapping serves the rest
                     ComPtr<ICoreWebView2WebResourceResponse> response;
                     if (auto file = find_embedded(ui_path(uri.view()))) {
                         ComPtr<IStream> stream;

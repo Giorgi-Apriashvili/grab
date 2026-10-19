@@ -58,7 +58,8 @@ add_library(grab_core STATIC
     src/schedule.cpp
     src/verify.cpp
     src/browse.cpp
-    src/space.cpp)
+    src/space.cpp
+    src/preview.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
@@ -160,6 +161,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
         src/gui/app.cpp
         src/gui/tray.cpp
         src/gui/webview.cpp
+        src/gui/preview_host.cpp
         src/gui/resources.cpp
         src/gui/grab-gui.rc)
     # The .rc embeds the UI files and the icon; rebuild it whenever one of them changes.
@@ -170,7 +172,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
     target_link_libraries(grab-gui PRIVATE
         grab_core
         ${webview2_SOURCE_DIR}/build/native/${GRAB_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib
-        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32)
+        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32 winhttp)
     install(TARGETS grab-gui RUNTIME DESTINATION bin)
 endif()
 install(FILES grab.conf.example DESTINATION .)

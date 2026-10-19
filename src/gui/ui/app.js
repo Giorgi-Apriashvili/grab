@@ -578,6 +578,182 @@ $('.results-head').addEventListener('click', (ev) => {
 
 // ---- browse mode: a server's folders -----------------------------------------------------
 
+// ---- previews: play a video or audio file, view an image, text file or PDF ---------------
+
+// The same lists as the backend's (src/preview.cpp).
+const KIND_OF = new Map();
+for (const [kind, list] of Object.entries({
+  video: 'mkv mp4 m4v avi mov wmv flv webm ts m2ts mts mpg mpeg vob ogv 3gp divx rmvb',
+  audio: 'mp3 flac m4a m4b aac ogg oga opus wav wma ape aiff aif alac mka dts ac3 wv',
+  image: 'jpg jpeg jfif png gif webp avif bmp ico svg',
+  text: 'nfo txt srt ass ssa vtt log md ini cfg conf json xml csv cue sfv m3u m3u8 yml yaml toml diz',
+  pdf: 'pdf',
+})) for (const ext of list.split(' ')) KIND_OF.set(ext, kind);
+
+// '' for a folder, a server or a file without a preview.
+function kindOf(h) {
+  if (!h || h.dir || h.server) return '';
+  const dot = h.name.lastIndexOf('.');
+  return dot < 0 ? '' : KIND_OF.get(h.name.slice(dot + 1).toLowerCase()) || '';
+}
+const plays = (kind) => kind === 'video' || kind === 'audio';
+const views = (kind) => kind === 'image' || kind === 'text' || kind === 'pdf';
+
+// Double-click, Space or the menu's Play / Preview: a video or audio file plays in the program
+// Windows uses for it; an image, text file or PDF opens in the viewer. False for other files.
+function openFile(h) {
+  const kind = kindOf(h);
+  if (plays(kind)) {
+    send({ type: 'play', remote: h.remote || state.remote, path: h.path });
+    flash(`Starting ${h.name}…`, 20000);
+    return true;
+  }
+  if (views(kind)) {
+    openViewer(h);
+    return true;
+  }
+  return false;
+}
+
+// A short note in the footer, e.g. "Playing x.mkv in mpc-hc64.exe".
+function flash(text, ms = 6000) {
+  state.flash = { text, until: Date.now() + ms };
+  renderBrowseBar();
+  setTimeout(renderBrowseBar, ms + 50);
+}
+
+function previewUrl(h) {
+  return `https://grab.ui/preview/${encodeURIComponent(h.remote || state.remote)}/${encodeURIComponent(h.path)}`;
+}
+
+// The viewer goes through the list's images, text files and PDFs, as they were when it opened.
+const viewer = { open: false, list: [], index: -1, token: 0, returnTo: null };
+
+function openViewer(h) {
+  viewer.list = state.hits.filter((x) => views(kindOf(x)));
+  viewer.index = Math.max(0, viewer.list.indexOf(h));
+  viewer.open = true;
+  viewer.returnTo = document.activeElement;
+  $('#viewer').hidden = false;
+  showViewerItem();
+  $('#viewer-body').focus();
+}
+
+function closeViewer() {
+  if (!viewer.open) return;
+  viewer.open = false;
+  viewer.token += 1;
+  $('#viewer').hidden = true;
+  $('#viewer-body').replaceChildren();
+  // The list's cursor goes to the last one viewed, as in Explorer.
+  const last = viewer.list[viewer.index];
+  const i = last ? state.hits.indexOf(last) : -1;
+  if (i >= 0) setCursor(i);
+  $('#results').focus();
+}
+
+function moveViewer(step) {
+  const i = viewer.index + step;
+  if (!viewer.open || i < 0 || i >= viewer.list.length) return;
+  viewer.index = i;
+  showViewerItem();
+}
+
+function showViewerItem() {
+  const h = viewer.list[viewer.index];
+  const kind = kindOf(h);
+  const url = previewUrl(h);
+  const token = ++viewer.token;
+  const info = [fmtSize(h.size), fmtDate(h.modified)].filter(Boolean);
+  $('#viewer-name').textContent = h.name;
+  $('#viewer-name').title = h.path;
+  $('#viewer-info').textContent = info.join(' · ');
+  $('#viewer-pos').textContent = viewer.list.length > 1 ? `${viewer.index + 1} / ${viewer.list.length}` : '';
+  $('#viewer-prev').disabled = viewer.index <= 0;
+  $('#viewer-next').disabled = viewer.index >= viewer.list.length - 1;
+  const body = $('#viewer-body');
+  body.className = `viewer-body ${kind}`;
+  body.innerHTML = '<span class="spinner"></span>';
+  const failed = (text) => {
+    if (token !== viewer.token) return;
+    const p = document.createElement('div');
+    p.className = 'viewer-error';
+    p.textContent = text || 'Couldn’t load the preview.';
+    body.replaceChildren(p);
+  };
+  // An error's reason, from the backend's answer.
+  const reason = () => fetch(url).then((r) => r.text()).then(failed, () => failed(''));
+  if (kind === 'image') {
+    const img = new Image();
+    img.className = 'fit';
+    img.alt = h.name;
+    img.onload = () => {
+      if (token !== viewer.token) return;
+      body.replaceChildren(img);
+      $('#viewer-info').textContent = [`${img.naturalWidth} × ${img.naturalHeight}`, ...info].join(' · ');
+    };
+    img.onerror = reason;
+    // A click: the full size (scroll to see the rest), and back.
+    img.addEventListener('click', () => {
+      img.classList.toggle('fit');
+      body.classList.toggle('full', !img.classList.contains('fit'));
+    });
+    img.src = url;
+  } else if (kind === 'text') {
+    fetch(url).then(async (r) => {
+      const text = await r.text();
+      if (token !== viewer.token) return;
+      if (!r.ok) return failed(text);
+      const pre = document.createElement('pre');
+      pre.className = 'viewer-text';
+      pre.textContent = text;
+      body.replaceChildren(pre);
+      const total = Number(r.headers.get('X-Grab-Total'));
+      if (total) {
+        const note = document.createElement('div');
+        note.className = 'viewer-note';
+        note.textContent = `Showing the first 1.0 MiB of ${fmtSize(total)}`;
+        body.append(note);
+      }
+    }, () => failed(''));
+  } else {
+    const frame = document.createElement('iframe');
+    frame.className = 'viewer-pdf';
+    frame.title = h.name;
+    frame.src = url;
+    body.replaceChildren(frame);
+  }
+  // The neighbours' images and text, fetched ahead (the backend keeps them).
+  for (const n of [viewer.list[viewer.index + 1], viewer.list[viewer.index - 1]]) {
+    const k = kindOf(n);
+    if (k === 'image') new Image().src = previewUrl(n);
+    else if (k === 'text') fetch(previewUrl(n)).catch(() => {});
+  }
+}
+
+$('#viewer-prev').addEventListener('click', () => moveViewer(-1));
+$('#viewer-next').addEventListener('click', () => moveViewer(1));
+$('#viewer-close').addEventListener('click', closeViewer);
+$('#viewer-download').addEventListener('click', () => {
+  const h = viewer.list[viewer.index];
+  if (h) download([h]);
+});
+// Esc or Space closes, ←/→ go through the others; nothing else reaches the list meanwhile.
+document.addEventListener('keydown', (ev) => {
+  if (!viewer.open || modal) return;
+  if (ev.key === 'Escape' || (ev.key === ' ' && !(ev.target instanceof HTMLInputElement))) {
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    closeViewer();
+  } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight') {
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    moveViewer(ev.key === 'ArrowLeft' ? -1 : 1);
+  } else if (ev.key !== 'Tab') {
+    ev.stopImmediatePropagation();
+  }
+}, true);
+
 const FOLDER_ICON = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 3.5C1 2.7 1.7 2 2.5 2h3.6l1.6 1.6h5.8c.8 0 1.5.7 1.5 1.5v7.4c0 .8-.7 1.5-1.5 1.5h-11C1.7 14 1 13.3 1 12.5z"/></svg>';
 
 // `path` without its `folder` prefix, for search results below a folder ('' for the folder itself).
@@ -644,6 +820,9 @@ function showFolder({ keep = false, select = null } = {}) {
 // `history`: a move Back or Forward (not a new place), with the `scroll` the place had.
 function browseTo(server, path, top, { select = null, live = false, keep = false, history = false, scroll = null } = {}) {
   const b = state.browse;
+  // Another place: the words in the search box were for the last one, as in Explorer.
+  const elsewhere = server !== b.server || (top || !server ? !b.top : b.top || path !== b.path);
+  if (elsewhere) $('#query').value = '';
   if (!history) navTo({ remote: state.remote, server, path: top ? '' : path, top: !server || top });
   b.inited = true;
   if (b.under) stopSearch();
@@ -784,6 +963,10 @@ function navShown() {
 // a server no longer configured is skipped.
 function navGo(dir) {
   if (settings.open || modal) return;
+  if (viewer.open) { // Back (or Forward) leaves the viewer first
+    closeViewer();
+    return;
+  }
   const n = state.nav;
   if (state.browse.under) {
     closeBelow();
@@ -923,7 +1106,9 @@ function renderBrowseBar() {
   renderSearchBox();
   // Where the folder's rows came from, in the footer (search results have their own, beside it).
   const status = $('#browse-status');
-  if (a.error && !b.under && !a.editing) {
+  if (state.flash && state.flash.until > Date.now()) {
+    status.textContent = state.flash.text;
+  } else if (a.error && !b.under && !a.editing) {
     status.innerHTML = `<span class="bad" title="${esc(a.error)}">${esc(a.error)}</span>`;
   } else if (b.under) {
     status.textContent = '';
@@ -1333,6 +1518,8 @@ function resultMenu() {
   const opens = one && one.dir;
   const items = [];
   if (opens) items.push({ label: 'Open', key: 'Enter', act: () => openRow(one) });
+  const kind = kindOf(one);
+  if (kind) items.push({ label: plays(kind) ? 'Play' : 'Preview', key: 'Space', act: () => openFile(one) });
   items.push({ label: picks.length > 1 ? `Download ${picks.length}` : 'Download', key: opens ? '' : 'Enter',
     act: () => download(picks) });
   items.push({ label: 'Download to…', act: () => downloadTo(picks) });
@@ -2309,7 +2496,11 @@ if (webview) {
       case 'update': state.update = msg; renderUpdate(); break;
       case 'updateChecked': onUpdateChecked(msg); break;
       case 'limit': onLimit(msg); break;
-      case 'error': showBanner(msg.message); break;
+      case 'error':
+        if (state.flash) state.flash.until = 0; // "Starting …" is over
+        showBanner(msg.message);
+        break;
+      case 'played': flash(`Playing ${msg.name} in ${msg.program}`); break;
       case 'servers': settings.servers = msg.items; renderServers(); break;
       case 'settingsBusy':
         settings.busy = msg.busy;
@@ -2381,7 +2572,7 @@ $('#rows').addEventListener('mousedown', (ev) => {
   if (ev.detail === 2 && ev.button === 0 && !onBox && !ev.shiftKey && !ev.ctrlKey) {
     const h = state.hits[i];
     if (h.dir || h.server) openRow(h);
-    else download([h]);
+    else if (!openFile(h)) download([h]);
     return;
   }
   setCursor(i, { extend: ev.shiftKey, toggle: onBox || ev.ctrlKey });
@@ -2469,7 +2660,10 @@ $('#results').addEventListener('keydown', (ev) => {
     ev.preventDefault();
     setCursor(ev.key === 'Home' ? 0 : state.hits.length - 1, { extend: ev.shiftKey });
   } else if (ev.key === ' ') {
+    // Space plays or previews the file under the cursor; Ctrl+Space, or Space on anything
+    // without a preview, ticks its checkbox.
     ev.preventDefault();
+    if (!ev.ctrlKey && openFile(state.hits[state.cursor])) return;
     if (state.cursor >= 0) setCursor(state.cursor, { toggle: true });
   } else if (ev.key === 'a' && ev.ctrlKey) {
     ev.preventDefault();

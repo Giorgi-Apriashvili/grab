@@ -7,21 +7,25 @@
 #include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "preview_host.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "update.hpp"
+#include "webview.hpp"
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <expected>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -70,8 +74,17 @@ public:
     void save_state() const;
     // UI thread, every second: follows the speed schedule.
     void tick();
+    // The page's https://grab.ui/preview/<remote>/<path> requests (the viewer's images, text and
+    // PDFs; each part percent-encoded): read from the server's local stream on a preview worker,
+    // or from the recent ones kept in memory. `reply` answers, from any thread.
+    void preview_request(const std::string& url, std::function<void(WebResource)> reply);
 
 private:
+    // A video or audio file, in the program Windows plays it with: {remote, path}.
+    void play(const json::Value& msg);
+    [[nodiscard]] WebResource preview_answer(const std::string& remote, const std::string& path);
+    void queue_preview(std::function<void()> job);
+    void run_preview_jobs(const std::stop_token& stop);
     // A plaintext password or passphrase, overwritten when it is dropped.
     class Secret {
     public:
@@ -345,6 +358,19 @@ private:
     std::map<std::string, int> learned_;
     std::chrono::steady_clock::time_point last_progress_post_{};
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
+
+    // Previews: the servers' local streams, and two workers for the page's requests and Play.
+    PreviewServers previews_;
+    std::mutex preview_mutex_; // guards preview_jobs_, preview_cache_, preview_workers_
+    std::condition_variable_any preview_wake_;
+    std::deque<std::function<void()>> preview_jobs_;
+    struct CachedPreview {
+        std::string key; // remote, a line break, path
+        WebResource answer;
+    };
+    std::list<CachedPreview> preview_cache_; // the most recent first, up to preview_cache_bytes
+    std::vector<std::jthread> preview_workers_; // after previews_: they stop before the servers end
+
     std::vector<std::jthread> workers_; // last member: stopped and joined first
 };
 

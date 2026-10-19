@@ -8,6 +8,7 @@
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "listing.hpp"
+#include "preview.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
@@ -149,6 +150,139 @@ App::~App() {
 
 void App::save_state() const { save_gui_state(state_path_, state_); }
 
+// ---- previews ------------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::size_t preview_cache_bytes = std::size_t{256} << 20;
+
+WebResource preview_failed(int status, std::string message) {
+    return WebResource{status, "text/plain; charset=utf-8", {}, std::move(message)};
+}
+
+} // namespace
+
+void App::queue_preview(std::function<void()> job) {
+    {
+        std::lock_guard lock(preview_mutex_);
+        preview_jobs_.push_back(std::move(job));
+        while (preview_workers_.size() < 2) {
+            preview_workers_.emplace_back([this](const std::stop_token& stop) { run_preview_jobs(stop); });
+        }
+    }
+    preview_wake_.notify_one();
+}
+
+void App::run_preview_jobs(const std::stop_token& stop) {
+    while (true) {
+        std::function<void()> job;
+        {
+            std::unique_lock lock(preview_mutex_);
+            if (!preview_wake_.wait(lock, stop, [this] { return !preview_jobs_.empty(); })) return;
+            job = std::move(preview_jobs_.front());
+            preview_jobs_.pop_front();
+        }
+        job();
+    }
+}
+
+void App::preview_request(const std::string& url, std::function<void(WebResource)> reply) {
+    constexpr std::string_view prefix = "https://grab.ui/preview/";
+    std::string_view rest = url;
+    if (!rest.starts_with(prefix)) return reply(preview_failed(400, "not a preview"));
+    rest.remove_prefix(prefix.size());
+    rest = rest.substr(0, rest.find_first_of("?#"));
+    const auto slash = rest.find('/');
+    const auto remote = preview::url_decode(rest.substr(0, slash));
+    const auto path = slash == std::string_view::npos ? std::nullopt : preview::url_decode(rest.substr(slash + 1));
+    if (!remote || !path || remote->empty() || path->empty()) return reply(preview_failed(400, "not a preview"));
+
+    std::string key = *remote + '\n' + *path;
+    {
+        std::lock_guard lock(preview_mutex_);
+        const auto it = std::ranges::find(preview_cache_, key, &CachedPreview::key);
+        if (it != preview_cache_.end()) {
+            preview_cache_.splice(preview_cache_.begin(), preview_cache_, it);
+            return reply(it->answer);
+        }
+    }
+    queue_preview([this, remote = *remote, path = *path, key = std::move(key), reply = std::move(reply)] {
+        auto answer = preview_answer(remote, path);
+        {
+            // Kept for ←/→ and the neighbours fetched ahead; failures too, briefly (they come
+            // back after the others push them out).
+            std::lock_guard lock(preview_mutex_);
+            preview_cache_.push_front(CachedPreview{key, answer});
+            std::size_t total = 0;
+            for (auto it = preview_cache_.begin(); it != preview_cache_.end();) {
+                total += it->answer.body.size();
+                it = total > preview_cache_bytes && it != preview_cache_.begin() ? preview_cache_.erase(it) : std::next(it);
+            }
+        }
+        reply(std::move(answer));
+    });
+}
+
+WebResource App::preview_answer(const std::string& remote, const std::string& path) {
+    const auto kind = preview::kind_of(path);
+    const auto max = preview::max_bytes(kind);
+    if (max == 0) return preview_failed(415, "This kind of file has no preview.");
+    auto ctx = engine::load_context(config_path_, remote);
+    if (!ctx) return preview_failed(500, ctx.error());
+    const auto at = preview::where(path);
+    auto base = previews_.base(*ctx, remote, at.root);
+    if (!base) return preview_failed(502, base.error());
+    auto got = http_get(*base + preview::url_path(at.path), max);
+    if (!got) return preview_failed(502, got.error());
+    if (got->status == 404) return preview_failed(404, std::format("Not found on {}.", remote));
+    if (got->status != 200 && got->status != 206) {
+        return preview_failed(502, std::format("{} answered {}.", remote, got->status));
+    }
+    const bool cut = got->total && *got->total > got->body.size();
+    if (cut && kind != preview::Kind::text) {
+        return preview_failed(413, std::format("Too big to preview ({}); download it instead.", util::format_size(*got->total)));
+    }
+    WebResource answer{200, preview::content_type(path), {}, {}};
+    if (kind == preview::Kind::text) {
+        answer.body = preview::text_utf8(got->body, util::to_lower(path).ends_with(".nfo"));
+        if (cut) answer.headers = std::format("X-Grab-Total: {}", *got->total);
+    } else {
+        answer.body = std::move(got->body);
+    }
+    // An SVG is shown as an image, where its scripts never run; if it were opened as a page
+    // anyway, it gets no rights at all.
+    if (util::to_lower(path).ends_with(".svg")) answer.headers = "Content-Security-Policy: sandbox";
+    return answer;
+}
+
+void App::play(const Value& msg) {
+    const std::string remote = msg.string_of("remote").value_or("");
+    const std::string path = msg.string_of("path").value_or("");
+    if (remote.empty() || path.empty()) return;
+    queue_preview([this, remote, path] {
+        Value v = Value::make_object();
+        auto fail = [&](const std::string& message) {
+            v.set("type", str("error"));
+            v.set("message", str(message));
+            post(v);
+        };
+        auto ctx = engine::load_context(config_path_, remote);
+        if (!ctx) return fail(ctx.error());
+        const auto at = preview::where(path);
+        auto base = previews_.base(*ctx, remote, at.root);
+        if (!base) return fail(std::format("Can't play {}: {}", remote_basename(path), base.error()));
+        const auto name = remote_basename(path);
+        const auto dot = name.rfind('.');
+        auto program = open_with_player(dot == std::string::npos ? "" : util::to_lower(name.substr(dot + 1)),
+                                        *base + preview::url_path(at.path));
+        if (!program) return fail(program.error());
+        v.set("type", str("played"));
+        v.set("name", str(name));
+        v.set("program", str(*program));
+        post(v);
+    });
+}
+
 void App::post(const Value& message) const { host_.post(json::stringify(message)); }
 
 bool App::downloads_active() const {
@@ -204,6 +338,8 @@ void App::on_message(const std::string& text) {
         save_state();
     } else if (type == "search") {
         start_search(*msg);
+    } else if (type == "play") {
+        play(*msg);
     } else if (type == "browse") {
         run_browse(int_of(*msg, "id"), msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""),
                    bool_of(*msg, "top"), bool_of(*msg, "live"), false, bool_of(*msg, "typed"));

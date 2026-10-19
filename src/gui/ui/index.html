@@ -253,6 +253,27 @@
 
 <div id="menu" class="menu" role="menu" hidden></div>
 
+<!-- The viewer: an image, text file or PDF from the server, over the list. -->
+<div id="viewer" class="viewer" role="dialog" aria-modal="true" aria-label="Preview" hidden>
+  <div class="viewer-bar">
+    <span id="viewer-name" class="viewer-name"></span>
+    <span id="viewer-info" class="viewer-info"></span>
+    <span class="spacer"></span>
+    <button id="viewer-prev" type="button" class="subtle icon-btn" title="Previous (←)" aria-label="Previous">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M10 3.5 5.5 8l4.5 4.5"/></svg>
+    </button>
+    <span id="viewer-pos" class="viewer-pos"></span>
+    <button id="viewer-next" type="button" class="subtle icon-btn" title="Next (→)" aria-label="Next">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M6 3.5 10.5 8 6 12.5"/></svg>
+    </button>
+    <button id="viewer-download" type="button">Download</button>
+    <button id="viewer-close" type="button" class="subtle icon-btn" title="Close (Esc or Space)" aria-label="Close">
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M4 4l8 8M12 4l-8 8"/></svg>
+    </button>
+  </div>
+  <div id="viewer-body" class="viewer-body" tabindex="-1"></div>
+</div>
+
 <div id="modal" class="modal-backdrop" hidden>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <h2 id="modal-title"></h2>

@@ -193,6 +193,24 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     Modified, then Size, and the files go largest first with the folders after them, newest
     first.
   - The sort stays, across searches, folders and restarts, until you change it.
+- **Previews: double-click or Space opens a file, as in Explorer.**
+  - **Videos and audio** play in the program Windows uses for them (VLC, MPC-HC, mpv...),
+    streamed from the server, with seeking and the subtitles inside the file. grab runs a
+    read-only `rclone serve http` for the server on this PC only (127.0.0.1, a random port and
+    a random secret path), started on first use and stopped with the window.
+    - A seek starts in about 1 s on a fast server and 2–4 s on a Storage Box. A Storage Box
+      streams at about 2.5 MB/s (its cap per connection): plenty for a 1080p release, not
+      for a big remux.
+    - A Store app as the default player (Films & TV) can't open a stream; grab says so.
+  - **Images, text files and PDFs** open in a viewer over the list: ←/→ go through the list's
+    others (fetched ahead), Esc or Space closes, and Download saves the one shown.
+    - Images fit the window; a click shows full size. jpg, png, gif, webp, avif, bmp, ico, svg.
+    - Text (.nfo, .txt, .srt, .log, .md, .json and more) shows its first MiB; .nfo files use
+      the DOS code page, so their ASCII art lines up.
+    - PDFs use the browser engine's built-in viewer (up to 128 MiB).
+    - Nothing is written to disk: previews go from the stream to the window in memory.
+  - Double-click on any other file still downloads it; Enter and the Download button always
+    download. Right-click has Play or Preview first; Ctrl+Space ticks a row's checkbox.
 - **Download** takes any mix of folders and files. "Choose…" picks the Save-to folder.
   - **Free space is checked first.** What the selection still needs on the Save-to drive
     (files less what's already there, folders as the file list holds them), plus what the
