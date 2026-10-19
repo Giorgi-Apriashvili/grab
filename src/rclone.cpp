@@ -1,5 +1,6 @@
 #include "rclone.hpp"
 
+#include "local_name.hpp"
 #include "util.hpp"
 
 namespace grab {
@@ -19,7 +20,8 @@ std::string remote_spec(std::string_view rclone_remote, std::string_view remote_
 }
 
 std::filesystem::path local_target(const RcloneRequest& req) {
-    return req.dest_dir / util::path_from_utf8(remote_basename(req.remote_path));
+    // The server's name as a safe Windows one (local_name.hpp): it can't leave dest_dir.
+    return req.dest_dir / local::relative(remote_basename(req.remote_path));
 }
 
 std::vector<std::string> build_rclone_argv(const RcloneRequest& req) {

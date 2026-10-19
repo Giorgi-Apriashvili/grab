@@ -4,6 +4,7 @@
 #include "fetch.hpp"
 #include "folder_job.hpp"
 #include "gui_state.hpp"
+#include "local_name.hpp"
 #include "process.hpp"
 #include "progress_line.hpp"
 #include "quote.hpp"
@@ -280,7 +281,7 @@ struct Session {
 };
 
 int fetch_file(const Session& s, const std::string& path, int id) {
-    const auto target = s.dest / util::path_from_utf8(remote_basename(path));
+    const auto target = s.dest / local::relative(remote_basename(path));
     std::uint64_t before = 0; // fetched by an earlier run
     if (auto p = fetch::saved_progress(target)) before = p->first;
 
@@ -457,7 +458,7 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
 // --dry-run: what would be fetched, without writing anything.
 void describe(const Session& s, const std::string& path, std::optional<std::uint64_t> size, int id,
               const std::string& position, int budget) {
-    const auto local = util::path_to_utf8(s.dest / util::path_from_utf8(remote_basename(path)));
+    const auto local = util::path_to_utf8(s.dest / local::relative(remote_basename(path)));
     std::string what;
     if (s.opts.mode == Mode::file) {
         if (size) what = std::format(" ({})", util::format_size(*size));
@@ -542,7 +543,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         std::uint64_t needed = 0;
         for (const auto& path : paths) {
             if (const auto it = sizes.find(path); it != sizes.end()) {
-                needed += space::still_needed(dest / util::path_from_utf8(remote_basename(path)), it->second);
+                needed += space::still_needed(dest / local::relative(remote_basename(path)), it->second);
             }
         }
         if (const auto free = space::free_bytes(dest); free && needed > *free) {
@@ -563,7 +564,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         }
         std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
                      remote_spec(ctx.settings.rclone_remote, path),
-                     util::path_to_utf8(dest / util::path_from_utf8(remote_basename(path))));
+                     util::path_to_utf8(dest / local::relative(remote_basename(path))));
         const int code = opts.mode == Mode::file ? fetch_file(s, path, id) : fetch_folder(s, path, id);
         if (code == 0) {
             ++tally.done;

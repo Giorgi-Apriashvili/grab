@@ -60,7 +60,8 @@ add_library(grab_core STATIC
     src/browse.cpp
     src/space.cpp
     src/preview.cpp
-    src/activity.cpp)
+    src/activity.cpp
+    src/local_name.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).

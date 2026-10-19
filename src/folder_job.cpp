@@ -1,6 +1,7 @@
 #include "folder_job.hpp"
 
 #include "cli.hpp"
+#include "local_name.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
 #include "server_ops.hpp"
@@ -134,7 +135,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
         f.speed = 0;
         f.eta.reset();
         if (finished) {
-            const auto local = dir / util::path_from_utf8(f.path);
+            const auto local = dir / local::relative(f.path);
             if (fs::file_size(local, ec) == f.size && !ec) {
                 f.status = State::done;
                 f.fetched = true;
@@ -186,7 +187,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                                      job.ctx->settings.rclone_remote, child_remote_path(job.remote_path, path), flags};
             d.server = job.server;
             d.id = job.id;
-            d.target = dir / util::path_from_utf8(path);
+            d.target = dir / local::relative(path);
             d.joined = true;
             d.limiter = job.limiter;
             d.weight = job.weight;
@@ -244,7 +245,9 @@ File make_file(std::string path, std::uint64_t size, std::string modtime) {
     f.path = std::move(path);
     f.size = size;
     f.modtime = std::move(modtime);
-    f.big = is_big(size);
+    // A device name (CON, nul.txt...) anywhere in its path: grab fetches it itself, since rclone
+    // would write it through a \\?\ path most programs can't open, under another name than grab's.
+    f.big = is_big(size) || local::has_device(f.path);
     return f;
 }
 
@@ -303,7 +306,7 @@ std::optional<fs::path> skip_file(Tree& tree, const fs::path& dir, const std::st
         if (f.status == State::queued || f.status == State::paused || f.status == State::failed) {
             if (f.status == State::queued && f.in_batch) tree.batch_stop.request_stop(); // rclone would still fetch it
             f.status = State::skipped;
-            if (f.big) discard = dir / util::path_from_utf8(f.path);
+            if (f.big) discard = dir / local::relative(f.path);
         } else if (f.status == State::running && f.big) {
             f.stop_reason = StopReason::skip; // run_big discards its partial file
             f.stop.request_stop();
@@ -338,7 +341,7 @@ Outcome outcome(const Tree& tree) {
 }
 
 fs::path local_dir(const fs::path& dest, const std::string& remote_path) {
-    return dest / util::path_from_utf8(remote_basename(remote_path));
+    return dest / local::relative(remote_basename(remote_path));
 }
 
 std::string child_remote_path(const std::string& folder, const std::string& rel) {
@@ -347,7 +350,7 @@ std::string child_remote_path(const std::string& folder, const std::string& rel)
 
 void discard_partials(const fs::path& dir, const Tree& tree) {
     for (const auto& f : tree.files) {
-        if (f.big && f.status != State::done) fetch::discard(dir / util::path_from_utf8(f.path));
+        if (f.big && f.status != State::done) fetch::discard(dir / local::relative(f.path));
     }
     engine::remove_partials(dir, Mode::folder); // rclone's own .partial files
 }
@@ -405,7 +408,7 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m) {
     const auto dir = local_dir(job.dest, job.remote_path);
     std::vector<std::pair<std::size_t, std::optional<std::uint64_t>>> found; // done (nullopt) or partial bytes
     for (const auto& c : queued) {
-        const auto local = dir / util::path_from_utf8(c.path);
+        const auto local = dir / local::relative(c.path);
         std::error_code ec;
         const bool partial = c.big && fs::exists(fetch::state_path(local), ec);
         if (!partial && fetch::up_to_date(local, c.size, c.modtime)) {
@@ -503,7 +506,7 @@ Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token 
             if (f.status != State::done || !f.fetched || f.verified) continue;
             if (differ.contains(f.path)) {
                 std::error_code ec;
-                fs::remove(r.local_dir / util::path_from_utf8(f.path), ec); // not the server's file
+                fs::remove(r.local_dir / local::relative(f.path), ec); // not the server's file
                 f.status = State::failed;
                 f.error = "differs from the server's copy; deleted";
                 f.fetched = false;

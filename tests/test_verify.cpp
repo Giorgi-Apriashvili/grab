@@ -47,8 +47,19 @@ TEST_CASE("the check asks the server for checksums, whatever the common flags sa
           std::vector<std::string>{"rclone", "check", "Box:movies", util::path_to_utf8(r.local_dir), "--config",
                                    util::path_to_utf8(*ctx.config.rclone_config), "--sftp-chunk-size", "255Ki",
                                    "--sftp-disable-hashcheck", "--fast-list", "--one-way", "--files-from-raw",
-                                   util::path_to_utf8(list), "--combined", "-", "--checkers", "4", "--sftp-connections",
-                                   "4", "--sftp-disable-hashcheck=false", "-v"});
+                                   util::path_to_utf8(list), "--no-traverse", "--combined", "-", "--checkers", "4",
+                                   "--sftp-connections", "4", "--sftp-disable-hashcheck=false", "-v"});
+}
+
+TEST_CASE("rclone hashsum's sums, by path") {
+    const auto sums = verify::parse_sums("9DD4E461268C8034F5C8564E155C67A6  CON\r\n"
+                                         "d41d8cd98f00b204e9800998ecf8427e  season 1/nul.txt\n"
+                                         "                     UNSUPPORTED  aux.srt\n"
+                                         "2026/10/19 21:27:00 NOTICE: noise\n\nshort  x\n");
+    CHECK(sums.size() == 2);
+    CHECK(sums.at("CON") == "9dd4e461268c8034f5c8564e155c67a6");
+    CHECK(sums.at("season 1/nul.txt") == "d41d8cd98f00b204e9800998ecf8427e");
+    CHECK(verify::parse_sums("").empty());
 }
 
 TEST_CASE("what the row and the command say about a check") {

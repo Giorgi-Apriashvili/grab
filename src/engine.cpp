@@ -3,6 +3,7 @@
 #include "folder.hpp"
 #include "json.hpp"
 #include "listing.hpp"
+#include "local_name.hpp"
 #include "match.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
@@ -318,7 +319,7 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
     if (!code) return util::fail(code.error());
     result.exit_code = *code;
     if (result.exit_code == proc::exit_stopped) {
-        remove_partials(dest_dir / util::path_from_utf8(remote_basename(remote_path)), mode);
+        remove_partials(dest_dir / local::relative(remote_basename(remote_path)), mode);
     }
     return result;
 }

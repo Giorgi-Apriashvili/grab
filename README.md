@@ -232,6 +232,11 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
   - A folder deeper than the file list is checked once it's listed, before anything is fetched:
     if it can't fit, it waits paused with the reason. Resume goes ahead (after freeing space,
     or anyway).
+  - **Server names become safe Windows names,** the way rclone writes them, so nothing lands
+    outside the Save-to folder, whatever a file is called on the server (`..\x`, `C:\x`,
+    `\\host\share\x`). `\ : * ? " < > |` become look-alikes (`＼ ： ＊ ？ ＂ ＜ ＞ ｜`), control
+    characters `␀`–`␟`, a trailing space or dot `␠` or `．`. Windows device names get an
+    underscore: `CON_`, `nul_.txt`.
 
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
@@ -522,6 +527,8 @@ grab config [-c PATH]
     again to continue`. A second Ctrl+C ends grab at once.
   - A file already in DEST with the same size, and not older than the server's copy, is not
     fetched again (`already there, nothing fetched`); in a folder, the same goes per file.
+  - Server names become safe Windows names, as in the window (see [GUI](#gui)): nothing lands
+    outside DEST.
   - `--limit` caps all connections together, exactly.
   - `--verify` (or the window's Verify downloads setting) checks each download against the
     server's MD5 afterwards: `checksum verified (MD5) in 0:03`. A copy that differs is deleted
@@ -636,6 +643,7 @@ src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
 src/verify.*    checking downloads against the server's checksum (rclone check)
+src/local_name.* server names as safe Windows names (rclone's encoding, device names)
 src/browse.*    browse mode: a server's folders from its file list, deeper ones live
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone

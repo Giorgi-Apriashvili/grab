@@ -8,6 +8,7 @@
 #include "file_list.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
+#include "local_name.hpp"
 #include "match.hpp"
 #include "process.hpp"
 #include "quote.hpp"
@@ -220,7 +221,7 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
         const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
         std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
                      remote_spec(ctx.settings.rclone_remote, path),
-                     util::path_to_utf8(dest / util::path_from_utf8(remote_basename(path))));
+                     util::path_to_utf8(dest / local::relative(remote_basename(path))));
         auto code = proc::run_inherit(rclone_argv);
         if (!code) {
             error(code.error());

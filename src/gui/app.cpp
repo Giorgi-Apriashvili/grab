@@ -9,6 +9,7 @@
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "listing.hpp"
+#include "local_name.hpp"
 #include "preview.hpp"
 #include "process.hpp"
 #include "quote.hpp"
@@ -43,6 +44,12 @@ using Microsoft::WRL::ComPtr;
 namespace grab::gui {
 
 namespace {
+
+// Where a file download lands: dest and the server's name as a safe Windows one (local_name.hpp),
+// from the server path (the page's "name" is only shown).
+std::filesystem::path file_target(const std::filesystem::path& dest, const std::string& remote_path) {
+    return dest / local::relative(remote_basename(remote_path));
+}
 
 using json::Value;
 
@@ -1679,8 +1686,7 @@ App::Needed App::needed_for(const Value& groups, const std::filesystem::path& de
                     need.partial = true;
                     continue;
                 }
-                const auto name = it.string_of("name").value_or(remote_basename(*path));
-                need.bytes += space::still_needed(dest / util::path_from_utf8(name), static_cast<std::uint64_t>(size->number));
+                need.bytes += space::still_needed(file_target(dest, *path), static_cast<std::uint64_t>(size->number));
                 continue;
             }
             if (!view) {
@@ -1694,9 +1700,9 @@ App::Needed App::needed_for(const Value& groups, const std::filesystem::path& de
             const auto below = view->index->below(*path);
             if (!below.complete) need.partial = true;
             // Files already there count only when the folder was downloaded before.
-            const auto local = folder::local_dir(dest, *path);
+            const auto folder_dir = folder::local_dir(dest, *path);
             std::error_code ec;
-            const bool started = std::filesystem::exists(local, ec);
+            const bool started = std::filesystem::exists(folder_dir, ec);
             for (const auto* e : below.files) {
                 const auto size = e->size.value_or(0);
                 if (!started) {
@@ -1706,7 +1712,7 @@ App::Needed App::needed_for(const Value& groups, const std::filesystem::path& de
                 std::string_view rel = e->path;
                 rel.remove_prefix(std::min(rel.size(), path->size()));
                 while (rel.starts_with('/')) rel.remove_prefix(1);
-                need.bytes += space::still_needed(local / util::path_from_utf8(rel), size);
+                need.bytes += space::still_needed(folder_dir / local::relative(rel), size);
             }
         }
     }
@@ -1757,7 +1763,7 @@ void App::cancel_items(int id) {
                 item->status = Status::cancelled;
                 item->speed = 0;
                 item->eta.reset();
-                if (item->mode == Mode::file) discard.push_back(item->dest / util::path_from_utf8(item->name));
+                if (item->mode == Mode::file) discard.push_back(file_target(item->dest, item->path));
                 else discard_folder_partials(*item); // finished files stay
             } else if (item->status == Status::running) {
                 item->stop_reason = StopReason::cancel;
@@ -1782,7 +1788,7 @@ void App::retry_item(int id) {
                 item->error.clear();
                 if (item->mode == Mode::folder) {
                     folder::retry_files(item->tree, cancelled); // after a cancel, everything not finished
-                } else if (!fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
+                } else if (!fetch::saved_progress(file_target(item->dest, item->path))) {
                     item->bytes = 0;
                 }
                 item->speed = 0;
@@ -1989,7 +1995,7 @@ void App::open_item_folder(int id) {
     {
         std::lock_guard lock(mutex_);
         for (const auto& item : items_) {
-            if (item->id == id) target = item->dest / util::path_from_utf8(item->name);
+            if (item->id == id) target = file_target(item->dest, item->path);
         }
     }
     if (target.empty()) return;
@@ -2102,7 +2108,7 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     item->connections = 0;
     item->current.clear();
     if (item->status == Status::cancelled && item->mode == Mode::file) {
-        fetch::discard(item->dest / util::path_from_utf8(item->name));
+        fetch::discard(file_target(item->dest, item->path));
     }
 }
 
@@ -2156,7 +2162,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                              engine::without_console_progress(ctx->settings.common_flags)};
     d.server = item->remote;
     d.id = item->id;
-    d.target = item->dest / util::path_from_utf8(item->name);
+    d.target = file_target(item->dest, item->path);
     d.limiter = &limiter_;
     d.weight = &item->weight;
     const auto result = fetch::run(d, connections_, [&](const fetch::Progress& p) {
@@ -2449,7 +2455,7 @@ void App::restore_queue() {
         item->status = saved.resume ? Status::queued : Status::paused;
         item->weight = weight_of(saved.priority);
         if (item->mode == Mode::file) {
-            if (auto p = fetch::saved_progress(item->dest / util::path_from_utf8(item->name))) {
+            if (auto p = fetch::saved_progress(file_target(item->dest, item->path))) {
                 item->bytes = p->first;
                 item->total = p->second;
             }
@@ -2465,7 +2471,7 @@ void App::restore_queue() {
                 c.verified = f.verified;
                 if (c.status == folder::State::done) c.bytes = c.size;
                 else if (c.big) {
-                    if (auto p = fetch::saved_progress(dir / util::path_from_utf8(c.path))) c.bytes = p->first;
+                    if (auto p = fetch::saved_progress(dir / local::relative(c.path))) c.bytes = p->first;
                 }
                 item->tree.files.push_back(std::move(c));
             }

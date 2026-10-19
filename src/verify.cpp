@@ -1,6 +1,7 @@
 #include "verify.hpp"
 
 #include "listing.hpp"
+#include "local_name.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
 #include "server_ops.hpp"
@@ -9,7 +10,9 @@
 #include <algorithm>
 #include <cctype>
 #include <format>
+#include <span>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #ifdef _WIN32
@@ -35,6 +38,117 @@ unsigned long process_id() {
 std::string upper(std::string s) {
     std::ranges::transform(s, s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return s;
+}
+
+bool write_list(const fs::path& file, std::span<const std::string> paths) {
+    std::string text;
+    for (const auto& p : paths) text += p + '\n';
+    return server_ops::write_text(file, text);
+}
+
+proc::RunOptions quiet(std::stop_token stop) {
+    proc::RunOptions o;
+    o.detached = true;
+    o.stop = std::move(stop);
+    return o;
+}
+
+// The plain names: one `rclone check` over all of them.
+std::expected<Report, std::string> check_names(const Request& r, std::span<const std::string> paths, int held,
+                                               const std::stop_token& stop) {
+    const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}.txt", process_id(), r.id);
+    if (!write_list(list, paths)) return util::fail("cannot write " + util::path_to_utf8(list));
+    const auto argv = check_argv(r, list, held);
+    if (r.on_command) r.on_command(argv);
+    auto ran = proc::run_capture(argv, quiet(stop));
+    std::error_code ec;
+    fs::remove(list, ec);
+    if (stop.stop_requested()) return util::fail("stopped");
+    if (!ran) return util::fail(ran.error());
+
+    const auto lines = parse_combined(ran->out);
+    if (lines.empty()) {
+        // A clean exit with nothing compared: the files were gone on both sides, say.
+        if (ran->exit_code == 0) return util::fail("rclone check compared nothing");
+        return util::fail(server_ops::clean_rclone_error(ran->err));
+    }
+    Report report;
+    report.hash = hash_used(ran->err);
+    for (const auto& line : lines) {
+        switch (line.verdict) {
+        case Verdict::same:
+            ++report.matched;
+            report.same.push_back(line.path);
+            break;
+        case Verdict::differs:
+        case Verdict::missing: report.differ.push_back(line.path); break;
+        case Verdict::error: ++report.unchecked; break;
+        }
+    }
+    // Files the server no longer has are not reported at all.
+    if (lines.size() < paths.size()) report.unchecked += paths.size() - lines.size();
+    const std::size_t no_hash = unhashed(ran->err);
+    if (no_hash > 0) { // counted as matches by rclone, without saying which
+        report.unchecked += std::min(no_hash, report.matched);
+        report.matched -= std::min(no_hash, report.matched);
+        report.same.clear();
+    }
+    if (report.hash.empty()) report.same.clear(); // sizes only
+    return report;
+}
+
+// The device names: the server's MD5 sums from one `rclone hashsum`, each copy's from another,
+// added to `report`.
+std::expected<void, std::string> compare_sums(const Request& r, std::span<const std::string> paths, int held,
+                                              const std::stop_token& stop, Report& report) {
+    const auto& ctx = *r.ctx;
+    const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}-sums.txt", process_id(), r.id);
+    if (!write_list(list, paths)) return util::fail("cannot write " + util::path_to_utf8(list));
+    std::vector<std::string> argv{ctx.config.rclone, "hashsum", "md5", remote_spec(ctx.settings.rclone_remote, r.remote_dir)};
+    if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
+    const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+    argv.insert(argv.end(), flags.begin(), flags.end());
+    argv.insert(argv.end(), r.extra.begin(), r.extra.end());
+    const auto n = std::to_string(std::max(held, 1));
+    argv.insert(argv.end(), {"--files-from-raw", util::path_to_utf8(list), "--checkers", n, "--sftp-connections", n,
+                             "--sftp-disable-hashcheck=false"});
+    if (r.on_command) r.on_command(argv);
+    auto ran = proc::run_capture(argv, quiet(stop));
+    std::error_code ec;
+    fs::remove(list, ec);
+    if (stop.stop_requested()) return util::fail("stopped");
+    if (!ran) return util::fail(ran.error());
+    const auto server = parse_sums(ran->out);
+    bool hashed = false;
+    for (const auto& p : paths) {
+        const auto theirs = server.find(p);
+        if (theirs == server.end()) { // gone from the server, or it could not hash it
+            ++report.unchecked;
+            continue;
+        }
+        hashed = true;
+        const auto copy = r.local_dir / local::relative(p);
+        if (!fs::is_regular_file(copy, ec)) {
+            report.differ.push_back(p);
+            continue;
+        }
+        std::vector<std::string> mine_argv{ctx.config.rclone, "hashsum", "md5", util::path_to_utf8(copy)};
+        if (ctx.config.rclone_config) mine_argv.insert(mine_argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
+        if (r.on_command) r.on_command(mine_argv);
+        auto mine = proc::run_capture(mine_argv, quiet(stop));
+        if (stop.stop_requested()) return util::fail("stopped");
+        const auto sums = mine ? parse_sums(mine->out) : std::unordered_map<std::string, std::string>{};
+        if (sums.size() != 1) {
+            ++report.unchecked;
+        } else if (sums.begin()->second == theirs->second) {
+            ++report.matched;
+            report.same.push_back(p);
+        } else {
+            report.differ.push_back(p);
+        }
+    }
+    if (hashed && report.hash.empty()) report.hash = "md5";
+    return {};
 }
 
 } // namespace
@@ -79,6 +193,23 @@ std::size_t unhashed(std::string_view log) {
     return n;
 }
 
+std::unordered_map<std::string, std::string> parse_sums(std::string_view out) {
+    std::unordered_map<std::string, std::string> sums;
+    while (!out.empty()) {
+        const auto end = out.find('\n');
+        std::string_view line = out.substr(0, end);
+        out.remove_prefix(end == std::string_view::npos ? out.size() : end + 1);
+        if (line.ends_with('\r')) line.remove_suffix(1);
+        if (line.size() < 35 || line.substr(32, 2) != "  ") continue;
+        const auto hex = line.substr(0, 32);
+        if (!std::ranges::all_of(hex, [](unsigned char c) { return std::isxdigit(c) != 0; })) continue;
+        std::string lower(hex);
+        std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        sums.insert_or_assign(std::string(line.substr(34)), std::move(lower));
+    }
+    return sums;
+}
+
 std::vector<std::string> check_argv(const Request& r, const fs::path& list_file, int connections) {
     const auto& ctx = *r.ctx;
     std::vector<std::string> argv{ctx.config.rclone, "check", remote_spec(ctx.settings.rclone_remote, r.remote_dir),
@@ -90,8 +221,11 @@ std::vector<std::string> check_argv(const Request& r, const fs::path& list_file,
     // Last, so they win over the common flags: grab's default --sftp-disable-hashcheck would
     // leave the server without checksums. -v logs which checksum was compared.
     const auto n = std::to_string(std::max(connections, 1));
-    argv.insert(argv.end(), {"--one-way", "--files-from-raw", util::path_to_utf8(list_file), "--combined", "-",
-                             "--checkers", n, "--sftp-connections", n, "--sftp-disable-hashcheck=false", "-v"});
+    // --no-traverse: each file looked up by name on both sides. Listing the folders instead,
+    // rclone 1.75.1 paired none of the names with a tab, a control character, DEL or ‛ in them.
+    argv.insert(argv.end(), {"--one-way", "--files-from-raw", util::path_to_utf8(list_file), "--no-traverse",
+                             "--combined", "-", "--checkers", n, "--sftp-connections", n,
+                             "--sftp-disable-hashcheck=false", "-v"});
     return argv;
 }
 
@@ -112,55 +246,25 @@ std::expected<Report, std::string> run(const Request& r, std::stop_token stop) {
         return util::fail("stopped");
     }
 
-    const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}.txt", process_id(), r.id);
-    if (!server_ops::write_text(list, [&] {
-            std::string text;
-            for (const auto& p : r.paths) text += p + '\n';
-            return text;
-        }())) {
-        done_with_pool();
-        return util::fail("cannot write " + util::path_to_utf8(list));
-    }
-    const auto argv = check_argv(r, list, held);
-    if (r.on_command) r.on_command(argv);
-    proc::RunOptions quiet;
-    quiet.detached = true;
-    quiet.stop = stop;
-    auto ran = proc::run_capture(argv, quiet);
-    std::error_code ec;
-    fs::remove(list, ec);
-    done_with_pool();
-    if (stop.stop_requested()) return util::fail("stopped");
-    if (!ran) return util::fail(ran.error());
-
-    const auto lines = parse_combined(ran->out);
-    if (lines.empty()) {
-        // A clean exit with nothing compared: the files were gone on both sides, say.
-        if (ran->exit_code == 0) return util::fail("rclone check compared nothing");
-        return util::fail(server_ops::clean_rclone_error(ran->err));
-    }
+    std::vector<std::string> plain;
+    std::vector<std::string> devices;
+    for (const auto& p : r.paths) (local::has_device(p) ? devices : plain).push_back(p);
     Report report;
-    report.hash = hash_used(ran->err);
-    for (const auto& line : lines) {
-        switch (line.verdict) {
-        case Verdict::same:
-            ++report.matched;
-            report.same.push_back(line.path);
-            break;
-        case Verdict::differs:
-        case Verdict::missing: report.differ.push_back(line.path); break;
-        case Verdict::error: ++report.unchecked; break;
+    if (!plain.empty()) {
+        auto checked = check_names(r, plain, held, stop);
+        if (!checked) {
+            done_with_pool();
+            return checked;
+        }
+        report = std::move(*checked);
+    }
+    if (!devices.empty()) {
+        if (auto summed = compare_sums(r, devices, held, stop, report); !summed) {
+            done_with_pool();
+            return util::fail(summed.error());
         }
     }
-    // Files the server no longer has are not reported at all.
-    if (lines.size() < r.paths.size()) report.unchecked += r.paths.size() - lines.size();
-    const std::size_t no_hash = unhashed(ran->err);
-    if (no_hash > 0) { // counted as matches by rclone, without saying which
-        report.unchecked += std::min(no_hash, report.matched);
-        report.matched -= std::min(no_hash, report.matched);
-        report.same.clear();
-    }
-    if (report.hash.empty()) report.same.clear(); // sizes only
+    done_with_pool();
     return report;
 }
 
@@ -168,7 +272,7 @@ std::expected<Report, std::string> file(Request base, const std::string& remote_
                                         std::stop_token stop) {
     // rclone check pairs files by name, so the copy must carry the server's.
     const std::string name = remote_basename(remote_path);
-    if (util::path_from_utf8(name) != target.filename()) return util::fail("the copy has another name than the server's file");
+    if (local::relative(name) != target.filename()) return util::fail("the copy has another name than the server's file");
     base.remote_dir = parent_of(remote_path);
     base.local_dir = target.parent_path();
     base.paths = {name};

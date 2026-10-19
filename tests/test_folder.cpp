@@ -2,6 +2,7 @@
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "gui_state.hpp"
+#include "util.hpp"
 
 #include <doctest/doctest.h>
 
@@ -110,6 +111,16 @@ TEST_CASE("folder totals count finished and running files, not skipped ones") {
     CHECK(*tot.eta == doctest::Approx(51.0));
     CHECK(folder::make_file("x", folder::big_file_threshold, "").big);
     CHECK_FALSE(folder::make_file("x", 10, "").big);
+    // A small file with a device name anywhere in its path goes through grab's engine, not rclone.
+    CHECK(folder::make_file("CON", 10, "").big);
+    CHECK(folder::make_file("season 1/nul.txt", 10, "").big);
+    CHECK(folder::make_file("aux/e01.srt", 10, "").big);
+    CHECK_FALSE(folder::make_file("console.txt", 10, "").big);
+    // A folder lands under its own name, made safe: never outside the download folder.
+    const std::filesystem::path dest = util::path_from_utf8("D:\\Downloads");
+    CHECK(folder::local_dir(dest, "/srv/..\\up") == dest / util::path_from_utf8("..＼up"));
+    CHECK(folder::local_dir(dest, "/srv/C:\\Windows") == dest / util::path_from_utf8("C：＼Windows"));
+    CHECK(folder::local_dir(dest, "/srv/..") == dest / util::path_from_utf8("．．"));
 }
 
 TEST_CASE("single files of a folder: pause, resume, skip and retry") {

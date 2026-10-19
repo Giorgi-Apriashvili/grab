@@ -2,7 +2,9 @@
 
 // Checking downloads against the server's copy (optional: Settings → Downloads, `grab --verify`).
 // One `rclone check` per download compares checksums that the server computes (md5sum over SSH)
-// with the local files'. Both sides read the files once more.
+// with the local files'. Both sides read the files once more. rclone check pairs files by name,
+// so files with a Windows device name (CON, nul.txt), which grab names otherwise than rclone
+// (CON_, local_name.hpp), are compared by `rclone hashsum md5` on both sides instead.
 
 #include "engine.hpp"
 #include "fetch.hpp"
@@ -13,6 +15,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace grab::verify {
@@ -31,6 +34,10 @@ struct Line {
 // (it then compared sizes only), and how many files it could not hash.
 [[nodiscard]] std::string hash_used(std::string_view log);
 [[nodiscard]] std::size_t unhashed(std::string_view log);
+
+// `rclone hashsum md5` output: "<32 hex>  <path>" per file, as path -> lowercase hex. Other lines
+// (the files it could not hash) are skipped.
+[[nodiscard]] std::unordered_map<std::string, std::string> parse_sums(std::string_view out);
 
 struct Request {
     const engine::Context* ctx = nullptr;
