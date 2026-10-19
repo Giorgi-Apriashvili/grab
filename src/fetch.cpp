@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <deque>
 #include <format>
+#include <random>
 #include <system_error>
 #include <thread>
 
@@ -193,30 +194,69 @@ std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::
     return argv;
 }
 
-fs::path part_path(const fs::path& target) {
-    fs::path p = target;
-    p += ".grabpart";
-    return p;
+PartialFiles partial_files(const fs::path& target, int slot) {
+    PartialFiles f{target, {}};
+    if (slot > 1) f.part += std::format(".{}", slot);
+    f.part += ".grabpart";
+    f.record = f.part;
+    f.record += ".json";
+    return f;
 }
 
-fs::path state_path(const fs::path& target) {
-    fs::path p = target;
-    p += ".grabpart.json";
-    return p;
+namespace {
+
+bool is_reserved(const Reserved& reserved, const PartialFiles& f) {
+    return reserved && (reserved(f.part) || reserved(f.record));
 }
 
-std::optional<std::pair<std::uint64_t, std::uint64_t>> saved_progress(const fs::path& target) {
-    auto text = util::read_file(state_path(target));
-    if (!text) return std::nullopt;
-    auto s = state_from_json(*text);
-    if (!s) return std::nullopt;
-    return std::pair{s->bytes_done(), s->size};
-}
-
-void discard(const fs::path& target) {
+// Deletes a partial download grab made: the data file while it has the size grab gave it (what
+// is there otherwise isn't grab's), then the record.
+void discard_own(const Partial& p) {
     std::error_code ec;
-    fs::remove(part_path(target), ec);
-    fs::remove(state_path(target), ec);
+    if (fs::is_regular_file(p.files.part, ec) && fs::file_size(p.files.part, ec) == p.state.size && !ec &&
+        !fs::remove(p.files.part, ec) && ec) {
+        return; // in use: the record stays with it
+    }
+    fs::remove(p.files.record, ec);
+}
+
+} // namespace
+
+std::optional<Partial> find_partial(const fs::path& target, std::string_view remote_path, const Reserved& reserved) {
+    constexpr std::uintmax_t record_max = 1 << 20; // a record is a few KiB; no reading anything big
+    for (int slot = 1; slot <= max_slot; ++slot) {
+        auto f = partial_files(target, slot);
+        if (is_reserved(reserved, f)) continue;
+        std::error_code ec;
+        if (!fs::is_regular_file(f.record, ec) || fs::file_size(f.record, ec) > record_max || ec) continue;
+        auto text = util::read_file(f.record);
+        if (!text) continue;
+        auto state = state_from_json(*text);
+        if (state && state->path == remote_path) return Partial{std::move(f), std::move(*state)};
+    }
+    return std::nullopt;
+}
+
+std::optional<PartialFiles> free_partial(const fs::path& target, const Reserved& reserved) {
+    for (int slot = 1; slot <= max_slot; ++slot) {
+        auto f = partial_files(target, slot);
+        if (is_reserved(reserved, f)) continue;
+        std::error_code ec;
+        if (!fs::exists(fs::symlink_status(f.part, ec)) && !fs::exists(fs::symlink_status(f.record, ec))) return f;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<std::uint64_t, std::uint64_t>> saved_progress(const fs::path& target,
+                                                                      std::string_view remote_path,
+                                                                      const Reserved& reserved) {
+    const auto p = find_partial(target, remote_path, reserved);
+    if (!p) return std::nullopt;
+    return std::pair{p->state.bytes_done(), p->state.size};
+}
+
+void discard(const fs::path& target, std::string_view remote_path, const Reserved& reserved) {
+    if (const auto p = find_partial(target, remote_path, reserved)) discard_own(*p);
 }
 
 // ---- connections -----------------------------------------------------------------------------
@@ -341,11 +381,11 @@ public:
     ~PartFile() { close(); }
 
     // Creates it sparse (writes far into the file must not zero-fill what lies before) and
-    // sized, or opens an existing one.
+    // sized, only where nothing exists yet; or opens grab's existing one.
     std::expected<void, std::string> open(const fs::path& p, std::uint64_t size, bool create) {
 #ifdef _WIN32
         h_ = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                         create ? CREATE_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                         create ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h_ == INVALID_HANDLE_VALUE) {
             h_ = nullptr;
             return util::failf("cannot open {}: {}", util::path_to_utf8(p), system_message(static_cast<int>(GetLastError())));
@@ -361,7 +401,7 @@ public:
             }
         }
 #else
-        fd_ = ::open(p.c_str(), O_RDWR | (create ? O_CREAT | O_TRUNC : 0), 0644);
+        fd_ = ::open(p.c_str(), O_RDWR | (create ? O_CREAT | O_EXCL : 0), 0644);
         if (fd_ < 0) return util::failf("cannot open {}: {}", util::path_to_utf8(p), system_message(errno));
         if (create && ftruncate(fd_, static_cast<off_t>(size)) != 0) {
             return util::failf("cannot size {}: {}", util::path_to_utf8(p), system_message(errno));
@@ -431,6 +471,41 @@ private:
 #endif
 };
 
+// Replaces grab's own record, never half written: the text goes to a new file of a random name
+// beside it, which then moves over the record.
+bool write_record(const fs::path& record, const std::string& text) {
+    thread_local std::mt19937 gen{std::random_device{}()};
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        auto tmp = record;
+        tmp += std::format(".{:08x}.tmp", static_cast<std::uint32_t>(gen()));
+        if (!util::write_new_file(tmp, text)) continue; // that name is taken: another
+        std::error_code ec;
+        fs::rename(tmp, record, ec);
+        if (!ec) return true;
+        fs::remove(tmp, ec); // made just now
+        return false;
+    }
+    return false;
+}
+
+// A new partial download in the first free slot: its record is created first, then the data
+// file, each only where nothing exists yet.
+std::expected<PartialFiles, std::string> claim(const fs::path& target, const State& state, const Reserved& reserved,
+                                               PartFile& file) {
+    auto f = free_partial(target, reserved);
+    if (!f) {
+        return util::failf("no free name for the partial download: {} and {} more names next to it are taken by other files",
+                           util::path_to_utf8(partial_files(target, 1).part), max_slot - 1);
+    }
+    if (!util::write_new_file(f->record, state_to_json(state))) return util::fail("cannot write " + util::path_to_utf8(f->record));
+    if (auto opened = file.open(f->part, state.size, true); !opened) {
+        std::error_code ec;
+        fs::remove(f->record, ec); // made just now
+        return util::fail(opened.error());
+    }
+    return *f;
+}
+
 std::chrono::seconds backoff(int attempt) {
     constexpr int steps[] = {2, 4, 8, 16, 30, 30};
     return std::chrono::seconds(steps[std::clamp(attempt - 1, 0, 5)]);
@@ -459,27 +534,24 @@ Result run(const Download& d, Connections& connections, const std::function<void
     if (remote->is_dir) return failed("this is a folder on the server; download it as a folder");
 
     Result result;
-    const auto part = part_path(d.target);
-    const auto state_file = state_path(d.target);
     std::error_code ec;
-    if (!fs::exists(state_file, ec) && up_to_date(d.target, remote->size, remote->modtime)) {
+    auto own = find_partial(d.target, src.path, d.reserved);
+    if (!own && up_to_date(d.target, remote->size, remote->modtime)) {
         if (on_progress) on_progress(Progress{remote->size, remote->size, 0, std::nullopt, 0});
         result.outcome = Outcome::done;
         result.present = true;
         return result;
     }
-    std::optional<State> saved;
-    if (auto text = util::read_file(state_file)) saved = state_from_json(*text);
-    const bool reuse = saved && saved->rclone_remote == src.rclone_remote && saved->path == src.path &&
-                       saved->size == remote->size && saved->modtime == remote->modtime &&
-                       fs::file_size(part, ec) == remote->size && !ec;
-    if (fs::exists(state_file, ec) && !reuse) {
+    const bool reuse = own && own->state.rclone_remote == src.rclone_remote && own->state.size == remote->size &&
+                       own->state.modtime == remote->modtime && fs::file_size(own->files.part, ec) == remote->size &&
+                       !ec;
+    if (own && !reuse) {
         result.note = "the file changed on the server, or its partial copy was damaged; started over";
+        discard_own(*own);
     }
-    State state = reuse ? *saved
+    State state = reuse ? own->state
                         : new_state(src.rclone_remote, src.path, remote->size, remote->modtime,
                                     chunk_size_for(remote->size, connections.budget(d.server)));
-    if (!reuse) discard(d.target);
 
     const auto remaining = state.size - state.bytes_done();
     if (auto space = fs::space(d.target.parent_path(), ec); !ec && space.available < remaining) {
@@ -489,9 +561,17 @@ Result run(const Download& d, Connections& connections, const std::function<void
     }
 
     PartFile file;
-    if (auto opened = file.open(part, state.size, !reuse); !opened) return failed(opened.error());
-    auto save = [&](const State& s) { return server_ops::write_text(state_file, state_to_json(s)); };
-    if (!reuse && !save(state)) return failed("cannot write " + util::path_to_utf8(state_file));
+    PartialFiles files;
+    if (reuse) {
+        files = own->files;
+        if (auto opened = file.open(files.part, state.size, false); !opened) return failed(opened.error());
+    } else {
+        auto claimed = claim(d.target, state, d.reserved, file);
+        if (!claimed) return failed(claimed.error());
+        files = std::move(*claimed);
+    }
+    const fs::path& part = files.part;
+    auto save = [&](const State& s) { return write_record(files.record, state_to_json(s)); };
 
     // Shared between the streams, under `m`. Per range (same index as state.ranges, which only
     // ever grows at the end): being fetched, failures in a row, and when it may be retried.
@@ -694,7 +774,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
     }
     fs::rename(part, d.target, ec); // replaces an older copy, as rclone copyto did
     if (ec) return Result{Outcome::failed, std::format("cannot rename to {}: {}", util::path_to_utf8(d.target), ec.message()), result.note};
-    fs::remove(state_file, ec);
+    fs::remove(files.record, ec);
     if (on_progress) on_progress(Progress{state.size, state.size, 0, std::nullopt, 0});
     result.outcome = Outcome::done;
     return result;

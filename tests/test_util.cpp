@@ -116,3 +116,17 @@ TEST_CASE("data protected for the current user comes back only with the same pur
     CHECK(util::unprotect_for_user(*util::protect_for_user("", "p"), "p") == std::string{});
 #endif
 }
+
+TEST_CASE("a new file is written only where nothing is") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-new-file";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "sub");
+    CHECK(util::write_new_file(dir / "a.txt", "one"));
+    CHECK(util::read_file(dir / "a.txt").value_or("") == "one");
+    CHECK_FALSE(util::write_new_file(dir / "a.txt", "two")); // there already: left alone
+    CHECK(util::read_file(dir / "a.txt").value_or("") == "one");
+    CHECK_FALSE(util::write_new_file(dir / "sub", "x")); // a folder
+    CHECK(util::write_new_file(dir / "empty.txt", ""));
+    CHECK(std::filesystem::file_size(dir / "empty.txt") == 0);
+    std::filesystem::remove_all(dir);
+}

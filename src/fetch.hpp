@@ -5,6 +5,11 @@
 // "<name>.grabpart" at the right offsets, and "<name>.grabpart.json" records how much of each
 // chunk is on disk. Stopping keeps both; the next run continues from there, even after grab
 // restarts. The streams of all downloads share each server's connection budget (conn_budget).
+//
+// Those files are grab's only when the record parses and names the same server file: grab never
+// replaces, reuses or deletes anything it can't prove it made. When the names are taken by
+// something else (the user's files, or files of a folder being downloaded), a download uses
+// "<name>.2.grabpart" and so on.
 
 #include "conn_budget.hpp"
 #include "rate.hpp"
@@ -102,13 +107,35 @@ struct Source {
 [[nodiscard]] std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::uint64_t count,
                                                 bool low_read_ahead = false);
 
-[[nodiscard]] std::filesystem::path part_path(const std::filesystem::path& target);  // <target>.grabpart
-[[nodiscard]] std::filesystem::path state_path(const std::filesystem::path& target); // <target>.grabpart.json
+// One partial download's files: the data, and the record of its State beside it.
+struct PartialFiles {
+    std::filesystem::path part;   // <target>.grabpart, or <target>.<slot>.grabpart
+    std::filesystem::path record; // the same name plus ".json"
+    bool operator==(const PartialFiles&) const = default;
+};
+inline constexpr int max_slot = 9;
+// Slot 1 is "<target>.grabpart"; slots 2 to max_slot are "<target>.<slot>.grabpart".
+[[nodiscard]] PartialFiles partial_files(const std::filesystem::path& target, int slot);
 
-// Bytes done and total size of a partial download of `target`, if there is one.
-[[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>> saved_progress(const std::filesystem::path& target);
-// Deletes the partial file and its state.
-void discard(const std::filesystem::path& target);
+// Names a partial download must not take, in a folder download where the folder's own files
+// land; empty: none.
+using Reserved = std::function<bool(const std::filesystem::path&)>;
+
+struct Partial {
+    PartialFiles files;
+    State state;
+};
+// grab's partial download of `target` from the server file `remote_path`: the first slot, not
+// reserved, whose record parses and names that file.
+[[nodiscard]] std::optional<Partial> find_partial(const std::filesystem::path& target, std::string_view remote_path,
+                                                  const Reserved& reserved = {});
+// The first slot for a new partial download of `target`: not reserved, and nothing at either name.
+[[nodiscard]] std::optional<PartialFiles> free_partial(const std::filesystem::path& target, const Reserved& reserved = {});
+// Its bytes done and total size.
+[[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>>
+saved_progress(const std::filesystem::path& target, std::string_view remote_path, const Reserved& reserved = {});
+// Deletes it: the record, and the data file while it has the size grab gave it. Nothing else.
+void discard(const std::filesystem::path& target, std::string_view remote_path, const Reserved& reserved = {});
 
 // The connection pools of all servers, shared by every running download. Thread-safe.
 class Connections {
@@ -167,6 +194,7 @@ struct Download {
     std::string server; // grab.conf section: the connection pool
     int id = 0;         // the download's id in the pools
     std::filesystem::path target; // DEST\<name>
+    Reserved reserved;            // names the partial files must not take (a folder's own files)
     // The caller already joined the pool under `id` and leaves it itself: a folder whose files
     // are fetched one after another (or several at once) as one pool user.
     bool joined = false;

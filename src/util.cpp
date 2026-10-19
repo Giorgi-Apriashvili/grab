@@ -17,6 +17,7 @@
 #include <bcrypt.h>
 #include <dpapi.h>
 #else
+#include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -110,6 +111,35 @@ bool write_file_atomic(const std::filesystem::path& p, std::string_view text) {
     }
     std::filesystem::rename(tmp, p, ec);
     return !ec;
+}
+
+bool write_new_file(const std::filesystem::path& p, std::string_view text) {
+    bool ok = true;
+#ifdef _WIN32
+    const HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    while (ok && !text.empty()) {
+        DWORD written = 0;
+        const DWORD n = static_cast<DWORD>(std::min<std::size_t>(text.size(), 1u << 30));
+        ok = WriteFile(h, text.data(), n, &written, nullptr) && written > 0;
+        text.remove_prefix(written);
+    }
+    ok = CloseHandle(h) && ok;
+#else
+    const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) return false;
+    while (ok && !text.empty()) {
+        const ssize_t written = ::write(fd, text.data(), text.size());
+        ok = written > 0;
+        if (ok) text.remove_prefix(static_cast<std::size_t>(written));
+    }
+    ok = ::close(fd) == 0 && ok;
+#endif
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(p, ec); // made just now, by us
+    }
+    return ok;
 }
 
 std::string escape_field(std::string_view s) {

@@ -84,29 +84,37 @@ TEST_CASE("download_argv uses the remote's flags and DEST\\<name>") {
                                    "--bwlimit", "10M"});
 }
 
-TEST_CASE("remove_partials deletes only the interrupted item's temp files") {
+TEST_CASE("rclone's temp files: only those of the run's files, made by the run") {
     namespace fs = std::filesystem;
     const auto dir = fs::temp_directory_path() / "grab_test_partials";
     fs::remove_all(dir);
-    fs::create_directories(dir / "show" / "sub");
+    fs::create_directories(dir / "sub");
     auto touch = [](const fs::path& p) { std::ofstream(p) << "x"; };
+    const std::string long_name = std::string(120, 'L') + ".bin"; // cut to its length, as rclone 1.75.1 does
+    const std::vector<fs::path> files{dir / "movie.mkv", dir / "sub" / "e01.mkv", dir / long_name};
+    touch(dir / "movie.mkv.0badf00d.partial"); // there before the run: not this run's
+    touch(dir / "notes.txt.partial");          // the user's
+    touch(dir / "movie.mkv.backup.partial");   // the user's: not rclone's pattern
+    touch(dir / "other.mkv.90c84c01.partial"); // not a file of this run
+    const auto before = engine::rclone_temp_files(files);
+    CHECK(before == std::vector<fs::path>{dir / "movie.mkv.0badf00d.partial"});
+
     touch(dir / "movie.mkv.37814e9b.partial");
-    touch(dir / "movie.mkv.aaaa.partial");
-    touch(dir / "movie.mkv");                    // a finished file: kept
-    touch(dir / "other.mkv.1234.partial");        // another item: kept
-    touch(dir / "show" / "e01.mkv.ff.partial");
-    touch(dir / "show" / "sub" / "e02.mkv.ee.partial");
-    touch(dir / "show" / "e03.mkv");
-
-    CHECK(engine::remove_partials(dir / "movie.mkv", Mode::file) == 2);
+    touch(dir / "sub" / "e01.mkv.90C84C01.partial");
+    touch(dir / (std::string(107, 'L') + ".35105d76.partial"));
+    touch(dir / "movie.mkv");
+    CHECK(engine::rclone_temp_files(files).size() == 4);
+    CHECK(engine::remove_rclone_temp_files(files, before) == 3);
+    CHECK(fs::exists(dir / "movie.mkv.0badf00d.partial"));
+    CHECK(fs::exists(dir / "notes.txt.partial"));
+    CHECK(fs::exists(dir / "movie.mkv.backup.partial"));
+    CHECK(fs::exists(dir / "other.mkv.90c84c01.partial"));
     CHECK(fs::exists(dir / "movie.mkv"));
-    CHECK(fs::exists(dir / "other.mkv.1234.partial"));
+    CHECK_FALSE(fs::exists(dir / "movie.mkv.37814e9b.partial"));
+    CHECK_FALSE(fs::exists(dir / "sub" / "e01.mkv.90C84C01.partial"));
 
-    CHECK(engine::remove_partials(dir / "show", Mode::folder) == 2);
-    CHECK(fs::exists(dir / "show" / "e03.mkv"));
-    CHECK_FALSE(fs::exists(dir / "show" / "sub" / "e02.mkv.ee.partial"));
-
-    CHECK(engine::remove_partials(dir / "missing", Mode::folder) == 0); // no throw
+    const std::vector<fs::path> missing{dir / "missing" / "x.bin"};
+    CHECK(engine::rclone_temp_files(missing).empty()); // no folder: no throw
     fs::remove_all(dir);
 }
 

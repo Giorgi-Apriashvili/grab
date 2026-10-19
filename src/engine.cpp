@@ -3,17 +3,21 @@
 #include "folder.hpp"
 #include "json.hpp"
 #include "listing.hpp"
-#include "local_name.hpp"
 #include "match.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
 #include "secrets.hpp"
 #include "util.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <format>
+#include <map>
 #include <optional>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace grab::engine {
@@ -318,38 +322,56 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
         run);
     if (!code) return util::fail(code.error());
     result.exit_code = *code;
-    if (result.exit_code == proc::exit_stopped) {
-        remove_partials(dest_dir / local::relative(remote_basename(remote_path)), mode);
-    }
     return result;
 }
 
-std::size_t remove_partials(const std::filesystem::path& local_target, Mode mode) {
+std::vector<std::filesystem::path> rclone_temp_files(std::span<const std::filesystem::path> files) {
     namespace fs = std::filesystem;
-    std::error_code ec;
-    std::size_t removed = 0;
-    auto is_partial_of = [](const fs::path& p, const std::wstring& stem) {
-        const std::wstring name = p.filename().wstring();
-        return name.size() > stem.size() + 1 && name.starts_with(stem + L".") &&
-               name.ends_with(L".partial");
+    using Name = fs::path::string_type;
+    // The files by folder: their names, and the long ones (cut short in the temp name).
+    struct Folder {
+        std::unordered_set<Name> names;
+        std::vector<Name> long_names;
     };
-
-    if (mode == Mode::file) {
-        const std::wstring stem = local_target.filename().wstring();
-        for (const auto& e : fs::directory_iterator(local_target.parent_path(), ec)) {
-            if (e.is_regular_file(ec) && is_partial_of(e.path(), stem) && fs::remove(e.path(), ec)) {
-                ++removed;
-            }
-        }
-        return removed;
+    std::map<fs::path, Folder> folders;
+    for (const auto& f : files) {
+        auto& folder = folders[f.parent_path()];
+        folder.names.insert(f.filename().native());
+        if (util::path_to_utf8(f.filename()).size() > 100) folder.long_names.push_back(f.filename().native());
     }
-    // Folder: rclone writes each file as "<file>.<random>.partial" next to its final name.
-    for (auto it = fs::recursive_directory_iterator(local_target, ec);
-         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (it->is_regular_file(ec) && it->path().extension() == L".partial" &&
-            fs::remove(it->path(), ec)) {
-            ++removed;
+    const Name suffix = fs::path(".partial").native();
+    std::vector<fs::path> found;
+    for (const auto& [dir, folder] : folders) {
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            const Name entry = e.path().filename().native();
+            // <name> "." 8 hex ".partial"
+            if (entry.size() < suffix.size() + 10 || !entry.ends_with(suffix)) continue;
+            const auto dot = entry.size() - suffix.size() - 9;
+            if (entry[dot] != '.') continue;
+            const bool hex = std::all_of(entry.begin() + static_cast<std::ptrdiff_t>(dot) + 1,
+                                         entry.end() - static_cast<std::ptrdiff_t>(suffix.size()), [](auto c) {
+                                             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                                         });
+            if (!hex) continue;
+            const Name name = entry.substr(0, dot);
+            const bool ours = folder.names.contains(name) ||
+                              std::ranges::any_of(folder.long_names, [&](const Name& n) {
+                                  return !name.empty() && n.size() > name.size() && n.starts_with(name);
+                              });
+            if (ours && e.is_regular_file(ec)) found.push_back(e.path());
         }
+    }
+    return found;
+}
+
+std::size_t remove_rclone_temp_files(std::span<const std::filesystem::path> files,
+                                     std::span<const std::filesystem::path> before) {
+    const std::set<std::filesystem::path> there(before.begin(), before.end());
+    std::size_t removed = 0;
+    for (const auto& p : rclone_temp_files(files)) {
+        std::error_code ec;
+        if (!there.contains(p) && std::filesystem::remove(p, ec)) ++removed;
     }
     return removed;
 }

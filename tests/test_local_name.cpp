@@ -72,6 +72,12 @@ TEST_CASE("Windows device names get an underscore") {
     CHECK_FALSE(local::has_device("season 1/e01.mkv"));
 }
 
+TEST_CASE("local paths compared as Windows does") {
+    CHECK(local::key(util::path_from_utf8("C:\\dl\\a.bin.GRABPART")) == local::key(util::path_from_utf8("c:\\DL\\A.bin.grabpart")));
+    CHECK(local::key(util::path_from_utf8("C:\\dl\\Ünï.txt")) == local::key(util::path_from_utf8("C:\\dl\\üNÏ.TXT")));
+    CHECK(local::key(util::path_from_utf8("C:\\dl\\a.bin")) != local::key(util::path_from_utf8("C:\\dl\\a.bin.grabpart")));
+}
+
 TEST_CASE("a remote path never leaves the download folder") {
     const std::filesystem::path dest = util::path_from_utf8("C:\\Users\\me\\Downloads");
     // Below dest, and every part a plain name that Windows reads as written.

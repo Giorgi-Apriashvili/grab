@@ -156,11 +156,15 @@ TEST_CASE("single files of a folder: pause, resume, skip and retry") {
     CHECK(t.files[1].status == State::queued);
 
     const auto dir = std::filesystem::path("D") / "Limits";
-    const auto discard = folder::skip_file(t, dir, "broken");
+    const auto discard = folder::skip_file(t, dir, "/srv/Limits", "broken");
     CHECK(t.files[3].status == State::skipped);
     REQUIRE(discard.has_value());
-    CHECK(*discard == dir / "broken");
-    CHECK_FALSE(folder::skip_file(t, dir, "big").has_value()); // running: stopped, then discarded
+    CHECK(discard->target == dir / "broken");
+    CHECK(discard->remote_path == "/srv/Limits/broken");
+    REQUIRE(discard->reserved);
+    CHECK(discard->reserved(dir / "BIG")); // the folder's files, as Windows compares names
+    CHECK_FALSE(discard->reserved(dir / "broken.grabpart"));
+    CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", "big").has_value()); // running: stopped, then discarded
     CHECK(t.files[2].stop_reason == folder::StopReason::skip);
 
     t.files[1].status = State::failed;

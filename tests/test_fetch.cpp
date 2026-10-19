@@ -258,24 +258,108 @@ TEST_CASE("rclone command lines for ranges") {
     CHECK(stat[2] == "--stat");
 }
 
-TEST_CASE("saved progress and discard") {
+namespace {
+
+void write(const std::filesystem::path& p, const std::string& text) { std::ofstream(p, std::ios::binary) << text; }
+
+std::string read(const std::filesystem::path& p) { return util::read_file(p).value_or("<missing>"); }
+
+void sized(const std::filesystem::path& p, std::uint64_t size) {
+    std::ofstream(p, std::ios::binary).close();
+    std::filesystem::resize_file(p, size);
+}
+
+} // namespace
+
+TEST_CASE("partial download names: slot 1 is the plain one") {
+    const std::filesystem::path target = util::path_from_utf8("D:\\dl\\movie.mkv");
+    CHECK(fetch::partial_files(target, 1).part == util::path_from_utf8("D:\\dl\\movie.mkv.grabpart"));
+    CHECK(fetch::partial_files(target, 1).record == util::path_from_utf8("D:\\dl\\movie.mkv.grabpart.json"));
+    CHECK(fetch::partial_files(target, 2).part == util::path_from_utf8("D:\\dl\\movie.mkv.2.grabpart"));
+    CHECK(fetch::partial_files(target, 9).record == util::path_from_utf8("D:\\dl\\movie.mkv.9.grabpart.json"));
+}
+
+TEST_CASE("grab's partial download: found by its record, discarded with nothing else") {
     const auto dir = std::filesystem::temp_directory_path() / "grab-test-fetch";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const auto target = dir / "movie.mkv";
-    CHECK_FALSE(fetch::saved_progress(target).has_value());
+    CHECK_FALSE(fetch::saved_progress(target, "/m.mkv").has_value());
     auto s = fetch::new_state("box", "/m.mkv", 40 * MiB, "2025-01-01T00:00:00Z", 16 * MiB);
     s.ranges[0].done = 16 * MiB;
     s.ranges[1].done = 3;
-    std::ofstream(fetch::state_path(target)) << fetch::state_to_json(s);
-    std::ofstream(fetch::part_path(target)) << "x";
-    auto p = fetch::saved_progress(target);
+    const auto one = fetch::partial_files(target, 1);
+    write(one.record, fetch::state_to_json(s)); // a record as 0.15 wrote it: still grab's
+    sized(one.part, 40 * MiB);
+    auto p = fetch::saved_progress(target, "/m.mkv");
     REQUIRE(p.has_value());
     CHECK(p->first == 16 * MiB + 3);
     CHECK(p->second == 40 * MiB);
-    fetch::discard(target);
-    CHECK_FALSE(std::filesystem::exists(fetch::state_path(target)));
-    CHECK_FALSE(std::filesystem::exists(fetch::part_path(target)));
+    CHECK_FALSE(fetch::saved_progress(target, "/other.mkv").has_value()); // another server file's
+    fetch::discard(target, "/other.mkv");
+    CHECK(std::filesystem::exists(one.record));
+    fetch::discard(target, "/m.mkv");
+    CHECK_FALSE(std::filesystem::exists(one.record));
+    CHECK_FALSE(std::filesystem::exists(one.part));
+
+    // The data file isn't grab's size any more: only the record goes.
+    write(one.record, fetch::state_to_json(s));
+    write(one.part, "the user's own file");
+    fetch::discard(target, "/m.mkv");
+    CHECK_FALSE(std::filesystem::exists(one.record));
+    CHECK(read(one.part) == "the user's own file");
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("files at grab's partial names that aren't grab's are never touched") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-fetch-foreign";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto target = dir / "normal.bin";
+    const auto one = fetch::partial_files(target, 1);
+    // The user's two files: no record, and a "record" that isn't one.
+    write(one.part, "photos");
+    write(one.record, "{\"notes\": true}");
+    CHECK_FALSE(fetch::find_partial(target, "/normal.bin").has_value());
+    fetch::discard(target, "/normal.bin");
+    CHECK(read(one.part) == "photos");
+    CHECK(read(one.record) == "{\"notes\": true}");
+    // A new download takes the next free names.
+    auto free = fetch::free_partial(target);
+    REQUIRE(free.has_value());
+    CHECK(*free == fetch::partial_files(target, 2));
+    // A real record in slot 2 is found there, past the user's files.
+    const auto s = fetch::new_state("main", "/normal.bin", 10, "2025-01-01T00:00:00Z", 16 * MiB);
+    write(free->record, fetch::state_to_json(s));
+    const auto found = fetch::find_partial(target, "/normal.bin");
+    REQUIRE(found.has_value());
+    CHECK(found->files == fetch::partial_files(target, 2));
+    CHECK(*fetch::free_partial(target) == fetch::partial_files(target, 3));
+    // Only the data file there is enough to make a slot taken.
+    write(fetch::partial_files(target, 3).part, "x");
+    CHECK(*fetch::free_partial(target) == fetch::partial_files(target, 4));
+    // Every slot taken: none left.
+    for (int slot = 4; slot <= fetch::max_slot; ++slot) write(fetch::partial_files(target, slot).part, "x");
+    CHECK_FALSE(fetch::free_partial(target).has_value());
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("reserved names: a folder's own files are never taken or read as grab's") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-fetch-reserved";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto target = dir / "a.bin";
+    // The server folder holds "a.bin.grabpart.json", with a record naming a.bin in it.
+    const auto one = fetch::partial_files(target, 1);
+    const auto s = fetch::new_state("main", "/f/a.bin", 10, "2025-01-01T00:00:00Z", 16 * MiB);
+    write(one.record, fetch::state_to_json(s));
+    const fetch::Reserved reserved = [&](const std::filesystem::path& p) { return p == one.record; };
+    CHECK(fetch::find_partial(target, "/f/a.bin").has_value());
+    CHECK_FALSE(fetch::find_partial(target, "/f/a.bin", reserved).has_value());
+    fetch::discard(target, "/f/a.bin", reserved);
+    CHECK(std::filesystem::exists(one.record));
+    std::filesystem::remove(one.record);
+    CHECK(*fetch::free_partial(target, reserved) == fetch::partial_files(target, 2)); // even with nothing there
     std::filesystem::remove_all(dir);
 }
 

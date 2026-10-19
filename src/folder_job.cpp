@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <format>
+#include <memory>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -77,6 +78,12 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     // are also charged to the shared limiter, which slows grab's own streams to match.
     if (limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(limit)});
     extra.insert(extra.end(), job.extra.begin(), job.extra.end());
+    // What rclone leaves when stopped: its temp files next to these, made by this run.
+    std::vector<fs::path> targets;
+    targets.reserve(paths.size());
+    const auto dir = local_dir(job.dest, job.remote_path);
+    for (const auto& p : paths) targets.push_back(dir / local::relative(p));
+    const auto temp_before = engine::rclone_temp_files(targets);
     std::uint64_t charged = 0;
     auto result = engine::download(
         *job.ctx, Mode::folder, job.remote_path, job.dest,
@@ -121,9 +128,9 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
         });
     std::error_code ec;
     fs::remove(list, ec);
+    engine::remove_rclone_temp_files(targets, temp_before);
     job.connections->release(job.server, job.id, reserved);
 
-    const auto dir = local_dir(job.dest, job.remote_path);
     std::lock_guard lock(m);
     tree.batch_running = false;
     const bool finished = result && result->exit_code == 0;
@@ -161,6 +168,11 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
 void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& stop) {
     constexpr int at_once = 3;
     const auto dir = local_dir(job.dest, job.remote_path);
+    fetch::Reserved reserved;
+    {
+        std::lock_guard lock(m);
+        reserved = reserved_names(dir, tree);
+    }
     auto flags = engine::without_console_progress(job.ctx->settings.common_flags);
     flags.insert(flags.end(), job.extra.begin(), job.extra.end());
     auto worker = [&] {
@@ -188,6 +200,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             d.server = job.server;
             d.id = job.id;
             d.target = dir / local::relative(path);
+            d.reserved = reserved;
             d.joined = true;
             d.limiter = job.limiter;
             d.weight = job.weight;
@@ -230,7 +243,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                     break;
                 }
             }
-            if (discard) fetch::discard(d.target);
+            if (discard) fetch::discard(d.target, d.source.path, d.reserved);
             notify(job, Event::changed);
         }
     };
@@ -299,14 +312,24 @@ void resume_paused(Tree& tree) {
     }
 }
 
-std::optional<fs::path> skip_file(Tree& tree, const fs::path& dir, const std::string& path) {
-    std::optional<fs::path> discard;
+fetch::Reserved reserved_names(const fs::path& dir, const Tree& tree) {
+    auto names = std::make_shared<std::unordered_set<fs::path::string_type>>();
+    names->reserve(tree.files.size());
+    for (const auto& f : tree.files) names->insert(local::key(dir / local::relative(f.path)));
+    return [names](const fs::path& p) { return names->contains(local::key(p)); };
+}
+
+std::optional<Discard> skip_file(Tree& tree, const fs::path& dir, const std::string& remote_path, const std::string& path) {
+    std::optional<Discard> discard;
     for (auto& f : tree.files) {
         if (f.path != path) continue;
         if (f.status == State::queued || f.status == State::paused || f.status == State::failed) {
             if (f.status == State::queued && f.in_batch) tree.batch_stop.request_stop(); // rclone would still fetch it
             f.status = State::skipped;
-            if (f.big) discard = dir / local::relative(f.path);
+            if (f.big) {
+                discard = Discard{dir / local::relative(f.path), child_remote_path(remote_path, f.path),
+                                  reserved_names(dir, tree)};
+            }
         } else if (f.status == State::running && f.big) {
             f.stop_reason = StopReason::skip; // run_big discards its partial file
             f.stop.request_stop();
@@ -348,11 +371,13 @@ std::string child_remote_path(const std::string& folder, const std::string& rel)
     return folder.empty() || folder.ends_with('/') ? folder + rel : folder + "/" + rel;
 }
 
-void discard_partials(const fs::path& dir, const Tree& tree) {
+void discard_partials(const std::string& remote_path, const fs::path& dir, const Tree& tree) {
+    const auto reserved = reserved_names(dir, tree);
     for (const auto& f : tree.files) {
-        if (f.big && f.status != State::done) fetch::discard(dir / local::relative(f.path));
+        if (f.big && f.status != State::done) {
+            fetch::discard(dir / local::relative(f.path), child_remote_path(remote_path, f.path), reserved);
+        }
     }
-    engine::remove_partials(dir, Mode::folder); // rclone's own .partial files
 }
 
 std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
@@ -397,24 +422,26 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m) {
         bool big;
     };
     std::vector<Candidate> queued;
+    const auto dir = local_dir(job.dest, job.remote_path);
+    fetch::Reserved reserved;
     {
         std::lock_guard lock(m);
         for (std::size_t i = 0; i < tree.files.size(); ++i) {
             const auto& f = tree.files[i];
             if (f.status == State::queued) queued.push_back({i, f.path, f.size, f.modtime, f.big});
         }
+        reserved = reserved_names(dir, tree);
     }
     // Looked at on disk without the lock: a big folder means many file system calls.
-    const auto dir = local_dir(job.dest, job.remote_path);
     std::vector<std::pair<std::size_t, std::optional<std::uint64_t>>> found; // done (nullopt) or partial bytes
     for (const auto& c : queued) {
         const auto local = dir / local::relative(c.path);
-        std::error_code ec;
-        const bool partial = c.big && fs::exists(fetch::state_path(local), ec);
-        if (!partial && fetch::up_to_date(local, c.size, c.modtime)) {
+        const auto partial = c.big ? fetch::saved_progress(local, child_remote_path(job.remote_path, c.path), reserved)
+                                   : std::nullopt;
+        if (partial) {
+            found.emplace_back(c.index, partial->first);
+        } else if (fetch::up_to_date(local, c.size, c.modtime)) {
             found.emplace_back(c.index, std::nullopt);
-        } else if (partial) {
-            if (auto p = fetch::saved_progress(local)) found.emplace_back(c.index, p->first);
         }
     }
     {

@@ -71,8 +71,8 @@ std::optional<std::uint64_t> free_bytes(const fs::path& path) {
     return free;
 }
 
-std::uint64_t still_needed(const fs::path& target, std::uint64_t size) {
-    if (const auto partial = fetch::saved_progress(target); partial && partial->second == size) {
+std::uint64_t still_needed(const fs::path& target, std::string_view remote_path, std::uint64_t size) {
+    if (const auto partial = fetch::saved_progress(target, remote_path); partial && partial->second == size) {
         return size > partial->first ? size - partial->first : 0;
     }
     std::error_code ec;

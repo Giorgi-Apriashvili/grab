@@ -253,6 +253,11 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
   streams at once, into `<name>.grabpart`. It records each range's progress in
   `<name>.grabpart.json` and renames the file when it is complete.
   - Pausing keeps both; resuming continues from the last saved bytes.
+  - grab reuses or deletes only partial files it made: their `.json` record names the server
+    file. When something else already has those names (your own files, or files of the folder
+    being downloaded), it uses `<name>.2.grabpart` and so on, and leaves them alone. Cancelling
+    deletes only grab's partial files, and of rclone's temporary `.partial` files only the ones
+    its stopped copy had just made.
   - This survives closing grab: unfinished downloads come back paused (the list is kept in
     `%APPDATA%\grab\queue.json`).
   - If the file changed on the server in the meantime, it starts over.

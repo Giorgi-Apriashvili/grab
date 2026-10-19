@@ -28,6 +28,9 @@ namespace grab::local {
 // properly, so grab fetches it itself.
 [[nodiscard]] bool has_device(std::string_view remote_rel);
 
+// A local path as Windows compares names (ignoring case), for sets of paths.
+[[nodiscard]] std::filesystem::path::string_type key(const std::filesystem::path& p);
+
 // A relative remote path (a/b/c) as a local one, each part through name(); empty parts dropped.
 // Every part is a plain name (no separator, drive, "." or ".."), so `dest / relative(x)` stays
 // below dest for any x.

@@ -283,7 +283,7 @@ struct Session {
 int fetch_file(const Session& s, const std::string& path, int id) {
     const auto target = s.dest / local::relative(remote_basename(path));
     std::uint64_t before = 0; // fetched by an earlier run
-    if (auto p = fetch::saved_progress(target)) before = p->first;
+    if (auto p = fetch::saved_progress(target, path)) before = p->first;
 
     fetch::Download d;
     d.source = fetch::Source{s.ctx.config.rclone, s.ctx.config.rclone_config, s.ctx.settings.rclone_remote, path, s.flags};
@@ -341,7 +341,7 @@ int fetch_file(const Session& s, const std::string& path, int id) {
         return 0;
     }
     case fetch::Outcome::stopped: {
-        const auto p = fetch::saved_progress(target);
+        const auto p = fetch::saved_progress(target, path);
         s.line.finish(p && p->second > 0
                           ? std::format("stopped at {}%; run the same command again to continue", p->first * 100 / p->second)
                           : "stopped");
@@ -352,7 +352,7 @@ int fetch_file(const Session& s, const std::string& path, int id) {
     }
     s.line.clear();
     std::println(stderr, "grab: error: {}", result.error);
-    if (fetch::saved_progress(target)) {
+    if (fetch::saved_progress(target, path)) {
         std::println(stderr, "grab: what was fetched is kept; run the same command again to continue");
     }
     return exit_download_failed;
@@ -543,7 +543,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         std::uint64_t needed = 0;
         for (const auto& path : paths) {
             if (const auto it = sizes.find(path); it != sizes.end()) {
-                needed += space::still_needed(dest / local::relative(remote_basename(path)), it->second);
+                needed += space::still_needed(dest / local::relative(remote_basename(path)), path, it->second);
             }
         }
         if (const auto free = space::free_bytes(dest); free && needed > *free) {

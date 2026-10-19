@@ -44,6 +44,9 @@ namespace grab::util {
 // Writes `text` to `p` through a sibling file and a rename, so a crash never leaves it half
 // written. Creates the parent folder.
 bool write_file_atomic(const std::filesystem::path& p, std::string_view text);
+// Writes `text` to a new file `p`; false when anything exists at `p` already (it is left alone)
+// or the write fails (the new file is removed again).
+bool write_new_file(const std::filesystem::path& p, std::string_view text);
 
 // One field of a tab-separated line: backslashes, tabs and line breaks escaped (\\ \t \n \r),
 // and back; nullopt for a stray or unknown escape.

@@ -74,8 +74,19 @@ struct Totals {
 void pause_file(Tree& tree, const std::string& path);
 void resume_file(Tree& tree, const std::string& path);
 void resume_paused(Tree& tree); // every paused file
-// Returns the file whose partial download to delete (fetch::discard) after unlocking, if any.
-std::optional<std::filesystem::path> skip_file(Tree& tree, const std::filesystem::path& dir, const std::string& path);
+// A big file's partial download to delete once the caller's mutex is released: fetch::discard
+// with these.
+struct Discard {
+    std::filesystem::path target;
+    std::string remote_path;
+    fetch::Reserved reserved;
+};
+// Where the folder's files land (dir: its local directory), which no partial download may take.
+// Under the caller's mutex.
+[[nodiscard]] fetch::Reserved reserved_names(const std::filesystem::path& dir, const Tree& tree);
+// `remote_path`: the folder's. Returns the partial download to delete after unlocking, if any.
+std::optional<Discard> skip_file(Tree& tree, const std::filesystem::path& dir, const std::string& remote_path,
+                                 const std::string& path);
 // Failed files are queued again; with `all_unfinished` (after a cancel) every file not done or
 // skipped.
 void retry_files(Tree& tree, bool all_unfinished);
@@ -92,9 +103,10 @@ struct Outcome {
 [[nodiscard]] std::filesystem::path local_dir(const std::filesystem::path& dest, const std::string& remote_path);
 [[nodiscard]] std::string child_remote_path(const std::string& folder, const std::string& rel);
 
-// Deletes what a cancelled folder leaves behind: its big files' partial downloads and rclone's
-// .partial files. Finished files stay.
-void discard_partials(const std::filesystem::path& dir, const Tree& tree);
+// Deletes what a cancelled folder (`remote_path`) leaves behind: its big files' partial
+// downloads, grab's by their records. Finished files stay; rclone's temp files went when its
+// batch stopped.
+void discard_partials(const std::string& remote_path, const std::filesystem::path& dir, const Tree& tree);
 
 enum class Event {
     progress,   // bytes moved; frequent, so throttle what it triggers

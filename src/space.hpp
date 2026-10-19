@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace grab::space {
 
@@ -21,9 +22,10 @@ namespace grab::space {
 // it, to try a full drive.
 [[nodiscard]] std::optional<std::uint64_t> free_bytes(const std::filesystem::path& path);
 
-// What fetching a file of `size` into `target` still writes: nothing when a copy of that size is
-// there, the rest of a partial download of it, else all of it.
-[[nodiscard]] std::uint64_t still_needed(const std::filesystem::path& target, std::uint64_t size);
+// What fetching the server file `remote_path` (`size` bytes) into `target` still writes: nothing
+// when a copy of that size is there, the rest of grab's partial download of it, else all of it.
+[[nodiscard]] std::uint64_t still_needed(const std::filesystem::path& target, std::string_view remote_path,
+                                         std::uint64_t size);
 
 // Whether `needed`, with what downloads already on the drive still need (`queued`), fits in
 // `free`.

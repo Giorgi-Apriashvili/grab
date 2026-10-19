@@ -1686,7 +1686,7 @@ App::Needed App::needed_for(const Value& groups, const std::filesystem::path& de
                     need.partial = true;
                     continue;
                 }
-                need.bytes += space::still_needed(file_target(dest, *path), static_cast<std::uint64_t>(size->number));
+                need.bytes += space::still_needed(file_target(dest, *path), *path, static_cast<std::uint64_t>(size->number));
                 continue;
             }
             if (!view) {
@@ -1712,7 +1712,7 @@ App::Needed App::needed_for(const Value& groups, const std::filesystem::path& de
                 std::string_view rel = e->path;
                 rel.remove_prefix(std::min(rel.size(), path->size()));
                 while (rel.starts_with('/')) rel.remove_prefix(1);
-                need.bytes += space::still_needed(folder_dir / local::relative(rel), size);
+                need.bytes += space::still_needed(folder_dir / local::relative(rel), e->path, size);
             }
         }
     }
@@ -1754,7 +1754,7 @@ void App::resume_items(int id) {
 }
 
 void App::cancel_items(int id) {
-    std::vector<std::filesystem::path> discard; // partial files of downloads not running now
+    std::vector<std::pair<std::filesystem::path, std::string>> discard; // partial downloads not running now
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
@@ -1763,7 +1763,7 @@ void App::cancel_items(int id) {
                 item->status = Status::cancelled;
                 item->speed = 0;
                 item->eta.reset();
-                if (item->mode == Mode::file) discard.push_back(file_target(item->dest, item->path));
+                if (item->mode == Mode::file) discard.emplace_back(file_target(item->dest, item->path), item->path);
                 else discard_folder_partials(*item); // finished files stay
             } else if (item->status == Status::running) {
                 item->stop_reason = StopReason::cancel;
@@ -1771,7 +1771,7 @@ void App::cancel_items(int id) {
             }
         }
     }
-    for (const auto& target : discard) fetch::discard(target);
+    for (const auto& [target, path] : discard) fetch::discard(target, path);
     save_queue();
     post_queue();
 }
@@ -1788,7 +1788,7 @@ void App::retry_item(int id) {
                 item->error.clear();
                 if (item->mode == Mode::folder) {
                     folder::retry_files(item->tree, cancelled); // after a cancel, everything not finished
-                } else if (!fetch::saved_progress(file_target(item->dest, item->path))) {
+                } else if (!fetch::saved_progress(file_target(item->dest, item->path), item->path)) {
                     item->bytes = 0;
                 }
                 item->speed = 0;
@@ -1833,16 +1833,16 @@ void App::resume_child(int id, const std::string& path) {
 }
 
 void App::skip_child(int id, const std::string& path) {
-    std::optional<std::filesystem::path> discard;
+    std::optional<folder::Discard> discard;
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id) continue;
-            discard = folder::skip_file(item->tree, folder::local_dir(item->dest, item->path), path);
+            discard = folder::skip_file(item->tree, folder::local_dir(item->dest, item->path), item->path, path);
             folder_totals(*item);
         }
     }
-    if (discard) fetch::discard(*discard);
+    if (discard) fetch::discard(discard->target, discard->remote_path, discard->reserved);
     save_queue();
     post_queue();
 }
@@ -2108,7 +2108,7 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     item->connections = 0;
     item->current.clear();
     if (item->status == Status::cancelled && item->mode == Mode::file) {
-        fetch::discard(file_target(item->dest, item->path));
+        fetch::discard(file_target(item->dest, item->path), item->path);
     }
 }
 
@@ -2238,7 +2238,7 @@ void App::folder_totals(Item& item) const {
 }
 
 void App::discard_folder_partials(const Item& item) const {
-    folder::discard_partials(folder::local_dir(item.dest, item.path), item.tree);
+    folder::discard_partials(item.path, folder::local_dir(item.dest, item.path), item.tree);
 }
 
 void App::folder_event(Item& item, folder::Event e) {
@@ -2455,7 +2455,7 @@ void App::restore_queue() {
         item->status = saved.resume ? Status::queued : Status::paused;
         item->weight = weight_of(saved.priority);
         if (item->mode == Mode::file) {
-            if (auto p = fetch::saved_progress(file_target(item->dest, item->path))) {
+            if (auto p = fetch::saved_progress(file_target(item->dest, item->path), item->path)) {
                 item->bytes = p->first;
                 item->total = p->second;
             }
@@ -2471,7 +2471,10 @@ void App::restore_queue() {
                 c.verified = f.verified;
                 if (c.status == folder::State::done) c.bytes = c.size;
                 else if (c.big) {
-                    if (auto p = fetch::saved_progress(dir / local::relative(c.path))) c.bytes = p->first;
+                    if (auto p = fetch::saved_progress(dir / local::relative(c.path),
+                                                       folder::child_remote_path(item->path, c.path))) {
+                        c.bytes = p->first;
+                    }
                 }
                 item->tree.files.push_back(std::move(c));
             }

@@ -7,6 +7,10 @@
 #include <format>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
+#endif
+
 namespace grab::local {
 
 namespace {
@@ -168,6 +172,23 @@ bool has_device(std::string_view remote_rel) {
         remote_rel.remove_prefix(slash + 1);
     }
     return false;
+}
+
+std::filesystem::path::string_type key(const std::filesystem::path& p) {
+    auto s = p.native();
+#ifdef _WIN32
+    // As NTFS does: upper case, the same in every locale.
+    if (!s.empty()) {
+        std::wstring up(s.size(), L'\0');
+        const int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, s.data(), static_cast<int>(s.size()),
+                                    up.data(), static_cast<int>(up.size()), nullptr, nullptr, 0);
+        if (n > 0) {
+            up.resize(static_cast<std::size_t>(n));
+            return up;
+        }
+    }
+#endif
+    return s;
 }
 
 std::filesystem::path relative(std::string_view remote_rel) {

@@ -67,12 +67,12 @@ TEST_CASE("what a file still needs on disk") {
     std::filesystem::remove_all(base);
     std::filesystem::create_directories(base);
     const auto target = base / "a.mkv";
-    CHECK(space::still_needed(target, 100) == 100); // nothing there
+    CHECK(space::still_needed(target, "/a.mkv", 100) == 100); // nothing there
     {
         std::ofstream out(target, std::ios::binary);
         out << std::string(100, 'x');
     }
-    CHECK(space::still_needed(target, 100) == 0);   // a complete copy
-    CHECK(space::still_needed(target, 500) == 500); // another file of that name: fetched again
+    CHECK(space::still_needed(target, "/a.mkv", 100) == 0);   // a complete copy
+    CHECK(space::still_needed(target, "/a.mkv", 500) == 500); // another file of that name: fetched again
     std::filesystem::remove_all(base);
 }
