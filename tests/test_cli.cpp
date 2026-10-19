@@ -106,6 +106,16 @@ TEST_CASE("--limit takes a speed like rclone's --bwlimit") {
     CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value()); // the speed schedule decides
 }
 
+TEST_CASE("--existing answers the question before it is asked") {
+    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.existing.has_value());
+    CHECK(parse_args(args({"movie.mkv", "--existing", "replace"}))->opts.existing == existing::Choice::replace);
+    CHECK(parse_args(args({"movie.mkv", "--existing", "both"}))->opts.existing == existing::Choice::keep_both);
+    CHECK(parse_args(args({"movie.mkv", "--existing", "skip"}))->opts.existing == existing::Choice::skip);
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--existing", "ask"})).has_value());
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--existing", "keep"})).has_value());
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--existing"})).has_value());
+}
+
 TEST_CASE("--verify and --no-verify override the window's setting for one run") {
     CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.verify.has_value());
     CHECK(parse_args(args({"movie.mkv", "--verify"}))->opts.verify == true);

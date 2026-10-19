@@ -237,6 +237,14 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     `\\host\share\x`). `\ : * ? " < > |` become look-alikes (`＼ ： ＊ ？ ＂ ＜ ＞ ｜`), control
     characters `␀`–`␟`, a trailing space or dot `␠` or `．`. Windows device names get an
     underscore: `CON_`, `nul_.txt`.
+  - **A different file already there is never replaced without asking.** When a file of the
+    download is already in the Save-to folder with another size, or older than the server's,
+    grab asks first, listing yours and the server's: **Replace**, **Keep both** (the new one is
+    saved as "name (2).ext", as Explorer does) or **Skip** (yours stays; that file isn't
+    downloaded). One answer covers the whole download. Files, and folders the file list holds,
+    are asked about before anything is queued; a deeper folder asks once it's listed and waits
+    paused, and Resume shows the question. A copy that matches the server's is no question: it
+    isn't fetched again.
 
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
@@ -478,6 +486,10 @@ grab config [-c PATH]
       --fresh          fetch the server's file list now instead of using a saved one
       --verify         check each download against the server's checksum (MD5) afterwards;
       --no-verify      don't. Without either, the setting in grab's window applies (off at first)
+      --existing WHAT  a different file already where a download goes (another size, or
+                       older than the server's): replace it, both (keep yours and save the
+                       new one as "name (2).ext") or skip it. Without it grab asks first, or
+                       stops when there is no console to ask on
       --rclone         download with plain rclone copyto / copy and rclone's own progress
   -n, --dry-run        resolve the target and show what would be fetched (with --rclone: the
                        rclone command); transfers nothing and creates no folders
@@ -534,6 +546,12 @@ grab config [-c PATH]
     fetched again (`already there, nothing fetched`); in a folder, the same goes per file.
   - Server names become safe Windows names, as in the window (see [GUI](#gui)): nothing lands
     outside DEST.
+  - A different file already in DEST (another size, or older than the server's) is never
+    replaced without asking. grab lists them, yours and the server's, and asks once:
+    `[r]eplace, [k]eep both, [s]kip, [q]uit` (Keep both saves `name (2).ext`). Picked files are
+    asked about together before fetching any, a folder once it's listed. `--existing replace`,
+    `both` or `skip` answers in advance; without a console to ask on, grab stops with exit code
+    `6` and replaces nothing unless `--existing` is given.
   - `--limit` caps all connections together, exactly.
   - `--verify` (or the window's Verify downloads setting) checks each download against the
     server's MD5 afterwards: `checksum verified (MD5) in 0:03`. A copy that differs is deleted
@@ -547,7 +565,10 @@ grab config [-c PATH]
 - `--rclone` downloads with plain `rclone copyto` / `rclone copy` instead, with rclone's own
   progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`, and the
   speed schedule a weekly `--bwlimit` timetable ("Mon-18:00,5120K Tue-00:00,off ..."). With
-  `--verify`, rclone compares checksums after each transfer itself.
+  `--verify`, rclone compares checksums after each transfer itself. grab looks first and asks
+  the same question before rclone would replace a file (another size, or a different time); a
+  folder offers Replace or Skip, since rclone copies it under the server's names, and Skip runs
+  rclone with `--ignore-existing`.
 - Anything after `--` is added to every rclone call grab makes. For speed, use `--limit`
   rather than `-- --bwlimit`, which rclone would apply to each connection separately.
 
@@ -649,6 +670,7 @@ src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
 src/verify.*    checking downloads against the server's checksum (rclone check)
 src/local_name.* server names as safe Windows names (rclone's encoding, device names)
+src/existing.*  a different file already there: replace, keep both ("name (2).ext") or skip
 src/browse.*    browse mode: a server's folders from its file list, deeper ones live
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone

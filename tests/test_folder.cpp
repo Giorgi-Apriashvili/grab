@@ -77,7 +77,8 @@ TEST_CASE("a folder's files survive a restart in queue.json") {
                      {"f.mp4", 60, "", "done"},                                         // was there already
                      {"b.mp4", 200, "", "paused"},
                      {"sub/c.mp4", 300, "", "skipped"},
-                     {"d.mp4", 400, "", "queued"}}};
+                     {"d.mp4", 400, "", "queued"},
+                     {"g.mp4", 500, "", "queued", false, false, "g (2).mp4"}}}; // a second copy
     const auto back = parse_queue(queue_to_json({d}));
     REQUIRE(back.size() == 1);
     CHECK(back[0] == d);

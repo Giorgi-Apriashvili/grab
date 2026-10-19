@@ -194,6 +194,8 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
         if (auto p = v.string_of("priority"); p == "high" || p == "low") d.priority = *p;
         if (const auto* r = v.find("resume"); r != nullptr && r->kind == json::Value::Kind::boolean) d.resume = r->boolean;
         if (const auto* o = v.find("spaceOk"); o != nullptr && o->kind == json::Value::Kind::boolean) d.space_ok = o->boolean;
+        if (auto e = v.string_of("existing"); e == "replace" || e == "both" || e == "skip") d.existing = *e;
+        d.local_name = v.string_of("localName").value_or("");
         if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
             d.total = static_cast<std::uint64_t>(t->number);
         }
@@ -213,6 +215,7 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
                     const auto* b = f.find(key);
                     *flag = b != nullptr && b->kind == json::Value::Kind::boolean && b->boolean;
                 }
+                sf.local = f.string_of("local").value_or("");
                 d.files.push_back(std::move(sf));
             }
         }
@@ -235,6 +238,8 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         v.set("priority", Value::make_string(d.priority));
         if (d.resume) v.set("resume", Value::make_bool(true));
         if (d.space_ok) v.set("spaceOk", Value::make_bool(true));
+        if (!d.existing.empty()) v.set("existing", Value::make_string(d.existing));
+        if (!d.local_name.empty()) v.set("localName", Value::make_string(d.local_name));
         if (!d.files.empty()) {
             Value files = Value::make_array();
             for (const auto& f : d.files) {
@@ -245,6 +250,7 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
                 fv.set("state", Value::make_string(f.state));
                 if (f.fetched) fv.set("fetched", Value::make_bool(true));
                 if (f.verified) fv.set("verified", Value::make_bool(true));
+                if (!f.local.empty()) fv.set("local", Value::make_string(f.local));
                 files.push(std::move(fv));
             }
             v.set("files", std::move(files));

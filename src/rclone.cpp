@@ -21,6 +21,7 @@ std::string remote_spec(std::string_view rclone_remote, std::string_view remote_
 
 std::filesystem::path local_target(const RcloneRequest& req) {
     // The server's name as a safe Windows one (local_name.hpp): it can't leave dest_dir.
+    if (req.local_name) return req.dest_dir / req.local_name->filename();
     return req.dest_dir / local::relative(remote_basename(req.remote_path));
 }
 

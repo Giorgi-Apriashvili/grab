@@ -21,6 +21,7 @@ struct RcloneRequest {
     std::span<const std::string> common_flags;
     std::span<const std::string> mode_flags;
     std::span<const std::string> extra;
+    std::optional<std::filesystem::path> local_name; // a file's name instead of the server's (Keep both)
 };
 
 // Last path component, ignoring trailing slashes.

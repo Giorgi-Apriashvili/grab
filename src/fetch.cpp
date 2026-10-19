@@ -534,12 +534,24 @@ Result run(const Download& d, Connections& connections, const std::function<void
     if (remote->is_dir) return failed("this is a folder on the server; download it as a folder");
 
     Result result;
+    result.size = remote->size;
+    result.modtime = remote->modtime;
     std::error_code ec;
     auto own = find_partial(d.target, src.path, d.reserved);
     if (!own && up_to_date(d.target, remote->size, remote->modtime)) {
         if (on_progress) on_progress(Progress{remote->size, remote->size, 0, std::nullopt, 0});
         result.outcome = Outcome::done;
         result.present = true;
+        return result;
+    }
+    // A different file there stays unless the user chose to replace it.
+    auto blocked = [&] {
+        std::error_code e;
+        return !d.replace && fs::is_regular_file(d.target, e) && !up_to_date(d.target, remote->size, remote->modtime);
+    };
+    if (blocked()) {
+        result.outcome = Outcome::exists;
+        result.error = "a different file is already at " + util::path_to_utf8(d.target);
         return result;
     }
     const bool reuse = own && own->state.rclone_remote == src.rclone_remote && own->state.size == remote->size &&
@@ -771,6 +783,11 @@ Result run(const Download& d, Connections& connections, const std::function<void
     file.close();
     if (fs::file_size(part, ec) != state.size || ec) {
         return Result{Outcome::failed, "the downloaded file has the wrong size", result.note};
+    }
+    if (blocked()) { // one appeared meanwhile: the complete download waits for the user's answer
+        result.outcome = Outcome::exists;
+        result.error = "a different file is already at " + util::path_to_utf8(d.target);
+        return result;
     }
     fs::rename(part, d.target, ec); // replaces an older copy, as rclone copyto did
     if (ec) return Result{Outcome::failed, std::format("cannot rename to {}: {}", util::path_to_utf8(d.target), ec.message()), result.note};

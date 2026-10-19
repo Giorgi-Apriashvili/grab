@@ -127,7 +127,8 @@ std::expected<void, std::string> compare_sums(const Request& r, std::span<const 
             continue;
         }
         hashed = true;
-        const auto copy = r.local_dir / local::relative(p);
+        const auto renamed = r.renamed.find(p);
+        const auto copy = r.local_dir / (renamed != r.renamed.end() ? renamed->second : local::relative(p));
         if (!fs::is_regular_file(copy, ec)) {
             report.differ.push_back(p);
             continue;
@@ -248,7 +249,7 @@ std::expected<Report, std::string> run(const Request& r, std::stop_token stop) {
 
     std::vector<std::string> plain;
     std::vector<std::string> devices;
-    for (const auto& p : r.paths) (local::has_device(p) ? devices : plain).push_back(p);
+    for (const auto& p : r.paths) (local::has_device(p) || r.renamed.contains(p) ? devices : plain).push_back(p);
     Report report;
     if (!plain.empty()) {
         auto checked = check_names(r, plain, held, stop);
@@ -270,9 +271,9 @@ std::expected<Report, std::string> run(const Request& r, std::stop_token stop) {
 
 std::expected<Report, std::string> file(Request base, const std::string& remote_path, const fs::path& target,
                                         std::stop_token stop) {
-    // rclone check pairs files by name, so the copy must carry the server's.
+    // rclone check pairs files by name: a copy under another name is compared by its sum.
     const std::string name = remote_basename(remote_path);
-    if (local::relative(name) != target.filename()) return util::fail("the copy has another name than the server's file");
+    if (local::relative(name) != target.filename()) base.renamed[name] = target.filename();
     base.remote_dir = parent_of(remote_path);
     base.local_dir = target.parent_path();
     base.paths = {name};

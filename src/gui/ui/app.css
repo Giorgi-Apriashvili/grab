@@ -706,6 +706,11 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
 }
 .modal p { margin: 0 0 10px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.existing { width: 100%; border-collapse: collapse; margin: 4px 0 8px; }
+.existing th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 8px; }
+.existing td { padding: 5px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+.existing td:first-child { word-break: break-all; }
+.existing td:not(:first-child) { white-space: nowrap; }
 .fingerprints { width: 100%; border-collapse: collapse; margin: 4px 0 12px; }
 .fingerprints td { padding: 5px 8px; border-top: 1px solid var(--line); vertical-align: top; }
 .fingerprints td:first-child { width: 80px; color: var(--muted); white-space: nowrap; }

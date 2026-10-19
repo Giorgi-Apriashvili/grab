@@ -44,6 +44,9 @@ struct Request {
     std::string remote_dir;           // the server folder the paths are relative to
     std::filesystem::path local_dir;  // the local copy of that folder
     std::vector<std::string> paths;   // relative, '/'-separated
+    // Copies under another name than the server's (Keep both): path -> local path relative to
+    // local_dir. Compared by their sums, like device names.
+    std::unordered_map<std::string, std::filesystem::path> renamed;
     std::vector<std::string> extra;   // added to the rclone call (`grab ... -- extra`)
     // The connections the check takes from the server's pool: one for a file, up to the
     // download's share for a folder.
@@ -68,8 +71,8 @@ struct Report {
 // Runs the check. An error means it could not run at all (the server unreachable, say); a
 // stop returns an error too.
 [[nodiscard]] std::expected<Report, std::string> run(const Request& r, std::stop_token stop);
-// One downloaded file, `target` being the local copy of `remote_path` (under the same name);
-// `base` gives the context, the pool and the hooks.
+// One downloaded file, `target` being the local copy of `remote_path` (under the server's name,
+// or another); `base` gives the context, the pool and the hooks.
 [[nodiscard]] std::expected<Report, std::string> file(Request base, const std::string& remote_path,
                                                       const std::filesystem::path& target, std::stop_token stop);
 

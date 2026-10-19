@@ -44,6 +44,7 @@ add_library(grab_core STATIC
     src/json.cpp
     src/update.cpp
     src/engine.cpp
+    src/existing.cpp
     src/gui_state.cpp
     src/servers.cpp
     src/server_ops.cpp

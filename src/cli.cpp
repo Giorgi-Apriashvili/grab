@@ -57,6 +57,10 @@ Options:
       --fresh          fetch the server's file list now instead of using a saved one
       --verify         check each download against the server's checksum (MD5) afterwards;
       --no-verify      don't. Without either, the setting in grab's window applies (off at first)
+      --existing WHAT  a different file already where a download goes (another size, or
+                       older than the server's): replace it, both (keep yours and save the
+                       new one as "name (2).ext") or skip it. Without it grab asks first, or
+                       stops when there is no console to ask on
       --rclone         download with plain rclone copyto / copy and rclone's own progress
                        instead of grab's resumable download over several connections
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
@@ -165,6 +169,14 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             result.opts.limit = *bytes;
         } else if (name == "--verify" || name == "--no-verify") {
             result.opts.verify = name == "--verify";
+        } else if (name == "--existing") {
+            auto v = take_value();
+            if (!v) return util::fail(v.error());
+            const auto choice = existing::parse(*v);
+            if (!choice || *choice == existing::Choice::ask) {
+                return util::failf("--existing takes replace, both or skip; got '{}'", *v);
+            }
+            result.opts.existing = *choice;
         } else if (name == "--first") {
             result.opts.first = true;
         } else if (name == "--all") {

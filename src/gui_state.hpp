@@ -79,6 +79,7 @@ struct SavedFile {
     std::string state = "queued"; // "queued" | "paused" | "done" | "skipped"
     bool fetched = false;  // done by the download, not found on disk already
     bool verified = false; // checked against the server's checksum
+    std::string local = {}; // Keep both: its second-copy name, relative to the folder
     bool operator==(const SavedFile&) const = default;
 };
 
@@ -97,6 +98,9 @@ struct SavedDownload {
     bool resume = false;
     // The free-space check is done: "Download anyway" was chosen, or Resume after it paused it.
     bool space_ok = false;
+    // A different file already there: "replace" | "both" | "skip", "" not answered (existing.hpp).
+    std::string existing = {};
+    std::string local_name = {}; // a file's Keep-both name
     bool operator==(const SavedDownload&) const = default;
 };
 

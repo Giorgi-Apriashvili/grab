@@ -2,6 +2,7 @@
 
 #include "browse.hpp"
 #include "cli.hpp"
+#include "existing.hpp"
 #include "fetch.hpp"
 #include "file_list.hpp"
 #include "folder_job.hpp"
@@ -155,6 +156,14 @@ private:
     enum class Status { queued, running, paused, done, failed, cancelled, skipped };
     // Why a running download is being stopped.
     enum class StopReason { none, pause, cancel };
+    // A file already there that a download would replace, for the question.
+    struct Asked {
+        std::string name; // as shown: the file's name, or its path in the folder
+        std::uint64_t size = 0;
+        std::optional<std::int64_t> modified; // the server's, Unix seconds
+        existing::Local mine;
+    };
+
     struct Item {
         int id = 0;
         std::string remote;
@@ -186,6 +195,13 @@ private:
         // The free-space check is done: "Download anyway" was chosen, or Resume after the check
         // paused it (a folder too big for the drive once listed).
         bool space_ok = false;
+        // A different file already at a target: what to do. Answered before queuing, or when a
+        // folder was listed; ask = not answered (it then waits paused with the question).
+        existing::Choice existing = existing::Choice::ask;
+        std::filesystem::path local_name; // a file's Keep-both name, instead of the server's
+        // Waiting for that answer: some of the files concerned, and how many there are.
+        std::vector<Asked> asked;
+        std::size_t asked_count = 0;
         folder::Tree tree; // folders: their files once listed (under mutex_)
     };
 
@@ -257,6 +273,16 @@ private:
         bool partial = false;
     };
     [[nodiscard]] Needed needed_for(const json::Value& groups, const std::filesystem::path& dest);
+    // The files of the selection that would replace a different file in `dest` (folders as their
+    // server's saved list holds them): up to `shown` of them, and how many in all.
+    std::vector<Asked> conflicts_for(const json::Value& groups, const std::filesystem::path& dest, std::size_t shown,
+                                     std::size_t& count);
+    // The answer for a download waiting with the question: it goes on.
+    void resolve_existing(int id, existing::Choice choice);
+    // The question's files for the page: {count, files: [{name, size, modified, mineSize, mineModified}]}.
+    [[nodiscard]] static json::Value asked_json(const std::vector<Asked>& asked, std::size_t count);
+    // Where a file download lands: its server name made safe, or its Keep-both name.
+    [[nodiscard]] static std::filesystem::path item_target(const Item& item);
     // Queue actions; `id` 0 means every item the action applies to.
     void pause_items(int id);
     void resume_items(int id);

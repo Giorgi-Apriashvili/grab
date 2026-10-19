@@ -10,6 +10,7 @@
 // files and act on single ones (pause, resume, skip) while the download runs.
 
 #include "engine.hpp"
+#include "existing.hpp"
 #include "fetch.hpp"
 #include "folder.hpp"
 #include "rate.hpp"
@@ -47,6 +48,8 @@ struct File {
     bool in_batch = false; // in the running batch: queued until rclone starts it, then running
     bool fetched = false;  // done by this download, not found on disk already
     bool verified = false; // checked against the server's checksum (verify_files)
+    // Keep both: where it goes instead, relative to the folder ("e01 (2).mkv"); fetched by grab.
+    std::filesystem::path local = {};
 };
 [[nodiscard]] File make_file(std::string path, std::uint64_t size, std::string modtime);
 
@@ -99,6 +102,10 @@ struct Outcome {
 };
 [[nodiscard]] Outcome outcome(const Tree& tree);
 
+// Where a file of the folder goes (dir: the folder's local directory): its server name made
+// safe, or its Keep-both name.
+[[nodiscard]] std::filesystem::path target_of(const std::filesystem::path& dir, const File& f);
+
 // The folder's own local directory: DEST\<folder name>, as rclone copy names it.
 [[nodiscard]] std::filesystem::path local_dir(const std::filesystem::path& dest, const std::string& remote_path);
 [[nodiscard]] std::string child_remote_path(const std::string& folder, const std::string& rel);
@@ -123,6 +130,9 @@ struct Job {
     const std::atomic<int>* weight = nullptr; // bandwidth priority; nullptr = normal
     std::string remote_path;
     std::filesystem::path dest; // DEST: files land in DEST\<folder name>\...
+    // Replace: different files already there may be replaced. Otherwise none is: conflicts were
+    // answered before run() (skipped, or a second copy), and one that appears meanwhile fails.
+    existing::Choice existing = existing::Choice::ask;
     // The small-file batch's share of the speed limit in bytes per second (0: none), asked
     // when a batch starts, without the mutex held.
     std::function<std::uint64_t()> batch_limit;
@@ -137,6 +147,19 @@ struct Job {
 // Marks queued files already complete on disk (fetch::up_to_date) as done; big ones with a
 // partial download get its progress.
 void mark_existing(const Job& job, Tree& tree, std::mutex& m);
+
+// A queued file whose place holds a different file (another size, or older than the server's).
+struct Conflict {
+    std::string path;            // relative to the folder
+    std::filesystem::path local; // the file there
+    std::uint64_t size = 0;      // the server's
+    std::string modtime;
+};
+// After mark_existing: the queued files that would replace a different file.
+[[nodiscard]] std::vector<Conflict> conflicts(const Job& job, Tree& tree, std::mutex& m);
+// The answer, under the caller's mutex: Skip leaves those files out, Keep both gives each a
+// second-copy name (fetched by grab itself: rclone can't rename), Replace changes nothing.
+void apply(existing::Choice choice, const std::vector<Conflict>& found, const std::filesystem::path& dir, Tree& tree);
 // Fetches the queued files until none is left or `stop`. Files still running at a stop are
 // queued again, ready for the next run.
 void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop);

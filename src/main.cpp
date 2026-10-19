@@ -5,7 +5,10 @@
 #include "cli_download.hpp"
 #include "config.hpp"
 #include "engine.hpp"
+#include "existing.hpp"
+#include "fetch.hpp"
 #include "file_list.hpp"
+#include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "local_name.hpp"
@@ -210,9 +213,91 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
 
     DownloadTally tally;
     const std::size_t total = paths.size();
+    // Different files already where rclone would write (another size, or a time off): asked first,
+    // all of them at once. Skip leaves them (--ignore-existing, which also keeps anything that
+    // appears meanwhile); a file can be kept beside the new one, a folder can't (rclone copies it
+    // under the server's names).
+    existing::Choice choice = opts.existing.value_or(existing::Choice::ask);
+    std::unordered_map<std::string, bool> in_the_way; // remote path -> a different file there
+    if (!opts.dry_run) {
+        std::vector<ExistingFile> shown;
+        std::size_t count = 0;
+        auto add = [&](const std::string& path, std::string name, const std::filesystem::path& local, std::uint64_t size,
+                       const std::string& modtime) {
+            if (!existing::rclone_replaces(local, size, util::parse_rfc3339(modtime))) return;
+            in_the_way[path] = true;
+            if (++count <= 10) shown.push_back({std::move(name), local, size, util::parse_rfc3339_seconds(modtime)});
+        };
+        const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+        for (const auto& path : paths) {
+            const auto target = dest / local::relative(remote_basename(path));
+            if (opts.mode == Mode::file) {
+                const fetch::Source src{ctx.config.rclone, ctx.config.rclone_config, ctx.settings.rclone_remote, path, flags};
+                const auto stat = fetch::stat_argv(src);
+                if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(stat));
+                proc::RunOptions quiet;
+                quiet.detached = true;
+                const auto ran = proc::run_capture(stat, quiet);
+                if (!ran || ran->exit_code != 0) continue; // rclone itself reports it below
+                if (const auto remote = fetch::parse_stat(ran->out); remote && !remote->is_dir) {
+                    add(path, util::path_to_utf8(target.filename()), target, remote->size, remote->modtime);
+                }
+                continue;
+            }
+            folder::Job job;
+            job.ctx = &ctx;
+            job.remote_path = path;
+            job.dest = dest;
+            job.extra = opts.extra;
+            if (opts.verbose) job.on_command = [](const std::vector<std::string>& argv) { std::println(stderr, "+ {}", quote::display_cmdline(argv)); };
+            folder::Tree tree;
+            std::mutex m;
+            if (!folder::list(job, tree, m, std::stop_token{})) continue; // rclone itself reports it below
+            const std::string folder_name = util::path_to_utf8(target.filename());
+            for (const auto& f : tree.files) {
+                add(path, folder_name + "/" + f.path, target / local::relative(f.path), f.size, f.modtime);
+            }
+        }
+        if (count > 0 && choice == existing::Choice::ask) {
+            const auto answer = choose_existing(opts, shown, count, opts.mode == Mode::file);
+            if (!answer) {
+                tally.code = answer.error();
+                tally.failed = paths;
+                return tally;
+            }
+            choice = *answer;
+        } else if (count > 0 && choice == existing::Choice::keep_both && opts.mode == Mode::folder) {
+            if (const auto answer = choose_existing(opts, shown, count, false); !answer) {
+                tally.code = answer.error();
+                tally.failed = paths;
+                return tally;
+            }
+        }
+    }
+    if (choice != existing::Choice::replace) extra.emplace_back("--ignore-existing");
+
     for (std::size_t i = 0; i < total; ++i) {
         const std::string& path = paths[i];
-        const auto rclone_argv = engine::download_argv(ctx, opts.mode, path, dest, extra);
+        std::optional<std::filesystem::path> local_name;
+        if (in_the_way.contains(path) && opts.mode == Mode::file) {
+            const auto target = dest / local::relative(remote_basename(path));
+            if (choice == existing::Choice::skip) {
+                std::println(stderr, "grab: skipped {}: your file is kept", util::path_to_utf8(target.filename()));
+                ++tally.done;
+                continue;
+            }
+            if (choice == existing::Choice::keep_both) {
+                const auto second = existing::second_copy(target);
+                if (!second) {
+                    error("no free name for a second copy next to " + util::path_to_utf8(target));
+                    if (tally.code == 0) tally.code = exit_download_failed;
+                    tally.failed.push_back(path);
+                    continue;
+                }
+                local_name = second->filename();
+            }
+        }
+        const auto rclone_argv = engine::download_argv(ctx, opts.mode, path, dest, extra, local_name);
         if (opts.verbose || opts.dry_run) {
             std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
         }
@@ -221,7 +306,7 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
         const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
         std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
                      remote_spec(ctx.settings.rclone_remote, path),
-                     util::path_to_utf8(dest / local::relative(remote_basename(path))));
+                     util::path_to_utf8(local_name ? dest / *local_name : dest / local::relative(remote_basename(path))));
         auto code = proc::run_inherit(rclone_argv);
         if (!code) {
             error(code.error());
@@ -345,10 +430,12 @@ int run(const Options& opts) {
 
     std::vector<std::string> paths;
     std::unordered_map<std::string, std::uint64_t> sizes;
+    std::unordered_map<std::string, std::int64_t> modified;
     std::unordered_map<std::string, const engine::Hit*> hit_at;
     for (const auto& hit : found->hits) {
         paths.push_back(hit.path);
         if (hit.size) sizes.emplace(hit.path, *hit.size);
+        if (hit.modified) modified.emplace(hit.path, *hit.modified);
         hit_at.emplace(hit.path, &hit);
     }
     PickOptions pick;
@@ -387,7 +474,7 @@ int run(const Options& opts) {
 
     // 4 + 5. download each chosen item -------------------------------------------------
     const DownloadTally tally = opts.rclone ? download_with_rclone(*ctx, opts, *chosen, dest)
-                                            : download_with_grab(*ctx, opts, *chosen, sizes, dest);
+                                            : download_with_grab(*ctx, opts, *chosen, sizes, modified, dest);
     if (opts.dry_run) return exit_ok;
 
     if (const std::size_t total = chosen->size(); total > 1) {

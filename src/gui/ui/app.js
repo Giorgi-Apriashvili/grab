@@ -3,11 +3,12 @@
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, suggest, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
-//                 pauseChild, resumeChild, skipChild,
+//                 pauseChild, resumeChild, skipChild, resolveExisting,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, error, update,
+//                 spaceShort, existing,
 //                 updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked
@@ -1627,8 +1628,10 @@ $('#rows').addEventListener('contextmenu', (ev) => {
 
 // Where a download lands on this PC: DEST\<name>, and a folder's files below that.
 function localPath(q, child) {
-  const base = `${q.dest.replace(/[\\/]+$/, '')}\\${q.name}`;
-  return child ? `${base}\\${child.replace(/\//g, '\\')}` : base;
+  const base = q.local || `${q.dest.replace(/[\\/]+$/, '')}\\${q.name}`;
+  if (!child) return base;
+  const c = (q.children || []).find((x) => x.path === child);
+  return `${base}\\${c && c.local ? c.local : child.replace(/\//g, '\\')}`;
 }
 
 // A download: pause, resume or retry, cancel, priority, move to the top, show it, copy its path.
@@ -1636,7 +1639,7 @@ function queueMenu(q) {
   const items = [];
   const active = ['queued', 'running', 'paused'].includes(q.status);
   if (q.status === 'queued' || q.status === 'running') items.push({ label: 'Pause', act: () => send({ type: 'pauseItem', id: q.id }) });
-  if (q.status === 'paused') items.push({ label: 'Resume', act: () => send({ type: 'resumeItem', id: q.id }) });
+  if (q.status === 'paused') items.push({ label: 'Resume', act: () => resumeItem(q) });
   if (q.status === 'failed' || q.status === 'cancelled') {
     items.push({ label: q.status === 'failed' && q.bytes > 0 ? 'Resume' : 'Retry', act: () => send({ type: 'retryItem', id: q.id }) });
   }
@@ -1711,7 +1714,7 @@ function download(hits, to = null) {
     const mode = h.dir ? 'folder' : 'file';
     const key = `${h.remote}|${mode}`;
     if (!groups.has(key)) groups.set(key, { remote: h.remote, mode, items: [] });
-    groups.get(key).items.push({ path: h.path, name: h.name, size: h.size });
+    groups.get(key).items.push({ path: h.path, name: h.name, size: h.size, modified: h.modified });
   }
   if (clashes.length) {
     showBanner(`Not downloaded again into the same folder: ${clashes.join(', ')}. ` +
@@ -1740,8 +1743,45 @@ function onSpaceShort(msg) {
       ` about ${esc(fmtSize(msg.need))}${esc(atLeast)}${esc(queued)}. ${esc(msg.drive)} has ${esc(fmtSize(msg.free))} free.</p>` +
       '<p class="muted">Free some space first, or download anyway if you’ll make room before it’s needed.</p>',
     ok: 'Download anyway',
-    onOk: () => send({ type: 'enqueue', dest: d.dest, groups: d.groups, remember: d.remember, force: true }),
+    onOk: () => send({ type: 'enqueue', dest: d.dest, groups: d.groups, remember: d.remember, existing: d.existing, force: true }),
   });
+}
+
+// Different files already where a download goes (another size, or older than the server's):
+// replace them, keep both (the new one as "name (2).ext"), or skip them and keep yours.
+// `ask`: {count, files: [{name, size, modified, mineSize, mineModified}]}.
+function existingDialog(ask, onChoice) {
+  const when = (sec) => (fmtDate(sec) ? ` · ${esc(fmtDate(sec))}` : '');
+  const rows = ask.files.map((f) => `<tr><td>${esc(f.name)}</td><td>${esc(fmtSize(f.mineSize))}${when(f.mineModified)}</td>` +
+    `<td>${esc(fmtSize(f.size))}${when(f.modified)}</td></tr>`).join('');
+  const more = ask.count > ask.files.length ? `<p class="muted">…and ${ask.count - ask.files.length} more.</p>` : '';
+  const one = ask.count === 1;
+  showModal({
+    title: one && ask.files.length ? `“${ask.files[0].name}” is already there` : `${ask.count} files are already there`,
+    html: `<p>${one ? 'A different file of that name is' : 'Different files of those names are'} already in the folder:</p>` +
+      `<table class="existing"><tr><th></th><th>Yours</th><th>The server’s</th></tr>${rows}</table>${more}` +
+      `<p class="muted">Keep both saves the new ${one ? 'one' : 'ones'} as “name (2)”. Skip keeps yours and doesn’t download ${one ? 'it' : 'them'}.</p>`,
+    ok: 'Replace',
+    danger: true,
+    onOk: () => onChoice('replace'),
+    extra: [{ label: 'Skip', act: () => onChoice('skip') }, { label: 'Keep both', act: () => onChoice('both') }],
+  });
+}
+
+// Nothing was queued: files are already there. The answer sends the same Download again.
+function onExisting(msg) {
+  const d = lastDownload;
+  if (!d) return;
+  existingDialog(msg.ask, (choice) => {
+    d.existing = choice;
+    send({ type: 'enqueue', dest: d.dest, groups: d.groups, remember: d.remember, existing: choice });
+  });
+}
+
+// Resume; a download waiting with that question asks it first.
+function resumeItem(q) {
+  if (q.ask) existingDialog(q.ask, (choice) => send({ type: 'resolveExisting', id: q.id, choice }));
+  else send({ type: 'resumeItem', id: q.id });
 }
 
 const queueEls = new Map(); // id -> element; updated in place so buttons don't flicker
@@ -2477,7 +2517,7 @@ function submitForm() {
 
 let modal = null; // { onOk, onCancel }
 
-function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel }) {
+function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [] }) {
   modal = { onOk, onCancel };
   $('#modal-title').textContent = title;
   $('#modal-body').innerHTML = html;
@@ -2485,6 +2525,21 @@ function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, o
   const okBtn = $('#modal-ok');
   okBtn.textContent = ok;
   okBtn.classList.toggle('danger', danger);
+  // More choices, between Cancel and OK: each closes the dialog and acts.
+  document.querySelectorAll('#modal .modal-extra').forEach((b) => b.remove());
+  for (const x of extra) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'modal-extra';
+    b.textContent = x.label;
+    b.addEventListener('click', () => {
+      if (!modal) return;
+      modal = null;
+      $('#modal').hidden = true;
+      x.act();
+    });
+    okBtn.before(b);
+  }
   $('#modal').hidden = false;
   $('#modal-cancel').focus(); // the safe choice is the default
 }
@@ -2572,6 +2627,7 @@ if (webview) {
       case 'searchError': onSearchError(msg); break;
       case 'browseResult': onBrowseResult(msg); break;
       case 'spaceShort': onSpaceShort(msg); break;
+      case 'existing': onExisting(msg); break;
       case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
@@ -2819,8 +2875,12 @@ $('#queue').addEventListener('click', (ev) => {
     }
     return;
   }
-  const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder', pause: 'pauseItem',
-    resume: 'resumeItem' }[act];
+  if (act === 'resume') {
+    const q = state.queue.find((x) => x.id === id);
+    if (q) resumeItem(q);
+    return;
+  }
+  const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder', pause: 'pauseItem' }[act];
   send({ type, id });
 });
 

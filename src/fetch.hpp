@@ -181,12 +181,16 @@ struct Progress {
     int connections = 0;     // streams open right now
 };
 
-enum class Outcome { done, stopped, failed };
+// exists: a different file is at the target (another size, or older than the server's) and the
+// download may not replace it; nothing was replaced, and a partial download is kept.
+enum class Outcome { done, stopped, failed, exists };
 struct Result {
     Outcome outcome = Outcome::failed;
     std::string error;
     std::string note; // e.g. "the file changed on the server; started over"
     bool present = false; // done because the target already held the file (up_to_date); nothing fetched
+    std::uint64_t size = 0; // the server's file, once looked at
+    std::string modtime = {};
 };
 
 struct Download {
@@ -195,6 +199,9 @@ struct Download {
     int id = 0;         // the download's id in the pools
     std::filesystem::path target; // DEST\<name>
     Reserved reserved;            // names the partial files must not take (a folder's own files)
+    // A different file at the target may be replaced (the user chose Replace); otherwise run()
+    // ends with Outcome::exists, checked before fetching and again before the final rename.
+    bool replace = false;
     // The caller already joined the pool under `id` and leaves it itself: a folder whose files
     // are fetched one after another (or several at once) as one pool user.
     bool joined = false;
@@ -208,8 +215,9 @@ struct Download {
 };
 
 // Fetches `d.source` into `d.target`, continuing a partial download. A target that is already
-// up_to_date with no partial download in progress is kept (Result::present). Stopping keeps the
-// partial file and its state (Outcome::stopped); a failure keeps them too, so a retry continues.
+// up_to_date with no partial download in progress is kept (Result::present); a different one is
+// replaced only with `d.replace` (else Outcome::exists). Stopping keeps the partial file and its
+// state (Outcome::stopped); a failure keeps them too, so a retry continues.
 [[nodiscard]] Result run(const Download& d, Connections& connections,
                          const std::function<void(const Progress&)>& on_progress, std::stop_token stop);
 
