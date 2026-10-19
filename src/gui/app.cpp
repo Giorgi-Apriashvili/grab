@@ -1,5 +1,6 @@
 #include "app.hpp"
 
+#include "activity.hpp"
 #include "browse.hpp"
 #include "config.hpp"
 #include "engine.hpp"
@@ -108,6 +109,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     parallel_ = state_.parallel;
     learned_ = state_.server_limits;
+    timings_ = state_.timings;
     verify_downloads_ = state_.verify_downloads;
     // The speed limit that holds now; the first tick() tells the page and drops a change that
     // no longer holds.
@@ -149,6 +151,100 @@ App::~App() {
 }
 
 void App::save_state() const { save_gui_state(state_path_, state_); }
+
+// ---- the status bar's activities ------------------------------------------------------------
+
+namespace {
+
+// 4925 -> "4,925"
+std::string thousands(std::uint64_t n) {
+    std::string digits = std::to_string(n);
+    for (auto at = digits.size(); at > 3; at -= 3) digits.insert(at - 3, ",");
+    return digits;
+}
+
+// "1 entry", "4,925 entries"
+std::string count_of(std::uint64_t n, std::string_view one, std::string_view many) {
+    return std::format("{} {}", thousands(n), n == 1 ? one : many);
+}
+
+} // namespace
+
+App::Activity::Activity(App& app, std::string text, std::string timing, bool background)
+    : app_(app), id_(app.next_activity_++), timing_(std::move(timing)), started_(std::chrono::steady_clock::now()),
+      text_(std::move(text)) {
+    Value v = Value::make_object();
+    v.set("type", str("activity"));
+    v.set("id", num(id_));
+    v.set("text", str(text_));
+    if (background) v.set("bg", Value::make_bool(true));
+    if (!timing_.empty()) {
+        std::lock_guard lock(app_.timings_mutex_);
+        const auto it = app_.timings_.find(timing_);
+        v.set("estimate", num(it != app_.timings_.end() ? it->second : activity::guess(timing_)));
+    }
+    app_.post(v);
+    sent_ = started_;
+}
+
+App::Activity::~Activity() {
+    Value v = Value::make_object();
+    v.set("type", str("activity"));
+    v.set("id", num(id_));
+    v.set("end", Value::make_bool(true));
+    app_.post(v);
+    if (failed_ || timing_.empty()) return;
+    const auto ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_).count());
+    int remembered = 0;
+    {
+        std::lock_guard lock(app_.timings_mutex_);
+        const auto it = app_.timings_.find(timing_);
+        remembered = activity::blend(it != app_.timings_.end() ? std::optional(it->second) : std::nullopt, ms);
+        app_.timings_[timing_] = remembered;
+    }
+    app_.host_.defer([&app = app_, key = timing_, remembered] {
+        app.state_.timings[key] = remembered;
+        app.save_state();
+    });
+}
+
+void App::Activity::text(std::string text) {
+    std::lock_guard lock(mutex_);
+    text_ = std::move(text);
+    send(false);
+}
+
+void App::Activity::progress(std::uint64_t done, std::uint64_t total, std::string text) {
+    std::lock_guard lock(mutex_);
+    const bool first = !total_;
+    done_ = done;
+    total_ = total;
+    if (!text.empty()) text_ = std::move(text);
+    send(first); // the bar switches from the estimate to real numbers at once
+}
+
+void App::Activity::detail(std::string detail) {
+    std::lock_guard lock(mutex_);
+    detail_ = std::move(detail);
+    send(true);
+}
+
+void App::Activity::send(bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - sent_ < std::chrono::milliseconds(100)) return;
+    sent_ = now;
+    Value v = Value::make_object();
+    v.set("type", str("activity"));
+    v.set("id", num(id_));
+    v.set("text", str(text_));
+    if (!detail_.empty()) v.set("detail", str(detail_));
+    if (done_ && total_ && *total_ > 0) {
+        v.set("done", num(static_cast<double>(*done_)));
+        v.set("total", num(static_cast<double>(*total_)));
+    }
+    app_.post(v);
+}
 
 // ---- previews ------------------------------------------------------------------------------
 
@@ -206,8 +302,9 @@ void App::preview_request(const std::string& url, std::function<void(WebResource
             return reply(it->answer);
         }
     }
-    queue_preview([this, remote = *remote, path = *path, key = std::move(key), reply = std::move(reply)] {
-        auto answer = preview_answer(remote, path);
+    const bool ahead = url.find("?ahead") != std::string::npos; // the viewer fetching the next one
+    queue_preview([this, remote = *remote, path = *path, key = std::move(key), reply = std::move(reply), ahead] {
+        auto answer = preview_answer(remote, path, ahead);
         {
             // Kept for ←/→ and the neighbours fetched ahead; failures too, briefly (they come
             // back after the others push them out).
@@ -223,16 +320,28 @@ void App::preview_request(const std::string& url, std::function<void(WebResource
     });
 }
 
-WebResource App::preview_answer(const std::string& remote, const std::string& path) {
+WebResource App::preview_answer(const std::string& remote, const std::string& path, bool ahead) {
     const auto kind = preview::kind_of(path);
     const auto max = preview::max_bytes(kind);
     if (max == 0) return preview_failed(415, "This kind of file has no preview.");
     auto ctx = engine::load_context(config_path_, remote);
     if (!ctx) return preview_failed(500, ctx.error());
     const auto at = preview::where(path);
+    std::optional<Activity> starting;
+    if (!previews_.running(remote, at.root)) {
+        starting.emplace(*this, std::format("Starting a stream from {} (rclone serve http)…", remote), "serve:" + remote, ahead);
+    }
     auto base = previews_.base(*ctx, remote, at.root);
+    if (!base && starting) starting->failed();
+    starting.reset();
     if (!base) return preview_failed(502, base.error());
-    auto got = http_get(*base + preview::url_path(at.path), max);
+    const auto name = remote_basename(path);
+    // Until the first bytes, rclone opens the file (the first one in a folder reads the folder).
+    Activity loading(*this, std::format("Opening {} on {}…", name, remote), std::string(), ahead);
+    auto got = http_get(*base + preview::url_path(at.path), max, [&](std::uint64_t done, std::uint64_t total) {
+        loading.progress(done, total,
+                         std::format("Loading {}: {} of {}", name, util::format_size(done), util::format_size(total)));
+    });
     if (!got) return preview_failed(502, got.error());
     if (got->status == 404) return preview_failed(404, std::format("Not found on {}.", remote));
     if (got->status != 200 && got->status != 206) {
@@ -269,7 +378,13 @@ void App::play(const Value& msg) {
         auto ctx = engine::load_context(config_path_, remote);
         if (!ctx) return fail(ctx.error());
         const auto at = preview::where(path);
+        std::optional<Activity> starting;
+        if (!previews_.running(remote, at.root)) {
+            starting.emplace(*this, std::format("Starting a stream from {} (rclone serve http)…", remote), "serve:" + remote);
+        }
         auto base = previews_.base(*ctx, remote, at.root);
+        if (!base && starting) starting->failed();
+        starting.reset();
         if (!base) return fail(std::format("Can't play {}: {}", remote_basename(path), base.error()));
         const auto name = remote_basename(path);
         const auto dot = name.rfind('.');
@@ -596,8 +711,16 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             std::ranges::move(got.hits, std::back_inserter(into->hits));
         };
+        std::optional<Activity> across; // All servers: by server
+        if (servers.size() > 1) across.emplace(*this, "Searching all servers…", std::string());
+        std::size_t index = 0;
         for (const auto& server : servers) {
             if (stop.stop_requested()) return fail("search cancelled", true);
+            if (across) {
+                across->progress(index, servers.size(),
+                                 std::format("Searching {} ({} of {})…", server, index + 1, servers.size()));
+            }
+            ++index;
             Value status = Value::make_object();
             status.set("remote", str(server));
             auto ctx = engine::load_context(config_path_, server);
@@ -640,10 +763,23 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             // One server without a usable list, or a search lists can't answer: live, as before.
             if (!found && (!all || !listable)) {
+                const bool over_ssh = ctx->method == FindMethod::ssh;
+                const std::string doing = std::format("Searching {} with {}", server, over_ssh ? "ssh + find" : "rclone lsf");
+                Activity act(*this, doing + "…", "search:" + server);
+                activity::Records records; // ssh + find prints the matches; rclone lsf everything
+                auto counted = run;
+                counted.on_output = [&](std::string_view chunk) {
+                    records.feed(chunk);
+                    act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(records.count()))
+                                      : std::format("{}… {} looked at", doing, count_of(records.count(), "entry", "entries")));
+                };
                 for (const Mode kind : kinds) {
                     auto r = req;
                     r.mode = kind;
-                    auto live = engine::search(*ctx, r, run);
+                    auto live = engine::search(*ctx, r, counted, [&](const std::vector<std::string>& argv) {
+                        act.detail(quote::display_cmdline(argv));
+                    });
+                    if (!live) act.failed();
                     if (stop.stop_requested()) return fail("search cancelled", true);
                     if (!live) {
                         if (!all) return fail(live.error(), false);
@@ -714,13 +850,31 @@ void App::start_refresh(const std::string& server) {
     if (s.refreshing) return;
     s.refreshing = true;
     // The previous refresh of this server, if any, has finished: replacing it joins it at once.
-    refresh_threads_[server] = std::jthread([this, server](std::stop_token stop) {
+    const std::size_t before = s.list ? s.list->entries.size() : 0; // the last list's entries
+    refresh_threads_[server] = std::jthread([this, server, before](std::stop_token stop) {
         proc::RunOptions run;
         run.stop = stop;
         run.detached = true;
+        const std::string doing = std::format("{} {}'s file list", before > 0 ? "Refreshing" : "Building", server);
+        Activity act(*this, doing + "…", "list:" + server, true);
+        if (before > 0) act.progress(0, before); // against the last list's count, from the start
+        activity::Records records;
+        run.on_output = [&](std::string_view chunk) {
+            records.feed(chunk);
+            const auto n = records.count();
+            if (before > 0) {
+                act.progress(std::min<std::uint64_t>(n, before), before,
+                             std::format("{}: {} of ~{} entries", doing, thousands(n), thousands(before)));
+            } else {
+                act.text(std::format("{}: {}", doing, count_of(n, "entry", "entries")));
+            }
+        };
         auto ctx = engine::load_context(config_path_, server);
-        auto fetched = ctx ? file_list::fetch(*ctx, unix_now(), true, run)
+        auto fetched = ctx ? file_list::fetch(*ctx, unix_now(), true, run, [&](const std::vector<std::string>& argv) {
+            act.detail(quote::display_cmdline(argv));
+        })
                            : std::expected<file_list::List, std::string>(std::unexpected(ctx.error()));
+        if (!fetched) act.failed();
         if (fetched) (void)file_list::save(file_list::path_for(lists_dir_, server), *fetched);
         {
             std::lock_guard inner(lists_mutex_);
@@ -803,11 +957,28 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
     // Deeper than the list (or a search lists can't answer): live, the folder the only root.
     engine::Context below = ctx;
     below.settings.search_roots = {under};
+    const bool over_ssh = ctx.method == FindMethod::ssh;
+    const std::string doing = under.empty() ? std::format("Searching all of {} with {}", server,
+                                                          over_ssh ? "ssh + find" : "rclone lsf")
+                                            : std::format("Searching below {} on {}", under, server);
+    Activity act(*this, doing + "…", "search:" + server);
+    activity::Records records;
+    auto counted = run;
+    counted.on_output = [&](std::string_view chunk) {
+        records.feed(chunk);
+        act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(records.count()))
+                          : std::format("{}… {} looked at", doing, count_of(records.count(), "entry", "entries")));
+    };
     for (const Mode m : {Mode::folder, Mode::file}) {
         auto r = req;
         r.mode = m;
-        auto found = engine::search(below, r, run);
-        if (!found) return util::fail(found.error());
+        auto found = engine::search(below, r, counted, [&](const std::vector<std::string>& argv) {
+            act.detail(quote::display_cmdline(argv));
+        });
+        if (!found) {
+            act.failed();
+            return util::fail(found.error());
+        }
         add(std::move(*found), m == Mode::folder);
     }
     status.set("live", Value::make_bool(true));
@@ -899,7 +1070,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             std::int64_t listed = 0;
             bool new_listing = false; // listed live just now, not kept yet
         };
-        auto rows_of = [&](const std::string& at) -> std::expected<Rows, std::string> {
+        auto rows_of = [&](const std::string& at, const std::string& what = {}) -> std::expected<Rows, std::string> {
             std::optional<LiveFolder> cached;
             if (!live) {
                 std::lock_guard lock(browse_mutex_);
@@ -915,8 +1086,20 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             proc::RunOptions run;
             run.stop = stop;
             run.detached = true;
-            auto got = browse::list_live(*ctx, at, run);
-            if (!got) return std::unexpected(got.error());
+            const std::string doing = what.empty() ? std::format("Listing {} on {}", at.empty() ? "~" : at, remote) : what;
+            Activity act(*this, doing + "…", "lsjson:" + remote);
+            activity::Records records('{'); // lsjson: "[", an item a line, "]"
+            run.on_output = [&](std::string_view chunk) {
+                records.feed(chunk);
+                if (records.count() > 0) act.text(std::format("{}… {} so far", doing, count_of(records.count(), "item", "items")));
+            };
+            auto got = browse::list_live(*ctx, at, run, [&](const std::vector<std::string>& argv) {
+                act.detail(quote::display_cmdline(argv));
+            });
+            if (!got) {
+                act.failed();
+                return std::unexpected(got.error());
+            }
             return Rows{std::move(*got), "live", now, true};
         };
 
@@ -946,7 +1129,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
                 // lsjson lists a file as that one file: its folder opens instead, when the file is
                 // there (rather than a folder of the same name holding just that file).
                 const std::string parent = parent_of(folder);
-                if (auto up = rows_of(parent)) {
+                if (auto up = rows_of(parent, std::format("Checking whether {} is a file", remote_basename(folder)))) {
                     const auto name = remote_basename(folder);
                     const auto it = std::ranges::find(up->items, name, &browse::Item::name);
                     if (it != up->items.end() && !it->dir) {
@@ -2353,7 +2536,10 @@ void App::maybe_check_updates() {
 void App::start_update_check(bool manual) {
     if (update_check_busy_.exchange(true)) return;
     update_check_thread_ = std::jthread([this, manual](std::stop_token stop) {
+        std::optional<Activity> act(std::in_place, *this, "Checking GitHub for a grab update…", "update", !manual);
         auto result = update::check(true, stop);
+        if (!result) act->failed();
+        act.reset();
         update_check_busy_ = false;
         if (stop.stop_requested()) return;
         host_.defer([this, manual, result = std::move(result)] { on_update_checked(result, manual); });

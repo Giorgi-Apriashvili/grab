@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -33,6 +34,8 @@ public:
     // starting it first if it isn't running (about 1.5 s; up to 20 s on a slow login). Any thread.
     [[nodiscard]] std::expected<std::string, std::string> base(const engine::Context& ctx, const std::string& remote,
                                                                const std::string& root);
+    // Whether that server runs already (base() then answers at once).
+    [[nodiscard]] bool running(const std::string& remote, const std::string& root);
 
 private:
     struct Server {
@@ -52,7 +55,10 @@ struct Fetched {
     std::string body;
     std::optional<std::uint64_t> total;
 };
-[[nodiscard]] std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t max);
+// `on_progress`: the bytes so far, and the most there will be, as they arrive.
+[[nodiscard]] std::expected<Fetched, std::string>
+http_get(const std::string& url, std::size_t max,
+         const std::function<void(std::uint64_t done, std::uint64_t total)>& on_progress = {});
 
 // Opens `url` in the program Windows opens files ending in `.ext` with ("mpc-hc64.exe" here),
 // returning its name. Fails when that is no desktop program that takes an address (a Store app),

@@ -7,7 +7,7 @@
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
-//   from backend: init, searchResult, searchError, browseResult, suggestions, folderPicked, queue, error, update,
+//   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, error, update,
 //                 updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked
@@ -578,6 +578,87 @@ $('.results-head').addEventListener('click', (ev) => {
 
 // ---- browse mode: a server's folders -----------------------------------------------------
 
+// ---- the status bar's activity: what grab is doing while it takes a while -----------------
+
+// From the backend's `activity` messages: { id, text, detail, bg, estimate, done, total }, then
+// { id, end }. Kept here with when each started, showed and ended.
+const activities = new Map();
+let activityFrame = 0;
+const SHOW_AFTER = 100;    // ms: instant work never shows
+const SHOW_AT_LEAST = 400; // ms on screen once shown, so it doesn't flash
+const FADE = 350;          // ms, after the bar filled
+
+function onActivity(msg) {
+  const now = performance.now();
+  let a = activities.get(msg.id);
+  if (msg.end) {
+    if (!a) return;
+    a.end = now;
+    if (!a.shown) activities.delete(msg.id); // over before it showed: nothing to see
+  } else if (!a) {
+    a = { id: msg.id, text: msg.text, detail: msg.detail || '', bg: !!msg.bg, estimate: msg.estimate || 3000,
+      done: msg.done, total: msg.total, start: now, shown: 0, end: 0 };
+    activities.set(msg.id, a);
+  } else {
+    if (msg.text) a.text = msg.text;
+    if (msg.detail) a.detail = msg.detail;
+    if (msg.total) {
+      // Counted from now on: the real numbers fill what the estimate left, so the bar goes on.
+      if (!a.total) a.base = a.fill || 0;
+      a.done = msg.done;
+      a.total = msg.total;
+    }
+  }
+  if (!activityFrame) activityFrame = requestAnimationFrame(drawActivity);
+}
+
+// How full the bar is: real progress where it was counted (filling what an estimate before it
+// left); else the time so far against the time the same step took before, 85% by then and
+// creeping on after, never quite full until it ends.
+function activityFraction(a, now) {
+  if (a.end) return 1;
+  if (a.total > 0) return (a.base || 0) + (1 - (a.base || 0)) * Math.min(1, a.done / a.total);
+  const t = now - a.start;
+  const est = Math.max(300, a.estimate);
+  return t < est ? 0.85 * (t / est) : 0.85 + 0.14 * (1 - Math.exp(-(t - est) / (est * 1.5)));
+}
+
+// Every frame while anything runs: the latest thing waited on (else background work), its bar,
+// its message with the seconds so far, "+N" for the others (listed on hover with the command).
+function drawActivity() {
+  activityFrame = 0;
+  const now = performance.now();
+  for (const [id, a] of activities) {
+    if (a.end && (!a.shown || now > Math.max(a.end, a.shown + SHOW_AT_LEAST) + FADE)) activities.delete(id);
+  }
+  const all = [...activities.values()];
+  const live = all.filter((a) => !a.end);
+  const latest = (list) => list.filter((a) => a.shown || now - a.start >= SHOW_AFTER)
+    .sort((x, y) => y.start - x.start)[0];
+  const shown = latest(live.filter((a) => !a.bg)) || latest(all.filter((a) => !a.bg)) || latest(live) || latest(all);
+  // A bar never goes back: when real numbers take over from the estimate, it waits for them.
+  for (const a of all) a.fill = Math.max(a.fill || 0, activityFraction(a, now));
+  const el = $('#activity');
+  el.hidden = !shown;
+  $('footer.action').classList.toggle('busy', !!shown);
+  if (shown) {
+    if (!shown.shown) shown.shown = now;
+    const fading = !!shown.end && now >= Math.max(shown.end, shown.shown + SHOW_AT_LEAST);
+    el.classList.toggle('bg', shown.bg);
+    el.classList.toggle('done', !!shown.end);
+    el.classList.toggle('fading', fading);
+    $('#act-fill').style.width = `${(shown.fill * 100).toFixed(1)}%`;
+    const secs = Math.floor((now - shown.start) / 1000);
+    const text = shown.text + (!shown.end && secs >= 2 ? ` · ${secs} s` : '');
+    if ($('#act-text').textContent !== text) $('#act-text').textContent = text;
+    const others = live.filter((a) => a !== shown);
+    $('#act-more').hidden = !others.length;
+    $('#act-more').textContent = `+${others.length}`;
+    el.title = [shown.detail, ...others.map((a) => `Also: ${a.text}`)].filter(Boolean).join('\n');
+  }
+  if (activities.size) activityFrame = requestAnimationFrame(drawActivity);
+}
+
 // ---- previews: play a video or audio file, view an image, text file or PDF ---------------
 
 // The same lists as the backend's (src/preview.cpp).
@@ -605,7 +686,6 @@ function openFile(h) {
   const kind = kindOf(h);
   if (plays(kind)) {
     send({ type: 'play', remote: h.remote || state.remote, path: h.path });
-    flash(`Starting ${h.name}…`, 20000);
     return true;
   }
   if (views(kind)) {
@@ -691,6 +771,7 @@ function showViewerItem() {
       if (token !== viewer.token) return;
       body.replaceChildren(img);
       $('#viewer-info').textContent = [`${img.naturalWidth} × ${img.naturalHeight}`, ...info].join(' · ');
+      fetchAhead();
     };
     img.onerror = reason;
     // A click: the full size (scroll to see the rest), and back.
@@ -708,6 +789,7 @@ function showViewerItem() {
       pre.className = 'viewer-text';
       pre.textContent = text;
       body.replaceChildren(pre);
+      fetchAhead();
       const total = Number(r.headers.get('X-Grab-Total'));
       if (total) {
         const note = document.createElement('div');
@@ -722,12 +804,17 @@ function showViewerItem() {
     frame.title = h.name;
     frame.src = url;
     body.replaceChildren(frame);
+    fetchAhead();
   }
-  // The neighbours' images and text, fetched ahead (the backend keeps them).
-  for (const n of [viewer.list[viewer.index + 1], viewer.list[viewer.index - 1]]) {
-    const k = kindOf(n);
-    if (k === 'image') new Image().src = previewUrl(n);
-    else if (k === 'text') fetch(previewUrl(n)).catch(() => {});
+  // The neighbours' images and text, fetched ahead once this one is in (so they don't slow it
+  // down); the backend keeps them.
+  function fetchAhead() {
+    if (token !== viewer.token) return;
+    for (const n of [viewer.list[viewer.index + 1], viewer.list[viewer.index - 1]]) {
+      const k = kindOf(n);
+      if (k === 'image') new Image().src = `${previewUrl(n)}?ahead`;
+      else if (k === 'text') fetch(`${previewUrl(n)}?ahead`).catch(() => {});
+    }
   }
 }
 
@@ -1113,7 +1200,7 @@ function renderBrowseBar() {
   } else if (b.under) {
     status.textContent = '';
   } else if (b.loading) {
-    status.innerHTML = '<span class="spinner"></span>opening…';
+    status.textContent = ''; // a folder listed from the server shows as an activity
   } else if (!b.server) {
     status.textContent = '';
   } else {
@@ -2485,6 +2572,7 @@ if (webview) {
       case 'searchError': onSearchError(msg); break;
       case 'browseResult': onBrowseResult(msg); break;
       case 'spaceShort': onSpaceShort(msg); break;
+      case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
       case 'queue':

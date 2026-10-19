@@ -79,10 +79,42 @@ public:
     // or from the recent ones kept in memory. `reply` answers, from any thread.
     void preview_request(const std::string& url, std::function<void(WebResource)> reply);
 
+    // Something the window may be waiting on, shown in the status bar while it runs: what grab is
+    // doing (and the command running, on hover), with real progress where it can be counted, else
+    // filled over the time the same step (`timing`, e.g. "lsjson:Box.Guest") took before. Any
+    // thread; it ends when it goes out of scope, and its time is remembered unless it failed.
+    class Activity {
+    public:
+        Activity(App& app, std::string text, std::string timing, bool background = false);
+        ~Activity();
+        Activity(const Activity&) = delete;
+        Activity& operator=(const Activity&) = delete;
+        void text(std::string text);
+        // Counted progress with its message, in one update; the first one is sent at once.
+        void progress(std::uint64_t done, std::uint64_t total, std::string text = {});
+        void detail(std::string detail);
+        void failed() { failed_ = true; }
+
+    private:
+        void send(bool force); // caller holds mutex_; at most ten updates a second
+
+        App& app_;
+        int id_ = 0;
+        std::string timing_;
+        std::chrono::steady_clock::time_point started_;
+        std::mutex mutex_;
+        std::string text_;
+        std::string detail_;
+        std::optional<std::uint64_t> done_;
+        std::optional<std::uint64_t> total_;
+        std::chrono::steady_clock::time_point sent_{};
+        bool failed_ = false;
+    };
+
 private:
     // A video or audio file, in the program Windows plays it with: {remote, path}.
     void play(const json::Value& msg);
-    [[nodiscard]] WebResource preview_answer(const std::string& remote, const std::string& path);
+    [[nodiscard]] WebResource preview_answer(const std::string& remote, const std::string& path, bool ahead);
     void queue_preview(std::function<void()> job);
     void run_preview_jobs(const std::stop_token& stop);
     // A plaintext password or passphrase, overwritten when it is dropped.
@@ -358,6 +390,11 @@ private:
     std::map<std::string, int> learned_;
     std::chrono::steady_clock::time_point last_progress_post_{};
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
+
+    // The status bar's activities: their ids, and how long steps took (from and to gui.json).
+    std::atomic<int> next_activity_{1};
+    std::mutex timings_mutex_;
+    std::map<std::string, int> timings_;
 
     // Previews: the servers' local streams, and two workers for the page's requests and Play.
     PreviewServers previews_;

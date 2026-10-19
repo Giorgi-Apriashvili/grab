@@ -82,6 +82,12 @@
 
   <footer class="bar action">
     <span id="summary" class="muted"></span>
+    <!-- What grab is doing while it takes a while: a progress bar and the message. -->
+    <span id="activity" class="activity" role="status" hidden>
+      <span class="act-bar"><span id="act-fill" class="act-fill"></span></span>
+      <span id="act-text" class="act-text"></span>
+      <span id="act-more" class="act-more" hidden></span>
+    </span>
     <span id="browse-status" class="browse-status"></span>
     <span id="list-status" class="list-status"></span>
     <button id="refresh-lists" type="button" class="link" title="Fetch the file list again now" hidden>Refresh</button>

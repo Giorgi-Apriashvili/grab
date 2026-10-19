@@ -101,6 +101,12 @@ PreviewServers::~PreviewServers() {
     if (job_ != nullptr) CloseHandle(job_);
 }
 
+bool PreviewServers::running(const std::string& remote, const std::string& root) {
+    std::lock_guard lock(mutex_);
+    const auto it = servers_.find(std::pair{remote, root});
+    return it != servers_.end() && WaitForSingleObject(it->second.process, 0) == WAIT_TIMEOUT;
+}
+
 std::expected<std::string, std::string> PreviewServers::base(const engine::Context& ctx, const std::string& remote,
                                                             const std::string& root) {
     std::lock_guard lock(mutex_); // one start at a time; another caller waits for it and reuses it
@@ -175,7 +181,8 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
     }
 }
 
-std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t max) {
+std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t max,
+                                            const std::function<void(std::uint64_t, std::uint64_t)>& on_progress) {
     constexpr std::string_view local = "http://127.0.0.1:";
     if (!url.starts_with(local) || max == 0) return util::fail("not a preview address");
     const std::string_view rest = std::string_view(url).substr(local.size());
@@ -228,6 +235,7 @@ std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t
         }
         got.body.resize(at + read);
         if (read == 0) break;
+        if (on_progress) on_progress(got.body.size(), std::min<std::uint64_t>(got.total.value_or(max), max));
     }
     return got;
 }

@@ -1,5 +1,6 @@
 #include "gui_state.hpp"
 
+#include "activity.hpp"
 #include "json.hpp"
 #include "util.hpp"
 
@@ -98,6 +99,13 @@ GuiState parse_gui_state(std::string_view json_text) {
             if (auto n = number(&l->items[i]); n && *n >= 1) s.server_limits[l->keys[i]] = *n;
         }
     }
+    if (const auto* t = doc->find("timings"); t != nullptr && t->kind == json::Value::Kind::object) {
+        for (std::size_t i = 0; i < t->keys.size(); ++i) {
+            if (auto n = number(&t->items[i]); n && *n >= activity::min_ms && *n <= activity::max_ms) {
+                s.timings[t->keys[i]] = *n;
+            }
+        }
+    }
     if (const auto* on = doc->find("updateCheck"); on != nullptr && on->kind == json::Value::Kind::boolean) {
         s.update_check = on->boolean;
     }
@@ -142,6 +150,9 @@ std::string gui_state_to_json(const GuiState& state) {
     Value limits = Value::make_object();
     for (const auto& [remote, n] : state.server_limits) limits.set(remote, Value::make_number(n));
     root.set("serverLimits", std::move(limits));
+    Value timings = Value::make_object();
+    for (const auto& [step, ms] : state.timings) timings.set(step, Value::make_number(ms));
+    root.set("timings", std::move(timings));
     root.set("updateCheck", Value::make_bool(state.update_check));
     root.set("lastUpdateCheck", Value::make_number(static_cast<double>(state.last_update_check)));
     if (!state.latest_version.empty()) {

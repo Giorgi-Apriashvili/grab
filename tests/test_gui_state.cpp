@@ -18,6 +18,7 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
     s.server_limits = {{"arch_guest", 7}};
+    s.timings = {{"lsjson:Box.Guest", 2300}, {"update", 900}};
     s.limit_on = true;
     s.limit_mibps = 2.5;
     s.speed_schedule = {{0x1F, 18 * 60, 0, 5}, {0x60, 22 * 60, 6 * 60, 2.5}};
@@ -61,6 +62,8 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
     CHECK(parse_gui_state(R"({})").parallel == 4);
     CHECK(parse_gui_state(R"({"serverLimits":{"a":3,"b":0,"c":"x"}})").server_limits ==
           std::map<std::string, int>{{"a", 3}});
+    CHECK(parse_gui_state(R"({"timings":{"a":1500,"b":0,"c":"x","d":99999999}})").timings ==
+          std::map<std::string, int>{{"a", 1500}});
 
     // The speed schedule keeps its valid rules; a broken change of the limit is dropped.
     CHECK(parse_gui_state(R"({"speedSchedule":[{"days":["sat"],"from":"10:00","to":"12:00","mibps":8},{"days":[]}]})")

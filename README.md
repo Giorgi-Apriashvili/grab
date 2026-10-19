@@ -193,6 +193,18 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     Modified, then Size, and the files go largest first with the folders after them, newest
     first.
   - The sort stays, across searches, folders and restarts, until you change it.
+- **The status bar shows what grab is doing** whenever something takes a while, with a loading
+  bar: "Listing movies on Box.Guest… 12 items so far", "Searching Main with ssh + find… 37
+  found so far", "Starting a stream from Box.Guest", "Loading cover.jpg: 3.2 of 8.0 MiB",
+  "Refreshing Box.Guest's file list: 3,100 of ~4,925 entries".
+  - The bar shows real progress where grab can count (bytes, entries against the last list,
+    servers searched); otherwise it fills over how long the same step took last time on that
+    server (remembered in gui.json), creeping on near the end until it's done. A shimmer runs
+    along it and the seconds count up, so it never looks stuck.
+  - Background work (list refreshes, the update check) shows greyed, only while nothing you're
+    waiting on runs. With several at once, "+2" lists the others; hovering also shows the exact
+    command running.
+  - Instant things (folders from the file list, list searches) show nothing.
 - **Previews: double-click or Space opens a file, as in Explorer.**
   - **Videos and audio** play in the program Windows uses for them (VLC, MPC-HC, mpv...),
     streamed from the server, with seeking and the subtitles inside the file. grab runs a

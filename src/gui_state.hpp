@@ -52,6 +52,9 @@ struct GuiState {
     std::optional<SortOrder> sort;                   // absent: the default order
     int parallel = 4;                               // downloads at once, min_parallel..max_parallel
     std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
+    // How long steps took ("lsjson:Box.Guest" -> ms, a moving average), for the status bar's
+    // progress where nothing can be counted.
+    std::map<std::string, int> timings;
     bool verify_downloads = false;                   // check each download against the server's checksum
     bool limit_on = false;                           // global download speed limit
     double limit_mibps = 5.0;                        // its value, kept while switched off

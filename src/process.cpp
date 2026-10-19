@@ -287,7 +287,10 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     if (opts.detached) {
         err_reader = std::jthread([&] { drain(err.read.h, [&](std::string_view s) { result.err += s; }); });
     }
-    drain(out.read.h, [&](std::string_view s) { result.out += s; });
+    drain(out.read.h, [&](std::string_view s) {
+        result.out += s;
+        if (opts.on_output) opts.on_output(s);
+    });
     if (err_reader.joinable()) err_reader.join();
     if (writer.joinable()) writer.join();
     result.exit_code = wait_exit(child); // a stopped job exits with exit_stopped
@@ -571,7 +574,10 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     if (opts.detached) {
         err_reader = std::jthread([&] { drain(err[0], [&](std::string_view s) { result.err += s; }); });
     }
-    drain(out[0], [&](std::string_view s) { result.out += s; });
+    drain(out[0], [&](std::string_view s) {
+        result.out += s;
+        if (opts.on_output) opts.on_output(s);
+    });
     if (err_reader.joinable()) err_reader.join();
     if (writer.joinable()) writer.join();
     close(out[0]);

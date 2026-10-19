@@ -27,6 +27,9 @@ struct RunOptions {
     // run_capture only: bytes written to the child's stdin (then closed), e.g. a password for
     // `rclone obscure -`, so secrets never appear on a command line.
     std::optional<std::string> input;
+    // run_capture only: each chunk of the child's stdout as it arrives (it is captured too), e.g.
+    // to count a listing's entries while it runs, for a progress bar. On the reading thread.
+    std::function<void(std::string_view)> on_output;
 };
 
 struct CaptureResult {
