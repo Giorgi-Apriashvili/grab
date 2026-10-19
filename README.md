@@ -140,6 +140,10 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     window is open.
   - Each start opens the server at its top; while the window is open, each server reopens
     where you left it.
+  - **Type-ahead**, as in Explorer: with the list focused, typing a name's first letters picks
+    it ("mob" finds `MobLand…`); the same letter again steps through the names starting with
+    it, and a pause of a second starts over. What you typed shows at the bottom of the list,
+    red when no name starts with it.
   - **Back and Forward**, as in Explorer: the mouse's side buttons, Alt+← and Alt+→, or the ←
     and → buttons (hovering names where they go). Back returns to the folder before, with the
     same row picked and the same scroll; with search results showing, it closes them first.

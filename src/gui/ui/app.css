@@ -146,6 +146,7 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 
 /* results ------------------------------------------------------------------------------- */
 .results-wrap {
+  position: relative;
   flex: 1;
   min-height: 120px;
   display: flex;
@@ -194,6 +195,24 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .results-head .sort.size[data-dir=asc]::before { content: "\25B4"; margin-right: 4px; }
 .results-head .sort.size[data-dir=desc]::before { content: "\25BE"; margin-right: 4px; }
 .results { position: relative; flex: 1; overflow-y: auto; outline: none; scrollbar-gutter: stable; }
+/* What was typed to jump to a name, for as long as more typing adds to it. */
+.type-hint {
+  position: absolute;
+  z-index: 5;
+  right: 22px;
+  bottom: 10px;
+  max-width: 50%;
+  padding: 3px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  background: var(--panel);
+  border: 1px solid var(--sel-line);
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
+  pointer-events: none;
+}
+.type-hint.miss { color: var(--danger); border-color: var(--danger); }
 #spacer { width: 1px; }
 #rows { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
 #rows .row { cursor: default; border-bottom: 1px solid transparent; }

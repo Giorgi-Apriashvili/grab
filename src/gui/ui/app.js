@@ -2331,6 +2331,7 @@ function pickRemote(name, enter = true) {
 $('#remote').addEventListener('change', (ev) => pickRemote(ev.target.value));
 
 $('#results').addEventListener('scroll', scheduleRows, { passive: true });
+$('#results').addEventListener('blur', endTypeAhead);
 window.addEventListener('resize', scheduleRows);
 
 $('#rows').addEventListener('mousedown', (ev) => {
@@ -2366,7 +2367,63 @@ $('#select-all').addEventListener('change', (ev) => {
   renderRows();
 });
 
+// ---- type-ahead: typing a name's first letters picks it, as in Explorer ------------------
+
+const TYPE_PAUSE = 1000; // ms: after a longer pause the next letter starts over
+const typeAhead = { text: '', at: 0, timer: 0 };
+
+// A character typed in the list: the row whose name starts with what has been typed gets picked
+// (cursor and selection, as a click), searching on from the cursor and around. A new first letter
+// looks past the cursor row; more letters keep it while it still matches; the same letter again
+// and again steps through the rows starting with it. Space belongs to a prefix being typed
+// ("the m"), and otherwise ticks the checkbox as before. Returns whether the key was taken.
+function typeAheadKey(ev) {
+  if (ev.ctrlKey || ev.altKey || ev.metaKey || [...ev.key].length !== 1 || ev.key === '/') return false;
+  const t = typeAhead;
+  const now = performance.now();
+  const fresh = !t.text || now - t.at > TYPE_PAUSE;
+  if (ev.key === ' ' && fresh) return false;
+  t.text = fresh ? ev.key : t.text + ev.key;
+  t.at = now;
+  const typed = t.text.toLowerCase();
+  const cycling = [...typed].every((c) => c === typed[0]);
+  const want = cycling ? typed[0] : typed;
+  const n = state.hits.length;
+  let hit = -1;
+  const from = fresh || cycling ? state.cursor + 1 : Math.max(0, state.cursor);
+  for (let k = 0; k < n && hit < 0; ++k) {
+    const i = (from + k) % n;
+    if (state.hits[i].name.toLowerCase().startsWith(want)) hit = i;
+  }
+  if (hit >= 0) setCursor(hit);
+  showTypeHint(hit >= 0 || !n);
+  return true;
+}
+
+// The hint at the bottom of the list: what was typed, red when no name starts with it. It goes
+// with the pause that ends the prefix.
+function showTypeHint(found) {
+  const hint = $('#type-hint');
+  hint.textContent = typeAhead.text;
+  hint.classList.toggle('miss', !found);
+  hint.hidden = false;
+  clearTimeout(typeAhead.timer);
+  typeAhead.timer = setTimeout(endTypeAhead, TYPE_PAUSE);
+}
+
+function endTypeAhead() {
+  clearTimeout(typeAhead.timer);
+  typeAhead.text = '';
+  $('#type-hint').hidden = true;
+}
+
 $('#results').addEventListener('keydown', (ev) => {
+  if (typeAheadKey(ev)) {
+    ev.preventDefault();
+    return;
+  }
+  // Any other key (but Shift and the like, which come before capitals) ends the prefix.
+  if (!['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'].includes(ev.key)) endTypeAhead();
   if (ev.key === 'Backspace' || (ev.key === 'ArrowUp' && ev.altKey)) {
     ev.preventDefault();
     browseUp();
