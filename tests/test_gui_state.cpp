@@ -1,5 +1,6 @@
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "util.hpp"
 
 #include <doctest/doctest.h>
 
@@ -149,6 +150,41 @@ TEST_CASE("queue order: move an item before another, or to the end") {
     CHECK_FALSE(move_before(ids, 9, 1));
     CHECK_FALSE(move_before(ids, 1, 9));
     CHECK(ids == std::vector<int>{2, 1, 3, 4});
+}
+
+TEST_CASE("recent searches are sealed on disk and come back") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-recent";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "recent";
+    CHECK(load_recent(file).items.empty()); // none yet
+    auto items = json::parse(R"([{"q":"lioness s03","remote":"Main","path":"downloads/tv","exact":false,"kinds":["video"],"min":1073741824},)"
+                             R"({"q":"winrar","remote":"*"},"not an entry",7])");
+    REQUIRE(items.has_value());
+    REQUIRE(save_recent(file, *items));
+    const auto text = util::read_file(file);
+    REQUIRE(text.has_value());
+    CHECK(text->find("lioness") == std::string::npos); // sealed: not readable as text
+    const auto back = load_recent(file);
+    REQUIRE(back.items.size() == 2); // the objects only
+    CHECK(back.items[0].string_of("q") == "lioness s03");
+    CHECK(back.items[1].string_of("remote") == "*");
+
+    json::Value many = json::Value::make_array();
+    for (int i = 0; i < 30; ++i) {
+        json::Value e = json::Value::make_object();
+        e.set("q", json::Value::make_string("search " + std::to_string(i)));
+        many.push(std::move(e));
+    }
+    REQUIRE(save_recent(file, many));
+    CHECK(load_recent(file).items.size() == recent_max);
+    CHECK(load_recent(file).items[0].string_of("q") == "search 0"); // the newest are kept
+
+    REQUIRE(save_recent(file, json::Value::make_array())); // Clear history
+    CHECK_FALSE(std::filesystem::exists(file));
+    util::write_file_atomic(file, "[{\"q\":\"plain\"}]"); // not sealed: ignored
+    CHECK(load_recent(file).items.empty());
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("the download queue round-trips and skips incomplete entries") {

@@ -174,6 +174,23 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     at once. A server without a list yet is searched live the first time while its list is
     built, and so is a folder deeper than the list.
   - A result's Folder column opens its folder with the result picked.
+  - **Filters** (in the box) show only some file types and sizes, in search results and in the
+    open folder, at once:
+    - Types, several at a time: Folders, Video, Audio, Images, Text, Documents, Archives,
+      Programs, Disc images, Other (the kinds the icons show).
+    - Size: at least and at most (`700M`, `1.5G`, `20 GiB`; a bare number is MiB), or one of
+      the presets (under 100 MiB, 100 MiB – 1 GiB, 1 – 10 GiB, over 10 GiB). A file whose size
+      isn't known is hidden while a size is set.
+    - Folders show with Folders, or when no type is picked; in an open folder its folders always
+      show, so you can keep going.
+    - A strip above the list says what's on: "Showing 12 of 340 · video · at least 1.0 GiB ·
+      Clear filters". Select all and Download take what's shown. Filters last while the window
+      is open.
+  - **Recent searches:** click into the empty search box, or press ↓ there, for the last 20
+    searches with where they ran and their filters. Click or Enter runs one again there (that
+    server and folder, Exact and the filters); × removes one, "Clear history" all of them. They
+    are kept in `%APPDATA%\grab\recent`, encrypted for your Windows account (DPAPI) like the
+    file lists.
 - **All servers** (at the top of the server picker) starts with one folder per server, and a
   search there covers every server's list at once. Results show their server, and Download
   sends each pick to its own server, into the same Save-to folder. Two picks with the same name
@@ -487,6 +504,10 @@ grab config [-c PATH]
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
+      --type KINDS     only files of these kinds, comma-separated: video, audio, image, text,
+                       document, archive, program, disc, other (e.g. --type video,audio)
+      --min-size SIZE  only files at least this big: 700M, 1.5G, 20GiB (a bare number is MiB)
+      --max-size SIZE  only files at most this big
       --fresh          fetch the server's file list now instead of using a saved one
       --verify         check each download against the server's checksum (MD5) afterwards;
       --no-verify      don't. Without either, the setting in grab's window applies (off at first)
@@ -566,6 +587,11 @@ grab config [-c PATH]
     change. `--limit RATE` replaces the schedule, and `--limit off` downloads without a limit.
   - Measured on a Storage Box: one 898 MiB file took 1:09 this way and 1:50 with `--rclone`,
     minutes apart.
+- `--type`, `--min-size` and `--max-size` narrow the matching files before the pick list (and
+  `--first` / `--all`): `grab "limits" --type video --min-size 50M`. The kinds are the window's
+  (by extension: `.mkv` is video, `.r00` an archive). A file whose size isn't known doesn't
+  pass a size bound. They pick files, so they don't go with `-f`; when nothing is left, grab
+  says so: `grab: error: 12 files found, but none is video, at least 1.0 GiB` (exit code `3`).
 - `--rclone` downloads with plain `rclone copyto` / `rclone copy` instead, with rclone's own
   progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`, and the
   speed schedule a weekly `--bwlimit` timetable ("Mon-18:00,5120K Tue-00:00,off ..."). With
@@ -675,6 +701,7 @@ src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's
 src/verify.*    checking downloads against the server's checksum (rclone check)
 src/local_name.* server names as safe Windows names (rclone's encoding, device names)
 src/existing.*  a different file already there: replace, keep both ("name (2).ext") or skip
+src/file_type.* file kinds by extension (as the window's icons and filters), --type/--min-size
 src/browse.*    browse mode: a server's folders from its file list, deeper ones live
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone

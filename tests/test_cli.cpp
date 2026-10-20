@@ -106,6 +106,24 @@ TEST_CASE("--limit takes a speed like rclone's --bwlimit") {
     CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.limit.has_value()); // the speed schedule decides
 }
 
+TEST_CASE("--type, --min-size and --max-size narrow the file hits") {
+    using file_type::Kind;
+    const auto none = parse_args(args({"lioness"}));
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->opts.filter.active());
+    const auto r = parse_args(args({"lioness", "--type", "video, audio,video", "--min-size", "1G", "--max-size", "20GiB"}));
+    REQUIRE(r.has_value());
+    CHECK(r->opts.filter.kinds == std::vector<Kind>{Kind::video, Kind::audio});
+    CHECK(r->opts.filter.min_size == std::uint64_t{1} << 30);
+    CHECK(r->opts.filter.max_size == std::uint64_t{20} << 30);
+    CHECK_FALSE(parse_args(args({"lioness", "--type", "movies"})).has_value());
+    CHECK_FALSE(parse_args(args({"lioness", "--type", ","})).has_value());
+    CHECK_FALSE(parse_args(args({"lioness", "--min-size", "huge"})).has_value());
+    CHECK_FALSE(parse_args(args({"lioness", "--min-size", "2G", "--max-size", "1G"})).has_value());
+    CHECK_FALSE(parse_args(args({"-f", "Limits", "--type", "video"})).has_value()); // files only
+    CHECK_FALSE(parse_args(args({"lioness", "--type"})).has_value());
+}
+
 TEST_CASE("--existing answers the question before it is asked") {
     CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.existing.has_value());
     CHECK(parse_args(args({"movie.mkv", "--existing", "replace"}))->opts.existing == existing::Choice::replace);

@@ -3,6 +3,7 @@
 #include "rate.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <string_view>
 
@@ -54,6 +55,10 @@ Options:
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
+      --type KINDS     only files of these kinds, comma-separated: video, audio, image, text,
+                       document, archive, program, disc, other (e.g. --type video,audio)
+      --min-size SIZE  only files at least this big: 700M, 1.5G, 20GiB (a bare number is MiB)
+      --max-size SIZE  only files at most this big
       --fresh          fetch the server's file list now instead of using a saved one
       --verify         check each download against the server's checksum (MD5) afterwards;
       --no-verify      don't. Without either, the setting in grab's window applies (off at first)
@@ -169,6 +174,29 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             result.opts.limit = *bytes;
         } else if (name == "--verify" || name == "--no-verify") {
             result.opts.verify = name == "--verify";
+        } else if (name == "--type") {
+            auto v = take_value();
+            if (!v) return util::fail(v.error());
+            std::string_view list = *v;
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                const auto part = util::trim(list.substr(0, comma));
+                list.remove_prefix(comma == std::string_view::npos ? list.size() : comma + 1);
+                if (part.empty()) continue;
+                const auto kind = file_type::parse(part);
+                if (!kind) return util::failf("--type takes {}; got '{}'", file_type::names(), part);
+                auto& kinds = result.opts.filter.kinds;
+                if (std::ranges::find(kinds, *kind) == kinds.end()) kinds.push_back(*kind);
+            }
+            if (result.opts.filter.kinds.empty()) return util::failf("--type takes {}", file_type::names());
+        } else if (name == "--min-size" || name == "--max-size") {
+            auto v = take_value();
+            if (!v) return util::fail(v.error());
+            const auto bytes = file_type::parse_size(*v);
+            if (!bytes) {
+                return util::failf("{} takes a size like 700M, 1.5G or 20GiB (a bare number is MiB); got '{}'", name, *v);
+            }
+            (name == "--min-size" ? result.opts.filter.min_size : result.opts.filter.max_size) = *bytes;
         } else if (name == "--existing") {
             auto v = take_value();
             if (!v) return util::fail(v.error());
@@ -246,6 +274,13 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
 
     result.opts.mode = mode.value_or(Mode::file); // a bare `grab NAME` looks for files
     result.opts.target = positionals[0];
+    const auto& filter = result.opts.filter;
+    if (filter.active() && result.opts.mode == Mode::folder) {
+        return util::fail("--type, --min-size and --max-size pick files; they don't apply with -f");
+    }
+    if (filter.min_size && filter.max_size && *filter.min_size > *filter.max_size) {
+        return util::fail("--min-size is bigger than --max-size");
+    }
     if (positionals.size() == 2) {
         if (util::trim(positionals[1]).empty()) return util::fail("DEST must not be empty");
         result.opts.dest = util::path_from_utf8(positionals[1]);

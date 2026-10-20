@@ -349,12 +349,14 @@ svg.ico .mark { fill: var(--panel); }
   box-shadow: none;
 }
 /* The search box: magnifier, the words, a spinner while searching, Exact and clear. */
+/* The box and its panels (Filters, recent searches) under it. */
+.search-wrap { position: relative; display: flex; flex: 0 1 320px; min-width: 220px; }
 .search {
   display: flex;
   align-items: center;
   gap: 2px;
-  flex: 0 1 320px;
-  min-width: 220px;
+  flex: 1;
+  min-width: 0;
   height: 34px;
   padding: 0 3px 0 9px;
   background: var(--input);
@@ -382,6 +384,55 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
   border-radius: 8px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
 }
+/* Filters and recent searches: panels under the search box. */
+.search-pop {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 5px);
+  right: 0;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  cursor: default;
+}
+.filters { width: 360px; }
+.f-head { margin: 2px 0 6px; font-weight: 600; color: var(--muted); font-size: 12px; }
+.f-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chip { height: 26px; padding: 0 10px; border-radius: 13px; font-size: 12px; background: transparent; }
+.chip[aria-pressed=true] { background: var(--sel); border-color: var(--sel-line); color: var(--accent); font-weight: 600; }
+.f-size { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.f-size input { width: 110px; height: 28px; }
+.f-size input.bad { border-color: var(--danger); }
+.f-foot { display: flex; align-items: center; gap: 8px; justify-content: space-between; padding-top: 8px; border-top: 1px solid var(--line); }
+.f-count { display: inline-block; min-width: 16px; margin-left: 4px; padding: 0 4px; border-radius: 8px; background: var(--accent); color: var(--accent-text); font-size: 11px; line-height: 16px; text-align: center; }
+.recent { left: 0; right: 0; max-height: 360px; padding: 4px; overflow-y: auto; }
+.recent .opt { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 4px 0 8px; border-radius: 5px; white-space: nowrap; }
+.recent .opt:hover { background: var(--hover); }
+.recent .opt.on { background: var(--sel); }
+.recent .r-q { flex: none; max-width: 55%; overflow: hidden; text-overflow: ellipsis; }
+.recent .r-where { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+.recent .r-del { flex: none; width: 22px; height: 22px; padding: 0; border: 0; background: transparent; color: var(--muted); visibility: hidden; }
+.recent .opt:hover .r-del, .recent .opt.on .r-del { visibility: visible; }
+.recent .r-del:hover { color: var(--danger); }
+.recent .r-head, .recent .r-foot { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; color: var(--muted); font-size: 12px; }
+.filter-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 14px 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--sel-line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.filter-strip .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.filter-strip .link, .search-pop .link { flex: none; height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); cursor: pointer; }
+.filter-strip .link:hover, .search-pop .link:hover { text-decoration: underline; }
 .suggest .opt { display: flex; align-items: center; height: 26px; padding: 0 8px; border-radius: 5px; white-space: nowrap; }
 .suggest .opt:hover { background: var(--hover); }
 .suggest .opt.on { background: var(--sel); }

@@ -117,6 +117,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       config_path_(std::move(config_path)),
       state_path_(std::move(state_path)),
       queue_path_(state_path_.parent_path() / "queue.json"),
+      recent_path_(state_path_.parent_path() / "recent"),
       state_(load_gui_state(state_path_)),
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     parallel_ = state_.parallel;
@@ -520,6 +521,8 @@ void App::on_message(const std::string& text) {
         const Value* mibps = msg->find("mibps");
         set_limit(bool_of(*msg, "on"),
                   mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps);
+    } else if (type == "setRecent") {
+        if (const Value* items = msg->find("items")) save_recent(recent_path_, *items);
     } else if (type == "setVerify") {
         state_.verify_downloads = bool_of(*msg, "on");
         verify_downloads_ = state_.verify_downloads;
@@ -611,6 +614,7 @@ void App::send_init() {
     init.set("updateCheck", Value::make_bool(state_.update_check));
     init.set("verifyDownloads", Value::make_bool(state_.verify_downloads));
     init.set("configPath", str(util::path_to_utf8(config_path_)));
+    init.set("recent", load_recent(recent_path_));
 
     Value remotes = Value::make_array();
     std::string selected;

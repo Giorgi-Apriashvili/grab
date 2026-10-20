@@ -7,11 +7,45 @@
 #include <algorithm>
 #include <fstream>
 #include <optional>
+#include <string>
+#include <system_error>
 #include <utility>
 
 namespace grab {
 
 std::filesystem::path default_gui_state_path() { return util::config_home() / "grab" / "gui.json"; }
+
+namespace {
+constexpr std::string_view recent_header = "grab-recent-searches-sealed 1\n";
+constexpr std::string_view recent_purpose = "grab recent searches";
+} // namespace
+
+json::Value load_recent(const std::filesystem::path& file) {
+    auto data = util::read_file(file);
+    if (!data || !data->starts_with(recent_header)) return json::Value::make_array();
+    const auto text = util::unprotect_for_user(std::string_view(*data).substr(recent_header.size()), recent_purpose);
+    if (!text) return json::Value::make_array(); // another user's, or damaged
+    auto doc = json::parse(*text);
+    if (!doc || doc->kind != json::Value::Kind::array) return json::Value::make_array();
+    return *doc;
+}
+
+bool save_recent(const std::filesystem::path& file, const json::Value& items) {
+    json::Value kept = json::Value::make_array();
+    if (items.kind == json::Value::Kind::array) {
+        for (const auto& it : items.items) {
+            if (kept.items.size() == recent_max) break;
+            if (it.kind == json::Value::Kind::object && json::stringify(it).size() <= 4096) kept.push(it);
+        }
+    }
+    std::error_code ec;
+    if (kept.items.empty()) {
+        std::filesystem::remove(file, ec);
+        return !ec;
+    }
+    const auto sealed = util::protect_for_user(json::stringify(kept), recent_purpose);
+    return sealed && util::write_file_atomic(file, std::string(recent_header) + *sealed);
+}
 
 std::optional<SortOrder> sort_from_json(const json::Value& v) {
     auto key = v.string_of("key");

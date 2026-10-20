@@ -51,18 +51,57 @@
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>
       </button>
     </div>
-    <form id="search-form" class="search" autocomplete="off" role="search">
-      <svg class="search-ico" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 10.5 3.6 3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      <input id="query" type="text" spellcheck="false" autofocus aria-label="Search">
-      <span id="search-spin" class="spinner" hidden></span>
-      <button id="exact" type="button" class="toggle" aria-pressed="false" title="Exact: match the whole name, case-sensitive">Exact</button>
-      <button id="search-clear" type="button" class="subtle icon-btn" title="Clear (Esc)" aria-label="Clear" hidden>
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      </button>
-    </form>
+    <div class="search-wrap">
+      <form id="search-form" class="search" autocomplete="off" role="search">
+        <svg class="search-ico" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 10.5 3.6 3.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <input id="query" type="text" spellcheck="false" autofocus aria-label="Search">
+        <span id="search-spin" class="spinner" hidden></span>
+        <button id="filters-btn" type="button" class="toggle" aria-pressed="false" aria-expanded="false" aria-controls="filters"
+                title="Show only some file types or sizes">Filters</button>
+        <button id="exact" type="button" class="toggle" aria-pressed="false" title="Exact: match the whole name, case-sensitive">Exact</button>
+        <button id="search-clear" type="button" class="subtle icon-btn" title="Clear (Esc)" aria-label="Clear" hidden>
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </form>
+      <!-- What the list shows: file types and sizes (search results and the open folder). -->
+      <div id="filters" class="search-pop filters" role="dialog" aria-label="Filters" hidden>
+        <div class="f-head">Types</div>
+        <div class="f-chips" id="f-kinds">
+          <button type="button" class="chip" data-kind="folder" aria-pressed="false">Folders</button>
+          <button type="button" class="chip" data-kind="video" aria-pressed="false">Video</button>
+          <button type="button" class="chip" data-kind="audio" aria-pressed="false">Audio</button>
+          <button type="button" class="chip" data-kind="image" aria-pressed="false">Images</button>
+          <button type="button" class="chip" data-kind="text" aria-pressed="false">Text</button>
+          <button type="button" class="chip" data-kind="document" aria-pressed="false">Documents</button>
+          <button type="button" class="chip" data-kind="archive" aria-pressed="false">Archives</button>
+          <button type="button" class="chip" data-kind="program" aria-pressed="false">Programs</button>
+          <button type="button" class="chip" data-kind="disc" aria-pressed="false">Disc images</button>
+          <button type="button" class="chip" data-kind="file" aria-pressed="false">Other</button>
+        </div>
+        <div class="f-head">Size</div>
+        <div class="f-size">
+          <input id="f-min" type="text" spellcheck="false" placeholder="Any" aria-label="At least" title="At least: 700M, 1.5G, 20 GiB (a bare number is MiB)">
+          <span class="muted">to</span>
+          <input id="f-max" type="text" spellcheck="false" placeholder="Any" aria-label="At most" title="At most: 700M, 1.5G, 20 GiB (a bare number is MiB)">
+        </div>
+        <div class="f-chips" id="f-presets">
+          <button type="button" class="chip" data-min="" data-max="100M">Under 100 MiB</button>
+          <button type="button" class="chip" data-min="100M" data-max="1G">100 MiB – 1 GiB</button>
+          <button type="button" class="chip" data-min="1G" data-max="10G">1 – 10 GiB</button>
+          <button type="button" class="chip" data-min="10G" data-max="">Over 10 GiB</button>
+        </div>
+        <div class="f-foot">
+          <span class="muted small">In a folder, its folders always show.</span>
+          <button type="button" id="f-clear" class="link">Clear filters</button>
+        </div>
+      </div>
+      <!-- Recent searches: under the empty search box. -->
+      <div id="recent" class="search-pop recent" role="listbox" aria-label="Recent searches" hidden></div>
+    </div>
   </div>
 
   <div id="banner" class="banner" hidden></div>
+  <div id="filter-strip" class="filter-strip" role="status" hidden></div>
 
   <main class="results-wrap">
     <div class="results-head row">

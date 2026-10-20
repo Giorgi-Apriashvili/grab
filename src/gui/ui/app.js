@@ -28,6 +28,16 @@ const state = {
   // The rows' order: key '' (the default), name, size or modified. A Size sort's `then` is the
   // sort before it, which orders the folders (they have no size); null for their default order.
   sort: { key: '', dir: 'asc', then: null },
+  // What the list shows: file types (icon kinds, 'folder', 'file' for others) and size bounds in
+  // bytes (null: none), with the size fields' text. For the window's run; a recent search
+  // brings its own.
+  filters: { kinds: new Set(), min: null, max: null, minText: '', maxText: '' },
+  results: [],           // the search's hits before the filters
+  filterTotal: 0,        // the rows before the filters (after the words that filter a folder)
+  recent: [],            // recent searches, newest first (the backend keeps them sealed)
+  recentLoaded: false,
+  recentSel: -1,
+  pendingSearch: null,   // a recent search, run once its folder is open
   searchId: 0,
   searching: false,
   searchStarted: 0,
@@ -227,7 +237,9 @@ function onSearchResult(msg) {
   const cursorKey = msg.update && state.hits[state.cursor] ? rowKey(state.hits[state.cursor]) : null;
   const shown = msg.update && cursorShown(); // a sorted update can move the cursor row far away
   msg.hits.forEach((h, i) => { h.ord = i; }); // best match first: the default order
-  state.hits = sortRows(msg.hits);
+  state.results = msg.hits;
+  state.filterTotal = msg.hits.length;
+  state.hits = sortRows(applyFilters(msg.hits, false));
   state.lists = msg.lists || [];
   if (msg.update) {
     state.selected = new Set();
@@ -323,7 +335,9 @@ function renderEmpty() {
   const b = state.browse;
   const filter = $('#query').value.trim();
   const u = b.under;
-  if (state.searching && u) {
+  if (filtersOn() && state.filterTotal > 0 && !state.searching && !b.loading) {
+    empty.textContent = `None of the ${state.filterTotal} ${u ? 'results' : 'items here'} ${state.filterTotal === 1 ? 'matches' : 'match'} the filters.`;
+  } else if (state.searching && u) {
     empty.innerHTML = `<span><span class="spinner"></span>Searching ${u.all ? 'every server' : `${esc(u.name)} and its folders`}` +
       ` for “${esc(state.lastQuery)}”…</span>`;
   } else if (u && u.error) {
@@ -350,6 +364,7 @@ function selectedHits() {
 }
 
 function renderSummary() {
+  renderFilterStrip();
   const sel = [...state.selected].map((i) => state.hits[i]);
   const bytes = sel.reduce((sum, h) => sum + (h.size || 0), 0);
   const unknown = sel.some((h) => h.size == null); // folders have no size: at least this much
@@ -888,6 +903,234 @@ function itemIcon(name, dir) {
   return dir ? FOLDER_ICON : FILE_ICONS[iconKind(name.slice(name.lastIndexOf('/') + 1))];
 }
 
+// ---- filters: file types and sizes ---------------------------------------------------------
+
+const FILTER_LABEL = {
+  folder: 'folders', video: 'video', audio: 'audio', image: 'images', text: 'text', document: 'documents',
+  archive: 'archives', program: 'programs', disc: 'disc images', file: 'other files',
+};
+
+const filtersOn = () => state.filters.kinds.size > 0 || state.filters.min !== null || state.filters.max !== null;
+
+// A size as typed: 700M, 700 MB, 1.5G, 20GiB, 500B (K/M/G/T are 1024-based); a bare number is
+// MiB. null for anything else. The same rules as the command's --min-size (src/file_type.cpp).
+function parseSize(text) {
+  let s = text.replace(/\s+/g, '').toLowerCase();
+  if (!s) return null;
+  let unit = 2 ** 20;
+  if (s.endsWith('ib')) {
+    s = s.slice(0, -2);
+    if (!/[kmgt]$/.test(s)) return null;
+  } else if (s.endsWith('b')) {
+    s = s.slice(0, -1);
+    if (!s) return null;
+    if (!/[kmgt]$/.test(s)) unit = 1;
+  }
+  const m = /^(\d+(?:\.\d*)?|\.\d+)([kmgt])?$/.exec(s);
+  if (!m) return null;
+  if (m[2]) unit = 1024 ** ('kmgt'.indexOf(m[2]) + 1);
+  return Math.round(Number(m[1]) * unit);
+}
+
+// Whether a row shows. Types and sizes pick files; folders show with Folders, or with no type
+// picked, and always in a folder view (`inFolder`), to keep moving through them. A file of
+// unknown size doesn't show while a size bound is set.
+function passesFilters(h, inFolder) {
+  const f = state.filters;
+  if (h.server) return true;
+  if (h.dir) return inFolder || f.kinds.size === 0 || f.kinds.has('folder');
+  if (f.kinds.size && !f.kinds.has(iconKind(h.name))) return false;
+  if (f.min !== null || f.max !== null) {
+    if (typeof h.size !== 'number') return false;
+    if (f.min !== null && h.size < f.min) return false;
+    if (f.max !== null && h.size > f.max) return false;
+  }
+  return true;
+}
+const applyFilters = (list, inFolder) => (filtersOn() ? list.filter((h) => passesFilters(h, inFolder)) : list.slice());
+
+// "video or audio · at least 1.0 GiB"
+function filtersText() {
+  const f = state.filters;
+  const parts = [];
+  if (f.kinds.size) parts.push([...f.kinds].map((k) => FILTER_LABEL[k]).join(' or '));
+  if (f.min !== null && f.max !== null) parts.push(`${fmtSize(f.min)} to ${fmtSize(f.max)}`);
+  else if (f.min !== null) parts.push(`at least ${fmtSize(f.min)}`);
+  else if (f.max !== null) parts.push(`at most ${fmtSize(f.max)}`);
+  return parts.join(' · ');
+}
+
+// The list again with the filters as they are now; the selection and cursor stay on their rows.
+function refilter() {
+  if (!state.browse.under) {
+    showFolder({ keep: true });
+  } else {
+    const picked = new Set([...state.selected].map((i) => state.hits[i] && rowKey(state.hits[i])));
+    const cursorKey = state.hits[state.cursor] ? rowKey(state.hits[state.cursor]) : null;
+    state.hits = sortRows(applyFilters(state.results, false));
+    state.selected = new Set();
+    state.hits.forEach((h, i) => { if (picked.has(rowKey(h))) state.selected.add(i); });
+    const c = cursorKey ? state.hits.findIndex((h) => rowKey(h) === cursorKey) : -1;
+    state.cursor = c >= 0 ? c : (state.hits.length ? 0 : -1);
+    state.anchor = state.cursor;
+    renderRows();
+  }
+  renderFilters();
+}
+
+// The button, the panel's chips and fields, and the strip above the list.
+function renderFilters() {
+  const f = state.filters;
+  const n = f.kinds.size + (f.min !== null || f.max !== null ? 1 : 0);
+  const btn = $('#filters-btn');
+  btn.innerHTML = n ? `Filters<span class="f-count">${n}</span>` : 'Filters';
+  btn.setAttribute('aria-pressed', String(n > 0));
+  btn.title = n ? `Showing only ${filtersText()}` : 'Show only some file types or sizes';
+  for (const chip of document.querySelectorAll('#f-kinds .chip')) {
+    chip.setAttribute('aria-pressed', String(f.kinds.has(chip.dataset.kind)));
+  }
+  for (const chip of document.querySelectorAll('#f-presets .chip')) {
+    const on = (parseSize(chip.dataset.min) ?? null) === f.min && (parseSize(chip.dataset.max) ?? null) === f.max;
+    chip.setAttribute('aria-pressed', String(on && n > 0));
+  }
+  for (const [id, text] of [['#f-min', f.minText], ['#f-max', f.maxText]]) {
+    const input = $(id);
+    if (document.activeElement !== input) input.value = text;
+    input.classList.toggle('bad', !!input.value.trim() && parseSize(input.value) === null);
+  }
+  renderFilterStrip();
+}
+
+function renderFilterStrip() {
+  const strip = $('#filter-strip');
+  const on = filtersOn() && (!!state.browse.under || !!state.browse.server);
+  strip.hidden = !on;
+  if (!on) return;
+  strip.innerHTML = `<span class="what">Showing ${state.hits.length} of ${state.filterTotal} · ${esc(filtersText())}</span>` +
+    '<button type="button" class="link" data-act="clear-filters">Clear filters</button>';
+}
+
+function clearFilters() {
+  state.filters = { kinds: new Set(), min: null, max: null, minText: '', maxText: '' };
+  refilter();
+}
+
+function openFilters(open) {
+  $('#filters').hidden = !open;
+  $('#filters-btn').setAttribute('aria-expanded', String(open));
+  if (open) {
+    showRecent(false);
+    renderFilters();
+  }
+}
+
+// A size field typed: applied when it reads as a size (or is empty); red otherwise.
+function onSizeInput(which) {
+  const input = $(which === 'min' ? '#f-min' : '#f-max');
+  const text = input.value.trim();
+  const bytes = text ? parseSize(text) : null;
+  input.classList.toggle('bad', !!text && bytes === null);
+  if (text && bytes === null) return;
+  state.filters[which] = bytes;
+  state.filters[`${which}Text`] = text;
+  refilter();
+}
+
+// ---- recent searches -----------------------------------------------------------------------
+
+const RECENT_MAX = 20;
+
+const recentKey = (e) => [e.q, e.remote, e.server, e.top ? '' : e.path, e.exact].join('\u0001');
+
+// A search that runs (Enter, or a recent one again) goes to the top, with where it ran and the
+// filters on at the time.
+function recordRecent(query) {
+  const b = state.browse;
+  const f = state.filters;
+  const e = {
+    q: query, remote: state.remote, server: b.server, path: b.top ? '' : b.path, top: !b.server || b.top,
+    exact: exactOn(), kinds: [...f.kinds], min: f.min, max: f.max, minText: f.minText, maxText: f.maxText,
+  };
+  const key = recentKey(e);
+  state.recent = [e, ...state.recent.filter((r) => recentKey(r) !== key)].slice(0, RECENT_MAX);
+  send({ type: 'setRecent', items: state.recent });
+}
+
+// "Main › downloads/tv · Exact · video, at least 1.0 GiB"
+function recentWhere(e) {
+  const where = e.server ? (e.top || !e.path ? e.server : `${e.server} › ${e.path}`) : 'All servers';
+  const extra = [];
+  if (e.exact) extra.push('Exact');
+  const kinds = (e.kinds || []).map((k) => FILTER_LABEL[k]).filter(Boolean);
+  if (kinds.length) extra.push(kinds.join(' or '));
+  if (typeof e.min === 'number' && typeof e.max === 'number') extra.push(`${fmtSize(e.min)} to ${fmtSize(e.max)}`);
+  else if (typeof e.min === 'number') extra.push(`≥ ${fmtSize(e.min)}`);
+  else if (typeof e.max === 'number') extra.push(`≤ ${fmtSize(e.max)}`);
+  return [where, ...extra].join(' · ');
+}
+
+function showRecent(open) {
+  const box = $('#recent');
+  if (open && !state.recent.length) open = false;
+  box.hidden = !open;
+  if (!open) {
+    state.recentSel = -1;
+    return;
+  }
+  $('#filters').hidden = true;
+  $('#filters-btn').setAttribute('aria-expanded', 'false');
+  box.innerHTML = '<div class="r-head"><span>Recent searches</span></div>' + state.recent.map((e, i) =>
+    `<div class="opt${i === state.recentSel ? ' on' : ''}" role="option" data-i="${i}" title="${esc(`${e.q} — ${recentWhere(e)}`)}">` +
+    `<span class="r-q">${esc(e.q)}</span><span class="r-where">${esc(recentWhere(e))}</span>` +
+    `<button type="button" class="r-del" data-del="${i}" title="Remove from recent searches" aria-label="Remove">×</button></div>`).join('') +
+    '<div class="r-foot"><span></span><button type="button" class="link" data-act="clear-recent">Clear history</button></div>';
+}
+
+// Runs a recent search again where it ran: that server and folder, Exact and the filters.
+function runRecent(e) {
+  showRecent(false);
+  const known = e.remote === ALL ? state.remotes.length > 1 : state.remotes.some((r) => r.name === e.remote);
+  if (!known || (e.server && !state.remotes.some((r) => r.name === e.server))) {
+    showBanner(`“${e.q}” was searched on a server that isn't configured any more.`);
+    return;
+  }
+  state.filters = {
+    kinds: new Set((e.kinds || []).filter((k) => FILTER_LABEL[k])),
+    min: typeof e.min === 'number' ? e.min : null, max: typeof e.max === 'number' ? e.max : null,
+    minText: e.minText || '', maxText: e.maxText || '',
+  };
+  $('#exact').setAttribute('aria-pressed', String(!!e.exact));
+  renderFilters();
+  if (e.remote !== state.remote) pickRemote(e.remote, false);
+  const b = state.browse;
+  const here = b.inited && !b.loading && (b.server || '') === (e.server || '') &&
+    (!e.server || (b.top ? e.top : !e.top && b.path === e.path));
+  state.pendingSearch = e.q;
+  if (here) {
+    runPendingSearch(true);
+    return;
+  }
+  browseTo(e.server || '', e.path || '', !!e.top);
+  if (!state.browse.loading) runPendingSearch(true); // All servers' top opens at once
+}
+
+function runPendingSearch(ok) {
+  const q = state.pendingSearch;
+  state.pendingSearch = null;
+  if (!ok || !q) return;
+  $('#query').value = q;
+  renderSearchBox();
+  searchBelow(q);
+}
+
+function removeRecent(i) {
+  state.recent.splice(i, 1);
+  send({ type: 'setRecent', items: state.recent });
+  if (state.recentSel >= state.recent.length) state.recentSel = state.recent.length - 1;
+  showRecent(state.recent.length > 0);
+  $('#query').focus();
+}
+
 // Sets an icon element's SVG, only when it changes (queue rows are updated in place often).
 function setIcon(el, name, dir) {
   const key = dir ? ':dir' : iconKind(name.slice(name.lastIndexOf('/') + 1));
@@ -914,11 +1157,12 @@ function browseHere() {
 // The folder's rows: its items, filtered by the words typed (every word, in any order).
 function filteredItems() {
   const words = $('#query').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  if (!words.length) return state.browse.items;
-  return state.browse.items.filter((it) => {
+  const named = !words.length ? state.browse.items : state.browse.items.filter((it) => {
     const name = it.name.toLowerCase();
     return words.every((w) => name.includes(w));
   });
+  state.filterTotal = named.length;
+  return applyFilters(named, true);
 }
 
 // Shows the folder in the results table. `keep`: the selection and cursor stay on the same
@@ -965,7 +1209,11 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   if (elsewhere) $('#query').value = '';
   if (!history) navTo({ remote: state.remote, server, path: top ? '' : path, top: !server || top });
   b.inited = true;
-  if (b.under) stopSearch();
+  if (b.under) {
+    stopSearch();
+    state.lists = []; // the search's sources: the footer shows the folder's own from now on
+    renderListStatus();
+  }
   b.under = null;
   b.typed = null;
   b.pendingScroll = scroll;
@@ -1046,6 +1294,7 @@ function onBrowseResult(msg) {
     showFolder({ keep: msg.update || b.keepSelection, select: b.pendingSelect });
     if (!msg.error && wasLoading) remember();
     navShown();
+    if (state.pendingSearch && wasLoading) runPendingSearch(!msg.error);
   }
   b.pendingSelect = null;
   b.keepSelection = false;
@@ -1181,6 +1430,9 @@ function searchBelow(query) {
   showBanner('');
   b.under = { query, path: b.path, all, whole, name: browseHere() };
   state.addr.error = ''; // a failed address is behind us
+  recordRecent(query);
+  state.results = [];
+  state.filterTotal = 0;
   state.searchId += 1;
   state.lastQuery = query;
   state.searchStarted = performance.now();
@@ -1507,6 +1759,7 @@ $('#browse-refresh').addEventListener('click', () => {
   if (b.server) browseTo(b.server, b.path, b.top, { live: true });
 });
 $('#query').addEventListener('input', () => {
+  showRecent(false);
   if (!state.browse.under) showFolder({ keep: true });
   renderSearchBox();
 });
@@ -1519,7 +1772,7 @@ $('#search-form').addEventListener('keydown', (ev) => {
   clearSearch();
 });
 // Exact and ✕ leave the typing where it is.
-for (const id of ['#exact', '#search-clear']) $(id).addEventListener('mousedown', (ev) => ev.preventDefault());
+for (const id of ['#exact', '#search-clear', '#filters-btn']) $(id).addEventListener('mousedown', (ev) => ev.preventDefault());
 function clearSearch() {
   if (state.searching) {
     stopSearch();
@@ -2139,6 +2392,10 @@ function cancelAll() {
 // ---- messages from the backend -----------------------------------------------------------
 
 function onInit(msg) {
+  if (!state.recentLoaded) {
+    state.recent = Array.isArray(msg.recent) ? msg.recent : [];
+    state.recentLoaded = true;
+  }
   // Sent again after every server change; folders typed here but not used yet win.
   state.destinations = { ...msg.destinations, ...state.destinations };
   state.remotes = msg.remotes;
@@ -2723,7 +2980,111 @@ if (webview) {
 
 // ---- events ------------------------------------------------------------------------------
 
-$('#search-form').addEventListener('submit', (ev) => { ev.preventDefault(); startSearch(); });
+$('#search-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  if (!$('#recent').hidden && state.recentSel >= 0) {
+    runRecent(state.recent[state.recentSel]);
+    return;
+  }
+  showRecent(false);
+  openFilters(false);
+  startSearch();
+});
+
+// Filters: the button opens the panel; chips, sizes and presets apply at once.
+$('#filters-btn').addEventListener('click', () => openFilters($('#filters').hidden));
+$('#filters').addEventListener('click', (ev) => {
+  const kind = ev.target.closest('#f-kinds .chip');
+  if (kind) {
+    const k = kind.dataset.kind;
+    if (state.filters.kinds.has(k)) state.filters.kinds.delete(k); else state.filters.kinds.add(k);
+    refilter();
+    return;
+  }
+  const preset = ev.target.closest('#f-presets .chip');
+  if (preset) {
+    const f = state.filters;
+    const same = preset.getAttribute('aria-pressed') === 'true';
+    f.minText = same ? '' : preset.dataset.min;
+    f.maxText = same ? '' : preset.dataset.max;
+    f.min = f.minText ? parseSize(f.minText) : null;
+    f.max = f.maxText ? parseSize(f.maxText) : null;
+    $('#f-min').value = f.minText;
+    $('#f-max').value = f.maxText;
+    refilter();
+    return;
+  }
+  if (ev.target.closest('#f-clear')) {
+    clearFilters();
+    $('#f-min').value = '';
+    $('#f-max').value = '';
+  }
+});
+$('#f-min').addEventListener('input', () => onSizeInput('min'));
+$('#f-max').addEventListener('input', () => onSizeInput('max'));
+// Esc in the panel closes it.
+$('#filters').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    ev.preventDefault();
+    ev.stopPropagation();
+    openFilters(false);
+    $('#filters-btn').focus();
+  }
+});
+$('#filter-strip').addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-act="clear-filters"]')) clearFilters();
+});
+// Outside the panels closes them.
+document.addEventListener('mousedown', (ev) => {
+  if (!$('#filters').hidden && !ev.target.closest('#filters') && !ev.target.closest('#filters-btn')) openFilters(false);
+  if (!$('#recent').hidden && !ev.target.closest('#recent') && ev.target !== $('#query')) showRecent(false);
+});
+
+// Recent searches: a click into the empty search box, or ↓ there.
+$('#query').addEventListener('mousedown', () => {
+  if (!$('#query').value) setTimeout(() => showRecent($('#recent').hidden), 0);
+});
+$('#query').addEventListener('keydown', (ev) => {
+  const box = $('#recent');
+  if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+    if (box.hidden) {
+      if (ev.key === 'ArrowDown' && !$('#query').value && state.recent.length) {
+        ev.preventDefault();
+        state.recentSel = 0;
+        showRecent(true);
+      }
+      return;
+    }
+    ev.preventDefault();
+    const n = state.recent.length;
+    state.recentSel = ev.key === 'ArrowDown' ? (state.recentSel + 1) % n : (state.recentSel <= 0 ? n - 1 : state.recentSel - 1);
+    showRecent(true);
+    box.querySelector('.opt.on')?.scrollIntoView({ block: 'nearest' });
+  } else if (ev.key === 'Delete' && !box.hidden && state.recentSel >= 0) {
+    ev.preventDefault();
+    removeRecent(state.recentSel);
+  } else if (ev.key === 'Escape' && !box.hidden) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    showRecent(false);
+  }
+});
+$('#recent').addEventListener('mousedown', (ev) => ev.preventDefault()); // the search box keeps the focus
+$('#recent').addEventListener('click', (ev) => {
+  const del = ev.target.closest('[data-del]');
+  if (del) {
+    removeRecent(Number(del.dataset.del));
+    return;
+  }
+  if (ev.target.closest('[data-act="clear-recent"]')) {
+    state.recent = [];
+    send({ type: 'setRecent', items: [] });
+    showRecent(false);
+    return;
+  }
+  const opt = ev.target.closest('.opt[data-i]');
+  if (opt) runRecent(state.recent[Number(opt.dataset.i)]);
+});
 
 // The server picked (also by an address typed for another server); `enter`: Browse opens its
 // folder (not when a typed address opens one instead).
@@ -3063,4 +3424,5 @@ if (webview) {
 }
 renderSearchBox();
 renderSortHead();
+renderFilters();
 renderRows();

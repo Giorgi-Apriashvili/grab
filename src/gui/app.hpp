@@ -365,6 +365,7 @@ private:
     std::filesystem::path config_path_;
     std::filesystem::path state_path_;
     std::filesystem::path queue_path_;
+    std::filesystem::path recent_path_; // recent searches, sealed (gui_state.hpp)
     GuiState state_;
     fetch::Connections connections_;
     rate::RateLimiter limiter_; // shared by every download's streams

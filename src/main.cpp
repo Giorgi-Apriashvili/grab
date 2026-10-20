@@ -416,6 +416,16 @@ int run(const Options& opts) {
     }
 
     const Query query = make_query(opts.target, opts.exact);
+    // --type, --min-size, --max-size: the hits that are such files.
+    const std::size_t unfiltered = found->hits.size();
+    if (opts.filter.active()) {
+        std::erase_if(found->hits, [&](const engine::Hit& h) { return !opts.filter.matches(h.name, h.size); });
+        if (found->hits.empty() && unfiltered > 0) {
+            error(unfiltered == 1 ? std::format("1 file found, but it isn't {}", opts.filter.describe())
+                                  : std::format("{} files found, but none is {}", unfiltered, opts.filter.describe()));
+            return exit_not_found;
+        }
+    }
     if (found->hits.empty()) {
         if (is_path_target(opts.target)) {
             error(std::format("no {} at '{}' on {}", mode_noun(opts.mode), opts.target,

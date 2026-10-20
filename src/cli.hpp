@@ -1,6 +1,7 @@
 #pragma once
 
 #include "existing.hpp"
+#include "file_type.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -26,6 +27,7 @@ struct Options {
     std::optional<bool> verify;      // --verify / --no-verify; without either, the window's setting
     // --existing: a different file already where a download goes; without it, grab asks.
     std::optional<existing::Choice> existing;
+    file_type::Filter filter;        // --type, --min-size, --max-size: which file hits count
     bool first = false;
     bool all = false;                // --all: take every match without asking
     bool exact = false;              // --exact: whole-name, case-sensitive matching

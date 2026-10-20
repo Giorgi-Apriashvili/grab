@@ -6,6 +6,7 @@
 #include "json.hpp"
 #include "schedule.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -70,6 +71,15 @@ struct GuiState {
 };
 
 [[nodiscard]] std::filesystem::path default_gui_state_path(); // <config>/grab/gui.json
+
+// The window's recent searches (<config>/grab/recent): a JSON array of the page's entries, at
+// most recent_max, newest first. Sealed for the current Windows user (DPAPI), as the file lists
+// are: what was searched for is unreadable to other accounts and to a copy of the file.
+inline constexpr std::size_t recent_max = 20;
+// An empty array when there is none, or it isn't this user's or is damaged.
+[[nodiscard]] json::Value load_recent(const std::filesystem::path& file);
+// Keeps the first recent_max objects (an entry's text at most 4 KiB); none removes the file.
+bool save_recent(const std::filesystem::path& file, const json::Value& items);
 
 // One file of a folder download, as saved.
 struct SavedFile {
