@@ -117,6 +117,13 @@ private:
     // A video or audio file, in the program Windows plays it with: {remote, path}.
     void play(const json::Value& msg);
     [[nodiscard]] WebResource preview_answer(const std::string& remote, const std::string& path, bool ahead);
+    // The address of `path` on `remote`'s rclone serve (preview::where), once it says it has the
+    // file; when it answers 500 (a folder on the way the server doesn't let you list, as a
+    // Storage Box's "/"), from the file's own folder. `on_ready`: called when a server runs, before it is asked. announce: the
+    // status bar says when one starts (bg: as background work).
+    [[nodiscard]] std::expected<std::string, std::string> stream_url(const engine::Context& ctx, const std::string& remote,
+                                                                     const std::string& path, bool announce, bool bg,
+                                                                     const std::function<void()>& on_ready = {});
     void queue_preview(std::function<void()> job);
     void run_preview_jobs(const std::stop_token& stop);
     // A plaintext password or passphrase, overwritten when it is dropped.

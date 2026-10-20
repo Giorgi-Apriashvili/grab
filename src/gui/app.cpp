@@ -340,21 +340,19 @@ WebResource App::preview_answer(const std::string& remote, const std::string& pa
     if (max == 0) return preview_failed(415, "This kind of file has no preview.");
     auto ctx = engine::load_context(config_path_, remote);
     if (!ctx) return preview_failed(500, ctx.error());
-    const auto at = preview::where(path);
-    std::optional<Activity> starting;
-    if (!previews_.running(remote, at.root)) {
-        starting.emplace(*this, std::format("Starting a stream from {} (rclone serve http)…", remote), "serve:" + remote, ahead);
-    }
-    auto base = previews_.base(*ctx, remote, at.root);
-    if (!base && starting) starting->failed();
-    starting.reset();
-    if (!base) return preview_failed(502, base.error());
     const auto name = remote_basename(path);
     // Until the first bytes, rclone opens the file (the first one in a folder reads the folder).
-    Activity loading(*this, std::format("Opening {} on {}…", name, remote), std::string(), ahead);
-    auto got = http_get(*base + preview::url_path(at.path), max, [&](std::uint64_t done, std::uint64_t total) {
-        loading.progress(done, total,
-                         std::format("Loading {}: {} of {}", name, util::format_size(done), util::format_size(total)));
+    std::optional<Activity> loading;
+    const auto url = stream_url(*ctx, remote, path, true, ahead, [&] {
+        if (!loading) loading.emplace(*this, std::format("Opening {} on {}…", name, remote), std::string(), ahead);
+    });
+    if (!url) {
+        if (loading) loading->failed();
+        return preview_failed(502, url.error());
+    }
+    auto got = http_get(*url, max, [&](std::uint64_t done, std::uint64_t total) {
+        loading->progress(done, total,
+                          std::format("Loading {}: {} of {}", name, util::format_size(done), util::format_size(total)));
     });
     if (!got) return preview_failed(502, got.error());
     if (got->status == 404) return preview_failed(404, std::format("Not found on {}.", remote));
@@ -378,6 +376,36 @@ WebResource App::preview_answer(const std::string& remote, const std::string& pa
     return answer;
 }
 
+std::expected<std::string, std::string> App::stream_url(const engine::Context& ctx, const std::string& remote,
+                                                         const std::string& path, bool announce, bool bg,
+                                                         const std::function<void()>& on_ready) {
+    auto at = preview::where(path, engine::search_roots(ctx));
+    const auto folder = preview::in_folder(path);
+    while (true) {
+        std::optional<Activity> starting;
+        if (announce && !previews_.running(remote, at.root)) {
+            starting.emplace(*this, std::format("Starting a stream from {} (rclone serve http)…", remote), "serve:" + remote, bg);
+        }
+        auto base = previews_.base(ctx, remote, at.root);
+        if (!base) {
+            if (starting) starting->failed();
+            return util::fail(base.error());
+        }
+        starting.reset();
+        if (on_ready) on_ready();
+        auto url = *base + preview::url_path(at.path);
+        const auto status = http_status(url);
+        if (!status) return util::fail(status.error());
+        if (*status == 200 || *status == 206) return url;
+        if (*status == 404) return util::failf("Not found on {}.", remote);
+        if (*status == 500 && at != folder) {
+            at = folder;
+            continue;
+        }
+        return util::fail(previews_.failure(remote, at.root, at.path).value_or(std::format("{} answered {}.", remote, *status)));
+    }
+}
+
 void App::play(const Value& msg) {
     const std::string remote = msg.string_of("remote").value_or("");
     const std::string path = msg.string_of("path").value_or("");
@@ -395,17 +423,14 @@ void App::play(const Value& msg) {
         };
         auto ctx = engine::load_context(config_path_, remote);
         if (!ctx) return fail(ctx.error());
-        const auto at = preview::where(path);
         const auto name = remote_basename(path);
         const auto dot = name.rfind('.');
         // The player gets grab's own stream: what it reads while opening, fetched over several
         // connections first; the rest from rclone serve, which starts meanwhile. If grab's
         // stream can't start, rclone serve's.
         std::shared_future<std::expected<std::string, std::string>> upstream =
-            std::async(std::launch::async, [this, ctx = *ctx, remote, at]() -> std::expected<std::string, std::string> {
-                auto base = previews_.base(ctx, remote, at.root);
-                if (!base) return util::fail(base.error());
-                return *base + preview::url_path(at.path);
+            std::async(std::launch::async, [this, ctx = *ctx, remote, path] {
+                return stream_url(ctx, remote, path, false, true);
             }).share();
         connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
         PlayServer::File file{fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, path,

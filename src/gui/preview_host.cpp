@@ -8,9 +8,11 @@
 #include <shlwapi.h> // AssocQueryStringW
 #include <winhttp.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <format>
+#include <optional>
 #include <random>
 #include <system_error>
 #include <vector>
@@ -112,9 +114,17 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
     std::lock_guard lock(mutex_); // one start at a time; another caller waits for it and reuses it
     const auto key = std::pair{remote, root};
     if (const auto it = servers_.find(key); it != servers_.end()) {
-        if (WaitForSingleObject(it->second.process, 0) == WAIT_TIMEOUT) return it->second.base;
+        if (WaitForSingleObject(it->second.process, 0) == WAIT_TIMEOUT) {
+            it->second.used = std::chrono::steady_clock::now();
+            return it->second.base;
+        }
         end(it->second.process, it->second.log); // it ended: a new one
         servers_.erase(it);
+    }
+    if (servers_.size() >= kept) { // folders outside the search roots, each its own server
+        const auto oldest = std::ranges::min_element(servers_, {}, [](const auto& s) { return s.second.used; });
+        end(oldest->second.process, oldest->second.log);
+        servers_.erase(oldest);
     }
 
     const auto token = random_token();
@@ -166,12 +176,13 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
         const auto text = read_shared(log);
         if (const auto port = preview::served_port(text)) {
             auto address = std::format("http://127.0.0.1:{}/{}/", *port, token);
-            servers_[key] = Server{pi.hProcess, address, log};
+            servers_[key] = Server{pi.hProcess, address, log, std::chrono::steady_clock::now()};
             return address;
         }
         if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+            // All it wrote: it may have said why only after `text` was read.
+            const auto why = server_ops::clean_rclone_error(read_shared(log));
             end(pi.hProcess, log);
-            const auto why = server_ops::clean_rclone_error(text);
             return util::fail(why.empty() ? std::string("the preview server ended") : why);
         }
         if (std::chrono::steady_clock::now() > deadline) {
@@ -181,10 +192,27 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
     }
 }
 
-std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t max,
-                                            const std::function<void(std::uint64_t, std::uint64_t)>& on_progress) {
+std::optional<std::string> PreviewServers::failure(const std::string& remote, const std::string& root,
+                                                   const std::string& path) {
+    std::filesystem::path log;
+    {
+        std::lock_guard lock(mutex_);
+        const auto it = servers_.find(std::pair{remote, root});
+        if (it == servers_.end()) return std::nullopt;
+        log = it->second.log;
+    }
+    return preview::serve_failure(read_shared(log), remote, root, path);
+}
+
+namespace {
+
+// Sends `method` to a local server's `url` ("http://127.0.0.1:PORT/..."), with `headers` (none
+// when empty), and hands the answered request and its status to `answered`.
+template <class Answered>
+auto ask_local(const std::string& url, const wchar_t* method, const std::wstring& headers, const Answered& answered)
+    -> decltype(answered(HINTERNET{}, DWORD{})) {
     constexpr std::string_view local = "http://127.0.0.1:";
-    if (!url.starts_with(local) || max == 0) return util::fail("not a preview address");
+    if (!url.starts_with(local)) return util::fail("not a preview address");
     const std::string_view rest = std::string_view(url).substr(local.size());
     const auto slash = rest.find('/');
     unsigned port = 0;
@@ -200,44 +228,61 @@ std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t
     WinHttpSetTimeouts(session.h, 5000, 5000, 30000, 60000);
     const Internet connection(WinHttpConnect(session.h, L"127.0.0.1", static_cast<INTERNET_PORT>(port), 0));
     const Internet request(connection.h == nullptr ? nullptr
-                                                   : WinHttpOpenRequest(connection.h, L"GET", path.c_str(), nullptr,
+                                                   : WinHttpOpenRequest(connection.h, method, path.c_str(), nullptr,
                                                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                                                         WINHTTP_FLAG_ESCAPE_DISABLE));
     if (request.h == nullptr) return util::fail("cannot reach the preview server");
-    const std::wstring range = std::format(L"Range: bytes=0-{}", max - 1);
-    if (!WinHttpSendRequest(request.h, range.c_str(), static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+    if (!WinHttpSendRequest(request.h, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+                            headers.empty() ? 0 : static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.h, nullptr)) {
         return util::failf("the preview server didn't answer: {}", std::system_category().message(static_cast<int>(GetLastError())));
     }
-    Fetched got;
     DWORD status = 0;
     DWORD status_size = sizeof(status);
     WinHttpQueryHeaders(request.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
                         &status, &status_size, WINHTTP_NO_HEADER_INDEX);
-    got.status = static_cast<int>(status);
-    // "bytes 0-1048575/52428800" for a part; the whole file's length otherwise.
-    if (const auto content_range = header(request.h, WINHTTP_QUERY_CONTENT_RANGE); !content_range.empty()) {
-        if (const auto slash_at = content_range.rfind(L'/'); slash_at != std::wstring::npos) {
-            got.total = number(std::wstring_view(content_range).substr(slash_at + 1));
+    return answered(request.h, status);
+}
+
+} // namespace
+
+std::expected<Fetched, std::string> http_get(const std::string& url, std::size_t max,
+                                            const std::function<void(std::uint64_t, std::uint64_t)>& on_progress) {
+    if (max == 0) return util::fail("not a preview address");
+    const std::wstring range = std::format(L"Range: bytes=0-{}", max - 1);
+    return ask_local(url, L"GET", range, [&](HINTERNET request, DWORD status) -> std::expected<Fetched, std::string> {
+        Fetched got;
+        got.status = static_cast<int>(status);
+        // "bytes 0-1048575/52428800" for a part; the whole file's length otherwise.
+        if (const auto content_range = header(request, WINHTTP_QUERY_CONTENT_RANGE); !content_range.empty()) {
+            if (const auto slash_at = content_range.rfind(L'/'); slash_at != std::wstring::npos) {
+                got.total = number(std::wstring_view(content_range).substr(slash_at + 1));
+            }
+        } else if (status == 200) {
+            got.total = number(header(request, WINHTTP_QUERY_CONTENT_LENGTH));
         }
-    } else if (status == 200) {
-        got.total = number(header(request.h, WINHTTP_QUERY_CONTENT_LENGTH));
-    }
-    while (got.body.size() < max) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.h, &available) || available == 0) break;
-        const std::size_t want = std::min<std::size_t>(available, max - got.body.size());
-        const std::size_t at = got.body.size();
-        got.body.resize(at + want);
-        DWORD read = 0;
-        if (!WinHttpReadData(request.h, got.body.data() + at, static_cast<DWORD>(want), &read)) {
-            return util::fail("the preview server stopped answering");
+        while (got.body.size() < max) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+            const std::size_t want = std::min<std::size_t>(available, max - got.body.size());
+            const std::size_t at = got.body.size();
+            got.body.resize(at + want);
+            DWORD read = 0;
+            if (!WinHttpReadData(request, got.body.data() + at, static_cast<DWORD>(want), &read)) {
+                return util::fail("the preview server stopped answering");
+            }
+            got.body.resize(at + read);
+            if (read == 0) break;
+            if (on_progress) on_progress(got.body.size(), std::min<std::uint64_t>(got.total.value_or(max), max));
         }
-        got.body.resize(at + read);
-        if (read == 0) break;
-        if (on_progress) on_progress(got.body.size(), std::min<std::uint64_t>(got.total.value_or(max), max));
-    }
-    return got;
+        return got;
+    });
+}
+
+std::expected<int, std::string> http_status(const std::string& url) {
+    return ask_local(url, L"HEAD", {}, [](HINTERNET, DWORD status) -> std::expected<int, std::string> {
+        return static_cast<int>(status);
+    });
 }
 
 std::expected<std::string, std::string> open_with_player(std::string_view ext, const std::string& url) {

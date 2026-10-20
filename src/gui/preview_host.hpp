@@ -1,14 +1,15 @@
 #pragma once
 
-// The window's previews at run time (see preview.hpp): one local `rclone serve http` per server
-// (and per root, for paths outside the login home), started on first use and ended with
-// grab-gui; files read from it for the viewer; videos and audio handed to the program Windows
-// plays them with.
+// The window's previews at run time (see preview.hpp): local `rclone serve http`s, one per server
+// and folder they serve from (preview::where), started on first use and ended with grab-gui (or
+// when more than a few run); files read from them for the viewer; videos and audio handed to the
+// program Windows plays them with.
 
 #include "engine.hpp"
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -30,18 +31,24 @@ public:
     PreviewServers(const PreviewServers&) = delete;
     PreviewServers& operator=(const PreviewServers&) = delete;
 
-    // "http://127.0.0.1:PORT/TOKEN/" of `remote`'s server for `root` ("" the login home, "/"),
-    // starting it first if it isn't running (about 1.5 s; up to 20 s on a slow login). Any thread.
+    // "http://127.0.0.1:PORT/TOKEN/" of `remote`'s server for `root` (preview::Where), starting it
+    // first if it isn't running (about 1.5 s; up to 20 s on a slow login); then the one used
+    // longest ago ends if more than `kept` run. Any thread.
     [[nodiscard]] std::expected<std::string, std::string> base(const engine::Context& ctx, const std::string& remote,
                                                                const std::string& root);
     // Whether that server runs already (base() then answers at once).
     [[nodiscard]] bool running(const std::string& remote, const std::string& root);
+    // Why that server answered 500 for `path` (preview::serve_failure), from its log.
+    [[nodiscard]] std::optional<std::string> failure(const std::string& remote, const std::string& root,
+                                                     const std::string& path);
 
 private:
+    static constexpr std::size_t kept = 8;
     struct Server {
         HANDLE process = nullptr;
         std::string base;
         std::filesystem::path log;
+        std::chrono::steady_clock::time_point used;
     };
     std::mutex mutex_;
     std::map<std::pair<std::string, std::string>, Server> servers_;
@@ -59,6 +66,8 @@ struct Fetched {
 [[nodiscard]] std::expected<Fetched, std::string>
 http_get(const std::string& url, std::size_t max,
          const std::function<void(std::uint64_t done, std::uint64_t total)>& on_progress = {});
+// A local server's status for `url` (a HEAD request): whether it can serve the file.
+[[nodiscard]] std::expected<int, std::string> http_status(const std::string& url);
 
 // Opens `url` in the program Windows opens files ending in `.ext` with ("mpc-hc64.exe" here),
 // returning its name. Fails when that is no desktop program that takes an address (a Store app),

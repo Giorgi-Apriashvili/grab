@@ -251,6 +251,12 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
       the DOS code page, so their ASCII art lines up.
     - PDFs use the browser engine's built-in viewer (up to 128 MiB).
     - Nothing is written to disk: previews go from the stream to the window in memory.
+  - The streams come from `rclone serve http`, which reads every folder on the way to a file, so
+    grab serves a file from the search root it is under (or the login home, or else its own
+    folder), never from a `/` the server may not let you list (a Storage Box's). When a folder on
+    the way can't be listed all the same, it serves the file from its own folder; when that
+    can't be listed either, the viewer says so ("Main doesn't let you list /srv/private.").
+    At most 8 such streams run at once.
   - Double-click on any other file still downloads it; Enter and the Download button always
     download. Right-click has Play or Preview first; Ctrl+Space ticks a row's checkbox.
 - **Download** takes any mix of folders and files. "Choose…" picks the Save-to folder.

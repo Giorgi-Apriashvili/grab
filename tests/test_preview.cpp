@@ -64,9 +64,41 @@ TEST_CASE("the local stream server's command line and address") {
     CHECK_FALSE(preview::served_port("http://127.0.0.1:/").has_value());
 }
 
+TEST_CASE("the folder a stream serves a file from") {
+    using preview::Where;
+    const std::vector<std::string> home{""};
+    CHECK(preview::where("movies/a.mkv", home) == Where{"", "movies/a.mkv"});
+    // Not from "/", which a Storage Box doesn't let you list: from the file's folder.
+    CHECK(preview::where("/home/tv/a.jpg", home) == Where{"/home/tv", "a.jpg"});
+    CHECK(preview::where("/a.jpg", home) == Where{"/", "a.jpg"});
+    // From the search root it is under (the shortest of several), which grab lists anyway.
+    const std::vector<std::string> roots{"/home/tv", "/home", "media", "/srv/x"};
+    CHECK(preview::where("/home/tv/s01/a.jpg", roots) == Where{"/home", "tv/s01/a.jpg"});
+    CHECK(preview::where("/srv/x/a.jpg", roots) == Where{"/srv/x", "a.jpg"});
+    CHECK(preview::where("/srv/xy/a.jpg", roots) == Where{"/srv/xy", "a.jpg"}); // not under /srv/x
+    CHECK(preview::where("media/b/a.jpg", roots) == Where{"media", "b/a.jpg"});
+    CHECK(preview::where("other/a.jpg", roots) == Where{"", "other/a.jpg"}); // the login home's one server
+    CHECK(preview::where("a.jpg", roots) == Where{"", "a.jpg"});
+    CHECK(preview::where("/etc/x.nfo", std::vector<std::string>{"/"}) == Where{"/", "etc/x.nfo"});
+    CHECK(preview::in_folder("/home/tv/a.jpg") == Where{"/home/tv", "a.jpg"});
+    CHECK(preview::in_folder("tv/a.jpg") == Where{"tv", "a.jpg"});
+
+    // Why rclone serve answered 500, from its log (rclone 1.75.1's words, 2026-10-20).
+    const std::string log = "2026/10/20 19:05:32 NOTICE: sftp://u@h:23//: HTTP Server started on [http://127.0.0.1:63027/t/]\r\n"
+                            "2026/10/20 19:05:34 ERROR : home/tv/: Dir.Stat error: error listing \"\": permission denied\r\n"
+                            "2026/10/20 19:05:34 ERROR : home/tv/a.jpg: Failed to find file: error listing \"\": permission "
+                            "denied\r\n"
+                            "2026/10/20 19:05:40 ERROR : home/tv/b.jpg: Failed to open file: connection lost\n";
+    CHECK(preview::serve_failure(log, "Box.Guest", "/", "home/tv/a.jpg") == "Box.Guest doesn't let you list /.");
+    CHECK(preview::serve_failure(log, "Box.Guest", "/", "home/tv/b.jpg") == "Box.Guest: Failed to open file: connection lost.");
+    CHECK_FALSE(preview::serve_failure(log, "Box.Guest", "/", "home/tv/c.jpg").has_value());
+    const std::string deeper = "ERROR : x/pics/a.png: Failed to find file: error listing \"x\": permission denied\n";
+    CHECK(preview::serve_failure(deeper, "Main", "/srv", "x/pics/a.png") == "Main doesn't let you list /srv/x.");
+    CHECK(preview::serve_failure(deeper, "Main", "", "x/pics/a.png") == "Main doesn't let you list x.");
+    CHECK(preview::serve_failure(deeper, "Main", "/", "x/pics/a.png") == "Main doesn't let you list /x.");
+}
+
 TEST_CASE("paths in the stream's addresses") {
-    CHECK(preview::where("movies/a.mkv") == preview::Where{"", "movies/a.mkv"});
-    CHECK(preview::where("/etc/x.nfo") == preview::Where{"/", "etc/x.nfo"});
     CHECK(preview::url_path("movies/Sahe AKA The Precinct (2010) #1.avi") ==
           "movies/Sahe%20AKA%20The%20Precinct%20%282010%29%20%231.avi");
     CHECK(preview::url_path("ა.jpg") == "%E1%83%90.jpg"); // UTF-8 bytes

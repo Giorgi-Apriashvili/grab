@@ -41,14 +41,25 @@ inline constexpr std::size_t max_pdf = std::size_t{128} << 20;
 // The port from rclone's "HTTP Server started on [http://127.0.0.1:PORT/...]" log line.
 [[nodiscard]] std::optional<int> served_port(std::string_view log);
 
-// The server root and the path under it for a remote path: "" (the login home) for a relative
-// one, "/" for an absolute one.
+// The folder a server serves a remote path from, and the path under it. rclone serve lists every
+// folder from its root down to a file and answers 500 at one it may not list (a Storage Box's
+// "/", found 2026-10-20 with "/home" as a search root), so: the search root the path is under
+// (`roots` as engine::search_roots; grab lists those; the shortest, so one server serves them
+// all), else the login home for a path in it (one server for them all, ~2 s each to start), else
+// the file's own folder.
 struct Where {
-    std::string root;
+    std::string root; // "" the login home, "media" under it, "/srv", "/"
     std::string path;
     bool operator==(const Where&) const = default;
 };
-[[nodiscard]] Where where(std::string_view remote_path);
+[[nodiscard]] Where where(std::string_view remote_path, const std::vector<std::string>& roots);
+// From the file's own folder: for when a folder on the way from its search root can't be listed.
+[[nodiscard]] Where in_folder(std::string_view remote_path);
+// Why a server serving from `root` answered 500 for `path`, from its log (its last
+// "ERROR : <path>: ..." line), in words for the window: "Box.Guest doesn't let you list /home." for
+// a folder it may not list, else "Box.Guest: <rclone's words>."; nullopt when the log says nothing.
+[[nodiscard]] std::optional<std::string> serve_failure(std::string_view log, std::string_view remote,
+                                                       std::string_view root, std::string_view path);
 
 // `path` for a URL: each segment percent-encoded, the slashes kept.
 [[nodiscard]] std::string url_path(std::string_view path);

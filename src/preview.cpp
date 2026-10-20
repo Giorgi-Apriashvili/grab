@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
+#include <format>
 #include <initializer_list>
 #include <optional>
 #include <system_error>
@@ -186,10 +187,57 @@ std::optional<int> served_port(std::string_view log) {
     return port;
 }
 
-Where where(std::string_view remote_path) {
-    if (!remote_path.starts_with('/')) return {"", std::string(remote_path)};
-    while (remote_path.starts_with('/')) remote_path.remove_prefix(1);
-    return {"/", std::string(remote_path)};
+Where where(std::string_view remote_path, const std::vector<std::string>& roots) {
+    const bool absolute = remote_path.starts_with('/');
+    const std::string* best = nullptr;
+    for (const auto& root : roots) {
+        const bool under = root.empty()  ? !absolute
+                           : root == "/" ? absolute
+                                         : remote_path.size() > root.size() + 1 && remote_path.starts_with(root) &&
+                                               remote_path[root.size()] == '/';
+        if (under && (best == nullptr || root.size() < best->size())) best = &root;
+    }
+    if (best == nullptr) return absolute ? in_folder(remote_path) : Where{"", std::string(remote_path)};
+    auto rest = remote_path.substr(best->size());
+    while (rest.starts_with('/')) rest.remove_prefix(1);
+    return {*best, std::string(rest)};
+}
+
+Where in_folder(std::string_view remote_path) {
+    const auto slash = remote_path.rfind('/');
+    if (slash == std::string_view::npos) return {"", std::string(remote_path)};
+    auto folder = remote_path.substr(0, slash);
+    while (folder.ends_with('/')) folder.remove_suffix(1);
+    return {folder.empty() ? "/" : std::string(folder), std::string(remote_path.substr(slash + 1))};
+}
+
+std::optional<std::string> serve_failure(std::string_view log, std::string_view remote, std::string_view root,
+                                         std::string_view path) {
+    const std::string mark = std::format("ERROR : {}: ", path);
+    std::optional<std::string_view> said;
+    while (!log.empty()) {
+        const auto eol = log.find('\n');
+        auto line = log.substr(0, eol);
+        log.remove_prefix(eol == std::string_view::npos ? log.size() : eol + 1);
+        if (line.ends_with('\r')) line.remove_suffix(1);
+        if (const auto at = line.find(mark); at != std::string_view::npos) said = line.substr(at + mark.size());
+    }
+    if (!said) return std::nullopt;
+    // "Failed to find file: error listing "tmp/locked": permission denied", the folder under root.
+    constexpr std::string_view listing = "error listing \"";
+    constexpr std::string_view denied = "\": permission denied";
+    if (const auto a = said->find(listing); a != std::string_view::npos) {
+        const auto from = a + listing.size();
+        if (const auto b = said->find(denied, from); b != std::string_view::npos) {
+            const auto folder = said->substr(from, b - from);
+            const std::string full = folder.empty() ? (root.empty() ? std::string("~") : std::string(root))
+                                     : root.empty() ? std::string(folder)
+                                     : root == "/"  ? std::format("/{}", folder)
+                                                    : std::format("{}/{}", root, folder);
+            return std::format("{} doesn't let you list {}.", remote, full);
+        }
+    }
+    return std::format("{}: {}.", remote, *said);
 }
 
 std::string url_path(std::string_view path) {
