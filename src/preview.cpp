@@ -4,10 +4,14 @@
 #include "rclone.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <system_error>
+#include <utility>
 
 namespace grab::preview {
 
@@ -242,6 +246,96 @@ std::string text_utf8(std::string_view bytes, bool nfo) {
         else append_utf8(out, c);
     }
     return out;
+}
+
+namespace {
+
+// An EBML variable-length number at `pos`: its value (the length marker removed for sizes, kept
+// for ids) and how many bytes it takes. nullopt past the end or for a malformed one.
+std::optional<std::pair<std::uint64_t, std::size_t>> ebml_vint(std::string_view b, std::size_t pos, bool id) {
+    if (pos >= b.size()) return std::nullopt;
+    const auto first = static_cast<unsigned char>(b[pos]);
+    std::size_t length = 1;
+    unsigned mask = 0x80;
+    while (length <= 8 && (first & mask) == 0) {
+        mask >>= 1;
+        ++length;
+    }
+    if (length > 8 || pos + length > b.size()) return std::nullopt;
+    std::uint64_t value = id ? first : (first & (mask - 1));
+    for (std::size_t i = 1; i < length; ++i) value = (value << 8) | static_cast<unsigned char>(b[pos + i]);
+    return std::pair{value, length};
+}
+
+struct EbmlElement {
+    std::uint64_t id = 0;
+    std::uint64_t size = 0;
+    bool unknown_size = false;
+    std::size_t body = 0; // where its contents start
+};
+
+std::optional<EbmlElement> ebml_element(std::string_view b, std::size_t pos) {
+    const auto id = ebml_vint(b, pos, true);
+    if (!id) return std::nullopt;
+    const auto size = ebml_vint(b, pos + id->second, false);
+    if (!size) return std::nullopt;
+    const std::size_t length = size->second;
+    const std::uint64_t all_ones = (std::uint64_t{1} << (7 * length)) - 1;
+    return EbmlElement{id->first, size->first, size->first == all_ones, pos + id->second + length};
+}
+
+constexpr std::uint64_t ebml_header_id = 0x1A45DFA3;
+constexpr std::uint64_t segment_id = 0x18538067;
+constexpr std::uint64_t cluster_id = 0x1F43B675;
+
+} // namespace
+
+std::optional<std::uint64_t> mkv_first_cluster(std::string_view head) {
+    const auto header = ebml_element(head, 0);
+    if (!header || header->id != ebml_header_id || header->unknown_size) return std::nullopt;
+    const auto segment = ebml_element(head, static_cast<std::size_t>(header->body + header->size));
+    if (!segment || segment->id != segment_id) return std::nullopt;
+    // The Segment's children, until the first cluster.
+    std::uint64_t pos = segment->body;
+    while (true) {
+        if (pos >= head.size()) return pos; // beyond what was read: the cluster comes at or after it
+        const auto e = ebml_element(head, static_cast<std::size_t>(pos));
+        if (!e) return pos;
+        if (e->id == cluster_id || e->unknown_size) return pos;
+        pos = e->body + e->size;
+    }
+}
+
+std::uint64_t warm_start(std::string_view head, std::uint64_t size) {
+    std::uint64_t want = warm_margin;
+    if (const auto cluster = mkv_first_cluster(head)) want = *cluster + warm_margin;
+    return std::min(size, std::min(want, warm_max));
+}
+
+Requested requested_range(std::string_view value, std::uint64_t size) {
+    value = util::trim(value);
+    if (util::to_lower(value.substr(0, 6)) != "bytes=") return {};
+    value.remove_prefix(6);
+    if (value.find(',') != std::string_view::npos) return {}; // several ranges: the whole file
+    const auto dash = value.find('-');
+    if (dash == std::string_view::npos) return {};
+    auto number = [](std::string_view t) -> std::optional<std::uint64_t> {
+        t = util::trim(t);
+        std::uint64_t n = 0;
+        const auto [end, err] = std::from_chars(t.data(), t.data() + t.size(), n);
+        if (t.empty() || err != std::errc{} || end != t.data() + t.size()) return std::nullopt;
+        return n;
+    };
+    const auto first = number(value.substr(0, dash));
+    const auto last = number(value.substr(dash + 1));
+    if (!first && last) { // "-500": the last 500 bytes
+        if (*last == 0 || size == 0) return {Requested::Kind::unsatisfiable};
+        return {Requested::Kind::part, size - std::min(*last, size), size - 1};
+    }
+    if (!first) return {};
+    if (*first >= size) return {Requested::Kind::unsatisfiable};
+    if (last && *last < *first) return {};
+    return {Requested::Kind::part, *first, last ? std::min(*last, size - 1) : size - 1};
 }
 
 } // namespace grab::preview

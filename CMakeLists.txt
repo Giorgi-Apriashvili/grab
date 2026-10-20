@@ -166,6 +166,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
         src/gui/tray.cpp
         src/gui/webview.cpp
         src/gui/preview_host.cpp
+        src/gui/play_server.cpp
         src/gui/resources.cpp
         src/gui/grab-gui.rc)
     # The .rc embeds the UI files and the icon; rebuild it whenever one of them changes.
@@ -176,7 +177,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
     target_link_libraries(grab-gui PRIVATE
         grab_core
         ${webview2_SOURCE_DIR}/build/native/${GRAB_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib
-        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32 winhttp)
+        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32 winhttp ws2_32)
     install(TARGETS grab-gui RUNTIME DESTINATION bin)
 endif()
 install(FILES grab.conf.example DESTINATION .)

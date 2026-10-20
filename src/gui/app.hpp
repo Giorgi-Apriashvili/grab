@@ -8,6 +8,7 @@
 #include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "play_server.hpp"
 #include "preview_host.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
@@ -425,6 +426,9 @@ private:
 
     // Previews: the servers' local streams, and two workers for the page's requests and Play.
     PreviewServers previews_;
+    // Play's warm starts and the player's stream; after previews_ and connections_ (it uses
+    // both), before the workers that call it.
+    PlayServer play_server_{connections_};
     std::mutex preview_mutex_; // guards preview_jobs_, preview_cache_, preview_workers_
     std::condition_variable_any preview_wake_;
     std::deque<std::function<void()>> preview_jobs_;

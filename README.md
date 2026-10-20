@@ -228,12 +228,21 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
   - Instant things (folders from the file list, list searches) show nothing.
 - **Previews: double-click or Space opens a file, as in Explorer.**
   - **Videos and audio** play in the program Windows uses for them (VLC, MPC-HC, mpv...),
-    streamed from the server, with seeking and the subtitles inside the file. grab runs a
-    read-only `rclone serve http` for the server on this PC only (127.0.0.1, a random port and
-    a random secret path), started on first use and stopped with the window.
-    - A seek starts in about 1 s on a fast server and 2–4 s on a Storage Box. A Storage Box
-      streams at about 2.5 MB/s (its cap per connection): plenty for a 1080p release, not
-      for a big remux.
+    streamed from the server, with seeking and the subtitles inside the file.
+    - **Warm start:** what a player reads while it opens a file (its start up to the first
+      video plus 8 MiB, and its last 4 MiB) is fetched first, over up to 6 connections at once
+      from the server's budget, and the player starts once it is in: it then opens at once.
+      The status bar shows "Preparing <name>: 18 of 38 MiB". This matters on a Storage Box,
+      where each read starts slowly: an anime release with 28 MB of subtitle fonts before its
+      first frame opened in ~12 s instead of 20–28 s (MPC-HC gave up after ~10 s), and an AVI
+      in 8 s instead of 29 s.
+    - The player gets grab's own address (a small server on this PC only: 127.0.0.1, a random
+      port and secret path); everything else comes from a read-only `rclone serve http` for the
+      server, started meanwhile and stopped with the window. A file's warm part stays in memory
+      while it is played (two files at most, five minutes after their last read).
+    - A seek outside the warm part takes about 1 s on a fast server and 2–8 s on a Storage Box.
+      A Storage Box streams at about 2.5 MB/s (its cap per connection): plenty for a 1080p
+      release, not for a big remux.
     - A Store app as the default player (Films & TV) can't open a stream; grab says so.
   - **Images, text files and PDFs** open in a viewer over the list: ←/→ go through the list's
     others (fetched ahead), Esc or Space closes, and Download saves the one shown.
@@ -699,6 +708,7 @@ src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
 src/verify.*    checking downloads against the server's checksum (rclone check)
+src/gui/play_server.* Play's warm start: the player's local stream (start and end from memory)
 src/local_name.* server names as safe Windows names (rclone's encoding, device names)
 src/existing.*  a different file already there: replace, keep both ("name (2).ext") or skip
 src/file_type.* file kinds by extension (as the window's icons and filters), --type/--min-size

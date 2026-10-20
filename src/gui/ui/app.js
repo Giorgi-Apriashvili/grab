@@ -701,7 +701,7 @@ const views = (kind) => kind === 'image' || kind === 'text' || kind === 'pdf';
 function openFile(h) {
   const kind = kindOf(h);
   if (plays(kind)) {
-    send({ type: 'play', remote: h.remote || state.remote, path: h.path });
+    send({ type: 'play', remote: h.remote || state.remote, path: h.path, size: h.size });
     return true;
   }
   if (views(kind)) {

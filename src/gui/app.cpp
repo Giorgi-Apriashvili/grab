@@ -29,6 +29,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <set>
@@ -381,7 +382,11 @@ void App::play(const Value& msg) {
     const std::string remote = msg.string_of("remote").value_or("");
     const std::string path = msg.string_of("path").value_or("");
     if (remote.empty() || path.empty()) return;
-    queue_preview([this, remote, path] {
+    std::optional<std::uint64_t> size; // the row's: no need to ask the server
+    if (const Value* n = msg.find("size"); n != nullptr && n->kind == Value::Kind::number && n->number >= 0) {
+        size = static_cast<std::uint64_t>(n->number);
+    }
+    queue_preview([this, remote, path, size] {
         Value v = Value::make_object();
         auto fail = [&](const std::string& message) {
             v.set("type", str("error"));
@@ -391,18 +396,36 @@ void App::play(const Value& msg) {
         auto ctx = engine::load_context(config_path_, remote);
         if (!ctx) return fail(ctx.error());
         const auto at = preview::where(path);
-        std::optional<Activity> starting;
-        if (!previews_.running(remote, at.root)) {
-            starting.emplace(*this, std::format("Starting a stream from {} (rclone serve http)…", remote), "serve:" + remote);
-        }
-        auto base = previews_.base(*ctx, remote, at.root);
-        if (!base && starting) starting->failed();
-        starting.reset();
-        if (!base) return fail(std::format("Can't play {}: {}", remote_basename(path), base.error()));
         const auto name = remote_basename(path);
         const auto dot = name.rfind('.');
-        auto program = open_with_player(dot == std::string::npos ? "" : util::to_lower(name.substr(dot + 1)),
-                                        *base + preview::url_path(at.path));
+        // The player gets grab's own stream: what it reads while opening, fetched over several
+        // connections first; the rest from rclone serve, which starts meanwhile. If grab's
+        // stream can't start, rclone serve's.
+        std::shared_future<std::expected<std::string, std::string>> upstream =
+            std::async(std::launch::async, [this, ctx = *ctx, remote, at]() -> std::expected<std::string, std::string> {
+                auto base = previews_.base(ctx, remote, at.root);
+                if (!base) return util::fail(base.error());
+                return *base + preview::url_path(at.path);
+            }).share();
+        connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
+        PlayServer::File file{fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, path,
+                                            engine::without_console_progress(ctx->settings.common_flags)},
+                              remote, upstream, name, size};
+        auto preparing = std::make_shared<Activity>(*this, std::format("Preparing {}…", name), "warm:" + remote);
+        auto address = play_server_.play(std::move(file), [preparing, name](std::uint64_t done, std::uint64_t total) {
+            preparing->progress(done, total, std::format("Preparing {}: {} of {}", name, util::format_size(done),
+                                                         util::format_size(total)));
+        });
+        if (!address) { // rclone serve's own stream, as before
+            const auto& direct = upstream.get();
+            if (!direct) {
+                preparing->failed();
+                return fail(std::format("Can't play {}: {}", name, direct.error()));
+            }
+            address = *direct;
+        }
+        preparing.reset(); // it ends once the start is in, with the warm start's own copy
+        auto program = open_with_player(dot == std::string::npos ? "" : util::to_lower(name.substr(dot + 1)), *address);
         if (!program) return fail(program.error());
         v.set("type", str("played"));
         v.set("name", str(name));
