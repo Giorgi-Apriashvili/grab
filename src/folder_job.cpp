@@ -135,7 +135,16 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
         });
     std::error_code ec;
     fs::remove(list, ec);
-    engine::remove_rclone_temp_files(targets, temp_before);
+    // A stopped or failed rclone leaves its temp files (after a clean finish it renamed them all),
+    // but never delete one of the folder's own files: they can be named like them.
+    if (!result || result->exit_code != 0) {
+        fetch::Reserved own_files;
+        {
+            std::lock_guard lock(m);
+            own_files = reserved_names(dir, tree);
+        }
+        engine::remove_rclone_temp_files(targets, temp_before, own_files);
+    }
     job.connections->release(job.server, job.id, reserved);
 
     std::lock_guard lock(m);

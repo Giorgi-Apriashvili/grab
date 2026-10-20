@@ -5,6 +5,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -104,7 +105,7 @@ TEST_CASE("rclone's temp files: only those of the run's files, made by the run")
     touch(dir / (std::string(107, 'L') + ".35105d76.partial"));
     touch(dir / "movie.mkv");
     CHECK(engine::rclone_temp_files(files).size() == 4);
-    CHECK(engine::remove_rclone_temp_files(files, before) == 3);
+    CHECK(engine::remove_rclone_temp_files(files, before, {}) == 3);
     CHECK(fs::exists(dir / "movie.mkv.0badf00d.partial"));
     CHECK(fs::exists(dir / "notes.txt.partial"));
     CHECK(fs::exists(dir / "movie.mkv.backup.partial"));
@@ -115,6 +116,28 @@ TEST_CASE("rclone's temp files: only those of the run's files, made by the run")
 
     const std::vector<fs::path> missing{dir / "missing" / "x.bin"};
     CHECK(engine::rclone_temp_files(missing).empty()); // no folder: no throw
+    fs::remove_all(dir);
+}
+
+TEST_CASE("rclone's temp files: never a file of the folder named like one") {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "grab_test_partials_own";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto touch = [](const fs::path& p) { std::ofstream(p) << "x"; };
+    // The server folder holds both; the batch downloads both.
+    const std::vector<fs::path> files{dir / "notes.txt", dir / "notes.txt.12345678.partial"};
+    const auto before = engine::rclone_temp_files(files);
+    CHECK(before.empty());
+    touch(dir / "notes.txt");
+    touch(dir / "notes.txt.12345678.partial");                  // downloaded: the folder's own file
+    touch(dir / "notes.txt.90c84c01.partial");                  // rclone's, left by a stop
+    touch(dir / "notes.txt.12345678.partial.0badf00d.partial"); // rclone's for the second file
+    const auto own = [&](const fs::path& p) { return std::ranges::find(files, p) != files.end(); };
+    CHECK(engine::remove_rclone_temp_files(files, before, own) == 2);
+    CHECK(fs::exists(dir / "notes.txt.12345678.partial"));
+    CHECK_FALSE(fs::exists(dir / "notes.txt.90c84c01.partial"));
+    CHECK_FALSE(fs::exists(dir / "notes.txt.12345678.partial.0badf00d.partial"));
     fs::remove_all(dir);
 }
 

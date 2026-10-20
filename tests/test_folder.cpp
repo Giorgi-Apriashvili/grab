@@ -165,6 +165,12 @@ TEST_CASE("single files of a folder: pause, resume, skip and retry") {
     REQUIRE(discard->reserved);
     CHECK(discard->reserved(dir / "BIG")); // the folder's files, as Windows compares names
     CHECK_FALSE(discard->reserved(dir / "broken.grabpart"));
+    // A folder file named like an rclone temp file is the folder's own: kept by the batch cleanup.
+    folder::Tree named;
+    named.files.push_back(folder::make_file("notes.txt", 1, ""));
+    named.files.push_back(folder::make_file("notes.txt.12345678.partial", 1, ""));
+    CHECK(folder::reserved_names(dir, named)(dir / "notes.txt.12345678.partial"));
+    CHECK_FALSE(folder::reserved_names(dir, named)(dir / "notes.txt.90c84c01.partial"));
     CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", "big").has_value()); // running: stopped, then discarded
     CHECK(t.files[2].stop_reason == folder::StopReason::skip);
 

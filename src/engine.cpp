@@ -367,12 +367,14 @@ std::vector<std::filesystem::path> rclone_temp_files(std::span<const std::filesy
 }
 
 std::size_t remove_rclone_temp_files(std::span<const std::filesystem::path> files,
-                                     std::span<const std::filesystem::path> before) {
+                                     std::span<const std::filesystem::path> before,
+                                     const std::function<bool(const std::filesystem::path&)>& keep) {
     const std::set<std::filesystem::path> there(before.begin(), before.end());
     std::size_t removed = 0;
     for (const auto& p : rclone_temp_files(files)) {
+        if (there.contains(p) || (keep && keep(p))) continue;
         std::error_code ec;
-        if (!there.contains(p) && std::filesystem::remove(p, ec)) ++removed;
+        if (std::filesystem::remove(p, ec)) ++removed;
     }
     return removed;
 }

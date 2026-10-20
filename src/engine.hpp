@@ -125,10 +125,12 @@ struct DownloadResult {
 // next to each (a name over 100 bytes is first cut short so the whole keeps its length). A
 // stopped rclone leaves them behind.
 [[nodiscard]] std::vector<std::filesystem::path> rclone_temp_files(std::span<const std::filesystem::path> files);
-// Deletes those that weren't there before the run (`before`, from rclone_temp_files): only what
-// that run of rclone made. Returns how many.
+// Deletes those that weren't there before the run (`before`, from rclone_temp_files) and aren't
+// files in their own right (`keep`: a folder's own files, which can be named like them, e.g.
+// "notes.txt.12345678.partial"): only what that run of rclone made. Returns how many.
 std::size_t remove_rclone_temp_files(std::span<const std::filesystem::path> files,
-                                     std::span<const std::filesystem::path> before);
+                                     std::span<const std::filesystem::path> before,
+                                     const std::function<bool(const std::filesystem::path&)>& keep);
 
 // Downloads with progress callbacks instead of a console progress bar (for the GUI). A
 // cancelled download's partial files are removed. `on_copied` gets each file rclone reports
