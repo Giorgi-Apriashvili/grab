@@ -178,6 +178,10 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
   search there covers every server's list at once. Results show their server, and Download
   sends each pick to its own server, into the same Save-to folder. Two picks with the same name
   aren't downloaded into one folder.
+- **File icons:** each file shows its type by icon and colour: video, audio, image, text
+  (`.nfo`, subtitles, logs), PDF and other documents (e-books, Office), archives (including split
+  parts like `.r00` and `.001`), programs (`.exe`, `.msi`, scripts) and disc images (`.iso`,
+  `.vhdx`); anything else gets a plain file icon. The Downloads list shows them too.
 - **Modified and sorting:** every row shows when the file or folder was last modified
   (`2026-10-16 14:32`, your local time; hovering adds the seconds and the age). A folder's date
   is its own, as file managers show it: it changes when something directly inside it is added,

@@ -304,7 +304,7 @@ function renderRows() {
     const dateTitle = date ? ` title="${fmtDate(h.modified, true)} · ${age >= 0 ? `${fmtAge(age)} ago` : `in ${fmtAge(-age)}`}"` : '';
     html += `<div class="row${sel ? ' sel' : ''}${i === state.cursor ? ' cursor' : ''}${h.dir ? ' folder' : ''}" data-i="${i}">` +
       `<input type="checkbox" tabindex="-1"${sel ? ' checked' : ''}${h.server ? ' disabled' : ''}>` +
-      `<span class="name" title="${esc(h.path || h.name)}">${h.dir ? FOLDER_ICON : ''}${esc(h.name)}</span>` +
+      `<span class="name" title="${esc(h.path || h.name)}">${itemIcon(h.name, h.dir)}${esc(h.name)}</span>` +
       `<span class="size">${fmtSize(h.size)}</span>` +
       `<span class="modified"${dateTitle}>${date}</span>` +
       `<span class="dir">${third}</span></div>`;
@@ -843,6 +843,58 @@ document.addEventListener('keydown', (ev) => {
 }, true);
 
 const FOLDER_ICON = '<svg class="ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 3.5C1 2.7 1.7 2 2.5 2h3.6l1.6 1.6h5.8c.8 0 1.5.7 1.5 1.5v7.4c0 .8-.7 1.5-1.5 1.5h-11C1.7 14 1 13.3 1 12.5z"/></svg>';
+
+// A file's type for its icon: the preview lists (KIND_OF) and more; 'file' for anything else.
+const ICON_KIND = new Map(KIND_OF);
+ICON_KIND.set('pdf', 'document');
+for (const [kind, list] of Object.entries({
+  image: 'tif tiff heic heif psd cr2 nef dng arw',
+  text: 'sub idx html htm rtf',
+  document: 'epub mobi azw3 djvu doc docx xls xlsx ppt pptx odt ods odp',
+  archive: 'zip rar 7z tar gz tgz bz2 tbz2 xz txz zst lz lzma cab',
+  program: 'exe msi msix appx bat cmd ps1 sh apk jar deb rpm',
+  disc: 'iso img mdf mds nrg dmg vhd vhdx vmdk',
+})) for (const ext of list.split(' ')) ICON_KIND.set(ext, kind);
+
+function iconKind(name) {
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return 'file';
+  const ext = name.slice(dot + 1).toLowerCase();
+  // Split archives: .r00, .z01, .001
+  return ICON_KIND.get(ext) || (/^(r\d\d|z\d\d|\d{3})$/.test(ext) ? 'archive' : 'file');
+}
+
+// A page in the type's colour, with a mark cut out of it in the panel's colour.
+const FILE_ICONS = (() => {
+  const page = '<path d="M3.5 1h6L14 5.5v8c0 .8-.7 1.5-1.5 1.5h-9C2.7 15 2 14.3 2 13.5v-11C2 1.7 2.7 1 3.5 1z"/>' +
+    '<path class="fold" d="M9.5 1v3c0 .8.7 1.5 1.5 1.5h3z"/>';
+  const marks = {
+    video: '<path d="M6.5 7.6v5l4-2.5z"/>',
+    audio: '<path d="M8.9 6.8h1.4l1.4 1v1.1l-1.4-.8v3.6a1.6 1.6 0 1 1-1.4-1.6z"/>',
+    image: '<path d="M4.5 12.8l2.4-3.1 1.6 1.9 1.3-1.4 1.7 2.6z"/><circle cx="10.1" cy="7.9" r="1"/>',
+    text: '<path d="M5 7.3h6v1H5zm0 2h6v1H5zm0 2h4v1H5z"/>',
+    document: '<path d="M5 7.3h6v1H5zm0 2h6v1H5zm0 2h6v1H5z"/>',
+    archive: '<path d="M7 1.6h1v1H7zm1 1h1v1H8zm-1 1h1v1H7zm1 1h1v1H8zm-1 1h1v1H7zm-.6 2.4h3.2v4H6.4zm.9 1.2v1.4h1.4V8.2z" fill-rule="evenodd"/>',
+    program: '<path d="M4.5 7.2h7v5.6h-7zm1 1.8v2.8h5V9z" fill-rule="evenodd"/>',
+    disc: '<path d="M8 6.8a3 3 0 1 1 0 6 3 3 0 0 1 0-6zm0 2.2a.8.8 0 1 0 0 1.6.8.8 0 0 0 0-1.6z" fill-rule="evenodd"/>',
+    file: '',
+  };
+  return Object.fromEntries(Object.entries(marks).map(([k, m]) =>
+    [k, `<svg class="ico f-${k}" viewBox="0 0 16 16" aria-hidden="true">${page}<g class="mark">${m}</g></svg>`]));
+})();
+
+// The icon of a file (its name or path), or of a folder.
+function itemIcon(name, dir) {
+  return dir ? FOLDER_ICON : FILE_ICONS[iconKind(name.slice(name.lastIndexOf('/') + 1))];
+}
+
+// Sets an icon element's SVG, only when it changes (queue rows are updated in place often).
+function setIcon(el, name, dir) {
+  const key = dir ? ':dir' : iconKind(name.slice(name.lastIndexOf('/') + 1));
+  if (el.dataset.k === key) return;
+  el.dataset.k = key;
+  el.innerHTML = itemIcon(name, dir);
+}
 
 // `path` without its `folder` prefix, for search results below a folder ('' for the folder itself).
 function relativeTo(path, folder) {
@@ -1822,7 +1874,7 @@ function renderTree(el, q) {
     if (!row) {
       row = document.createElement('div');
       row.dataset.key = w.key;
-      row.innerHTML = '<span class="q-branch">|---</span><span class="q-cname"></span>' +
+      row.innerHTML = '<span class="q-branch">|---</span><span class="q-cico"></span><span class="q-cname"></span>' +
         '<span class="q-cbar"><span></span></span><span class="q-cmeta"></span><span class="q-cactions"></span>';
     }
     rows.delete(w.key);
@@ -1832,6 +1884,7 @@ function renderTree(el, q) {
     prev = row;
     if (!w.child) {
       row.className = 'q-child q-summary';
+      row.querySelector('.q-cico').hidden = true;
       row.querySelector('.q-cname').textContent = w.text;
       row.querySelector('.q-cmeta').textContent = '';
       row.querySelector('.q-cbar').hidden = true;
@@ -1841,6 +1894,9 @@ function renderTree(el, q) {
     const c = w.child;
     row.className = `q-child cst-${c.status}`;
     row.dataset.path = c.path;
+    const icon = row.querySelector('.q-cico');
+    icon.hidden = false;
+    setIcon(icon, c.path, false);
     const name = row.querySelector('.q-cname');
     name.textContent = c.path;
     name.title = c.path;
@@ -1888,7 +1944,7 @@ function renderQueue() {
       el = document.createElement('div');
       el.innerHTML = '<div class="q-top"><span class="q-handle" title="Drag to change the order">≡</span>' +
         '<button type="button" class="q-toggle" data-act="toggle" hidden></button>' +
-        '<span class="q-name"></span>' +
+        '<span class="q-ico"></span><span class="q-name"></span>' +
         '<select class="q-prio" title="Bandwidth priority: how running downloads share the speed" aria-label="Bandwidth priority">' +
         '<option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select>' +
         '<span class="q-meta"></span><span class="q-actions"></span></div>' +
@@ -1906,6 +1962,7 @@ function renderQueue() {
     prio.hidden = !active;
     prio.className = `q-prio prio-${q.priority}`;
     if (document.activeElement !== prio) prio.value = q.priority;
+    setIcon(el.querySelector('.q-ico'), q.name, q.mode === 'folder');
     el.querySelector('.q-name').textContent = q.mode === 'folder' ? `${q.name}/` : q.name;
     el.querySelector('.q-name').title = `${q.remote}:${q.path}`;
     const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;

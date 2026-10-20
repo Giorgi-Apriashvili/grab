@@ -16,6 +16,16 @@
   --bar-bg: #e4e8ef;
   --input: #ffffff;
   --folder: #d29b1f;
+  /* File-type icons */
+  --f-video: #7c5ccf;
+  --f-audio: #dd7a32;
+  --f-image: #2f9a6a;
+  --f-text: #8a93a0;
+  --f-document: #cf4338;
+  --f-archive: #9c6b3c;
+  --f-program: #3a76d0;
+  --f-disc: #3f97a6;
+  --f-file: #9aa2ad;
   --row: 32px;
   color-scheme: light;
 }
@@ -38,6 +48,15 @@
     --bar-bg: #333841;
     --input: #1f2226;
     --folder: #e3b341;
+    --f-video: #a48cf0;
+    --f-audio: #f0a060;
+    --f-image: #4cc28a;
+    --f-text: #8d96a1;
+    --f-document: #f07068;
+    --f-archive: #c9a06a;
+    --f-program: #6a9ff0;
+    --f-disc: #62bfcc;
+    --f-file: #7d8692;
     color-scheme: dark;
   }
 }
@@ -257,6 +276,21 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .results:focus #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
 .name, .dir, .modified { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .ico { width: 16px; height: 16px; margin-right: 7px; vertical-align: -3px; fill: var(--folder); }
+svg.ico.f-video { fill: var(--f-video); }
+svg.ico.f-audio { fill: var(--f-audio); }
+svg.ico.f-image { fill: var(--f-image); }
+svg.ico.f-text { fill: var(--f-text); }
+svg.ico.f-document { fill: var(--f-document); }
+svg.ico.f-archive { fill: var(--f-archive); }
+svg.ico.f-program { fill: var(--f-program); }
+svg.ico.f-disc { fill: var(--f-disc); }
+svg.ico.f-file { fill: var(--f-file); }
+svg.ico .fold { fill: var(--panel); opacity: .5; }
+svg.ico .mark { fill: var(--panel); }
+.q-ico, .q-cico { display: flex; flex: none; }
+.q-ico { margin-right: -4px; }
+.q-cico { margin-right: -2px; }
+.q-ico .ico, .q-cico .ico { width: 16px; height: 16px; fill: var(--folder); }
 .row .go { color: inherit; cursor: pointer; }
 .row .go:hover { color: var(--accent); text-decoration: underline; }
 
