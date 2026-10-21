@@ -136,6 +136,23 @@ std::filesystem::path default_grab_config_path() {
     return util::config_home() / "grab" / "grab.conf";
 }
 
+std::string config_key(const std::filesystem::path& config_dir) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const char16_t ch : util::path_from_utf8(util::to_lower(util::path_to_utf8(config_dir))).u16string()) {
+        h = (h ^ static_cast<std::uint64_t>(ch)) * 1099511628211ULL;
+    }
+    return std::format("{:016x}", h);
+}
+
+std::optional<std::string> config_folder_name(const std::filesystem::path& grab_conf) {
+    std::error_code ec;
+    const auto dir = std::filesystem::absolute(grab_conf, ec).parent_path();
+    const std::string key = config_key(dir);
+    if (key == config_key(util::config_home() / "grab")) return std::nullopt;
+    std::string name = util::path_to_utf8(dir.filename());
+    return std::format("{}-{}", name.empty() ? "config" : name, key.substr(0, 8));
+}
+
 std::filesystem::path grab_rclone_config_path() { return util::config_home() / "grab" / "rclone.conf"; }
 
 std::filesystem::path grab_known_hosts_path() { return util::config_home() / "grab" / "known_hosts"; }

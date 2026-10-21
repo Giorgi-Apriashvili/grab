@@ -204,6 +204,11 @@ fs::path default_dir() {
     return util::local_data_home() / "grab" / "lists";
 }
 
+fs::path dir_for(const fs::path& grab_conf) {
+    const auto own = config_folder_name(grab_conf);
+    return own ? default_dir() / util::path_from_utf8(*own) : default_dir();
+}
+
 fs::path path_for(const fs::path& dir, std::string_view server) {
     std::string name;
     bool changed = server.empty() || server.starts_with('.');

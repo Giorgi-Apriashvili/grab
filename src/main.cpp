@@ -199,7 +199,7 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
     // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
     // Without it, rclone follows the speed schedule by itself, as a weekly timetable.
     std::vector<std::string> extra;
-    const auto gui = window_settings(default_gui_state_path());
+    const auto gui = window_settings(state_dir(opts.config.value_or(default_grab_config_path())) / "gui.json");
     if (opts.limit) {
         if (*opts.limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
     } else if (!gui.speed_schedule.empty()) {
@@ -360,7 +360,8 @@ std::expected<engine::SearchResult, std::string> search(const engine::Context& c
     }
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch()).count();
-    const auto file = file_list::path_for(file_list::default_dir(), ctx.settings.name);
+    const auto file = file_list::path_for(file_list::dir_for(opts.config.value_or(default_grab_config_path())),
+                                          ctx.settings.name);
     auto list = opts.fresh ? std::nullopt : file_list::load(file);
     if (list && list->fingerprint == file_list::fingerprint(ctx) && file_list::fresh(*list, now)) {
         if (opts.verbose) {

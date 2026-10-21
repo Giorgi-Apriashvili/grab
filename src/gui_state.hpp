@@ -1,7 +1,7 @@
 #pragma once
 
-// What grab-gui remembers between runs (%APPDATA%\grab\gui.json). Pure data + JSON, so it
-// lives in grab_core and is unit-tested.
+// What grab-gui remembers between runs (%APPDATA%\grab\gui.json, see state_dir). Pure data +
+// JSON, so it lives in grab_core and is unit-tested.
 
 #include "json.hpp"
 #include "schedule.hpp"
@@ -71,9 +71,12 @@ struct GuiState {
     bool operator==(const GuiState&) const = default;
 };
 
-[[nodiscard]] std::filesystem::path default_gui_state_path(); // <config>/grab/gui.json
+// Where the window keeps gui.json, queue.json and recent for the configuration at `grab_conf`:
+// <config>/grab for the default one, <config>/grab/configs/<config_folder_name> for any other
+// (GRAB_CONFIG, --config), so two configurations' windows never share a queue (review G35).
+[[nodiscard]] std::filesystem::path state_dir(const std::filesystem::path& grab_conf);
 
-// The window's recent searches (<config>/grab/recent): a JSON array of the page's entries, at
+// The window's recent searches (state_dir's "recent"): a JSON array of the page's entries, at
 // most recent_max, newest first. Sealed for the current Windows user (DPAPI), as the file lists
 // are: what was searched for is unreadable to other accounts and to a copy of the file.
 inline constexpr std::size_t recent_max = 20;
@@ -96,7 +99,7 @@ struct SavedFile {
     bool operator==(const SavedFile&) const = default;
 };
 
-// An unfinished download, kept across restarts in <config>/grab/queue.json.
+// An unfinished download, kept across restarts in state_dir's queue.json.
 struct SavedDownload {
     std::string remote;
     std::string mode = "file"; // "file" | "folder"
@@ -121,7 +124,6 @@ struct SavedDownload {
 // item before itself, change nothing. Returns whether the order changed.
 bool move_before(std::vector<int>& ids, int id, int before);
 
-[[nodiscard]] std::filesystem::path default_queue_path(); // <config>/grab/queue.json
 [[nodiscard]] std::vector<SavedDownload> parse_queue(std::string_view json_text); // bad entries skipped
 // queue.json as saved: nullopt when there is none; an error when it exists but can't be read or
 // isn't a JSON array, so that it is never replaced unseen (review G212).

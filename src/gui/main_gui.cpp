@@ -66,17 +66,6 @@ void notify(std::wstring_view title, std::wstring_view text, bool error) {
     g.tray.notify(title, text, error);
 }
 
-// A short stable name for a configuration folder (FNV-1a of its lower-cased path), so each
-// configuration gets its own single-instance lock.
-std::wstring instance_key(const std::filesystem::path& config_dir) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const wchar_t ch : util::to_wide(util::to_lower(util::path_to_utf8(config_dir)))) {
-        h = (h ^ static_cast<std::uint64_t>(ch)) * 1099511628211ULL;
-    }
-    wchar_t buf[17];
-    swprintf(buf, 17, L"%016llx", static_cast<unsigned long long>(h));
-    return buf;
-}
 
 bool system_uses_dark_theme() {
     DWORD value = 1;
@@ -334,7 +323,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     // One window per configuration (%APPDATA%\grab, or GRAB_CONFIG's folder): a second launch
     // brings that window to the front, even from the tray. Its handle is published in a small
     // named shared-memory slot next to the mutex.
-    const std::wstring key = instance_key(default_grab_config_path().parent_path());
+    const std::wstring key = util::to_wide(config_key(default_grab_config_path().parent_path()));
     HANDLE mutex = CreateMutexW(nullptr, TRUE, (std::wstring(instance_mutex) + key).c_str());
     bool already_running = mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS;
     // "--restart PID": started by an update's "Restart grab" while the old window (PID) is
@@ -410,7 +399,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     host.quit = [] {
         if (g.hwnd != nullptr) quit(g.hwnd);
     };
-    g.app = std::make_unique<gui::App>(std::move(host), default_grab_config_path(), default_gui_state_path());
+    g.app = std::make_unique<gui::App>(std::move(host), default_grab_config_path(),
+                                       state_dir(default_grab_config_path()) / "gui.json");
 
     place_window(g.hwnd, g.app->state(), show);
     apply_theme(g.hwnd);

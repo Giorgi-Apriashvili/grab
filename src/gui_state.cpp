@@ -1,6 +1,7 @@
 #include "gui_state.hpp"
 
 #include "activity.hpp"
+#include "config.hpp"
 #include "json.hpp"
 #include "util.hpp"
 
@@ -13,7 +14,11 @@
 
 namespace grab {
 
-std::filesystem::path default_gui_state_path() { return util::config_home() / "grab" / "gui.json"; }
+std::filesystem::path state_dir(const std::filesystem::path& grab_conf) {
+    const auto home = util::config_home() / "grab";
+    const auto own = config_folder_name(grab_conf);
+    return own ? home / "configs" / util::path_from_utf8(*own) : home;
+}
 
 namespace {
 constexpr std::string_view recent_header = "grab-recent-searches-sealed 1\n";
@@ -235,8 +240,6 @@ bool move_before(std::vector<int>& ids, int id, int before) {
     ids.insert(to, id);
     return ids != old;
 }
-
-std::filesystem::path default_queue_path() { return util::config_home() / "grab" / "queue.json"; }
 
 namespace {
 

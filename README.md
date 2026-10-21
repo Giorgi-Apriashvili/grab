@@ -524,6 +524,11 @@ max_depth     = 4
 
 All keys and their defaults are documented in [grab.conf.example](grab.conf.example).
 The config path can be overridden with `--config PATH` or the `GRAB_CONFIG` env var.
+grab-gui then runs one window per configuration folder, and each configuration other than the
+default keeps its own window settings, queue and recent searches in
+`%APPDATA%\grab\configs\<folder>-<id>` and its file lists in
+`%LOCALAPPDATA%\grab\lists\<folder>-<id>` (the command reads the same). grab's rclone.conf,
+saved passwords and known_hosts are shared by all of them.
 Add one `[section]` per server and choose with `-r NAME`.
 
 ## Usage

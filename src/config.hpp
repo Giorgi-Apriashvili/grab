@@ -79,6 +79,16 @@ inline constexpr std::string_view default_file_flags =
 extern const std::string_view example_config;
 
 [[nodiscard]] std::filesystem::path default_grab_config_path(); // $GRAB_CONFIG or <config>/grab/grab.conf
+
+// A short stable key for a configuration folder: 16 hex digits of the FNV-1a of its lower-cased
+// path. grab-gui runs one window per key.
+[[nodiscard]] std::string config_key(const std::filesystem::path& config_dir);
+// The name of the folder that keeps what the configuration at `grab_conf` saves apart from the
+// default configuration's (gui_state.hpp's state_dir, file_list.hpp's dir_for), so two never
+// share a queue or delete each other's lists (review G35, G219): "<its folder's name>-<8 hex
+// digits of config_key>". nullopt for the default configuration (<config>/grab), whose files
+// stay where they always were.
+[[nodiscard]] std::optional<std::string> config_folder_name(const std::filesystem::path& grab_conf);
 // grab's own rclone config, holding the remotes grab manages: <config>/grab/rclone.conf.
 [[nodiscard]] std::filesystem::path grab_rclone_config_path();
 // Host keys pinned by `grab server add|trust`: <config>/grab/known_hosts.

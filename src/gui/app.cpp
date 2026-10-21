@@ -144,7 +144,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
         }
     }
     restore_queue();
-    lists_dir_ = file_list::default_dir();
+    lists_dir_ = file_list::dir_for(config_path_);
     prune_lists();
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {

@@ -1,4 +1,6 @@
 #include "config.hpp"
+#include "file_list.hpp"
+#include "gui_state.hpp"
 #include "ini.hpp"
 #include "util.hpp"
 
@@ -8,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -447,4 +450,22 @@ TEST_CASE("the settings lock has one holder at a time, and a thread may take it 
     { auto done = std::move(*first); } // let go
     other.join();
     CHECK(got.load());
+}
+TEST_CASE("each configuration keeps its window state and lists apart; the default one's stay put (G35, G219)") {
+    const auto home = util::config_home() / "grab";
+    CHECK_FALSE(config_folder_name(home / "grab.conf").has_value());
+    CHECK(state_dir(home / "grab.conf") == home);
+    CHECK(file_list::dir_for(home / "grab.conf") == file_list::default_dir());
+
+    const auto work = std::filesystem::temp_directory_path() / "grab-test-configs" / "work" / "grab.conf";
+    const auto name = config_folder_name(work);
+    const std::string own = name.value_or("");
+    CHECK(own.starts_with("work-"));
+    CHECK(own.size() == std::string("work-").size() + 8);
+    CHECK(config_folder_name(work.parent_path() / "other.conf") == name); // one per folder, as the window
+    CHECK(config_folder_name(util::path_from_utf8(util::to_lower(util::path_to_utf8(work)))) == name);
+    CHECK(config_folder_name(work.parent_path().parent_path() / "play" / "grab.conf") != name);
+    CHECK(state_dir(work) == home / "configs" / util::path_from_utf8(own));
+    CHECK(file_list::dir_for(work) == file_list::default_dir() / util::path_from_utf8(own));
+    CHECK(config_key(work.parent_path()).size() == 16);
 }

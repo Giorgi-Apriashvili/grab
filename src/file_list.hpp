@@ -81,6 +81,10 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 
 // %LOCALAPPDATA%\grab\lists (Windows), else $XDG_CACHE_HOME or ~/.cache, /grab/lists.
 [[nodiscard]] std::filesystem::path default_dir();
+// The lists of the configuration at `grab_conf`: default_dir() for the default one, a folder in
+// it named by config_folder_name for any other, so one configuration never deletes another's
+// lists, nor uses those of another server of the same name (review G219).
+[[nodiscard]] std::filesystem::path dir_for(const std::filesystem::path& grab_conf);
 // <dir>\<server>.list; a name with characters unsafe in a file name gets them replaced and a
 // short hash appended, so different names never share a file.
 [[nodiscard]] std::filesystem::path path_for(const std::filesystem::path& dir, std::string_view server);
