@@ -360,10 +360,14 @@ private:
     void folder_event(Item& item, folder::Event e); // a running folder's progress, for the page
     void folder_totals(Item& item) const;          // caller holds mutex_
     void discard_folder_partials(const Item& item) const; // cancelled folder: big files' .grabpart
-    // The connection budget for a server, from grab.conf, its host and what grab learned.
+    // The connection budget for a server, from grab.conf, its host and what grab (or the command)
+    // learned, read from limits.json each time.
     [[nodiscard]] int connection_budget(const std::string& remote, const std::string& host,
-                                        std::optional<int> configured) const;
+                                        std::optional<int> configured);
     void on_budget_learned(const std::string& server, int budget); // any thread
+    // After a download from `server` ended done: with no refusal since `refusals_before`, a
+    // learned limit goes up by one (budget::raised).
+    void download_went_well(const std::string& server, std::uint64_t refusals_before);
     [[nodiscard]] json::Value queue_snapshot() const; // caller holds mutex_
     void post_queue();
     void restore_queue();
@@ -378,6 +382,7 @@ private:
     std::filesystem::path state_path_;
     std::filesystem::path queue_path_;
     std::filesystem::path recent_path_; // recent searches, sealed (gui_state.hpp)
+    std::filesystem::path limits_path_; // learned connection limits, shared with the command
     GuiState state_;
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
     fetch::Connections connections_;
@@ -420,18 +425,20 @@ private:
     std::atomic<bool> settings_busy_{false};
     std::jthread settings_thread_;
 
-    // Guards items_, next_id_, last_progress_post_, parallel_, learned_. Worker threads read the
-    // last two here rather than state_, which belongs to the UI thread.
+    // Guards items_, next_id_, last_progress_post_, parallel_, learned_, defaults_. Worker threads
+    // read parallel_ here rather than state_, which belongs to the UI thread.
     mutable std::mutex mutex_;
     std::condition_variable_any wake_;
     std::vector<std::shared_ptr<Item>> items_;
     int next_id_ = 1;
     int parallel_ = 4;
-    std::map<std::string, int> learned_;
+    std::map<std::string, int> learned_;  // as limits.json had it when last read
+    std::map<std::string, int> defaults_; // each server's default budget, by its host
     std::chrono::steady_clock::time_point last_progress_post_{};
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
     mutable std::atomic<bool> queue_unsaved_{false}; // the last save of queue.json failed (shown once)
     mutable std::atomic<bool> state_unsaved_{false}; // the same for gui.json
+    mutable std::atomic<bool> limits_unsaved_{false}; // and for limits.json
 
     // The status bar's activities: their ids, and how long steps took (from and to gui.json).
     std::atomic<int> next_activity_{1};

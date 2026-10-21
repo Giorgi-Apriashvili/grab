@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <expected>
+#include <map>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -214,9 +215,6 @@ std::string gui_state_to_json(const GuiState& state) {
         c.set("until", Value::make_number(static_cast<double>(state.limit_change->until)));
         root.set("limitChange", std::move(c));
     }
-    Value limits = Value::make_object();
-    for (const auto& [remote, n] : state.server_limits) limits.set(remote, Value::make_number(n));
-    root.set("serverLimits", std::move(limits));
     Value timings = Value::make_object();
     for (const auto& [step, ms] : state.timings) timings.set(step, Value::make_number(ms));
     root.set("timings", std::move(timings));
@@ -341,6 +339,49 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         list.push(std::move(v));
     }
     return json::stringify(list);
+}
+
+std::filesystem::path learned_limits_path(const std::filesystem::path& grab_conf) {
+    return state_dir(grab_conf) / "limits.json";
+}
+
+namespace {
+
+// The file's limits; nullopt when there is no file. A damaged one counts as empty: these are
+// only hints, learned again from the next refusal.
+std::optional<std::map<std::string, int>> read_limits(const std::filesystem::path& file) {
+    auto text = util::read_file_if_exists(file);
+    if (text && !*text) return std::nullopt;
+    std::map<std::string, int> out;
+    if (!text) return out;
+    if (auto doc = json::parse(**text); doc && doc->kind == json::Value::Kind::object) {
+        for (std::size_t i = 0; i < doc->keys.size(); ++i) {
+            const auto& v = doc->items[i];
+            if (v.kind == json::Value::Kind::number && v.number >= 1 && v.number <= 1000) {
+                out[doc->keys[i]] = static_cast<int>(v.number);
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+std::map<std::string, int> load_learned_limits(const std::filesystem::path& file,
+                                               const std::map<std::string, int>& before) {
+    return read_limits(file).value_or(before);
+}
+
+std::expected<void, std::string> save_learned_limit(const std::filesystem::path& file, const std::string& server,
+                                                    std::optional<int> limit, const std::map<std::string, int>& before) {
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
+    auto limits = read_limits(file).value_or(before);
+    if (limit) limits[server] = *limit;
+    else limits.erase(server);
+    json::Value v = json::Value::make_object();
+    for (const auto& [name, n] : limits) v.set(name, json::Value::make_number(n));
+    return util::write_file_atomic(file, json::stringify(v));
 }
 
 std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state) {

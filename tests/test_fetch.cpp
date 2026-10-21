@@ -28,18 +28,68 @@ TEST_CASE("connection budgets: known limits, overrides, learned values") {
     CHECK(budget::effective_budget(std::nullopt, 12, 7) == 7);
     CHECK(budget::effective_budget(std::nullopt, 8, 20) == 8); // learning only lowers
     CHECK(budget::effective_budget(16, 8, 3) == 16);            // an explicit setting wins
+    // A learned value creeps back up after clean downloads, and is dropped at the default (G10).
+    CHECK(budget::raised(9, 14) == 10);
+    CHECK_FALSE(budget::raised(13, 14).has_value());
+    CHECK_FALSE(budget::raised(20, 14).has_value());
 }
 
 TEST_CASE("refusals are told apart from other failures") {
     using budget::Failure;
     CHECK(budget::classify_failure("Failed to create file system: couldn't connect SSH: ssh: handshake failed: EOF") ==
           Failure::refused);
-    CHECK(budget::classify_failure("dial tcp 1.2.3.4:23: connectex: No connection could be made because the "
-                                   "target machine actively refused it. connection refused") == Failure::refused);
     CHECK(budget::classify_failure("kex_exchange_identification: read: Connection reset by peer") == Failure::refused);
     CHECK(budget::classify_failure("object not found") == Failure::other);
     CHECK(budget::classify_failure("") == Failure::other);
+
+    // As rclone 1.75.1 printed them against a real server (G9): the Windows text for a refused
+    // port has no "connection refused" in it...
+    CHECK(budget::classify_failure("NewFs: couldn't connect SSH: dial tcp 127.0.0.1:1: connectex: No connection could be "
+                                   "made because the target machine actively refused it.") == Failure::refused);
+    // ...and a refused login or a changed host key, though "handshake failed" too, stop the download.
+    CHECK(budget::classify_failure("NewFs: couldn't connect SSH: ssh: handshake failed: ssh: unable to authenticate, "
+                                   "attempted methods [none publickey], no supported methods remain") == Failure::fatal);
+    CHECK(budget::classify_failure("NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key mismatch") ==
+          Failure::fatal);
+    CHECK(budget::classify_failure("ssh: handshake failed: ssh: disconnect, reason 2: Too many authentication failures") ==
+          Failure::fatal);
+    CHECK(budget::classify_failure("ssh: disconnect, reason 11: too many connections") == Failure::refused);
+    CHECK(budget::classify_failure("read tcp: wsarecv: A connection attempt failed because the connected party did not "
+                                   "properly respond") == Failure::other);
 }
+
+#ifdef _WIN32
+TEST_CASE("a download whose logins are refused for good stops with the reason, at once (G9)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-fatal";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // A stand-in rclone: the size check works, every read is refused as after a host key change.
+    std::ofstream(dir / "rclone.cmd", std::ios::binary)
+        << "@echo off\r\n"
+           "if \"%2\"==\"--stat\" (\r\n"
+           "  echo {\"Path\":\"f.bin\",\"Name\":\"f.bin\",\"Size\":67108864,\"ModTime\":\"2026-01-01T00:00:00Z\",\"IsDir\":false}\r\n"
+           "  exit /b 0\r\n"
+           ")\r\n"
+           "echo CRITICAL: Failed to create file system: NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key mismatch 1>&2\r\n"
+           "exit /b 1\r\n";
+    std::vector<int> learned;
+    fetch::Connections connections([&](const std::string&, int b) { learned.push_back(b); });
+    connections.configure("Main", 12);
+    fetch::Download d;
+    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .config = std::nullopt,
+                             .rclone_remote = "Main", .path = "f.bin", .flags = {}};
+    d.server = "Main";
+    d.id = 1;
+    d.target = dir / "f.bin";
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = fetch::run(d, connections, {}, {});
+    CHECK(r.outcome == fetch::Outcome::failed);
+    CHECK(r.error.find("knownhosts: key mismatch") != std::string::npos);
+    CHECK(std::chrono::steady_clock::now() - t0 < 30s);
+    CHECK(learned.empty()); // not taken for a full server
+    std::filesystem::remove_all(dir);
+}
+#endif
 
 TEST_CASE("a server pool shares its budget fairly and staggers starts") {
     budget::ServerPool pool(8);
@@ -104,13 +154,18 @@ TEST_CASE("more downloads than connections: each still gets one") {
     CHECK(pool.total_active() == 3);
 }
 
-TEST_CASE("a refusal lowers the budget, never below 1, and only with two or more open") {
+TEST_CASE("a refusal lowers the budget, never below 1, and only while another connection gets data (G10)") {
     budget::ServerPool pool(3);
     pool.add_user(1);
     auto t = budget::ServerPool::Clock::time_point{} + 10s;
     pool.started(1, t);
     CHECK_FALSE(pool.refused()); // a single connection failing says nothing about the limit
     pool.started(1, t + 1s);
+    pool.started(1, t + 2s);
+    // Several open but none getting data: the server is full of something else's connections.
+    CHECK_FALSE(pool.refused());
+    CHECK(pool.budget() == 3);
+    pool.working(1, +1); // one gets data: the others are over the server's limit
     CHECK(pool.refused());
     CHECK(pool.budget() == 2);
     CHECK(pool.refused());

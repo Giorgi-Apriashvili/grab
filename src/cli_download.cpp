@@ -615,15 +615,22 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
                                  const std::filesystem::path& dest) {
     LiveLine line;
     const std::string& server = ctx.settings.name;
-    fetch::Connections connections([&line](const std::string& name, int budget) {
+    const auto config = opts.config.value_or(default_grab_config_path());
+    const auto gui = window_settings(state_dir(config) / "gui.json");
+    // The connection limits learned from refusals, by the window or an earlier command; what this
+    // run learns is saved there too (review G195).
+    const auto limits_file = learned_limits_path(config);
+    const auto limits = load_learned_limits(limits_file, gui.server_limits);
+    fetch::Connections connections([&](const std::string& name, int budget) {
         line.message(std::format("grab: {} refused a connection; using {} from now on", name, budget));
+        if (auto saved = save_learned_limit(limits_file, name, budget, gui.server_limits); !saved) {
+            line.message("grab: " + saved.error());
+        }
     });
-    // The budget grab-gui uses, including what it learned from refusals (read only: gui.json
-    // belongs to the window).
     std::optional<int> learned;
-    const auto gui = window_settings(state_dir(opts.config.value_or(default_grab_config_path())) / "gui.json");
-    if (const auto it = gui.server_limits.find(server); it != gui.server_limits.end()) learned = it->second;
-    const int budget = budget::effective_budget(ctx.settings.max_connections, budget::default_budget(ctx.remote.host), learned);
+    if (const auto it = limits.find(server); it != limits.end()) learned = it->second;
+    const int default_budget = budget::default_budget(ctx.remote.host);
+    const int budget = budget::effective_budget(ctx.settings.max_connections, default_budget, learned);
     connections.configure(server, budget);
     rate::RateLimiter limiter;
     if (opts.limit) limiter.set_rate(*opts.limit);
@@ -721,6 +728,14 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         if (code == proc::exit_stopped) {
             tally.stopped = i + 1 < total;
             break;
+        }
+    }
+    // Downloads that ended without a refusal: a learned limit goes up by one, so a drop that
+    // wasn't the server's real limit wears off (review G10).
+    if (learned && tally.done > 0 && connections.refusals(server) == 0) {
+        if (auto saved = save_learned_limit(limits_file, server, budget::raised(*learned, default_budget), gui.server_limits);
+            !saved) {
+            std::println(stderr, "grab: {}", saved.error());
         }
     }
     return tally;

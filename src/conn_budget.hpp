@@ -22,13 +22,18 @@ namespace grab::budget {
 
 // [server] max_connections when set, else the default lowered to what grab learned.
 [[nodiscard]] int effective_budget(std::optional<int> configured, int default_value, std::optional<int> learned);
+// A learned limit after a download from its server finished without a refusal: one higher, so a
+// drop that wasn't the server's real limit (a network blip, another program using the account for
+// a while) wears off; nullopt once it's back at the default, which drops it (review G10).
+[[nodiscard]] std::optional<int> raised(int learned, int default_value);
 
 enum class Failure {
     refused, // the server turned the connection away: too many, reset during the handshake
+    fatal,   // trying again can't help: the login was refused, the host key changed, no permission
     other    // anything else: network, missing file, ...
 };
 
-// Classifies a failed `rclone cat`/`rclone copy` by its stderr.
+// Classifies a failed `rclone cat`/`rclone lsjson --stat` by its stderr.
 [[nodiscard]] Failure classify_failure(std::string_view stderr_text);
 
 // One server's connections, shared fairly by the downloads using it. Not thread-safe; the
@@ -69,9 +74,11 @@ public:
     [[nodiscard]] Clock::time_point next_start(Clock::time_point now) const;
     void started(int id, Clock::time_point now);
     void finished(int id);
+    // Connections of `id` that got data in their current run (`delta` +1 or -1).
+    void working(int id, int delta);
 
-    // The server refused a connection. With two or more open that means the budget is too high:
-    // it drops by one (not below 1). Returns whether it was lowered.
+    // The server refused a connection. While another of grab's connections to it gets data, that
+    // means the budget is too high: it drops by one (not below 1). Returns whether it was lowered.
     bool refused();
 
 private:
@@ -80,6 +87,7 @@ private:
         int active;
         int waiting = 0;
         int weight = 2;
+        int working = 0;
     };
     [[nodiscard]] const User* find(int id) const;
     [[nodiscard]] bool other_starved(int id) const;

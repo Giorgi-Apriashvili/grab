@@ -329,11 +329,17 @@ int Connections::reserve(const std::string& server, int id, std::stop_token stop
     return got;
 }
 
-void Connections::release(const std::string& server, int id, int count) {
+void Connections::release(const std::string& server, int id, int count, bool worked) {
     std::lock_guard lock(mutex_);
     auto& p = pool(server);
     for (int i = 0; i < count; ++i) p.finished(id);
+    if (worked) p.working(id, -count);
     changed_.notify_all();
+}
+
+void Connections::working(const std::string& server, int id) {
+    std::lock_guard lock(mutex_);
+    pool(server).working(id, +1);
 }
 
 bool Connections::yield_if_over_share(const std::string& server, int id) {
@@ -341,6 +347,7 @@ bool Connections::yield_if_over_share(const std::string& server, int id) {
     auto& p = pool(server);
     if (!p.should_yield(id)) return false;
     p.finished(id);
+    p.working(id, -1); // it yields mid-transfer, after data
     changed_.notify_all();
     return true;
 }
@@ -349,10 +356,17 @@ void Connections::refused(const std::string& server) {
     int lowered = 0;
     {
         std::lock_guard lock(mutex_);
+        ++refusals_[server];
         auto& p = pool(server);
         if (p.refused()) lowered = p.budget();
     }
     if (lowered > 0 && on_learned_) on_learned_(server, lowered);
+}
+
+std::uint64_t Connections::refusals(const std::string& server) {
+    std::lock_guard lock(mutex_);
+    const auto it = refusals_.find(server);
+    return it == refusals_.end() ? 0 : it->second;
 }
 
 int Connections::active(const std::string& server, int id) {
@@ -582,6 +596,12 @@ Result run(const Download& d, Connections& connections, const std::function<void
     std::vector<char> busy(state.ranges.size(), 0);
     std::vector<int> tries(state.ranges.size(), 0);
     std::vector<Clock::time_point> not_before(state.ranges.size(), Clock::time_point{});
+    // While the server refuses this download and no data comes (it is full with something else's
+    // connections): since when, how many times in a row, and until when no stream may try. Then
+    // one stream at a time asks, 1, 2, 4, 8, then 15 s apart (review G9).
+    std::optional<Clock::time_point> refused_since;
+    int refused_streak = 0;
+    Clock::time_point hold_until{};
     std::string error;
     std::stop_source inner; // ends all streams: a stop from outside, or a fatal error
     std::stop_callback forward(stop, [&] { inner.request_stop(); });
@@ -591,6 +611,16 @@ Result run(const Download& d, Connections& connections, const std::function<void
     // `retry_at` when only ranges that are backing off remain.
     auto next_range = [&](std::optional<Clock::time_point>& retry_at) -> std::optional<std::size_t> {
         const auto now = Clock::now();
+        if (refused_since) {
+            if (now < hold_until) {
+                retry_at = hold_until;
+                return std::nullopt;
+            }
+            if (std::ranges::find(busy, 1) != busy.end()) { // one asks at a time
+                retry_at = now + std::chrono::milliseconds(250);
+                return std::nullopt;
+            }
+        }
         for (std::size_t r = 0; r < state.ranges.size(); ++r) {
             if (busy[r] || state.ranges[r].remaining() == 0) continue;
             if (not_before[r] <= now) return r;
@@ -638,6 +668,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 count = state.ranges[i].remaining();
             }
             std::uint64_t got = 0;
+            bool worked = false; // counted as working in the pool, from its first data
             bool write_failed = false;
             bool yielded = false;  // gave the connection to another download mid-range
             bool restarted = false; // the speed limit changed: start again with fitting flags
@@ -664,6 +695,12 @@ Result run(const Download& d, Connections& connections, const std::function<void
                     }
                     r.done += data.size();
                     got += data.size();
+                    refused_since.reset(); // the server takes this download's connections
+                    refused_streak = 0;
+                    if (!worked && !data.empty()) {
+                        worked = true;
+                        connections.working(d.server, d.id);
+                    }
                     if (r.remaining() == 0) return false;
                 }
                 // A download that just joined this server gets its share now, not when this
@@ -678,12 +715,15 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 }
                 return true;
             }, opts);
-            // A refusal before any data arrived means this server wants fewer connections.
-            const bool refused = run && run->exit_code != 0 && got == 0 && !yielded && !restarted &&
-                                 !token.stop_requested() &&
-                                 budget::classify_failure(run->err) == budget::Failure::refused;
+            // A failure before any data arrived says why the connection failed: the server is full
+            // (it wants fewer connections), or trying again can't help (review G9).
+            const auto failure = run && run->exit_code != 0 && got == 0 && !yielded && !restarted &&
+                                         !token.stop_requested()
+                                     ? budget::classify_failure(run->err)
+                                     : budget::Failure::other;
+            const bool refused = failure == budget::Failure::refused;
             if (refused) connections.refused(d.server);
-            if (!yielded) connections.release(d.server, d.id);
+            if (!yielded) connections.release(d.server, d.id, 1, worked);
 
             std::lock_guard lock(m);
             busy[i] = 0;
@@ -695,9 +735,22 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 inner.request_stop();
                 return;
             }
+            if (failure == budget::Failure::fatal) {
+                error = server_ops::clean_rclone_error(run->err);
+                inner.request_stop();
+                return;
+            }
             if (state.ranges[i].remaining() == 0) continue;
             if (refused) {
-                not_before[i] = Clock::now() + std::chrono::seconds(1);
+                const auto now = Clock::now();
+                if (!refused_since) refused_since = now;
+                if (now - *refused_since >= refused_give_up) {
+                    error = "the server keeps refusing connections: " + server_ops::clean_rclone_error(run->err);
+                    inner.request_stop();
+                    return;
+                }
+                hold_until = now + std::min(std::chrono::seconds(1 << std::min(refused_streak++, 4)), std::chrono::seconds(15));
+                not_before[i] = now + std::chrono::seconds(1); // also while others' data keeps coming
                 continue;
             }
             if (got > 0) tries[i] = 0; // it made progress: only repeated failures in a row count

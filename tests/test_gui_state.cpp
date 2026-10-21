@@ -19,7 +19,6 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.sort = SortOrder{"modified", "desc"};
     s.destinations = {{"hetzner", "E:\\TV"}, {"arch_guest", "D:\\Box \"quoted\""}};
     s.parallel = 6;
-    s.server_limits = {{"arch_guest", 7}};
     s.timings = {{"lsjson:Box.Guest", 2300}, {"update", 900}};
     s.limit_on = true;
     s.limit_mibps = 2.5;
@@ -252,5 +251,25 @@ TEST_CASE("saved settings and a saved queue that can't be read are told apart fr
     const auto one = read_queue(queue);
     REQUIRE(one.has_value());
     CHECK(one->value_or(std::vector<SavedDownload>{}).size() == 1);
+    std::filesystem::remove_all(dir);
+}
+TEST_CASE("learned connection limits are one file for the window and the command (G195)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-limits";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "limits.json";
+    const std::map<std::string, int> before{{"Box", 9}, {"Main", 4}}; // gui.json's, from 0.17
+    CHECK(load_learned_limits(file).empty());
+    CHECK(load_learned_limits(file, before) == before); // until the file exists
+    REQUIRE(save_learned_limit(file, "Box", 8, before)); // the first save carries the others over
+    CHECK(load_learned_limits(file) == std::map<std::string, int>{{"Box", 8}, {"Main", 4}});
+    REQUIRE(save_learned_limit(file, "Main", std::nullopt, before)); // dropped, back to the default
+    CHECK(load_learned_limits(file, before) == std::map<std::string, int>{{"Box", 8}});
+    REQUIRE(util::write_file_atomic(file, R"({"Box":"x","Other":0,"Ok":5})"));
+    CHECK(load_learned_limits(file) == std::map<std::string, int>{{"Ok", 5}});
+    // gui.json no longer carries them.
+    GuiState s;
+    s.server_limits = {{"Box", 3}};
+    CHECK(gui_state_to_json(s).find("serverLimits") == std::string::npos);
     std::filesystem::remove_all(dir);
 }

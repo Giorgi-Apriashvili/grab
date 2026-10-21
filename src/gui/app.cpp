@@ -120,6 +120,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       state_path_(std::move(state_path)),
       queue_path_(state_path_.parent_path() / "queue.json"),
       recent_path_(state_path_.parent_path() / "recent"),
+      limits_path_(state_path_.parent_path() / "limits.json"),
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     if (auto saved = read_gui_state(state_path_); !saved) {
         set_aside("grab's settings", state_path_, saved.error(), "the defaults are used");
@@ -127,7 +128,14 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
         state_ = std::move(**saved);
     }
     parallel_ = state_.parallel;
-    learned_ = state_.server_limits;
+    // Learned connection limits are in limits.json, shared with the command (G195); what gui.json
+    // held before moves there once.
+    learned_ = load_learned_limits(limits_path_, state_.server_limits);
+    if (std::error_code ec; !state_.server_limits.empty() && !std::filesystem::exists(limits_path_, ec)) {
+        const auto& [server, n] = *state_.server_limits.begin();
+        report_save("the learned connection limits", save_learned_limit(limits_path_, server, n, state_.server_limits),
+                    limits_unsaved_);
+    }
     timings_ = state_.timings;
     verify_downloads_ = state_.verify_downloads;
     // The speed limit that holds now; the first tick() tells the page and drops a change that
@@ -1466,6 +1474,7 @@ std::expected<server_ops::Env, std::string> App::load_env() const {
 }
 
 void App::post_servers(const server_ops::Env& env) const {
+    const auto learned = load_learned_limits(limits_path_);
     Value items = Value::make_array();
     for (const auto& s : server_ops::list_servers(env)) {
         Value v = Value::make_object();
@@ -1477,12 +1486,11 @@ void App::post_servers(const server_ops::Env& env) const {
         v.set("depth", num(s.max_depth));
         v.set("maxConnections", s.max_connections ? num(*s.max_connections) : Value{});
         {
-            // The automatic value, lowered to what grab learned from refusals.
-            std::lock_guard lock(mutex_);
-            const auto it = learned_.find(s.name);
+            // The automatic value, lowered to what grab (or the command) learned from refusals.
+            const auto it = learned.find(s.name);
             v.set("autoConnections",
                   num(budget::effective_budget(std::nullopt, s.default_connections,
-                                               it == learned_.end() ? std::nullopt : std::optional(it->second))));
+                                               it == learned.end() ? std::nullopt : std::optional(it->second))));
         }
         v.set("error", str(s.error));
         v.set("host", str(s.host));
@@ -1637,15 +1645,12 @@ void App::apply_pending(Pending p, std::stop_token stop) {
     if (!done->empty()) settings_error(*done);
     // An explicit connection limit replaces whatever grab learned for this server.
     if (p.server.max_connections) {
-        const std::string name = p.server.name;
         {
             std::lock_guard lock(mutex_);
-            learned_.erase(name);
+            learned_.erase(p.server.name);
         }
-        host_.defer([this, name] {
-            state_.server_limits.erase(name);
-            save_state();
-        });
+        report_save("the learned connection limits", save_learned_limit(limits_path_, p.server.name, std::nullopt),
+                    limits_unsaved_);
     }
 
     Value v = Value::make_object();
@@ -2305,8 +2310,15 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
         item->error = std::format("cannot create {}: {}", util::path_to_utf8(item->dest), ec.message());
         return;
     }
+    const auto refusals_before = connections_.refusals(item->remote);
     if (item->mode == Mode::file) run_file(item, item_stop);
     else run_folder(item, item_stop);
+    bool done = false;
+    {
+        std::lock_guard lock(mutex_);
+        done = item->status == Status::done;
+    }
+    if (done) download_went_well(item->remote, refusals_before);
 
     // A stopped download ends paused or cancelled, as asked; closing the app leaves it paused.
     std::lock_guard lock(mutex_);
@@ -2319,13 +2331,17 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     }
 }
 
-int App::connection_budget(const std::string& remote, const std::string& host, std::optional<int> configured) const {
+int App::connection_budget(const std::string& remote, const std::string& host, std::optional<int> configured) {
+    auto limits = load_learned_limits(limits_path_); // the command may have learned since
     std::optional<int> learned;
+    const int default_value = budget::default_budget(host);
     {
         std::lock_guard lock(mutex_);
+        learned_ = std::move(limits);
+        defaults_[remote] = default_value;
         if (auto it = learned_.find(remote); it != learned_.end()) learned = it->second;
     }
-    return budget::effective_budget(configured, budget::default_budget(host), learned);
+    return budget::effective_budget(configured, default_value, learned);
 }
 
 void App::on_budget_learned(const std::string& server, int budget) {
@@ -2333,10 +2349,22 @@ void App::on_budget_learned(const std::string& server, int budget) {
         std::lock_guard lock(mutex_);
         learned_[server] = budget;
     }
-    host_.defer([this, server, budget] {
-        state_.server_limits[server] = budget;
-        save_state();
-    });
+    report_save("the learned connection limits", save_learned_limit(limits_path_, server, budget), limits_unsaved_);
+}
+
+void App::download_went_well(const std::string& server, std::uint64_t refusals_before) {
+    if (connections_.refusals(server) != refusals_before) return;
+    std::optional<int> raised;
+    {
+        std::lock_guard lock(mutex_);
+        const auto it = learned_.find(server);
+        const auto def = defaults_.find(server);
+        if (it == learned_.end() || def == defaults_.end()) return;
+        raised = budget::raised(it->second, def->second);
+        if (raised) it->second = *raised;
+        else learned_.erase(it);
+    }
+    report_save("the learned connection limits", save_learned_limit(limits_path_, server, raised), limits_unsaved_);
 }
 
 // Progress for the page, at most every progress_interval across all downloads.

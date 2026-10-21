@@ -53,7 +53,9 @@ struct GuiState {
     std::map<std::string, std::string> destinations; // remote -> last destination folder
     std::optional<SortOrder> sort;                   // absent: the default order
     int parallel = 4;                               // downloads at once, min_parallel..max_parallel
-    std::map<std::string, int> server_limits;        // remote -> connection budget learned from refusals
+    // remote -> connection budget learned from refusals, as grab 0.17 and older saved it here; read
+    // only, to carry it over to limits.json (learned_limits_path), and no longer written.
+    std::map<std::string, int> server_limits;
     // How long steps took ("lsjson:Box.Guest" -> ms, a moving average), for the status bar's
     // progress where nothing can be counted.
     std::map<std::string, int> timings;
@@ -139,6 +141,18 @@ read_queue(const std::filesystem::path& p);
 // gui.json as saved: nullopt when there is none; an error when it exists but can't be read or
 // isn't a JSON object, so that the defaults never replace it unseen (review G213).
 [[nodiscard]] std::expected<std::optional<GuiState>, std::string> read_gui_state(const std::filesystem::path& p);
+// The connection limits grab learned per server from refusals, shared by the window and the
+// command (review G195): state_dir's "limits.json", {"server": n}. `before`: what gui.json held
+// as "serverLimits" (grab 0.17 and older), used while the file doesn't exist yet.
+[[nodiscard]] std::filesystem::path learned_limits_path(const std::filesystem::path& grab_conf);
+[[nodiscard]] std::map<std::string, int> load_learned_limits(const std::filesystem::path& file,
+                                                             const std::map<std::string, int>& before = {});
+// Sets one server's learned limit, or drops it (nullopt), under the settings lock and from the
+// file as it is then: both programs write it.
+[[nodiscard]] std::expected<void, std::string> save_learned_limit(const std::filesystem::path& file,
+                                                                  const std::string& server, std::optional<int> limit,
+                                                                  const std::map<std::string, int>& before = {});
+
 // Replaced in one step (util::write_file_atomic); the error says why it couldn't be.
 [[nodiscard]] std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state);
 

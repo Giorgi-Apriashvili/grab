@@ -20,16 +20,33 @@ int effective_budget(std::optional<int> configured, int default_value, std::opti
     return std::max(b, 1);
 }
 
+std::optional<int> raised(int learned, int default_value) {
+    if (learned + 1 >= default_value) return std::nullopt;
+    return learned + 1;
+}
+
 Failure classify_failure(std::string_view stderr_text) {
     const std::string t = util::to_lower(stderr_text);
-    // Messages from Go's ssh library and the OS when a server sheds connections: too many
-    // (Storage Box), MaxStartups dropping a login, or a reset before the handshake finished.
-    static constexpr std::string_view refused_signs[] = {
-        "connection refused",   "connection reset by peer", "too many",
-        "handshake failed",     "kex_exchange_identification",
-        "ssh: disconnect",      "max_startups",             "maxstartups",
-        "forcibly closed",      "wsarecv",
+    // First, as Go's ssh library wraps them in "handshake failed" too: trying again only repeats
+    // a refused login (an account lock, fail2ban) or a changed host key (review G9).
+    // (Not a bare "host key": rclone's notice "No host key validation is being performed" comes
+    // with every failure of a server without a pinned key.)
+    static constexpr std::string_view fatal_signs[] = {
+        "unable to authenticate", "no supported methods remain", "too many authentication failures",
+        "permission denied",      "knownhosts:",                 "host key mismatch",
+        "host key verification failed", "remote host identification has changed",
     };
+    // Messages from Go's ssh library and the OS when a server sheds connections: too many
+    // (Storage Box), MaxStartups dropping a login, the handshake cut short, or the port refusing
+    // (Windows: "actively refused").
+    static constexpr std::string_view refused_signs[] = {
+        "too many",          "max_startups",    "maxstartups",           "kex_exchange_identification",
+        "handshake failed: eof", "ssh: disconnect", "connection reset by peer", "forcibly closed",
+        "connection refused", "actively refused",
+    };
+    for (auto sign : fatal_signs) {
+        if (t.find(sign) != std::string::npos) return Failure::fatal;
+    }
     for (auto sign : refused_signs) {
         if (t.find(sign) != std::string::npos) return Failure::refused;
     }
@@ -125,8 +142,18 @@ void ServerPool::finished(int id) {
     if (it != users_.end() && it->active > 0) --it->active;
 }
 
+void ServerPool::working(int id, int delta) {
+    auto it = std::ranges::find(users_, id, &User::id);
+    if (it != users_.end()) it->working = std::max(0, it->working + delta);
+}
+
 bool ServerPool::refused() {
-    if (total_active() < 2 || budget_ <= 1) return false;
+    // Only while another of grab's connections to it gets data: then the server's limit is below
+    // what grab opens. With none working, it is full of something else's connections, and a lower
+    // budget would only stay behind (review G10).
+    int working = 0;
+    for (const auto& u : users_) working += u.working;
+    if (working < 1 || budget_ <= 1) return false;
     --budget_;
     return true;
 }

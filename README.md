@@ -381,8 +381,18 @@ too and goes on without them.
     Settings, or as `max_connections` in grab.conf.
   - A lone download uses the whole budget; several split it fairly. A small file that can
     only use one connection lends the rest to the others.
-  - Connections open slightly staggered. If a server refuses one, grab lowers that server's
-    budget and remembers it.
+  - Connections open slightly staggered. If a server refuses one while others of grab's get
+    data, grab lowers that server's budget and remembers it (in `limits.json` next to
+    gui.json, shared with the `grab` command). Each download from that server that ends
+    without a refusal raises it by one again, back to the default, so a drop caused by a
+    passing hiccup wears off.
+  - A server that refuses everything is full with something else's connections: grab asks
+    again one connection at a time, 1, 2, 4, 8, then 15 seconds apart, and after 5 minutes
+    without any data the download fails ("the server keeps refusing connections"); Retry or
+    Resume picks it up again. A refused login or a changed host key stops the download at
+    once with the server's message, instead of trying again.
+  - The window and a `grab` command running at the same time each use the whole budget; only
+    what they learn is shared.
   - Measured on a Storage Box, where each connection is capped at about 2.5 MB/s: 1
     connection gives 2.5 MB/s, 8 give about 14 MB/s, and 14 about 19 MB/s. `rclone copyto`
     reached about 5 MB/s.
@@ -723,8 +733,8 @@ made verification compare sizes only). Likewise they see no `RCLONE_*` environme
 for interactive rclone would put progress text into the bytes grab reads. A folder's small-file
 batch gets its `--transfers` from grab (the connections it may use), and grab's own engine
 fetches a file in byte ranges over `max_connections` (blank = automatic: 14 on Storage Boxes,
-12 elsewhere, lowered when a server refuses connections), in the window and in the `grab`
-command alike.
+12 elsewhere, lowered when a server refuses connections and raised again by clean downloads),
+in the window and in the `grab` command alike.
 
 With `--rclone`, concurrent SFTP connections ≈ `transfers × multi-thread-streams`
 (+ checkers). If the server logs `MaxStartups` drops, lower one of them.

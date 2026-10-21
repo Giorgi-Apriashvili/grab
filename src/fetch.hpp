@@ -15,6 +15,7 @@
 #include "rate.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <expected>
@@ -36,6 +37,9 @@ inline constexpr std::uint64_t max_chunk = std::uint64_t{128} << 20;
 // A busy range is split for an idle stream only when both halves get at least this much.
 inline constexpr std::uint64_t min_split = std::uint64_t{4} << 20;
 inline constexpr int max_retries = 6; // per range, before the download fails
+// A server that refuses every connection this long, with no data meanwhile, fails the download:
+// it is full with something else's connections (review G9).
+inline constexpr std::chrono::minutes refused_give_up{5};
 
 // Chunk size for a file of `size` bytes fetched over up to `streams` connections: enough chunks
 // to keep every stream busy, within [min_chunk, max_chunk].
@@ -155,13 +159,19 @@ public:
     // Takes up to `id`'s whole share at once (for an rclone copy that manages its own
     // connections); at least 1 unless stopped (0).
     int reserve(const std::string& server, int id, std::stop_token stop);
-    void release(const std::string& server, int id, int count = 1);
+    // `worked`: the connection got data (see working), and stops counting as working too.
+    void release(const std::string& server, int id, int count = 1, bool worked = false);
+    // A connection of `id` got its first data: the server takes grab's connections.
+    void working(const std::string& server, int id);
     // When `id` holds more connections than its share while another download waits for its own
     // (e.g. one just joined), gives one up and returns true; the caller then stops that stream
     // and must not release it again.
     bool yield_if_over_share(const std::string& server, int id);
     // A connection of this server was refused; call while it still counts as open.
     void refused(const std::string& server);
+    // How many refusals this server has had so far: a download that ends with the same number it
+    // started with had none.
+    [[nodiscard]] std::uint64_t refusals(const std::string& server);
     [[nodiscard]] int active(const std::string& server, int id);
     [[nodiscard]] int budget(const std::string& server);
 
@@ -170,6 +180,7 @@ private:
     std::mutex mutex_;
     std::condition_variable_any changed_;
     std::map<std::string, budget::ServerPool> pools_;
+    std::map<std::string, std::uint64_t> refusals_;
     OnLearned on_learned_;
 };
 
