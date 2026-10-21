@@ -412,13 +412,17 @@ std::expected<std::string, std::string> remove_server(const Env& env, std::strin
     if (auto written = write_grab_conf(env, text); !written) return util::fail(written.error());
     // Only grab's own rclone.conf is edited; an explicitly configured shared one is left alone.
     if (env.cfg.rclone_config) return std::string{};
-    (void)change_secrets(env, [&](secrets::Store& st) { st.erase(rclone_name); });
+    // The server is gone from grab either way; what couldn't be cleaned up is said.
+    std::vector<std::string> notes;
+    if (auto forgot = change_secrets(env, [&](secrets::Store& st) { st.erase(rclone_name); }); !forgot) {
+        notes.push_back(std::format("its saved password could not be removed: {}", forgot.error()));
+    }
     auto deleted = proc::run_capture(servers::delete_argv(env.rclone, env.rclone_conf, rclone_name), quiet());
     if (!ok(deleted)) {
-        return std::format("rclone config delete {} failed: {}", rclone_name,
-                           deleted ? clean_rclone_error(deleted->err) : deleted.error());
+        notes.push_back(std::format("rclone config delete {} failed: {}", rclone_name,
+                                    deleted ? clean_rclone_error(deleted->err) : deleted.error()));
     }
-    return std::string{};
+    return util::join(notes, "; ");
 }
 
 std::expected<void, std::string> set_default(const Env& env, std::string_view name) {

@@ -131,8 +131,8 @@ rclone_edit_updates(const ini::Section& current, const servers::NewServer& wante
                                                             const HostKeys& keys);
 
 // Removes the grab.conf section and, unless rclone_config is set explicitly, the rclone
-// remote. A default_remote pointing at it moves to the next server. Returns a note when the
-// rclone side could not be removed (the server is gone from grab either way).
+// remote. A default_remote pointing at it moves to the next server. Returns a note when its saved
+// password or the rclone remote could not be removed (the server is gone from grab either way).
 [[nodiscard]] std::expected<std::string, std::string> remove_server(const Env& env, std::string_view name);
 
 [[nodiscard]] std::expected<void, std::string> set_default(const Env& env, std::string_view name);
