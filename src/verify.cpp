@@ -42,10 +42,10 @@ std::string upper(std::string s) {
     return s;
 }
 
-bool write_list(const fs::path& file, std::span<const std::string> paths) {
+std::expected<void, std::string> write_list(const fs::path& file, std::span<const std::string> paths) {
     std::string text;
     for (const auto& p : paths) text += p + '\n';
-    return server_ops::write_text(file, text);
+    return util::write_file_atomic(file, text);
 }
 
 proc::RunOptions quiet(std::stop_token stop) {
@@ -59,7 +59,7 @@ proc::RunOptions quiet(std::stop_token stop) {
 std::expected<Report, std::string> check_names(const Request& r, std::span<const std::string> paths, int held,
                                                const std::stop_token& stop) {
     const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}.txt", process_id(), r.id);
-    if (!write_list(list, paths)) return util::fail("cannot write " + util::path_to_utf8(list));
+    if (auto written = write_list(list, paths); !written) return util::fail(written.error());
     const auto built = check_argv(r, list, held);
     if (!built) {
         std::error_code ec;
@@ -112,7 +112,7 @@ std::expected<void, std::string> compare_sums(const Request& r, std::span<const 
                                               const std::stop_token& stop, Report& report) {
     const auto& ctx = *r.ctx;
     const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}-sums.txt", process_id(), r.id);
-    if (!write_list(list, paths)) return util::fail("cannot write " + util::path_to_utf8(list));
+    if (auto written = write_list(list, paths); !written) return util::fail(written.error());
     std::vector<std::string> argv{ctx.config.rclone, "hashsum", "md5", remote_spec(ctx.settings.rclone_remote, r.remote_dir)};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
     const auto flags = rclone_flags::connection(ctx.settings.common_flags);

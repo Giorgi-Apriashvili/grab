@@ -50,10 +50,21 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     const int reserved = job.connections->reserve(job.server, job.id, stop);
     if (reserved == 0) return; // stopped while waiting
     const auto list = fs::temp_directory_path() / std::format("grab-files-{}-{}.txt", process_id(), job.id);
-    (void)server_ops::write_text(list, files_from_text(paths));
+    std::unordered_map<std::string, std::size_t> index; // path -> file
+    if (auto written = util::write_file_atomic(list, files_from_text(paths)); !written) {
+        job.connections->release(job.server, job.id, reserved);
+        std::lock_guard lock(m);
+        for (std::size_t i = 0; i < tree.files.size(); ++i) index.emplace(tree.files[i].path, i);
+        for (const auto& p : paths) {
+            auto& f = tree.files[index[p]];
+            if (f.status != State::queued) continue;
+            f.status = State::failed;
+            f.error = written.error();
+        }
+        return;
+    }
     const std::uint64_t limit = job.batch_limit ? job.batch_limit() : 0;
 
-    std::unordered_map<std::string, std::size_t> index; // path -> file
     std::stop_source batch;
     {
         std::lock_guard lock(m);

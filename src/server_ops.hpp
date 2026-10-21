@@ -38,9 +38,6 @@ struct Env {
 [[nodiscard]] std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf,
                                                        const std::filesystem::path& exe_dir);
 
-// Writes through a temporary file and a rename, so a reader never sees half a file.
-[[nodiscard]] bool write_text(const std::filesystem::path& p, const std::string& text);
-
 // A server's secrets in the store (secrets.hpp) after choosing `auth`: a password server keeps
 // only its password, a key-file server only its passphrase, an ssh-agent server none. A new
 // `obscured` secret replaces the old one; none keeps the old one of the same kind.

@@ -182,7 +182,7 @@ TEST_CASE("recent searches are sealed on disk and come back") {
 
     REQUIRE(save_recent(file, json::Value::make_array())); // Clear history
     CHECK_FALSE(std::filesystem::exists(file));
-    util::write_file_atomic(file, "[{\"q\":\"plain\"}]"); // not sealed: ignored
+    REQUIRE(util::write_file_atomic(file, "[{\"q\":\"plain\"}]")); // not sealed: ignored
     CHECK(load_recent(file).items.empty());
     std::filesystem::remove_all(dir);
 }

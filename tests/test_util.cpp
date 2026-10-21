@@ -7,10 +7,16 @@
 #include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
 #endif
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace grab;
 
@@ -148,5 +154,175 @@ TEST_CASE("a new file is written only where nothing is") {
     CHECK_FALSE(util::write_new_file(dir / "sub", "x")); // a folder
     CHECK(util::write_new_file(dir / "empty.txt", ""));
     CHECK(std::filesystem::file_size(dir / "empty.txt") == 0);
+    std::filesystem::remove_all(dir);
+}
+
+namespace {
+
+std::filesystem::path fresh_dir(const char* name) {
+    const auto dir = std::filesystem::temp_directory_path() / name;
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+// The files in `dir` (names only), to see that nothing was left beside the target.
+std::vector<std::string> names_in(const std::filesystem::path& dir) {
+    std::vector<std::string> out;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) out.push_back(util::path_to_utf8(e.path().filename()));
+    std::ranges::sort(out);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("two writers of one file never mix, and leave nothing beside it (G11)") {
+    const auto dir = fresh_dir("grab-test-atomic");
+    const auto file = dir / "grab.conf";
+    const std::string a(3000, 'a');
+    const std::string b(2000, 'b');
+    int mixed = 0;
+    int failed = 0;
+    for (int round = 0; round < 100; ++round) {
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        bool wrote_a = false;
+        bool wrote_b = false;
+        auto writer = [&](const std::string& text, bool& wrote) {
+            ++ready;
+            while (!go) {
+            }
+            wrote = util::write_file_atomic(file, text).has_value();
+        };
+        std::thread one(writer, std::cref(a), std::ref(wrote_a));
+        std::thread two(writer, std::cref(b), std::ref(wrote_b));
+        while (ready < 2) {
+        }
+        go = true;
+        one.join();
+        two.join();
+        const auto got = util::read_file(file).value_or("");
+        if (got != a && got != b) ++mixed;
+        if (!wrote_a || !wrote_b) ++failed;
+    }
+    CHECK(mixed == 0);
+    CHECK(failed == 0);
+    CHECK(names_in(dir) == std::vector<std::string>{"grab.conf"});
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a failed write says why and leaves the file as it was") {
+    const auto dir = fresh_dir("grab-test-atomic-fail");
+    REQUIRE(util::write_file_atomic(dir / "blocker", "a file where a folder should be"));
+    const auto written = util::write_file_atomic(dir / "blocker" / "grab.conf", "x");
+    REQUIRE_FALSE(written.has_value());
+    CHECK(written.error().starts_with("cannot write "));
+    CHECK(written.error().size() > std::string("cannot write ").size() + util::path_to_utf8(dir).size() + 20);
+    CHECK(names_in(dir) == std::vector<std::string>{"blocker"});
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("missing, unreadable and readable files are told apart") {
+    const auto dir = fresh_dir("grab-test-read");
+    const auto missing = util::read_file_if_exists(dir / "none");
+    REQUIRE(missing.has_value());
+    CHECK_FALSE(missing->has_value());
+    CHECK_FALSE(util::read_file(dir / "none").has_value());
+    const auto no_folder = util::read_file_if_exists(dir / "no-folder" / "none");
+    CHECK((no_folder.has_value() && !no_folder->has_value()));
+    REQUIRE(util::write_file_atomic(dir / "empty", ""));
+    const auto empty = util::read_file_if_exists(dir / "empty");
+    CHECK((empty.has_value() && *empty == std::optional<std::string>("")));
+    CHECK_FALSE(util::read_file_if_exists(dir).has_value()); // a folder: unreadable, not missing
+    std::filesystem::remove_all(dir);
+}
+
+#ifdef _WIN32
+TEST_CASE("a read that fails part-way is an error, not a shorter file (G216)") {
+    const auto dir = fresh_dir("grab-test-read-tail");
+    const auto file = dir / "known_hosts";
+    REQUIRE(util::write_file_atomic(file, std::string(10000, 'k')));
+    // Another program holds a lock on the tail.
+    const HANDLE other = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(other != INVALID_HANDLE_VALUE);
+    OVERLAPPED at{};
+    at.Offset = 6000;
+    REQUIRE(LockFileEx(other, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 100000, 0, &at));
+    const auto read = util::read_file(file);
+    CHECK_FALSE(read.has_value());
+    if (!read) CHECK(read.error().starts_with("cannot read "));
+    UnlockFileEx(other, 0, 100000, 0, &at);
+    CloseHandle(other);
+    CHECK(util::read_file(file).value_or("").size() == 10000);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a file being read can still be replaced, and another program's hold is waited out (G216)") {
+    const auto dir = fresh_dir("grab-test-replace-open");
+    const auto file = dir / "grab.conf";
+    REQUIRE(util::write_file_atomic(file, "old"));
+    // A reader that shares delete, as read_file opens files: the replace goes ahead at once.
+    HANDLE reader = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reader != INVALID_HANDLE_VALUE);
+    CHECK(util::write_file_atomic(file, "new").has_value());
+    CloseHandle(reader);
+    CHECK(util::read_file(file).value_or("") == "new");
+
+    // Another program that doesn't share delete, and lets go a moment later.
+    reader = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reader != INVALID_HANDLE_VALUE);
+    std::thread let_go([reader] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        CloseHandle(reader);
+    });
+    CHECK(util::write_file_atomic(file, "newer").has_value());
+    let_go.join();
+    CHECK(util::read_file(file).value_or("") == "newer");
+
+    // One that never lets go: the write fails, the file stays as it was, nothing is left beside it.
+    reader = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reader != INVALID_HANDLE_VALUE);
+    CHECK_FALSE(util::write_file_atomic(file, "lost").has_value());
+    CloseHandle(reader);
+    CHECK(util::read_file(file).value_or("") == "newer");
+    CHECK(names_in(dir) == std::vector<std::string>{"grab.conf"});
+    std::filesystem::remove_all(dir);
+}
+#endif
+
+TEST_CASE("a file moved aside keeps its text and never replaces another") {
+    const auto dir = fresh_dir("grab-test-aside");
+    const auto file = dir / "queue.json";
+    REQUIRE(util::write_file_atomic(file, "one"));
+    const auto first = util::move_aside(file, "bad");
+    REQUIRE(first.has_value());
+    CHECK(util::path_to_utf8(first->filename()).starts_with("queue.json.bad-"));
+    CHECK_FALSE(std::filesystem::exists(file));
+    REQUIRE(util::write_file_atomic(file, "two"));
+    const auto second = util::move_aside(file, "bad"); // most likely the same second
+    REQUIRE(second.has_value());
+    CHECK(*second != *first);
+    CHECK(util::read_file(*first).value_or("") == "one");
+    CHECK(util::read_file(*second).value_or("") == "two");
+    CHECK_FALSE(util::move_aside(file, "bad").has_value()); // gone already
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a file lock has one holder at a time") {
+    const auto dir = fresh_dir("grab-test-lock");
+    const auto at = dir / "settings.lock";
+    auto held = util::lock_file(at, std::chrono::milliseconds(0));
+    REQUIRE(held.has_value());
+    bool second = true;
+    std::thread other([&] { second = util::lock_file(at, std::chrono::milliseconds(100)).has_value(); });
+    other.join();
+    CHECK_FALSE(second);
+    std::thread waiter([&] { second = util::lock_file(at, std::chrono::seconds(5)).has_value(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    *held = util::FileLock{}; // let go: the waiter gets it
+    waiter.join();
+    CHECK(second);
     std::filesystem::remove_all(dir);
 }

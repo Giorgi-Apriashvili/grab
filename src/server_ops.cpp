@@ -37,8 +37,7 @@ bool ok(const std::expected<proc::CaptureResult, std::string>& run) { return run
 
 std::expected<void, std::string> write_grab_conf(const Env& env, const std::string& text) {
     if (text == env.grab_text) return {};
-    if (!write_text(env.grab_conf, text)) return util::failf("cannot write {}", util::path_to_utf8(env.grab_conf));
-    return {};
+    return util::write_file_atomic(env.grab_conf, text);
 }
 
 // The server's host key lines via real ssh handshakes, one per key type (see
@@ -153,14 +152,12 @@ std::expected<void, std::string> change_secrets(const Env& env, const std::funct
     const auto file = secrets::path_beside(env.rclone_conf);
     auto store = secrets::load(file).value_or(secrets::Store{});
     change(store);
-    if (!secrets::save(file, store)) return util::failf("cannot write {}", util::path_to_utf8(file));
+    if (auto saved = secrets::save(file, store); !saved) return saved;
     secrets::export_to_env(store);
     return {};
 }
 
 } // namespace
-
-bool write_text(const std::filesystem::path& p, const std::string& text) { return util::write_file_atomic(p, text); }
 
 // ---- lists ---------------------------------------------------------------------------------
 
@@ -231,10 +228,7 @@ std::expected<void, std::string> pin_host_keys(const std::filesystem::path& know
                                                const std::vector<std::string>& lines) {
     std::string existing;
     if (auto t = util::read_file(known_hosts)) existing = std::move(*t);
-    if (!write_text(known_hosts, servers::merge_known_hosts(existing, lines))) {
-        return util::failf("cannot write {}", util::path_to_utf8(known_hosts));
-    }
-    return {};
+    return util::write_file_atomic(known_hosts, servers::merge_known_hosts(existing, lines));
 }
 
 std::expected<std::string, std::string> obscure(const Env& env, const std::string& secret) {

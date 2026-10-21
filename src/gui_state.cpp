@@ -5,7 +5,7 @@
 #include "util.hpp"
 
 #include <algorithm>
-#include <fstream>
+#include <expected>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -44,7 +44,7 @@ bool save_recent(const std::filesystem::path& file, const json::Value& items) {
         return !ec;
     }
     const auto sealed = util::protect_for_user(json::stringify(kept), recent_purpose);
-    return sealed && util::write_file_atomic(file, std::string(recent_header) + *sealed);
+    return sealed && util::write_file_atomic(file, std::string(recent_header) + *sealed).has_value();
 }
 
 std::optional<SortOrder> sort_from_json(const json::Value& v) {
@@ -299,20 +299,8 @@ GuiState load_gui_state(const std::filesystem::path& p) {
     return text ? parse_gui_state(*text) : GuiState{};
 }
 
-bool save_gui_state(const std::filesystem::path& p, const GuiState& state) {
-    std::error_code ec;
-    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
-    // Write a sibling and swap it in, so a crash mid-write never leaves a truncated file.
-    auto tmp = p;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out << gui_state_to_json(state);
-        if (!out) return false;
-    }
-    std::filesystem::rename(tmp, p, ec);
-    return !ec;
+std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state) {
+    return util::write_file_atomic(p, gui_state_to_json(state));
 }
 
 } // namespace grab

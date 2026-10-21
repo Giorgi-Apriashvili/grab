@@ -165,7 +165,21 @@ App::~App() {
     wake_.notify_all();
 }
 
-void App::save_state() const { save_gui_state(state_path_, state_); }
+void App::save_state() const { report_save("the window's settings", save_gui_state(state_path_, state_), state_unsaved_); }
+
+// gui.json and queue.json are saved often: a failure shows once, until a save works again (G214).
+void App::report_save(std::string_view what, const std::expected<void, std::string>& saved,
+                      std::atomic<bool>& failing) const {
+    if (saved) {
+        failing = false;
+        return;
+    }
+    if (failing.exchange(true)) return;
+    Value v = Value::make_object();
+    v.set("type", str("error"));
+    v.set("message", str(std::format("Couldn't save {}: {}", what, saved.error())));
+    post(v);
+}
 
 // ---- the status bar's activities ------------------------------------------------------------
 
@@ -1376,9 +1390,10 @@ void App::pick_file(std::wstring current) {
 // Like `grab config`: [grab] editor, $VISUAL, $EDITOR, else Notepad. Started, not waited for.
 void App::open_config() const {
     std::error_code ec;
-    if (!std::filesystem::exists(config_path_, ec) &&
-        !server_ops::write_text(config_path_, generate_grab_config(nullptr, ""))) {
-        return settings_error("cannot create " + util::path_to_utf8(config_path_));
+    if (!std::filesystem::exists(config_path_, ec)) {
+        if (auto created = util::write_file_atomic(config_path_, generate_grab_config(nullptr, "")); !created) {
+            return settings_error(created.error());
+        }
     }
     std::vector<std::string> candidates;
     if (auto doc = ini::parse_file(config_path_)) {
@@ -2740,6 +2755,9 @@ void App::restore_queue() {
 }
 
 void App::save_queue() const {
+    // The snapshot is taken under the file's lock too, so two savers can't write in the opposite
+    // order of their snapshots and leave an older queue on disk (review G53).
+    std::lock_guard file_lock(queue_file_mutex_);
     std::vector<SavedDownload> unfinished;
     {
         std::lock_guard lock(mutex_);
@@ -2763,13 +2781,12 @@ void App::save_queue() const {
             unfinished.push_back(std::move(d));
         }
     }
-    std::lock_guard lock(queue_file_mutex_);
     std::error_code ec;
     if (unfinished.empty()) {
         std::filesystem::remove(queue_path_, ec);
         return;
     }
-    (void)server_ops::write_text(queue_path_, queue_to_json(unfinished));
+    report_save("the download queue", util::write_file_atomic(queue_path_, queue_to_json(unfinished)), queue_unsaved_);
 }
 
 // ---- updates ------------------------------------------------------------------------------

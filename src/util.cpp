@@ -5,11 +5,14 @@
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <system_error>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
@@ -17,8 +20,11 @@
 #include <bcrypt.h>
 #include <dpapi.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <termios.h>
+#include <thread>
 #include <unistd.h>
 #endif
 
@@ -100,17 +106,214 @@ std::string format_size(std::uint64_t bytes) {
     return std::format("{:.1f} {}", value, units[unit]);
 }
 
-bool write_file_atomic(const std::filesystem::path& p, std::string_view text) {
+namespace {
+
+// Eight random hex digits, for a file made beside another one.
+std::string random_suffix() {
+    thread_local std::mt19937 gen{std::random_device{}()};
+    return std::format("{:08x}", static_cast<std::uint32_t>(gen()));
+}
+
+#ifdef _WIN32
+
+// Another program has the file open, and may let go of it in a moment.
+bool busy(DWORD e) { return e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION; }
+
+// Moves the new file `tmp`, open as `h` with DELETE access, over `target`, and closes `h`. With
+// POSIX semantics this also replaces a file that others have open while sharing delete, as
+// read_file opens it; MoveFileExW refuses any open file (review G216). File systems without them
+// (FAT, some network shares) get MoveFileExW. A target another program holds without sharing
+// delete is tried again for two seconds. Returns 0 or the Win32 error.
+DWORD replace_with(HANDLE h, const std::filesystem::path& tmp, const std::filesystem::path& target) {
+    std::error_code ec;
+    const std::wstring name = std::filesystem::absolute(target, ec).wstring();
+    std::vector<char> buf(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+    info->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+    std::memcpy(info->FileName, name.c_str(), info->FileNameLength);
+    DWORD e = 0;
+    for (int attempt = 0;; ++attempt) {
+        if (SetFileInformationByHandle(h, FileRenameInfoEx, info, static_cast<DWORD>(buf.size()))) {
+            CloseHandle(h);
+            return 0;
+        }
+        e = GetLastError();
+        if (!busy(e) || attempt == 40) break;
+        Sleep(50);
+    }
+    CloseHandle(h);
+    if (busy(e)) return e;
+    for (int attempt = 0;; ++attempt) {
+        if (MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+        e = GetLastError();
+        if (!busy(e) || attempt == 40) return e;
+        Sleep(50);
+    }
+}
+
+#endif
+
+} // namespace
+
+std::expected<void, std::string> write_file_atomic(const std::filesystem::path& p, std::string_view text) {
+    const auto failed = [&](unsigned long code) {
+        return failf("cannot write {}: {}", path_to_utf8(p), error_message(code));
+    };
     std::error_code ec;
     if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
-    auto tmp = p;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out || !(out << text)) return false;
+    std::filesystem::path tmp;
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; ++attempt) {
+        tmp = p;
+        tmp += "." + random_suffix() + ".tmp";
+        h = CreateFileW(tmp.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) return failed(GetLastError());
     }
-    std::filesystem::rename(tmp, p, ec);
-    return !ec;
+    if (h == INVALID_HANDLE_VALUE) return failed(ERROR_FILE_EXISTS);
+    DWORD e = 0;
+    while (e == 0 && !text.empty()) {
+        DWORD written = 0;
+        const DWORD n = static_cast<DWORD>(std::min<std::size_t>(text.size(), 1u << 30));
+        if (!WriteFile(h, text.data(), n, &written, nullptr)) e = GetLastError();
+        else if (written == 0) e = ERROR_WRITE_FAULT;
+        text.remove_prefix(written);
+    }
+    // On the disk before it takes p's place: a crash then leaves the old text or the new one.
+    if (e == 0 && !FlushFileBuffers(h)) e = GetLastError();
+    if (e == 0) {
+        e = replace_with(h, tmp, p);
+    } else {
+        CloseHandle(h);
+    }
+    if (e != 0) {
+        DeleteFileW(tmp.c_str());
+        return failed(e);
+    }
+#else
+    int fd = -1;
+    for (int attempt = 0; attempt < 8 && fd < 0; ++attempt) {
+        tmp = p;
+        tmp += "." + random_suffix() + ".tmp";
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0 && errno != EEXIST) return failed(errno);
+    }
+    if (fd < 0) return failed(EEXIST);
+    int e = 0;
+    while (e == 0 && !text.empty()) {
+        const ssize_t written = ::write(fd, text.data(), text.size());
+        if (written > 0) text.remove_prefix(static_cast<std::size_t>(written));
+        else if (written == 0) e = EIO;
+        else if (errno != EINTR) e = errno;
+    }
+    if (e == 0 && ::fsync(fd) != 0) e = errno;
+    if (::close(fd) != 0 && e == 0) e = errno;
+    if (e == 0 && ::rename(tmp.c_str(), p.c_str()) != 0) e = errno;
+    if (e != 0) {
+        ::unlink(tmp.c_str());
+        return failed(static_cast<unsigned long>(e));
+    }
+#endif
+    return {};
+}
+
+std::expected<std::filesystem::path, std::string> move_aside(const std::filesystem::path& p, std::string_view tag) {
+    const auto now = std::time(nullptr);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &now);
+#else
+    localtime_r(&now, &tm);
+#endif
+    const auto stamp = std::format("{:04}{:02}{:02}-{:02}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                                   tm.tm_hour, tm.tm_min, tm.tm_sec);
+    for (int n = 1; n <= 20; ++n) {
+        auto to = p;
+        to += std::format(".{}-{}{}", tag, stamp, n == 1 ? std::string() : std::format("-{}", n));
+        // Never over another file: that name is taken, the next one is tried.
+#ifdef _WIN32
+        if (MoveFileExW(p.c_str(), to.c_str(), 0)) return to;
+        const DWORD e = GetLastError();
+        if (e != ERROR_ALREADY_EXISTS && e != ERROR_FILE_EXISTS) {
+            return failf("cannot move {} aside: {}", path_to_utf8(p), error_message(e));
+        }
+#else
+        std::error_code ec;
+        if (std::filesystem::exists(to, ec)) continue;
+        if (::rename(p.c_str(), to.c_str()) == 0) return to;
+        return failf("cannot move {} aside: {}", path_to_utf8(p), error_message(static_cast<unsigned long>(errno)));
+#endif
+    }
+    return failf("cannot move {} aside: too many files of that name", path_to_utf8(p));
+}
+
+FileLock::FileLock(FileLock&& other) noexcept {
+#ifdef _WIN32
+    std::swap(handle_, other.handle_);
+#else
+    std::swap(fd_, other.fd_);
+#endif
+}
+
+FileLock& FileLock::operator=(FileLock&& other) noexcept {
+    if (this != &other) {
+        release();
+#ifdef _WIN32
+        std::swap(handle_, other.handle_);
+#else
+        std::swap(fd_, other.fd_);
+#endif
+    }
+    return *this;
+}
+
+FileLock::~FileLock() { release(); }
+
+// Closing the file ends the lock (also when the process dies).
+void FileLock::release() {
+#ifdef _WIN32
+    if (handle_ != nullptr) CloseHandle(static_cast<HANDLE>(handle_));
+    handle_ = nullptr;
+#else
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+#endif
+}
+
+std::expected<FileLock, std::string> lock_file(const std::filesystem::path& p, std::chrono::milliseconds wait) {
+    std::error_code ec;
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+    const auto until = std::chrono::steady_clock::now() + wait;
+    FileLock lock;
+#ifdef _WIN32
+    const HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return failf("cannot open {}: {}", path_to_utf8(p), error_message(GetLastError()));
+    lock.handle_ = h;
+    for (;;) {
+        OVERLAPPED at{};
+        if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &at)) return lock;
+        if (const DWORD e = GetLastError(); e != ERROR_LOCK_VIOLATION) {
+            return failf("cannot lock {}: {}", path_to_utf8(p), error_message(e));
+        }
+        if (std::chrono::steady_clock::now() >= until) return failf("{} stayed locked", path_to_utf8(p));
+        Sleep(20);
+    }
+#else
+    const int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return failf("cannot open {}: {}", path_to_utf8(p), error_message(static_cast<unsigned long>(errno)));
+    lock.fd_ = fd;
+    for (;;) {
+        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return lock;
+        if (errno != EWOULDBLOCK && errno != EINTR) {
+            return failf("cannot lock {}: {}", path_to_utf8(p), error_message(static_cast<unsigned long>(errno)));
+        }
+        if (std::chrono::steady_clock::now() >= until) return failf("{} stayed locked", path_to_utf8(p));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+#endif
 }
 
 bool write_new_file(const std::filesystem::path& p, std::string_view text) {
@@ -295,13 +498,81 @@ std::filesystem::path path_from_utf8(std::string_view s) {
     return std::filesystem::path(std::u8string(s.begin(), s.end()));
 }
 
+std::expected<std::optional<std::string>, std::string> read_file_if_exists(const std::filesystem::path& p) {
+    std::string out;
+#ifdef _WIN32
+    // Sharing delete as well: grab may replace the file while this reads it (write_file_atomic).
+    const HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return std::nullopt;
+        return failf("cannot open '{}': {}", path_to_utf8(p), error_message(e));
+    }
+    constexpr DWORD chunk = 1 << 16;
+    std::size_t have = 0;
+    DWORD e = 0;
+    for (;;) {
+        out.resize(have + chunk);
+        DWORD got = 0;
+        if (!ReadFile(h, out.data() + have, chunk, &got, nullptr)) {
+            e = GetLastError();
+            break;
+        }
+        if (got == 0) break;
+        have += got;
+    }
+    CloseHandle(h);
+    out.resize(have);
+#else
+    const int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return std::nullopt;
+        return failf("cannot open '{}': {}", path_to_utf8(p), error_message(static_cast<unsigned long>(errno)));
+    }
+    char buf[1 << 16];
+    int e = 0;
+    for (;;) {
+        const ssize_t got = ::read(fd, buf, sizeof(buf));
+        if (got > 0) out.append(buf, static_cast<std::size_t>(got));
+        else if (got == 0) break;
+        else if (errno != EINTR) {
+            e = errno;
+            break;
+        }
+    }
+    ::close(fd);
+#endif
+    if (e != 0) return failf("cannot read '{}': {}", path_to_utf8(p), error_message(static_cast<unsigned long>(e)));
+    return out;
+}
+
 std::expected<std::string, std::string> read_file(const std::filesystem::path& p) {
-    std::ifstream in(p, std::ios::binary);
-    if (!in) return failf("cannot open '{}'", path_to_utf8(p));
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    auto text = read_file_if_exists(p);
+    if (!text) return fail(text.error());
+    if (!*text) {
+#ifdef _WIN32
+        return failf("cannot open '{}': {}", path_to_utf8(p), error_message(ERROR_FILE_NOT_FOUND));
+#else
+        return failf("cannot open '{}': {}", path_to_utf8(p), error_message(ENOENT));
+#endif
+    }
+    return std::move(**text);
 }
 
 #ifdef _WIN32
+
+std::string error_message(unsigned long code) {
+    LPWSTR buf = nullptr;
+    const DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                                       FORMAT_MESSAGE_IGNORE_INSERTS,
+                                   nullptr, code, 0, reinterpret_cast<LPWSTR>(&buf), 0, nullptr);
+    std::string msg = n != 0 ? to_utf8(std::wstring_view(buf, n)) : std::string{};
+    if (buf != nullptr) LocalFree(buf);
+    msg = std::string(trim(msg));
+    if (msg.empty()) msg = std::format("Win32 error {}", code);
+    return msg;
+}
 
 std::wstring to_wide(std::string_view utf8) {
     if (utf8.empty()) return {};
@@ -471,6 +742,8 @@ std::optional<std::string> unprotect_for_user(std::string_view data, std::string
 }
 
 #else
+
+std::string error_message(unsigned long code) { return std::generic_category().message(static_cast<int>(code)); }
 
 std::optional<std::string> getenv_utf8(const char* name) {
     const char* v = std::getenv(name);

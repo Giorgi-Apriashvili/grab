@@ -49,7 +49,10 @@ void WebViewHost::offer_link(std::wstring uri) {
         // Tests: the question goes to this file and is answered No, so no dialog shows.
         if (const auto test = util::getenv_utf8("GRAB_TEST_LINKS"); test && !test->empty()) {
             const auto before = util::read_file(util::path_from_utf8(*test)).value_or("");
-            (void)util::write_file_atomic(util::path_from_utf8(*test), before + util::to_utf8(text) + "\n----\n");
+            if (auto noted = util::write_file_atomic(util::path_from_utf8(*test), before + util::to_utf8(text) + "\n----\n");
+                !noted) {
+                OutputDebugStringW(util::to_wide(noted.error()).c_str());
+            }
         } else
 #endif
         {

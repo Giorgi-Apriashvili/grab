@@ -317,7 +317,7 @@ std::optional<List> load(const fs::path& file) {
 
 bool save(const fs::path& file, const List& list) {
     const auto sealed = util::protect_for_user(to_text(list), purpose);
-    return sealed && util::write_file_atomic(file, std::string(sealed_header) + *sealed);
+    return sealed && util::write_file_atomic(file, std::string(sealed_header) + *sealed).has_value();
 }
 
 } // namespace grab::file_list

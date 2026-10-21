@@ -109,9 +109,10 @@ std::expected<Store, std::string> load(const fs::path& file) {
     return std::move(*store);
 }
 
-bool save(const fs::path& file, const Store& store) {
+std::expected<void, std::string> save(const fs::path& file, const Store& store) {
     const auto sealed = util::protect_for_user(to_text(store), purpose);
-    return sealed && util::write_file_atomic(file, std::string(sealed_header) + *sealed);
+    if (!sealed) return util::failf("cannot write {}: the passwords could not be encrypted", util::path_to_utf8(file));
+    return util::write_file_atomic(file, std::string(sealed_header) + *sealed);
 }
 
 std::string env_name(std::string_view remote, std::string_view key) {
@@ -190,7 +191,9 @@ std::expected<void, std::string> prepare(const fs::path& rclone_conf) {
                 if (store) export_to_env(*store);
                 return {};
             }
-            (void)util::write_file_atomic(rclone_conf, taken.text);
+            if (!util::write_file_atomic(rclone_conf, taken.text)) {
+                // They stay in the file as well, where rclone reads them anyway; the next run tries again.
+            }
             store = std::move(merged);
         }
     }

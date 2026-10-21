@@ -368,6 +368,8 @@ private:
     void post_queue();
     void restore_queue();
     void save_queue() const; // any thread; unfinished items, for the next start
+    void report_save(std::string_view what, const std::expected<void, std::string>& saved,
+                     std::atomic<bool>& failing) const;
 
     Host host_;
     std::filesystem::path config_path_;
@@ -425,6 +427,8 @@ private:
     std::map<std::string, int> learned_;
     std::chrono::steady_clock::time_point last_progress_post_{};
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
+    mutable std::atomic<bool> queue_unsaved_{false}; // the last save of queue.json failed (shown once)
+    mutable std::atomic<bool> state_unsaved_{false}; // the same for gui.json
 
     // The status bar's activities: their ids, and how long steps took (from and to gui.json).
     std::atomic<int> next_activity_{1};

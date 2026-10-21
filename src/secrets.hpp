@@ -31,7 +31,8 @@ using Store = std::map<std::string, std::map<std::string, std::string>>;
 // A missing file is an empty store. An unreadable one (another Windows user's, damaged) is an
 // error, and the store on disk is then left alone.
 [[nodiscard]] std::expected<Store, std::string> load(const std::filesystem::path& file);
-bool save(const std::filesystem::path& file, const Store& store); // encrypted, atomically
+// Encrypted, and replaced in one step (util::write_file_atomic).
+[[nodiscard]] std::expected<void, std::string> save(const std::filesystem::path& file, const Store& store);
 
 // The environment variable rclone reads for `key` of `remote`, as rclone's ConfigToEnv names it:
 // RCLONE_CONFIG_<REMOTE>_<KEY>, upper case, '-' as '_' in the key only (my-box's password is

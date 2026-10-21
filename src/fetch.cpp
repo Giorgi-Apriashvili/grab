@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <deque>
 #include <format>
-#include <random>
 #include <system_error>
 #include <thread>
 
@@ -429,12 +428,14 @@ public:
         return true;
     }
 
-    void flush() {
+    // To the disk, so a record saved after it never claims bytes a power cut lost (review G71).
+    [[nodiscard]] std::expected<void, std::string> flush() {
 #ifdef _WIN32
-        if (h_ != nullptr) FlushFileBuffers(h_);
+        if (h_ != nullptr && !FlushFileBuffers(h_)) return util::fail(util::error_message(GetLastError()));
 #else
-        if (fd_ >= 0) fsync(fd_);
+        if (fd_ >= 0 && fsync(fd_) != 0) return util::fail(util::error_message(static_cast<unsigned long>(errno)));
 #endif
+        return {};
     }
 
     // Modification time, nanoseconds since 1970 UTC.
@@ -472,20 +473,9 @@ private:
 };
 
 // Replaces grab's own record, never half written: the text goes to a new file of a random name
-// beside it, which then moves over the record.
+// beside it, on the disk before it moves over the record.
 bool write_record(const fs::path& record, const std::string& text) {
-    thread_local std::mt19937 gen{std::random_device{}()};
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        auto tmp = record;
-        tmp += std::format(".{:08x}.tmp", static_cast<std::uint32_t>(gen()));
-        if (!util::write_new_file(tmp, text)) continue; // that name is taken: another
-        std::error_code ec;
-        fs::rename(tmp, record, ec);
-        if (!ec) return true;
-        fs::remove(tmp, ec); // made just now
-        return false;
-    }
-    return false;
+    return util::write_file_atomic(record, text).has_value();
 }
 
 // A new partial download in the first free slot: its record is created first, then the data
@@ -745,7 +735,13 @@ Result run(const Download& d, Connections& connections, const std::function<void
     };
     auto checkpoint = [&] {
         const State s = snapshot(); // counted bytes were written before they were counted
-        file.flush();
+        // Saved only once those bytes are on the disk; one that can't get there is a write error.
+        if (auto flushed = file.flush(); !flushed) {
+            std::lock_guard lock(m);
+            if (error.empty()) error = std::format("cannot write {}: {}", util::path_to_utf8(part), flushed.error());
+            inner.request_stop();
+            return;
+        }
         save(s);
     };
     while (running.load() > 0) {

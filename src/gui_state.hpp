@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -128,6 +129,7 @@ bool move_before(std::vector<int>& ids, int id, int before);
 [[nodiscard]] std::string gui_state_to_json(const GuiState& state);
 
 [[nodiscard]] GuiState load_gui_state(const std::filesystem::path& p);
-bool save_gui_state(const std::filesystem::path& p, const GuiState& state);
+// Replaced in one step (util::write_file_atomic); the error says why it couldn't be.
+[[nodiscard]] std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state);
 
 } // namespace grab

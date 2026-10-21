@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -47,12 +48,45 @@ namespace grab::util {
 // Lowercase hex MD5 of a file, as `rclone hashsum md5` prints it (Windows CNG).
 [[nodiscard]] std::expected<std::string, std::string> md5_file(const std::filesystem::path& p);
 
-// Writes `text` to `p` through a sibling file and a rename, so a crash never leaves it half
-// written. Creates the parent folder.
-bool write_file_atomic(const std::filesystem::path& p, std::string_view text);
+// Replaces `p` with `text` in one step. The text goes to a new file of a random name beside it,
+// which is flushed to the disk before it takes p's place, so `p` holds the old text or the new
+// one, never a part of either, also after a full disk or a power cut, and two writers never mix
+// (review G11). Replacing works while grab reads `p` elsewhere (read_file); while another program
+// has it open, it is tried again for a moment. Creates the parent folder. On failure `p` is
+// unchanged, the new file is gone, and the error says why.
+[[nodiscard]] std::expected<void, std::string> write_file_atomic(const std::filesystem::path& p,
+                                                                 std::string_view text);
 // Writes `text` to a new file `p`; false when anything exists at `p` already (it is left alone)
 // or the write fails (the new file is removed again).
 bool write_new_file(const std::filesystem::path& p, std::string_view text);
+
+// Moves the file `p` aside as "<p>.<tag>-YYYYMMDD-HHMMSS" (local time), so what replaces it never
+// overwrites it: a damaged file is kept for whoever wants to look at it. Returns the new path.
+[[nodiscard]] std::expected<std::filesystem::path, std::string> move_aside(const std::filesystem::path& p,
+                                                                          std::string_view tag);
+
+// An exclusive lock on the file `p` (created if missing), held until the object is destroyed:
+// one holder at a time across threads and processes. lock_file waits for it up to `wait`.
+class FileLock {
+public:
+    FileLock() = default;
+    FileLock(FileLock&& other) noexcept;
+    FileLock& operator=(FileLock&& other) noexcept;
+    FileLock(const FileLock&) = delete;
+    FileLock& operator=(const FileLock&) = delete;
+    ~FileLock();
+
+private:
+    friend std::expected<FileLock, std::string> lock_file(const std::filesystem::path& p, std::chrono::milliseconds wait);
+    void release();
+#ifdef _WIN32
+    void* handle_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
+};
+[[nodiscard]] std::expected<FileLock, std::string> lock_file(const std::filesystem::path& p,
+                                                             std::chrono::milliseconds wait);
 
 // One field of a tab-separated line: backslashes, tabs and line breaks escaped (\\ \t \n \r),
 // and back; nullopt for a stray or unknown escape.
@@ -66,7 +100,14 @@ bool write_new_file(const std::filesystem::path& p, std::string_view text);
 // The reverse; nullopt when `data` was not protected by this user for `purpose`, or is damaged.
 [[nodiscard]] std::optional<std::string> unprotect_for_user(std::string_view data, std::string_view purpose);
 
+// The whole file. A read that fails part-way is an error, never a shorter text (review G216).
+// The file can be replaced meanwhile (write_file_atomic).
 [[nodiscard]] std::expected<std::string, std::string> read_file(const std::filesystem::path& p);
+// The same, but nullopt when there is no such file: a missing file is not an unreadable one.
+[[nodiscard]] std::expected<std::optional<std::string>, std::string> read_file_if_exists(const std::filesystem::path& p);
+
+// The system's text for an error code (Win32 GetLastError, else errno), in UTF-8.
+[[nodiscard]] std::string error_message(unsigned long code);
 
 [[nodiscard]] std::string join(const std::vector<std::string>& items, std::string_view sep);
 

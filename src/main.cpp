@@ -28,7 +28,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <print>
 #include <string>
@@ -98,7 +97,10 @@ int do_init(const std::filesystem::path& path) {
         std::println("config already exists: {}", shown);
         // Never rewrite it; only point out rclone remotes it does not cover yet.
         auto cfg = load_grab_config(path);
-        if (!cfg) return exit_ok;
+        if (!cfg) {
+            error(cfg.error());
+            return exit_config;
+        }
         auto rclone = read_rclone_for_init(cfg->rclone_config.value_or(standard_rclone_config_path()));
         if (!rclone) return exit_ok;
         const auto missing = missing_remotes(*cfg, *rclone);
@@ -122,13 +124,10 @@ int do_init(const std::filesystem::path& path) {
     const auto text =
         generate_grab_config(rclone ? &*rclone : nullptr, util::path_to_utf8(rclone_path));
 
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        error(std::format("cannot write {}", shown));
+    if (auto written = util::write_file_atomic(path, text); !written) {
+        error(written.error());
         return exit_config;
     }
-    out << text;
-    out.close();
 
     if (remotes.empty()) {
         std::println("wrote {} (no servers yet)", shown);

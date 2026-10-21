@@ -156,17 +156,6 @@ struct Handle {
     Handle& operator=(const Handle&) = delete;
 };
 
-std::string last_error_message(DWORD err) {
-    LPWSTR buf = nullptr;
-    const DWORD n = FormatMessageW(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, err, 0, reinterpret_cast<LPWSTR>(&buf), 0, nullptr);
-    std::string msg = n != 0 ? util::to_utf8(std::wstring_view(buf, n)) : std::string{};
-    if (buf != nullptr) LocalFree(buf);
-    msg = std::string(util::trim(msg));
-    if (msg.empty()) msg = std::format("Win32 error {}", err);
-    return msg;
-}
 
 // An inheritable anonymous pipe; the parent's end is made non-inheritable.
 struct Pipe {
@@ -179,7 +168,7 @@ std::expected<void, std::string> make_pipe(Pipe& p, bool parent_reads, DWORD siz
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
     if (!CreatePipe(&p.read.h, &p.write.h, &sa, size)) {
-        return util::failf("cannot create pipe: {}", last_error_message(GetLastError()));
+        return util::failf("cannot create pipe: {}", util::error_message(GetLastError()));
     }
     SetHandleInformation(parent_reads ? p.read.h : p.write.h, HANDLE_FLAG_INHERIT, 0);
     return {};
@@ -192,7 +181,7 @@ std::expected<Handle*, std::string> open_null(Handle& h) {
     h.h = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
                       OPEN_EXISTING, 0, nullptr);
     if (h.h == INVALID_HANDLE_VALUE) {
-        return util::failf("cannot open NUL: {}", last_error_message(GetLastError()));
+        return util::failf("cannot open NUL: {}", util::error_message(GetLastError()));
     }
     return &h;
 }
@@ -226,7 +215,7 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
 
     child.job.h = CreateJobObjectW(nullptr, nullptr);
     if (child.job.h == nullptr) {
-        return util::failf("cannot create job object: {}", last_error_message(GetLastError()));
+        return util::failf("cannot create job object: {}", util::error_message(GetLastError()));
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -252,7 +241,7 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
         si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_storage.data());
         if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &size)) {
             return util::failf("cannot set up handle inheritance: {}",
-                               last_error_message(GetLastError()));
+                               util::error_message(GetLastError()));
         }
         // NUL may be passed for two of the three streams; list each handle once.
         std::size_t count = 1;
@@ -262,7 +251,7 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
                                        inherit_list, count * sizeof(HANDLE), nullptr, nullptr)) {
             DeleteProcThreadAttributeList(si.lpAttributeList);
             return util::failf("cannot set up handle inheritance: {}",
-                               last_error_message(GetLastError()));
+                               util::error_message(GetLastError()));
         }
         flags |= EXTENDED_STARTUPINFO_PRESENT;
     }
@@ -281,7 +270,7 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
     const DWORD create_error = GetLastError();
     if (si.lpAttributeList != nullptr) DeleteProcThreadAttributeList(si.lpAttributeList);
     if (!ok) {
-        return util::failf("cannot start '{}': {}", argv[0], last_error_message(create_error));
+        return util::failf("cannot start '{}': {}", argv[0], util::error_message(create_error));
     }
     child.process.h = pi.hProcess;
     child.thread.h = pi.hThread;
@@ -462,7 +451,7 @@ std::expected<Independent, std::string> start_independent(std::span<const std::s
     Handle out(CreateFileW(output.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (out.h == INVALID_HANDLE_VALUE) {
-        return util::failf("cannot create {}: {}", util::path_to_utf8(output), last_error_message(GetLastError()));
+        return util::failf("cannot create {}: {}", util::path_to_utf8(output), util::error_message(GetLastError()));
     }
     Handle in;
     if (auto r = open_null(in); !r) return util::fail(r.error());
@@ -482,7 +471,7 @@ std::expected<Independent, std::string> start_independent(std::span<const std::s
     if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &size) ||
         !UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list,
                                    sizeof(inherit_list), nullptr, nullptr)) {
-        return util::failf("cannot set up handle inheritance: {}", last_error_message(GetLastError()));
+        return util::failf("cannot set up handle inheritance: {}", util::error_message(GetLastError()));
     }
 
     const auto program = find_program(argv[0]);
@@ -502,7 +491,7 @@ std::expected<Independent, std::string> start_independent(std::span<const std::s
     }
     const DWORD create_error = GetLastError();
     DeleteProcThreadAttributeList(si.lpAttributeList);
-    if (!ok) return util::failf("cannot start '{}': {}", argv[0], last_error_message(create_error));
+    if (!ok) return util::failf("cannot start '{}': {}", argv[0], util::error_message(create_error));
     CloseHandle(pi.hThread);
     Independent started;
     started.handle_ = pi.hProcess;
