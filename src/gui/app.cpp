@@ -1386,11 +1386,14 @@ void App::open_config() const {
     candidates.push_back(util::getenv_utf8("VISUAL").value_or(""));
     candidates.push_back(util::getenv_utf8("EDITOR").value_or(""));
     const auto argv = editor_command(candidates, config_path_);
-    const std::wstring exe = util::to_wide(argv.front());
+    // By its full path: ShellExecute would look in the current folder first (G3). Like
+    // ShellExecute, a bare name may be a .cmd ("code" is code.cmd).
+    const auto exe = proc::find_program(argv.front(), true);
+    if (!exe) return settings_error(std::format("could not start the editor: {}", exe.error()));
     const std::wstring params =
         util::to_wide(quote::windows_cmdline(std::span<const std::string>(argv).subspan(1)));
     const auto rc = reinterpret_cast<INT_PTR>(
-        ShellExecuteW(host_.hwnd, L"open", exe.c_str(), params.c_str(), nullptr, SW_SHOWNORMAL));
+        ShellExecuteW(host_.hwnd, L"open", exe->c_str(), params.c_str(), nullptr, SW_SHOWNORMAL));
     if (rc <= 32) settings_error(std::format("could not start the editor \"{}\"", argv.front()));
 }
 
@@ -2169,9 +2172,12 @@ void App::open_item_folder(int id) {
     if (target.empty()) return;
     std::error_code ec;
     if (std::filesystem::exists(target, ec)) {
-        // Open Explorer with the downloaded file or folder selected.
+        // Open Explorer with the downloaded file or folder selected; the Windows folder's, never
+        // an explorer.exe in the current folder (G3).
         const std::wstring args = L"/select,\"" + target.wstring() + L"\"";
-        ShellExecuteW(host_.hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+        const auto explorer = proc::find_program("explorer");
+        if (!explorer) return;
+        ShellExecuteW(host_.hwnd, L"open", explorer->c_str(), args.c_str(), nullptr, SW_SHOWNORMAL);
     } else {
         ShellExecuteW(host_.hwnd, L"open", target.parent_path().c_str(), nullptr, nullptr,
                       SW_SHOWNORMAL);

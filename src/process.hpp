@@ -32,6 +32,16 @@ struct RunOptions {
     std::function<void(std::string_view)> on_output;
 };
 
+// The program argv[0] names, as every run_* and start_independent start it (review G3). A name
+// with a folder in it is taken as given. A bare name ("ssh", "curl") comes from System32, the
+// Windows folder or an absolute PATH entry, in that order, with ".exe" added when it has no
+// extension; never from the current folder or grab's own (where a download could have put a
+// program of that name), nor from a relative PATH entry. `pathext`: also try PATHEXT's other
+// extensions (.cmd, .bat...), as ShellExecute would. On POSIX, argv[0] as given (posix_spawnp
+// searches PATH, which doesn't include the current folder unless PATH says so).
+[[nodiscard]] std::expected<std::filesystem::path, std::string> find_program(std::string_view argv0,
+                                                                           bool pathext = false);
+
 struct CaptureResult {
     int exit_code = 0;
     std::string out; // child's stdout, raw bytes

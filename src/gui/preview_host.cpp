@@ -1,6 +1,7 @@
 #include "preview_host.hpp"
 
 #include "preview.hpp"
+#include "process.hpp"
 #include "quote.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
@@ -129,6 +130,8 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
 
     const auto token = random_token();
     const auto argv = preview::serve_argv(ctx, root, token);
+    const auto program = proc::find_program(argv.front()); // never from the current folder (G3)
+    if (!program) return util::fail(program.error());
     const auto log = std::filesystem::temp_directory_path() /
                      std::format("grab-preview-{}-{}.log", GetCurrentProcessId(), token.substr(0, 8));
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -157,7 +160,7 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
                                                   sizeof(inherit), nullptr, nullptr);
     std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
     PROCESS_INFORMATION pi{};
-    const BOOL ok = listed && CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
+    const BOOL ok = listed && CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE,
                                              CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED |
                                                  EXTENDED_STARTUPINFO_PRESENT,
                                              nullptr, nullptr, &si.StartupInfo, &pi);
@@ -328,18 +331,28 @@ std::expected<std::string, std::string> open_with_player(std::string_view ext, c
     if (!placed) line += L" \"" + wide_url + L"\"";
     for (auto at = line.find(L"%*"); at != std::wstring::npos; at = line.find(L"%*")) line.erase(at, 2);
 
+    // The program part of the command. A bare name ("vlc.exe %1") is looked up as grab's own
+    // programs are, never in the current folder (G3); a path stays as Windows reads it.
+    std::wstring program = command;
+    if (program.starts_with(L'"')) program = program.substr(1, program.find(L'"', 1) - 1);
+    else program = program.substr(0, program.find(L' '));
+    std::optional<std::filesystem::path> found;
+    if (const std::filesystem::path p(program); !p.has_parent_path() && !p.has_root_name()) {
+        auto where = proc::find_program(util::to_utf8(program));
+        if (!where) return util::failf("cannot start the player: {}", where.error());
+        found = std::move(*where);
+    }
+
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, CREATE_DEFAULT_ERROR_MODE, nullptr, nullptr, &si, &pi)) {
+    if (!CreateProcessW(found ? found->c_str() : nullptr, line.data(), nullptr, nullptr, FALSE, CREATE_DEFAULT_ERROR_MODE,
+                        nullptr, nullptr, &si, &pi)) {
         return util::failf("cannot start the player: {}", std::system_category().message(static_cast<int>(GetLastError())));
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    // Its name, for the window: the program part of the command.
-    std::wstring program = command;
-    if (program.starts_with(L'"')) program = program.substr(1, program.find(L'"', 1) - 1);
-    else program = program.substr(0, program.find(L' '));
+    // Its name, for the window.
     return util::path_to_utf8(std::filesystem::path(program).filename());
 }
 

@@ -60,6 +60,49 @@ private:
 
 #ifdef _WIN32
 
+std::expected<std::filesystem::path, std::string> find_program(std::string_view argv0, bool pathext) {
+    namespace fs = std::filesystem;
+    if (argv0.empty()) return util::fail("empty command");
+    const fs::path given = util::path_from_utf8(argv0);
+    // With a folder (or drive) in it: what the configuration says, as CreateProcess would read it.
+    if (given.has_parent_path() || given.has_root_name()) return given;
+
+    std::vector<std::wstring> extensions;
+    if (given.has_extension()) {
+        extensions.emplace_back();
+    } else if (pathext) {
+        const auto list = util::getenv_utf8("PATHEXT").value_or(".COM;.EXE;.BAT;.CMD");
+        for (const auto& e : util::split(list, ';')) {
+            if (const auto ext = util::trim(e); ext.starts_with('.')) extensions.push_back(util::to_wide(ext));
+        }
+        if (extensions.empty()) extensions.emplace_back(L".exe");
+    } else {
+        extensions.emplace_back(L".exe");
+    }
+
+    // Not grab's own folder either: a portable copy may sit in the folder downloads go to. Its
+    // own programs (rclone.exe, grab.exe) are always started by their full path.
+    std::vector<fs::path> dirs;
+    wchar_t buf[MAX_PATH];
+    if (const UINT n = GetSystemDirectoryW(buf, MAX_PATH); n > 0 && n < MAX_PATH) dirs.emplace_back(buf);
+    if (const UINT n = GetWindowsDirectoryW(buf, MAX_PATH); n > 0 && n < MAX_PATH) dirs.emplace_back(buf);
+    for (const auto& entry : util::split(util::getenv_utf8("PATH").value_or(""), ';')) {
+        auto dir = util::trim(entry);
+        if (dir.size() >= 2 && dir.front() == '"' && dir.back() == '"') dir = dir.substr(1, dir.size() - 2);
+        const fs::path p = util::path_from_utf8(dir);
+        if (!dir.empty() && p.is_absolute()) dirs.push_back(p); // ".", "bin": relative to the current folder
+    }
+    std::error_code ec;
+    for (const auto& dir : dirs) {
+        for (const auto& ext : extensions) {
+            auto candidate = dir / given;
+            candidate += ext;
+            if (fs::is_regular_file(candidate, ec)) return candidate;
+        }
+    }
+    return util::failf("cannot find {}{} in System32 or PATH", argv0, given.has_extension() ? "" : ".exe");
+}
+
 namespace {
 
 BOOL WINAPI ignore_ctrl(DWORD type) {
@@ -201,9 +244,15 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
         flags |= EXTENDED_STARTUPINFO_PRESENT;
     }
 
+    const auto program = find_program(argv[0]);
+    if (!program) {
+        if (si.lpAttributeList != nullptr) DeleteProcThreadAttributeList(si.lpAttributeList);
+        return util::fail(program.error());
+    }
     std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
     PROCESS_INFORMATION pi{};
-    const BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags, nullptr,
+    // The program by its full path: Windows itself would look in the current folder first.
+    const BOOL ok = CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE, flags, nullptr,
                                    nullptr, &si.StartupInfo, &pi);
     const DWORD create_error = GetLastError();
     if (si.lpAttributeList != nullptr) DeleteProcThreadAttributeList(si.lpAttributeList);
@@ -412,14 +461,19 @@ std::expected<Independent, std::string> start_independent(std::span<const std::s
         return util::failf("cannot set up handle inheritance: {}", last_error_message(GetLastError()));
     }
 
+    const auto program = find_program(argv[0]);
+    if (!program) {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        return util::fail(program.error());
+    }
     std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
     const DWORD flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
     PROCESS_INFORMATION pi{};
     // Out of a job this process may be in (if that job allows it), so the program outlives it.
-    BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags | CREATE_BREAKAWAY_FROM_JOB,
-                             nullptr, nullptr, &si.StartupInfo, &pi);
+    BOOL ok = CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE,
+                             flags | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si.StartupInfo, &pi);
     if (!ok && GetLastError() == ERROR_ACCESS_DENIED) {
-        ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE, flags, nullptr, nullptr,
+        ok = CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE, flags, nullptr, nullptr,
                             &si.StartupInfo, &pi);
     }
     const DWORD create_error = GetLastError();
@@ -432,6 +486,11 @@ std::expected<Independent, std::string> start_independent(std::span<const std::s
 }
 
 #else // POSIX
+
+std::expected<std::filesystem::path, std::string> find_program(std::string_view argv0, bool) {
+    if (argv0.empty()) return util::fail("empty command");
+    return util::path_from_utf8(argv0);
+}
 
 namespace {
 

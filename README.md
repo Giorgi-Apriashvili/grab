@@ -283,6 +283,10 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     are asked about before anything is queued; a deeper folder asks once it's listed and waits
     paused, and Resume shows the question. A copy that matches the server's is no question: it
     isn't fetched again.
+  - **A downloaded program never runs in place of a tool.** The programs grab starts by name
+    (ssh, curl, tar, ssh-keyscan, the editor, Explorer) come from System32, the Windows folder or
+    PATH's full folders, never from the current folder or grab's own, so an `ssh.exe` that lands
+    in the folder you run `grab` from is never started. A full path in grab.conf is used as given.
 
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;

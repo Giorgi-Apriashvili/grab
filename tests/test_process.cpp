@@ -1,10 +1,16 @@
 #include "process.hpp"
+#include "util.hpp"
 
 #include <doctest/doctest.h>
+
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -188,6 +194,58 @@ TEST_CASE("an already-requested stop still returns cleanly") {
     auto r = proc::run_capture(shell("echo hi"), opts);
     REQUIRE(r.has_value()); // killed at once or finished first; either way no hang or crash
 }
+
+#ifdef _WIN32
+TEST_CASE("programs started by bare name never come from the current folder (G3)") {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "grab-find-program-test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "onpath");
+    // Planted where grab runs from (a download folder): names grab starts by bare name. They
+    // aren't even programs, so starting one would fail.
+    for (const char* name : {"cmd.exe", "whoami.exe", "nothere-xyz.exe"}) std::ofstream(dir / name) << "planted";
+    std::ofstream(dir / "onpath" / "tool-xyz.cmd") << "@echo off";
+
+    struct Restore {
+        fs::path cwd = fs::current_path();
+        std::wstring path = util::to_wide(util::getenv_utf8("PATH").value_or(""));
+        fs::path dir;
+        ~Restore() {
+            SetEnvironmentVariableW(L"PATH", path.c_str());
+            fs::current_path(cwd);
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        }
+    } restore{.dir = dir};
+    fs::current_path(dir);
+    // Relative PATH entries point at the current folder too.
+    SetEnvironmentVariableW(L"PATH", (L".;bin;" + (dir / "onpath").wstring() + L";" + restore.path).c_str());
+
+    const auto cmd = proc::find_program("cmd");
+    REQUIRE_MESSAGE(cmd.has_value(), cmd.error_or(""));
+    CHECK(cmd->parent_path() != dir);
+    CHECK(util::to_lower(util::path_to_utf8(cmd->filename())) == "cmd.exe");
+    const auto who = proc::find_program("whoami");
+    REQUIRE(who.has_value());
+    CHECK(who->parent_path() != dir);
+    const auto missing = proc::find_program("nothere-xyz"); // only in the current folder and "."
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error() == "cannot find nothere-xyz.exe in System32 or PATH");
+    // .cmd only when asked, as ShellExecute would (the window's editor), from an absolute entry.
+    CHECK_FALSE(proc::find_program("tool-xyz").has_value());
+    const auto tool = proc::find_program("tool-xyz", true);
+    REQUIRE(tool.has_value());
+    CHECK(util::to_lower(util::path_to_utf8(*tool)) == util::to_lower(util::path_to_utf8(dir / "onpath" / "tool-xyz.cmd")));
+    // A path is the configuration's choice, taken as given.
+    CHECK(proc::find_program("C:\\Tools\\rclone.exe").value() == fs::path(L"C:\\Tools\\rclone.exe"));
+    CHECK(proc::find_program(".\\local.exe").value() == fs::path(L".\\local.exe"));
+
+    // What runs is the real cmd.exe.
+    const auto ran = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/c", "echo real"});
+    REQUIRE_MESSAGE(ran.has_value(), ran.error_or(""));
+    CHECK(ran->out.find("real") != std::string::npos);
+}
+#endif
 
 TEST_CASE("a missing executable is reported, not crashed on") {
     const std::vector<std::string> argv{"grab-definitely-not-installed-xyz", "--version"};
