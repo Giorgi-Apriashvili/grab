@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace grab;
 namespace fs = std::filesystem;
@@ -139,4 +140,28 @@ TEST_CASE("a folder's conflicts: skipped, kept beside, or replaced") {
     CHECK(t.files[1].status == folder::State::queued);
     CHECK(t.files[1].local.empty());
     fs::remove_all(dest);
+}
+
+TEST_CASE("a numbered copy that already is the server's file counts as there (G112)") {
+    const auto dir = fs::temp_directory_path() / "grab-test-kept-copy";
+    fs::remove_all(dir);
+    make(dir / "movie.mkv", 5, 100);        // the user's own, different
+    make(dir / "movie (2).mkv", 9, 1000);   // an older Keep both: another version
+    make(dir / "movie (3).mkv", 10, 2000);  // the server's file, kept by the last run
+    CHECK(existing::kept_copy(dir / "movie.mkv", 10, 2000 * ns_per_s) == dir / "movie (3).mkv");
+    CHECK_FALSE(existing::kept_copy(dir / "movie.mkv", 11, 2000 * ns_per_s).has_value()); // the server's changed
+    make(dir / "movie (5).mkv", 11, 3000);  // past a gap: copies are numbered in a row
+    CHECK_FALSE(existing::kept_copy(dir / "movie.mkv", 11, 3000 * ns_per_s).has_value());
+    fs::remove_all(dir);
+}
+TEST_CASE("picks of the same name land under numbered names, in pick order (G103)") {
+    const fs::path dest = "E:\\x";
+    CHECK(existing::pick_targets(dest, {"/r1/sample.txt", "/r2/sample.txt", "/r3/SAMPLE.TXT", "/r4/other.txt"}, false) ==
+          std::vector<fs::path>{dest / "sample.txt", dest / "sample (2).txt", dest / "SAMPLE (3).TXT", dest / "other.txt"});
+    // A pick already named like a numbered one keeps its name; the next number is free.
+    CHECK(existing::pick_targets(dest, {"/a/sample (2).txt", "/b/sample.txt", "/c/sample.txt"}, false) ==
+          std::vector<fs::path>{dest / "sample (2).txt", dest / "sample.txt", dest / "sample (3).txt"});
+    CHECK(existing::pick_targets(dest, {"/tv/A/Season 1", "/tv/B/Season 1"}, true) ==
+          std::vector<fs::path>{dest / "Season 1", dest / "Season 1 (2)"});
+    CHECK(existing::pick_targets(dest, {"/x/v1.2", "/y/v1.2"}, true) == std::vector<fs::path>{dest / "v1.2", dest / "v1.2 (2)"});
 }

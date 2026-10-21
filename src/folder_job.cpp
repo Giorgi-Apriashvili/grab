@@ -98,7 +98,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     // What rclone leaves when stopped: its temp files next to these, made by this run.
     std::vector<fs::path> targets;
     targets.reserve(paths.size());
-    const auto dir = local_dir(job.dest, job.remote_path);
+    const auto dir = job_dir(job);
     {
         std::lock_guard lock(m);
         for (const auto& f : tree.files) {
@@ -160,7 +160,8 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
                 f.eta.reset();
             }
             notify(job, Event::progress); // can be many a second in a folder of small files
-        });
+        },
+        job.local_name.empty() ? std::nullopt : std::optional(job.local_name));
     std::error_code ec;
     fs::remove(list, ec);
     // A stopped or failed rclone leaves its temp files (after a clean finish it renamed them all),
@@ -211,7 +212,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
 // They share the folder's connections (same pool id) and split ranges to keep them busy.
 void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& stop) {
     constexpr int at_once = 3;
-    const auto dir = local_dir(job.dest, job.remote_path);
+    const auto dir = job_dir(job);
     fetch::Reserved reserved;
     {
         std::lock_guard lock(m);
@@ -416,6 +417,10 @@ fs::path target_of(const fs::path& dir, const File& f) {
     return dir / (f.local.empty() ? local::relative(f.path) : f.local);
 }
 
+fs::path job_dir(const Job& job) {
+    return job.local_name.empty() ? local_dir(job.dest, job.remote_path) : job.dest / job.local_name;
+}
+
 fs::path local_dir(const fs::path& dest, const std::string& remote_path) {
     return dest / local::relative(remote_basename(remote_path));
 }
@@ -482,7 +487,7 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m) {
         fs::path local;
     };
     std::vector<Candidate> queued;
-    const auto dir = local_dir(job.dest, job.remote_path);
+    const auto dir = job_dir(job);
     fetch::Reserved reserved;
     {
         std::lock_guard lock(m);
@@ -520,7 +525,7 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m) {
 }
 
 std::vector<Conflict> conflicts(const Job& job, Tree& tree, std::mutex& m) {
-    const auto dir = local_dir(job.dest, job.remote_path);
+    const auto dir = job_dir(job);
     std::vector<Conflict> queued;
     {
         std::lock_guard lock(m);
@@ -565,7 +570,7 @@ void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
     // A folder whose name rclone can't be told (rclone_encoding.hpp: a "\" in the server's name,
     // or a ‛ in the Save-to folder's): grab fetches every file itself rather than letting the batch
     // write somewhere else (G80).
-    if (!rclone_enc::local_path(local_dir(job.dest, job.remote_path))) {
+    if (!rclone_enc::local_path(job_dir(job))) {
         std::lock_guard lock(m);
         for (auto& f : tree.files) f.big = true;
     }
@@ -622,7 +627,7 @@ Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token 
     c.files = r.paths.size();
     r.ctx = job.ctx;
     r.remote_dir = job.remote_path;
-    r.local_dir = local_dir(job.dest, job.remote_path);
+    r.local_dir = job_dir(job);
     r.extra = job.extra;
     r.connections = job.connections;
     r.server = job.server;

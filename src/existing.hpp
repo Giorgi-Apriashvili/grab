@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace grab::existing {
 
@@ -34,6 +35,18 @@ enum class Choice { ask, replace, keep_both, skip };
 // nothing there that isn't reserved.
 [[nodiscard]] std::optional<std::filesystem::path> second_copy(const std::filesystem::path& target,
                                                                const fetch::Reserved& reserved = {});
+// A numbered copy next to `target` ("name (2).ext", (3)...) that already is the server's file
+// (fetch::up_to_date): kept by an earlier Keep both, so nothing is fetched again (review G112).
+[[nodiscard]] std::optional<std::filesystem::path> kept_copy(const std::filesystem::path& target, std::uint64_t size,
+                                                             std::optional<std::int64_t> modtime_ns);
+
+// Where each of a command's picks (server paths) lands in `dest`: DEST\<its name>. A pick whose
+// name an earlier pick already takes (the same name in two server folders, or one differing only
+// in case) gets the next number, as Keep both names a second copy: "name (2).ext", or for
+// `folders` "name (2)" (review G103). Numbered by pick order, so the same picks land the same way
+// again.
+[[nodiscard]] std::vector<std::filesystem::path> pick_targets(const std::filesystem::path& dest,
+                                                              const std::vector<std::string>& paths, bool folders);
 
 // The file already there, for the question.
 struct Local {

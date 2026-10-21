@@ -30,17 +30,29 @@ struct ExistingFile {
     std::filesystem::path local;          // the file there
     std::uint64_t size = 0;               // the server's
     std::optional<std::int64_t> modified; // the server's, Unix seconds
+    // Why it couldn't be compared with the server's (the check failed); empty when it was.
+    std::string uncompared = {};
 };
-// What to do with them (`count` of them in all, `files` some): --existing, else asked once on
-// the console ([r]eplace, [k]eep both, [s]kip, [q]uit; no Keep both unless `keep_both`). An exit
-// code instead when the user quits, or there is no console to ask on (with a message).
-[[nodiscard]] std::expected<existing::Choice, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
-                                                                 std::size_t count, bool keep_both);
+// The answer: what to do, and whether it also goes for every later question of this run
+// (--existing, or a capital letter).
+struct Answer {
+    existing::Choice choice = existing::Choice::ask;
+    bool for_all = false;
+};
+// What to do with them (`count` of them in all, `files` some): --existing, else asked on the
+// console ([r]eplace, [k]eep both, [s]kip, [q]uit; no Keep both unless `keep_both`; with
+// `offer_all`, R, K or S answer the rest of the run too). An exit code instead when the user
+// quits, or there is no console to ask on (with a message).
+[[nodiscard]] std::expected<Answer, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
+                                                       std::size_t count, bool keep_both, bool offer_all = false);
+
 
 struct DownloadTally {
     std::size_t done = 0;
     std::vector<std::string> failed; // remote paths
     bool stopped = false;            // Ctrl+C
+    bool quit = false;               // [q]uit at a question
+    std::size_t not_started = 0;     // picks left when it stopped or quit
     int code = 0;                    // the first failure's exit code, 0 if none
 };
 

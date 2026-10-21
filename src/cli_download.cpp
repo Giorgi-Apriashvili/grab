@@ -24,9 +24,11 @@
 #include <cstdio>
 #include <format>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <print>
+#include <set>
 #include <stop_token>
 #include <system_error>
 #include <thread>
@@ -281,19 +283,32 @@ struct Session {
     std::stop_token stop;
     ScheduleFollower* follower = nullptr; // when the speed schedule applies
     bool verify = false;                  // check downloads against the server's checksum
-    existing::Choice* existing = nullptr; // a different file already there; ask until answered
+    // "A different file is already there" (review G105): the answers given in the question before
+    // fetching, for the files listed in it (remote path -> answer); one for all the rest
+    // (--existing, or a capital letter); anything else is asked when it comes up.
+    const std::map<std::string, existing::Choice>* answered = nullptr;
+    std::optional<existing::Choice>* for_rest = nullptr;
+    bool several = false; // more than one pick: the question offers "the same for the rest"
 };
 
 // "name  (yours: 1.2 GiB, 2024-01-02; the server's: 1.4 GiB, 2025-03-04)"
 std::string existing_line(const ExistingFile& f) {
     auto when = [](std::optional<std::int64_t> t) { return t ? ", " + util::local_date(*t) : std::string(); };
     const auto mine = existing::local_file(f.local).value_or(existing::Local{});
+    if (!f.uncompared.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(f.local, ec)) {
+            return std::format("{}/  (your folder; couldn't compare with the server's: {})", f.name, f.uncompared);
+        }
+        return std::format("{}  (yours: {}{}; couldn't compare with the server's: {})", f.name,
+                           util::format_size(mine.size), when(mine.modified), f.uncompared);
+    }
     return std::format("{}  (yours: {}{}; the server's: {}{})", f.name, util::format_size(mine.size), when(mine.modified),
                        util::format_size(f.size), when(f.modified));
 }
 
-int fetch_file(const Session& s, const std::string& path, int id) {
-    auto target = s.dest / local::relative(remote_basename(path));
+// `target`: where it lands (DEST\<name>, or a numbered name when another pick has the same).
+int fetch_file(const Session& s, const std::string& path, int id, std::filesystem::path target) {
     std::uint64_t before = 0; // fetched by an earlier run
     if (auto p = fetch::saved_progress(target, path)) before = p->first;
 
@@ -304,9 +319,13 @@ int fetch_file(const Session& s, const std::string& path, int id) {
     d.limiter = &s.limiter;
     d.on_command = s.trace;
     const auto start = Clock::now();
+    auto choice = [&] {
+        if (const auto it = s.answered->find(path); it != s.answered->end()) return it->second;
+        return s.for_rest->value_or(existing::Choice::ask);
+    }();
     auto fetch_once = [&] {
         d.target = target;
-        d.replace = *s.existing == existing::Choice::replace;
+        d.replace = choice == existing::Choice::replace;
         return fetch::run(d, s.connections, [&](const fetch::Progress& p) {
             s.line.show(progress::line({p.bytes, p.total, p.speed, p.eta, p.connections, {}, {}}));
         }, s.stop);
@@ -315,19 +334,25 @@ int fetch_file(const Session& s, const std::string& path, int id) {
     // A different file already there that the check before fetching didn't see, or one asked
     // about: the answer decides.
     while (result.outcome == fetch::Outcome::exists) {
-        if (*s.existing == existing::Choice::ask) {
+        if (choice == existing::Choice::ask) {
             s.line.clear();
             const ExistingFile f{util::path_to_utf8(target.filename()), target, result.size,
                                  util::parse_rfc3339_seconds(result.modtime)};
-            const auto answer = choose_existing(s.opts, {f}, 1, true);
+            const auto answer = choose_existing(s.opts, {f}, 1, true, s.several);
             if (!answer) return answer.error();
-            *s.existing = *answer;
+            choice = answer->choice;
+            if (answer->for_all) *s.for_rest = choice;
         }
-        if (*s.existing == existing::Choice::skip) {
+        if (choice == existing::Choice::skip) {
             s.line.finish("skipped: your file is kept");
             return 0;
         }
-        if (*s.existing == existing::Choice::keep_both) {
+        if (choice == existing::Choice::keep_both) {
+            // A copy an earlier run kept that already is the server's file (review G112).
+            if (const auto kept = existing::kept_copy(target, result.size, util::parse_rfc3339(result.modtime))) {
+                s.line.finish(std::format("already there as {}, nothing fetched", util::path_to_utf8(kept->filename())));
+                return 0;
+            }
             const auto second = existing::second_copy(target);
             if (!second) {
                 s.line.clear();
@@ -404,7 +429,8 @@ int fetch_file(const Session& s, const std::string& path, int id) {
     return exit_download_failed;
 }
 
-int fetch_folder(const Session& s, const std::string& path, int id) {
+// `local_name`: the folder's name in DEST when another pick has the server's (else empty).
+int fetch_folder(const Session& s, const std::string& path, int id, const std::filesystem::path& local_name) {
     folder::Tree tree;
     std::mutex m;
     const ScheduleFollower::Watch watch(s.follower, tree, m);
@@ -416,6 +442,7 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
     job.id = id;
     job.remote_path = path;
     job.dest = s.dest;
+    job.local_name = local_name;
     job.batch_limit = [&s] { return s.limiter.rate(); }; // one download at a time: all of it
     job.extra = s.opts.extra;
     job.on_command = s.trace;
@@ -442,24 +469,26 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
         return proc::exit_stopped;
     }
     folder::mark_existing(job, tree, m);
-    // Different files already where some of the folder's go: the answer first.
+    // Different files already where some of the folder's go: the answer first, for this folder's
+    // files as listed here, not one given for another pick (review G105).
+    job.existing = s.for_rest->value_or(existing::Choice::ask);
     if (const auto found = folder::conflicts(job, tree, m); !found.empty()) {
-        if (*s.existing == existing::Choice::ask) {
+        if (job.existing == existing::Choice::ask) {
             s.line.clear();
-            const std::string folder_name = util::path_to_utf8(folder::local_dir(s.dest, path).filename());
+            const std::string folder_name = util::path_to_utf8(folder::job_dir(job).filename());
             std::vector<ExistingFile> files;
             for (const auto& c : found) {
                 if (files.size() == 10) break;
                 files.push_back({folder_name + "/" + c.path, c.local, c.size, util::parse_rfc3339_seconds(c.modtime)});
             }
-            const auto answer = choose_existing(s.opts, files, found.size(), true);
+            const auto answer = choose_existing(s.opts, files, found.size(), true, s.several);
             if (!answer) return answer.error();
-            *s.existing = *answer;
+            job.existing = answer->choice;
+            if (answer->for_all) *s.for_rest = answer->choice;
         }
         std::lock_guard lock(m);
-        folder::apply(*s.existing, found, folder::local_dir(s.dest, path), tree);
+        folder::apply(job.existing, found, folder::job_dir(job), tree);
     }
-    job.existing = *s.existing;
     std::uint64_t before = 0;    // on disk already: finished files, partial big ones
     std::size_t already = 0;     // files that were complete
     std::uint64_t needed = 0;    // what is left to fetch
@@ -519,10 +548,9 @@ int fetch_folder(const Session& s, const std::string& path, int id) {
     return 0;
 }
 
-// --dry-run: what would be fetched, without writing anything.
+// --dry-run: what would be fetched, without writing anything. `target`: where it would land.
 void describe(const Session& s, const std::string& path, std::optional<std::uint64_t> size, int id,
-              const std::string& position, int budget) {
-    const auto target = s.dest / local::relative(remote_basename(path));
+              const std::string& position, int budget, const std::filesystem::path& target) {
     const auto local = util::path_to_utf8(target);
     std::string what;
     if (s.opts.mode == Mode::file) {
@@ -537,6 +565,7 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
         job.ctx = &s.ctx;
         job.remote_path = path;
         job.dest = s.dest;
+        if (target != folder::local_dir(s.dest, path)) job.local_name = target.filename();
         job.extra = s.opts.extra;
         job.on_command = s.trace;
         job.id = id;
@@ -577,18 +606,21 @@ std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rule
                        schedule::speed_text(*limit), next ? " until " + schedule::when_text(now.minute, next->minutes) : "");
 }
 
-std::expected<existing::Choice, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
-                                                   std::size_t count, bool keep_both) {
+
+std::expected<Answer, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
+                                         std::size_t count, bool keep_both, bool offer_all) {
     if (opts.existing) {
         if (*opts.existing == existing::Choice::keep_both && !keep_both) {
             std::println(stderr, "grab: error: --existing both can't be used here: rclone copies a folder under the "
                                  "server's names; use replace or skip");
             return std::unexpected(exit_aborted);
         }
-        return *opts.existing;
+        return Answer{.choice = *opts.existing, .for_all = true};
     }
-    std::println(stderr, "grab: {} already there differ{} from the server's:",
-                 count == 1 ? std::string("1 file") : std::format("{} files", count), count == 1 ? "s" : "");
+    const bool unsure = std::ranges::any_of(files, [](const ExistingFile& f) { return !f.uncompared.empty(); });
+    std::println(stderr, "grab: {} already there {} from the server's:",
+                 count == 1 ? std::string("1 file") : std::format("{} files", count),
+                 unsure ? "may differ" : count == 1 ? "differs" : "differ");
     for (const auto& f : files) std::println(stderr, "  {}", existing_line(f));
     if (count > files.size()) std::println(stderr, "  ... and {} more", count - files.size());
     if (!util::stdin_is_tty()) {
@@ -598,13 +630,21 @@ std::expected<existing::Choice, int> choose_existing(const Options& opts, const 
         return std::unexpected(exit_download_failed);
     }
     for (;;) {
-        std::print(stderr, "{}", keep_both ? "[r]eplace, [k]eep both, [s]kip, [q]uit: " : "[r]eplace, [s]kip, [q]uit: ");
+        std::print(stderr, "{}{}", keep_both ? "[r]eplace, [k]eep both, [s]kip, [q]uit" : "[r]eplace, [s]kip, [q]uit",
+                   !offer_all ? ": " : keep_both ? " (R, K, S: the same for the rest): " : " (R, S: the same for the rest): ");
         std::string line;
         if (!std::getline(std::cin, line)) return std::unexpected(exit_aborted);
-        const auto answer = util::to_lower(std::string(util::trim(line)));
-        if (answer == "r" || answer == "replace") return existing::Choice::replace;
-        if (keep_both && (answer == "k" || answer == "keep both" || answer == "both")) return existing::Choice::keep_both;
-        if (answer == "s" || answer == "skip") return existing::Choice::skip;
+        const std::string typed(util::trim(line));
+        // A capital letter answers every later question of this run too.
+        if (offer_all && typed == "R") return Answer{.choice = existing::Choice::replace, .for_all = true};
+        if (offer_all && keep_both && typed == "K") return Answer{.choice = existing::Choice::keep_both, .for_all = true};
+        if (offer_all && typed == "S") return Answer{.choice = existing::Choice::skip, .for_all = true};
+        const auto answer = util::to_lower(typed);
+        if (answer == "r" || answer == "replace") return Answer{.choice = existing::Choice::replace};
+        if (keep_both && (answer == "k" || answer == "keep both" || answer == "both")) {
+            return Answer{.choice = existing::Choice::keep_both};
+        }
+        if (answer == "s" || answer == "skip") return Answer{.choice = existing::Choice::skip};
         if (answer == "q" || answer == "quit") return std::unexpected(exit_aborted);
     }
 }
@@ -652,8 +692,11 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
               ctrl_c.token()};
     if (follower) s.follower = &*follower;
     s.verify = verify;
-    existing::Choice choice = opts.existing.value_or(existing::Choice::ask);
-    s.existing = &choice;
+    std::map<std::string, existing::Choice> answered;
+    std::optional<existing::Choice> for_rest = opts.existing;
+    s.answered = &answered;
+    s.for_rest = &for_rest;
+    s.several = paths.size() > 1;
     const auto given = rclone_flags::connection(opts.extra);
     s.flags.insert(s.flags.end(), given.begin(), given.end());
     if (opts.verbose) {
@@ -663,41 +706,51 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
 
     DownloadTally tally;
     const std::size_t total = paths.size();
+    const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
+    // A picked file's size and time (nanoseconds), when the pick list had them.
+    auto known = [&](const std::string& path) -> std::optional<std::pair<std::uint64_t, std::optional<std::int64_t>>> {
+        const auto size = sizes.find(path);
+        if (size == sizes.end()) return std::nullopt;
+        const auto when = modified.find(path);
+        return std::pair{size->second, when == modified.end() ? std::nullopt : std::optional(when->second * 1'000'000'000)};
+    };
     // Different files already where picked files go: one question for all of them, before
-    // fetching any (a folder asks once it is listed).
-    if (!opts.dry_run && opts.mode == Mode::file && choice == existing::Choice::ask) {
+    // fetching any (a folder asks once it is listed). The answer goes for the files listed.
+    if (!opts.dry_run && opts.mode == Mode::file && !for_rest) {
         std::vector<ExistingFile> found;
-        std::size_t count = 0;
-        for (const auto& path : paths) {
-            const auto size = sizes.find(path);
-            if (size == sizes.end()) continue;
-            const auto when = modified.find(path);
-            const std::optional<std::int64_t> seconds =
-                when == modified.end() ? std::nullopt : std::optional(when->second);
-            const auto target = dest / local::relative(remote_basename(path));
-            if (!existing::differs(target, size->second, seconds ? std::optional(*seconds * 1'000'000'000) : std::nullopt)) {
-                continue;
+        std::vector<std::string> listed;
+        for (std::size_t i = 0; i < total; ++i) {
+            const auto k = known(paths[i]);
+            if (!k || !existing::differs(targets[i], k->first, k->second)) continue;
+            listed.push_back(paths[i]);
+            if (listed.size() <= 10) {
+                const auto seconds = k->second ? std::optional(*k->second / 1'000'000'000) : std::nullopt;
+                found.push_back({.name = util::path_to_utf8(targets[i].filename()), .local = targets[i], .size = k->first,
+                                 .modified = seconds});
             }
-            if (++count <= 10) found.push_back({util::path_to_utf8(target.filename()), target, size->second, seconds});
         }
-        if (count > 0) {
-            const auto answer = choose_existing(opts, found, count, true);
+        if (!listed.empty()) {
+            const auto answer = choose_existing(opts, found, listed.size(), true, total > listed.size());
             if (!answer) {
                 tally.code = answer.error();
                 tally.failed = paths;
                 return tally;
             }
-            choice = *answer;
+            for (const auto& path : listed) answered[path] = answer->choice;
+            if (answer->for_all) for_rest = answer->choice;
         }
     }
     // Free space for the files picked, all together, before fetching any (a folder checks once
-    // it is listed).
+    // it is listed). Files to be skipped don't count (review G113).
     if (!opts.dry_run && opts.mode == Mode::file) {
         std::uint64_t needed = 0;
-        for (const auto& path : paths) {
-            if (const auto it = sizes.find(path); it != sizes.end()) {
-                needed += space::still_needed(dest / local::relative(remote_basename(path)), path, it->second);
-            }
+        for (std::size_t i = 0; i < total; ++i) {
+            const auto k = known(paths[i]);
+            if (!k) continue;
+            const auto it = answered.find(paths[i]);
+            const auto choice = it != answered.end() ? it->second : for_rest.value_or(existing::Choice::ask);
+            if (choice == existing::Choice::skip && existing::differs(targets[i], k->first, k->second)) continue;
+            needed += space::still_needed(targets[i], paths[i], k->first);
         }
         if (const auto free = space::free_bytes(dest); free && needed > *free) {
             std::println(stderr, "grab: error: {}", space::shortage(space::drive_of(dest), needed, *free));
@@ -710,23 +763,32 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         const std::string& path = paths[i];
         const int id = static_cast<int>(i) + 1;
         const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
+        // Another pick has its name: a numbered one instead (pick_targets).
+        const bool renamed = targets[i] != (opts.mode == Mode::folder ? folder::local_dir(dest, path)
+                                                                      : dest / local::relative(remote_basename(path)));
         if (opts.dry_run) {
             const auto it = sizes.find(path);
-            describe(s, path, it == sizes.end() ? std::nullopt : std::optional(it->second), id, position, budget);
+            describe(s, path, it == sizes.end() ? std::nullopt : std::optional(it->second), id, position, budget,
+                     targets[i]);
             continue;
         }
-        std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
-                     remote_spec(ctx.settings.rclone_remote, path),
-                     util::path_to_utf8(dest / local::relative(remote_basename(path))));
-        const int code = opts.mode == Mode::file ? fetch_file(s, path, id) : fetch_folder(s, path, id);
+        std::println(stderr, "grab: {}{} {}  ->  {}{}", mode_noun(opts.mode), position,
+                     remote_spec(ctx.settings.rclone_remote, path), util::path_to_utf8(targets[i]),
+                     renamed ? "  (another pick has that name)" : "");
+        const int code = opts.mode == Mode::file
+                             ? fetch_file(s, path, id, targets[i])
+                             : fetch_folder(s, path, id, renamed ? targets[i].filename() : std::filesystem::path());
         if (code == 0) {
             ++tally.done;
             continue;
         }
         if (tally.code == 0) tally.code = code;
         tally.failed.push_back(path);
-        if (code == proc::exit_stopped) {
-            tally.stopped = i + 1 < total;
+        // Ctrl+C, or [q]uit at a question: the picks after it don't start (review G106).
+        if (code == proc::exit_stopped || code == exit_aborted) {
+            tally.stopped = code == proc::exit_stopped;
+            tally.quit = code == exit_aborted;
+            tally.not_started = total - i - 1;
             break;
         }
     }

@@ -109,6 +109,9 @@ struct Outcome {
 // The folder's own local directory: DEST\<folder name>, as rclone copy names it.
 [[nodiscard]] std::filesystem::path local_dir(const std::filesystem::path& dest, const std::string& remote_path);
 [[nodiscard]] std::string child_remote_path(const std::string& folder, const std::string& rel);
+struct Job;
+// A job's local directory: local_dir, or DEST\<job.local_name> when it has one.
+[[nodiscard]] std::filesystem::path job_dir(const Job& job);
 
 // Deletes what a cancelled folder (`remote_path`) leaves behind: its big files' partial
 // downloads, grab's by their records. Finished files stay; rclone's temp files went when its
@@ -130,6 +133,9 @@ struct Job {
     const std::atomic<int>* weight = nullptr; // bandwidth priority; nullptr = normal
     std::string remote_path;
     std::filesystem::path dest; // DEST: files land in DEST\<folder name>\...
+    // The local folder's name instead of the server's, e.g. "Season 1 (2)" when another pick of
+    // the same command has that name too; empty: the server's (local_dir).
+    std::filesystem::path local_name;
     // Replace: different files already there may be replaced. Otherwise none is: conflicts were
     // answered before run() (skipped, or a second copy), and one that appears meanwhile fails.
     existing::Choice existing = existing::Choice::ask;

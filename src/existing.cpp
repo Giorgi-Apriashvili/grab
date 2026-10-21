@@ -1,9 +1,12 @@
 #include "existing.hpp"
 
+#include "local_name.hpp"
+#include "rclone.hpp"
 #include "util.hpp"
 
 #include <chrono>
 #include <format>
+#include <set>
 #include <system_error>
 
 namespace grab::existing {
@@ -71,6 +74,33 @@ std::optional<fs::path> second_copy(const fs::path& target, const fetch::Reserve
         return p;
     }
     return std::nullopt;
+}
+
+std::optional<fs::path> kept_copy(const fs::path& target, std::uint64_t size, std::optional<std::int64_t> modtime_ns) {
+    const std::string base = util::path_to_utf8(target.filename());
+    for (int n = 2; n < 1000; ++n) {
+        const auto p = target.parent_path() / util::path_from_utf8(numbered(base, n));
+        const auto s = stat(p);
+        std::error_code ec;
+        if (!s && !fs::exists(fs::symlink_status(p, ec))) return std::nullopt; // copies are numbered in a row
+        if (s && fetch::up_to_date(s->first, s->second, size, modtime_ns)) return p;
+    }
+    return std::nullopt;
+}
+
+std::vector<fs::path> pick_targets(const fs::path& dest, const std::vector<std::string>& paths, bool folders) {
+    std::vector<fs::path> out;
+    std::set<fs::path::string_type> taken;
+    for (const auto& path : paths) {
+        auto target = dest / local::relative(remote_basename(path));
+        const std::string name = util::path_to_utf8(target.filename());
+        for (int n = 2; taken.contains(local::key(target)) && n < 1000; ++n) {
+            target = dest / util::path_from_utf8(folders ? std::format("{} ({})", name, n) : numbered(name, n));
+        }
+        taken.insert(local::key(target));
+        out.push_back(std::move(target));
+    }
+    return out;
 }
 
 std::optional<Local> local_file(const fs::path& p) {

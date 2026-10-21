@@ -633,11 +633,19 @@ grab config [-c PATH]
   - Server names become safe Windows names, as in the window (see [GUI](#gui)): nothing lands
     outside DEST.
   - A different file already in DEST (another size, or older than the server's) is never
-    replaced without asking. grab lists them, yours and the server's, and asks once:
+    replaced without asking. grab lists them, yours and the server's, and asks:
     `[r]eplace, [k]eep both, [s]kip, [q]uit` (Keep both saves `name (2).ext`). Picked files are
-    asked about together before fetching any, a folder once it's listed. `--existing replace`,
-    `both` or `skip` answers in advance; without a console to ask on, grab stops with exit code
-    `6` and replaces nothing unless `--existing` is given.
+    asked about together before fetching any, each folder once it's listed; an answer goes for
+    what that question listed. With several picks, `R`, `K` or `S` (capital) answers every later
+    question of the run too, and `q` stops the run: the picks after it don't start.
+    `--existing replace`, `both` or `skip` answers everything in advance; without a console to
+    ask on, grab stops with exit code `6` and replaces nothing unless `--existing` is given. When
+    the check can't reach the server (`--rclone`), a file there is asked about as one that
+    couldn't be compared.
+  - Keep both doesn't download again what an earlier Keep both kept: a numbered copy that is
+    already the server's file counts as there (`already there as movie (2).mkv`).
+  - Picks with the same name (`sample.txt` in two server folders, three `Season 1` folders) land
+    under numbered names in pick order: `sample (2).txt`, `Season 1 (2)`.
   - `--limit` caps all connections together, exactly.
   - `--verify` (or the window's Verify downloads setting) checks each download against the
     server's MD5 afterwards: `checksum verified (MD5) in 0:03`. A copy that differs is deleted

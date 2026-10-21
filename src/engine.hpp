@@ -156,11 +156,13 @@ std::size_t remove_rclone_temp_files(std::span<const std::filesystem::path> file
 
 // Downloads with progress callbacks instead of a console progress bar (for the GUI). A
 // cancelled download's partial files are removed. `on_copied` gets each file rclone reports
-// copied (relative name); that needs rclone's info level (-v in `extra`).
+// copied (relative name); that needs rclone's info level (-v in `extra`). `local_name`: the
+// name in `dest_dir` instead of the server's.
 [[nodiscard]] std::expected<DownloadResult, std::string>
 download(const Context& ctx, Mode mode, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run = {}, std::span<const std::string> extra = {},
-         const CommandHook& on_command = {}, const std::function<void(const std::string&)>& on_copied = {});
+         const CommandHook& on_command = {}, const std::function<void(const std::string&)>& on_copied = {},
+         const std::optional<std::filesystem::path>& local_name = {});
 
 } // namespace grab::engine

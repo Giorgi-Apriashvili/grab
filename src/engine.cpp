@@ -372,7 +372,8 @@ std::expected<DownloadResult, std::string>
 download(const Context& ctx, Mode mode, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run, std::span<const std::string> extra,
-         const CommandHook& on_command, const std::function<void(const std::string&)>& on_copied) {
+         const CommandHook& on_command, const std::function<void(const std::string&)>& on_copied,
+         const std::optional<std::filesystem::path>& local_name) {
     // grab's own batch: only the connection flags of the configured ones (rclone_flags.hpp);
     // `extra` is grab's (--files-from-raw, --transfers...).
     const auto common = rclone_flags::connection(ctx.settings.common_flags);
@@ -389,6 +390,7 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
     rq.rclone_remote = ctx.settings.rclone_remote;
     rq.remote_path = remote_path;
     rq.dest_dir = dest_dir;
+    rq.local_name = local_name;
     rq.common_flags = common;
     rq.mode_flags = mode_flags;
     rq.extra = tail;
