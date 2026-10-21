@@ -57,8 +57,8 @@ struct Request {
     bool many = false;
     engine::CommandHook on_command;
 };
-[[nodiscard]] std::vector<std::string> check_argv(const Request& r, const std::filesystem::path& list_file,
-                                                  int connections);
+[[nodiscard]] std::expected<std::vector<std::string>, std::string>
+check_argv(const Request& r, const std::filesystem::path& list_file, int connections);
 
 struct Report {
     std::string hash;                // "md5"; "" when the server can't compute checksums

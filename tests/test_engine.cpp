@@ -74,12 +74,12 @@ TEST_CASE("download_argv uses the remote's flags and DEST\\<name>") {
     ctx.settings.folder_flags = {"--transfers", "8"};
     const auto dest = util::path_from_utf8("E:\\TV");
 
-    CHECK(engine::download_argv(ctx, Mode::file, "/srv/tv/Lioness.S03E08.mkv", dest) ==
+    CHECK(engine::download_argv(ctx, Mode::file, "/srv/tv/Lioness.S03E08.mkv", dest).value() ==
           std::vector<std::string>{"rclone", "copyto", "hetzner:/srv/tv/Lioness.S03E08.mkv",
                                    util::path_to_utf8(dest / "Lioness.S03E08.mkv"), "-P",
                                    "--multi-thread-streams", "8"});
     const std::vector<std::string> extra{"--bwlimit", "10M"};
-    CHECK(engine::download_argv(ctx, Mode::folder, "/srv/tv/show", dest, extra) ==
+    CHECK(engine::download_argv(ctx, Mode::folder, "/srv/tv/show", dest, extra).value() ==
           std::vector<std::string>{"rclone", "copy", "hetzner:/srv/tv/show",
                                    util::path_to_utf8(dest / "show"), "-P", "--transfers", "8",
                                    "--bwlimit", "10M"});

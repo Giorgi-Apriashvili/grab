@@ -206,9 +206,9 @@ SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vect
     return result;
 }
 
-std::vector<std::string> download_argv(const Context& ctx, Mode mode, const std::string& remote_path,
-                                       const std::filesystem::path& dest_dir, std::span<const std::string> extra,
-                                       std::optional<std::filesystem::path> local_name) {
+std::expected<std::vector<std::string>, std::string>
+download_argv(const Context& ctx, Mode mode, const std::string& remote_path, const std::filesystem::path& dest_dir,
+              std::span<const std::string> extra, std::optional<std::filesystem::path> local_name) {
     RcloneRequest rq;
     rq.mode = mode;
     rq.rclone_exe = ctx.config.rclone;
@@ -305,7 +305,9 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
     rq.common_flags = common;
     rq.mode_flags = mode_flags;
     rq.extra = tail;
-    const auto argv = build_rclone_argv(rq);
+    const auto built = build_rclone_argv(rq);
+    if (!built) return util::fail(built.error());
+    const auto& argv = *built;
     if (on_command) on_command(argv);
 
     DownloadResult result;

@@ -43,7 +43,7 @@ TEST_CASE("the check asks the server for checksums, whatever the common flags sa
     r.local_dir = util::path_from_utf8("E:\\dl\\movies");
     r.extra = {"--fast-list"};
     const auto list = util::path_from_utf8("C:\\tmp\\list.txt");
-    CHECK(verify::check_argv(r, list, 4) ==
+    CHECK(verify::check_argv(r, list, 4).value() ==
           std::vector<std::string>{"rclone", "check", "Box:movies", util::path_to_utf8(r.local_dir), "--config",
                                    util::path_to_utf8(*ctx.config.rclone_config), "--sftp-chunk-size", "255Ki",
                                    "--sftp-disable-hashcheck", "--fast-list", "--one-way", "--files-from-raw",

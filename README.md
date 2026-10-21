@@ -274,7 +274,11 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     outside the Save-to folder, whatever a file is called on the server (`..\x`, `C:\x`,
     `\\host\share\x`). `\ : * ? " < > |` become look-alikes (`＼ ： ＊ ？ ＂ ＜ ＞ ｜`), control
     characters `␀`–`␟`, a trailing space or dot `␠` or `．`. Windows device names get an
-    underscore: `CON_`, `nul_.txt`.
+    underscore: `CON_`, `nul_.txt`. rclone encodes every local path it's given once more, so
+    grab tells it each folder and file name in the form that comes back as grab's: a folder like
+    `Mission: Impossible (1996)` lands in one `Mission： Impossible (1996)`, also when the Save-to
+    folder's own name has such characters. A folder whose name rclone can't be told (a `‛` in the
+    Save-to folder's name) is fetched by grab's own engine, and checked by its MD5 sums.
   - **A different file already there is never replaced without asking.** When a file of the
     download is already in the Save-to folder with another size, or older than the server's,
     grab asks first, listing yours and the server's: **Replace**, **Keep both** (the new one is
@@ -725,6 +729,7 @@ src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's
 src/verify.*    checking downloads against the server's checksum (rclone check)
 src/gui/play_server.* Play's warm start: the player's local stream (start and end from memory)
 src/local_name.* server names as safe Windows names (rclone's encoding, device names)
+src/rclone_encoding.* rclone's own name encoding; local paths as rclone must be told them
 src/existing.*  a different file already there: replace, keep both ("name (2).ext") or skip
 src/file_type.* file kinds by extension (as the window's icons and filters), --type/--min-size
 src/browse.*    browse mode: a server's folders from its file list, deeper ones live

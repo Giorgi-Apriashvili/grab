@@ -4,6 +4,7 @@
 #include "local_name.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
+#include "rclone_encoding.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
 
@@ -527,6 +528,13 @@ void apply(existing::Choice choice, const std::vector<Conflict>& found, const fs
 }
 
 void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
+    // A folder whose name rclone can't be told (rclone_encoding.hpp: a "\" in the server's name,
+    // or a ‛ in the Save-to folder's): grab fetches every file itself rather than letting the batch
+    // write somewhere else (G80).
+    if (!rclone_enc::local_path(local_dir(job.dest, job.remote_path))) {
+        std::lock_guard lock(m);
+        for (auto& f : tree.files) f.big = true;
+    }
     job.connections->join(job.server, job.id, job.weight != nullptr ? job.weight->load() : 2);
     while (!stop.stop_requested()) {
         // (not "small": windows.h defines that as a macro)

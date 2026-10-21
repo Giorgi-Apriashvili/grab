@@ -2,6 +2,7 @@
 
 #include "cli.hpp"
 
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -35,6 +36,8 @@ struct RcloneRequest {
 
 // Folder: rclone copy   remote:/path DEST\<name>   (the folder is recreated inside DEST)
 // File:   rclone copyto remote:/path DEST\<name>
-[[nodiscard]] std::vector<std::string> build_rclone_argv(const RcloneRequest& req);
+// The local side as rclone must be told it to use exactly local_target() (rclone_encoding.hpp);
+// fails for a local name rclone can't be made to use.
+[[nodiscard]] std::expected<std::vector<std::string>, std::string> build_rclone_argv(const RcloneRequest& req);
 
 } // namespace grab

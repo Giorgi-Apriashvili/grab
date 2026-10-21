@@ -40,6 +40,8 @@ namespace grab::util {
 
 // Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
 [[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
+// Lowercase hex MD5 of a file, as `rclone hashsum md5` prints it (Windows CNG).
+[[nodiscard]] std::expected<std::string, std::string> md5_file(const std::filesystem::path& p);
 
 // Writes `text` to `p` through a sibling file and a rename, so a crash never leaves it half
 // written. Creates the parent folder.

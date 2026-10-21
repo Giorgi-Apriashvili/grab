@@ -376,14 +376,18 @@ std::filesystem::path self_exe_path() {
     }
 }
 
-std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p) {
+namespace {
+
+// A file's digest in lower-case hex, with Windows' CNG `algorithm` (`size` bytes of digest).
+std::expected<std::string, std::string> hash_file(const std::filesystem::path& p, LPCWSTR algorithm,
+                                                  std::size_t size, std::string_view name) {
     std::ifstream in(p, std::ios::binary);
     if (!in) return failf("cannot open '{}'", path_to_utf8(p));
 
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
-        return fail("SHA-256 is not available (BCryptOpenAlgorithmProvider failed)");
+    if (BCryptOpenAlgorithmProvider(&alg, algorithm, nullptr, 0) < 0) {
+        return failf("{} is not available (BCryptOpenAlgorithmProvider failed)", name);
     }
     struct Guard {
         BCRYPT_ALG_HANDLE& alg;
@@ -407,12 +411,24 @@ std::expected<std::string, std::string> sha256_file(const std::filesystem::path&
     }
     if (in.bad()) return failf("error reading '{}'", path_to_utf8(p));
 
-    unsigned char digest[32];
-    if (BCryptFinishHash(hash, digest, sizeof(digest), 0) < 0) return fail("BCryptFinishHash failed");
+    std::vector<unsigned char> digest(size);
+    if (BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) {
+        return fail("BCryptFinishHash failed");
+    }
     std::string hex;
-    hex.reserve(64);
+    hex.reserve(size * 2);
     for (const unsigned char b : digest) hex += std::format("{:02x}", b);
     return hex;
+}
+
+} // namespace
+
+std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p) {
+    return hash_file(p, BCRYPT_SHA256_ALGORITHM, 32, "SHA-256");
+}
+
+std::expected<std::string, std::string> md5_file(const std::filesystem::path& p) {
+    return hash_file(p, BCRYPT_MD5_ALGORITHM, 16, "MD5");
 }
 
 namespace {
@@ -491,6 +507,10 @@ std::filesystem::path self_exe_path() {
 
 std::expected<std::string, std::string> sha256_file(const std::filesystem::path&) {
     return fail("SHA-256 hashing is only implemented on Windows");
+}
+
+std::expected<std::string, std::string> md5_file(const std::filesystem::path&) {
+    return fail("MD5 hashing is only implemented on Windows");
 }
 
 std::optional<std::string> protect_for_user(std::string_view data, std::string_view) { return std::string(data); }

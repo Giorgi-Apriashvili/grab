@@ -297,7 +297,14 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
                 local_name = second->filename();
             }
         }
-        const auto rclone_argv = engine::download_argv(ctx, opts.mode, path, dest, extra, local_name);
+        const auto built = engine::download_argv(ctx, opts.mode, path, dest, extra, local_name);
+        if (!built) {
+            error(built.error());
+            if (tally.code == 0) tally.code = exit_download_failed;
+            tally.failed.push_back(path);
+            continue;
+        }
+        const auto& rclone_argv = *built;
         if (opts.verbose || opts.dry_run) {
             std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
         }

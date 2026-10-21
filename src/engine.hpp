@@ -84,8 +84,8 @@ search(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run
        const CommandHook& on_command = {});
 
 // rclone argv for downloading `remote_path` into `dest_dir` (DEST\<name>), with the remote's
-// flags as configured (including -P for the console).
-[[nodiscard]] std::vector<std::string> download_argv(const Context& ctx, Mode mode,
+// flags as configured (including -P for the console). Fails as build_rclone_argv does.
+[[nodiscard]] std::expected<std::vector<std::string>, std::string> download_argv(const Context& ctx, Mode mode,
                                                      const std::string& remote_path,
                                                      const std::filesystem::path& dest_dir,
                                                      std::span<const std::string> extra = {},

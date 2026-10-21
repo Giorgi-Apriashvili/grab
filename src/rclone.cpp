@@ -1,7 +1,10 @@
 #include "rclone.hpp"
 
 #include "local_name.hpp"
+#include "rclone_encoding.hpp"
 #include "util.hpp"
+
+#include <utility>
 
 namespace grab {
 
@@ -25,12 +28,15 @@ std::filesystem::path local_target(const RcloneRequest& req) {
     return req.dest_dir / local::relative(remote_basename(req.remote_path));
 }
 
-std::vector<std::string> build_rclone_argv(const RcloneRequest& req) {
+std::expected<std::vector<std::string>, std::string> build_rclone_argv(const RcloneRequest& req) {
     // rclone copy syncs the *contents* of the source directory into the destination, so the
     // folder is recreated by naming it explicitly; copyto writes the single file to that path.
+    // rclone encodes every part of a local path again: grab's already safe name goes in the form
+    // that comes back as itself (G80: "Mission： Impossible" became "Mission‛： Impossible").
+    auto local = rclone_enc::local_path(local_target(req));
+    if (!local) return util::fail(local.error());
     std::vector<std::string> argv{req.rclone_exe, req.mode == Mode::folder ? "copy" : "copyto",
-                                  remote_spec(req.rclone_remote, req.remote_path),
-                                  util::path_to_utf8(local_target(req))};
+                                  remote_spec(req.rclone_remote, req.remote_path), std::move(*local)};
 
     if (req.rclone_config) {
         argv.push_back("--config");

@@ -34,7 +34,7 @@ TEST_CASE("folder mode recreates the folder inside DEST, flags in common, mode, 
     rq.extra = extra;
 
     CHECK(local_target(rq) == rq.dest_dir / "releases");
-    const auto argv = build_rclone_argv(rq);
+    const auto argv = build_rclone_argv(rq).value();
     CHECK(argv == std::vector<std::string>{"rclone", "copy", "hetzner:/home/alice/releases",
                                            util::path_to_utf8(rq.dest_dir / "releases"), "-P",
                                            "--sftp-chunk-size", "255Ki", "--transfers", "4",
@@ -49,7 +49,7 @@ TEST_CASE("folder names with spaces and punctuation survive as one path") {
     rq.remote_path = "/home/alice/courses/Course - Learn to Program with C++ by Jane Doe";
     rq.dest_dir = util::path_from_utf8("C:\\Users\\alice\\Desktop");
 
-    const auto argv = build_rclone_argv(rq);
+    const auto argv = build_rclone_argv(rq).value();
     REQUIRE(argv.size() == 4);
     CHECK(argv[3] == util::path_to_utf8(
                          rq.dest_dir / "Course - Learn to Program with C++ by Jane Doe"));
@@ -70,7 +70,7 @@ TEST_CASE("file mode builds rclone copyto DEST\\name and passes --config when se
     rq.common_flags = common;
     rq.mode_flags = file;
 
-    const auto argv = build_rclone_argv(rq);
+    const auto argv = build_rclone_argv(rq).value();
     const auto expected_dest = util::path_to_utf8(rq.dest_dir / "Some.Movie.2013.mkv");
     CHECK(argv == std::vector<std::string>{
                       "C:\\Tools\\rclone.exe", "copyto",
@@ -79,6 +79,29 @@ TEST_CASE("file mode builds rclone copyto DEST\\name and passes --config when se
                       "--multi-thread-streams", "8"});
 }
 
+#ifdef _WIN32
+TEST_CASE("rclone is told the local side so that it lands in grab's folder (G80)") {
+    RcloneRequest rq;
+    rq.mode = Mode::folder;
+    rq.rclone_exe = "rclone";
+    rq.rclone_remote = "r";
+    rq.remote_path = "/media/Mission: Impossible (1996)";
+    // A Save-to folder grab named earlier from a server's "Shows: 2024".
+    rq.dest_dir = util::path_from_utf8("D:\\Shows\uFF1A 2024");
+    CHECK(local_target(rq) == util::path_from_utf8("D:\\Shows\uFF1A 2024\\Mission\uFF1A Impossible (1996)"));
+    // rclone encodes ':' itself: given grab's '：' it would write into "Mission‛： Impossible".
+    CHECK(build_rclone_argv(rq).value()[3] == "D:\\Shows: 2024\\Mission: Impossible (1996)");
+
+    rq.mode = Mode::file;
+    rq.remote_path = "/media/a.txt";
+    rq.dest_dir = util::path_from_utf8("D:\\in");
+    rq.local_name = util::path_from_utf8("odd\u201Bname (2).txt"); // a ‛ rclone can't be made to write
+    const auto refused = build_rclone_argv(rq);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("odd\u201Bname (2).txt") != std::string::npos);
+}
+#endif
+
 TEST_CASE("empty flag lists produce a bare command") {
     RcloneRequest rq;
     rq.mode = Mode::folder;
@@ -86,7 +109,7 @@ TEST_CASE("empty flag lists produce a bare command") {
     rq.rclone_remote = "r";
     rq.remote_path = "/p";
     rq.dest_dir = util::path_from_utf8("D:\\out");
-    const auto argv = build_rclone_argv(rq);
+    const auto argv = build_rclone_argv(rq).value();
     CHECK(argv == std::vector<std::string>{"rclone", "copy", "r:/p",
                                            util::path_to_utf8(rq.dest_dir / "p")});
 }

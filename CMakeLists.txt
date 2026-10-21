@@ -64,6 +64,7 @@ add_library(grab_core STATIC
     src/preview.cpp
     src/activity.cpp
     src/local_name.cpp
+src/rclone_encoding.cpp
 src/ui_origin.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

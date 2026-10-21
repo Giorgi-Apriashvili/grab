@@ -4,6 +4,7 @@
 #include "local_name.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
+#include "rclone_encoding.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
 
@@ -58,7 +59,13 @@ std::expected<Report, std::string> check_names(const Request& r, std::span<const
                                                const std::stop_token& stop) {
     const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}.txt", process_id(), r.id);
     if (!write_list(list, paths)) return util::fail("cannot write " + util::path_to_utf8(list));
-    const auto argv = check_argv(r, list, held);
+    const auto built = check_argv(r, list, held);
+    if (!built) {
+        std::error_code ec;
+        fs::remove(list, ec);
+        return util::fail(built.error());
+    }
+    const auto& argv = *built;
     if (r.on_command) r.on_command(argv);
     auto ran = proc::run_capture(argv, quiet(stop));
     std::error_code ec;
@@ -97,8 +104,9 @@ std::expected<Report, std::string> check_names(const Request& r, std::span<const
     return report;
 }
 
-// The device names: the server's MD5 sums from one `rclone hashsum`, each copy's from another,
-// added to `report`.
+// Files rclone check can't pair by name (device names, renamed copies, or all of them when the
+// folder's name can't be given to rclone): the server's MD5 sums from one `rclone hashsum`, each
+// copy's from grab, added to `report`.
 std::expected<void, std::string> compare_sums(const Request& r, std::span<const std::string> paths, int held,
                                               const std::stop_token& stop, Report& report) {
     const auto& ctx = *r.ctx;
@@ -133,15 +141,12 @@ std::expected<void, std::string> compare_sums(const Request& r, std::span<const 
             report.differ.push_back(p);
             continue;
         }
-        std::vector<std::string> mine_argv{ctx.config.rclone, "hashsum", "md5", util::path_to_utf8(copy)};
-        if (ctx.config.rclone_config) mine_argv.insert(mine_argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-        if (r.on_command) r.on_command(mine_argv);
-        auto mine = proc::run_capture(mine_argv, quiet(stop));
+        // grab sums its own copy: no local path for rclone to read under another name (G80).
         if (stop.stop_requested()) return util::fail("stopped");
-        const auto sums = mine ? parse_sums(mine->out) : std::unordered_map<std::string, std::string>{};
-        if (sums.size() != 1) {
+        const auto mine = util::md5_file(copy);
+        if (!mine) {
             ++report.unchecked;
-        } else if (sums.begin()->second == theirs->second) {
+        } else if (*mine == theirs->second) {
             ++report.matched;
             report.same.push_back(p);
         } else {
@@ -211,10 +216,14 @@ std::unordered_map<std::string, std::string> parse_sums(std::string_view out) {
     return sums;
 }
 
-std::vector<std::string> check_argv(const Request& r, const fs::path& list_file, int connections) {
+std::expected<std::vector<std::string>, std::string> check_argv(const Request& r, const fs::path& list_file,
+                                                                int connections) {
     const auto& ctx = *r.ctx;
+    // As the folder batch: the folder as rclone must be told it to look in grab's (G80).
+    auto local = rclone_enc::local_path(r.local_dir);
+    if (!local) return util::fail(local.error());
     std::vector<std::string> argv{ctx.config.rclone, "check", remote_spec(ctx.settings.rclone_remote, r.remote_dir),
-                                  util::path_to_utf8(r.local_dir)};
+                                  std::move(*local)};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
     const auto flags = engine::without_console_progress(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
@@ -249,7 +258,11 @@ std::expected<Report, std::string> run(const Request& r, std::stop_token stop) {
 
     std::vector<std::string> plain;
     std::vector<std::string> devices;
-    for (const auto& p : r.paths) (local::has_device(p) || r.renamed.contains(p) ? devices : plain).push_back(p);
+    // A folder rclone can't be told the name of (rclone_encoding.hpp): every file by its sum.
+    const bool checkable = rclone_enc::local_path(r.local_dir).has_value();
+    for (const auto& p : r.paths) {
+        (!checkable || local::has_device(p) || r.renamed.contains(p) ? devices : plain).push_back(p);
+    }
     Report report;
     if (!plain.empty()) {
         auto checked = check_names(r, plain, held, stop);
