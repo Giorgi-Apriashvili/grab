@@ -2,6 +2,7 @@
 
 #include "conn_budget.hpp"
 #include "rclone.hpp"
+#include "rclone_flags.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -170,7 +171,9 @@ std::vector<std::string> serve_argv(const engine::Context& ctx, std::string_view
                                   "--baseurl",           "/" + std::string(token),
                                   "--read-only",         "--log-level", "NOTICE"};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+    // Only connection flags (rclone_flags.hpp): a -v next to grab's --log-level ended every
+    // preview's server at once (G185), a --log-file hid the port line it waits for (G187).
+    const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
     argv.insert(argv.end(), {"--sftp-concurrency", budget::is_storage_box(ctx.remote.host) ? "4" : "8"});
     return argv;

@@ -5,6 +5,7 @@
 #include "process.hpp"
 #include "rclone.hpp"
 #include "rclone_encoding.hpp"
+#include "rclone_flags.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
 
@@ -114,9 +115,10 @@ std::expected<void, std::string> compare_sums(const Request& r, std::span<const 
     if (!write_list(list, paths)) return util::fail("cannot write " + util::path_to_utf8(list));
     std::vector<std::string> argv{ctx.config.rclone, "hashsum", "md5", remote_spec(ctx.settings.rclone_remote, r.remote_dir)};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+    const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
-    argv.insert(argv.end(), r.extra.begin(), r.extra.end());
+    const auto extra = rclone_flags::connection(r.extra);
+    argv.insert(argv.end(), extra.begin(), extra.end());
     const auto n = std::to_string(std::max(held, 1));
     argv.insert(argv.end(), {"--files-from-raw", util::path_to_utf8(list), "--checkers", n, "--sftp-connections", n,
                              "--sftp-disable-hashcheck=false"});
@@ -225,9 +227,12 @@ std::expected<std::vector<std::string>, std::string> check_argv(const Request& r
     std::vector<std::string> argv{ctx.config.rclone, "check", remote_spec(ctx.settings.rclone_remote, r.remote_dir),
                                   std::move(*local)};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+    // Only connection flags (rclone_flags.hpp): a --size-only made check compare sizes alone while
+    // grab reported an MD5 check (G184), a --log-file hid which checksum was used (G187).
+    const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
-    argv.insert(argv.end(), r.extra.begin(), r.extra.end());
+    const auto extra = rclone_flags::connection(r.extra);
+    argv.insert(argv.end(), extra.begin(), extra.end());
     // Last, so they win over the common flags: grab's default --sftp-disable-hashcheck would
     // leave the server without checksums. -v logs which checksum was compared.
     const auto n = std::to_string(std::max(connections, 1));

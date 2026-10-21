@@ -17,6 +17,7 @@
 #include "quote.hpp"
 #include "rate.hpp"
 #include "rclone.hpp"
+#include "rclone_flags.hpp"
 #include "remote.hpp"
 #include "schedule.hpp"
 #include "server_cli.hpp"
@@ -228,7 +229,11 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
             in_the_way[path] = true;
             if (++count <= 10) shown.push_back({std::move(name), local, size, util::parse_rfc3339_seconds(modtime)});
         };
-        const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+        // grab's own check before rclone runs: the connection flags only (rclone_flags.hpp), so a
+        // -vP or a filter meant for the copy can't break it (G182, G183).
+        auto flags = rclone_flags::connection(ctx.settings.common_flags);
+        const auto given = rclone_flags::connection(opts.extra);
+        flags.insert(flags.end(), given.begin(), given.end());
         for (const auto& path : paths) {
             const auto target = dest / local::relative(remote_basename(path));
             if (opts.mode == Mode::file) {

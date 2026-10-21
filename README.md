@@ -627,8 +627,11 @@ grab config [-c PATH]
   the same question before rclone would replace a file (another size, or a different time); a
   folder offers Replace or Skip, since rclone copies it under the server's names, and Skip runs
   rclone with `--ignore-existing`.
-- Anything after `--` is added to every rclone call grab makes. For speed, use `--limit`
-  rather than `-- --bwlimit`, which rclone would apply to each connection separately.
+- After `--` go rclone flags. grab's own downloads take only connection flags there
+  (`--sftp-*`, `--bind`, `--contimeout`, `--timeout`, certificates); any other one is refused
+  before anything runs, with what to use instead (`-- --dry-run`: grab's own `-n`; `-- --bwlimit`:
+  `--limit`, which also shares the speed across connections). With `--rclone`, every flag after
+  `--` goes to the rclone copy.
 
 Exit codes: `0` ok, `1` usage, `2` config, `3` target not found or pick aborted,
 `4` remote lookup failed (ssh or rclone listing), `5` `grab update` failed, `6` a download
@@ -696,11 +699,18 @@ Defaults (override per remote in grab.conf):
 | `folder_flags` | `--transfers 8 --checkers 8`                                                | more transfers hide per-file round trips on trees of small files; with rclone's default 4 streams that is ≤32 connections, which both test servers accepted without errors |
 | `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
-`common_flags` go to every rclone call (`-P` is dropped where grab shows its own progress).
-`folder_flags` apply to a folder's small-file batch, whose `--transfers` grab sets to the
-connections it may use. `file_flags` only matter with `--rclone`: grab's own engine fetches
-a file in byte ranges over `max_connections` (blank = automatic: 14 on Storage Boxes, 12
-elsewhere, lowered when a server refuses connections), in the window and in the `grab`
+All three are for `--rclone`, the plain rclone copy, which gets them as they are. grab's own
+rclone calls (its downloads, listings, searches, previews, Play and verification) take only
+their connection flags: `--sftp-*`, `--bind`, `--contimeout`, `--timeout`,
+`--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and
+`--password-command`. Those calls depend on rclone's exact output, so a progress, logging,
+filter or comparison flag there would break them (`-vP` failed every download, `--size-only`
+made verification compare sizes only). Likewise they see no `RCLONE_*` environment variable but
+`RCLONE_CONFIG*`, `RCLONE_PASSWORD_COMMAND` and `RCLONE_SFTP_*`: an `RCLONE_PROGRESS=true` meant
+for interactive rclone would put progress text into the bytes grab reads. A folder's small-file
+batch gets its `--transfers` from grab (the connections it may use), and grab's own engine
+fetches a file in byte ranges over `max_connections` (blank = automatic: 14 on Storage Boxes,
+12 elsewhere, lowered when a server refuses connections), in the window and in the `grab`
 command alike.
 
 With `--rclone`, concurrent SFTP connections ≈ `transfers × multi-thread-streams`
@@ -761,9 +771,10 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
 - **[rclone](https://rclone.org)** v1.75.1, © Nick Craig-Wood, MIT license
   ([licenses/rclone.txt](licenses/rclone.txt)). `rclone.exe` ships next to `grab.exe`
   (81 MB, which is why the installer is about 22 MB), and grab uses it rather than any rclone
-  on PATH. Set `rclone = <path>` in `[grab]` to use another copy; for dates in rclone
-  listings its `lsf` must accept `--time-format unix`, as the bundled 1.75.1 does (without
-  the flag listings fail; with it but not `unix`, rows show no date).
+  on PATH (only when it is missing does grab look on PATH). Set `rclone = <path>` in `[grab]`
+  to use another copy. Another copy must be 1.67 or newer (folder downloads and verification use
+  `--sftp-connections`); grab checks once and says so when it's older. For dates in listings it
+  must also understand `--time-format unix` (1.72 and newer; older ones show rows without dates).
   - **Pin:** the build downloads the official Windows zip and checks it against the pinned
     SHA-256, which is rclone's own published `SHA256SUMS` value.
   - **To bump:** change `GRAB_RCLONE_VERSION` and the hash in `CMakeLists.txt`, then rebuild.

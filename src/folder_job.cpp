@@ -5,6 +5,7 @@
 #include "process.hpp"
 #include "rclone.hpp"
 #include "rclone_encoding.hpp"
+#include "rclone_flags.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
 
@@ -80,7 +81,8 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     if (limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(limit)});
     // Conflicts were answered before: a file that appeared at one of these names since stays.
     if (job.existing != existing::Choice::replace) extra.emplace_back("--ignore-existing");
-    extra.insert(extra.end(), job.extra.begin(), job.extra.end());
+    const auto given = rclone_flags::connection(job.extra);
+    extra.insert(extra.end(), given.begin(), given.end());
     // What rclone leaves when stopped: its temp files next to these, made by this run.
     std::vector<fs::path> targets;
     targets.reserve(paths.size());
@@ -190,8 +192,9 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
         std::lock_guard lock(m);
         reserved = reserved_names(dir, tree);
     }
-    auto flags = engine::without_console_progress(job.ctx->settings.common_flags);
-    flags.insert(flags.end(), job.extra.begin(), job.extra.end());
+    auto flags = rclone_flags::connection(job.ctx->settings.common_flags);
+    const auto extra = rclone_flags::connection(job.extra);
+    flags.insert(flags.end(), extra.begin(), extra.end());
     auto worker = [&] {
         for (;;) {
             if (stop.stop_requested()) return;
@@ -414,9 +417,10 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", "-R", "--files-only",
                                   remote_spec(ctx.settings.rclone_remote, job.remote_path)};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+    const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
-    argv.insert(argv.end(), job.extra.begin(), job.extra.end());
+    const auto extra = rclone_flags::connection(job.extra);
+    argv.insert(argv.end(), extra.begin(), extra.end());
     if (job.on_command) job.on_command(argv);
     proc::RunOptions quiet;
     quiet.detached = true;

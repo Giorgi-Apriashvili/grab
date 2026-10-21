@@ -11,6 +11,7 @@
 #include "quote.hpp"
 #include "rate.hpp"
 #include "rclone.hpp"
+#include "rclone_flags.hpp"
 #include "schedule.hpp"
 #include "space.hpp"
 #include "util.hpp"
@@ -628,13 +629,16 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     StopOnCtrlC ctrl_c;
-    Session s{ctx, opts, dest, line, connections, limiter, engine::without_console_progress(ctx.settings.common_flags), {},
+    // grab's engine: only the connection flags of the configured ones and of `--` (rclone_flags.hpp;
+    // cli.cpp refuses any other after `--`).
+    Session s{ctx, opts, dest, line, connections, limiter, rclone_flags::connection(ctx.settings.common_flags), {},
               ctrl_c.token()};
     if (follower) s.follower = &*follower;
     s.verify = verify;
     existing::Choice choice = opts.existing.value_or(existing::Choice::ask);
     s.existing = &choice;
-    s.flags.insert(s.flags.end(), opts.extra.begin(), opts.extra.end());
+    const auto given = rclone_flags::connection(opts.extra);
+    s.flags.insert(s.flags.end(), given.begin(), given.end());
     if (opts.verbose) {
         s.trace = [&line](const std::vector<std::string>& argv) { line.message("+ " + quote::display_cmdline(argv)); };
         std::println(stderr, "grab: up to {} connections to {}", budget, server);

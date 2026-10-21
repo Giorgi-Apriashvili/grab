@@ -47,6 +47,7 @@ std::vector<std::string> build_lsf_argv(const ListRequest& req) {
         argv.push_back("--config");
         argv.push_back(util::path_to_utf8(*req.rclone_config));
     }
+    argv.insert(argv.end(), req.flags.begin(), req.flags.end());
     return argv;
 }
 

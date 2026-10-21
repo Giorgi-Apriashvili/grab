@@ -34,6 +34,22 @@ struct Context {
 [[nodiscard]] std::expected<Context, std::string>
 load_context(const std::filesystem::path& config_path, const std::optional<std::string>& remote_name);
 
+// rclone's version from `rclone version`'s output ("rclone v1.75.1").
+struct RcloneVersion {
+    int major = 0;
+    int minor = 0;
+    int patch = 0;
+    auto operator<=>(const RcloneVersion&) const = default;
+};
+[[nodiscard]] std::optional<RcloneVersion> parse_rclone_version(std::string_view out);
+// The oldest rclone grab works with: --sftp-connections (every folder batch, verify) came in 1.67.
+inline constexpr RcloneVersion min_rclone{1, 67, 0};
+// Whether `rclone` can be used: the one grab ships always; another (grab.conf's `rclone =`
+// when `configured`, else PATH's because the bundled one is missing) is asked its version once
+// per process and refused below min_rclone (review G190).
+[[nodiscard]] std::expected<void, std::string> check_rclone(const std::string& rclone,
+                                                            const std::filesystem::path& exe_dir, bool configured);
+
 struct SearchRequest {
     std::string target; // words, glob, or a remote path containing '/'
     Mode mode = Mode::file;
@@ -113,8 +129,6 @@ struct Progress {
 [[nodiscard]] std::optional<Progress> parse_stats_line(std::string_view line);
 // The message of an error-level JSON log line; nullopt otherwise.
 [[nodiscard]] std::optional<std::string> parse_error_line(std::string_view line);
-// Flags with console-only progress options removed (-P, --progress, --stats-one-line*, -q).
-[[nodiscard]] std::vector<std::string> without_console_progress(std::span<const std::string> flags);
 
 struct DownloadResult {
     int exit_code = 0;      // rclone's; proc::exit_stopped when cancelled

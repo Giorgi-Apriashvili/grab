@@ -42,6 +42,14 @@ struct RunOptions {
 [[nodiscard]] std::expected<std::filesystem::path, std::string> find_program(std::string_view argv0,
                                                                            bool pathext = false);
 
+#ifdef _WIN32
+// This process's environment as a CreateProcess block (UTF-16), without the RCLONE_* variables
+// grab's internal rclone calls must not see (rclone_flags::kept_variable; review G8). run_capture,
+// run_streaming and run_piped give their children this one; run_inherit (the user's own --rclone
+// copy, an editor, an installer) and start_independent everything.
+[[nodiscard]] std::wstring internal_environment();
+#endif
+
 struct CaptureResult {
     int exit_code = 0;
     std::string out; // child's stdout, raw bytes

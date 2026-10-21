@@ -5,6 +5,7 @@
 #include "listing.hpp"
 #include "match.hpp"
 #include "quote.hpp"
+#include "rclone_flags.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -189,6 +190,7 @@ std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t 
         req.rclone_config = ctx.config.rclone_config;
         req.rclone_remote = ctx.settings.rclone_remote;
         req.all_entries = true;
+        req.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches the list too (G189)
         auto out = engine::run_listing(build_lsf_argv(req), run, on_command);
         if (!out) return util::fail(out.error());
         auto entries = parse_lsf(*out, root);

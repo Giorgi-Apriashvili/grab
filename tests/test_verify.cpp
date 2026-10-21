@@ -36,17 +36,20 @@ TEST_CASE("the check asks the server for checksums, whatever the common flags sa
     ctx.config.rclone = "rclone";
     ctx.config.rclone_config = util::path_from_utf8("C:\\grab\\rclone.conf");
     ctx.settings.rclone_remote = "Box";
-    ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki", "--sftp-disable-hashcheck"};
+    // A --size-only made check compare sizes only while grab reported an MD5 check (G184), a
+    // --log-file hid which checksum was used (G187): only connection flags reach it.
+    ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki", "--sftp-disable-hashcheck", "--size-only",
+                                 "--log-file", "C:\\logs\\rclone.log"};
     verify::Request r;
     r.ctx = &ctx;
     r.remote_dir = "movies";
     r.local_dir = util::path_from_utf8("E:\\dl\\movies");
-    r.extra = {"--fast-list"};
+    r.extra = {"--bind", "10.8.0.2", "--fast-list"};
     const auto list = util::path_from_utf8("C:\\tmp\\list.txt");
     CHECK(verify::check_argv(r, list, 4).value() ==
           std::vector<std::string>{"rclone", "check", "Box:movies", util::path_to_utf8(r.local_dir), "--config",
                                    util::path_to_utf8(*ctx.config.rclone_config), "--sftp-chunk-size", "255Ki",
-                                   "--sftp-disable-hashcheck", "--fast-list", "--one-way", "--files-from-raw",
+                                   "--sftp-disable-hashcheck", "--bind", "10.8.0.2", "--one-way", "--files-from-raw",
                                    util::path_to_utf8(list), "--no-traverse", "--combined", "-", "--checkers", "4",
                                    "--sftp-connections", "4", "--sftp-disable-hashcheck=false", "-v"});
 }

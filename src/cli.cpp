@@ -1,6 +1,7 @@
 #include "cli.hpp"
 
 #include "rate.hpp"
+#include "rclone_flags.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -68,6 +69,8 @@ Options:
                        stops when there is no console to ask on
       --rclone         download with plain rclone copyto / copy and rclone's own progress
                        instead of grab's resumable download over several connections
+  -- FLAGS             rclone flags: connection ones (--sftp-*, --bind, --timeout...) for
+                       grab's downloads; with --rclone, any rclone flags for its copy
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
   -v, --verbose        echo the ssh and rclone command lines before running them
       --init           write a commented example grab.conf to the config path if absent
@@ -284,6 +287,15 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     if (positionals.size() == 2) {
         if (util::trim(positionals[1]).empty()) return util::fail("DEST must not be empty");
         result.opts.dest = util::path_from_utf8(positionals[1]);
+    }
+    // grab's engine uses only connection flags (rclone_flags.hpp): anything else after `--` would
+    // be ignored, or worse ("-- --dry-run" still downloaded the big files, G186).
+    if (!result.opts.rclone) {
+        if (const auto bad = rclone_flags::first_unusable(result.opts.extra)) {
+            return util::failf("{} after -- isn't used by grab's downloads, which take only connection flags "
+                               "(--sftp-*, --bind, --timeout...): {}",
+                               bad->flag, bad->hint);
+        }
     }
     return result;
 }

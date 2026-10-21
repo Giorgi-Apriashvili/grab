@@ -5,15 +5,19 @@
 #include "listing.hpp"
 #include "match.hpp"
 #include "rclone.hpp"
+#include "rclone_flags.hpp"
 #include "remote.hpp"
 #include "secrets.hpp"
 #include "util.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <map>
+#include <mutex>
+#include <system_error>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -21,6 +25,62 @@
 #include <utility>
 
 namespace grab::engine {
+
+std::optional<RcloneVersion> parse_rclone_version(std::string_view out) {
+    constexpr std::string_view mark = "rclone v";
+    const auto at = out.find(mark);
+    if (at == std::string_view::npos) return std::nullopt;
+    out.remove_prefix(at + mark.size());
+    RcloneVersion v;
+    int* parts[] = {&v.major, &v.minor, &v.patch};
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto [end, err] = std::from_chars(out.data(), out.data() + out.size(), *parts[i]);
+        if (err != std::errc{} || end == out.data()) return std::nullopt;
+        out.remove_prefix(static_cast<std::size_t>(end - out.data()));
+        if (i == 2) break;
+        if (!out.starts_with('.')) return i == 1 ? std::optional(v) : std::nullopt; // "v1.70": no patch
+        out.remove_prefix(1);
+    }
+    return v;
+}
+
+std::expected<void, std::string> check_rclone(const std::string& rclone, const std::filesystem::path& exe_dir,
+                                              bool configured) {
+#ifdef _WIN32
+    const auto bundled = exe_dir / "rclone.exe";
+#else
+    const auto bundled = exe_dir / "rclone";
+#endif
+    if (!exe_dir.empty() && rclone == util::path_to_utf8(bundled)) return {}; // the one grab ships
+    static std::mutex m;
+    static std::map<std::string, std::string> checked; // program -> why it can't be used ("" fine)
+    {
+        std::lock_guard lock(m);
+        if (const auto it = checked.find(rclone); it != checked.end()) {
+            if (it->second.empty()) return {};
+            return util::fail(it->second);
+        }
+    }
+    proc::RunOptions quiet;
+    quiet.detached = true;
+    const auto ran = proc::run_capture(std::vector<std::string>{rclone, "version"}, quiet);
+    std::string why;
+    // One that can't run at all is reported by the call that needs it (ssh searches don't).
+    if (ran && ran->exit_code == 0) {
+        if (const auto v = parse_rclone_version(ran->out); v && *v < min_rclone) {
+            why = std::format("{} is rclone {}.{}.{}, too old for grab, which needs {}.{} or newer (its folder downloads "
+                              "and verification use --sftp-connections). {}",
+                              rclone, v->major, v->minor, v->patch, min_rclone.major, min_rclone.minor,
+                              configured ? "Remove `rclone =` from grab.conf to use the rclone that comes with grab"
+                                         : "The rclone.exe that comes with grab is missing next to grab.exe; "
+                                           "reinstall grab or run `grab update`");
+        }
+    }
+    std::lock_guard lock(m);
+    checked.emplace(rclone, why);
+    if (why.empty()) return {};
+    return util::fail(why);
+}
 
 std::expected<Context, std::string> load_context(const std::filesystem::path& config_path,
                                                  const std::optional<std::string>& remote_name) {
@@ -38,7 +98,11 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
         if (auto ready = secrets::prepare(grab_rclone_config_path()); !ready) secrets_error = ready.error();
     }
 
-    cfg->rclone = resolve_rclone_exe(*cfg, util::self_exe_path().parent_path());
+    const auto exe_dir = util::self_exe_path().parent_path();
+    cfg->rclone = resolve_rclone_exe(*cfg, exe_dir);
+    if (auto usable = check_rclone(cfg->rclone, exe_dir, !util::trim(cfg->rclone).empty()); !usable) {
+        return util::fail(usable.error());
+    }
     cfg->rclone_config = effective_rclone_config(*cfg); // always passed as --config
     auto remote = load_rclone_remote(*cfg->rclone_config, settings.rclone_remote);
     if (!remote) {
@@ -104,6 +168,7 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, const std::vecto
         list.rclone_exe = ctx.config.rclone;
         list.rclone_config = ctx.config.rclone_config;
         list.rclone_remote = ctx.settings.rclone_remote;
+        list.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches searches too (G189)
 
         auto out = run_listing(build_lsf_argv(list), run, on_command);
         if (!out) return util::fail(out.error());
@@ -271,26 +336,16 @@ std::optional<std::string> parse_error_line(std::string_view line) {
     return doc->string_of("msg");
 }
 
-std::vector<std::string> without_console_progress(std::span<const std::string> flags) {
-    std::vector<std::string> out;
-    for (const auto& f : flags) {
-        if (f == "-P" || f == "--progress" || f == "--stats-one-line" ||
-            f == "--stats-one-line-date" || f == "-q" || f == "--quiet") {
-            continue;
-        }
-        out.push_back(f);
-    }
-    return out;
-}
-
 std::expected<DownloadResult, std::string>
 download(const Context& ctx, Mode mode, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run, std::span<const std::string> extra,
          const CommandHook& on_command, const std::function<void(const std::string&)>& on_copied) {
-    const auto common = without_console_progress(ctx.settings.common_flags);
-    const auto mode_flags = without_console_progress(
-        mode == Mode::folder ? ctx.settings.folder_flags : ctx.settings.file_flags);
+    // grab's own batch: only the connection flags of the configured ones (rclone_flags.hpp);
+    // `extra` is grab's (--files-from-raw, --transfers...).
+    const auto common = rclone_flags::connection(ctx.settings.common_flags);
+    const auto mode_flags =
+        rclone_flags::connection(mode == Mode::folder ? ctx.settings.folder_flags : ctx.settings.file_flags);
     std::vector<std::string> tail(extra.begin(), extra.end());
     // Appended last so they win over anything configured.
     tail.insert(tail.end(), {"--use-json-log", "--stats", "500ms", "--stats-log-level", "NOTICE"});

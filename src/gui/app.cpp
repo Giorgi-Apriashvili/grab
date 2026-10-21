@@ -14,6 +14,7 @@
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
+#include "rclone_flags.hpp"
 #include "space.hpp"
 #include "util.hpp"
 #include "verify.hpp"
@@ -434,7 +435,7 @@ void App::play(const Value& msg) {
             }).share();
         connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
         PlayServer::File file{fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, path,
-                                            engine::without_console_progress(ctx->settings.common_flags)},
+                                            rclone_flags::connection(ctx->settings.common_flags)},
                               remote, upstream, name, size};
         auto preparing = std::make_shared<Activity>(*this, std::format("Preparing {}…", name), "warm:" + remote);
         auto address = play_server_.play(std::move(file), [preparing, name](std::uint64_t done, std::uint64_t total) {
@@ -2333,7 +2334,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
 
     fetch::Download d;
     d.source = fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, item->path,
-                             engine::without_console_progress(ctx->settings.common_flags)};
+                             rclone_flags::connection(ctx->settings.common_flags)};
     d.server = item->remote;
     d.id = item->id;
     existing::Choice choice{};

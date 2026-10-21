@@ -52,7 +52,8 @@ max_connections =
 skip_hidden = true
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
 ssh_options =
-# rclone flags used in both modes. 255Ki is the largest SFTP packet OpenSSH accepts and
+# rclone flags for --rclone copies; grab's own downloads, listings, previews and checks use
+# only the connection ones (--sftp-*, --bind, --timeout...). 255Ki is the largest SFTP packet OpenSSH accepts and
 # cuts round trips roughly 8x compared with the 32Ki default. --sftp-disable-hashcheck skips
 # the post-transfer md5sum rclone would otherwise run on the server (minutes for a 30 GB
 # file); SSH already guarantees integrity in flight.

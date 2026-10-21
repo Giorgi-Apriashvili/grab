@@ -44,12 +44,29 @@ TEST_CASE("file mode, long flags and options in any order") {
     CHECK(util::path_to_utf8(*r->opts.config) == "C:\\g.conf");
 }
 
-TEST_CASE("everything after -- goes to rclone verbatim") {
-    auto r = parse_args(args({"-s", "x", "d", "--", "--bwlimit", "10M", "-f", "--dry-run"}));
+TEST_CASE("everything after -- goes to rclone verbatim with --rclone") {
+    auto r = parse_args(args({"-s", "x", "d", "--rclone", "--", "--bwlimit", "10M", "-f", "--dry-run"}));
     REQUIRE(r.has_value());
     CHECK(r->opts.mode == Mode::file);
     CHECK_FALSE(r->opts.dry_run);
     CHECK(r->opts.extra == std::vector<std::string>{"--bwlimit", "10M", "-f", "--dry-run"});
+}
+
+TEST_CASE("grab's own downloads take only connection flags after -- (G186)") {
+    auto ok = parse_args(args({"x", "d", "--", "--sftp-chunk-size", "1Mi", "--bind=10.8.0.2", "--timeout", "2m"}));
+    REQUIRE(ok.has_value());
+    CHECK(ok->opts.extra.size() == 5);
+    // "-- --dry-run" still downloaded the big files; now it says what to use instead.
+    auto dry = parse_args(args({"-f", "x", "d", "--", "--dry-run"}));
+    REQUIRE_FALSE(dry.has_value());
+    CHECK(dry.error().find("--dry-run after -- isn't used by grab's downloads") != std::string::npos);
+    CHECK(dry.error().find("grab's own -n") != std::string::npos);
+    auto limit = parse_args(args({"x", "d", "--", "--bwlimit", "10M"}));
+    REQUIRE_FALSE(limit.has_value());
+    CHECK(limit.error().find("--limit") != std::string::npos);
+    auto filter = parse_args(args({"x", "d", "--", "--exclude", "*.part"}));
+    REQUIRE_FALSE(filter.has_value());
+    CHECK(filter.error().find("--rclone") != std::string::npos);
 }
 
 TEST_CASE("mode defaults to file and the two mode flags are exclusive") {

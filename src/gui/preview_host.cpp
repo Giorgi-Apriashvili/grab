@@ -159,11 +159,12 @@ std::expected<std::string, std::string> PreviewServers::base(const engine::Conte
                         UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
                                                   sizeof(inherit), nullptr, nullptr);
     std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
+    std::wstring environment = proc::internal_environment(); // no RCLONE_PROGRESS and such (G8)
     PROCESS_INFORMATION pi{};
     const BOOL ok = listed && CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE,
                                              CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED |
                                                  EXTENDED_STARTUPINFO_PRESENT,
-                                             nullptr, nullptr, &si.StartupInfo, &pi);
+                                             environment.data(), nullptr, &si.StartupInfo, &pi);
     const DWORD error = GetLastError();
     if (listed) DeleteProcThreadAttributeList(si.lpAttributeList);
     CloseHandle(in);

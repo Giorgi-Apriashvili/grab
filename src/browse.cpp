@@ -3,6 +3,7 @@
 #include "json.hpp"
 #include "listing.hpp"
 #include "rclone.hpp"
+#include "rclone_flags.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
 
@@ -203,7 +204,7 @@ std::vector<std::string> listing_argv(const engine::Context& ctx, std::string_vi
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", remote_spec(ctx.settings.rclone_remote, path),
                                   "--no-mimetype"};
     if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    const auto flags = engine::without_console_progress(ctx.settings.common_flags);
+    const auto flags = rclone_flags::connection(ctx.settings.common_flags); // rclone_flags.hpp
     argv.insert(argv.end(), flags.begin(), flags.end());
     return argv;
 }

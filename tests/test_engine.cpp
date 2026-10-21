@@ -58,12 +58,36 @@ TEST_CASE("other lines are not stats; error lines yield their message") {
     CHECK_FALSE(engine::parse_error_line("{\"level\": broken").has_value());
 }
 
-TEST_CASE("console-only progress flags are dropped for streaming") {
-    const std::vector<std::string> flags{"-P", "--sftp-chunk-size", "255Ki", "--progress",
-                                         "--stats-one-line", "-q", "--transfers", "8"};
-    CHECK(engine::without_console_progress(flags) ==
-          std::vector<std::string>{"--sftp-chunk-size", "255Ki", "--transfers", "8"});
+TEST_CASE("rclone's version, and the oldest grab works with (G190)") {
+    CHECK(engine::parse_rclone_version("rclone v1.75.1\n- os/version: Microsoft Windows 11\n") ==
+          engine::RcloneVersion{1, 75, 1});
+    CHECK(engine::parse_rclone_version("rclone v1.66.0-DEV\n") == engine::RcloneVersion{1, 66, 0});
+    CHECK(engine::parse_rclone_version("rclone v1.70") == engine::RcloneVersion{1, 70, 0});
+    CHECK_FALSE(engine::parse_rclone_version("not rclone").has_value());
+    CHECK(engine::RcloneVersion{1, 66, 9} < engine::min_rclone);
+    CHECK_FALSE(engine::RcloneVersion{1, 67, 0} < engine::min_rclone);
+    CHECK_FALSE(engine::RcloneVersion{2, 0, 0} < engine::min_rclone);
 }
+
+#ifdef _WIN32
+TEST_CASE("an old rclone that isn't the bundled one is refused with a reason (G190)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-old-rclone";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream(dir / "old-rclone.cmd") << "@echo rclone v1.66.0\r\n";
+        std::ofstream(dir / "new-rclone.cmd") << "@echo rclone v1.75.1\r\n";
+    }
+    const auto old = engine::check_rclone(util::path_to_utf8(dir / "old-rclone.cmd"), dir / "bin", true);
+    REQUIRE_FALSE(old.has_value());
+    CHECK(old.error().find("rclone 1.66.0, too old for grab, which needs 1.67 or newer") != std::string::npos);
+    CHECK(old.error().find("Remove `rclone =`") != std::string::npos);
+    CHECK(engine::check_rclone(util::path_to_utf8(dir / "new-rclone.cmd"), dir / "bin", true).has_value());
+    // The bundled one is never asked.
+    CHECK(engine::check_rclone(util::path_to_utf8(dir / "rclone.exe"), dir, false).has_value());
+    std::filesystem::remove_all(dir);
+}
+#endif
 
 TEST_CASE("download_argv uses the remote's flags and DEST\\<name>") {
     engine::Context ctx;
