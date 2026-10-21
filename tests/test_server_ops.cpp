@@ -437,3 +437,41 @@ TEST_CASE("an add that fails after rclone made the remote takes it out again, so
     std::filesystem::remove(grab_known_hosts_path(), ec);
 }
 #endif
+
+TEST_CASE("a change sets aside a password store it can't decrypt, and names who needs a password again (G211)") {
+    const auto own = grab_rclone_config_path();
+    REQUIRE(util::path_to_utf8(own).find("grab-tests-home") != std::string::npos);
+    Scratch s;
+    std::filesystem::create_directories(own.parent_path());
+    std::ofstream(own, std::ios::binary) << "[box]\ntype = sftp\nhost = box.example.com\nport = 23\nuser = u1\n\n"
+                                            "[two]\ntype = sftp\nhost = two.example.com\nuser = u2\n\n"
+                                            "[agent]\ntype = sftp\nhost = h.example.com\nuser = me\nkey_use_agent = true\n";
+    const auto store = secrets::path_beside(own);
+    std::ofstream(store, std::ios::binary) << "grab-secrets-sealed 1\nanother account's";
+    s.write("grab.conf", "[grab]\ndefault_remote = box\n\n[box]\nmax_depth = 4\n\n[two]\n\n[agent]\n");
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    CHECK_FALSE(env->secrets_error.empty());
+
+    // box gets a new password: the store starts over, and two's password is the one to enter again.
+    const auto note = server_ops::update_server(*env, server(Auth::password), std::string("NEWOBS"), std::nullopt);
+    REQUIRE(note.has_value());
+    CHECK(note->find("couldn't be read and were moved to") != std::string::npos);
+    CHECK(note->find("enter the password of two again") != std::string::npos);
+    CHECK(secrets::load(store) == secrets::Store{{"box", {{"pass", "NEWOBS"}}}});
+    bool kept = false;
+    for (const auto& e : std::filesystem::directory_iterator(own.parent_path())) {
+        if (util::path_to_utf8(e.path().filename()).starts_with("secrets.unreadable-")) {
+            kept = util::read_file(e.path()).value_or("") == "grab-secrets-sealed 1\nanother account's";
+            std::filesystem::remove(e.path());
+        }
+    }
+    CHECK(kept);
+    // Readable now: the next change has nothing to say.
+    env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    CHECK(server_ops::update_server(*env, server(Auth::password), std::nullopt, std::nullopt) == std::string());
+    secrets::export_to_env({});
+    std::filesystem::remove(own);
+    std::filesystem::remove(store);
+}

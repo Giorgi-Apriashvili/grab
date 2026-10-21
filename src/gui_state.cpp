@@ -21,13 +21,23 @@ constexpr std::string_view recent_purpose = "grab recent searches";
 } // namespace
 
 json::Value load_recent(const std::filesystem::path& file) {
-    auto data = util::read_file(file);
-    if (!data || !data->starts_with(recent_header)) return json::Value::make_array();
-    const auto text = util::unprotect_for_user(std::string_view(*data).substr(recent_header.size()), recent_purpose);
-    if (!text) return json::Value::make_array(); // another user's, or damaged
-    auto doc = json::parse(*text);
-    if (!doc || doc->kind != json::Value::Kind::array) return json::Value::make_array();
-    return *doc;
+    if (auto data = util::read_file_if_exists(file)) {
+        const std::optional<std::string>& saved = *data;
+        if (!saved) return json::Value::make_array(); // none yet
+        if (saved->starts_with(recent_header)) {
+            const auto text =
+                util::unprotect_for_user(std::string_view(*saved).substr(recent_header.size()), recent_purpose);
+            if (text) {
+                if (auto doc = json::parse(*text); doc && doc->kind == json::Value::Kind::array) return *doc;
+            }
+        }
+    }
+    // Unreadable, damaged, another user's, or DPAPI failing for now: moved aside, so the next
+    // search's save doesn't replace it, and the list starts empty (review G215).
+    if (!util::move_aside(file, "bad")) {
+        // Not even that: the next search's save replaces it.
+    }
+    return json::Value::make_array();
 }
 
 bool save_recent(const std::filesystem::path& file, const json::Value& items) {
@@ -70,10 +80,11 @@ json::Value sort_to_json(const SortOrder& s) {
     return v;
 }
 
-GuiState parse_gui_state(std::string_view json_text) {
+namespace {
+
+GuiState gui_state_from(const json::Value* doc) {
     GuiState s;
-    auto doc = json::parse(json_text);
-    if (!doc || doc->kind != json::Value::Kind::object) return s;
+    if (doc == nullptr || doc->kind != json::Value::Kind::object) return s;
 
     auto number = [](const json::Value* v) -> std::optional<int> {
         if (v == nullptr || v->kind != json::Value::Kind::number) return std::nullopt;
@@ -151,6 +162,23 @@ GuiState parse_gui_state(std::string_view json_text) {
     return s;
 }
 
+} // namespace
+
+GuiState parse_gui_state(std::string_view json_text) {
+    const auto doc = json::parse(json_text);
+    return gui_state_from(doc ? &*doc : nullptr);
+}
+
+std::expected<std::optional<GuiState>, std::string> read_gui_state(const std::filesystem::path& p) {
+    auto text = util::read_file_if_exists(p);
+    if (!text) return util::fail(text.error());
+    if (!*text) return std::nullopt;
+    const auto doc = json::parse(**text);
+    if (!doc) return util::fail(doc.error());
+    if (doc->kind != json::Value::Kind::object) return util::fail("not grab's settings");
+    return gui_state_from(&*doc);
+}
+
 std::string gui_state_to_json(const GuiState& state) {
     using json::Value;
     Value root = Value::make_object();
@@ -210,10 +238,11 @@ bool move_before(std::vector<int>& ids, int id, int before) {
 
 std::filesystem::path default_queue_path() { return util::config_home() / "grab" / "queue.json"; }
 
-std::vector<SavedDownload> parse_queue(std::string_view json_text) {
+namespace {
+
+std::vector<SavedDownload> queue_from(const json::Value* doc) {
     std::vector<SavedDownload> out;
-    auto doc = json::parse(json_text);
-    if (!doc || doc->kind != json::Value::Kind::array) return out;
+    if (doc == nullptr || doc->kind != json::Value::Kind::array) return out;
     for (const auto& v : doc->items) {
         SavedDownload d;
         auto remote = v.string_of("remote");
@@ -258,6 +287,23 @@ std::vector<SavedDownload> parse_queue(std::string_view json_text) {
     return out;
 }
 
+} // namespace
+
+std::vector<SavedDownload> parse_queue(std::string_view json_text) {
+    const auto doc = json::parse(json_text);
+    return queue_from(doc ? &*doc : nullptr);
+}
+
+std::expected<std::optional<std::vector<SavedDownload>>, std::string> read_queue(const std::filesystem::path& p) {
+    auto text = util::read_file_if_exists(p);
+    if (!text) return util::fail(text.error());
+    if (!*text) return std::nullopt;
+    const auto doc = json::parse(**text);
+    if (!doc) return util::fail(doc.error());
+    if (doc->kind != json::Value::Kind::array) return util::fail("not a saved queue");
+    return queue_from(&*doc);
+}
+
 std::string queue_to_json(const std::vector<SavedDownload>& items) {
     using json::Value;
     Value list = Value::make_array();
@@ -292,11 +338,6 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         list.push(std::move(v));
     }
     return json::stringify(list);
-}
-
-GuiState load_gui_state(const std::filesystem::path& p) {
-    auto text = util::read_file(p);
-    return text ? parse_gui_state(*text) : GuiState{};
 }
 
 std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state) {

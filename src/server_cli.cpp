@@ -216,10 +216,12 @@ int server_add(const Env& env, const std::string& prefill) {
         }
         obscured = std::move(*ob);
     }
-    if (auto added = server_ops::add_server(env, s, obscured, *keys); !added) {
+    auto added = server_ops::add_server(env, s, obscured, *keys);
+    if (!added) {
         error(added.error());
         return exit_config;
     }
+    if (!added->empty()) std::println(stderr, "note: {}", *added);
     std::println(stderr, "\nSaved {} to {} and {}.", s.name, util::path_to_utf8(env.grab_conf),
                  util::path_to_utf8(env.rclone_conf));
 

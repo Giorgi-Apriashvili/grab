@@ -370,6 +370,8 @@ private:
     void save_queue() const; // any thread; unfinished items, for the next start
     void report_save(std::string_view what, const std::expected<void, std::string>& saved,
                      std::atomic<bool>& failing) const;
+    void set_aside(std::string_view what, const std::filesystem::path& p, const std::string& why,
+                   std::string_view instead);
 
     Host host_;
     std::filesystem::path config_path_;
@@ -377,6 +379,7 @@ private:
     std::filesystem::path queue_path_;
     std::filesystem::path recent_path_; // recent searches, sealed (gui_state.hpp)
     GuiState state_;
+    std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
     fetch::Connections connections_;
     rate::RateLimiter limiter_; // shared by every download's streams
     std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers

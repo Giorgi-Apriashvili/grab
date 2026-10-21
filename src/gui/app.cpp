@@ -120,8 +120,12 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       state_path_(std::move(state_path)),
       queue_path_(state_path_.parent_path() / "queue.json"),
       recent_path_(state_path_.parent_path() / "recent"),
-      state_(load_gui_state(state_path_)),
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
+    if (auto saved = read_gui_state(state_path_); !saved) {
+        set_aside("grab's settings", state_path_, saved.error(), "the defaults are used");
+    } else if (*saved) {
+        state_ = std::move(**saved);
+    }
     parallel_ = state_.parallel;
     learned_ = state_.server_limits;
     timings_ = state_.timings;
@@ -166,6 +170,16 @@ App::~App() {
 }
 
 void App::save_state() const { report_save("the window's settings", save_gui_state(state_path_, state_), state_unsaved_); }
+
+// A saved file that exists but can't be read: moved aside, so nothing this run saves replaces
+// it, with a notice for the page once it's open (reviews G212, G213).
+void App::set_aside(std::string_view what, const std::filesystem::path& p, const std::string& why,
+                    std::string_view instead) {
+    auto moved = util::move_aside(p, "bad");
+    notices_.push_back(moved ? std::format("{} couldn't be read ({}), so {}; the old file is kept as {}.", what, why,
+                                           instead, util::path_to_utf8(*moved))
+                             : std::format("{} couldn't be read ({}), so {}.", what, why, instead));
+}
 
 // gui.json and queue.json are saved often: a failure shows once, until a save works again (G214).
 void App::report_save(std::string_view what, const std::expected<void, std::string>& saved,
@@ -508,6 +522,12 @@ void App::on_message(const std::string& text) {
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
+        if (!notices_.empty()) {
+            Value v = Value::make_object();
+            v.set("type", str("error"));
+            v.set("message", str(util::join(std::exchange(notices_, {}), " ")));
+            post(v);
+        }
     } else if (type == "updateCheckNow") {
         start_update_check(true);
     } else if (type == "setUpdateCheck") {
@@ -1600,7 +1620,7 @@ void App::apply_pending(Pending p, std::stop_token stop) {
         if (!ob) return settings_error(ob.error());
         obscured = std::move(*ob);
     }
-    std::expected<void, std::string> done;
+    std::expected<std::string, std::string> done; // a note to show, when it worked
     switch (p.kind) {
     case Pending::Kind::add:
         done = server_ops::add_server(*env, p.server, obscured, p.keys);
@@ -1610,10 +1630,11 @@ void App::apply_pending(Pending p, std::stop_token stop) {
                                          p.keys.lines.empty() ? std::nullopt : std::optional(p.keys));
         break;
     case Pending::Kind::trust:
-        done = server_ops::trust_server(*env, p.server.name, p.keys);
+        done = server_ops::trust_server(*env, p.server.name, p.keys).transform([] { return std::string{}; });
         break;
     }
     if (!done) return settings_error(done.error());
+    if (!done->empty()) settings_error(*done);
     // An explicit connection limit replaces whatever grab learned for this server.
     if (p.server.max_connections) {
         const std::string name = p.server.name;
@@ -2698,9 +2719,14 @@ json::Value App::queue_snapshot() const {
 
 // Unfinished downloads from the last run come back paused, with their progress.
 void App::restore_queue() {
-    auto text = util::read_file(queue_path_);
-    if (!text) return;
-    for (const auto& saved : parse_queue(*text)) {
+    auto queue = read_queue(queue_path_);
+    if (!queue) {
+        // This run didn't load it, so its saves (at the latest when the window closes) must not
+        // delete or replace it (review G212).
+        return set_aside("The saved download queue", queue_path_, queue.error(), "it starts empty");
+    }
+    if (!*queue) return;
+    for (const auto& saved : **queue) {
         auto item = std::make_shared<Item>();
         item->id = next_id_++;
         item->remote = saved.remote;

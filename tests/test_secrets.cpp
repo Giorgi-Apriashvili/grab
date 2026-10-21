@@ -6,6 +6,10 @@
 
 #include <doctest/doctest.h>
 
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (LockFileEx)
+#endif
+
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -28,6 +32,15 @@ std::filesystem::path fresh_dir(const char* name) {
 void write(const std::filesystem::path& p, std::string_view text) {
     std::ofstream out(p, std::ios::binary | std::ios::trunc);
     out << text;
+}
+// The text of the store set aside in `dir` ("secrets.unreadable-<time>"), or "" when there is none.
+std::string set_aside_in(const std::filesystem::path& dir) {
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (util::path_to_utf8(e.path().filename()).starts_with("secrets.unreadable-")) {
+            return util::read_file(e.path()).value_or("");
+        }
+    }
+    return {};
 }
 
 } // namespace
@@ -154,10 +167,11 @@ TEST_CASE("prepare moves secrets out of rclone.conf once and hands them over") {
     // An unreadable store is an error while the file has nothing to fall back on...
     write(secrets::path_beside(conf), "grab-secrets-sealed 1\ngarbage");
     CHECK_FALSE(secrets::prepare(conf).has_value());
-    // ...and is replaced by the secrets the file still has.
+    // ...and the secrets the file still has start a new one, the old file set aside (G211).
     write(conf, "[grabtest-box]\npass = NEW\n");
     REQUIRE(secrets::prepare(conf).has_value());
     CHECK(secrets::load(secrets::path_beside(conf)) == Store{{"grabtest-box", {{"pass", "NEW"}}}});
+    CHECK(set_aside_in(dir) == "grab-secrets-sealed 1\ngarbage");
 #endif
     secrets::export_to_env({});
     std::filesystem::remove_all(dir);
@@ -177,4 +191,43 @@ TEST_CASE("a server's secrets follow its login method") {
     server_ops::apply_auth(store, "New", Auth::password, std::nullopt); // nothing to keep
     CHECK_FALSE(store.contains("New"));
     CHECK(store.at("Other").at("pass") == "KEEP");
+}
+
+TEST_CASE("a change of an undecryptable store sets it aside; one that can't be read waits (G211)") {
+    const auto dir = fresh_dir("grab-test-secrets-change");
+    const auto file = dir / "secrets";
+    auto none = secrets::load_for_change(file);
+    REQUIRE(none.has_value());
+    CHECK(none->store.empty());
+    CHECK_FALSE(none->set_aside.has_value());
+
+    const Store store{{"Box", {{"pass", "OBS"}}}};
+    REQUIRE(secrets::save(file, store));
+    auto good = secrets::load_for_change(file);
+    REQUIRE(good.has_value());
+    CHECK(good->store == store);
+    CHECK_FALSE(good->set_aside.has_value());
+
+    write(file, "grab-secrets-sealed 1\nanother account's, or damaged");
+    auto damaged = secrets::load_for_change(file);
+    REQUIRE(damaged.has_value());
+    CHECK(damaged->store.empty());
+    REQUIRE(damaged->set_aside.has_value());
+    CHECK_FALSE(std::filesystem::exists(file));
+    CHECK(set_aside_in(dir) == "grab-secrets-sealed 1\nanother account's, or damaged");
+
+#ifdef _WIN32
+    // Can't be read at all for the moment (another program's lock): an error, the file left alone.
+    REQUIRE(secrets::save(file, store));
+    const HANDLE other = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(other != INVALID_HANDLE_VALUE);
+    OVERLAPPED at{};
+    REQUIRE(LockFileEx(other, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 100000, 0, &at));
+    CHECK_FALSE(secrets::load_for_change(file).has_value());
+    UnlockFileEx(other, 0, 100000, 0, &at);
+    CloseHandle(other);
+    CHECK(secrets::load(file) == store);
+#endif
+    std::filesystem::remove_all(dir);
 }

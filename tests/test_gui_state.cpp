@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,7 +38,9 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     const auto file = std::filesystem::temp_directory_path() / "grab_test_gui" / "gui.json";
     std::filesystem::remove_all(file.parent_path());
     CHECK(save_gui_state(file, s)); // creates the folder
-    CHECK(load_gui_state(file) == s);
+    const auto back = read_gui_state(file);
+    REQUIRE(back.has_value());
+    CHECK(*back == std::optional<GuiState>(s));
     std::filesystem::remove_all(file.parent_path());
 }
 
@@ -53,7 +56,8 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
     CHECK(partial.last_remote == "box");
     CHECK(partial.destinations == std::map<std::string, std::string>{{"box", "C:\\x"}});
 
-    CHECK(load_gui_state("Z:\\definitely\\missing\\gui.json") == GuiState{});
+    const auto missing = read_gui_state(std::filesystem::temp_directory_path() / "grab-test-missing" / "gui.json");
+    CHECK((missing.has_value() && !missing->has_value())); // none: the defaults, nothing to say
 
     // Parallel downloads stay within 1..8; nonsense limits are dropped.
     CHECK(parse_gui_state(R"({"limitMiBps":0})").limit_mibps == 5.0); // out of range: default
@@ -182,8 +186,17 @@ TEST_CASE("recent searches are sealed on disk and come back") {
 
     REQUIRE(save_recent(file, json::Value::make_array())); // Clear history
     CHECK_FALSE(std::filesystem::exists(file));
-    REQUIRE(util::write_file_atomic(file, "[{\"q\":\"plain\"}]")); // not sealed: ignored
+    REQUIRE(util::write_file_atomic(file, R"([{"q":"plain"}])")); // not sealed: not used...
     CHECK(load_recent(file).items.empty());
+    // ...and set aside, so the next search's save doesn't replace it (G215).
+    CHECK_FALSE(std::filesystem::exists(file));
+    bool kept = false;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (util::path_to_utf8(e.path().filename()).starts_with("recent.bad-")) {
+            kept = util::read_file(e.path()).value_or("") == R"([{"q":"plain"}])";
+        }
+    }
+    CHECK(kept);
     std::filesystem::remove_all(dir);
 }
 
@@ -207,4 +220,37 @@ TEST_CASE("the download queue round-trips and skips incomplete entries") {
     REQUIRE(partial.size() == 1);
     CHECK(partial[0].name == "/x");
     CHECK(partial[0].mode == "file");
+}
+
+TEST_CASE("saved settings and a saved queue that can't be read are told apart from none (G212, G213)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-damaged-state";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto gui = dir / "gui.json";
+    const auto queue = dir / "queue.json";
+    const auto none_gui = read_gui_state(gui);
+    CHECK((none_gui.has_value() && !none_gui->has_value()));
+    const auto none_queue = read_queue(queue);
+    CHECK((none_queue.has_value() && !none_queue->has_value()));
+
+    // Cut off, or not what grab saves: errors, so the window sets them aside instead of saving
+    // the defaults or an empty queue over them.
+    REQUIRE(util::write_file_atomic(gui, R"({"verifyDownloads":true,"updateCh)"));
+    CHECK_FALSE(read_gui_state(gui).has_value());
+    REQUIRE(util::write_file_atomic(gui, "[1,2]"));
+    CHECK_FALSE(read_gui_state(gui).has_value());
+    REQUIRE(util::write_file_atomic(gui, R"({"verifyDownloads":true})"));
+    const auto good = read_gui_state(gui);
+    REQUIRE(good.has_value());
+    CHECK(good->value_or(GuiState{}).verify_downloads);
+
+    REQUIRE(util::write_file_atomic(queue, R"([{"remote":"A","path":"/x","dest":"C:\\d"},{"remote":"B","pa)"));
+    CHECK_FALSE(read_queue(queue).has_value());
+    REQUIRE(util::write_file_atomic(queue, "{}"));
+    CHECK_FALSE(read_queue(queue).has_value());
+    REQUIRE(util::write_file_atomic(queue, R"([{"remote":"A","path":"/x","dest":"C:\\d"}])"));
+    const auto one = read_queue(queue);
+    REQUIRE(one.has_value());
+    CHECK(one->value_or(std::vector<SavedDownload>{}).size() == 1);
+    std::filesystem::remove_all(dir);
 }

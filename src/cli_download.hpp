@@ -7,6 +7,7 @@
 
 #include "cli.hpp"
 #include "engine.hpp"
+#include "gui_state.hpp"
 #include "schedule.hpp"
 
 #include <cstddef>
@@ -42,6 +43,11 @@ struct DownloadTally {
     bool stopped = false;            // Ctrl+C
     int code = 0;                    // the first failure's exit code, 0 if none
 };
+
+// The window's settings at `gui_json` that the command follows too (Verify downloads, the speed
+// schedule, learned connection limits): the defaults when there are none, and a warning on
+// stderr when the file can't be read; the file is the window's and is left as it is (G213).
+[[nodiscard]] GuiState window_settings(const std::filesystem::path& gui_json);
 
 // "speed limited to 5 MiB/s until 24:00 by the speed schedule (...)" when the speed schedule set
 // in grab's window limits the speed now.

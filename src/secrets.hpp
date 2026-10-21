@@ -31,6 +31,17 @@ using Store = std::map<std::string, std::map<std::string, std::string>>;
 // A missing file is an empty store. An unreadable one (another Windows user's, damaged) is an
 // error, and the store on disk is then left alone.
 [[nodiscard]] std::expected<Store, std::string> load(const std::filesystem::path& file);
+
+// The store about to be changed. One that was read but can't be decrypted or parsed (another
+// Windows user's, damaged, or DPAPI failing for now, as after a domain password reset) is moved
+// aside to "<file>.unreadable-<time>" and the change starts from an empty store, its passwords
+// kept should they become readable again; `set_aside` then names that file (review G211). A file
+// that can't be read at all is an error: the change has to wait rather than replace it.
+struct ForChange {
+    Store store;
+    std::optional<std::filesystem::path> set_aside;
+};
+[[nodiscard]] std::expected<ForChange, std::string> load_for_change(const std::filesystem::path& file);
 // Encrypted, and replaced in one step (util::write_file_atomic).
 [[nodiscard]] std::expected<void, std::string> save(const std::filesystem::path& file, const Store& store);
 

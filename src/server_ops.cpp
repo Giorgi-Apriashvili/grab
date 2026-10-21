@@ -171,17 +171,32 @@ void apply_auth(secrets::Store& store, const std::string& remote, servers::Auth 
 
 namespace {
 
-// Changes the encrypted store of grab's own rclone.conf and hands the result to rclone. An
-// unreadable store (another account's, damaged) starts over: it could not be used anyway.
-std::expected<void, std::string> change_secrets(const Env& env, const std::function<void(secrets::Store&)>& change) {
+// Changes the encrypted store of grab's own rclone.conf and hands the result to rclone. A store
+// that can't be decrypted starts over, the old file set aside (secrets::load_for_change); the
+// note returned then says so, and which other servers (but `leaving`, one being removed) need
+// their password again (review G211). Empty otherwise.
+std::expected<std::string, std::string> change_secrets(const Env& env, const std::function<void(secrets::Store&)>& change,
+                                                       std::string_view leaving = {}) {
     auto lock = lock_settings();
     if (!lock) return util::fail(lock.error());
     const auto file = secrets::path_beside(env.rclone_conf);
-    auto store = secrets::load(file).value_or(secrets::Store{});
-    change(store);
-    if (auto saved = secrets::save(file, store); !saved) return saved;
-    secrets::export_to_env(store);
-    return {};
+    auto loaded = secrets::load_for_change(file);
+    if (!loaded) return util::fail(loaded.error());
+    change(loaded->store);
+    if (auto saved = secrets::save(file, loaded->store); !saved) return util::fail(saved.error());
+    secrets::export_to_env(loaded->store);
+    if (!loaded->set_aside) return std::string{};
+    std::vector<std::string> again;
+    for (const auto& s : list_servers(env)) {
+        if (s.error.empty() && s.auth == servers::Auth::password && s.rclone_remote != leaving &&
+            !loaded->store.contains(s.rclone_remote)) {
+            again.push_back(s.name);
+        }
+    }
+    std::string note = std::format("the saved passwords couldn't be read and were moved to {}",
+                                   util::path_to_utf8(*loaded->set_aside));
+    if (!again.empty()) note += std::format("; enter the password of {} again (Edit)", util::join(again, ", "));
+    return note;
 }
 
 } // namespace
@@ -286,7 +301,7 @@ std::expected<std::string, std::string> obscure(const Env& env, const std::strin
 
 // ---- changes -------------------------------------------------------------------------------
 
-std::expected<void, std::string> add_server(const Env& loaded, const servers::NewServer& s,
+std::expected<std::string, std::string> add_server(const Env& loaded, const servers::NewServer& s,
                                             const std::optional<std::string>& obscured_secret,
                                             const HostKeys& keys) {
     auto locked = lock_current(loaded);
@@ -298,7 +313,7 @@ std::expected<void, std::string> add_server(const Env& loaded, const servers::Ne
     if (!rclone_doc) return util::fail(rclone_doc.error());
     if (auto why = name_taken(env, *rclone_doc, s.name)) return util::fail(*why);
 
-    if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return pinned;
+    if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return util::fail(pinned.error());
     std::error_code ec;
     std::filesystem::create_directories(env.rclone_conf.parent_path(), ec);
     // grab's own rclone.conf gets no secret (nor does the command line): the store keeps it.
@@ -311,6 +326,7 @@ std::expected<void, std::string> add_server(const Env& loaded, const servers::Ne
     // From here a failure takes the remote out again, with its secret, so that the name can be
     // added once more (review G218).
     bool secret_saved = false;
+    std::string note;
     auto undo = [&](std::string why) {
         if (secret_saved) {
             if (auto forgot = change_secrets(env, [&](secrets::Store& st) { st.erase(s.name); }); !forgot) {
@@ -328,6 +344,7 @@ std::expected<void, std::string> add_server(const Env& loaded, const servers::Ne
         auto kept = change_secrets(env, [&](secrets::Store& st) { apply_auth(st, s.name, s.auth, obscured_secret); });
         if (!kept) return undo(kept.error());
         secret_saved = true;
+        note = std::move(*kept);
     }
 
     const RcloneRemote remote = servers::to_remote(s, env.known_hosts);
@@ -339,7 +356,7 @@ std::expected<void, std::string> add_server(const Env& loaded, const servers::Ne
         text = servers::set_value(text, "grab", "default_remote", s.name);
     }
     if (auto written = write_grab_conf(env, text); !written) return undo(written.error());
-    return {};
+    return note;
 }
 
 std::vector<std::pair<std::string, std::string>>
@@ -393,7 +410,7 @@ bool edit_needs_password(const ServerInfo& current, const servers::NewServer& wa
            current.user != wanted.user;
 }
 
-std::expected<void, std::string> update_server(const Env& loaded, const servers::NewServer& wanted,
+std::expected<std::string, std::string> update_server(const Env& loaded, const servers::NewServer& wanted,
                                                const std::optional<std::string>& obscured_secret,
                                                const std::optional<HostKeys>& keys) {
     auto locked = lock_current(loaded);
@@ -421,7 +438,7 @@ std::expected<void, std::string> update_server(const Env& loaded, const servers:
     const bool own = !env.cfg.rclone_config; // own: the secret goes to the store, not rclone.conf
     auto updates = rclone_edit_updates(*section, wanted, own ? std::nullopt : obscured_secret);
     if (keys) {
-        if (auto pinned = pin_host_keys(env.known_hosts, keys->lines); !pinned) return pinned;
+        if (auto pinned = pin_host_keys(env.known_hosts, keys->lines); !pinned) return util::fail(pinned.error());
         const std::string known = util::path_to_utf8(env.known_hosts);
         if (section->get("known_hosts_file").value_or("") != known) updates.emplace_back("known_hosts_file", known);
     }
@@ -430,11 +447,13 @@ std::expected<void, std::string> update_server(const Env& loaded, const servers:
                                      quiet());
         if (!ok(run)) return run_failed("rclone config update", run);
     }
+    std::string note;
     if (own) {
         auto kept = change_secrets(env, [&](secrets::Store& st) {
             apply_auth(st, settings->rclone_remote, wanted.auth, obscured_secret);
         });
-        if (!kept) return kept;
+        if (!kept) return util::fail(kept.error());
+        note = std::move(*kept);
     }
 
     std::string text = servers::set_value(env.grab_text, wanted.name, "search_roots",
@@ -450,7 +469,8 @@ std::expected<void, std::string> update_server(const Env& loaded, const servers:
     RcloneRemote remote = servers::to_remote(described, {});
     text = servers::replace_lead_in(text, wanted.name,
                                     std::format("# rclone remote [{}]: {}", remote.name, describe_remote(remote)));
-    return write_grab_conf(env, text);
+    if (auto written = write_grab_conf(env, text); !written) return util::fail(written.error());
+    return note;
 }
 
 std::expected<void, std::string> trust_server(const Env& loaded, std::string_view name, const HostKeys& keys) {
@@ -490,8 +510,10 @@ std::expected<std::string, std::string> remove_server(const Env& loaded, std::st
     if (env.cfg.rclone_config) return std::string{};
     // The server is gone from grab either way; what couldn't be cleaned up is said.
     std::vector<std::string> notes;
-    if (auto forgot = change_secrets(env, [&](secrets::Store& st) { st.erase(rclone_name); }); !forgot) {
+    if (auto forgot = change_secrets(env, [&](secrets::Store& st) { st.erase(rclone_name); }, rclone_name); !forgot) {
         notes.push_back(std::format("its saved password could not be removed: {}", forgot.error()));
+    } else if (!forgot->empty()) {
+        notes.push_back(std::move(*forgot));
     }
     auto deleted = proc::run_capture(servers::delete_argv(env.rclone, env.rclone_conf, rclone_name), quiet());
     if (!ok(deleted)) {

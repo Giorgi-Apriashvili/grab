@@ -77,7 +77,9 @@ struct GuiState {
 // most recent_max, newest first. Sealed for the current Windows user (DPAPI), as the file lists
 // are: what was searched for is unreadable to other accounts and to a copy of the file.
 inline constexpr std::size_t recent_max = 20;
-// An empty array when there is none, or it isn't this user's or is damaged.
+// An empty array when there is none. One that can't be read (damaged, another user's, DPAPI
+// failing for now) is moved aside as "recent.bad-<time>" first, so the next save doesn't
+// replace it, and the list starts empty (review G215).
 [[nodiscard]] json::Value load_recent(const std::filesystem::path& file);
 // Keeps the first recent_max objects (an entry's text at most 4 KiB); none removes the file.
 bool save_recent(const std::filesystem::path& file, const json::Value& items);
@@ -121,6 +123,10 @@ bool move_before(std::vector<int>& ids, int id, int before);
 
 [[nodiscard]] std::filesystem::path default_queue_path(); // <config>/grab/queue.json
 [[nodiscard]] std::vector<SavedDownload> parse_queue(std::string_view json_text); // bad entries skipped
+// queue.json as saved: nullopt when there is none; an error when it exists but can't be read or
+// isn't a JSON array, so that it is never replaced unseen (review G212).
+[[nodiscard]] std::expected<std::optional<std::vector<SavedDownload>>, std::string>
+read_queue(const std::filesystem::path& p);
 [[nodiscard]] std::string queue_to_json(const std::vector<SavedDownload>& items);
 
 // Unknown or malformed content yields defaults for the affected fields, never an error: a
@@ -128,7 +134,9 @@ bool move_before(std::vector<int>& ids, int id, int before);
 [[nodiscard]] GuiState parse_gui_state(std::string_view json_text);
 [[nodiscard]] std::string gui_state_to_json(const GuiState& state);
 
-[[nodiscard]] GuiState load_gui_state(const std::filesystem::path& p);
+// gui.json as saved: nullopt when there is none; an error when it exists but can't be read or
+// isn't a JSON object, so that the defaults never replace it unseen (review G213).
+[[nodiscard]] std::expected<std::optional<GuiState>, std::string> read_gui_state(const std::filesystem::path& p);
 // Replaced in one step (util::write_file_atomic); the error says why it couldn't be.
 [[nodiscard]] std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state);
 

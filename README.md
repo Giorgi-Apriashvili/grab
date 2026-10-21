@@ -130,7 +130,10 @@ installed exe has no VC redistributable dependency.
 Explorer: pick a server, click through its folders or search them, select rows (click,
 Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the download queue with
 live progress. It reads the same grab.conf and remembers the last server, the destination per
-server and the rows' sort in `%APPDATA%\grab\gui.json`.
+server and the rows' sort in `%APPDATA%\grab\gui.json`. Should that file ever be damaged, the
+window starts with the defaults, keeps the old file as `gui.json.bad-<date>-<time>` and says
+so; the command line, which follows Verify downloads and the speed schedule from it, says so
+too and goes on without them.
 
 - **Folders:** the address bar shows where you are (`Box.Guest › movies › georgian.movies`),
   with ↑ (Backspace) to go up and ⟳ to list the folder from the server again.
@@ -190,7 +193,8 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     searches with where they ran and their filters. Click or Enter runs one again there (that
     server and folder, Exact and the filters); × removes one, "Clear history" all of them. They
     are kept in `%APPDATA%\grab\recent`, encrypted for your Windows account (DPAPI) like the
-    file lists.
+    file lists. A file that can't be read is kept as `recent.bad-<date>-<time>`, and the list
+    starts empty.
 - **All servers** (at the top of the server picker) starts with one folder per server, and a
   search there covers every server's list at once. Results show their server, and Download
   sends each pick to its own server, into the same Save-to folder. Two picks with the same name
@@ -313,7 +317,8 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     deletes only grab's partial files, and of rclone's temporary `.partial` files only the ones
     its stopped copy had just made.
   - This survives closing grab: unfinished downloads come back paused (the list is kept in
-    `%APPDATA%\grab\queue.json`).
+    `%APPDATA%\grab\queue.json`). Should the list be damaged, the queue starts empty, the old
+    file is kept as `queue.json.bad-<date>-<time>` and the window says so.
   - If the file changed on the server in the meantime, it starts over.
   - A file already in the destination, with the same size and not older than the server's
     copy, is not fetched again ("already there, nothing fetched").
@@ -460,6 +465,9 @@ the file can reverse.
 - If the store can't be read (another Windows account, a damaged file, or a Windows password an
   admin reset), servers with passwords say so: enter the password again in Settings → Edit, or
   remove and add the server again. Servers without passwords keep working.
+  - That first change keeps the old store as `secrets.unreadable-<date>-<time>` (it may become
+    readable again, e.g. once a domain controller is reachable after a reset) and names the
+    other servers whose passwords need entering again.
 
 **Upgrading from 0.7.0 or earlier:** the first run moves the passwords out of grab's rclone.conf
 into the encrypted store by itself. They leave the file only after the store holds them. The

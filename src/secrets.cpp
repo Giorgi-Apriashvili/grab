@@ -90,22 +90,38 @@ std::optional<Store> from_text(std::string_view text) {
     return store;
 }
 
+namespace {
+
+// The store in a file's `data`; nullopt when it can't be decrypted or parsed.
+std::optional<Store> unseal(std::string_view data) {
+    if (!data.starts_with(sealed_header)) return std::nullopt;
+    const auto text = util::unprotect_for_user(data.substr(sealed_header.size()), purpose);
+    return text ? from_text(*text) : std::nullopt;
+}
+
+} // namespace
+
 std::expected<Store, std::string> load(const fs::path& file) {
     auto data = util::read_file_if_exists(file);
     if (!data) return util::fail(data.error());
     if (!*data) return Store{};
-    std::optional<Store> store;
-    if ((*data)->starts_with(sealed_header)) {
-        if (auto text = util::unprotect_for_user(std::string_view(**data).substr(sealed_header.size()), purpose)) {
-            store = from_text(*text);
-        }
-    }
+    auto store = unseal(**data);
     if (!store) {
         return util::failf("the saved passwords in {} can't be read (they belong to another Windows account, or the "
                            "file is damaged)",
                            util::path_to_utf8(file));
     }
     return std::move(*store);
+}
+
+std::expected<ForChange, std::string> load_for_change(const fs::path& file) {
+    auto data = util::read_file_if_exists(file);
+    if (!data) return util::fail(data.error());
+    if (!*data) return ForChange{};
+    if (auto store = unseal(**data)) return ForChange{.store = std::move(*store), .set_aside = std::nullopt};
+    auto moved = util::move_aside(file, "unreadable");
+    if (!moved) return util::fail(moved.error());
+    return ForChange{.store = {}, .set_aside = std::move(*moved)};
 }
 
 std::expected<void, std::string> save(const fs::path& file, const Store& store) {
@@ -181,12 +197,13 @@ std::expected<void, std::string> prepare(const fs::path& rclone_conf) {
         // Moved under the settings lock, from both files as they are then: another grab may be
         // moving them at the same time (review G175). Without the lock they stay for now.
         if (auto lock = lock_settings()) {
-            store = load(file);
             text = util::read_file(rclone_conf);
             auto taken = text ? take_secrets(*text) : Taken{};
-            if (!taken.found.empty()) {
-                // An unreadable store can't be used anyway: the secrets just found replace it.
-                Store merged = store ? *store : Store{};
+            // A store that can't be decrypted is set aside first, as for any change (G211); the
+            // secrets just found start a new one.
+            auto base = taken.found.empty() ? util::fail("nothing to move") : load_for_change(file);
+            if (base) {
+                Store merged = std::move(base->store);
                 for (auto& [remote, values] : taken.found) {
                     for (auto& [key, value] : values) merged[remote][key] = std::move(value);
                 }
@@ -196,9 +213,9 @@ std::expected<void, std::string> prepare(const fs::path& rclone_conf) {
                     if (!util::write_file_atomic(rclone_conf, taken.text)) {
                         // They stay in the file as well, where rclone reads them anyway.
                     }
-                    store = std::move(merged);
                 }
             }
+            store = load(file);
         }
     }
     if (!store) return util::fail(store.error());

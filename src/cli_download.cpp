@@ -559,6 +559,16 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
 
 } // namespace
 
+GuiState window_settings(const std::filesystem::path& gui_json) {
+    auto saved = read_gui_state(gui_json);
+    if (!saved) {
+        std::println(stderr, "grab: {} can't be used ({}); going on without the window's settings (Verify downloads, "
+                             "speed schedule, connection limits)", util::path_to_utf8(gui_json), saved.error());
+        return {};
+    }
+    return saved->value_or(GuiState{});
+}
+
 std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules, const schedule::Now& now) {
     const auto limit = schedule::limit_at(rules, now.minute);
     if (!limit) return std::nullopt;
@@ -611,7 +621,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     // The budget grab-gui uses, including what it learned from refusals (read only: gui.json
     // belongs to the window).
     std::optional<int> learned;
-    const auto gui = load_gui_state(default_gui_state_path());
+    const auto gui = window_settings(default_gui_state_path());
     if (const auto it = gui.server_limits.find(server); it != gui.server_limits.end()) learned = it->second;
     const int budget = budget::effective_budget(ctx.settings.max_connections, budget::default_budget(ctx.remote.host), learned);
     connections.configure(server, budget);

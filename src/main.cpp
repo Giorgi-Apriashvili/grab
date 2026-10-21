@@ -199,7 +199,7 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
     // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
     // Without it, rclone follows the speed schedule by itself, as a weekly timetable.
     std::vector<std::string> extra;
-    const auto gui = load_gui_state(default_gui_state_path());
+    const auto gui = window_settings(default_gui_state_path());
     if (opts.limit) {
         if (*opts.limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
     } else if (!gui.speed_schedule.empty()) {

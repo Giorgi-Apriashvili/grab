@@ -112,7 +112,8 @@ struct HostKeys {
 // Pins `keys`, creates the rclone remote, appends the grab.conf section and makes it the
 // default when there is none. `obscured_secret`: the password or key passphrase, obscured. If
 // a later step fails, the remote and its secret are removed again, so the name stays free.
-[[nodiscard]] std::expected<void, std::string> add_server(const Env& env, const servers::NewServer& s,
+// Returns a note when the saved passwords had to be set aside (secrets::load_for_change), else "".
+[[nodiscard]] std::expected<std::string, std::string> add_server(const Env& env, const servers::NewServer& s,
                                                           const std::optional<std::string>& obscured_secret,
                                                           const HostKeys& keys);
 
@@ -134,8 +135,8 @@ rclone_edit_updates(const ini::Section& current, const servers::NewServer& wante
 
 // Applies an edit of server `wanted.name` (the name itself cannot change): rclone keys via
 // `rclone config update`, search_roots/max_depth and the lead-in comment in grab.conf.
-// `keys`, when given, are pinned and become the remote's known_hosts_file.
-[[nodiscard]] std::expected<void, std::string> update_server(const Env& env, const servers::NewServer& wanted,
+// `keys`, when given, are pinned and become the remote's known_hosts_file. A note as add_server's.
+[[nodiscard]] std::expected<std::string, std::string> update_server(const Env& env, const servers::NewServer& wanted,
                                                              const std::optional<std::string>& obscured_secret,
                                                              const std::optional<HostKeys>& keys);
 
