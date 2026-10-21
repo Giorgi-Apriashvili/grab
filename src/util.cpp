@@ -339,6 +339,11 @@ std::filesystem::path config_home() {
     return std::filesystem::current_path();
 }
 
+std::filesystem::path local_data_home() {
+    if (auto l = getenv_utf8("LOCALAPPDATA"); l && !l->empty()) return path_from_utf8(*l);
+    return config_home();
+}
+
 bool stdin_is_tty() {
     // _isatty() is also true for other character devices such as NUL, which would make grab
     // prompt when started with stdin redirected; only a real console has a console mode.
@@ -477,6 +482,11 @@ std::filesystem::path config_home() {
     if (auto x = getenv_utf8("XDG_CONFIG_HOME"); x && !x->empty()) return path_from_utf8(*x);
     if (auto h = getenv_utf8("HOME"); h && !h->empty()) return path_from_utf8(*h) / ".config";
     return std::filesystem::current_path();
+}
+
+std::filesystem::path local_data_home() {
+    if (auto x = getenv_utf8("XDG_CACHE_HOME"); x && !x->empty()) return path_from_utf8(*x);
+    return path_from_utf8(getenv_utf8("HOME").value_or(".")) / ".cache";
 }
 
 bool stdin_is_tty() { return isatty(STDIN_FILENO) != 0; }

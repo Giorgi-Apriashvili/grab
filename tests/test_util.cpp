@@ -1,11 +1,31 @@
+#include "file_list.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
+#endif
+
 #include <cstdint>
+#include <filesystem>
 #include <optional>
+#include <string>
 
 using namespace grab;
+
+#ifdef _WIN32
+TEST_CASE("a profile folder with non-ASCII letters stays itself (G140)") {
+    const auto saved = util::getenv_utf8("LOCALAPPDATA");
+    const std::wstring local = L"C:\\Users\\\u10D2\u10D8\u10DD\u10E0\u10D2\u10D8\\AppData\\Local"; // გიორგი
+    SetEnvironmentVariableW(L"LOCALAPPDATA", local.c_str());
+    // Not C:\Users\áƒ’áƒ˜... (the UTF-8 bytes read as Windows-1252), where the window's browser
+    // profile couldn't be created.
+    CHECK(util::local_data_home() == std::filesystem::path(local));
+    CHECK(file_list::default_dir() == std::filesystem::path(local) / L"grab" / L"lists");
+    SetEnvironmentVariableW(L"LOCALAPPDATA", saved ? util::to_wide(*saved).c_str() : nullptr);
+}
+#endif
 
 TEST_CASE("trim strips spaces, tabs and CR") {
     CHECK(util::trim("  abc \t\r\n") == "abc");

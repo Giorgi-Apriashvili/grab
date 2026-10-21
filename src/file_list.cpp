@@ -199,17 +199,7 @@ std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t 
 }
 
 fs::path default_dir() {
-#ifdef _WIN32
-    if (auto local = util::getenv_utf8("LOCALAPPDATA"); local && !local->empty()) {
-        return util::path_from_utf8(*local) / "grab" / "lists";
-    }
-    return util::config_home() / "grab" / "lists";
-#else
-    if (auto cache = util::getenv_utf8("XDG_CACHE_HOME"); cache && !cache->empty()) {
-        return util::path_from_utf8(*cache) / "grab" / "lists";
-    }
-    return util::path_from_utf8(util::getenv_utf8("HOME").value_or(".")) / ".cache" / "grab" / "lists";
-#endif
+    return util::local_data_home() / "grab" / "lists";
 }
 
 fs::path path_for(const fs::path& dir, std::string_view server) {

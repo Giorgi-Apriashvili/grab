@@ -25,6 +25,10 @@ namespace grab::util {
 
 // %APPDATA% on Windows, $XDG_CONFIG_HOME or ~/.config elsewhere.
 [[nodiscard]] std::filesystem::path config_home();
+// %LOCALAPPDATA% (else config_home()) on Windows, $XDG_CACHE_HOME or ~/.cache elsewhere: file
+// lists, the window's browser profile. Environment variables are UTF-8 here: a path built
+// straight from one would read it in the ANSI code page (review G140).
+[[nodiscard]] std::filesystem::path local_data_home();
 
 [[nodiscard]] std::string path_to_utf8(const std::filesystem::path& p);
 [[nodiscard]] std::filesystem::path path_from_utf8(std::string_view s);

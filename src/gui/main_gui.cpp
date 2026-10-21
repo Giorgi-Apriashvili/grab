@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <filesystem>
+#include <format>
 #include <functional>
 #include <memory>
 #include <cwchar>
@@ -119,8 +120,7 @@ void show_webview_error(HWND hwnd, HRESULT hr) {
             ? L"grab-gui needs the Microsoft Edge WebView2 Runtime, which is not installed.\n\n"
               L"Install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 and start "
               L"grab-gui again. Open the download page now?"
-            : L"The WebView2 control could not start (error 0x" +
-                  std::to_wstring(static_cast<unsigned long>(hr)) + L").";
+            : std::format(L"The WebView2 control could not start (error 0x{:08X}).", static_cast<unsigned long>(hr));
     const int answer = MessageBoxW(hwnd, text.c_str(), L"grab",
                                    (missing_runtime ? MB_YESNO : MB_OK) | MB_ICONERROR);
     if (missing_runtime && answer == IDYES) {
@@ -431,7 +431,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     SetTimer(g.hwnd, timer_tray, 1000, nullptr);
 
     gui::WebViewHost::Options options;
-    options.user_data_dir = (std::filesystem::path(util::getenv_utf8("LOCALAPPDATA").value_or(".")) / "grab" / "WebView2").wstring();
+    // %LOCALAPPDATA% read as UTF-8 (G140): read in the ANSI code page, a profile folder such as
+    // C:\Users\გიორგი became C:\Users\áƒ’..., which can't be created, and the window never opened.
+    options.user_data_dir = (util::local_data_home() / "grab" / "WebView2").wstring();
     options.dev_ui_dir = util::to_wide(util::getenv_utf8("GRAB_UI_DIR").value_or(""));
 #ifndef NDEBUG
     options.dev_tools = true;

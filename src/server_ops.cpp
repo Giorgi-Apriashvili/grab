@@ -54,7 +54,7 @@ std::expected<std::vector<std::string>, std::string> handshake_host_key(const st
         // A fresh record file each time: once a host is known with one key type, accept-new
         // would not record another.
         const auto record = std::filesystem::temp_directory_path() /
-                            std::format("grab-hostkey-{}-{}-{}.txt", host, port, algorithm);
+                            util::path_from_utf8(std::format("grab-hostkey-{}-{}-{}.txt", host, port, algorithm));
         std::filesystem::remove(record, ec);
         auto run = proc::run_capture(servers::handshake_argv(ssh, host, port, record, algorithm), quiet(stop));
         auto text = util::read_file(record);

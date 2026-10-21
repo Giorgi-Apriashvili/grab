@@ -364,7 +364,7 @@ int run(bool check_only) {
 
     std::println("{}{} ({} install)", text::downloading, name, via_installer ? "installer" : "portable");
     const auto sums_file = tmp / std::string(sums_asset_name);
-    const auto payload = tmp / name;
+    const auto payload = tmp / util::path_from_utf8(name); // the release's name, UTF-8 (G140)
     if (auto r = download(sums->url, sums_file, false); !r) {
         error(r.error());
         return exit_update_failed;
