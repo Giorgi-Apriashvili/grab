@@ -34,7 +34,8 @@ using Store = std::map<std::string, std::map<std::string, std::string>>;
 bool save(const std::filesystem::path& file, const Store& store); // encrypted, atomically
 
 // The environment variable rclone reads for `key` of `remote`, as rclone's ConfigToEnv names it:
-// RCLONE_CONFIG_<REMOTE>_<KEY>, upper case, '-' as '_'.
+// RCLONE_CONFIG_<REMOTE>_<KEY>, upper case, '-' as '_' in the key only (my-box's password is
+// RCLONE_CONFIG_MY-BOX_PASS).
 [[nodiscard]] std::string env_name(std::string_view remote, std::string_view key);
 
 // Puts every secret of `store` into this process's environment, so the rclone processes grab

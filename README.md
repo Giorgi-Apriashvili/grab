@@ -449,8 +449,8 @@ the file can reverse.
   accounts, backups and copies of the file can't read them; programs running as you can, as
   grab does, without asking you for anything.
 - When grab runs rclone, it hands them over as environment variables
-  (`RCLONE_CONFIG_<SERVER>_PASS`, which rclone reads like its config), never on disk unencrypted
-  or on a command line.
+  (`RCLONE_CONFIG_<SERVER>_PASS`, which rclone reads like its config; a server called `my-box`
+  keeps its dash: `RCLONE_CONFIG_MY-BOX_PASS`), never on disk unencrypted or on a command line.
 - A grab.conf `rclone_config =` that points at your own rclone.conf is used as it is: its
   passwords stay there.
 - If the store can't be read (another Windows account, a damaged file, or a Windows password an

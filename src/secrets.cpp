@@ -115,10 +115,13 @@ bool save(const fs::path& file, const Store& store) {
 }
 
 std::string env_name(std::string_view remote, std::string_view key) {
+    // As rclone's fs.ConfigToEnv: '-' becomes '_' in the key only; the remote keeps its '-' and
+    // '.', or rclone never finds the password of a server called "my-box" (review G6).
+    const auto upper = [](char c) { return static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c); };
     std::string name = "RCLONE_CONFIG_";
-    for (const char c : std::string(remote) + "_" + std::string(key)) {
-        name += c == '-' ? '_' : static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c);
-    }
+    for (const char c : remote) name += upper(c);
+    name += '_';
+    for (const char c : key) name += c == '-' ? '_' : upper(c);
     return name;
 }
 

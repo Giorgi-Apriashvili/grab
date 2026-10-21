@@ -1,3 +1,4 @@
+#include "process.hpp"
 #include "secrets.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
@@ -9,6 +10,8 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <system_error>
+#include <vector>
 
 using namespace grab;
 using secrets::Store;
@@ -57,17 +60,49 @@ TEST_CASE("the secret store survives its saved form, encrypted") {
 
 TEST_CASE("secrets reach rclone as RCLONE_CONFIG_<REMOTE>_<KEY>") {
     CHECK(secrets::env_name("Box.Guest", "pass") == "RCLONE_CONFIG_BOX.GUEST_PASS");
-    CHECK(secrets::env_name("my-box", "key_file_pass") == "RCLONE_CONFIG_MY_BOX_KEY_FILE_PASS");
+    // rclone keeps the remote's '-' (G6); only the key's become '_'.
+    CHECK(secrets::env_name("my-box", "key_file_pass") == "RCLONE_CONFIG_MY-BOX_KEY_FILE_PASS");
+    CHECK(secrets::env_name("my_box", "pass") == "RCLONE_CONFIG_MY_BOX_PASS");
+    CHECK(secrets::env_name("box", "key-file-pass") == "RCLONE_CONFIG_BOX_KEY_FILE_PASS");
 
-    secrets::export_to_env({{"grabtest-a", {{"pass", "X1"}}}, {"grabtest-b", {{"pass", "X2"}}}});
-    CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_A_PASS") == "X1");
+    secrets::export_to_env({{"grabtest-a", {{"pass", "X1"}}}, {"grabtest_b", {{"pass", "X2"}}}});
+    CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST-A_PASS") == "X1");
+    CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_A_PASS").has_value());
     CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_B_PASS") == "X2");
     secrets::export_to_env({{"grabtest-a", {{"pass", "X3"}}}}); // b removed, a changed
-    CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_A_PASS") == "X3");
+    CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST-A_PASS") == "X3");
     CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_B_PASS").has_value());
     secrets::export_to_env({});
-    CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_A_PASS").has_value());
+    CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG_GRABTEST-A_PASS").has_value());
 }
+
+#ifdef _WIN32
+TEST_CASE("rclone itself finds what grab exports for a remote with '-' in its name (G6)") {
+    // The bundled rclone, one folder above this test program (build\<preset>\rclone.exe).
+    const auto rclone = util::self_exe_path().parent_path().parent_path() / "rclone.exe";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(rclone, ec)) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    // An alias remote whose folder comes only from the environment, as a password does.
+    const auto dir = fresh_dir("grab-test-env-name");
+    std::filesystem::create_directories(dir / "target");
+    write(dir / "target" / "found-it.txt", "x");
+    write(dir / "rclone.conf", "[grab-test-box]\ntype = alias\n");
+    secrets::export_to_env({{"grab-test-box", {{"remote", util::path_to_utf8(dir / "target")}}}});
+    proc::RunOptions quiet;
+    quiet.detached = true;
+    const auto ran = proc::run_capture(std::vector<std::string>{util::path_to_utf8(rclone), "lsf", "grab-test-box:",
+                                                                "--config", util::path_to_utf8(dir / "rclone.conf")},
+                                       quiet);
+    secrets::export_to_env({});
+    std::filesystem::remove_all(dir, ec);
+    REQUIRE(ran.has_value());
+    CHECK_MESSAGE(ran->exit_code == 0, ran->err);
+    CHECK(ran->out.find("found-it.txt") != std::string::npos);
+}
+#endif
 
 TEST_CASE("secret lines leave rclone.conf, everything else stays") {
     const std::string conf = "# grab's servers\r\n"
@@ -107,7 +142,7 @@ TEST_CASE("prepare moves secrets out of rclone.conf once and hands them over") {
     REQUIRE(secrets::prepare(conf).has_value());
     CHECK(*util::read_file(conf) == "[grabtest-box]\ntype = sftp\nhost = h\n");
     CHECK(secrets::load(secrets::path_beside(conf)) == Store{{"grabtest-box", {{"pass", "OBS"}}}});
-    CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST_BOX_PASS") == "OBS");
+    CHECK(util::getenv_utf8("RCLONE_CONFIG_GRABTEST-BOX_PASS") == "OBS"); // rclone's name for it (G6)
 
     // A secret added to the file later (e.g. an import) joins the store; the others stay.
     write(conf, "[grabtest-box]\ntype = sftp\nhost = h\n[grabtest-two]\npass = OBS2\n");
