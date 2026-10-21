@@ -1547,8 +1547,9 @@ void App::save_server(const Value& msg) {
             const auto list = server_ops::list_servers(*env);
             auto it = std::ranges::find(list, s.name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + s.name);
-            if (s.auth == servers::Auth::password && p.secret.empty() && it->auth != servers::Auth::password) {
-                return invalid("secret", "enter the password");
+            if (p.secret.empty() && server_ops::edit_needs_password(*it, s)) {
+                return invalid("secret", it->auth == servers::Auth::password ? "enter the password again for the new host or user"
+                                                                              : "enter the password");
             }
             need_keys = it->error.empty() ? server_ops::edit_needs_host_key(*it, s) : true;
         } else {

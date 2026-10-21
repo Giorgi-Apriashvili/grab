@@ -2749,14 +2749,29 @@ function renderServers() {
       '<button type="button" class="primary" data-act="add">Add a server</button></div>';
 }
 
+// A saved password stays only with the host and user it was typed for (the backend checks too).
+function keepsSecret(auth) {
+  const f = settings.form;
+  if (!f || !f.editing || f.origAuth !== auth) return false;
+  return auth !== 'password' || ($('#f-host').value.trim().toLowerCase() === f.origHost.toLowerCase() &&
+    $('#f-user').value.trim() === f.origUser);
+}
+
+function setSecretPlaceholder() {
+  const auth = settings.auth;
+  const f = settings.form;
+  $('#f-secret').placeholder = keepsSecret(auth)
+    ? (auth === 'key' ? 'Leave blank to keep the saved passphrase' : 'Leave blank to keep the saved password')
+    : auth === 'key' ? 'Only if the key has one'
+    : f && f.editing && f.origAuth === 'password' ? 'Enter it again for the new host or user' : '';
+}
+
 function setAuth(auth) {
   settings.auth = auth;
   for (const b of $('#f-auth').querySelectorAll('button')) b.setAttribute('aria-checked', String(b.dataset.auth === auth));
   for (const el of document.querySelectorAll('[data-auth-only]')) el.hidden = !el.dataset.authOnly.split(' ').includes(auth);
-  const keep = settings.form && settings.form.editing && settings.form.origAuth === auth;
   $('#secret-label').textContent = auth === 'key' ? 'Passphrase' : 'Password';
-  $('#f-secret').placeholder = keep ? (auth === 'key' ? 'Leave blank to keep the saved passphrase' : 'Leave blank to keep the saved password')
-    : (auth === 'key' ? 'Only if the key has one' : '');
+  setSecretPlaceholder();
   $('#secret-hint').textContent = auth === 'key'
     ? 'Searches use ssh, which cannot ask for a passphrase here: load such a key into ssh-agent (ssh-add) and choose ssh-agent instead.'
     : 'Stored obscured in grab\'s rclone.conf, never in plain text on a command line.';
@@ -2773,7 +2788,8 @@ function clearFieldErrors() {
 
 function openForm(name) {
   const s = name ? settings.servers.find((x) => x.name === name) : null;
-  settings.form = { editing: !!s, name: s ? s.name : '', origAuth: s ? s.auth : null };
+  settings.form = { editing: !!s, name: s ? s.name : '', origAuth: s ? s.auth : null,
+    origHost: s ? s.host : '', origUser: s ? s.user : '' };
   $('#form-title').textContent = s ? `Edit ${s.name}` : 'Add a server';
   $('#f-name').value = s ? s.name : '';
   $('#f-name').disabled = !!s;
@@ -3376,6 +3392,8 @@ $('#f-auth').addEventListener('click', (ev) => {
   const b = ev.target.closest('button[data-auth]');
   if (b) setAuth(b.dataset.auth);
 });
+$('#f-host').addEventListener('input', setSecretPlaceholder);
+$('#f-user').addEventListener('input', setSecretPlaceholder);
 $('#f-key-browse').addEventListener('click', () => send({ type: 'pickFile', current: $('#f-key').value.trim() }));
 $('#modal-ok').addEventListener('click', () => closeModal(true));
 $('#modal-cancel').addEventListener('click', () => closeModal(false));

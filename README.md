@@ -249,7 +249,9 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
     - Images fit the window; a click shows full size. jpg, png, gif, webp, avif, bmp, ico, svg.
     - Text (.nfo, .txt, .srt, .log, .md, .json and more) shows its first MiB; .nfo files use
       the DOS code page, so their ASCII art lines up.
-    - PDFs use the browser engine's built-in viewer (up to 128 MiB).
+    - PDFs use the browser engine's built-in viewer (up to 128 MiB). A link inside one opens
+      in your browser only after grab asks, showing the site it really goes to; nothing from a
+      preview can replace grab's window.
     - Nothing is written to disk: previews go from the stream to the window in memory.
   - The streams come from `rclone serve http`, which reads every folder on the way to a file, so
     grab serves a file from the search root it is under (or the login home, or else its own
@@ -389,8 +391,11 @@ server and the rows' sort in `%APPDATA%\grab\gui.json`.
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
   test, trust, make default and remove. Each server's search folders and depth are edited
   there too. Adding a server, or changing its address, shows the host key fingerprints
-  and writes nothing until you trust them. "Open grab.conf" covers the rarer settings
+  and writes nothing until you trust them. A saved password stays with the host and user it
+  was typed for: changing either asks for it again. "Open grab.conf" covers the rarer settings
   (rclone flags, ssh options, find method).
+- **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
+  only that page's messages reach grab, and files dragged in from outside are ignored.
 - **Tray:** closing the window while downloads run keeps them going in the notification
   area, and grab exits by itself when they finish. When the window is idle, closing it
   quits. A notification reports each finished or failed download while the window isn't in
@@ -721,6 +726,7 @@ src/file_type.* file kinds by extension (as the window's icons and filters), --t
 src/browse.*    browse mode: a server's folders from its file list, deeper ones live
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
+src/ui_origin.* what the window may show and whose messages count (exact addresses)
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)

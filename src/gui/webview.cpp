@@ -1,6 +1,7 @@
 #include "webview.hpp"
 
 #include "resources.hpp"
+#include "ui_origin.hpp"
 #include "util.hpp"
 
 #include <shellapi.h>
@@ -15,9 +16,6 @@ using Microsoft::WRL::ComPtr;
 namespace grab::gui {
 
 namespace {
-
-constexpr std::wstring_view ui_origin = L"https://grab.ui";
-constexpr std::wstring_view preview_prefix = L"https://grab.ui/preview/";
 
 std::wstring reason(int status) {
     switch (status) {
@@ -36,24 +34,31 @@ struct CoString {
     [[nodiscard]] std::wstring_view view() const { return p ? std::wstring_view(p) : std::wstring_view(); }
 };
 
-// Path part of a https://grab.ui/... URL, without query or fragment.
-std::wstring_view ui_path(std::wstring_view uri) {
-    if (!uri.starts_with(ui_origin)) return {};
-    uri.remove_prefix(ui_origin.size());
-    const auto cut = uri.find_first_of(L"?#");
-    if (cut != std::wstring_view::npos) uri = uri.substr(0, cut);
-    return uri.empty() ? std::wstring_view(L"/") : uri;
-}
-
-void open_externally(std::wstring_view uri) {
-    // Only web links leave the app; anything else is ignored.
-    if (uri.starts_with(L"https://") || uri.starts_with(L"http://")) {
-        const std::wstring target(uri);
-        ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    }
-}
-
 } // namespace
+
+void WebViewHost::offer_link(std::wstring uri) {
+    if (!ui_origin::is_web_link(uri) || !options_.defer) return;
+    // After the event handler has returned: a dialog's message loop inside it could re-enter WebView2.
+    options_.defer([this, uri = std::move(uri)] {
+        if (asking_) return; // one question at a time; more clicks while it shows are dropped
+        asking_ = true;
+        const std::wstring text = L"A link in the preview goes to:\n\n" + ui_origin::shown(uri) + L"\n\nSite: " +
+                                  ui_origin::shown(ui_origin::link_host(uri), 100) + L"\n\nOpen it in your browser?";
+        int answer = IDNO;
+#ifndef NDEBUG
+        // Tests: the question goes to this file and is answered No, so no dialog shows.
+        if (const auto test = util::getenv_utf8("GRAB_TEST_LINKS"); test && !test->empty()) {
+            const auto before = util::read_file(util::path_from_utf8(*test)).value_or("");
+            (void)util::write_file_atomic(util::path_from_utf8(*test), before + util::to_utf8(text) + "\n----\n");
+        } else
+#endif
+        {
+            answer = MessageBoxW(hwnd_, text.c_str(), L"Open a link?", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        }
+        asking_ = false;
+        if (answer == IDYES) ShellExecuteW(nullptr, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    });
+}
 
 HRESULT WebViewHost::start(HWND hwnd, Options options, OnMessage on_message, OnReady on_ready) {
     hwnd_ = hwnd;
@@ -114,10 +119,17 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
         }
     }
 
+    // Nothing dragged in from outside: a dropped link would navigate the window.
+    ComPtr<ICoreWebView2Controller4> controller4;
+    if (SUCCEEDED(controller_.As(&controller4))) controller4->put_AllowExternalDrop(FALSE);
+
     EventRegistrationToken token{};
+    // Only grab's own page talks to grab (ui_origin.hpp).
     webview_->add_WebMessageReceived(
         Callback<ICoreWebView2WebMessageReceivedEventHandler>(
             [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                CoString source;
+                if (FAILED(args->get_Source(&source.p)) || !ui_origin::is_page(source.view())) return S_OK;
                 CoString json;
                 if (SUCCEEDED(args->get_WebMessageAsJson(&json.p)) && on_message_) {
                     on_message_(util::to_utf8(json.view()));
@@ -127,15 +139,31 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
             .Get(),
         &token);
 
-    // Keep the window on the app: other links open in the default browser.
+    // The window shows grab's page and nothing else; a link to a web page (from a previewed PDF)
+    // opens in the browser once the user agrees.
     webview_->add_NavigationStarting(
         Callback<ICoreWebView2NavigationStartingEventHandler>(
-            [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+            [this](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
                 CoString uri;
                 args->get_Uri(&uri.p);
-                if (!uri.view().starts_with(ui_origin)) {
+                if (!ui_origin::is_page(uri.view())) {
                     args->put_Cancel(TRUE);
-                    open_externally(uri.view());
+                    offer_link(std::wstring(uri.view()));
+                }
+                return S_OK;
+            })
+            .Get(),
+        &token);
+    // The viewer's frame shows previews; the PDF viewer's own frames (not http) are its business.
+    webview_->add_FrameNavigationStarting(
+        Callback<ICoreWebView2NavigationStartingEventHandler>(
+            [this](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                CoString uri;
+                args->get_Uri(&uri.p);
+                const bool web = ui_origin::is_web_link(uri.view()) || ui_origin::path_of(uri.view());
+                if (web && !ui_origin::is_preview(uri.view())) {
+                    args->put_Cancel(TRUE);
+                    offer_link(std::wstring(uri.view()));
                 }
                 return S_OK;
             })
@@ -143,11 +171,11 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
         &token);
     webview_->add_NewWindowRequested(
         Callback<ICoreWebView2NewWindowRequestedEventHandler>(
-            [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+            [this](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
                 CoString uri;
                 args->get_Uri(&uri.p);
-                args->put_Handled(TRUE);
-                open_externally(uri.view());
+                args->put_Handled(TRUE); // never a second window
+                offer_link(std::wstring(uri.view()));
                 return S_OK;
             })
             .Get(),
@@ -174,7 +202,7 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
                     CoString uri;
                     request->get_Uri(&uri.p);
                     // A preview: answered later, from a worker thread, through the deferral.
-                    if (uri.view().starts_with(preview_prefix) && options_.on_preview && options_.defer) {
+                    if (ui_origin::is_preview(uri.view()) && options_.on_preview && options_.defer) {
                         ComPtr<ICoreWebView2Deferral> deferral;
                         if (FAILED(args->GetDeferral(&deferral))) return S_OK;
                         ComPtr<ICoreWebView2WebResourceRequestedEventArgs> held(args);
@@ -199,7 +227,7 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
                     }
                     if (dev_ui) return S_OK; // the folder mapping serves the rest
                     ComPtr<ICoreWebView2WebResourceResponse> response;
-                    if (auto file = find_embedded(ui_path(uri.view()))) {
+                    if (auto file = find_embedded(ui_origin::path_of(uri.view()).value_or(L""))) {
                         ComPtr<IStream> stream;
                         stream.Attach(SHCreateMemStream(reinterpret_cast<const BYTE*>(file->data.data()),
                                                         static_cast<UINT>(file->data.size())));
@@ -236,7 +264,10 @@ void WebViewHost::resize(const RECT& bounds) {
 }
 
 void WebViewHost::post_json(const std::string& json) {
-    if (webview_) webview_->PostWebMessageAsJson(util::to_wide(json).c_str());
+    if (!webview_) return;
+    CoString source; // what grab says goes to its own page only
+    if (FAILED(webview_->get_Source(&source.p)) || !ui_origin::is_page(source.view())) return;
+    webview_->PostWebMessageAsJson(util::to_wide(json).c_str());
 }
 
 void WebViewHost::focus() {

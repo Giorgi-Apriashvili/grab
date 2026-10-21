@@ -155,6 +155,41 @@ TEST_CASE("an edit needs the host key again when the address changes or none is 
     CHECK(server_ops::edit_needs_host_key(cur, server(Auth::password)));
 }
 
+TEST_CASE("a saved password stays with the host and user it was typed for (G40)") {
+    server_ops::ServerInfo cur;
+    cur.host = "box.example.com";
+    cur.user = "u1";
+    cur.port = 23;
+    cur.auth = Auth::password;
+    auto wanted = server(Auth::password);
+    CHECK_FALSE(server_ops::edit_needs_password(cur, wanted));
+    wanted.port = 22; // the same machine on another port
+    CHECK_FALSE(server_ops::edit_needs_password(cur, wanted));
+    wanted.host = "BOX.example.com"; // host names ignore case
+    CHECK_FALSE(server_ops::edit_needs_password(cur, wanted));
+    wanted.host = "evil.example";
+    CHECK(server_ops::edit_needs_password(cur, wanted));
+    wanted = server(Auth::password);
+    wanted.user = "u2";
+    CHECK(server_ops::edit_needs_password(cur, wanted));
+    cur.auth = Auth::agent; // switching to a password always needs one
+    CHECK(server_ops::edit_needs_password(cur, server(Auth::password)));
+    CHECK_FALSE(server_ops::edit_needs_password(cur, server(Auth::agent)));
+
+    // The backend refuses it too, whatever the window says.
+    Scratch s;
+    s.write("rclone.conf", rclone_conf);
+    s.write("grab.conf", grab_conf(s.dir));
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    auto moved = server(Auth::password);
+    moved.host = "evil.example";
+    const auto refused = server_ops::update_server(*env, moved, std::nullopt, std::nullopt);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("enter the password again") != std::string::npos);
+    CHECK(s.read("rclone.conf") == rclone_conf);
+}
+
 TEST_CASE("rclone errors lose their log prefix") {
     CHECK(server_ops::clean_rclone_error("2026/09/24 00:38:10 CRITICAL: Failed to create file system for \"hz3:\": "
                                          "ssh: this private key is passphrase protected\nmore\n") ==

@@ -44,6 +44,7 @@ add_executable(grab_tests
     test_preview.cpp
     test_activity.cpp
     test_local_name.cpp
+    test_ui_origin.cpp
     test_update.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)

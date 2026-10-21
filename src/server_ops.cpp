@@ -320,6 +320,12 @@ bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wa
     return !current.host_key_pinned || current.host != wanted.host || current.port != wanted.port;
 }
 
+bool edit_needs_password(const ServerInfo& current, const servers::NewServer& wanted) {
+    if (wanted.auth != servers::Auth::password) return false;
+    return current.auth != servers::Auth::password || util::to_lower(current.host) != util::to_lower(wanted.host) ||
+           current.user != wanted.user;
+}
+
 std::expected<void, std::string> update_server(const Env& env, const servers::NewServer& wanted,
                                                const std::optional<std::string>& obscured_secret,
                                                const std::optional<HostKeys>& keys) {
@@ -334,6 +340,14 @@ std::expected<void, std::string> update_server(const Env& env, const servers::Ne
         return util::failf("{} has no remote called {}", util::path_to_utf8(env.rclone_conf), settings->rclone_remote);
     }
 
+    if (wanted.auth == servers::Auth::password && !obscured_secret) {
+        // As edit_needs_password: the saved password stays with the server it was typed for.
+        const auto cur = [&](std::string_view key) { return std::string(util::trim(section->get(key).value_or(""))); };
+        const bool was_password = !truthy(cur("key_use_agent")) && cur("key_file").empty();
+        if (!was_password || util::to_lower(cur("host")) != util::to_lower(wanted.host) || cur("user") != wanted.user) {
+            return util::fail("enter the password again: it is only kept for the same host and user");
+        }
+    }
     const bool own = !env.cfg.rclone_config; // own: the secret goes to the store, not rclone.conf
     auto updates = rclone_edit_updates(*section, wanted, own ? std::nullopt : obscured_secret);
     if (keys) {

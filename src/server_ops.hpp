@@ -114,6 +114,10 @@ rclone_edit_updates(const ini::Section& current, const servers::NewServer& wante
 // Whether an edit from `current` to `wanted` must fetch and confirm the host key again: the
 // address changed, or no key is pinned yet.
 [[nodiscard]] bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wanted);
+// Whether an edit to password login must be given the password: the server didn't use one, or
+// its host or user changed, so the saved password never goes to another server or account
+// without being typed (G40: a page that took over the window could otherwise send it anywhere).
+[[nodiscard]] bool edit_needs_password(const ServerInfo& current, const servers::NewServer& wanted);
 
 // Applies an edit of server `wanted.name` (the name itself cannot change): rclone keys via
 // `rclone config update`, search_roots/max_depth and the lead-in comment in grab.conf.

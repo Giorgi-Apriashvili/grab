@@ -52,8 +52,12 @@ private:
     HRESULT on_environment(HRESULT result, ICoreWebView2Environment* env);
     HRESULT on_controller(HRESULT result, ICoreWebView2Controller* controller);
     void fail(HRESULT hr);
+    // A web link from a preview: grab asks (showing where it really goes), then opens it in the
+    // default browser. Anything else is dropped.
+    void offer_link(std::wstring uri);
 
     HWND hwnd_ = nullptr;
+    bool asking_ = false;
     Options options_;
     OnMessage on_message_;
     OnReady on_ready_;
