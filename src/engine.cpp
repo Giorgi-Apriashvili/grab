@@ -11,6 +11,7 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -149,17 +150,20 @@ lookup_via_ssh(const Context& ctx, const SearchRequest& req, const std::vector<s
     return parse_find_output(*out, req.mode == Mode::file);
 }
 
-std::expected<std::vector<RemoteEntry>, std::string>
-lookup_via_rclone(const Context& ctx, const SearchRequest& req, const std::vector<std::string>& roots,
-                  int max_depth, const proc::RunOptions& run, const CommandHook& on_command) {
+// The entries of each kind in `kinds`, from one walk per root whatever their number.
+std::expected<std::vector<std::vector<RemoteEntry>>, std::string>
+lookup_via_rclone(const Context& ctx, const SearchRequest& req, std::span<const Mode> kinds,
+                  const std::vector<std::string>& roots, int max_depth, const proc::RunOptions& run,
+                  const CommandHook& on_command) {
     // A path target is checked with a single listing of its parent, whatever the roots.
     const std::vector<std::string> bases =
         is_path_target(req.target) ? std::vector<std::string>{""} : roots;
 
-    std::vector<RemoteEntry> found;
+    std::vector<std::vector<RemoteEntry>> found(kinds.size());
     for (const auto& root : bases) {
         ListRequest list;
-        list.mode = req.mode;
+        list.mode = kinds.front();
+        list.all_entries = kinds.size() > 1;
         list.target = req.target;
         list.exact = req.exact;
         list.root = root;
@@ -169,12 +173,16 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, const std::vecto
         list.rclone_config = ctx.config.rclone_config;
         list.rclone_remote = ctx.settings.rclone_remote;
         list.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches searches too (G189)
+        list.flags.insert(list.flags.end(), req.walk_flags.begin(), req.walk_flags.end());
 
         auto out = run_listing(build_lsf_argv(list), run, on_command);
         if (!out) return util::fail(out.error());
-        auto entries = parse_lsf_output(list, *out);
-        found.insert(found.end(), std::make_move_iterator(entries.begin()),
-                     std::make_move_iterator(entries.end()));
+        for (std::size_t k = 0; k < kinds.size(); ++k) {
+            list.mode = kinds[k];
+            auto entries = parse_lsf_output(list, *out);
+            found[k].insert(found[k].end(), std::make_move_iterator(entries.begin()),
+                            std::make_move_iterator(entries.end()));
+        }
     }
     return found;
 }
@@ -238,11 +246,35 @@ std::expected<SearchResult, std::string> search(const Context& ctx, const Search
                                                 const CommandHook& on_command) {
     const auto roots = search_roots(ctx);
     const int max_depth = req.depth.value_or(ctx.settings.max_depth);
-    auto entries = ctx.method == FindMethod::ssh
-                       ? lookup_via_ssh(ctx, req, roots, max_depth, run, on_command)
-                       : lookup_via_rclone(ctx, req, roots, max_depth, run, on_command);
+    if (ctx.method == FindMethod::ssh) {
+        auto entries = lookup_via_ssh(ctx, req, roots, max_depth, run, on_command);
+        if (!entries) return util::fail(entries.error());
+        return make_result(ctx, req, std::move(*entries));
+    }
+    const Mode kind = req.mode;
+    auto entries = lookup_via_rclone(ctx, req, std::span(&kind, 1), roots, max_depth, run, on_command);
     if (!entries) return util::fail(entries.error());
-    return make_result(ctx, req, std::move(*entries));
+    return make_result(ctx, req, std::move(entries->front()));
+}
+
+std::expected<std::pair<SearchResult, SearchResult>, std::string>
+search_both(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run, const CommandHook& on_command) {
+    auto folders = req;
+    folders.mode = Mode::folder;
+    auto files = req;
+    files.mode = Mode::file;
+    if (ctx.method == FindMethod::ssh) {
+        auto f = search(ctx, folders, run, on_command);
+        if (!f) return util::fail(f.error());
+        auto g = search(ctx, files, run, on_command);
+        if (!g) return util::fail(g.error());
+        return std::pair{std::move(*f), std::move(*g)};
+    }
+    constexpr std::array kinds{Mode::folder, Mode::file};
+    auto entries = lookup_via_rclone(ctx, req, kinds, search_roots(ctx), req.depth.value_or(ctx.settings.max_depth),
+                                     run, on_command);
+    if (!entries) return util::fail(entries.error());
+    return std::pair{make_result(ctx, folders, std::move((*entries)[0])), make_result(ctx, files, std::move((*entries)[1]))};
 }
 
 SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vector<RemoteEntry> entries) {

@@ -514,3 +514,19 @@ TEST_CASE("a size check refused by a full server is asked again, not failed (G19
     std::filesystem::remove_all(dir);
 }
 #endif
+TEST_CASE("a listing takes its connections from the pool: up to 8 alone, what's free next to a download (G191)") {
+    fetch::Connections c;
+    c.configure("box", 14);
+    {
+        const fetch::Listing alone(c, "box", {});
+        CHECK(alone.connections() == 8);
+        CHECK(alone.flags() == std::vector<std::string>{"--checkers", "8", "--sftp-connections", "8"});
+    }
+    // A download holds 12 of 14 and doesn't give any back here: the listing takes the 2 left
+    // (after waiting a moment for more), never going past the budget.
+    c.join("box", 1);
+    for (int i = 0; i < 12; ++i) REQUIRE(c.acquire("box", 1, {}));
+    const fetch::Listing busy(c, "box", {});
+    CHECK(busy.connections() == 2);
+    CHECK(c.active("box", 1) == 12);
+}

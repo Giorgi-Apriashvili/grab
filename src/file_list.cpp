@@ -169,7 +169,8 @@ std::vector<Entry> parse_lsf(std::string_view out, std::string_view root) {
 }
 
 std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh,
-                                       const proc::RunOptions& run, const engine::CommandHook& on_command) {
+                                       const proc::RunOptions& run, const engine::CommandHook& on_command,
+                                       const std::vector<std::string>& walk_flags) {
     List list;
     list.fetched = now;
     list.fingerprint = fingerprint(ctx);
@@ -191,6 +192,7 @@ std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t 
         req.rclone_remote = ctx.settings.rclone_remote;
         req.all_entries = true;
         req.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches the list too (G189)
+        req.flags.insert(req.flags.end(), walk_flags.begin(), walk_flags.end());
         auto out = engine::run_listing(build_lsf_argv(req), run, on_command);
         if (!out) return util::fail(out.error());
         auto entries = parse_lsf(*out, root);

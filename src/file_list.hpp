@@ -75,9 +75,11 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 
 // Fetches the server's list now (ssh + find, or rclone lsf per root). `batch_ssh`: never let
 // ssh prompt (the window).
+// `walk_flags`: an rclone walk's connections from the pool (fetch::Listing::flags).
 [[nodiscard]] std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh = false,
                                                      const proc::RunOptions& run = {},
-                                                     const engine::CommandHook& on_command = {});
+                                                     const engine::CommandHook& on_command = {},
+                                                     const std::vector<std::string>& walk_flags = {});
 
 // %LOCALAPPDATA%\grab\lists (Windows), else $XDG_CACHE_HOME or ~/.cache, /grab/lists.
 [[nodiscard]] std::filesystem::path default_dir();

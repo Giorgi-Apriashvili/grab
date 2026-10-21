@@ -568,10 +568,10 @@ void App::on_message(const std::string& text) {
         const std::string remote = msg->string_of("remote").value_or("");
         if (remote == "*") {
             if (auto cfg = load_grab_config(config_path_)) {
-                for (const auto& r : cfg->remotes) start_refresh(r.name);
+                for (const auto& r : cfg->remotes) start_refresh(r.name, true);
             }
         } else if (!remote.empty()) {
-            start_refresh(remote);
+            start_refresh(remote, true);
         }
     } else if (type == "cancelSearch") {
         if (search_thread_.joinable()) search_thread_.request_stop();
@@ -884,12 +884,29 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
                     act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(records.count()))
                                       : std::format("{}… {} looked at", doing, count_of(records.count(), "entry", "entries")));
                 };
-                for (const Mode kind : kinds) {
-                    auto r = req;
-                    r.mode = kind;
-                    auto live = engine::search(*ctx, r, counted, [&](const std::vector<std::string>& argv) {
-                        act.detail(quote::display_cmdline(argv));
-                    });
+                // Over rclone the walk's connections come from the pool (review G191), and one walk
+                // lists both kinds (G197).
+                auto r = req;
+                std::optional<fetch::Listing> walk;
+                if (!over_ssh) {
+                    walk.emplace(connections_, server, stop);
+                    r.walk_flags = walk->flags();
+                }
+                const auto hook = [&](const std::vector<std::string>& argv) { act.detail(quote::display_cmdline(argv)); };
+                std::vector<std::pair<Mode, std::expected<engine::SearchResult, std::string>>> results;
+                if (kinds.size() == 2) {
+                    if (auto walked = engine::search_both(*ctx, r, counted, hook)) {
+                        results.emplace_back(Mode::folder, std::move(walked->first));
+                        results.emplace_back(Mode::file, std::move(walked->second));
+                    } else {
+                        results.emplace_back(Mode::folder, std::unexpected(walked.error()));
+                    }
+                } else {
+                    r.mode = kinds.front();
+                    results.emplace_back(kinds.front(), engine::search(*ctx, r, counted, hook));
+                }
+                walk.reset();
+                for (auto& [kind, live] : results) {
                     if (!live) act.failed();
                     if (stop.stop_requested()) return fail("search cancelled", true);
                     if (!live) {
@@ -955,10 +972,13 @@ App::ListSlot& App::list_slot(const std::string& server) {
     return s;
 }
 
-void App::start_refresh(const std::string& server) {
+void App::start_refresh(const std::string& server, bool asked) {
     std::lock_guard lock(lists_mutex_);
     auto& s = list_slot(server);
     if (s.refreshing) return;
+    // After a failed one, not again by itself for a while (1, 2, 4... up to 15 minutes): each is
+    // a whole walk of the server; Refresh still asks at once (review G196).
+    if (!asked && std::chrono::steady_clock::now() < s.retry_after) return;
     s.refreshing = true;
     // The previous refresh of this server, if any, has finished: replacing it joins it at once.
     const std::size_t before = s.list ? s.list->entries.size() : 0; // the last list's entries
@@ -981,10 +1001,18 @@ void App::start_refresh(const std::string& server) {
             }
         };
         auto ctx = engine::load_context(config_path_, server);
+        // Over rclone the walk's connections come from the pool (review G191).
+        std::optional<fetch::Listing> walk;
+        std::vector<std::string> walk_flags;
+        if (ctx && ctx->method != FindMethod::ssh) {
+            walk.emplace(connections_, server, stop);
+            walk_flags = walk->flags();
+        }
         auto fetched = ctx ? file_list::fetch(*ctx, unix_now(), true, run, [&](const std::vector<std::string>& argv) {
             act.detail(quote::display_cmdline(argv));
-        })
+        }, walk_flags)
                            : std::expected<file_list::List, std::string>(std::unexpected(ctx.error()));
+        walk.reset();
         if (!fetched) act.failed();
         if (fetched) (void)file_list::save(file_list::path_for(lists_dir_, server), *fetched);
         {
@@ -996,8 +1024,12 @@ void App::start_refresh(const std::string& server) {
                 slot.list = std::make_shared<const file_list::List>(std::move(*fetched));
                 slot.index.reset(); // built again from the new list on the next browse
                 slot.error.clear();
+                slot.failures = 0;
             } else {
                 slot.error = fetched.error();
+                slot.retry_after = std::chrono::steady_clock::now() +
+                                   std::min(std::chrono::minutes(1 << std::min(slot.failures, 4)), std::chrono::minutes(15));
+                ++slot.failures;
             }
         }
         host_.defer([this, server] { on_list_refreshed(server); });
@@ -1080,18 +1112,23 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
         act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(records.count()))
                           : std::format("{}… {} looked at", doing, count_of(records.count(), "entry", "entries")));
     };
-    for (const Mode m : {Mode::folder, Mode::file}) {
-        auto r = req;
-        r.mode = m;
-        auto found = engine::search(below, r, counted, [&](const std::vector<std::string>& argv) {
-            act.detail(quote::display_cmdline(argv));
-        });
-        if (!found) {
-            act.failed();
-            return util::fail(found.error());
-        }
-        add(std::move(*found), m == Mode::folder);
+    // Over rclone the walk's connections come from the pool (review G191), and one walk lists both
+    // kinds (G197).
+    auto r = req;
+    std::optional<fetch::Listing> walk;
+    if (!over_ssh) {
+        walk.emplace(connections_, server, run.stop);
+        r.walk_flags = walk->flags();
     }
+    auto found = engine::search_both(below, r, counted, [&](const std::vector<std::string>& argv) {
+        act.detail(quote::display_cmdline(argv));
+    });
+    if (!found) {
+        act.failed();
+        return util::fail(found.error());
+    }
+    add(std::move(found->first), true);
+    add(std::move(found->second), false);
     status.set("live", Value::make_bool(true));
     return hits;
 }

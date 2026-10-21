@@ -220,3 +220,36 @@ TEST_CASE("format_size") {
     CHECK(util::format_size(1536) == "1.5 KiB");
     CHECK(util::format_size(13367823676ULL) == "12.4 GiB");
 }
+
+#ifdef _WIN32
+TEST_CASE("a search for folders and files walks the server once over rclone (G197)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-search-both";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // A stand-in rclone: logs each call and its arguments, prints a folder and a file below it.
+    std::ofstream(dir / "rclone.cmd", std::ios::binary)
+        << "@echo off\r\n"
+           ">> \"%~dp0calls.log\" echo %*\r\n" // (redirect first: "...connections 3>>" would be handle 3)
+           "echo 1697000000;-1;tv/Lioness/\r\n"
+           "echo 1697354554;300;tv/Lioness/Lioness.S03E08.mkv\r\n";
+    engine::Context ctx;
+    ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+    ctx.method = FindMethod::rclone;
+    ctx.settings.rclone_remote = "Box";
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.walk_flags = {"--checkers", "3", "--sftp-connections", "3"};
+    const auto both = engine::search_both(ctx, req);
+    REQUIRE(both.has_value());
+    REQUIRE(both->first.hits.size() == 1);
+    CHECK(both->first.hits[0].path == "tv/Lioness");
+    REQUIRE(both->second.hits.size() == 1);
+    CHECK(both->second.hits[0].path == "tv/Lioness/Lioness.S03E08.mkv");
+    const auto calls = util::split(util::read_file(dir / "calls.log").value_or(""), '\n');
+    REQUIRE(calls.size() == 1); // one walk for both kinds
+    CHECK(calls[0].find("--dirs-only") == std::string::npos);
+    CHECK(calls[0].find("--files-only") == std::string::npos);
+    CHECK(calls[0].find("--checkers 3 --sftp-connections 3") != std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+#endif

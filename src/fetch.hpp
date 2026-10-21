@@ -156,9 +156,11 @@ public:
     void leave(const std::string& server, int id);
     // Waits until `id` may open one more connection; false when `stop` was requested first.
     bool acquire(const std::string& server, int id, std::stop_token stop);
-    // Takes up to `id`'s whole share at once (for an rclone copy that manages its own
-    // connections); at least 1 unless stopped (0).
-    int reserve(const std::string& server, int id, std::stop_token stop);
+    // Takes up to `id`'s whole share at once (for an rclone copy or listing that manages its own
+    // connections), at most `at_most`; at least 1 unless stopped (0). With `settle`, it waits that
+    // long for downloads above their shares to hand connections back first.
+    int reserve(const std::string& server, int id, std::stop_token stop, int at_most = 1 << 20,
+                std::chrono::milliseconds settle = std::chrono::milliseconds(0));
     // `worked`: the connection got data (see working), and stops counting as working too.
     void release(const std::string& server, int id, int count = 1, bool worked = false);
     // `count` connections of `id` got their first data: the server takes grab's connections.
@@ -178,14 +180,38 @@ public:
     [[nodiscard]] std::uint64_t refusals(const std::string& server);
     [[nodiscard]] int active(const std::string& server, int id);
     [[nodiscard]] int budget(const std::string& server);
+    // A pool id of its own for a short user (a listing): negative, so never a download's.
+    [[nodiscard]] int new_id();
 
 private:
+    std::atomic<int> next_id_{0};
     budget::ServerPool& pool(const std::string& server); // caller holds mutex_
     std::mutex mutex_;
     std::condition_variable_any changed_;
     std::map<std::string, budget::ServerPool> pools_;
     std::map<std::string, std::uint64_t> refusals_;
     OnLearned on_learned_;
+};
+
+// Connections from a server's pool for one rclone walk of a tree (lsf -R, lsjson -R), which
+// opens as many as its --checkers (rclone's default 8; each a new SSH login): up to `at_most`,
+// its share at High priority while downloads run, given back when destroyed (review G191). Pass
+// connections() to rclone as --checkers N --sftp-connections N.
+class Listing {
+public:
+    Listing(Connections& connections, std::string server, std::stop_token stop, int at_most = 8);
+    ~Listing();
+    Listing(const Listing&) = delete;
+    Listing& operator=(const Listing&) = delete;
+    [[nodiscard]] int connections() const { return held_; } // 0: stopped while waiting
+    // The rclone flags for them.
+    [[nodiscard]] std::vector<std::string> flags() const;
+
+private:
+    Connections& connections_;
+    std::string server_;
+    int id_;
+    int held_ = 0;
 };
 
 struct Progress {

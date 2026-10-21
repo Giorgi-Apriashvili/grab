@@ -258,6 +258,8 @@ private:
         std::shared_ptr<const browse::Index> index; // the list's folders, built on the first browse
         bool refreshing = false;
         std::string error; // why the last refresh failed
+        int failures = 0;  // refreshes failed in a row
+        std::chrono::steady_clock::time_point retry_after{}; // no automatic refresh before
     };
     ListSlot& list_slot(const std::string& server); // caller holds lists_mutex_
     // The server's list, if it fits `ctx`, with its browse index; any thread.
@@ -266,7 +268,9 @@ private:
         std::shared_ptr<const browse::Index> index;
     };
     [[nodiscard]] ListView list_view(const std::string& server, const engine::Context& ctx);
-    void start_refresh(const std::string& server);   // fetches a new list in the background; any thread
+    // Fetches a new list in the background; any thread. `asked`: the user's Refresh, which goes
+    // ahead even while a failed one waits to be tried again.
+    void start_refresh(const std::string& server, bool asked = false);
     void on_list_refreshed(const std::string& server); // UI thread: shows the last search again
     void prune_lists();                                // drops lists of servers no longer configured
     // Download (or Download to…): {dest, groups: [{remote, mode, items}], force, remember}. Unless

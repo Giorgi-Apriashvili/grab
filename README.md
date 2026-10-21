@@ -406,8 +406,9 @@ too and goes on without them.
     connection gives 2.5 MB/s, 8 give about 14 MB/s, and 14 about 19 MB/s. `rclone copyto`
     reached about 5 MB/s.
   - Hetzner documents 10 connections per Storage Box account, but boxes accepted 16 on one
-    account, and 28 across a main account and its sub-account at once. 14 leaves two for
-    searches while downloads run.
+    account, and 28 across a main account and its sub-account at once. Searches, file lists
+    and folder listings that walk the server over rclone take their connections from the same
+    budget (see [File lists](#file-lists)).
 
 - **Updates:** once a day, when the window opens, grab asks GitHub for the latest release (one
   request; a failure stays silent). A newer one shows a banner: `grab 0.7.0 is available ·
@@ -705,6 +706,12 @@ on your PC in milliseconds, with the same matching and ranking as a live search.
   out as searches leave them out. It is fetched in one go (ssh + find, or `rclone lsf -R`).
 - It is fresh for 15 minutes. The `grab` command then fetches a new one before searching;
   the window answers from the old one at once and refreshes it in the background.
+- When fetching a list fails, the window doesn't try again by itself for a minute, then 2, 4,
+  8 and at most 15 minutes after each further failure; the Refresh button tries at once.
+- Walking a server over rclone opens up to 8 connections at once. In the window they come out
+  of the server's connection budget, as downloads' do: all 8 when nothing else runs, a share
+  while downloads run (they hand theirs back within moments). A search for files and folders
+  walks once.
 - Changing a server's address, login, search roots or depth makes its list stale; removing a
   server deletes its list.
 - A path target, a search for a dot-name, and `--depth` other than the configured one search

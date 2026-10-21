@@ -17,7 +17,8 @@ namespace grab::budget {
 
 // 14 for Storage Boxes, 12 elsewhere. Hetzner documents 10 connections per Storage Box account,
 // but boxes accepted 16 on one account and 28 across a main account and its sub-account at
-// once (2026-09 and 2026-10); 14 leaves two for searches. A refusal still lowers the budget.
+// once (2026-09 and 2026-10). Walks of the server (searches, lists) take theirs from the same
+// budget (fetch::Listing). A refusal still lowers it.
 [[nodiscard]] int default_budget(std::string_view host);
 
 // [server] max_connections when set, else the default lowered to what grab learned.

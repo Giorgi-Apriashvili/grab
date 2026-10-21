@@ -316,16 +316,29 @@ bool Connections::acquire(const std::string& server, int id, std::stop_token sto
     }
 }
 
-int Connections::reserve(const std::string& server, int id, std::stop_token stop) {
+int Connections::reserve(const std::string& server, int id, std::stop_token stop, int at_most,
+                         std::chrono::milliseconds settle) {
     if (!acquire(server, id, stop)) return 0;
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     auto& p = pool(server);
     int got = 1;
-    const auto now = budget::ServerPool::Clock::now();
-    while (p.active(id) < p.share(id) && p.total_active() < p.budget()) {
-        p.started(id, now); // rclone staggers its own connections
-        ++got;
+    const auto deadline = budget::ServerPool::Clock::now() + settle;
+    bool counted = false; // waiting, so downloads above their shares hand connections back
+    for (;;) {
+        const int wanted = std::min(p.share(id), at_most);
+        const auto now = budget::ServerPool::Clock::now();
+        while (got < wanted && p.total_active() < p.budget()) {
+            p.started(id, now); // rclone staggers its own connections
+            ++got;
+        }
+        if (got >= wanted || now >= deadline || stop.stop_requested()) break;
+        if (!counted) {
+            p.waiting(id, +1);
+            counted = true;
+        }
+        changed_.wait_until(lock, stop, deadline, [] { return false; });
     }
+    if (counted) p.waiting(id, -1);
     return got;
 }
 
@@ -386,6 +399,24 @@ int Connections::active(const std::string& server, int id) {
 int Connections::budget(const std::string& server) {
     std::lock_guard lock(mutex_);
     return pool(server).budget();
+}
+
+int Connections::new_id() { return --next_id_; }
+
+Listing::Listing(Connections& connections, std::string server, std::stop_token stop, int at_most)
+    : connections_(connections), server_(std::move(server)), id_(connections.new_id()) {
+    connections_.join(server_, id_, 4);
+    held_ = connections_.reserve(server_, id_, stop, at_most, std::chrono::seconds(2));
+}
+
+Listing::~Listing() {
+    if (held_ > 0) connections_.release(server_, id_, held_);
+    connections_.leave(server_, id_);
+}
+
+std::vector<std::string> Listing::flags() const {
+    const std::string n = std::to_string(std::max(held_, 1));
+    return {"--checkers", n, "--sftp-connections", n};
 }
 
 // ---- the partial file ------------------------------------------------------------------------

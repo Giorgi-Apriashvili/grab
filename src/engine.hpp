@@ -56,6 +56,8 @@ struct SearchRequest {
     bool exact = false;
     std::optional<int> depth; // overrides the remote's max_depth
     bool batch_ssh = false;   // never let ssh prompt (GUI): -o BatchMode=yes
+    // For a walk with rclone: its connections from the pool (fetch::Listing::flags).
+    std::vector<std::string> walk_flags;
 };
 
 struct Hit {
@@ -98,6 +100,12 @@ run_listing(std::span<const std::string> argv, const proc::RunOptions& run = {},
 [[nodiscard]] std::expected<SearchResult, std::string>
 search(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run = {},
        const CommandHook& on_command = {});
+// Folders and files at once (the window's searches), `req.mode` aside: over rclone one walk lists
+// both kinds, where a search per kind walked the server twice (review G197); over ssh, a find
+// per kind.
+[[nodiscard]] std::expected<std::pair<SearchResult, SearchResult>, std::string>
+search_both(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run = {},
+            const CommandHook& on_command = {});
 
 // rclone argv for downloading `remote_path` into `dest_dir` (DEST\<name>), with the remote's
 // flags as configured (including -P for the console). Fails as build_rclone_argv does.
