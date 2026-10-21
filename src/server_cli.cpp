@@ -116,14 +116,16 @@ std::optional<std::string> ask_until(std::string_view prompt, std::string_view d
 // Answers come from the console, or from piped stdin one per line (scriptable); running out
 // of input aborts without writing anything.
 int server_add(const Env& env, const std::string& prefill) {
-    auto rclone_doc = ini::parse(util::read_file(env.rclone_conf).value_or(""));
+    // Checked before the questions: an rclone.conf that can't be read could hide a remote of the
+    // name about to be chosen.
+    auto rclone_doc = server_ops::read_rclone_conf(env);
+    if (!rclone_doc) {
+        error(rclone_doc.error());
+        return exit_config;
+    }
     auto taken = [&](const std::string& name) -> std::optional<std::string> {
         if (auto why = servers::validate_name(name)) return why;
-        if (server_ops::find_server(env.cfg, name) != nullptr) return "grab.conf already has a server called " + name;
-        if (rclone_doc && rclone_doc->find(name) != nullptr) {
-            return "grab's rclone.conf already has a remote called " + name;
-        }
-        return std::nullopt;
+        return server_ops::name_taken(env, *rclone_doc, name);
     };
     auto required = [](const std::string& v) -> std::optional<std::string> {
         return v.empty() ? std::optional<std::string>("required") : std::nullopt;

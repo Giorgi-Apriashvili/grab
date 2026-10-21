@@ -90,6 +90,26 @@ extern const std::string_view example_config;
 // The rclone.conf grab passes to rclone: [grab] rclone_config if set, else grab's own file.
 [[nodiscard]] std::filesystem::path effective_rclone_config(const GrabConfig& cfg);
 
+// Held while grab changes grab.conf, an rclone.conf, the password store or known_hosts, so that
+// grab.exe and grab-gui (and the window's threads) change them one at a time, each change
+// starting from the files as they are then (review G175). A lock on <config>/grab/settings.lock;
+// re-entrant within a thread. Released when the last one in the thread is destroyed.
+class SettingsLock {
+public:
+    SettingsLock(SettingsLock&& other) noexcept;
+    SettingsLock& operator=(SettingsLock&&) = delete;
+    SettingsLock(const SettingsLock&) = delete;
+    SettingsLock& operator=(const SettingsLock&) = delete;
+    ~SettingsLock();
+
+private:
+    SettingsLock() = default;
+    friend std::expected<SettingsLock, std::string> lock_settings();
+    bool held_ = false;
+};
+// Waits for the lock up to 30 seconds (another grab's change).
+[[nodiscard]] std::expected<SettingsLock, std::string> lock_settings();
+
 // The rclone executable to run. [grab] rclone blank or the bare name "rclone": the bundled
 // rclone.exe in `exe_dir` (the folder of the running grab) when present, else "rclone" from
 // PATH. Anything else is used as given.

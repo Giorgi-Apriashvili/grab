@@ -37,6 +37,8 @@ std::expected<Document, std::string> parse(std::string_view text) {
     Section* current = nullptr;
     int lineno = 0;
     std::size_t pos = 0;
+    // A UTF-8 byte order mark, as some editors save one; rclone skips it too.
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
 
     while (pos <= text.size()) {
         const auto nl = text.find('\n', pos);

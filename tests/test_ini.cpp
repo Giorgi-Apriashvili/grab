@@ -85,3 +85,11 @@ TEST_CASE("ini handles an empty document and a missing trailing newline") {
     REQUIRE(no_nl.has_value());
     CHECK(no_nl->find("s")->get("k") == "v");
 }
+
+TEST_CASE("a UTF-8 byte order mark at the start is skipped, as rclone does") {
+    auto doc = ini::parse("\xEF\xBB\xBF[nas]\ntype = sftp\nhost = old.example.invalid\n");
+    REQUIRE(doc.has_value());
+    REQUIRE(doc->find("nas") != nullptr);
+    CHECK(doc->find("nas")->get("host") == "old.example.invalid");
+    CHECK_FALSE(ini::parse("[a]\nx = 1\n\xEF\xBB\xBF[b]\n").has_value()); // only at the very start
+}

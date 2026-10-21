@@ -40,6 +40,42 @@ std::expected<void, std::string> write_grab_conf(const Env& env, const std::stri
     return util::write_file_atomic(env.grab_conf, text);
 }
 
+// grab.conf into `env`, its text and settings; a missing file is an empty config. True when the
+// file exists.
+std::expected<bool, std::string> read_grab_conf(Env& env) {
+    auto text = util::read_file_if_exists(env.grab_conf);
+    if (!text) return util::fail(text.error());
+    if (!*text) {
+        env.grab_text = generate_grab_config(nullptr, "");
+        env.cfg = GrabConfig{};
+        return false;
+    }
+    env.grab_text = std::move(**text);
+    auto doc = ini::parse(env.grab_text);
+    if (!doc) return util::failf("{}: {}", util::path_to_utf8(env.grab_conf), doc.error());
+    auto cfg = parse_grab_config(*doc);
+    if (!cfg) return util::failf("{}: {}", util::path_to_utf8(env.grab_conf), cfg.error());
+    env.cfg = std::move(*cfg);
+    return true;
+}
+
+// For a change: the settings lock, and grab.conf read again under it, so the change starts from
+// the file as it is rather than as it was when `loaded` was read; another grab may have changed
+// it meanwhile (review G175).
+struct Locked {
+    SettingsLock lock;
+    Env env;
+};
+
+std::expected<Locked, std::string> lock_current(const Env& loaded) {
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
+    Env env = loaded;
+    if (auto read = read_grab_conf(env); !read) return util::fail(read.error());
+    env.rclone_conf = effective_rclone_config(env.cfg);
+    return Locked{.lock = std::move(*lock), .env = std::move(env)};
+}
+
 // The server's host key lines via real ssh handshakes, one per key type (see
 // servers::handshake_argv): the fallback for when ssh-keyscan cannot negotiate.
 std::expected<std::vector<std::string>, std::string> handshake_host_key(const std::string& ssh,
@@ -100,20 +136,9 @@ std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf,
                                          const std::filesystem::path& exe_dir) {
     Env env;
     env.grab_conf = grab_conf;
-    std::error_code ec;
-    if (std::filesystem::exists(env.grab_conf, ec)) {
-        auto text = util::read_file(env.grab_conf);
-        if (!text) return util::fail(text.error());
-        env.grab_text = std::move(*text);
-        auto doc = ini::parse(env.grab_text);
-        if (!doc) return util::failf("{}: {}", util::path_to_utf8(env.grab_conf), doc.error());
-        auto cfg = parse_grab_config(*doc);
-        if (!cfg) return util::failf("{}: {}", util::path_to_utf8(env.grab_conf), cfg.error());
-        env.cfg = std::move(*cfg);
-        env.imported = migrate_rclone_remotes(env.cfg).imported;
-    } else {
-        env.grab_text = generate_grab_config(nullptr, "");
-    }
+    auto exists = read_grab_conf(env);
+    if (!exists) return util::fail(exists.error());
+    if (*exists) env.imported = migrate_rclone_remotes(env.cfg).imported;
     env.rclone_conf = effective_rclone_config(env.cfg);
     env.known_hosts = grab_known_hosts_path();
     env.rclone = resolve_rclone_exe(env.cfg, exe_dir);
@@ -149,6 +174,8 @@ namespace {
 // Changes the encrypted store of grab's own rclone.conf and hands the result to rclone. An
 // unreadable store (another account's, damaged) starts over: it could not be used anyway.
 std::expected<void, std::string> change_secrets(const Env& env, const std::function<void(secrets::Store&)>& change) {
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
     const auto file = secrets::path_beside(env.rclone_conf);
     auto store = secrets::load(file).value_or(secrets::Store{});
     change(store);
@@ -226,9 +253,27 @@ std::expected<HostKeys, std::string> scan_host_keys(const std::string& ssh, cons
 
 std::expected<void, std::string> pin_host_keys(const std::filesystem::path& known_hosts,
                                                const std::vector<std::string>& lines) {
-    std::string existing;
-    if (auto t = util::read_file(known_hosts)) existing = std::move(*t);
-    return util::write_file_atomic(known_hosts, servers::merge_known_hosts(existing, lines));
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
+    auto existing = util::read_file_if_exists(known_hosts);
+    // One that can't be read is never replaced by the new lines alone: every other server's
+    // pins would go with it (review G89).
+    if (!existing) return util::fail(existing.error());
+    return util::write_file_atomic(known_hosts, servers::merge_known_hosts(existing->value_or(""), lines));
+}
+
+std::expected<ini::Document, std::string> read_rclone_conf(const Env& env) {
+    auto text = util::read_file_if_exists(env.rclone_conf);
+    if (!text) return util::fail(text.error());
+    auto doc = ini::parse(text->value_or(""));
+    if (!doc) return util::failf("{}: {}", util::path_to_utf8(env.rclone_conf), doc.error());
+    return std::move(*doc);
+}
+
+std::optional<std::string> name_taken(const Env& env, const ini::Document& rclone, const std::string& name) {
+    if (find_server(env.cfg, name) != nullptr) return std::format("grab.conf already has a server called {}", name);
+    if (rclone.find(name) != nullptr) return std::format("grab's rclone.conf already has a remote called {}", name);
+    return std::nullopt;
 }
 
 std::expected<std::string, std::string> obscure(const Env& env, const std::string& secret) {
@@ -241,9 +286,18 @@ std::expected<std::string, std::string> obscure(const Env& env, const std::strin
 
 // ---- changes -------------------------------------------------------------------------------
 
-std::expected<void, std::string> add_server(const Env& env, const servers::NewServer& s,
+std::expected<void, std::string> add_server(const Env& loaded, const servers::NewServer& s,
                                             const std::optional<std::string>& obscured_secret,
                                             const HostKeys& keys) {
+    auto locked = lock_current(loaded);
+    if (!locked) return util::fail(locked.error());
+    const Env& env = locked->env;
+    // The name once more, now that no other change can come in between; `rclone config create`
+    // would replace a remote of that name (review G217).
+    auto rclone_doc = read_rclone_conf(env);
+    if (!rclone_doc) return util::fail(rclone_doc.error());
+    if (auto why = name_taken(env, *rclone_doc, s.name)) return util::fail(*why);
+
     if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return pinned;
     std::error_code ec;
     std::filesystem::create_directories(env.rclone_conf.parent_path(), ec);
@@ -253,9 +307,27 @@ std::expected<void, std::string> add_server(const Env& env, const servers::NewSe
                                                           own ? std::nullopt : obscured_secret, env.known_hosts),
                                      quiet());
     if (!ok(created)) return run_failed("rclone config create", created);
+
+    // From here a failure takes the remote out again, with its secret, so that the name can be
+    // added once more (review G218).
+    bool secret_saved = false;
+    auto undo = [&](std::string why) {
+        if (secret_saved) {
+            if (auto forgot = change_secrets(env, [&](secrets::Store& st) { st.erase(s.name); }); !forgot) {
+                why += std::format("; its saved password could not be removed again: {}", forgot.error());
+            }
+        }
+        auto deleted = proc::run_capture(servers::delete_argv(env.rclone, env.rclone_conf, s.name), quiet());
+        if (!ok(deleted)) {
+            why += std::format("; rclone config delete {} failed too: {}", s.name,
+                               deleted ? clean_rclone_error(deleted->err) : deleted.error());
+        }
+        return util::fail(std::move(why));
+    };
     if (own) {
         auto kept = change_secrets(env, [&](secrets::Store& st) { apply_auth(st, s.name, s.auth, obscured_secret); });
-        if (!kept) return kept;
+        if (!kept) return undo(kept.error());
+        secret_saved = true;
     }
 
     const RcloneRemote remote = servers::to_remote(s, env.known_hosts);
@@ -266,7 +338,8 @@ std::expected<void, std::string> add_server(const Env& env, const servers::NewSe
     if (!env.cfg.default_remote || env.cfg.remotes.empty()) {
         text = servers::set_value(text, "grab", "default_remote", s.name);
     }
-    return write_grab_conf(env, text);
+    if (auto written = write_grab_conf(env, text); !written) return undo(written.error());
+    return {};
 }
 
 std::vector<std::pair<std::string, std::string>>
@@ -320,9 +393,12 @@ bool edit_needs_password(const ServerInfo& current, const servers::NewServer& wa
            current.user != wanted.user;
 }
 
-std::expected<void, std::string> update_server(const Env& env, const servers::NewServer& wanted,
+std::expected<void, std::string> update_server(const Env& loaded, const servers::NewServer& wanted,
                                                const std::optional<std::string>& obscured_secret,
                                                const std::optional<HostKeys>& keys) {
+    auto locked = lock_current(loaded);
+    if (!locked) return util::fail(locked.error());
+    const Env& env = locked->env;
     const auto* settings = find_server(env.cfg, wanted.name);
     if (settings == nullptr) return util::failf("no server called {} in grab.conf", wanted.name);
     auto rclone_text = util::read_file(env.rclone_conf);
@@ -377,7 +453,10 @@ std::expected<void, std::string> update_server(const Env& env, const servers::Ne
     return write_grab_conf(env, text);
 }
 
-std::expected<void, std::string> trust_server(const Env& env, std::string_view name, const HostKeys& keys) {
+std::expected<void, std::string> trust_server(const Env& loaded, std::string_view name, const HostKeys& keys) {
+    auto locked = lock_current(loaded);
+    if (!locked) return util::fail(locked.error());
+    const Env& env = locked->env;
     const auto* s = find_server(env.cfg, name);
     if (s == nullptr) return util::failf("no server called {} in grab.conf", name);
     if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return pinned;
@@ -388,7 +467,10 @@ std::expected<void, std::string> trust_server(const Env& env, std::string_view n
     return {};
 }
 
-std::expected<std::string, std::string> remove_server(const Env& env, std::string_view name) {
+std::expected<std::string, std::string> remove_server(const Env& loaded, std::string_view name) {
+    auto locked = lock_current(loaded);
+    if (!locked) return util::fail(locked.error());
+    const Env& env = locked->env;
     const auto* s = find_server(env.cfg, name);
     if (s == nullptr) return util::failf("no server called {} in grab.conf", name);
     const std::string rclone_name = s->rclone_remote;
@@ -419,7 +501,10 @@ std::expected<std::string, std::string> remove_server(const Env& env, std::strin
     return util::join(notes, "; ");
 }
 
-std::expected<void, std::string> set_default(const Env& env, std::string_view name) {
+std::expected<void, std::string> set_default(const Env& loaded, std::string_view name) {
+    auto locked = lock_current(loaded);
+    if (!locked) return util::fail(locked.error());
+    const Env& env = locked->env;
     if (find_server(env.cfg, name) == nullptr) return util::failf("no server called {} in grab.conf", name);
     return write_grab_conf(env, servers::set_value(env.grab_text, "grab", "default_remote", name));
 }

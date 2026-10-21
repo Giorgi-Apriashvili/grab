@@ -7,6 +7,10 @@
 
 #include <doctest/doctest.h>
 
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (LockFileEx, SetFileAttributesW)
+#endif
+
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -334,3 +338,102 @@ TEST_CASE("grab's own rclone.conf loses its passwords to the encrypted store on 
     std::filesystem::remove(own);
     std::filesystem::remove(secrets::path_beside(own));
 }
+
+TEST_CASE("a change starts from grab.conf as it is now, not as it was loaded (G175)") {
+    Scratch s;
+    s.write("rclone.conf", rclone_conf);
+    s.write("grab.conf", grab_conf(s.dir));
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    // Another grab adds a folder to box meanwhile; this one's change doesn't undo it.
+    s.write("grab.conf", servers::set_value(grab_conf(s.dir), "box", "search_roots", "/home/movies, /home/tv"));
+    REQUIRE(server_ops::set_default(*env, "agent").has_value());
+    const auto text = s.read("grab.conf");
+    CHECK(text.find("default_remote = agent\n") != std::string::npos);
+    CHECK(text.find("search_roots = /home/movies, /home/tv\n") != std::string::npos);
+}
+
+TEST_CASE("a new server's name is checked against an rclone.conf that has to be readable (G217)") {
+    Scratch s;
+    s.write("rclone.conf", rclone_conf + "\n[nas]\ntype = sftp\nhost = nas.example.invalid\n");
+    s.write("grab.conf", grab_conf(s.dir));
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    auto doc = server_ops::read_rclone_conf(*env);
+    REQUIRE(doc.has_value());
+    CHECK(server_ops::name_taken(*env, *doc, "box") == "grab.conf already has a server called box");
+    CHECK(server_ops::name_taken(*env, *doc, "nas") == "grab's rclone.conf already has a remote called nas");
+    CHECK_FALSE(server_ops::name_taken(*env, *doc, "fresh").has_value());
+
+    // One grab can't parse is an error, not "no remotes"; the add stops before anything is written.
+    const std::string broken = rclone_conf + "\n[nas]\ntype = sftp\nthis line is not ini\n";
+    s.write("rclone.conf", broken);
+    CHECK_FALSE(server_ops::read_rclone_conf(*env).has_value());
+    auto nas = server(Auth::agent);
+    nas.name = "nas";
+    nas.host = "new.example.invalid";
+    const server_ops::HostKeys keys{.lines = {"new.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}, .fingerprints = {}};
+    CHECK_FALSE(server_ops::add_server(*env, nas, std::nullopt, keys).has_value());
+    CHECK(s.read("rclone.conf") == broken);
+    CHECK(s.read("grab.conf") == grab_conf(s.dir));
+}
+
+#ifdef _WIN32
+TEST_CASE("a known_hosts that can't be read is never replaced by the new pins alone (G89)") {
+    Scratch s;
+    const std::string pinned = "other.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n";
+    s.write("known_hosts", pinned);
+    const auto file = s.dir / "known_hosts";
+    // Another program holds a lock on it for a moment: reading fails, replacing would work.
+    const HANDLE other = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(other != INVALID_HANDLE_VALUE);
+    OVERLAPPED at{};
+    REQUIRE(LockFileEx(other, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 100000, 0, &at));
+    const auto result = server_ops::pin_host_keys(file, {"new.example.invalid ssh-ed25519 BBBB"});
+    UnlockFileEx(other, 0, 100000, 0, &at);
+    CloseHandle(other);
+    CHECK_FALSE(result.has_value());
+    CHECK(s.read("known_hosts") == pinned);
+    // A missing one is simply started.
+    REQUIRE(server_ops::pin_host_keys(s.dir / "new_known_hosts", {"new.example.invalid ssh-ed25519 BBBB"}).has_value());
+    CHECK(s.read("new_known_hosts").find("new.example.invalid ssh-ed25519 BBBB") != std::string::npos);
+}
+
+TEST_CASE("an add that fails after rclone made the remote takes it out again, so the name stays free (G218)") {
+    // The bundled rclone, one folder above this test program (build\<preset>\rclone.exe).
+    const auto rclone_dir = util::self_exe_path().parent_path().parent_path();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(rclone_dir / "rclone.exe", ec)) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    Scratch s;
+    s.write("rclone.conf", rclone_conf);
+    s.write("grab.conf", grab_conf(s.dir));
+    auto env = server_ops::load_env(s.dir / "grab.conf", rclone_dir);
+    REQUIRE(env.has_value());
+    auto fresh = server(Auth::agent);
+    fresh.name = "fresh";
+    fresh.host = "fresh.example.invalid";
+    const server_ops::HostKeys keys{.lines = {"fresh.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}, .fingerprints = {}};
+
+    // grab.conf can't be replaced (read-only), so the last step fails.
+    const auto conf = s.dir / "grab.conf";
+    SetFileAttributesW(conf.c_str(), FILE_ATTRIBUTE_READONLY);
+    const auto added = server_ops::add_server(*env, fresh, std::nullopt, keys);
+    SetFileAttributesW(conf.c_str(), FILE_ATTRIBUTE_NORMAL);
+    REQUIRE_FALSE(added.has_value());
+    CHECK(s.read("rclone.conf").find("[fresh]") == std::string::npos);
+    CHECK(s.read("grab.conf") == grab_conf(s.dir));
+
+    // The same add now goes through.
+    env = server_ops::load_env(conf, rclone_dir);
+    REQUIRE(env.has_value());
+    const auto again = server_ops::add_server(*env, fresh, std::nullopt, keys);
+    CHECK_MESSAGE(again.has_value(), again.error_or(""));
+    CHECK(s.read("rclone.conf").find("[fresh]") != std::string::npos);
+    CHECK(s.read("grab.conf").find("[fresh]") != std::string::npos);
+    std::filesystem::remove(grab_known_hosts_path(), ec);
+}
+#endif

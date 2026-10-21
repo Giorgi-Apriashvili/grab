@@ -1,11 +1,11 @@
 #include "secrets.hpp"
 
+#include "config.hpp"
 #include "util.hpp"
 
 #include <format>
 #include <mutex>
 #include <set>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -91,13 +91,12 @@ std::optional<Store> from_text(std::string_view text) {
 }
 
 std::expected<Store, std::string> load(const fs::path& file) {
-    std::error_code ec;
-    if (!fs::exists(file, ec)) return Store{};
-    auto data = util::read_file(file);
+    auto data = util::read_file_if_exists(file);
     if (!data) return util::fail(data.error());
+    if (!*data) return Store{};
     std::optional<Store> store;
-    if (data->starts_with(sealed_header)) {
-        if (auto text = util::unprotect_for_user(std::string_view(*data).substr(sealed_header.size()), purpose)) {
+    if ((*data)->starts_with(sealed_header)) {
+        if (auto text = util::unprotect_for_user(std::string_view(**data).substr(sealed_header.size()), purpose)) {
             store = from_text(*text);
         }
     }
@@ -177,24 +176,29 @@ Taken take_secrets(std::string_view rclone_text) {
 std::expected<void, std::string> prepare(const fs::path& rclone_conf) {
     const auto file = path_beside(rclone_conf);
     auto store = load(file);
-    if (auto text = util::read_file(rclone_conf)) {
-        auto taken = take_secrets(*text);
-        if (!taken.found.empty()) {
-            // An unreadable store can't be used anyway: the secrets just found replace it.
-            Store merged = store ? std::move(*store) : Store{};
-            for (auto& [remote, values] : taken.found) {
-                for (auto& [key, value] : values) merged[remote][key] = std::move(value);
+    auto text = util::read_file(rclone_conf);
+    if (text && !take_secrets(*text).found.empty()) {
+        // Moved under the settings lock, from both files as they are then: another grab may be
+        // moving them at the same time (review G175). Without the lock they stay for now.
+        if (auto lock = lock_settings()) {
+            store = load(file);
+            text = util::read_file(rclone_conf);
+            auto taken = text ? take_secrets(*text) : Taken{};
+            if (!taken.found.empty()) {
+                // An unreadable store can't be used anyway: the secrets just found replace it.
+                Store merged = store ? *store : Store{};
+                for (auto& [remote, values] : taken.found) {
+                    for (auto& [key, value] : values) merged[remote][key] = std::move(value);
+                }
+                // The file keeps its secrets until the store holds them for sure. If anything
+                // fails, they stay where rclone reads them anyway, and the next run tries again.
+                if (save(file, merged) && load(file) == merged) {
+                    if (!util::write_file_atomic(rclone_conf, taken.text)) {
+                        // They stay in the file as well, where rclone reads them anyway.
+                    }
+                    store = std::move(merged);
+                }
             }
-            // The file keeps its secrets until the store holds them for sure. If anything fails,
-            // they stay where rclone reads them anyway, and the next run tries again.
-            if (!save(file, merged) || load(file) != merged) {
-                if (store) export_to_env(*store);
-                return {};
-            }
-            if (!util::write_file_atomic(rclone_conf, taken.text)) {
-                // They stay in the file as well, where rclone reads them anyway; the next run tries again.
-            }
-            store = std::move(merged);
         }
     }
     if (!store) return util::fail(store.error());

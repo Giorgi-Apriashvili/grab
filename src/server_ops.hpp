@@ -86,16 +86,32 @@ struct HostKeys {
                                                                   const std::string& host, int port,
                                                                   std::stop_token stop = {});
 
+// Adds `lines` to known_hosts. A known_hosts that exists but can't be read is an error, never
+// replaced by the new lines alone.
 [[nodiscard]] std::expected<void, std::string> pin_host_keys(const std::filesystem::path& known_hosts,
                                                              const std::vector<std::string>& lines);
+
+// The rclone.conf servers are added to, as a document (empty when there is none). One that
+// exists but can't be read or parsed is an error, never "no remotes": a new remote's name is
+// checked against it, and `rclone config create` would replace one this couldn't see (G217).
+[[nodiscard]] std::expected<ini::Document, std::string> read_rclone_conf(const Env& env);
+// Why `name` can't be a new server's (grab.conf has that server, or `rclone` that remote), or
+// nullopt when it's free.
+[[nodiscard]] std::optional<std::string> name_taken(const Env& env, const ini::Document& rclone,
+                                                    const std::string& name);
 
 // `rclone obscure -` with the secret on stdin, so it never appears on a command line.
 [[nodiscard]] std::expected<std::string, std::string> obscure(const Env& env, const std::string& secret);
 
 // ---- changes ------------------------------------------------------------------------------
 
+// Each change holds the settings lock (config.hpp) and starts from grab.conf and rclone.conf as
+// they are then, not as they were when `env` was loaded: another grab may have changed them
+// in between.
+
 // Pins `keys`, creates the rclone remote, appends the grab.conf section and makes it the
-// default when there is none. `obscured_secret`: the password or key passphrase, obscured.
+// default when there is none. `obscured_secret`: the password or key passphrase, obscured. If
+// a later step fails, the remote and its secret are removed again, so the name stays free.
 [[nodiscard]] std::expected<void, std::string> add_server(const Env& env, const servers::NewServer& s,
                                                           const std::optional<std::string>& obscured_secret,
                                                           const HostKeys& keys);

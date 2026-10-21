@@ -1573,13 +1573,9 @@ void App::save_server(const Value& msg) {
             need_keys = it->error.empty() ? server_ops::edit_needs_host_key(*it, s) : true;
         } else {
             p.kind = Pending::Kind::add;
-            if (server_ops::find_server(env->cfg, s.name) != nullptr) {
-                return invalid("name", "a server with this name already exists");
-            }
-            auto rclone_doc = ini::parse(util::read_file(env->rclone_conf).value_or(""));
-            if (rclone_doc && rclone_doc->find(s.name) != nullptr) {
-                return invalid("name", "grab's rclone.conf already has a remote with this name");
-            }
+            auto rclone_doc = server_ops::read_rclone_conf(*env);
+            if (!rclone_doc) return settings_error(rclone_doc.error());
+            if (auto why = server_ops::name_taken(*env, *rclone_doc, s.name)) return invalid("name", *why);
             if (s.auth == servers::Auth::password && p.secret.empty()) return invalid("secret", "enter the password");
         }
         if (!need_keys) return apply_pending(std::move(p), stop);

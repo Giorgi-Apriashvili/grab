@@ -4,8 +4,12 @@
 
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
@@ -423,4 +427,24 @@ TEST_CASE("example config parses and matches the defaults") {
     CHECK(cfg.remotes[0].common_flags == util::split_args(default_common_flags));
     CHECK(cfg.remotes[0].folder_flags == util::split_args(default_folder_flags));
     CHECK(cfg.remotes[0].file_flags == util::split_args(default_file_flags));
+}
+
+TEST_CASE("the settings lock has one holder at a time, and a thread may take it again") {
+    auto first = lock_settings();
+    REQUIRE(first.has_value());
+    {
+        auto again = lock_settings(); // the same thread: a change inside a change
+        REQUIRE(again.has_value());
+    }
+    // Still held after the inner one ends: another thread (or grab) waits.
+    std::atomic<bool> got{false};
+    std::thread other([&] {
+        auto lock = lock_settings();
+        got = lock.has_value();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK_FALSE(got.load());
+    { auto done = std::move(*first); } // let go
+    other.join();
+    CHECK(got.load());
 }
