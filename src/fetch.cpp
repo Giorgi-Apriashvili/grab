@@ -221,7 +221,8 @@ void discard_own(const Partial& p) {
 
 } // namespace
 
-std::optional<Partial> find_partial(const fs::path& target, std::string_view remote_path, const Reserved& reserved) {
+std::optional<Partial> find_partial(const fs::path& target, std::string_view remote_path, const Reserved& reserved,
+                                    std::string_view rclone_remote) {
     constexpr std::uintmax_t record_max = 1 << 20; // a record is a few KiB; no reading anything big
     for (int slot = 1; slot <= max_slot; ++slot) {
         auto f = partial_files(target, slot);
@@ -231,7 +232,9 @@ std::optional<Partial> find_partial(const fs::path& target, std::string_view rem
         auto text = util::read_file(f.record);
         if (!text) continue;
         auto state = state_from_json(*text);
-        if (state && state->path == remote_path) return Partial{std::move(f), std::move(*state)};
+        if (state && state->path == remote_path && (rclone_remote.empty() || state->rclone_remote == rclone_remote)) {
+            return Partial{.files = std::move(f), .state = std::move(*state)};
+        }
     }
     return std::nullopt;
 }
@@ -248,14 +251,32 @@ std::optional<PartialFiles> free_partial(const fs::path& target, const Reserved&
 
 std::optional<std::pair<std::uint64_t, std::uint64_t>> saved_progress(const fs::path& target,
                                                                       std::string_view remote_path,
-                                                                      const Reserved& reserved) {
-    const auto p = find_partial(target, remote_path, reserved);
+                                                                      const Reserved& reserved,
+                                                                      std::string_view rclone_remote) {
+    const auto p = find_partial(target, remote_path, reserved, rclone_remote);
     if (!p) return std::nullopt;
     return std::pair{p->state.bytes_done(), p->state.size};
 }
 
-void discard(const fs::path& target, std::string_view remote_path, const Reserved& reserved) {
-    if (const auto p = find_partial(target, remote_path, reserved)) discard_own(*p);
+void discard(const fs::path& target, std::string_view remote_path, const Reserved& reserved,
+             std::string_view rclone_remote) {
+    if (const auto p = find_partial(target, remote_path, reserved, rclone_remote)) discard_own(*p);
+}
+
+bool move_partial(const fs::path& from, const fs::path& to, std::string_view remote_path, std::string_view rclone_remote) {
+    const auto p = find_partial(from, remote_path, {}, rclone_remote);
+    if (!p) return false;
+    const auto dest = partial_files(to, 1);
+    std::error_code ec;
+    if (fs::exists(fs::symlink_status(dest.part, ec)) || fs::exists(fs::symlink_status(dest.record, ec))) return false;
+    fs::rename(p->files.part, dest.part, ec);
+    if (ec) return false;
+    fs::rename(p->files.record, dest.record, ec);
+    if (ec) {
+        fs::rename(dest.part, p->files.part, ec); // back, so the record still has its data
+        return false;
+    }
+    return true;
 }
 
 // ---- connections -----------------------------------------------------------------------------
@@ -622,8 +643,11 @@ Result run(const Download& d, Connections& connections, const std::function<void
     result.size = remote->size;
     result.modtime = remote->modtime;
     std::error_code ec;
-    auto own = find_partial(d.target, src.path, d.reserved);
-    if (!own && up_to_date(d.target, remote->size, remote->modtime)) {
+    auto own = find_partial(d.target, src.path, d.reserved, src.rclone_remote);
+    // A file there that is the server's already (same size, not older) is kept, also when a
+    // partial download of it was left: that is then given up (review G75).
+    if (up_to_date(d.target, remote->size, remote->modtime)) {
+        if (own) discard_own(*own);
         if (on_progress) on_progress(Progress{remote->size, remote->size, 0, std::nullopt, 0});
         result.outcome = Outcome::done;
         result.present = true;

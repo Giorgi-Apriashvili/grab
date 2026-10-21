@@ -189,8 +189,9 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
         if (finished) {
             const auto local = target_of(dir, f);
             if (fs::file_size(local, ec) == f.size && !ec) {
+                // rclone didn't say it copied this one: it was there already (kept by
+                // --ignore-existing), not written by grab, so verify never deletes it (review G82).
                 f.status = State::done;
-                f.fetched = true;
                 f.bytes = f.size;
             } else {
                 f.status = State::failed;
@@ -293,7 +294,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                     break;
                 }
             }
-            if (discard) fetch::discard(d.target, d.source.path, d.reserved);
+            if (discard) fetch::discard(d.target, d.source.path, d.reserved, d.source.rclone_remote);
             notify(job, Event::changed);
         }
     };
@@ -429,11 +430,12 @@ std::string child_remote_path(const std::string& folder, const std::string& rel)
     return folder.empty() || folder.ends_with('/') ? folder + rel : folder + "/" + rel;
 }
 
-void discard_partials(const std::string& remote_path, const fs::path& dir, const Tree& tree) {
+void discard_partials(const std::string& remote_path, const fs::path& dir, const Tree& tree,
+                      std::string_view rclone_remote) {
     const auto reserved = reserved_names(dir, tree);
     for (const auto& f : tree.files) {
         if (f.big && f.status != State::done) {
-            fetch::discard(target_of(dir, f), child_remote_path(remote_path, f.path), reserved);
+            fetch::discard(target_of(dir, f), child_remote_path(remote_path, f.path), reserved, rclone_remote);
         }
     }
 }
@@ -500,7 +502,8 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m) {
     // Looked at on disk without the lock: a big folder means many file system calls.
     std::vector<std::pair<std::size_t, std::optional<std::uint64_t>>> found; // done (nullopt) or partial bytes
     for (const auto& c : queued) {
-        const auto partial = c.big ? fetch::saved_progress(c.local, child_remote_path(job.remote_path, c.path), reserved)
+        const auto partial = c.big ? fetch::saved_progress(c.local, child_remote_path(job.remote_path, c.path), reserved,
+                                                            job.ctx->settings.rclone_remote)
                                    : std::nullopt;
         if (partial) {
             found.emplace_back(c.index, partial->first);

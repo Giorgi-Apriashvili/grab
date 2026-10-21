@@ -130,16 +130,25 @@ struct Partial {
     State state;
 };
 // grab's partial download of `target` from the server file `remote_path`: the first slot, not
-// reserved, whose record parses and names that file.
+// reserved, whose record parses and names that file, from the rclone remote `rclone_remote` when
+// one is given. The same path on another server is another file: its partial is left alone
+// (review G20).
 [[nodiscard]] std::optional<Partial> find_partial(const std::filesystem::path& target, std::string_view remote_path,
-                                                  const Reserved& reserved = {});
+                                                  const Reserved& reserved = {}, std::string_view rclone_remote = {});
 // The first slot for a new partial download of `target`: not reserved, and nothing at either name.
 [[nodiscard]] std::optional<PartialFiles> free_partial(const std::filesystem::path& target, const Reserved& reserved = {});
 // Its bytes done and total size.
 [[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>>
-saved_progress(const std::filesystem::path& target, std::string_view remote_path, const Reserved& reserved = {});
+saved_progress(const std::filesystem::path& target, std::string_view remote_path, const Reserved& reserved = {},
+               std::string_view rclone_remote = {});
 // Deletes it: the record, and the data file while it has the size grab gave it. Nothing else.
-void discard(const std::filesystem::path& target, std::string_view remote_path, const Reserved& reserved = {});
+void discard(const std::filesystem::path& target, std::string_view remote_path, const Reserved& reserved = {},
+             std::string_view rclone_remote = {});
+// Moves it to `to`'s first partial names, so a download to `to` goes on from it (Keep both after
+// the file there turned out different; review G74). False when there is none, or `to`'s names
+// are taken.
+bool move_partial(const std::filesystem::path& from, const std::filesystem::path& to, std::string_view remote_path,
+                  std::string_view rclone_remote);
 
 // The connection pools of all servers, shared by every running download. Thread-safe.
 class Connections {

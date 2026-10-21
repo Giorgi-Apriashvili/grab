@@ -312,7 +312,8 @@ too and goes on without them.
   `<name>.grabpart.json` and renames the file when it is complete.
   - Pausing keeps both; resuming continues from the last saved bytes.
   - grab reuses or deletes only partial files it made: their `.json` record names the server
-    file. When something else already has those names (your own files, or files of the folder
+    and its file (the same path on another server is another file). When something else
+    already has those names (your own files, or files of the folder
     being downloaded), it uses `<name>.2.grabpart` and so on, and leaves them alone. Cancelling
     deletes only grab's partial files, and of rclone's temporary `.partial` files only the ones
     its stopped copy had just made.

@@ -116,7 +116,8 @@ struct Job;
 // Deletes what a cancelled folder (`remote_path`) leaves behind: its big files' partial
 // downloads, grab's by their records. Finished files stay; rclone's temp files went when its
 // batch stopped.
-void discard_partials(const std::string& remote_path, const std::filesystem::path& dir, const Tree& tree);
+void discard_partials(const std::string& remote_path, const std::filesystem::path& dir, const Tree& tree,
+                      std::string_view rclone_remote = {});
 
 enum class Event {
     progress,   // bytes moved; frequent, so throttle what it triggers

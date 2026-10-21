@@ -2000,7 +2000,12 @@ void App::resume_items(int id) {
 }
 
 void App::cancel_items(int id) {
-    std::vector<std::pair<std::filesystem::path, std::string>> discard; // partial downloads not running now
+    struct Discard {
+        std::filesystem::path target;
+        std::string path;
+        std::string server;
+    };
+    std::vector<Discard> discard; // partial downloads not running now
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
@@ -2009,7 +2014,9 @@ void App::cancel_items(int id) {
                 item->status = Status::cancelled;
                 item->speed = 0;
                 item->eta.reset();
-                if (item->mode == Mode::file) discard.emplace_back(item_target(*item), item->path);
+                if (item->mode == Mode::file) {
+                    discard.push_back({.target = item_target(*item), .path = item->path, .server = item->remote});
+                }
                 else discard_folder_partials(*item); // finished files stay
             } else if (item->status == Status::running) {
                 item->stop_reason = StopReason::cancel;
@@ -2017,7 +2024,7 @@ void App::cancel_items(int id) {
             }
         }
     }
-    for (const auto& [target, path] : discard) fetch::discard(target, path);
+    for (const auto& d : discard) fetch::discard(d.target, d.path, {}, rclone_remote_of(d.server));
     save_queue();
     post_queue();
 }
@@ -2034,7 +2041,7 @@ void App::retry_item(int id) {
                 item->error.clear();
                 if (item->mode == Mode::folder) {
                     folder::retry_files(item->tree, cancelled); // after a cancel, everything not finished
-                } else if (!fetch::saved_progress(item_target(*item), item->path)) {
+                } else if (!fetch::saved_progress(item_target(*item), item->path, {}, rclone_remote_of(item->remote))) {
                     item->bytes = 0;
                 }
                 item->speed = 0;
@@ -2080,15 +2087,17 @@ void App::resume_child(int id, const std::string& path) {
 
 void App::skip_child(int id, const std::string& path) {
     std::optional<folder::Discard> discard;
+    std::string server;
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id) continue;
             discard = folder::skip_file(item->tree, folder::local_dir(item->dest, item->path), item->path, path);
+            server = item->remote;
             folder_totals(*item);
         }
     }
-    if (discard) fetch::discard(discard->target, discard->remote_path, discard->reserved);
+    if (discard) fetch::discard(discard->target, discard->remote_path, discard->reserved, rclone_remote_of(server));
     save_queue();
     post_queue();
 }
@@ -2372,7 +2381,7 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     item->connections = 0;
     item->current.clear();
     if (item->status == Status::cancelled && item->mode == Mode::file) {
-        fetch::discard(item_target(*item), item->path);
+        fetch::discard(item_target(*item), item->path, {}, rclone_remote_of(item->remote));
     }
 }
 
@@ -2466,8 +2475,14 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     };
     auto result = fetch_once();
     if (result.outcome == fetch::Outcome::exists && choice == existing::Choice::keep_both) {
+        // A copy an earlier Keep both kept that already is the server's file (review G112).
+        if (const auto kept = existing::kept_copy(d.target, result.size, util::parse_rfc3339(result.modtime))) {
+            return set(Status::done, {}, std::format("already there as {}, nothing fetched", util::path_to_utf8(kept->filename())));
+        }
         const auto second = existing::second_copy(d.target);
         if (!second) return set(Status::failed, "no free name for a second copy next to " + util::path_to_utf8(d.target));
+        // What was fetched goes on under the new name, done already if it was complete (G74).
+        fetch::move_partial(d.target, *second, item->path, d.source.rclone_remote);
         {
             std::lock_guard lock(mutex_);
             item->local_name = second->filename();
@@ -2477,6 +2492,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         result = fetch_once();
     }
     if (result.outcome == fetch::Outcome::exists && choice == existing::Choice::skip) {
+        fetch::discard(d.target, item->path, {}, d.source.rclone_remote); // what was fetched won't be used (G74)
         return set(Status::done, {}, "skipped: your file is kept");
     }
     if (result.outcome == fetch::Outcome::exists) { // not answered yet: wait for the answer
@@ -2554,7 +2570,16 @@ void App::folder_totals(Item& item) const {
 }
 
 void App::discard_folder_partials(const Item& item) const {
-    folder::discard_partials(item.path, folder::local_dir(item.dest, item.path), item.tree);
+    folder::discard_partials(item.path, folder::local_dir(item.dest, item.path), item.tree, rclone_remote_of(item.remote));
+}
+
+std::string App::rclone_remote_of(const std::string& server) const {
+    if (auto cfg = load_grab_config(config_path_)) {
+        for (const auto& r : cfg->remotes) {
+            if (r.name == server) return r.rclone_remote;
+        }
+    }
+    return server;
 }
 
 void App::folder_event(Item& item, folder::Event e) {
@@ -2815,7 +2840,7 @@ void App::restore_queue() {
         item->status = saved.resume ? Status::queued : Status::paused;
         item->weight = weight_of(saved.priority);
         if (item->mode == Mode::file) {
-            if (auto p = fetch::saved_progress(item_target(*item), item->path)) {
+            if (auto p = fetch::saved_progress(item_target(*item), item->path, {}, rclone_remote_of(item->remote))) {
                 item->bytes = p->first;
                 item->total = p->second;
             }
@@ -2835,8 +2860,8 @@ void App::restore_queue() {
                 }
                 if (c.status == folder::State::done) c.bytes = c.size;
                 else if (c.big) {
-                    if (auto p = fetch::saved_progress(folder::target_of(dir, c),
-                                                       folder::child_remote_path(item->path, c.path))) {
+                    if (auto p = fetch::saved_progress(folder::target_of(dir, c), folder::child_remote_path(item->path, c.path),
+                                                       {}, rclone_remote_of(item->remote))) {
                         c.bytes = p->first;
                     }
                 }

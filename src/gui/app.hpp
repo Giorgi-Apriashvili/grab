@@ -364,6 +364,9 @@ private:
     void folder_event(Item& item, folder::Event e); // a running folder's progress, for the page
     void folder_totals(Item& item) const;          // caller holds mutex_
     void discard_folder_partials(const Item& item) const; // cancelled folder: big files' .grabpart
+    // grab.conf's rclone remote for `server` (else the name): partial downloads are told apart by
+    // it, so another server's of the same path is left alone (review G20).
+    [[nodiscard]] std::string rclone_remote_of(const std::string& server) const;
     // The connection budget for a server, from grab.conf, its host and what grab (or the command)
     // learned, read from limits.json each time.
     [[nodiscard]] int connection_budget(const std::string& remote, const std::string& host,

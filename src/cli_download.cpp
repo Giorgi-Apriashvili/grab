@@ -309,8 +309,9 @@ std::string existing_line(const ExistingFile& f) {
 
 // `target`: where it lands (DEST\<name>, or a numbered name when another pick has the same).
 int fetch_file(const Session& s, const std::string& path, int id, std::filesystem::path target) {
+    const std::string& rclone_remote = s.ctx.settings.rclone_remote;
     std::uint64_t before = 0; // fetched by an earlier run
-    if (auto p = fetch::saved_progress(target, path)) before = p->first;
+    if (auto p = fetch::saved_progress(target, path, {}, rclone_remote)) before = p->first;
 
     fetch::Download d;
     d.source = fetch::Source{s.ctx.config.rclone, s.ctx.config.rclone_config, s.ctx.settings.rclone_remote, path, s.flags};
@@ -344,6 +345,7 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
             if (answer->for_all) *s.for_rest = choice;
         }
         if (choice == existing::Choice::skip) {
+            fetch::discard(target, path, {}, rclone_remote); // what was fetched for it won't be used (G74)
             s.line.finish("skipped: your file is kept");
             return 0;
         }
@@ -359,10 +361,12 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
                 std::println(stderr, "grab: error: no free name for a second copy next to {}", util::path_to_utf8(target));
                 return exit_download_failed;
             }
+            // What was fetched goes on under the new name, done already if it was complete (G74).
+            fetch::move_partial(target, *second, path, rclone_remote);
             target = *second;
             s.line.message("grab: saving it as " + util::path_to_utf8(target.filename()));
             before = 0;
-            if (auto p = fetch::saved_progress(target, path)) before = p->first;
+            if (auto p = fetch::saved_progress(target, path, {}, rclone_remote)) before = p->first;
         }
         result = fetch_once();
     }
@@ -411,7 +415,7 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
         return 0;
     }
     case fetch::Outcome::stopped: {
-        const auto p = fetch::saved_progress(target, path);
+        const auto p = fetch::saved_progress(target, path, {}, rclone_remote);
         s.line.finish(p && p->second > 0
                           ? std::format("stopped at {}%; run the same command again to continue", p->first * 100 / p->second)
                           : "stopped");
@@ -423,7 +427,7 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
     }
     s.line.clear();
     std::println(stderr, "grab: error: {}", result.error);
-    if (fetch::saved_progress(target, path)) {
+    if (fetch::saved_progress(target, path, {}, rclone_remote)) {
         std::println(stderr, "grab: what was fetched is kept; run the same command again to continue");
     }
     return exit_download_failed;

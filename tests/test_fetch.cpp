@@ -530,3 +530,76 @@ TEST_CASE("a listing takes its connections from the pool: up to 8 alone, what's 
     CHECK(busy.connections() == 2);
     CHECK(c.active("box", 1) == 12);
 }
+TEST_CASE("a partial download belongs to its server: the same path from another is left alone (G20)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-fetch-servers";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto target = dir / "big.bin";
+    const auto one = fetch::partial_files(target, 1);
+    auto s = fetch::new_state("Main", "/tmp/big.bin", 40 * MiB, "2025-01-01T00:00:00Z", 16 * MiB);
+    s.ranges[0].done = 16 * MiB;
+    write(one.record, fetch::state_to_json(s));
+    sized(one.part, 40 * MiB);
+    CHECK(fetch::saved_progress(target, "/tmp/big.bin", {}, "Main").has_value());
+    CHECK_FALSE(fetch::saved_progress(target, "/tmp/big.bin", {}, "Main2").has_value());
+    fetch::discard(target, "/tmp/big.bin", {}, "Main2"); // Main2's: there is none
+    CHECK(std::filesystem::exists(one.record));
+    CHECK(std::filesystem::exists(one.part));
+    // Without a server it is anyone's, as before.
+    CHECK(fetch::saved_progress(target, "/tmp/big.bin").has_value());
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("a partial download moves with Keep both to the second copy's name (G74)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-fetch-move";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto target = dir / "big.bin";
+    const auto second = dir / "big (2).bin";
+    const auto one = fetch::partial_files(target, 1);
+    auto s = fetch::new_state("Main", "/tmp/big.bin", 40 * MiB, "2025-01-01T00:00:00Z", 16 * MiB);
+    s.ranges[0].done = 16 * MiB;
+    write(one.record, fetch::state_to_json(s));
+    sized(one.part, 40 * MiB);
+    CHECK_FALSE(fetch::move_partial(target, second, "/tmp/big.bin", "Main2")); // another server's
+    REQUIRE(fetch::move_partial(target, second, "/tmp/big.bin", "Main"));
+    CHECK_FALSE(std::filesystem::exists(one.part));
+    CHECK_FALSE(std::filesystem::exists(one.record));
+    const auto p = fetch::saved_progress(second, "/tmp/big.bin", {}, "Main");
+    CHECK(p.value_or(std::pair<std::uint64_t, std::uint64_t>{}).first == 16 * MiB);
+    CHECK_FALSE(fetch::move_partial(target, second, "/tmp/big.bin", "Main")); // moved already
+    std::filesystem::remove_all(dir);
+}
+
+#ifdef _WIN32
+TEST_CASE("a file that already is the server's wins over a partial download of it (G75)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-fetch-present";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // The server's file: 64 MiB from 2026-01-01; the stand-in answers only the size check.
+    std::ofstream(dir / "rclone.cmd", std::ios::binary)
+        << "@echo off\r\n"
+           "echo {\"Path\":\"f.bin\",\"Name\":\"f.bin\",\"Size\":67108864,\"ModTime\":\"2026-01-01T00:00:00Z\",\"IsDir\":false}\r\n";
+    const auto target = dir / "f.bin";
+    const auto one = fetch::partial_files(target, 1);
+    auto s = fetch::new_state("Main", "/f.bin", 64 * MiB, "2026-01-01T00:00:00Z", 16 * MiB);
+    s.ranges[0].done = 16 * MiB;
+    write(one.record, fetch::state_to_json(s));
+    sized(one.part, 64 * MiB);
+    sized(target, 64 * MiB); // the same size, written now: newer than the server's
+    fetch::Connections connections;
+    connections.configure("Main", 12);
+    fetch::Download d;
+    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .config = std::nullopt,
+                             .rclone_remote = "Main", .path = "/f.bin", .flags = {}};
+    d.server = "Main";
+    d.id = 1;
+    d.target = target;
+    const auto r = fetch::run(d, connections, {}, {});
+    CHECK(r.outcome == fetch::Outcome::done);
+    CHECK(r.present);
+    CHECK_FALSE(std::filesystem::exists(one.record)); // given up
+    CHECK(std::filesystem::file_size(target) == 64 * MiB);
+    std::filesystem::remove_all(dir);
+}
+#endif
