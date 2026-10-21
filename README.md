@@ -364,7 +364,8 @@ too and goes on without them.
   - The `grab` command follows the same schedule (see [Usage](#usage)). Each program caps its
     own downloads.
   - At each change, a folder's small-file batch starts again with the new cap; the files it
-    had in flight start over.
+    had in flight start over. Other downloads keep their connections and just follow the new
+    speed; they reconnect only when the limit switches on or off.
 - **Folders** are listed once and shown as a tree under their row, collapsible with ▸/▾.
   - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
   - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
@@ -373,6 +374,9 @@ too and goes on without them.
   - Smaller files go in one `rclone copy` batch that reuses its connections, since a new SSH
     login per small file would dominate. Pausing drops the progress of small files that were
     in flight.
+  - The batch's connections follow its share: when another download from the same server
+    starts, it starts again with fewer within a few seconds, and with more once they're free
+    again (the small files in flight start over).
   - The tree and each file's state survive closing grab. Files already complete on disk are
     not fetched again.
 - **Connections per server:** every download from a server shares that server's connection
@@ -381,6 +385,11 @@ too and goes on without them.
     Settings, or as `max_connections` in grab.conf.
   - A lone download uses the whole budget; several split it fairly. A small file that can
     only use one connection lends the rest to the others.
+  - The budget is a hard limit: with more downloads queued for a server than it has
+    connections, the window starts only that many, and the rest wait their turn. Each file's
+    first look at the server (its size and date) takes one of them too.
+  - Previews and Play's player use their own `rclone serve`, outside the budget, with at most
+    two connections.
   - Connections open slightly staggered. If a server refuses one while others of grab's get
     data, grab lowers that server's budget and remembers it (in `limits.json` next to
     gui.json, shared with the `grab` command). Each download from that server that ends

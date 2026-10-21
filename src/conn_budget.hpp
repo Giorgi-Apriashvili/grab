@@ -60,8 +60,9 @@ public:
     [[nodiscard]] int active(int id) const;
     [[nodiscard]] int total_active() const;
 
-    // Whether `id` may open another connection now: within the budget, at least `stagger` after
-    // the previous start on this server, and either below its share or borrowing capacity no
+    // Whether `id` may open another connection now: within the budget (a hard cap, also with more
+    // users than connections), at least `stagger` after the previous start on this server, not
+    // ahead of a waiting user that has none, and either below its share or borrowing capacity no
     // other download is waiting for (a small file that can only use one connection leaves the
     // rest of its share to the others).
     [[nodiscard]] bool may_start(int id, Clock::time_point now) const;

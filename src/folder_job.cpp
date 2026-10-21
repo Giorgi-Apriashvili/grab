@@ -10,6 +10,7 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <format>
 #include <memory>
 #include <system_error>
@@ -106,6 +107,8 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     }
     const auto temp_before = engine::rclone_temp_files(targets);
     std::uint64_t charged = 0;
+    bool worked = false; // its connections count as working (fetch::Connections::working)
+    auto last_check = std::chrono::steady_clock::now();
     auto result = engine::download(
         *job.ctx, Mode::folder, job.remote_path, job.dest,
         [&](const engine::Progress& p) {
@@ -128,6 +131,17 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
                                                             : std::nullopt;
                 }
                 tree.connections = conns;
+            }
+            if (p.bytes > 0 && !worked) {
+                worked = true;
+                job.connections->working(job.server, job.id, reserved);
+            }
+            // Its connections follow its share (review G192): when another download waits for its
+            // own while this holds more, or two or more are free within its share, rclone starts
+            // again with the new number; only the files in flight start over.
+            if (const auto now = std::chrono::steady_clock::now(); now - last_check >= std::chrono::seconds(3)) {
+                last_check = now;
+                if (job.connections->unbalanced(job.server, job.id, reserved)) batch.request_stop();
             }
             notify(job, Event::progress);
         },
@@ -159,7 +173,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
         }
         engine::remove_rclone_temp_files(targets, temp_before, own_files);
     }
-    job.connections->release(job.server, job.id, reserved);
+    job.connections->release(job.server, job.id, reserved, worked);
 
     std::lock_guard lock(m);
     tree.batch_running = false;

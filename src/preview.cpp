@@ -175,6 +175,9 @@ std::vector<std::string> serve_argv(const engine::Context& ctx, std::string_view
     // preview's server at once (G185), a --log-file hid the port line it waits for (G187).
     const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
+    // Its connections are not in the pool (it answers the viewer and the player at any time): at
+    // most two, as more in parallel added no speed through one server (review G146).
+    argv.insert(argv.end(), {"--sftp-connections", "2"});
     argv.insert(argv.end(), {"--sftp-concurrency", budget::is_storage_box(ctx.remote.host) ? "4" : "8"});
     return argv;
 }

@@ -161,8 +161,12 @@ public:
     int reserve(const std::string& server, int id, std::stop_token stop);
     // `worked`: the connection got data (see working), and stops counting as working too.
     void release(const std::string& server, int id, int count = 1, bool worked = false);
-    // A connection of `id` got its first data: the server takes grab's connections.
-    void working(const std::string& server, int id);
+    // `count` connections of `id` got their first data: the server takes grab's connections.
+    void working(const std::string& server, int id, int count = 1);
+    // For an rclone copy holding `held` connections (reserve): whether it should start again
+    // with another number, because another download waits for its share while this holds more
+    // than its own, or because at least two more are free within its share (review G192).
+    [[nodiscard]] bool unbalanced(const std::string& server, int id, int held);
     // When `id` holds more connections than its share while another download waits for its own
     // (e.g. one just joined), gives one up and returns true; the caller then stops that stream
     // and must not release it again.

@@ -53,6 +53,7 @@ TEST_CASE("the local stream server's command line and address") {
     CHECK(std::ranges::find(argv, "-P") == argv.end()); // no console progress
     CHECK(has("--sftp-chunk-size", "255Ki"));
     CHECK(has("--sftp-concurrency", "4")); // few reads in flight: a seek starts in seconds
+    CHECK(has("--sftp-connections", "2")); // outside the pool, so few (G146)
     CHECK(argv.back() == "4");             // after the configured flags, so it wins
     CHECK(std::ranges::find(argv, "--vfs-read-chunk-streams") == argv.end()); // slow to start on a Storage Box
     CHECK(preview::serve_argv(ctx, "/", "t")[3] == "Box.Guest:/");

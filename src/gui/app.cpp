@@ -2256,8 +2256,16 @@ void App::worker_loop(std::stop_token stop) {
                 auto same_target = [](const Item& a, const Item& b) {
                     return a.name == b.name && a.dest == b.dest;
                 };
+                // Nor more downloads on one server than its connections: past that the extra ones
+                // would only wait for one (review G194); a queued one for another server goes first.
+                auto server_full = [&](const Item& i) {
+                    const auto running_there = std::ranges::count_if(items_, [&](const auto& r) {
+                        return r->status == Status::running && r->remote == i.remote;
+                    });
+                    return running_there >= connections_.budget(i.remote);
+                };
                 auto it = std::ranges::find_if(items_, [&](const auto& i) {
-                    return i->status == Status::queued && std::ranges::none_of(items_, [&](const auto& r) {
+                    return i->status == Status::queued && !server_full(*i) && std::ranges::none_of(items_, [&](const auto& r) {
                                return r->status == Status::running && same_target(*r, *i);
                            });
                 });

@@ -337,9 +337,18 @@ void Connections::release(const std::string& server, int id, int count, bool wor
     changed_.notify_all();
 }
 
-void Connections::working(const std::string& server, int id) {
+void Connections::working(const std::string& server, int id, int count) {
     std::lock_guard lock(mutex_);
-    pool(server).working(id, +1);
+    pool(server).working(id, count);
+}
+
+bool Connections::unbalanced(const std::string& server, int id, int held) {
+    std::lock_guard lock(mutex_);
+    auto& p = pool(server);
+    if (p.should_yield(id)) return true;
+    const int share = p.share(id);
+    const int free = p.budget() - p.total_active();
+    return held < share && std::min(share, held + free) >= held + 2;
 }
 
 bool Connections::yield_if_over_share(const std::string& server, int id) {
@@ -515,6 +524,26 @@ std::chrono::seconds backoff(int attempt) {
     return std::chrono::seconds(steps[std::clamp(attempt - 1, 0, 5)]);
 }
 
+// The download's place in its server's pool, from the size check on, left on every way out.
+class Seat {
+public:
+    Seat(Connections& connections, const Download& d, int weight) : connections_(connections), d_(d) {
+        if (!d.joined) connections_.join(d.server, d.id, weight);
+    }
+    Seat(const Seat&) = delete;
+    Seat& operator=(const Seat&) = delete;
+    ~Seat() { leave(); }
+    void leave() {
+        if (!d_.joined && !left_) connections_.leave(d_.server, d_.id);
+        left_ = true;
+    }
+
+private:
+    Connections& connections_;
+    const Download& d_;
+    bool left_ = false;
+};
+
 } // namespace
 
 // ---- a download ------------------------------------------------------------------------------
@@ -523,16 +552,37 @@ Result run(const Download& d, Connections& connections, const std::function<void
            std::stop_token stop) {
     auto failed = [](std::string why) { return Result{Outcome::failed, std::move(why), {}}; };
     const Source& src = d.source;
+    auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
+    Seat seat(connections, d, weight());
 
     proc::RunOptions quiet;
     quiet.detached = true;
     quiet.stop = stop;
     const auto stat = stat_argv(src);
-    if (d.on_command) d.on_command(stat);
-    auto stat_run = proc::run_capture(stat, quiet);
-    if (stop.stop_requested()) return Result{Outcome::stopped, {}, {}};
-    if (!stat_run) return failed(stat_run.error());
-    if (stat_run->exit_code != 0) return failed(server_ops::clean_rclone_error(stat_run->err));
+    // The size check is a connection like the others: taken from the pool, and when the server
+    // is full, asked again 1, 2, 4, 8, then 15 s apart rather than failing the file (review G193).
+    std::expected<proc::CaptureResult, std::string> stat_run;
+    const auto stat_from = Clock::now();
+    for (int attempt = 0;; ++attempt) {
+        if (!connections.acquire(d.server, d.id, stop)) return Result{Outcome::stopped, {}, {}};
+        if (d.on_command) d.on_command(stat);
+        stat_run = proc::run_capture(stat, quiet);
+        const bool refused = stat_run && stat_run->exit_code != 0 && !stop.stop_requested() &&
+                             budget::classify_failure(stat_run->err) == budget::Failure::refused;
+        if (refused) connections.refused(d.server);
+        connections.release(d.server, d.id);
+        if (stop.stop_requested()) return Result{Outcome::stopped, {}, {}};
+        if (!stat_run) return failed(stat_run.error());
+        if (stat_run->exit_code == 0) break;
+        if (!refused || Clock::now() - stat_from >= refused_give_up) {
+            return failed(server_ops::clean_rclone_error(stat_run->err));
+        }
+        std::mutex wait_m;
+        std::condition_variable_any wait_cv;
+        std::unique_lock wait_lock(wait_m);
+        wait_cv.wait_for(wait_lock, stop, std::min(std::chrono::seconds(1 << std::min(attempt, 4)), std::chrono::seconds(15)),
+                         [] { return false; });
+    }
     auto remote = parse_stat(stat_run->out);
     if (!remote) return failed(remote.error());
     if (remote->is_dir) return failed("this is a folder on the server; download it as a folder");
@@ -641,8 +691,6 @@ Result run(const Download& d, Connections& connections, const std::function<void
         return tail;
     };
 
-    auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
-    if (!d.joined) connections.join(d.server, d.id, weight());
     auto stream = [&] {
         for (;;) {
             // A connection first: work found while waiting for one could be gone by then.
@@ -671,9 +719,9 @@ Result run(const Download& d, Connections& connections, const std::function<void
             bool worked = false; // counted as working in the pool, from its first data
             bool write_failed = false;
             bool yielded = false;  // gave the connection to another download mid-range
-            bool restarted = false; // the speed limit changed: start again with fitting flags
-            // The limit's setting this stream starts under; its read-ahead depends on it.
-            const std::uint64_t limit_generation = d.limiter != nullptr ? d.limiter->generation() : 0;
+            bool restarted = false; // the speed limit went on or off: start again with fitting flags
+            // Whether a speed limit is on as this stream starts: its read-ahead depends on that,
+            // not on the limit's value, so only switching it on or off restarts the stream (G76).
             const bool limited = d.limiter != nullptr && d.limiter->rate() > 0;
             proc::RunOptions opts;
             opts.detached = true;
@@ -709,7 +757,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                     yielded = true;
                     return false;
                 }
-                if (d.limiter != nullptr && d.limiter->generation() != limit_generation) {
+                if (d.limiter != nullptr && (d.limiter->rate() > 0) != limited) {
                     restarted = true;
                     return false;
                 }
@@ -821,7 +869,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         }
     }
     streams.clear(); // join
-    if (!d.joined) connections.leave(d.server, d.id);
+    seat.leave();
     checkpoint();
 
     if (stop.stop_requested()) return Result{Outcome::stopped, {}, result.note};

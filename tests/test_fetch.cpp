@@ -141,17 +141,24 @@ TEST_CASE("bandwidth priority weights the connection shares 4:2:1") {
     CHECK(pool.share(3) == 1);
 }
 
-TEST_CASE("more downloads than connections: each still gets one") {
+TEST_CASE("more downloads than connections: never past the budget, and the one without waits first (G194)") {
     budget::ServerPool pool(2);
     auto t = budget::ServerPool::Clock::time_point{} + 10s;
     for (int id = 1; id <= 3; ++id) pool.add_user(id);
-    for (int id = 1; id <= 3; ++id) {
-        CHECK(pool.share(id) == 1);
+    for (int id = 1; id <= 2; ++id) {
         REQUIRE(pool.may_start(id, t));
         pool.started(id, t);
         t += 1s;
     }
-    CHECK(pool.total_active() == 3);
+    CHECK_FALSE(pool.may_start(3, t)); // the budget is a hard cap
+    pool.waiting(3, +1);
+    CHECK(pool.total_active() == 2);
+    pool.finished(1);
+    CHECK_FALSE(pool.may_start(2, t)); // 2 has one, 3 has none and waits: 3 goes first
+    CHECK(pool.may_start(3, t));
+    pool.waiting(3, -1);
+    pool.started(3, t);
+    CHECK(pool.total_active() == 2);
 }
 
 TEST_CASE("a refusal lowers the budget, never below 1, and only while another connection gets data (G10)") {
@@ -441,3 +448,69 @@ TEST_CASE("a local copy is up to date with the same size and a time not older th
     CHECK_FALSE(fetch::up_to_date(dir, 0, "")); // a directory is not a copy of a file
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("a folder's batch learns when to take connections back or give them (G192)") {
+    fetch::Connections c;
+    c.configure("box", 14);
+    c.join("box", 1);
+    const int held = c.reserve("box", 1, {});
+    CHECK(held == 14);
+    CHECK_FALSE(c.unbalanced("box", 1, held)); // alone: all of them
+    c.join("box", 2);
+    std::stop_source give_up;
+    std::jthread file([&](std::stop_token) { (void)c.acquire("box", 2, give_up.get_token()); });
+    std::this_thread::sleep_for(100ms); // the file now waits for its share
+    CHECK(c.unbalanced("box", 1, held)); // so the batch starts again with fewer
+    give_up.request_stop();
+    file.join();
+    c.release("box", 1, held);
+
+    // A batch that started with one while another download held the rest grows when it ends.
+    fetch::Connections d;
+    d.configure("box", 14);
+    d.join("box", 1);
+    d.join("box", 2);
+    for (int i = 0; i < 13; ++i) REQUIRE(d.acquire("box", 2, {}));
+    const int small_batch = d.reserve("box", 1, {});
+    CHECK(small_batch == 1);
+    CHECK_FALSE(d.unbalanced("box", 1, small_batch));
+    d.release("box", 2, 13);
+    d.leave("box", 2);
+    CHECK(d.unbalanced("box", 1, small_batch));
+}
+
+#ifdef _WIN32
+TEST_CASE("a size check refused by a full server is asked again, not failed (G193)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-stat-refused";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // The first size check is refused, the second answers; every read then fails for good, which
+    // ends the download with that read's message rather than the size check's.
+    std::ofstream(dir / "rclone.cmd", std::ios::binary)
+        << "@echo off\r\n" // (labels: an exit /b inside nested parentheses comes back as 0)
+           "if not \"%2\"==\"--stat\" goto read\r\n"
+           "if exist \"%~dp0asked\" goto answer\r\n"
+           "echo x> \"%~dp0asked\"\r\n"
+           "echo CRITICAL: couldn't connect SSH: ssh: disconnect, reason 11: too many connections 1>&2\r\n"
+           "exit /b 1\r\n"
+           ":answer\r\n"
+           "echo {\"Path\":\"f.bin\",\"Name\":\"f.bin\",\"Size\":67108864,\"ModTime\":\"2026-01-01T00:00:00Z\",\"IsDir\":false}\r\n"
+           "exit /b 0\r\n"
+           ":read\r\n"
+           "echo CRITICAL: couldn't connect SSH: ssh: handshake failed: knownhosts: key mismatch 1>&2\r\n"
+           "exit /b 1\r\n";
+    fetch::Connections connections;
+    connections.configure("Main", 12);
+    fetch::Download d;
+    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .config = std::nullopt,
+                             .rclone_remote = "Main", .path = "f.bin", .flags = {}};
+    d.server = "Main";
+    d.id = 1;
+    d.target = dir / "f.bin";
+    const auto r = fetch::run(d, connections, {}, {});
+    CHECK(r.outcome == fetch::Outcome::failed);
+    CHECK_MESSAGE(r.error.find("knownhosts: key mismatch") != std::string::npos, r.error); // got past the size check
+    CHECK(std::filesystem::exists(dir / "asked"));
+    std::filesystem::remove_all(dir);
+}
+#endif

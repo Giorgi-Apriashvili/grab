@@ -108,10 +108,14 @@ bool ServerPool::other_starved(int id) const {
 bool ServerPool::may_start(int id, Clock::time_point now) const {
     const auto* u = find(id);
     if (u == nullptr) return false;
-    // More users than budget: everyone still gets one connection, so the total may exceed the
-    // budget by design only when shares round up to 1.
-    if (total_active() >= std::max(budget_, users())) return false;
+    // Never more than the budget, however many downloads share it: past the server's limit the
+    // extra ones are only refused (review G194). With more users than connections, one that
+    // has none waits its turn ahead of those that have one.
+    if (total_active() >= budget_) return false;
     if (last_start_ && now - *last_start_ < stagger) return false;
+    if (u->active > 0 && std::ranges::any_of(users_, [&](const User& o) { return o.id != id && o.waiting > 0 && o.active == 0; })) {
+        return false;
+    }
     return u->active < share(id) || !other_starved(id);
 }
 
