@@ -1732,8 +1732,9 @@ void App::enqueue(const Value& msg) {
     const Value* groups = msg.find("groups");
     if (groups == nullptr || groups->kind != Value::Kind::array) return;
     // A GUI's working directory is arbitrary, so a relative folder would land somewhere
-    // unexpected; insist on a full path.
-    const auto dest_path = util::path_from_utf8(dest);
+    // unexpected; insist on a full path. One spelling of it ("D:/x/" is D:\x\), for telling two
+    // downloads into one place (G44).
+    const auto dest_path = util::path_from_utf8(dest).lexically_normal();
     const auto answer = existing::parse(msg.string_of("existing").value_or(""));
     if (!dest_path.is_absolute()) {
         Value v = Value::make_object();
@@ -1789,6 +1790,13 @@ void App::enqueue(const Value& msg) {
         }
     }
 
+    // The answer goes for the items whose differing files the question showed in full; any other
+    // asks once it finds some, after its folder is listed (review G26).
+    std::set<std::pair<std::string, std::string>> covered;
+    if (answer) {
+        std::size_t count = 0;
+        [[maybe_unused]] const auto none_shown = conflicts_for(*groups, dest_path, 0, count, &covered);
+    }
     {
         std::lock_guard lock(mutex_);
         for (const auto& group : groups->items) {
@@ -1809,9 +1817,20 @@ void App::enqueue(const Value& msg) {
                 item->name = it.string_of("name").value_or(*path);
                 item->dest = dest_path;
                 item->space_ok = force;
-                item->existing = answer.value_or(existing::Choice::ask);
+                item->existing = answer && covered.contains({remote, *path}) ? *answer : existing::Choice::ask;
                 if (const Value* size = it.find("size"); size && size->kind == Value::Kind::number) {
                     item->total = static_cast<std::uint64_t>(size->number);
+                }
+                // Already in the queue for the same place (the page lets a failed row's file through,
+                // and spells a folder its own way): no second row sharing its partial download; a
+                // failed one starts again from it, with this answer (review G134).
+                if (const auto twin = twin_of(*item)) {
+                    if (twin->status == Status::failed) {
+                        twin->existing = item->existing;
+                        twin->space_ok = force;
+                        requeue(*twin);
+                    }
+                    continue;
                 }
                 items_.push_back(std::move(item));
             }
@@ -1892,7 +1911,7 @@ void App::pause_items(int id) {
 }
 
 std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::filesystem::path& dest, std::size_t shown,
-                                           std::size_t& count) {
+                                           std::size_t& count, std::set<std::pair<std::string, std::string>>* covered) {
     std::vector<Asked> found;
     count = 0;
     auto add = [&](const std::filesystem::path& local, std::string name, std::uint64_t size,
@@ -1915,10 +1934,12 @@ std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::files
                 if (size == nullptr || size->kind != Value::Kind::number) continue;
                 const Value* modified = it.find("modified");
                 const auto target = file_target(dest, *path);
+                const auto before = count;
                 add(target, util::path_to_utf8(target.filename()), static_cast<std::uint64_t>(size->number),
                     modified != nullptr && modified->kind == Value::Kind::number
                         ? std::optional(static_cast<std::int64_t>(modified->number))
                         : std::nullopt);
+                if (covered != nullptr && count > before) covered->emplace(remote, *path);
                 continue;
             }
             // A folder's files, when it was downloaded here before and the list holds them; a
@@ -1932,13 +1953,17 @@ std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::files
             }
             if (!view->index) continue;
             const std::string folder_name = util::path_to_utf8(folder_dir.filename());
-            for (const auto* e : view->index->below(*path).files) {
+            const auto below = view->index->below(*path);
+            const auto before = count;
+            for (const auto* e : below.files) {
                 std::string_view rel = e->path;
                 rel.remove_prefix(std::min(rel.size(), path->size()));
                 while (rel.starts_with('/')) rel.remove_prefix(1);
                 add(folder_dir / local::relative(rel), folder_name + "/" + std::string(rel), e->size.value_or(0),
                     e->modified);
             }
+            // Only a folder the list holds completely had all of its differing files counted.
+            if (covered != nullptr && count > before && below.complete) covered->emplace(remote, *path);
         }
     }
     return found;
@@ -2014,10 +2039,13 @@ void App::cancel_items(int id) {
                 item->status = Status::cancelled;
                 item->speed = 0;
                 item->eta.reset();
+                // Not while another row for the same file into the same place goes on from it (G134).
+                if (twin_of(*item)) continue;
                 if (item->mode == Mode::file) {
                     discard.push_back({.target = item_target(*item), .path = item->path, .server = item->remote});
+                } else {
+                    discard_folder_partials(*item); // finished files stay
                 }
-                else discard_folder_partials(*item); // finished files stay
             } else if (item->status == Status::running) {
                 item->stop_reason = StopReason::cancel;
                 item->stop.request_stop();
@@ -2034,24 +2062,28 @@ void App::retry_item(int id) {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id == id && (item->status == Status::failed || item->status == Status::cancelled)) {
-                // A failed file download continues from its partial file; a cancelled one's
-                // was deleted, so it starts over.
-                const bool cancelled = item->status == Status::cancelled;
-                item->status = Status::queued;
-                item->error.clear();
-                if (item->mode == Mode::folder) {
-                    folder::retry_files(item->tree, cancelled); // after a cancel, everything not finished
-                } else if (!fetch::saved_progress(item_target(*item), item->path, {}, rclone_remote_of(item->remote))) {
-                    item->bytes = 0;
-                }
-                item->speed = 0;
-                item->eta.reset();
+                requeue(*item);
             }
         }
     }
     wake_.notify_all();
     save_queue();
     post_queue();
+}
+
+void App::requeue(Item& item) const {
+    // A failed file download continues from its partial file; a cancelled one's was deleted, so
+    // it starts over.
+    const bool cancelled = item.status == Status::cancelled;
+    item.status = Status::queued;
+    item.error.clear();
+    if (item.mode == Mode::folder) {
+        folder::retry_files(item.tree, cancelled); // after a cancel, everything not finished
+    } else if (!fetch::saved_progress(item_target(item), item.path, {}, rclone_remote_of(item.remote))) {
+        item.bytes = 0;
+    }
+    item.speed = 0;
+    item.eta.reset();
 }
 
 void App::pause_child(int id, const std::string& path) {
@@ -2300,7 +2332,8 @@ void App::worker_loop(std::stop_token stop) {
                 // Never two downloads into the same file or folder at once: they would share
                 // one partial file.
                 auto same_target = [](const Item& a, const Item& b) {
-                    return a.name == b.name && a.dest == b.dest;
+                    // Where they write, as Windows names it: "D:\x\" and "d:\X" are one folder (G44).
+                    return local::key(item_target(a)) == local::key(item_target(b));
                 };
                 // Nor more downloads on one server than its connections: past that the extra ones
                 // would only wait for one (review G194); a queued one for another server goes first.
@@ -2380,7 +2413,7 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     item->eta.reset();
     item->connections = 0;
     item->current.clear();
-    if (item->status == Status::cancelled && item->mode == Mode::file) {
+    if (item->status == Status::cancelled && item->mode == Mode::file && !twin_of(*item)) {
         fetch::discard(item_target(*item), item->path, {}, rclone_remote_of(item->remote));
     }
 }
@@ -2571,6 +2604,15 @@ void App::folder_totals(Item& item) const {
 
 void App::discard_folder_partials(const Item& item) const {
     folder::discard_partials(item.path, folder::local_dir(item.dest, item.path), item.tree, rclone_remote_of(item.remote));
+}
+
+std::shared_ptr<App::Item> App::twin_of(const Item& item) const {
+    const auto key = local::key(item_target(item));
+    const auto it = std::ranges::find_if(items_, [&](const auto& o) {
+        return o.get() != &item && o->remote == item.remote && o->path == item.path && o->mode == item.mode &&
+               o->status != Status::done && o->status != Status::cancelled && local::key(item_target(*o)) == key;
+    });
+    return it == items_.end() ? nullptr : *it;
 }
 
 std::string App::rclone_remote_of(const std::string& server) const {

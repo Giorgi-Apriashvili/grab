@@ -287,10 +287,13 @@ too and goes on without them.
     download is already in the Save-to folder with another size, or older than the server's,
     grab asks first, listing yours and the server's: **Replace**, **Keep both** (the new one is
     saved as "name (2).ext", as Explorer does) or **Skip** (yours stays; that file isn't
-    downloaded). One answer covers the whole download. Files, and folders the file list holds,
-    are asked about before anything is queued; a deeper folder asks once it's listed and waits
-    paused, and Resume shows the question. A copy that matches the server's is no question: it
-    isn't fetched again.
+    downloaded). Files, and folders the file list holds, are asked about before anything is
+    queued, and the answer covers the files the question listed. A folder the file list holds
+    only partly asks for itself once it's listed, and waits paused; Resume shows the question.
+    A copy that matches the server's is no question: it isn't fetched again.
+  - **The same file or folder sent again to the same place is the same download,** however the
+    folder is spelled (`D:/Media/` and `d:\media` are one): one already queued, running or paused
+    stays as it is, and a failed one starts again from its partial file.
   - **A downloaded program never runs in place of a tool.** The programs grab starts by name
     (ssh, curl, tar, ssh-keyscan, the editor, Explorer) come from System32, the Windows folder or
     PATH's full folders, never from the current folder or grab's own, so an `ssh.exe` that lands

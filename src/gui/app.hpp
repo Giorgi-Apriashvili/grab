@@ -286,9 +286,12 @@ private:
     };
     [[nodiscard]] Needed needed_for(const json::Value& groups, const std::filesystem::path& dest);
     // The files of the selection that would replace a different file in `dest` (folders as their
-    // server's saved list holds them): up to `shown` of them, and how many in all.
+    // server's saved list holds them): up to `shown` of them, and how many in all. `covered` gets
+    // the items (server, path) with such files whose all are known: files, and folders the list
+    // holds completely.
     std::vector<Asked> conflicts_for(const json::Value& groups, const std::filesystem::path& dest, std::size_t shown,
-                                     std::size_t& count);
+                                     std::size_t& count,
+                                     std::set<std::pair<std::string, std::string>>* covered = nullptr);
     // The answer for a download waiting with the question: it goes on.
     void resolve_existing(int id, existing::Choice choice);
     // The question's files for the page: {count, files: [{name, size, modified, mineSize, mineModified}]}.
@@ -367,6 +370,12 @@ private:
     // grab.conf's rclone remote for `server` (else the name): partial downloads are told apart by
     // it, so another server's of the same path is left alone (review G20).
     [[nodiscard]] std::string rclone_remote_of(const std::string& server) const;
+    // Another row, not over, for the same server file into the same place (compared as Windows
+    // names it): it shares `item`'s partial download. Caller holds mutex_.
+    [[nodiscard]] std::shared_ptr<Item> twin_of(const Item& item) const;
+    // A failed or cancelled row queued again (Retry): a file goes on from its partial download
+    // when one is left. Caller holds mutex_.
+    void requeue(Item& item) const;
     // The connection budget for a server, from grab.conf, its host and what grab (or the command)
     // learned, read from limits.json each time.
     [[nodiscard]] int connection_budget(const std::string& remote, const std::string& host,

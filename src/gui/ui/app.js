@@ -1992,6 +1992,10 @@ $('#queue').addEventListener('contextmenu', (ev) => {
 // ---- downloads ---------------------------------------------------------------------------
 
 // To the Save-to folder, or with `to` (Download to...) to that folder this once.
+// A folder as Windows names it, for telling two downloads to one place: one kind of separator,
+// none at the end, case ignored ("D:\Media\" and "d:/media" are one folder).
+const placeKey = (dest) => dest.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+
 function download(hits, to = null) {
   if (!hits.length) return;
   const dest = to || $('#dest').value.trim();
@@ -2005,14 +2009,14 @@ function download(hits, to = null) {
   // Skip anything already waiting or running for the same place, and two downloads into the same
   // file (the same name from two servers under All servers): they would write it at once.
   const active = state.queue.filter((q) => ['queued', 'running', 'paused'].includes(q.status));
-  const busy = new Set(active.map((q) => `${q.remote}|${q.path}|${q.dest}`));
-  const targets = new Set(active.map((q) => `${q.dest.toLowerCase()}|${q.name.toLowerCase()}`));
+  const busy = new Set(active.map((q) => `${q.remote}|${q.path}|${placeKey(q.dest)}`));
+  const targets = new Set(active.map((q) => `${placeKey(q.dest)}|${q.name.toLowerCase()}`));
   const clashes = [];
   // Each hit goes to its own server's queue (they differ under All servers).
   const groups = new Map();
   for (const h of hits) {
-    if (busy.has(`${h.remote}|${h.path}|${dest}`)) continue;
-    const target = `${dest.toLowerCase()}|${h.name.toLowerCase()}`;
+    if (busy.has(`${h.remote}|${h.path}|${placeKey(dest)}`)) continue;
+    const target = `${placeKey(dest)}|${h.name.toLowerCase()}`;
     if (targets.has(target)) { clashes.push(h.name); continue; }
     targets.add(target);
     // Folders and files mix: each goes as its own kind of download.

@@ -78,6 +78,14 @@ TEST_CASE("local paths compared as Windows does") {
     CHECK(local::key(util::path_from_utf8("C:\\dl\\a.bin")) != local::key(util::path_from_utf8("C:\\dl\\a.bin.grabpart")));
 }
 
+TEST_CASE("one folder spelled two ways is one place for a download") {
+    // The window takes the Save-to folder as typed, normalized (review G44).
+    const auto typed = util::path_from_utf8("d:/Media/").lexically_normal();
+    const auto picked = util::path_from_utf8("D:\\media");
+    CHECK(local::key(typed / "big.bin") == local::key(picked / "BIG.bin"));
+    CHECK(local::key(typed / local::relative("Season 1")) == local::key(picked / "season 1"));
+}
+
 TEST_CASE("a remote path never leaves the download folder") {
     const std::filesystem::path dest = util::path_from_utf8("C:\\Users\\me\\Downloads");
     // Below dest, and every part a plain name that Windows reads as written.
