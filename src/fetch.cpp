@@ -813,50 +813,58 @@ Result run(const Download& d, Connections& connections, const std::function<void
             opts.stop = token;
             const auto cat = cat_argv(src, offset, count, limited);
             if (d.on_command) d.on_command(cat);
-            auto run = proc::run_piped(cat, [&](std::string_view data) {
-                // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
-                if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token, d.id, weight())) return false;
-                {
-                    // Under the lock: the range may have been shortened by a split meanwhile.
-                    std::lock_guard lock(m);
-                    if (token.stop_requested()) return false;
-                    Range& r = state.ranges[i];
-                    data = data.substr(0, static_cast<std::size_t>(std::min<std::uint64_t>(data.size(), r.remaining())));
-                    if (!data.empty() && !file.write_at(r.start + r.done, data)) {
-                        write_failed = true;
+            auto run = proc::run_piped(cat, [&](std::string_view chunk) {
+                // Under a speed limit, in slices of 64 KiB: bytes pass evenly rather than a pipe's
+                // worth (up to 1 MiB) at a time, and no slice waits for a full bucket, whose excess
+                // a late wake-up would lose (the limit came out 5% short).
+                const std::size_t slice = limited ? std::size_t{64} << 10 : chunk.size();
+                while (!chunk.empty()) {
+                    std::string_view data = chunk.substr(0, slice);
+                    chunk.remove_prefix(data.size());
+                    // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
+                    if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token, d.id, weight())) return false;
+                    {
+                        // Under the lock: the range may have been shortened by a split meanwhile.
+                        std::lock_guard lock(m);
+                        if (token.stop_requested()) return false;
+                        Range& r = state.ranges[i];
+                        data = data.substr(0, static_cast<std::size_t>(std::min<std::uint64_t>(data.size(), r.remaining())));
+                        if (!data.empty() && !file.write_at(r.start + r.done, data)) {
+                            write_failed = true;
+                            return false;
+                        }
+                        r.done += data.size();
+                        got += data.size();
+                        refused_since.reset(); // the server takes this download's connections
+                        refused_streak = 0;
+                        if (!worked && !data.empty()) {
+                            worked = true;
+                            connections.working(d.server, d.id);
+                        }
+                        if (r.remaining() == 0) return false;
+                    }
+                    // A download that just joined this server gets its share now, not when this
+                    // range ends; what was written stays and the range is picked up again later.
+                    if (connections.yield_if_over_share(d.server, d.id)) {
+                        yielded = true;
                         return false;
                     }
-                    r.done += data.size();
-                    got += data.size();
-                    refused_since.reset(); // the server takes this download's connections
-                    refused_streak = 0;
-                    if (!worked && !data.empty()) {
-                        worked = true;
-                        connections.working(d.server, d.id);
+                    // Another file of the folder started: this one keeps only its even part (taken off
+                    // here, so its other streams don't all give theirs up at once).
+                    if (d.streams_cap) {
+                        const int cap = d.streams_cap();
+                        int h = holding.load();
+                        while (h > cap && !holding.compare_exchange_weak(h, h - 1)) {
+                        }
+                        if (h > cap) {
+                            gave_way = true;
+                            return false;
+                        }
                     }
-                    if (r.remaining() == 0) return false;
-                }
-                // A download that just joined this server gets its share now, not when this
-                // range ends; what was written stays and the range is picked up again later.
-                if (connections.yield_if_over_share(d.server, d.id)) {
-                    yielded = true;
-                    return false;
-                }
-                // Another file of the folder started: this one keeps only its even part (taken off
-                // here, so its other streams don't all give theirs up at once).
-                if (d.streams_cap) {
-                    const int cap = d.streams_cap();
-                    int h = holding.load();
-                    while (h > cap && !holding.compare_exchange_weak(h, h - 1)) {
-                    }
-                    if (h > cap) {
-                        gave_way = true;
+                    if (d.limiter != nullptr && (d.limiter->rate() > 0) != limited) {
+                        restarted = true;
                         return false;
                     }
-                }
-                if (d.limiter != nullptr && (d.limiter->rate() > 0) != limited) {
-                    restarted = true;
-                    return false;
                 }
                 return true;
             }, opts);
