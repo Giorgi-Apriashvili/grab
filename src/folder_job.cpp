@@ -310,9 +310,9 @@ File make_file(std::string path, std::uint64_t size, std::string modtime) {
     f.path = std::move(path);
     f.size = size;
     f.modtime = std::move(modtime);
-    // A device name (CON, nul.txt...) anywhere in its path: grab fetches it itself, since rclone
-    // would write it through a \\?\ path most programs can't open, under another name than grab's.
-    f.big = is_big(size) || local::has_device(f.path);
+    // A name grab gives otherwise than rclone anywhere in its path (a device name, a short name,
+    // bidi controls): grab fetches it itself, since rclone would write it under rclone's name.
+    f.big = is_big(size) || local::differs_from_rclone(f.path);
     return f;
 }
 

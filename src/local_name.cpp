@@ -1,9 +1,11 @@
 #include "local_name.hpp"
 
+#include "rclone_encoding.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <vector>
 
@@ -14,8 +16,6 @@
 namespace grab::local {
 
 namespace {
-
-constexpr char32_t quote = U'‛'; // ‛
 
 void append_utf8(std::string& out, char32_t c) {
     if (c < 0x80) {
@@ -83,32 +83,21 @@ std::vector<Piece> pieces(std::string_view s) {
     return out;
 }
 
-// What rclone writes for a character that Windows won't take in a name (0 for one it keeps).
-char32_t replacement(char32_t r) {
-    if (r < 0x20) return U'␀' + r; // control characters: ␀..␟
-    switch (r) {
-    case U'"': return U'＂';
-    case U'*': return U'＊';
-    case U'/': return U'／';
-    case U':': return U'：';
-    case U'<': return U'＜';
-    case U'>': return U'＞';
-    case U'?': return U'？';
-    case U'\\': return U'＼';
-    case U'|': return U'｜';
-    default: return 0;
-    }
+// Bidi controls: marks, embeddings, overrides and isolates. They make a name read otherwise
+// than it is ("invoice<U+202E>fdp.exe" shows as "invoiceexe.pdf"), in grab's window and in
+// Explorer alike (review G51).
+bool is_bidi(char32_t r) {
+    return r == 0x061C || r == 0x200E || r == 0x200F || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069);
 }
 
-// A character that already is one of those replacements: quoted, so the name stays distinct.
-bool quoted(char32_t r) {
-    switch (r) {
-    case U'＂': case U'＊': case U'／': case U'：': case U'＜': case U'＞':
-    case U'？': case U'＼': case U'｜': case quote:
-        return true;
-    default:
-        return false;
+std::string without_bidi(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (const auto& p : pieces(s)) {
+        if (p.bad >= 0) out += static_cast<char>(p.bad);
+        else if (!is_bidi(p.rune)) append_utf8(out, p.rune);
     }
+    return out;
 }
 
 char32_t upper(char32_t c) { return c >= U'a' && c <= U'z' ? c - 32 : c; }
@@ -129,49 +118,49 @@ bool is_device(std::string_view local_name) {
     return false;
 }
 
-std::string name(std::string_view remote_name) {
-    if (remote_name == ".") return "．";
-    if (remote_name == "..") return "．．";
-    const auto ps = pieces(remote_name);
-    std::string out;
-    out.reserve(remote_name.size() + 8);
-    for (std::size_t i = 0; i < ps.size(); ++i) {
-        const auto& p = ps[i];
-        if (p.bad >= 0) {
-            append_utf8(out, quote);
-            out += std::format("{:02X}", p.bad);
-            continue;
-        }
-        const bool last = i + 1 == ps.size();
-        if (last && p.rune == U' ') {
-            append_utf8(out, U'␠'); // ␠
-        } else if (last && p.rune == U'.') {
-            append_utf8(out, U'．'); // ．
-        } else if (last && (p.rune == U'␠' || p.rune == U'．')) {
-            append_utf8(out, quote);
-            append_utf8(out, p.rune);
-        } else if (const char32_t rep = replacement(p.rune)) {
-            append_utf8(out, rep);
-        } else if (quoted(p.rune)) {
-            append_utf8(out, quote);
-            append_utf8(out, p.rune);
-        } else {
-            append_utf8(out, p.rune);
-        }
+bool is_short_name(std::string_view local_name) {
+    // NAME~N or NAME~N.EXT as Windows makes them: up to 8 ASCII characters ending in ~ and a
+    // number, up to 3 after a single period. Windows finds them in any case.
+    const auto dot = local_name.find('.');
+    const auto base = local_name.substr(0, dot);
+    if (dot != std::string_view::npos) {
+        const auto ext = local_name.substr(dot + 1);
+        if (ext.empty() || ext.size() > 3 || ext.find('.') != std::string_view::npos) return false;
     }
-    if (is_device(out)) out.insert(std::min(out.find('.'), out.size()), "_");
+    if (base.size() < 3 || base.size() > 8) return false;
+    if (!std::ranges::all_of(local_name, [](char c) { return static_cast<unsigned char>(c) < 0x80; })) return false;
+    const auto tilde = base.rfind('~');
+    if (tilde == std::string_view::npos || tilde == 0 || tilde + 1 == base.size()) return false;
+    return std::ranges::all_of(base.substr(tilde + 1), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::string name(std::string_view remote_name) {
+    std::string out = rclone_enc::from_standard_name(without_bidi(remote_name));
+    if (out.empty()) return "_"; // nothing but bidi controls
+    if (is_device(out) || is_short_name(out)) out.insert(std::min(out.find('.'), out.size()), "_");
     return out;
 }
 
-bool has_device(std::string_view remote_rel) {
+bool differs_from_rclone(std::string_view remote_rel) {
     while (!remote_rel.empty()) {
         const auto slash = remote_rel.find('/');
         const auto part = remote_rel.substr(0, slash);
-        if (!part.empty() && is_device(part)) return true;
+        if (!part.empty() && name(part) != rclone_enc::from_standard_name(part)) return true;
         if (slash == std::string_view::npos) break;
         remote_rel.remove_prefix(slash + 1);
     }
     return false;
+}
+
+std::string bidi_visible(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const auto& p : pieces(text)) {
+        if (p.bad >= 0) out += static_cast<char>(p.bad);
+        else if (is_bidi(p.rune)) out += std::format("⟨U+{:04X}⟩", static_cast<std::uint32_t>(p.rune));
+        else append_utf8(out, p.rune);
+    }
+    return out;
 }
 
 std::filesystem::path::string_type key(const std::filesystem::path& p) {

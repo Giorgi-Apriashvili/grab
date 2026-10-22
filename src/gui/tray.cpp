@@ -1,6 +1,10 @@
 #include "tray.hpp"
 
+#include "local_name.hpp"
+#include "util.hpp"
+
 #include <cwchar>
+#include <string>
 
 namespace grab::gui {
 
@@ -8,9 +12,11 @@ namespace {
 
 template <std::size_t N>
 void copy_text(wchar_t (&dst)[N], std::wstring_view src) {
+    // A server's name in it can't read backwards (review G51).
+    const std::wstring text = util::to_wide(local::bidi_visible(util::to_utf8(src)));
     // Truncates to fit; the shell shows at most N - 1 characters anyway.
-    const std::size_t n = src.size() < N ? src.size() : N - 1;
-    std::wmemcpy(dst, src.data(), n);
+    const std::size_t n = text.size() < N ? text.size() : N - 1;
+    std::wmemcpy(dst, text.data(), n);
     dst[n] = L'\0';
 }
 

@@ -78,8 +78,15 @@ const state = {
 const webview = window.chrome && window.chrome.webview;
 function send(msg) { if (webview) webview.postMessage(msg); }
 
+// Bidi controls in a server's text shown as marks, so a name can't read backwards:
+// "invoice⟨U+202E⟩fdp.exe", not "invoiceexe.pdf" (review G51; the tray does the same).
+const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+function bidiVisible(s) {
+  return String(s).replace(BIDI, (c) => `⟨U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}⟩`);
+}
+
 function esc(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  return bidiVisible(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 function fmtSize(bytes) {
@@ -174,7 +181,7 @@ function exactOn() { return $('#exact').getAttribute('aria-pressed') === 'true';
 function showBanner(text) {
   const b = $('#banner');
   b.hidden = !text;
-  b.textContent = text || '';
+  b.textContent = bidiVisible(text || '');
 }
 
 function setSearching(on) {
@@ -341,18 +348,18 @@ function renderEmpty() {
     empty.innerHTML = `<span><span class="spinner"></span>Searching ${u.all ? 'every server' : `${esc(u.name)} and its folders`}` +
       ` for “${esc(state.lastQuery)}”…</span>`;
   } else if (u && u.error) {
-    empty.textContent = u.error;
+    empty.textContent = bidiVisible(u.error);
   } else if (u) {
-    empty.textContent = `Nothing ${u.all ? 'on any server' : `in ${u.name} or its folders`} matches “${u.query}”.`;
+    empty.textContent = bidiVisible(`Nothing ${u.all ? 'on any server' : `in ${u.name} or its folders`} matches “${u.query}”.`);
   } else if (b.loading) {
     empty.innerHTML = `<span><span class="spinner"></span>Opening ${esc(browseHere())}…</span>`;
   } else if (b.error) {
-    empty.textContent = b.error;
+    empty.textContent = bidiVisible(b.error);
   } else if (!state.remotes.length) {
     empty.innerHTML = '<div>No servers yet. Add the Linux server you want to download from.<br>' +
       '<button type="button" class="primary" data-act="add-server">Add a server</button></div>';
   } else if (filter) {
-    empty.textContent = `Nothing in ${browseHere()} matches “${filter}”. Enter searches its folders too.`;
+    empty.textContent = bidiVisible(`Nothing in ${browseHere()} matches “${filter}”. Enter searches its folders too.`);
   } else {
     empty.textContent = 'This folder is empty.';
   }
@@ -370,7 +377,7 @@ function renderSummary() {
   const unknown = sel.some((h) => h.size == null); // folders have no size: at least this much
   let text = state.resultNote || '';
   if (sel.length) text += `${text ? ' · ' : ''}${sel.length} selected${bytes ? ` (${fmtSize(bytes)}${unknown ? '+' : ''})` : ''}`;
-  $('#summary').textContent = text;
+  $('#summary').textContent = bidiVisible(text);
   const count = selectedHits().length;
   const btn = $('#download');
   btn.disabled = count === 0 || !state.remote;
@@ -665,12 +672,12 @@ function drawActivity() {
     el.classList.toggle('fading', fading);
     $('#act-fill').style.width = `${(shown.fill * 100).toFixed(1)}%`;
     const secs = Math.floor((now - shown.start) / 1000);
-    const text = shown.text + (!shown.end && secs >= 2 ? ` · ${secs} s` : '');
+    const text = bidiVisible(shown.text + (!shown.end && secs >= 2 ? ` · ${secs} s` : ''));
     if ($('#act-text').textContent !== text) $('#act-text').textContent = text;
     const others = live.filter((a) => a !== shown);
     $('#act-more').hidden = !others.length;
     $('#act-more').textContent = `+${others.length}`;
-    el.title = [shown.detail, ...others.map((a) => `Also: ${a.text}`)].filter(Boolean).join('\n');
+    el.title = bidiVisible([shown.detail, ...others.map((a) => `Also: ${a.text}`)].filter(Boolean).join('\n'));
   }
   if (activities.size) activityFrame = requestAnimationFrame(drawActivity);
 }
@@ -761,8 +768,8 @@ function showViewerItem() {
   const url = previewUrl(h);
   const token = ++viewer.token;
   const info = [fmtSize(h.size), fmtDate(h.modified)].filter(Boolean);
-  $('#viewer-name').textContent = h.name;
-  $('#viewer-name').title = h.path;
+  $('#viewer-name').textContent = bidiVisible(h.name);
+  $('#viewer-name').title = bidiVisible(h.path);
   $('#viewer-info').textContent = info.join(' · ');
   $('#viewer-pos').textContent = viewer.list.length > 1 ? `${viewer.index + 1} / ${viewer.list.length}` : '';
   $('#viewer-prev').disabled = viewer.index <= 0;
@@ -774,7 +781,7 @@ function showViewerItem() {
     if (token !== viewer.token) return;
     const p = document.createElement('div');
     p.className = 'viewer-error';
-    p.textContent = text || 'Couldn’t load the preview.';
+    p.textContent = bidiVisible(text || 'Couldn’t load the preview.');
     body.replaceChildren(p);
   };
   // An error's reason, from the backend's answer.
@@ -817,7 +824,7 @@ function showViewerItem() {
   } else {
     const frame = document.createElement('iframe');
     frame.className = 'viewer-pdf';
-    frame.title = h.name;
+    frame.title = bidiVisible(h.name);
     frame.src = url;
     body.replaceChildren(frame);
     fetchAhead();
@@ -1499,7 +1506,7 @@ function renderBrowseBar() {
   // Where the folder's rows came from, in the footer (search results have their own, beside it).
   const status = $('#browse-status');
   if (state.flash && state.flash.until > Date.now()) {
-    status.textContent = state.flash.text;
+    status.textContent = bidiVisible(state.flash.text);
   } else if (a.error && !b.under && !a.editing) {
     status.innerHTML = `<span class="bad" title="${esc(a.error)}">${esc(a.error)}</span>`;
   } else if (b.under) {
@@ -2142,7 +2149,7 @@ function renderTree(el, q) {
     if (!w.child) {
       row.className = 'q-child q-summary';
       row.querySelector('.q-cico').hidden = true;
-      row.querySelector('.q-cname').textContent = w.text;
+      row.querySelector('.q-cname').textContent = bidiVisible(w.text);
       row.querySelector('.q-cmeta').textContent = '';
       row.querySelector('.q-cbar').hidden = true;
       row.querySelector('.q-cactions').innerHTML = '';
@@ -2155,8 +2162,8 @@ function renderTree(el, q) {
     icon.hidden = false;
     setIcon(icon, c.path, false);
     const name = row.querySelector('.q-cname');
-    name.textContent = c.path;
-    name.title = c.path;
+    name.textContent = bidiVisible(c.path);
+    name.title = bidiVisible(c.path);
     const bar = row.querySelector('.q-cbar');
     bar.hidden = !(c.status === 'running' || c.status === 'paused' || c.bytes > 0);
     bar.firstChild.style.width = `${c.size ? Math.min(100, (100 * c.bytes) / c.size) : 0}%`;
@@ -2174,7 +2181,7 @@ function renderTree(el, q) {
       meta = `Queued · ${fmtSize(c.size)}`;
     }
     row.querySelector('.q-cmeta').textContent = meta;
-    row.querySelector('.q-cmeta').title = c.status === 'failed' ? c.error : '';
+    row.querySelector('.q-cmeta').title = c.status === 'failed' ? bidiVisible(c.error) : '';
     const actions = c.status === 'paused' ? [['cresume', 'Resume'], ['cskip', 'Skip']]
       : c.status === 'failed' ? [['cskip', 'Skip']]
         : [['cpause', 'Pause'], ['cskip', 'Skip']];
@@ -2220,8 +2227,8 @@ function renderQueue() {
     prio.className = `q-prio prio-${q.priority}`;
     if (document.activeElement !== prio) prio.value = q.priority;
     setIcon(el.querySelector('.q-ico'), q.name, q.mode === 'folder');
-    el.querySelector('.q-name').textContent = q.mode === 'folder' ? `${q.name}/` : q.name;
-    el.querySelector('.q-name').title = `${q.remote}:${q.path}`;
+    el.querySelector('.q-name').textContent = bidiVisible(q.mode === 'folder' ? `${q.name}/` : q.name);
+    el.querySelector('.q-name').title = bidiVisible(`${q.remote}:${q.path}`);
     const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;
     el.querySelector('.q-bar > div').style.width = `${q.status === 'done' || q.verifying ? 100 : pct}%`;
     const sizes = q.total ? `${fmtSize(q.bytes)} of ${fmtSize(q.total)}` : fmtSize(q.bytes);
@@ -2265,9 +2272,9 @@ function renderQueue() {
     }
     const sub = el.querySelector('.q-sub');
     // A paused download's reason (the free-space check) comes first; the whole line shows on hover.
-    sub.textContent = q.status === 'failed' && q.error ? q.error
+    sub.textContent = bidiVisible(q.status === 'failed' && q.error ? q.error
       : q.note && q.status === 'paused' ? `${q.note} · → ${q.dest}`
-        : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`;
+        : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`);
     sub.title = sub.textContent;
     renderTree(el, q);
   }
@@ -2499,7 +2506,7 @@ function onUpdateChecked(msg) {
   $('#update-now').disabled = false;
   const r = $('#update-result');
   r.className = msg.ok ? (msg.available ? 'good' : 'muted') : 'bad';
-  r.textContent = msg.text;
+  r.textContent = bidiVisible(msg.text);
   if (msg.available) { state.updateLater = false; renderUpdate(); }
 }
 
@@ -2655,7 +2662,7 @@ const AUTH_TEXT = { password: 'password', key: 'key file', agent: 'ssh-agent' };
 function showSettingsBanner(text) {
   const b = $('#settings-banner');
   b.hidden = !text;
-  b.textContent = text || '';
+  b.textContent = bidiVisible(text || '');
 }
 
 function setStatus(text) {
@@ -2853,7 +2860,7 @@ let modal = null; // { onOk, onCancel }
 
 function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [] }) {
   modal = { onOk, onCancel };
-  $('#modal-title').textContent = title;
+  $('#modal-title').textContent = bidiVisible(title);
   $('#modal-body').innerHTML = html;
   $('#modal-cancel').textContent = cancel;
   const okBtn = $('#modal-ok');
@@ -2909,7 +2916,7 @@ function onServerError(msg) {
   setStatus('');
   const target = msg.field && settings.form && document.querySelector(`.field-error[data-for="${msg.field}"]`);
   if (target) {
-    target.textContent = msg.message;
+    target.textContent = bidiVisible(msg.message);
     const input = { name: '#f-name', host: '#f-host', port: '#f-port', user: '#f-user', keyFile: '#f-key',
       secret: '#f-secret', depth: '#f-depth', connections: '#f-conns' }[msg.field];
     if (input) $(input).focus();

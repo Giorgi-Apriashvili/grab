@@ -266,7 +266,7 @@ std::expected<Report, std::string> run(const Request& r, std::stop_token stop) {
     // A folder rclone can't be told the name of (rclone_encoding.hpp): every file by its sum.
     const bool checkable = rclone_enc::local_path(r.local_dir).has_value();
     for (const auto& p : r.paths) {
-        (!checkable || local::has_device(p) || r.renamed.contains(p) ? devices : plain).push_back(p);
+        (!checkable || local::differs_from_rclone(p) || r.renamed.contains(p) ? devices : plain).push_back(p);
     }
     Report report;
     if (!plain.empty()) {

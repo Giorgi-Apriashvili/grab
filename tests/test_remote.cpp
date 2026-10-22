@@ -10,6 +10,7 @@
 #include <format>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace grab;
@@ -296,4 +297,12 @@ TEST_CASE("choose_matches: single, --first, --all, non-interactive, interactive"
         CHECK(err.str().find("[101]") == std::string::npos);
         CHECK(err.str().find("20 more not shown") != std::string::npos);
     }
+}
+
+TEST_CASE("find answering \"/\" or \".\" gives no hit (G15)") {
+    // A hostile server, or a search at the top: its local target would be DEST itself.
+    using namespace std::string_view_literals;
+    const auto hits = parse_find_output("1697000000\t/\0" "1697000000\t.\0" "1697000000\t/srv/x\0"sv, false);
+    REQUIRE(hits.size() == 1);
+    CHECK(hits[0].path == "/srv/x");
 }

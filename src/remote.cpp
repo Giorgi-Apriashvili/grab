@@ -1,6 +1,7 @@
 #include "remote.hpp"
 
 #include "quote.hpp"
+#include "rclone.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -110,7 +111,7 @@ std::vector<RemoteEntry> parse_find_output(std::string_view out, bool sized) {
             }
         }
         if (item.starts_with("./")) item.remove_prefix(2);
-        if (item.empty()) continue;
+        if (!has_name(item)) continue; // "/", ".": nothing to save it under (review G15)
         e.path = std::string(item);
         entries.push_back(std::move(e));
     }

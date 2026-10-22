@@ -275,6 +275,8 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent); }
 .results:focus #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
 .name, .dir, .modified { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A right-to-left name keeps to its own box: it can't reorder what's around it (review G51). */
+.name, .dir, .q-name, .q-cname, #viewer-name { unicode-bidi: isolate; }
 .row .ico { width: 16px; height: 16px; margin-right: 7px; vertical-align: -3px; fill: var(--folder); }
 svg.ico.f-video { fill: var(--f-video); }
 svg.ico.f-audio { fill: var(--f-audio); }

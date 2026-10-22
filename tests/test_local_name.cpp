@@ -11,7 +11,8 @@
 using namespace grab;
 
 TEST_CASE("remote names as rclone writes them on Windows") {
-    // Every pair is what rclone 1.75.1 wrote for the same Linux file name (2026-10-19), but the
+    // Every pair is what rclone 1.75.1 wrote for the same Linux file name (2026-10-19; over SFTP
+    // from Main 2026-10-22, review G24: rclone's own replacements in a server name), but the
     // device names, which grab gives a "_".
     const std::vector<std::pair<std::string, std::string>> rclone{
         {"..\\escaped.bin", "..＼escaped.bin"},
@@ -41,6 +42,20 @@ TEST_CASE("remote names as rclone writes them on Windows") {
         {"bad\xFF" "byte.txt", "bad‛FFbyte.txt"},
         {"normal.txt", "normal.txt"},
         {"console.txt", "console.txt"},
+        {"AC／DC.txt", "AC／DC.txt"},
+        {"del␡.txt", "del\x7F.txt"},
+        {"．", "．"},
+        {"．．", "．．"},
+        {"‛．", "‛．"},
+        {"‛．．", "‛‛．‛．"},
+        {"q‛／.txt", "q‛／.txt"},
+        {"q‛‛.txt", "q‛‛.txt"},
+        {"x‛．", "x‛‛‛．"},
+        {"a‛＼b.txt", "a‛‛‛＼b.txt"},
+        {"ends‛", "ends‛‛"},
+        {"‛plain.txt", "‛‛plain.txt"},
+        {"lt＜gt＞.txt", "lt‛＜gt‛＞.txt"},
+        {"␀zero.txt", "␀zero.txt"},
     };
     for (const auto& [remote, local] : rclone) {
         INFO(remote);
@@ -67,9 +82,41 @@ TEST_CASE("Windows device names get an underscore") {
     CHECK(local::name("console.txt") == "console.txt");
     CHECK(local::is_device("con .txt")); // Windows ignores the spaces before the extension
     CHECK_FALSE(local::is_device("conn"));
-    CHECK(local::has_device("season 1/CON/e01.mkv"));
-    CHECK(local::has_device("aux.srt"));
-    CHECK_FALSE(local::has_device("season 1/e01.mkv"));
+    CHECK(local::differs_from_rclone("season 1/CON/e01.mkv"));
+    CHECK(local::differs_from_rclone("aux.srt"));
+    CHECK_FALSE(local::differs_from_rclone("season 1/e01.mkv"));
+    CHECK_FALSE(local::differs_from_rclone("AC／DC/a:b.txt")); // rclone names those the same
+}
+
+TEST_CASE("names shaped like 8.3 short names get an underscore (G167)") {
+    // On a volume that makes short names, "REPORT~1.DOC" also names "Report for the board.docx".
+    CHECK(local::name("REPORT~1.DOC") == "REPORT~1_.DOC");
+    CHECK(local::name("repor~12.doc") == "repor~12_.doc");
+    CHECK(local::name("report~12.doc") == "report~12.doc"); // 9 before the period: never short
+    CHECK(local::name("PROGRA~1") == "PROGRA~1_");
+    CHECK(local::name("AB12C3~1.TXT") == "AB12C3~1_.TXT");
+    CHECK(local::name("a~1") == "a~1_");
+    CHECK(local::name("REPORT~1.DOCX") == "REPORT~1.DOCX"); // a short name's extension has 3
+    CHECK(local::name("LONGNAME~1.TXT") == "LONGNAME~1.TXT"); // and its name 8
+    CHECK(local::name("~1.txt") == "~1.txt");
+    CHECK(local::name("a~b.txt") == "a~b.txt");
+    CHECK(local::name("a~1.tar.gz") == "a~1.tar.gz");
+    CHECK(local::name("Ä~1.txt") == "Ä~1.txt"); // Windows makes them of ASCII
+    CHECK(local::is_short_name("x~9"));
+    CHECK(local::differs_from_rclone("docs/PROGRA~1/a.txt"));
+}
+
+TEST_CASE("bidi controls are dropped from a saved name and shown as marks (G51)") {
+    CHECK(local::name("invoice\u202Efdp.exe") == "invoicefdp.exe");
+    CHECK(local::name("a\u2066b\u2069\u200F\u061C.txt") == "ab.txt");
+    CHECK(local::name("\u202E") == "_");
+    CHECK(local::name("end.\u202E") == "end．"); // what's left is encoded as a whole
+    CHECK(local::name("\u202E..") == "．．");
+    CHECK(local::name("bad\xFF\u202E") == "bad‛FF");
+    CHECK(local::differs_from_rclone("x/invoice\u202Efdp.exe"));
+    CHECK(local::bidi_visible("invoice\u202Efdp.exe") == "invoice⟨U+202E⟩fdp.exe");
+    CHECK(local::bidi_visible("a\u200Eb\xFF") == "a⟨U+200E⟩b\xFF");
+    CHECK(local::bidi_visible("plain ✓") == "plain ✓");
 }
 
 TEST_CASE("local paths compared as Windows does") {

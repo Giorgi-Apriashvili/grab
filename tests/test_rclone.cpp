@@ -113,3 +113,14 @@ TEST_CASE("empty flag lists produce a bare command") {
     CHECK(argv == std::vector<std::string>{"rclone", "copy", "r:/p",
                                            util::path_to_utf8(rq.dest_dir / "p")});
 }
+
+TEST_CASE("a remote path with no name to save it under (G15)") {
+    CHECK(has_name("/srv/x"));
+    CHECK(has_name("x/"));
+    CHECK(has_name("a"));
+    CHECK_FALSE(has_name("/"));
+    CHECK_FALSE(has_name("//"));
+    CHECK_FALSE(has_name(""));
+    CHECK_FALSE(has_name("."));
+    CHECK_FALSE(has_name("/srv/.."));
+}

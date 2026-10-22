@@ -1808,7 +1808,7 @@ void App::enqueue(const Value& msg) {
             state_.last_remote = remote;
             for (const auto& it : items->items) {
                 auto path = it.string_of("path");
-                if (!path) continue;
+                if (!path || !has_name(*path)) continue; // "/": it would land in the Save-to folder itself (G15)
                 auto item = std::make_shared<Item>();
                 item->id = next_id_++;
                 item->remote = remote;

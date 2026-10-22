@@ -15,6 +15,11 @@ std::string remote_basename(std::string_view remote_path) {
     return std::string(remote_path.substr(slash + 1));
 }
 
+bool has_name(std::string_view remote_path) {
+    const auto name = remote_basename(remote_path);
+    return !name.empty() && name != "/" && name != "." && name != "..";
+}
+
 std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path) {
     std::string out(rclone_remote);
     out += ':';

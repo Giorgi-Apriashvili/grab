@@ -277,8 +277,14 @@ too and goes on without them.
   - **Server names become safe Windows names,** the way rclone writes them, so nothing lands
     outside the Save-to folder, whatever a file is called on the server (`..\x`, `C:\x`,
     `\\host\share\x`). `\ : * ? " < > |` become look-alikes (`＼ ： ＊ ？ ＂ ＜ ＞ ｜`), control
-    characters `␀`–`␟`, a trailing space or dot `␠` or `．`. Windows device names get an
-    underscore: `CON_`, `nul_.txt`. rclone encodes every local path it's given once more, so
+    characters `␀`–`␟`, a trailing space or dot `␠` or `．`; a server name that already holds
+    rclone's look-alikes keeps them as rclone does (`AC／DC`). Windows device names get an
+    underscore (`CON_`, `nul_.txt`), and so do names shaped like 8.3 short names (`REPORT~1_.DOC`:
+    on a drive that makes short names, `REPORT~1.DOC` could be your "Report for the board.docx").
+    Bidi controls, which make a name read backwards (`invoice` + U+202E + `fdp.exe` shows as
+    `invoiceexe.pdf`), are left out of the saved name (`invoicefdp.exe`) and show as `⟨U+202E⟩` in
+    the window and its notifications. grab fetches such renamed files itself and checks them by
+    their MD5 sums. rclone encodes every local path it's given once more, so
     grab tells it each folder and file name in the form that comes back as grab's: a folder like
     `Mission: Impossible (1996)` lands in one `Mission： Impossible (1996)`, also when the Save-to
     folder's own name has such characters. A folder whose name rclone can't be told (a `‛` in the
