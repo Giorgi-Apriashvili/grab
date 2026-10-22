@@ -373,6 +373,9 @@ private:
     // Another row, not over, for the same server file into the same place (compared as Windows
     // names it): it shares `item`'s partial download. Caller holds mutex_.
     [[nodiscard]] std::shared_ptr<Item> twin_of(const Item& item) const;
+    // Files the running downloads but `except` download right now, as "At once" counts them: a
+    // file is one, a folder the files it runs (at least one). Caller holds mutex_.
+    [[nodiscard]] int files_in_use(const Item* except = nullptr) const;
     // A failed or cancelled row queued again (Retry): a file goes on from its partial download
     // when one is left. Caller holds mutex_.
     void requeue(Item& item) const;

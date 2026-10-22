@@ -2327,8 +2327,8 @@ void App::worker_loop(std::stop_token stop) {
         {
             std::unique_lock lock(mutex_);
             auto next_queued = [&]() -> std::shared_ptr<Item> {
-                const auto running = std::ranges::count_if(items_, [](const auto& i) { return i->status == Status::running; });
-                if (running >= parallel_) return nullptr;
+                // "At once" counts files: a folder's take places too.
+                if (files_in_use() >= parallel_) return nullptr;
                 // Never two downloads into the same file or folder at once: they would share
                 // one partial file.
                 auto same_target = [](const Item& a, const Item& b) {
@@ -2615,6 +2615,15 @@ std::shared_ptr<App::Item> App::twin_of(const Item& item) const {
     return it == items_.end() ? nullptr : *it;
 }
 
+int App::files_in_use(const Item* except) const {
+    int used = 0;
+    for (const auto& i : items_) {
+        if (i.get() == except || i->status != Status::running) continue;
+        used += i->mode == Mode::folder ? std::max(1, i->tree.files_at_once) : 1;
+    }
+    return used;
+}
+
 std::string App::rclone_remote_of(const std::string& server) const {
     if (auto cfg = load_grab_config(config_path_)) {
         for (const auto& r : cfg->remotes) {
@@ -2637,6 +2646,8 @@ void App::folder_event(Item& item, folder::Event e) {
     }
     if (e == folder::Event::checkpoint) save_queue();
     if (post) post_queue();
+    // A file of it ended: the place may go to another download.
+    if (e == folder::Event::changed) wake_.notify_all();
 }
 
 // A folder is listed once, then its files are fetched by folder::run (shared with the grab
@@ -2676,6 +2687,11 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
         return limit * static_cast<std::uint64_t>(weight) / static_cast<std::uint64_t>(std::max(total_weight, weight));
     };
     job.on_event = [this, item](folder::Event e) { folder_event(*item, e); };
+    // Its files at once: what "At once" leaves of the files other downloads hold.
+    job.files_at_once = [this, item] {
+        std::lock_guard lock(mutex_);
+        return std::max(1, parallel_ - files_in_use(item.get()));
+    };
 
     if (auto listed = folder::list(job, item->tree, mutex_, item_stop); !listed) return fail(listed.error());
     // Files already complete on disk (an earlier run, or downloaded before) are not fetched

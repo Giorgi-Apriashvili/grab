@@ -477,6 +477,15 @@ TEST_CASE("a folder's batch learns when to take connections back or give them (G
     d.release("box", 2, 13);
     d.leave("box", 2);
     CHECK(d.unbalanced("box", 1, small_batch));
+
+    // A batch held to the files it may copy at once ("At once") isn't told to grow past that.
+    fetch::Connections e;
+    e.configure("box", 14);
+    e.join("box", 1);
+    const int capped = e.reserve("box", 1, {}, 2);
+    CHECK(capped == 2);
+    CHECK_FALSE(e.unbalanced("box", 1, capped, 2));
+    CHECK(e.unbalanced("box", 1, capped, 4)); // allowed more: it starts again with them
 }
 
 #ifdef _WIN32

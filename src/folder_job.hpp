@@ -67,7 +67,8 @@ struct Tree {
     // The running small-file batch. Stopping it restarts it without paused or skipped files.
     std::stop_source batch_stop;
     bool batch_running = false;
-    int connections = 0; // open right now
+    int connections = 0;   // open right now
+    int files_at_once = 0; // files it downloads right now: the batch's at once, or its big files running
 };
 
 struct Totals {
@@ -135,6 +136,9 @@ enum class Event {
 struct Job {
     const engine::Context* ctx = nullptr;
     fetch::Connections* connections = nullptr; // nullptr: list() walks with rclone's own (--rclone)
+    // How many of its files it may download at the same time now: "At once", less what other
+    // downloads hold; at least 1. Called without the caller's mutex. Unset: 4.
+    std::function<int()> files_at_once;
     rate::RateLimiter* limiter = nullptr;      // nullptr: unlimited
     std::string server;                   // grab.conf section: the connection pool
     int id = 0;                           // the folder's id in the pool

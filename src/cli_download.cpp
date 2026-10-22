@@ -282,6 +282,7 @@ struct Session {
     std::stop_token stop;
     ScheduleFollower* follower = nullptr; // when the speed schedule applies
     bool verify = false;                  // check downloads against the server's checksum
+    int files_at_once = 4;                // a folder's files at once: the window's "At once"
     // "A different file is already there" (review G105): the answers given in the question before
     // fetching, for the files listed in it (remote path -> answer); one for all the rest
     // (--existing, or a capital letter); anything else is asked when it comes up.
@@ -447,6 +448,7 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
     job.dest = s.dest;
     job.local_name = local_name;
     job.batch_limit = [&s] { return s.limiter.rate(); }; // one download at a time: all of it
+    job.files_at_once = [&s] { return s.files_at_once; }; // the window's "At once"
     job.extra = s.opts.extra;
     job.on_command = s.trace;
     job.on_event = [&](folder::Event) {
@@ -709,6 +711,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
               ctrl_c.token()};
     if (follower) s.follower = &*follower;
     s.verify = verify;
+    s.files_at_once = std::clamp(gui.parallel, min_parallel, max_parallel);
     std::map<std::string, existing::Choice> answered;
     std::optional<existing::Choice> for_rest = opts.existing;
     s.answered = &answered;

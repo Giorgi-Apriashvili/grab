@@ -324,8 +324,12 @@ too and goes on without them.
     Copy path (where it lands on this PC). A file inside a folder download has Pause, Resume,
     Skip and Copy path.
   - Shift+F10 or the menu key opens the menu for the row under the cursor.
-- **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4. Each
-  one can be paused, resumed or cancelled, or all together with Pause all / Resume all and
+- **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4, is how many
+  files download at the same time, all downloads together. Each file of a folder counts: at 1 a
+  folder goes file by file; at 4 it runs up to 4 of its files, fewer while other downloads run.
+  A file then gets more of the server's connections, so fewer at once costs no speed. The
+  grab command downloads a folder's files as many at a time as the window's At once. Each
+  download can be paused, resumed or cancelled, or all together with Pause all / Resume all and
   Cancel all.
 - **Resumable file downloads:** grab fetches a file in byte ranges, several `rclone cat`
   streams at once, into `<name>.grabpart`. It records each range's progress in
@@ -391,9 +395,9 @@ too and goes on without them.
   - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
   - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
     files.
-  - Files of 64 MiB and more take the resumable path above, up to three at a time.
+  - Files of 64 MiB and more take the resumable path above, as many at a time as At once allows.
   - Smaller files go in one `rclone copy` batch that reuses its connections, since a new SSH
-    login per small file would dominate. Pausing drops the progress of small files that were
+    login per small file would dominate; it copies as many at a time as At once allows. Pausing drops the progress of small files that were
     in flight.
   - The batch's connections follow its share: when another download from the same server
     starts, it starts again with fewer within a few seconds, and with more once they're free

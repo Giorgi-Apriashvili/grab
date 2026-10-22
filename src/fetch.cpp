@@ -377,11 +377,11 @@ void Connections::working(const std::string& server, int id, int count) {
     pool(server).working(id, count);
 }
 
-bool Connections::unbalanced(const std::string& server, int id, int held) {
+bool Connections::unbalanced(const std::string& server, int id, int held, int at_most) {
     std::lock_guard lock(mutex_);
     auto& p = pool(server);
     if (p.should_yield(id)) return true;
-    const int share = p.share(id);
+    const int share = std::min(p.share(id), at_most);
     const int free = p.budget() - p.total_active();
     return held < share && std::min(share, held + free) >= held + 2;
 }

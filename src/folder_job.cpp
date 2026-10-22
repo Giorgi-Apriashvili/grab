@@ -46,12 +46,17 @@ unsigned long process_id() {
 #endif
 }
 
+// How many of the folder's files may download at once now (Job::files_at_once).
+int allowed(const Job& job) { return job.files_at_once ? std::max(1, job.files_at_once()) : 4; }
+
 // The queued small files (`batch_files`: their indexes) in one rclone copy: its connection pool
-// is reused for every file, where a new SSH login per small file would dominate. Pausing or
-// skipping one of them restarts the batch without it.
+// is reused for every file, where a new SSH login per small file would dominate. As many files
+// at once as the folder may download, each on a connection of its own; it starts again with
+// another number when that changes. Pausing or skipping one of them restarts the batch without it.
 void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std::size_t>& batch_files,
                const std::stop_token& stop) {
-    const int reserved = job.connections->reserve(job.server, job.id, stop);
+    const int wanted = allowed(job);
+    const int reserved = job.connections->reserve(job.server, job.id, stop, wanted);
     if (reserved == 0) return; // stopped while waiting
     const auto list = fs::temp_directory_path() / std::format("grab-files-{}-{}.txt", process_id(), job.id);
     std::vector<std::string> paths;
@@ -86,6 +91,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
         }
         tree.batch_stop = batch;
         tree.batch_running = true;
+        tree.files_at_once = reserved;
         tree.connections = job.connections->active(job.server, job.id);
     }
     notify(job, Event::changed);
@@ -145,10 +151,13 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
             }
             // Its connections follow its share (review G192): when another download waits for its
             // own while this holds more, or two or more are free within its share, rclone starts
-            // again with the new number; only the files in flight start over.
+            // again with the new number; so does a change of how many files it may download at
+            // once. Only the files in flight start over.
             if (const auto now = std::chrono::steady_clock::now(); now - last_check >= std::chrono::seconds(3)) {
                 last_check = now;
-                if (job.connections->unbalanced(job.server, job.id, reserved)) batch.request_stop();
+                if (job.connections->unbalanced(job.server, job.id, reserved, wanted) || allowed(job) != wanted) {
+                    batch.request_stop();
+                }
             }
             notify(job, Event::progress);
         },
@@ -185,6 +194,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
 
     std::lock_guard lock(m);
     tree.batch_running = false;
+    tree.files_at_once = 0;
     const bool finished = result && result->exit_code == 0;
     for (const auto i : batch_files) {
         auto& f = tree.files[i];
@@ -216,10 +226,11 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     }
 }
 
-// The queued big files, up to three at a time, each resumable like a single-file download.
-// They share the folder's connections (same pool id) and split ranges to keep them busy.
+// The queued big files, each resumable like a single-file download, as many at a time as the
+// folder may download ("At once": Job::files_at_once, asked again as each file ends). They share
+// the folder's connections (same pool id) and split ranges to keep them busy.
 void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& stop) {
-    constexpr int at_once = 3;
+    constexpr int most = 8; // "At once" goes up to 8
     const auto dir = job_dir(job);
     fetch::Reserved reserved;
     {
@@ -232,14 +243,28 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
     auto worker = [&] {
         for (;;) {
             if (stop.stop_requested()) return;
+            const int may = allowed(job); // without the lock: the window's answer takes its own
             std::size_t i = 0;
             std::stop_source file_stop;
             std::string path;
             fs::path target;
+            bool wait = false;
             {
                 std::lock_guard lock(m);
                 auto it = std::ranges::find_if(tree.files, [](const File& f) { return f.big && f.status == State::queued; });
                 if (it == tree.files.end()) return;
+                wait = tree.files_at_once >= may;
+            }
+            if (wait) { // as many as it may are running: another starts when one ends or more are allowed
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
+            }
+            {
+                std::lock_guard lock(m);
+                auto it = std::ranges::find_if(tree.files, [](const File& f) { return f.big && f.status == State::queued; });
+                if (it == tree.files.end()) return;
+                if (tree.files_at_once >= may) continue; // another worker took the place
+                ++tree.files_at_once;
                 i = static_cast<std::size_t>(it - tree.files.begin());
                 it->status = State::running;
                 it->error.clear();
@@ -279,6 +304,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             bool discard = false;
             {
                 std::lock_guard lock(m);
+                --tree.files_at_once;
                 auto& f = tree.files[i];
                 f.speed = 0;
                 f.eta.reset();
@@ -306,7 +332,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
         }
     };
     std::vector<std::jthread> workers;
-    for (int k = 0; k < at_once; ++k) workers.emplace_back(worker);
+    for (int k = 0; k < most; ++k) workers.emplace_back(worker);
 }
 
 } // namespace
