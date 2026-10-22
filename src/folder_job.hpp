@@ -127,8 +127,8 @@ enum class Event {
 
 struct Job {
     const engine::Context* ctx = nullptr;
-    fetch::Connections* connections = nullptr;
-    rate::RateLimiter* limiter = nullptr; // nullptr: unlimited
+    fetch::Connections* connections = nullptr; // nullptr: list() walks with rclone's own (--rclone)
+    rate::RateLimiter* limiter = nullptr;      // nullptr: unlimited
     std::string server;                   // grab.conf section: the connection pool
     int id = 0;                           // the folder's id in the pool
     const std::atomic<int>* weight = nullptr; // bandwidth priority; nullptr = normal

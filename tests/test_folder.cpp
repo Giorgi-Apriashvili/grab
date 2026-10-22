@@ -8,6 +8,9 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -195,3 +198,31 @@ TEST_CASE("a folder's local directory and its files' remote paths") {
     CHECK(folder::child_remote_path("/a/", "b") == "/a/b");
     CHECK(folder::child_remote_path("", "b") == "b");
 }
+
+#ifdef _WIN32
+TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's listing)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-list-no-pool";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // A stand-in rclone: logs its arguments, lists one file.
+    std::ofstream(dir / "rclone.cmd", std::ios::binary)
+        << "@echo off\r\n"
+           ">> \"%~dp0calls.log\" echo %*\r\n"
+           "echo [{\"Path\":\"a.txt\",\"Name\":\"a.txt\",\"Size\":3,\"ModTime\":\"2026-10-21T10:00:00Z\",\"IsDir\":false}]\r\n";
+    engine::Context ctx;
+    ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+    ctx.settings.rclone_remote = "Main";
+    folder::Job job;
+    job.ctx = &ctx; // no job.connections
+    job.remote_path = "/tmp/f";
+    job.dest = dir / "out";
+    folder::Tree tree;
+    std::mutex m;
+    REQUIRE(folder::list(job, tree, m, std::stop_token{}).has_value());
+    REQUIRE(tree.files.size() == 1);
+    CHECK(tree.files[0].path == "a.txt");
+    const auto calls = util::read_file(dir / "calls.log").value_or("");
+    CHECK(calls.find("--checkers") == std::string::npos); // rclone's own walk
+    std::filesystem::remove_all(dir);
+}
+#endif

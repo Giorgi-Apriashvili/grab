@@ -28,7 +28,6 @@
 #include <mutex>
 #include <optional>
 #include <print>
-#include <set>
 #include <stop_token>
 #include <system_error>
 #include <thread>
@@ -567,6 +566,8 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
         std::mutex m;
         folder::Job job;
         job.ctx = &s.ctx;
+        job.connections = &s.connections; // its walk takes them from the pool, as a download's
+        job.server = s.ctx.settings.name;
         job.remote_path = path;
         job.dest = s.dest;
         if (target != folder::local_dir(s.dest, path)) job.local_name = target.filename();

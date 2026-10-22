@@ -13,6 +13,7 @@
 #include <chrono>
 #include <format>
 #include <memory>
+#include <optional>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -453,11 +454,15 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     argv.insert(argv.end(), flags.begin(), flags.end());
     const auto extra = rclone_flags::connection(job.extra);
     argv.insert(argv.end(), extra.begin(), extra.end());
-    // Its walk's connections come from the pool, as the downloads' do (review G191).
-    const fetch::Listing walk(*job.connections, job.server, stop);
-    if (stop.stop_requested()) return {};
-    const auto walk_flags = walk.flags();
-    argv.insert(argv.end(), walk_flags.begin(), walk_flags.end());
+    // Its walk's connections come from the pool, as the downloads' do (review G191); without one
+    // (--rclone), rclone's own.
+    std::optional<fetch::Listing> walk;
+    if (job.connections != nullptr) {
+        walk.emplace(*job.connections, job.server, stop);
+        if (stop.stop_requested()) return {};
+        const auto walk_flags = walk->flags();
+        argv.insert(argv.end(), walk_flags.begin(), walk_flags.end());
+    }
     if (job.on_command) job.on_command(argv);
     proc::RunOptions quiet;
     quiet.detached = true;
