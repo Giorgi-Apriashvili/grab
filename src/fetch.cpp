@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <deque>
 #include <format>
+#include <limits>
 #include <system_error>
 #include <thread>
 
@@ -362,6 +363,11 @@ int Connections::reserve(const std::string& server, int id, std::stop_token stop
     }
     if (counted) p.waiting(id, -1);
     return got;
+}
+
+int Connections::share(const std::string& server, int id) {
+    std::lock_guard lock(mutex_);
+    return pool(server).share(id);
 }
 
 void Connections::release(const std::string& server, int id, int count, bool worked) {
@@ -751,10 +757,27 @@ Result run(const Download& d, Connections& connections, const std::function<void
         return tail;
     };
 
+    // Connections this file's streams hold, against Download::streams_cap.
+    std::atomic<int> holding{0};
     auto stream = [&] {
         for (;;) {
+            // No more than its part of a folder's connections: a place under it is taken before the
+            // connection, so its streams starting together can't all pass; else it waits.
+            int h = holding.load();
+            const int cap = d.streams_cap ? d.streams_cap() : std::numeric_limits<int>::max();
+            while (h < cap && !holding.compare_exchange_weak(h, h + 1)) {
+            }
+            if (h >= cap) {
+                std::unique_lock lock(m);
+                wake.wait_until(lock, token, Clock::now() + std::chrono::milliseconds(250), [] { return false; });
+                if (token.stop_requested()) return;
+                continue;
+            }
             // A connection first: work found while waiting for one could be gone by then.
-            if (!connections.acquire(d.server, d.id, token)) return;
+            if (!connections.acquire(d.server, d.id, token)) {
+                --holding;
+                return;
+            }
             std::size_t i = 0;
             std::uint64_t offset = 0;
             std::uint64_t count = 0;
@@ -765,6 +788,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 if (!pick) {
                     lock.unlock();
                     connections.release(d.server, d.id);
+                    --holding;
                     if (!retry_at || token.stop_requested()) return; // nothing left for this stream
                     lock.lock();
                     wake.wait_until(lock, token, *retry_at, [] { return false; });
@@ -780,6 +804,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
             bool write_failed = false;
             bool yielded = false;  // gave the connection to another download mid-range
             bool restarted = false; // the speed limit went on or off: start again with fitting flags
+            bool gave_way = false;  // over its part of the folder's connections: one for another file
             // Whether a speed limit is on as this stream starts: its read-ahead depends on that,
             // not on the limit's value, so only switching it on or off restarts the stream (G76).
             const bool limited = d.limiter != nullptr && d.limiter->rate() > 0;
@@ -817,6 +842,18 @@ Result run(const Download& d, Connections& connections, const std::function<void
                     yielded = true;
                     return false;
                 }
+                // Another file of the folder started: this one keeps only its even part (taken off
+                // here, so its other streams don't all give theirs up at once).
+                if (d.streams_cap) {
+                    const int cap = d.streams_cap();
+                    int h = holding.load();
+                    while (h > cap && !holding.compare_exchange_weak(h, h - 1)) {
+                    }
+                    if (h > cap) {
+                        gave_way = true;
+                        return false;
+                    }
+                }
                 if (d.limiter != nullptr && (d.limiter->rate() > 0) != limited) {
                     restarted = true;
                     return false;
@@ -825,19 +862,20 @@ Result run(const Download& d, Connections& connections, const std::function<void
             }, opts);
             // A failure before any data arrived says why the connection failed: the server is full
             // (it wants fewer connections), or trying again can't help (review G9).
-            const auto failure = run && run->exit_code != 0 && got == 0 && !yielded && !restarted &&
+            const auto failure = run && run->exit_code != 0 && got == 0 && !yielded && !restarted && !gave_way &&
                                          !token.stop_requested()
                                      ? budget::classify_failure(run->err)
                                      : budget::Failure::other;
             const bool refused = failure == budget::Failure::refused;
             if (refused) connections.refused(d.server);
             if (!yielded) connections.release(d.server, d.id, 1, worked);
+            if (!gave_way) --holding; // given up, it was taken off already
 
             std::lock_guard lock(m);
             busy[i] = 0;
             wake.notify_all();
             if (token.stop_requested()) return;
-            if (yielded || restarted) continue; // not a failure; the range goes on from its bytes
+            if (yielded || restarted || gave_way) continue; // not a failure; the range goes on from its bytes
             if (write_failed) {
                 error = "cannot write " + util::path_to_utf8(part) + " (disk full?)";
                 inner.request_stop();

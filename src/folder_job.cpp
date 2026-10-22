@@ -11,6 +11,7 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <memory>
@@ -240,6 +241,12 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
     auto flags = rclone_flags::connection(job.ctx->settings.common_flags);
     const auto extra = rclone_flags::connection(job.extra);
     flags.insert(flags.end(), extra.begin(), extra.end());
+    // Its big files downloading now: they split the folder's connections evenly, so one that
+    // starts later gets its part instead of waiting for the first ones to end.
+    std::atomic<int> files_running{0};
+    auto even_part = [&] {
+        return std::max(1, job.connections->share(job.server, job.id) / std::max(1, files_running.load()));
+    };
     auto worker = [&] {
         for (;;) {
             if (stop.stop_requested()) return;
@@ -265,6 +272,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                 if (it == tree.files.end()) return;
                 if (tree.files_at_once >= may) continue; // another worker took the place
                 ++tree.files_at_once;
+                ++files_running;
                 i = static_cast<std::size_t>(it - tree.files.begin());
                 it->status = State::running;
                 it->error.clear();
@@ -286,6 +294,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             d.joined = true;
             d.limiter = job.limiter;
             d.weight = job.weight;
+            d.streams_cap = even_part;
             d.on_command = job.on_command;
             std::error_code ec;
             fs::create_directories(d.target.parent_path(), ec);
@@ -305,6 +314,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             {
                 std::lock_guard lock(m);
                 --tree.files_at_once;
+                --files_running;
                 auto& f = tree.files[i];
                 f.speed = 0;
                 f.eta.reset();

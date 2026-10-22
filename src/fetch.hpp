@@ -190,6 +190,8 @@ public:
     [[nodiscard]] std::uint64_t refusals(const std::string& server);
     [[nodiscard]] int active(const std::string& server, int id);
     [[nodiscard]] int budget(const std::string& server);
+    // `id`'s fair part of the server's budget now.
+    [[nodiscard]] int share(const std::string& server, int id);
     // A pool id of its own for a short user (a listing): negative, so never a download's.
     [[nodiscard]] int new_id();
 
@@ -261,6 +263,10 @@ struct Download {
     // Bandwidth priority (high 4, normal 2, low 1), read at each stream start and limiter
     // request, so a change applies while running. nullptr = normal.
     const std::atomic<int>* weight = nullptr;
+    // At most this many streams at once, asked as each starts and at each read: a folder's file
+    // gets an even part of the folder's connections beside its other files downloading. A stream
+    // over it gives its connection up and goes on later from its bytes. Unset: no cap.
+    std::function<int()> streams_cap;
     // Sees every rclone command line before it runs (`grab -v`); called from several threads.
     std::function<void(const std::vector<std::string>&)> on_command;
 };
