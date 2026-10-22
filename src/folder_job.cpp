@@ -1,6 +1,7 @@
 #include "folder_job.hpp"
 
 #include "cli.hpp"
+#include "existing.hpp"
 #include "local_name.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
@@ -14,6 +15,7 @@
 #include <format>
 #include <memory>
 #include <optional>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -44,21 +46,25 @@ unsigned long process_id() {
 #endif
 }
 
-// The queued small files in one rclone copy: its connection pool is reused for every file,
-// where a new SSH login per small file would dominate. Pausing or skipping one of them
-// restarts the batch without it.
-void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std::string>& paths,
+// The queued small files (`batch_files`: their indexes) in one rclone copy: its connection pool
+// is reused for every file, where a new SSH login per small file would dominate. Pausing or
+// skipping one of them restarts the batch without it.
+void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std::size_t>& batch_files,
                const std::stop_token& stop) {
     const int reserved = job.connections->reserve(job.server, job.id, stop);
     if (reserved == 0) return; // stopped while waiting
     const auto list = fs::temp_directory_path() / std::format("grab-files-{}-{}.txt", process_id(), job.id);
-    std::unordered_map<std::string, std::size_t> index; // path -> file
+    std::vector<std::string> paths;
+    {
+        std::lock_guard lock(m);
+        for (const auto i : batch_files) paths.push_back(tree.files[i].path);
+    }
+    std::unordered_map<std::string, std::size_t> index; // path -> file, for the names rclone reports
     if (auto written = util::write_file_atomic(list, files_from_text(paths)); !written) {
         job.connections->release(job.server, job.id, reserved);
         std::lock_guard lock(m);
-        for (std::size_t i = 0; i < tree.files.size(); ++i) index.emplace(tree.files[i].path, i);
-        for (const auto& p : paths) {
-            auto& f = tree.files[index[p]];
+        for (const auto i : batch_files) {
+            auto& f = tree.files[i];
             if (f.status != State::queued) continue;
             f.status = State::failed;
             f.error = written.error();
@@ -71,8 +77,8 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     {
         std::lock_guard lock(m);
         for (std::size_t i = 0; i < tree.files.size(); ++i) index.emplace(tree.files[i].path, i);
-        for (const auto& p : paths) {
-            auto& f = tree.files[index[p]];
+        for (const auto i : batch_files) {
+            auto& f = tree.files[i];
             if (f.status != State::queued) continue;
             f.in_batch = true; // stays queued until rclone starts it
             f.bytes = 0;
@@ -87,7 +93,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     proc::RunOptions run;
     run.detached = true;
     run.stop = batch.get_token();
-    std::vector<std::string> extra{"--files-from-raw", util::path_to_utf8(list), "--transfers",
+    std::vector<std::string> extra{"--files-from0", util::path_to_utf8(list), "--transfers",
                                    std::to_string(reserved), "--sftp-connections", std::to_string(reserved), "-v"};
     // rclone writes these files itself, so the speed limit reaches it as --bwlimit; its bytes
     // are also charged to the shared limiter, which slows grab's own streams to match.
@@ -180,8 +186,8 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     std::lock_guard lock(m);
     tree.batch_running = false;
     const bool finished = result && result->exit_code == 0;
-    for (const auto& p : paths) {
-        auto& f = tree.files[index[p]];
+    for (const auto i : batch_files) {
+        auto& f = tree.files[i];
         const bool was_in_batch = f.in_batch;
         f.in_batch = false;
         if (!was_in_batch || (f.status != State::running && f.status != State::queued)) continue; // done, paused, skipped
@@ -196,7 +202,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
                 f.bytes = f.size;
             } else {
                 f.status = State::failed;
-                f.error = "missing after the copy";
+                f.error = name_not_utf8(f.path) ? std::string(not_utf8_error) : "missing after the copy";
             }
         } else if (batch.stop_requested()) {
             f.status = State::queued; // restarted without a paused/skipped file, or the folder stopped
@@ -314,6 +320,45 @@ File make_file(std::string path, std::uint64_t size, std::string modtime) {
     // bidi controls): grab fetches it itself, since rclone would write it under rclone's name.
     f.big = is_big(size) || local::differs_from_rclone(f.path);
     return f;
+}
+
+void settle_names(std::vector<File>& files) {
+    // rclone's batch would copy one of each clashing group: grab fetches them all.
+    std::vector<std::string> paths;
+    paths.reserve(files.size());
+    for (const auto& f : files) paths.push_back(f.path);
+    const auto clash = local::clashing(paths);
+    // Every file's local path, and every folder on the way to one, as Windows compares them.
+    std::vector<fs::path> locals;
+    locals.reserve(files.size());
+    std::unordered_set<fs::path::string_type> names; // key() of every file's own name
+    std::unordered_set<fs::path::string_type> taken; // key() of every folder, then of names given out
+    for (const auto& f : files) {
+        locals.push_back(local::relative(f.path));
+        const auto& rel = locals.back();
+        for (auto folder = rel.parent_path(); !folder.empty(); folder = folder.parent_path()) taken.insert(local::key(folder));
+        names.insert(local::key(rel));
+    }
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        auto& f = files[i];
+        if (clash.contains(f.path)) f.big = true;
+        if (taken.insert(local::key(locals[i])).second) continue; // the first with this name
+        // An earlier file, or a folder, has this name on Windows: the next free number.
+        const std::string name = util::path_to_utf8(locals[i].filename());
+        bool given = false;
+        for (int n = 2; n < 1000 && !given; ++n) {
+            auto numbered = locals[i].parent_path() / util::path_from_utf8(existing::numbered(name, n));
+            const auto k = local::key(numbered);
+            if (names.contains(k) || !taken.insert(k).second) continue;
+            f.local = std::move(numbered);
+            f.big = true; // grab writes it under that name
+            given = true;
+        }
+        if (!given) {
+            f.status = State::failed;
+            f.error = "no free name for it: other files of the folder have its name on Windows";
+        }
+    }
 }
 
 Totals totals(const Tree& tree) {
@@ -478,6 +523,7 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
         tree.files.clear();
         tree.files.reserve(listing->size());
         for (auto& f : *listing) tree.files.push_back(make_file(std::move(f.path), f.size, std::move(f.modtime)));
+        settle_names(tree.files);
         tree.listed = true;
     }
     notify(job, Event::checkpoint);
@@ -585,14 +631,15 @@ void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
     job.connections->join(job.server, job.id, job.weight != nullptr ? job.weight->load() : 2);
     while (!stop.stop_requested()) {
         // (not "small": windows.h defines that as a macro)
-        std::vector<std::string> small_files;
+        std::vector<std::size_t> small_files;
         bool big_waiting = false;
         {
             std::lock_guard lock(m);
-            for (const auto& f : tree.files) {
+            for (std::size_t i = 0; i < tree.files.size(); ++i) {
+                const auto& f = tree.files[i];
                 if (f.status != State::queued) continue;
                 if (f.big) big_waiting = true;
-                else small_files.push_back(f.path);
+                else small_files.push_back(i);
             }
         }
         if (!small_files.empty()) run_batch(job, tree, m, small_files, stop);

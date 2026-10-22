@@ -2162,8 +2162,10 @@ function renderTree(el, q) {
     icon.hidden = false;
     setIcon(icon, c.path, false);
     const name = row.querySelector('.q-cname');
-    name.textContent = bidiVisible(c.path);
-    name.title = bidiVisible(c.path);
+    // Saved under a name grab gave it: Keep both, or another file of the folder has its own.
+    name.textContent = bidiVisible(c.savedAs ? `${c.path}  → ${c.savedAs}` : c.path);
+    name.title = bidiVisible(c.savedAs ? `${c.path}\nSaved as ${c.savedAs}: a file with its name on Windows is there or in the folder`
+      : c.path);
     const bar = row.querySelector('.q-cbar');
     bar.hidden = !(c.status === 'running' || c.status === 'paused' || c.bytes > 0);
     bar.firstChild.style.width = `${c.size ? Math.min(100, (100 * c.bytes) / c.size) : 0}%`;

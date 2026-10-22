@@ -42,9 +42,13 @@ std::string upper(std::string s) {
     return s;
 }
 
+// A --files-from0 list: a name can hold a line break, never a NUL (review G18).
 std::expected<void, std::string> write_list(const fs::path& file, std::span<const std::string> paths) {
     std::string text;
-    for (const auto& p : paths) text += p + '\n';
+    for (const auto& p : paths) {
+        text += p;
+        text += '\0';
+    }
     return util::write_file_atomic(file, text);
 }
 
@@ -111,24 +115,52 @@ std::expected<Report, std::string> check_names(const Request& r, std::span<const
 std::expected<void, std::string> compare_sums(const Request& r, std::span<const std::string> paths, int held,
                                               const std::stop_token& stop, Report& report) {
     const auto& ctx = *r.ctx;
-    const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}-sums.txt", process_id(), r.id);
-    if (auto written = write_list(list, paths); !written) return util::fail(written.error());
-    std::vector<std::string> argv{ctx.config.rclone, "hashsum", "md5", remote_spec(ctx.settings.rclone_remote, r.remote_dir)};
-    if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    const auto flags = rclone_flags::connection(ctx.settings.common_flags);
-    argv.insert(argv.end(), flags.begin(), flags.end());
-    const auto extra = rclone_flags::connection(r.extra);
-    argv.insert(argv.end(), extra.begin(), extra.end());
-    const auto n = std::to_string(std::max(held, 1));
-    argv.insert(argv.end(), {"--files-from-raw", util::path_to_utf8(list), "--checkers", n, "--sftp-connections", n,
-                             "--sftp-disable-hashcheck=false"});
-    if (r.on_command) r.on_command(argv);
-    auto ran = proc::run_capture(argv, quiet(stop));
+    auto hashsum_argv = [&](const std::string& where) {
+        std::vector<std::string> argv{ctx.config.rclone, "hashsum", "md5", remote_spec(ctx.settings.rclone_remote, where)};
+        if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
+        const auto flags = rclone_flags::connection(ctx.settings.common_flags);
+        argv.insert(argv.end(), flags.begin(), flags.end());
+        const auto extra = rclone_flags::connection(r.extra);
+        argv.insert(argv.end(), extra.begin(), extra.end());
+        return argv;
+    };
+    // hashsum prints a line per file, so a name with a line break is asked about alone and its
+    // sum read off the start of the answer (review G18).
+    std::vector<std::string> by_list;
+    std::vector<std::string> alone;
+    for (const auto& p : paths) (p.find_first_of("\r\n") == std::string::npos ? by_list : alone).push_back(p);
+    std::unordered_map<std::string, std::string> server;
+    if (!by_list.empty()) {
+        const auto list = fs::temp_directory_path() / std::format("grab-verify-{}-{}-sums.txt", process_id(), r.id);
+        if (auto written = write_list(list, by_list); !written) return util::fail(written.error());
+        auto argv = hashsum_argv(r.remote_dir);
+        const auto n = std::to_string(std::max(held, 1));
+        argv.insert(argv.end(), {"--files-from0", util::path_to_utf8(list), "--checkers", n, "--sftp-connections", n,
+                                 "--sftp-disable-hashcheck=false"});
+        if (r.on_command) r.on_command(argv);
+        auto ran = proc::run_capture(argv, quiet(stop));
+        std::error_code ec;
+        fs::remove(list, ec);
+        if (stop.stop_requested()) return util::fail("stopped");
+        if (!ran) return util::fail(ran.error());
+        server = parse_sums(ran->out);
+    }
+    for (const auto& p : alone) {
+        auto argv = hashsum_argv(join_remote(r.remote_dir, p));
+        argv.emplace_back("--sftp-disable-hashcheck=false");
+        if (r.on_command) r.on_command(argv);
+        auto ran = proc::run_capture(argv, quiet(stop));
+        if (stop.stop_requested()) return util::fail("stopped");
+        if (!ran) return util::fail(ran.error());
+        const std::string_view out = ran->out;
+        if (out.size() >= 34 && out.substr(32, 2) == "  " &&
+            std::ranges::all_of(out.substr(0, 32), [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+            std::string lower(out.substr(0, 32));
+            std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            server.insert_or_assign(p, std::move(lower));
+        }
+    }
     std::error_code ec;
-    fs::remove(list, ec);
-    if (stop.stop_requested()) return util::fail("stopped");
-    if (!ran) return util::fail(ran.error());
-    const auto server = parse_sums(ran->out);
     bool hashed = false;
     for (const auto& p : paths) {
         const auto theirs = server.find(p);
@@ -238,7 +270,7 @@ std::expected<std::vector<std::string>, std::string> check_argv(const Request& r
     const auto n = std::to_string(std::max(connections, 1));
     // --no-traverse: each file looked up by name on both sides. Listing the folders instead,
     // rclone 1.75.1 paired none of the names with a tab, a control character, DEL or ‛ in them.
-    argv.insert(argv.end(), {"--one-way", "--files-from-raw", util::path_to_utf8(list_file), "--no-traverse",
+    argv.insert(argv.end(), {"--one-way", "--files-from0", util::path_to_utf8(list_file), "--no-traverse",
                              "--combined", "-", "--checkers", n, "--sftp-connections", n,
                              "--sftp-disable-hashcheck=false", "-v"});
     return argv;
@@ -265,8 +297,13 @@ std::expected<Report, std::string> run(const Request& r, std::stop_token stop) {
     std::vector<std::string> devices;
     // A folder rclone can't be told the name of (rclone_encoding.hpp): every file by its sum.
     const bool checkable = rclone_enc::local_path(r.local_dir).has_value();
+    // check would compare one of names it takes for one and drop the others (local::clashing), and
+    // a line break in a name splits its report line: those by their sums (review G25, G18).
+    const auto clash = local::clashing(r.paths);
     for (const auto& p : r.paths) {
-        (!checkable || local::differs_from_rclone(p) || r.renamed.contains(p) ? devices : plain).push_back(p);
+        const bool breaks = p.find_first_of("\r\n") != std::string::npos;
+        const bool by_sum = !checkable || breaks || clash.contains(p) || local::differs_from_rclone(p) || r.renamed.contains(p);
+        (by_sum ? devices : plain).push_back(p);
     }
     Report report;
     if (!plain.empty()) {

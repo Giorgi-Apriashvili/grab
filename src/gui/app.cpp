@@ -2836,6 +2836,8 @@ json::Value App::queue_snapshot() const {
                 Value cv = Value::make_object();
                 cv.set("path", str(c.path));
                 cv.set("local", str(util::path_to_utf8(c.local.empty() ? local::relative(c.path) : c.local)));
+                // A name grab gave it: Keep both, or another file of the folder has its own (G25).
+                if (!c.local.empty()) cv.set("savedAs", str(util::path_to_utf8(c.local.filename())));
                 cv.set("status", str(file_state_name(c.status)));
                 cv.set("bytes", num(static_cast<double>(c.bytes)));
                 cv.set("size", num(static_cast<double>(c.size)));

@@ -471,6 +471,15 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
         s.line.finish("stopped");
         return proc::exit_stopped;
     }
+    {
+        // Files that have another file's name on Windows ("README" and "readme"), numbered (G25).
+        std::lock_guard lock(m);
+        for (const auto& f : tree.files) {
+            if (f.local.empty()) continue;
+            s.line.message(std::format("grab: {} is saved as \"{}\": another file of the folder has its name on Windows",
+                                       f.path, util::path_to_utf8(f.local.filename())));
+        }
+    }
     folder::mark_existing(job, tree, m);
     // Different files already where some of the folder's go: the answer first, for this folder's
     // files as listed here, not one given for another pick (review G105).
@@ -581,6 +590,9 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
             const auto t = folder::totals(tree);
             what = std::format(" ({} file{}, {}", t.files, t.files == 1 ? "" : "s", util::format_size(t.total));
             if (t.files_done > 0) what += std::format("; {} already there", t.files_done);
+            if (const auto n = std::ranges::count_if(tree.files, [](const folder::File& f) { return !f.local.empty(); }); n > 0) {
+                what += std::format("; {} numbered: another file has its name on Windows", n);
+            }
             if (const auto n = folder::conflicts(job, tree, m).size(); n > 0) {
                 what += std::format("; {} differ{} from yours: asked first", n, n == 1 ? "s" : "");
             }

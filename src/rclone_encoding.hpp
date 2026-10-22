@@ -36,6 +36,9 @@ inline constexpr Mask standard = slash | ctl | del | dot;
 inline constexpr Mask windows = slash | dot | colon | question | double_quote | asterisk | lt_gt | pipe | back_slash |
                                 ctl | right_space | right_period | invalid_utf8;
 
+// Whether `s` is UTF-8 throughout (as Go's utf8 package sees it).
+[[nodiscard]] bool valid_utf8(std::string_view s);
+
 // rclone's MultiEncoder.Encode and .Decode for `mask`.
 [[nodiscard]] std::string encode(std::string_view in, Mask mask);
 [[nodiscard]] std::string decode(std::string_view in, Mask mask);

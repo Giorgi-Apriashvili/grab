@@ -242,7 +242,10 @@ std::expected<std::vector<Item>, std::string> list_live(const engine::Context& c
     auto ran = proc::run_capture(argv, run);
     if (!ran) return util::fail(ran.error());
     if (run.stop.stop_requested()) return util::fail("stopped");
-    if (ran->exit_code != 0) return util::fail(server_ops::clean_rclone_error(ran->err));
+    if (ran->exit_code != 0) {
+        // A folder whose name came through rclone's JSON with U+FFFD for its bytes (review G60).
+        return util::fail(name_not_utf8(path) ? std::string(not_utf8_error) : server_ops::clean_rclone_error(ran->err));
+    }
     return parse_lsjson(ran->out, path, ctx.settings.skip_hidden);
 }
 

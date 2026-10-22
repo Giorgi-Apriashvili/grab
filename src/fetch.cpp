@@ -3,6 +3,7 @@
 #include "json.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
+#include "rclone_encoding.hpp"
 #include "server_ops.hpp"
 #include "util.hpp"
 
@@ -604,6 +605,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
            std::stop_token stop) {
     auto failed = [](std::string why) { return Result{Outcome::failed, std::move(why), {}}; };
     const Source& src = d.source;
+    // Bytes that aren't UTF-8 can't reach rclone: said at once, not as "directory not found" (G17).
+    if (!rclone_enc::valid_utf8(src.path)) return failed(std::string(not_utf8_error));
     auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
     Seat seat(connections, d, weight());
 
@@ -627,7 +630,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         if (!stat_run) return failed(stat_run.error());
         if (stat_run->exit_code == 0) break;
         if (!refused || Clock::now() - stat_from >= refused_give_up) {
-            return failed(server_ops::clean_rclone_error(stat_run->err));
+            return failed(name_not_utf8(src.path) ? std::string(not_utf8_error) : server_ops::clean_rclone_error(stat_run->err));
         }
         std::mutex wait_m;
         std::condition_variable_any wait_cv;

@@ -25,6 +25,11 @@ std::expected<std::vector<FolderFile>, std::string> parse_listing(std::string_vi
         files.push_back(std::move(f));
     }
     std::ranges::sort(files, {}, &FolderFile::path);
+    // A path listed twice (a server answering a name twice, or two names that differ only in
+    // bytes rclone's JSON shows as U+FFFD) is one file: a second entry would never be fetched,
+    // and the folder would start rclone again for it without end (review G81).
+    const auto [first, last] = std::ranges::unique(files, {}, &FolderFile::path);
+    files.erase(first, last);
     return files;
 }
 
@@ -32,7 +37,7 @@ std::string files_from_text(const std::vector<std::string>& paths) {
     std::string out;
     for (const auto& p : paths) {
         out += p;
-        out += '\n';
+        out += '\0';
     }
     return out;
 }

@@ -26,10 +26,11 @@ struct FolderFile {
     bool operator==(const FolderFile&) const = default;
 };
 
-// `rclone lsjson -R --files-only` output, sorted by path.
+// `rclone lsjson -R --files-only` output, sorted by path, each path once.
 [[nodiscard]] std::expected<std::vector<FolderFile>, std::string> parse_listing(std::string_view json_text);
 
-// A `--files-from-raw` list: one relative path per line, taken literally (no filter syntax).
+// A `--files-from0` list: the relative paths, each ended by a NUL and taken literally (a name can
+// hold a line break, never a NUL; review G18).
 [[nodiscard]] std::string files_from_text(const std::vector<std::string>& paths);
 
 // The file named by an info-level "Copied (new)" / "Copied (replaced existing)" JSON log line.

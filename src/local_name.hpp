@@ -14,8 +14,10 @@
 //   - bidi controls are dropped: "invoice<U+202E>fdp.exe" shows as "invoiceexe.pdf" (review G51).
 
 #include <filesystem>
+#include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 namespace grab::local {
 
@@ -42,6 +44,14 @@ namespace grab::local {
 
 // A local path as Windows compares names (ignoring case), for sets of paths.
 [[nodiscard]] std::filesystem::path::string_type key(const std::filesystem::path& p);
+// A local path as rclone matches names copying to or checking Windows: case aside, and the
+// Unicode spellings of a character as one ("e" + U+0301 is "é"), which NTFS keeps apart.
+[[nodiscard]] std::filesystem::path::string_type fold(const std::filesystem::path& p);
+// Of these relative remote paths (a/b/c), the ones rclone takes for another of them on Windows,
+// by the file's name or a folder on its way ("README" and "readme", "Docs/a" and "docs/b", "café"
+// spelled two ways): rclone copies or checks one of each such group and drops the rest, a folder
+// with all it holds (review G25).
+[[nodiscard]] std::unordered_set<std::string> clashing(std::span<const std::string> remote_rels);
 
 // A relative remote path (a/b/c) as a local one, each part through name(); empty parts dropped.
 // Every part is a plain name (no separator, drive, "." or ".."), so `dest / relative(x)` stays

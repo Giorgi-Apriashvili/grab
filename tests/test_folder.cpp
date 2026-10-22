@@ -6,15 +6,18 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace grab;
+using namespace std::string_view_literals;
 using folder::State;
 
 TEST_CASE("folder listing: files only, sorted, sizes and times") {
@@ -41,7 +44,8 @@ TEST_CASE("big files take the resumable path") {
 
 TEST_CASE("rclone's file list and its per-file log lines") {
     // Taken literally with --files-from-raw, so filter characters need no escaping.
-    CHECK(folder::files_from_text({"a #1 [x].mp4", "sub/b.mp4"}) == "a #1 [x].mp4\nsub/b.mp4\n");
+    CHECK(folder::files_from_text({"a #1 [x].mp4", "sub/b.mp4", "line\nbreak"}) ==
+          "a #1 [x].mp4\0sub/b.mp4\0line\nbreak\0"sv); // --files-from0 (G18)
     CHECK(folder::files_from_text({}).empty());
 
     // (R"j(...)j": the text itself contains `)"`.)
@@ -226,3 +230,42 @@ TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's l
     std::filesystem::remove_all(dir);
 }
 #endif
+
+TEST_CASE("a path listed twice is one file (G81)") {
+    const auto files = folder::parse_listing(R"([{"Path":"a.txt","Size":3},{"Path":"b.txt","Size":1},{"Path":"a.txt","Size":3}])");
+    REQUIRE(files.has_value());
+    REQUIRE(files->size() == 2);
+    CHECK((*files)[0].path == "a.txt");
+    CHECK((*files)[1].path == "b.txt");
+}
+
+TEST_CASE("names that are one on Windows or to rclone's batch (G25)") {
+    // As rclone lists them, sorted: README before readme, Docs before docs.
+    std::vector<folder::File> files;
+    for (const char* p : {"Docs/a.txt", "Docs/only-upper.txt", "NOTES/x.txt", "README", "caf\u00e9.txt", "cafe\u0301.txt",
+                          "docs/a.txt", "docs/only-lower.txt", "notes", "plain.txt", "readme", "readme (2)"}) {
+        files.push_back(folder::make_file(p, 5, ""));
+    }
+    folder::settle_names(files);
+    auto file = [&](std::string_view p) -> const folder::File& {
+        return *std::ranges::find(files, p, &folder::File::path);
+    };
+    // rclone would copy one of each and drop the rest (a folder with all it holds): grab fetches them.
+    for (const char* p : {"Docs/a.txt", "Docs/only-upper.txt", "README", "caf\u00e9.txt", "cafe\u0301.txt", "docs/a.txt",
+                          "docs/only-lower.txt", "readme"}) {
+        INFO(p);
+        CHECK(file(p).big);
+    }
+    CHECK_FALSE(file("plain.txt").big);
+    CHECK(file("NOTES/x.txt").big); // its folder and the file "notes" are one name to rclone
+    CHECK_FALSE(file("readme (2)").big);
+    // The first keeps its name; a later one with the same name on Windows gets the next free number.
+    CHECK(file("README").local.empty());
+    CHECK(file("readme").local == std::filesystem::path("readme (3)")); // "readme (2)" is the server's
+    CHECK(file("Docs/a.txt").local.empty());
+    CHECK(file("docs/a.txt").local == std::filesystem::path("docs") / "a (2).txt");
+    CHECK(file("docs/only-lower.txt").local.empty()); // one folder on Windows, no clash in it
+    CHECK(file("notes").local == std::filesystem::path("notes (2)")); // a folder has its name
+    CHECK(file("caf\u00e9.txt").local.empty()); // two names to NTFS
+    CHECK(file("cafe\u0301.txt").local.empty());
+}

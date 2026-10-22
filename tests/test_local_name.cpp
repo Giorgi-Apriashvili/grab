@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -163,4 +164,15 @@ TEST_CASE("a remote path never leaves the download folder") {
     CHECK(local::relative("").empty());
     CHECK(local::relative("///").empty());
     CHECK(local::relative("a:b/CON/c?.txt") == util::path_from_utf8("a：b") / "CON_" / util::path_from_utf8("c？.txt"));
+}
+
+TEST_CASE("names rclone takes for one on Windows (G25)") {
+    const std::vector<std::string> paths{"Docs/a.txt", "docs/b.txt", "README", "readme", "caf\u00e9.txt", "cafe\u0301.txt",
+                                         "plain.txt", "sub/x.txt", "sub/y.txt"};
+    const auto clash = local::clashing(paths);
+    CHECK(clash == std::unordered_set<std::string>{"Docs/a.txt", "docs/b.txt", "README", "readme", "caf\u00e9.txt",
+                                                    "cafe\u0301.txt"});
+    CHECK(local::clashing(std::vector<std::string>{"a/b", "a/c", "b"}).empty());
+    CHECK(local::fold(util::path_from_utf8("Caf\u00e9")) == local::fold(util::path_from_utf8("CAFE\u0301")));
+    CHECK(local::key(util::path_from_utf8("Caf\u00e9")) != local::key(util::path_from_utf8("CAFE\u0301"))); // two to NTFS
 }

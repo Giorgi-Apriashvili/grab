@@ -119,6 +119,8 @@ bool decode_touches(char32_t r, Mask mask) {
 
 bool hex(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 
+} // namespace
+
 bool valid_utf8(std::string_view s) {
     for (std::size_t i = 0; i < s.size();) {
         const Rune r = rune_at(s, i);
@@ -127,8 +129,6 @@ bool valid_utf8(std::string_view s) {
     }
     return true;
 }
-
-} // namespace
 
 std::string encode(std::string_view in, Mask mask) {
     if (in.empty()) return {};

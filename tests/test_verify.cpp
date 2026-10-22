@@ -49,7 +49,7 @@ TEST_CASE("the check asks the server for checksums, whatever the common flags sa
     CHECK(verify::check_argv(r, list, 4).value() ==
           std::vector<std::string>{"rclone", "check", "Box:movies", util::path_to_utf8(r.local_dir), "--config",
                                    util::path_to_utf8(*ctx.config.rclone_config), "--sftp-chunk-size", "255Ki",
-                                   "--sftp-disable-hashcheck", "--bind", "10.8.0.2", "--one-way", "--files-from-raw",
+                                   "--sftp-disable-hashcheck", "--bind", "10.8.0.2", "--one-way", "--files-from0",
                                    util::path_to_utf8(list), "--no-traverse", "--combined", "-", "--checkers", "4",
                                    "--sftp-connections", "4", "--sftp-disable-hashcheck=false", "-v"});
 }

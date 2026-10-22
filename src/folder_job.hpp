@@ -48,10 +48,17 @@ struct File {
     bool in_batch = false; // in the running batch: queued until rclone starts it, then running
     bool fetched = false;  // done by this download, not found on disk already
     bool verified = false; // checked against the server's checksum (verify_files)
-    // Keep both: where it goes instead, relative to the folder ("e01 (2).mkv"); fetched by grab.
+    // Where it goes instead, relative to the folder ("e01 (2).mkv"): Keep both, or a name another
+    // file of the folder has on Windows (settle_names); fetched by grab.
     std::filesystem::path local = {};
 };
 [[nodiscard]] File make_file(std::string path, std::uint64_t size, std::string modtime);
+// A folder's files (sorted by path) that are one name on Windows ("README" and "readme", folders
+// "Docs" and "docs") or to rclone's batch, which also takes "café" in its two Unicode spellings
+// for one (review G25). rclone keeps one of them and drops the others, a folder with all it holds,
+// so each of them is fetched by grab; and a file whose name an earlier file or any folder of the
+// listing has on Windows gets a numbered one, as Keep both names them: "readme (2)".
+void settle_names(std::vector<File>& files);
 
 // A folder download's state. Every access holds the caller's mutex.
 struct Tree {

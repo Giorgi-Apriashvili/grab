@@ -289,6 +289,13 @@ too and goes on without them.
     `Mission: Impossible (1996)` lands in one `Mission： Impossible (1996)`, also when the Save-to
     folder's own name has such characters. A folder whose name rclone can't be told (a `‛` in the
     Save-to folder's name) is fetched by grab's own engine, and checked by its MD5 sums.
+  - **Names that are one on Windows** in a server folder (`README` and `readme`, folders `Docs`
+    and `docs`) all arrive: the later file gets a number (`readme (2)`), which the download's
+    file list and the command say. rclone would copy one of them and drop the others (a folder
+    with all it holds), so grab fetches these itself and checks them by their MD5 sums; the same
+    goes for a name spelled two ways in Unicode (`café`), which Windows keeps apart. Names with a
+    line break arrive too (`report␊notes.txt`). A server name that isn't UTF-8 (an old Latin-1
+    name) can't be given to rclone: such a file fails saying so; rename it on the server.
   - **A different file already there is never replaced without asking.** When a file of the
     download is already in the Save-to folder with another size, or older than the server's,
     grab asks first, listing yours and the server's: **Replace**, **Keep both** (the new one is

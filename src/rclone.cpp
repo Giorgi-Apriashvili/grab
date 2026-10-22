@@ -20,6 +20,10 @@ bool has_name(std::string_view remote_path) {
     return !name.empty() && name != "/" && name != "." && name != "..";
 }
 
+bool name_not_utf8(std::string_view remote_path) {
+    return !rclone_enc::valid_utf8(remote_path) || remote_path.find("\xEF\xBF\xBD") != std::string_view::npos;
+}
+
 std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path) {
     std::string out(rclone_remote);
     out += ':';
