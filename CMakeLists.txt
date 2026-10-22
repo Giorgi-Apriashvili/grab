@@ -98,7 +98,9 @@ if(WIN32)
     target_sources(grab PRIVATE src/grab.rc)
     target_include_directories(grab PRIVATE "${CMAKE_BINARY_DIR}")
     set_source_files_properties(src/grab.rc PROPERTIES
-        OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/version.rc;${CMAKE_CURRENT_SOURCE_DIR}/src/gui/grab.ico")
+        OBJECT_DEPENDS "${CMAKE_BINARY_DIR}/version.rc;${CMAKE_CURRENT_SOURCE_DIR}/src/gui/grab.ico;${CMAKE_CURRENT_SOURCE_DIR}/src/grab.manifest")
+    # Both programs' manifest is src/grab.manifest, in their .rc files.
+    target_link_options(grab PRIVATE /MANIFEST:NO)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -176,7 +178,8 @@ if(WIN32 AND GRAB_BUILD_GUI)
         src/gui/grab-gui.rc)
     # The .rc embeds the UI files and the icon; rebuild it whenever one of them changes.
     set_source_files_properties(src/gui/grab-gui.rc PROPERTIES
-        OBJECT_DEPENDS "${GRAB_GUI_UI_FILES};${CMAKE_BINARY_DIR}/version.rc")
+        OBJECT_DEPENDS "${GRAB_GUI_UI_FILES};${CMAKE_BINARY_DIR}/version.rc;${CMAKE_CURRENT_SOURCE_DIR}/src/grab.manifest")
+    target_link_options(grab-gui PRIVATE /MANIFEST:NO) # src/grab.manifest, in its .rc
     target_include_directories(grab-gui PRIVATE src/gui "${CMAKE_BINARY_DIR}")
     target_include_directories(grab-gui SYSTEM PRIVATE ${webview2_SOURCE_DIR}/build/native/include)
     target_link_libraries(grab-gui PRIVATE

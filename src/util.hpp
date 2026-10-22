@@ -109,6 +109,15 @@ private:
 // The system's text for an error code (Win32 GetLastError, else errno), in UTF-8.
 [[nodiscard]] std::string error_message(unsigned long code);
 
+// Whether this process can use local paths past 260 characters: Windows' long paths are on
+// (LongPathsEnabled) and the program says it can (longPathAware, src/grab.manifest). Elsewhere
+// always.
+[[nodiscard]] bool long_paths();
+// A local file path too long to use here, with `extra` characters more for the longest name grab
+// makes beside it (a partial download's ".2.grabpart.json"): the reason, else nothing (review G19).
+[[nodiscard]] std::optional<std::string> too_long(const std::filesystem::path& p, std::size_t extra = 0);
+[[nodiscard]] std::optional<std::string> too_long(const std::filesystem::path& p, std::size_t extra, bool long_paths_on);
+
 [[nodiscard]] std::string join(const std::vector<std::string>& items, std::string_view sep);
 
 // Human-readable byte count: "512 B", "1.5 KiB", "12.4 GiB".

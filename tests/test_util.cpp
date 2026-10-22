@@ -326,3 +326,32 @@ TEST_CASE("a file lock has one holder at a time") {
     CHECK(second);
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("a local path too long while Windows' long paths are off (G19)") {
+    const auto dir = util::path_from_utf8("C:\\" + std::string(200, 'd'));
+    const auto file = dir / std::string(50, 'f'); // 254 characters
+    CHECK_FALSE(util::too_long(file, 0, false).has_value());
+    CHECK_FALSE(util::too_long(file, 5, false).has_value()); // 259: still fits
+    const std::string why = util::too_long(file, 16, false).value_or(""); // with ".2.grabpart.json"
+    CHECK(why.find("270 characters") != std::string::npos);
+    CHECK(why.find("long paths") != std::string::npos);
+    CHECK_FALSE(util::too_long(file, 16, true).has_value());
+    CHECK(util::long_paths() == util::long_paths()); // asked once
+}
+
+#ifdef _WIN32
+TEST_CASE("a replaced file's temp name is short, whatever its own (G70)") {
+    if (!util::long_paths()) return; // the path below is past 260 characters
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-long-name";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    // 248 characters, as a 234-character file's record: its name plus ".<8 hex>.tmp" would pass
+    // Windows' 255 for one name.
+    const auto record = dir / (std::string(234, 'n') + ".grabpart.json");
+    REQUIRE(util::write_file_atomic(record, "one").has_value());
+    REQUIRE(util::write_file_atomic(record, "two").has_value());
+    CHECK(util::read_file(record).value_or("") == "two");
+    CHECK(std::distance(std::filesystem::directory_iterator(dir), std::filesystem::directory_iterator()) == 1);
+    std::filesystem::remove_all(dir);
+}
+#endif

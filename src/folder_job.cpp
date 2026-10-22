@@ -524,6 +524,15 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
         tree.files.reserve(listing->size());
         for (auto& f : *listing) tree.files.push_back(make_file(std::move(f.path), f.size, std::move(f.modtime)));
         settle_names(tree.files);
+        // Without long paths, a file past what Windows takes here: grab couldn't see it on disk
+        // or keep a partial download beside it, so it fails saying why (review G19).
+        const auto dir = job_dir(job);
+        for (auto& f : tree.files) {
+            if (auto why = util::too_long(target_of(dir, f), f.big ? std::string_view(".2.grabpart.json").size() : 0)) {
+                f.status = State::failed;
+                f.error = std::move(*why);
+            }
+        }
         tree.listed = true;
     }
     notify(job, Event::checkpoint);

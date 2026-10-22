@@ -296,6 +296,10 @@ too and goes on without them.
     goes for a name spelled two ways in Unicode (`café`), which Windows keeps apart. Names with a
     line break arrive too (`report␊notes.txt`). A server name that isn't UTF-8 (an old Latin-1
     name) can't be given to rclone: such a file fails saying so; rename it on the server.
+  - **Paths past 260 characters** (deep folders with long release names) work where Windows'
+    long paths are on (the "Enable Win32 long paths" policy, or `LongPathsEnabled` in the
+    registry; many PCs have it). Where they're off, a file whose path would be too long fails
+    at once, saying so, instead of failing midway or being missed on the next run.
   - **A different file already there is never replaced without asking.** When a file of the
     download is already in the Save-to folder with another size, or older than the server's,
     grab asks first, listing yours and the server's: **Replace**, **Keep both** (the new one is

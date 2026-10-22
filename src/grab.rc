@@ -2,6 +2,9 @@
 
 APP_ICON ICON "gui/grab.ico"
 
+// The manifest, shared with grab-gui: long paths (review G19).
+1 24 "grab.manifest"
+
 #define GRAB_FILE_DESCRIPTION "grab"
 #define GRAB_FILE_NAME "grab.exe"
 #include "version.rc"

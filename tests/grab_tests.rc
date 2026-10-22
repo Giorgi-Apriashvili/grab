@@ -1,0 +1,2 @@
+// The programs' manifest: the tests see local paths as grab.exe and grab-gui.exe do.
+1 24 "../src/grab.manifest"

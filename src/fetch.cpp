@@ -550,8 +550,8 @@ private:
 
 // Replaces grab's own record, never half written: the text goes to a new file of a random name
 // beside it, on the disk before it moves over the record.
-bool write_record(const fs::path& record, const std::string& text) {
-    return util::write_file_atomic(record, text).has_value();
+std::expected<void, std::string> write_record(const fs::path& record, const std::string& text) {
+    return util::write_file_atomic(record, text);
 }
 
 // A new partial download in the first free slot: its record is created first, then the data
@@ -607,6 +607,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
     const Source& src = d.source;
     // Bytes that aren't UTF-8 can't reach rclone: said at once, not as "directory not found" (G17).
     if (!rclone_enc::valid_utf8(src.path)) return failed(std::string(not_utf8_error));
+    // Past what Windows takes here, the partial download's record could never be written (G19).
+    if (auto why = util::too_long(d.target, std::string_view(".2.grabpart.json").size())) return failed(std::move(*why));
     auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
     Seat seat(connections, d, weight());
 
@@ -901,7 +903,13 @@ Result run(const Download& d, Connections& connections, const std::function<void
             inner.request_stop();
             return;
         }
-        save(s);
+        // Progress that can't be saved would be lost at the next stop: said, not carried on as if
+        // it were (review G70).
+        if (auto saved = save(s); !saved) {
+            std::lock_guard lock(m);
+            if (error.empty()) error = std::format("the progress can't be saved: {}", saved.error());
+            inner.request_stop();
+        }
     };
     while (running.load() > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));

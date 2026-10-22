@@ -50,5 +50,11 @@ add_executable(grab_tests
     test_update.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)
+if(WIN32)
+    # The programs' manifest (long paths), so the tests see paths as grab does.
+    target_sources(grab_tests PRIVATE grab_tests.rc)
+    set_source_files_properties(grab_tests.rc PROPERTIES OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/src/grab.manifest")
+    target_link_options(grab_tests PRIVATE /MANIFEST:NO)
+endif()
 
 add_test(NAME grab_tests COMMAND grab_tests)

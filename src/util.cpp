@@ -156,6 +156,35 @@ DWORD replace_with(HANDLE h, const std::filesystem::path& tmp, const std::filesy
 
 } // namespace
 
+bool long_paths() {
+#ifdef _WIN32
+    // ntdll's answer for this process (Windows 10 1607 and later; before, never).
+    static const bool on = [] {
+        using Fn = BOOLEAN(NTAPI*)();
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto fn = ntdll != nullptr ? reinterpret_cast<Fn>(GetProcAddress(ntdll, "RtlAreLongPathsEnabled")) : nullptr;
+        return fn != nullptr && fn() != FALSE;
+    }();
+    return on;
+#else
+    return true;
+#endif
+}
+
+std::optional<std::string> too_long(const std::filesystem::path& p, std::size_t extra) {
+    return too_long(p, extra, long_paths());
+}
+
+std::optional<std::string> too_long(const std::filesystem::path& p, std::size_t extra, bool long_paths_on) {
+    constexpr std::size_t max_path = 259; // MAX_PATH, less its NUL
+    const std::size_t n = p.native().size() + extra;
+    if (long_paths_on || n <= max_path) return std::nullopt;
+    return std::format("{} is too long for Windows here ({} characters with grab's own files beside it, {} at most "
+                       "while long paths are off): turn them on (\"Enable Win32 long paths\"), or save to a "
+                       "shorter folder",
+                       path_to_utf8(p), n, max_path);
+}
+
 std::expected<void, std::string> write_file_atomic(const std::filesystem::path& p, std::string_view text) {
     const auto failed = [&](unsigned long code) {
         return failf("cannot write {}: {}", path_to_utf8(p), error_message(code));
@@ -166,8 +195,9 @@ std::expected<void, std::string> write_file_atomic(const std::filesystem::path& 
 #ifdef _WIN32
     HANDLE h = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; ++attempt) {
-        tmp = p;
-        tmp += "." + random_suffix() + ".tmp";
+        // A short name beside it: `p`'s own name plus a suffix could pass Windows' 255 for a name,
+        // and a download's progress then never got saved (review G70).
+        tmp = p.parent_path() / ("~grab-" + random_suffix() + ".tmp");
         h = CreateFileW(tmp.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) return failed(GetLastError());
     }
@@ -194,8 +224,7 @@ std::expected<void, std::string> write_file_atomic(const std::filesystem::path& 
 #else
     int fd = -1;
     for (int attempt = 0; attempt < 8 && fd < 0; ++attempt) {
-        tmp = p;
-        tmp += "." + random_suffix() + ".tmp";
+        tmp = p.parent_path() / ("~grab-" + random_suffix() + ".tmp");
         fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (fd < 0 && errno != EEXIST) return failed(errno);
     }
