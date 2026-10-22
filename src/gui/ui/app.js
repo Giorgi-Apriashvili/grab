@@ -1764,6 +1764,7 @@ document.addEventListener('mouseup', (ev) => {
 $('#browse-refresh').addEventListener('click', () => {
   const b = state.browse;
   if (b.server) browseTo(b.server, b.path, b.top, { live: true });
+  else enterBrowse(); // the list of servers: built again
 });
 $('#query').addEventListener('input', () => {
   showRecent(false);
@@ -2427,9 +2428,10 @@ function onInit(msg) {
   renderRemotes();
   renderSortHead();
   // Sent again after a server change: browse goes on where it is, if that server still exists.
-  if (!state.browse.inited || (state.browse.server && !state.remotes.some((r) => r.name === state.browse.server))) {
-    enterBrowse();
-  }
+  // The list of servers (All servers' top, or nothing before the first one) is built again from
+  // them: after adding the first server, it opens (it stayed an empty page until a restart).
+  const b = state.browse;
+  if (!b.inited || !b.server || !state.remotes.some((r) => r.name === b.server)) enterBrowse();
   renderRows();
   if (msg.configError) {
     showBanner(`${msg.configError}\n\nConfig file: ${msg.configPath}`);
