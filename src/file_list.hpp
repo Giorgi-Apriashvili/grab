@@ -70,7 +70,7 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 // "d\t<mtime>\t<path>\0" or "f\t<size>\t<mtime>\t<path>\0" record per entry (<mtime>: %T@).
 [[nodiscard]] std::string find_command(const std::vector<std::string>& roots, int max_depth, bool skip_hidden);
 [[nodiscard]] std::vector<Entry> parse_find(std::string_view out);
-// `rclone lsf --format tsp --time-format unix -R` output of `root` (see parse_lsf_line).
+// `rclone lsf --format tsp --time-format unix --csv -R` output of `root` (see parse_lsf_record).
 [[nodiscard]] std::vector<Entry> parse_lsf(std::string_view out, std::string_view root);
 
 // Fetches the server's list now (ssh + find, or rclone lsf per root). `batch_ssh`: never let

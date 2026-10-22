@@ -43,7 +43,7 @@ ListRequest base_request() {
 TEST_CASE("lsf argv for a name search under the home root prunes dot-dirs") {
     CHECK(build_lsf_argv(base_request()) ==
           std::vector<std::string>{"rclone", "lsf", "arch_guest:", "--format", "tsp", "--time-format", "unix",
-                                   "--dirs-only", "-R", "--max-depth", "3", "--exclude", ".*/**", "--exclude", ".*"});
+                                   "--csv", "--dirs-only", "-R", "--max-depth", "3", "--exclude", ".*/**", "--exclude", ".*"});
 }
 
 TEST_CASE("lsf argv for a file search with hidden allowed and --config") {
@@ -54,7 +54,7 @@ TEST_CASE("lsf argv for a file search with hidden allowed and --config") {
     r.rclone_config = util::path_from_utf8("C:\\cfg\\rclone.conf");
     CHECK(build_lsf_argv(r) ==
           std::vector<std::string>{"rclone", "lsf", "arch_guest:/home", "--format", "tsp", "--time-format", "unix",
-                                   "--files-only", "-R", "--max-depth", "3", "--config",
+                                   "--csv", "--files-only", "-R", "--max-depth", "3", "--config",
                                    util::path_to_utf8(*r.rclone_config)});
 }
 
@@ -63,18 +63,18 @@ TEST_CASE("lsf argv for a path target lists only the parent, one level") {
     r.target = "learning/Course - Intro to Testing - Jane Doe";
     CHECK(build_lsf_argv(r) ==
           std::vector<std::string>{"rclone", "lsf", "arch_guest:learning", "--format", "tsp", "--time-format",
-                                   "unix", "--dirs-only"});
+                                   "unix", "--csv", "--dirs-only"});
     r.target = "/x";
     CHECK(build_lsf_argv(r)[2] == "arch_guest:/");
 }
 
 TEST_CASE("lsf output: dirs end with '/', CRLF tolerated, hidden pruned, glob on the leaf") {
-    const std::string out = "games/\r\n"
-                            "learning/\n"
-                            "learning/Course - Intro to Testing - Jane Doe/\n"
-                            "learning/Course - Intro to Testing - Jane Doe/Resources/\n"
-                            "learning/.cache/Course old/\n"
-                            "misc/Course - Other/\n"
+    const std::string out = "0,-1,games/\r\n"
+                            "0,-1,learning/\n"
+                            "0,-1,learning/Course - Intro to Testing - Jane Doe/\n"
+                            "0,-1,learning/Course - Intro to Testing - Jane Doe/Resources/\n"
+                            "0,-1,learning/.cache/Course old/\n"
+                            "0,-1,misc/Course - Other/\n"
                             "\n";
     CHECK(paths_of(parse_lsf_output(base_request(), out)) ==
           std::vector<std::string>{"learning/Course - Intro to Testing - Jane Doe",
@@ -86,7 +86,7 @@ TEST_CASE("lsf output joins onto an absolute root and respects the mode") {
     r.root = "/home";
     r.target = "*.mkv";
     r.mode = Mode::file;
-    const std::string out = "movies/a.mkv\nmovies/b.mkv/\nmovies/c.txt\n"; // b.mkv/ is a dir
+    const std::string out = "0,1,movies/a.mkv\n0,-1,movies/b.mkv/\n0,1,movies/c.txt\n"; // b.mkv/ is a dir
     CHECK(paths_of(parse_lsf_output(r, out)) == std::vector<std::string>{"/home/movies/a.mkv"});
 }
 
@@ -94,7 +94,7 @@ TEST_CASE("lsf output for a path target matches the leaf exactly in the parent l
     auto r = base_request();
     r.target = "learning/Course - Intro to Testing - Jane Doe/";
     const std::string out =
-        "Course - Intro to Testing - Jane Doe/\nCourse - Other/\n";
+        "0,-1,Course - Intro to Testing - Jane Doe/\n0,-1,Course - Other/\n";
     CHECK(paths_of(parse_lsf_output(r, out)) ==
           std::vector<std::string>{"learning/Course - Intro to Testing - Jane Doe"});
     r.target = "learning/missing";
@@ -106,10 +106,10 @@ TEST_CASE("lsf output with a word query: case-insensitive, any order, hidden sti
     r.mode = Mode::file;
     r.target = "LIONESS e08";
     const std::string out =
-        "tv/Lioness.2023.S03E08.The.Unravelling.2160p.ATV.WEB-DL.DDP5.1.DV.HDR.H.265-NTb.mkv\n"
-        "tv/Lioness.2023.S03E07.Something.2160p.mkv\n"
-        "tv/.trash/Lioness.2023.S03E08.old.mkv\n"
-        "tv/lioness-e08-sample.MKV\n";
+        "0,1,tv/Lioness.2023.S03E08.The.Unravelling.2160p.ATV.WEB-DL.DDP5.1.DV.HDR.H.265-NTb.mkv\n"
+        "0,1,tv/Lioness.2023.S03E07.Something.2160p.mkv\n"
+        "0,1,tv/.trash/Lioness.2023.S03E08.old.mkv\n"
+        "0,1,tv/lioness-e08-sample.MKV\n";
     CHECK(paths_of(parse_lsf_output(r, out)) ==
           std::vector<std::string>{
               "tv/Lioness.2023.S03E08.The.Unravelling.2160p.ATV.WEB-DL.DDP5.1.DV.HDR.H.265-NTb.mkv",
@@ -124,44 +124,48 @@ TEST_CASE("a dot target disables hidden pruning") {
     r.target = ".config";
     const auto argv = build_lsf_argv(r);
     CHECK(std::ranges::find(argv, "--exclude") == argv.end());
-    CHECK(paths_of(parse_lsf_output(r, ".config/\nx/.config/\n")) ==
+    CHECK(paths_of(parse_lsf_output(r, "0,-1,.config/\n0,-1,x/.config/\n")) ==
           std::vector<std::string>{".config", "x/.config"});
 }
 
-TEST_CASE("lsf --format tsp: times, sizes for files, none for directories, ';' inside names") {
+TEST_CASE("lsf --format tsp --csv: times, sizes for files, none for directories, quoted names") {
     auto r = base_request();
     r.mode = Mode::file;
     r.target = "knight";
     r.root = "/home";
-    const std::string out = "1697354553;2859284292;tv/A.Knight.S01E01.mkv\n"
-                            "1697000000;-1;tv/knight/\n"
-                            "-62135596800;17;tv/knight;notes.txt\n";
+    const std::string out = "1697354553,2859284292,tv/A.Knight.S01E01.mkv\n"
+                            "1697000000,-1,tv/knight/\n"
+                            "-62135596800,17,\"tv/knight,\"\"notes\"\".txt\"\n"
+                            "1697000001,5,\"tv/knight\nmore.txt\"\n";
     CHECK(parse_lsf_output(r, out) ==
           std::vector<RemoteEntry>{{"/home/tv/A.Knight.S01E01.mkv", 2859284292ULL, 1697354553},
-                                   {"/home/tv/knight;notes.txt", 17ULL, std::nullopt}}); // a time before 1970: unknown
+                                   {"/home/tv/knight,\"notes\".txt", 17ULL, std::nullopt}, // a time before 1970: unknown
+                                   {"/home/tv/knight\nmore.txt", 5ULL, 1697000001}});  // one name with a line break (G59)
 
     r.mode = Mode::folder;
     CHECK(parse_lsf_output(r, out) ==
           std::vector<RemoteEntry>{{"/home/tv/knight", std::nullopt, 1697000000}});
 }
 
-TEST_CASE("one lsf line: both fields first, or none; a time that doesn't parse is only unknown") {
-    const auto file = parse_lsf_line("1697354553;12;a;b.mkv");
+TEST_CASE("one lsf record: the three fields; a time that doesn't parse is only unknown") {
+    using Fields = std::vector<std::string>;
+    const auto file = parse_lsf_record(Fields{"1697354553", "12", "a;b.mkv"});
     REQUIRE(file.has_value());
     CHECK(file->path == "a;b.mkv");
     CHECK(file->size == 12ULL);
     CHECK(file->modified == 1697354553);
-    const auto dir = parse_lsf_line("0;-1;tv/");
+    const auto dir = parse_lsf_record(Fields{"0", "-1", "tv/"});
     REQUIRE(dir.has_value());
     CHECK(dir->path == "tv/");
     CHECK_FALSE(dir->size.has_value());
     CHECK_FALSE(dir->modified.has_value());
-    CHECK_FALSE(parse_lsf_line("tv/").has_value());
-    CHECK_FALSE(parse_lsf_line("12;tv/a.mkv").has_value());      // the old "sp" form
-    CHECK_FALSE(parse_lsf_line("5;size;tv/a.mkv").has_value());  // not a size
+    CHECK_FALSE(parse_lsf_record(Fields{"tv/"}).has_value());
+    CHECK_FALSE(parse_lsf_record(Fields{"12", "tv/a.mkv"}).has_value());          // the old "sp" form
+    CHECK_FALSE(parse_lsf_record(Fields{"5", "size", "tv/a.mkv"}).has_value());   // not a size
+    CHECK_FALSE(parse_lsf_record(Fields{"5", "", "tv/a.mkv"}).has_value());
     // An rclone without --time-format's "unix" prints the format's name: right path and size,
     // no date.
-    const auto no_time = parse_lsf_line("unix;3;tv/a.mkv");
+    const auto no_time = parse_lsf_record(Fields{"unix", "3", "tv/a.mkv"});
     REQUIRE(no_time.has_value());
     CHECK(no_time->path == "tv/a.mkv");
     CHECK(no_time->size == 3ULL);
@@ -171,5 +175,20 @@ TEST_CASE("one lsf line: both fields first, or none; a time that doesn't parse i
     r.root = "/home";
     r.target = "a";
     r.mode = Mode::file;
-    CHECK(parse_lsf_output(r, "unix;3;tv/a.mkv\n") == std::vector<RemoteEntry>{{"/home/tv/a.mkv", 3ULL, std::nullopt}});
+    CHECK(parse_lsf_output(r, "unix,3,tv/a.mkv\n") == std::vector<RemoteEntry>{{"/home/tv/a.mkv", 3ULL, std::nullopt}});
+}
+
+TEST_CASE("rclone's CSV: quoted fields, doubled quotes, line breaks inside (G59)") {
+    using Records = std::vector<std::vector<std::string>>;
+    // As rclone 1.75.1 printed them for Main's /tmp/grab-g6/nl (2026-10-22).
+    CHECK(parse_csv("1792651228,5,\" lead.txt\"\n1792651228,6,\"a,b\"\"c.txt\"\n1792614386,13,\"endcr\r\"\n"
+                    "1792614386,13,\"notes\n2023.txt\"\n1792614386,12,notes.txt\n") ==
+          Records{{"1792651228", "5", " lead.txt"},
+                  {"1792651228", "6", "a,b\"c.txt"},
+                  {"1792614386", "13", "endcr\r"},
+                  {"1792614386", "13", "notes\n2023.txt"},
+                  {"1792614386", "12", "notes.txt"}});
+    CHECK(parse_csv("a,b\r\nc,\n\n") == Records{{"a", "b"}, {"c", ""}});
+    CHECK(parse_csv("x,y") == Records{{"x", "y"}});
+    CHECK(parse_csv("").empty());
 }

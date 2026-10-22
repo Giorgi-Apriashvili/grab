@@ -36,25 +36,30 @@ struct ListRequest {
 // "learning/x" -> "learning"   "/x" -> "/"   "a/b/" -> "a"   "x" -> ""
 [[nodiscard]] std::string parent_of(std::string_view path);
 
-// Name search: `rclone lsf REMOTE:root --format tsp --time-format unix --dirs-only|--files-only -R
-// --max-depth N [--exclude ...]`.
-// Path target:  `rclone lsf REMOTE:<parent> --format tsp --time-format unix --dirs-only|--files-only`
-// (one level).
+// Name search: `rclone lsf REMOTE:root --format tsp --time-format unix --csv --dirs-only|--files-only
+// -R --max-depth N [--exclude ...]`.
+// Path target:  `rclone lsf REMOTE:<parent> --format tsp --time-format unix --csv
+// --dirs-only|--files-only` (one level).
 [[nodiscard]] std::vector<std::string> build_lsf_argv(const ListRequest& req);
 
-// One line of that output: "<time>;<size>;<path>", the time in Unix seconds, folders ending in
-// '/' with size -1. The fields come first, so a ';' inside the path is harmless.
+// --csv output (Go's encoding/csv): records of comma-separated fields; a field holding a comma, a
+// quote, a line break or a leading space is in quotes, its quotes doubled. A name can hold a line
+// break, so a record isn't a line (review G59).
+[[nodiscard]] std::vector<std::vector<std::string>> parse_csv(std::string_view text);
+
+// One record of that output: <time>,<size>,<path>, the time in Unix seconds, folders ending in '/'
+// with size -1.
 struct LsfLine {
-    std::string_view path; // a folder's trailing '/' included
+    std::string path; // a folder's trailing '/' included
     std::optional<std::uint64_t> size;
     std::optional<std::int64_t> modified;
 };
-// nullopt when the line doesn't start with both fields (a size, or -1); a time that doesn't parse
-// gives an unknown date.
-[[nodiscard]] std::optional<LsfLine> parse_lsf_line(std::string_view line);
+// nullopt unless it is the three fields with a size (or -1); a time that doesn't parse gives an
+// unknown date.
+[[nodiscard]] std::optional<LsfLine> parse_lsf_record(const std::vector<std::string>& fields);
 
 // Entries from lsf output whose last component matches the query (see match.hpp); paths are
-// joined onto the root / parent. A line without the fields is taken as a bare path.
+// joined onto the root / parent.
 [[nodiscard]] std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req,
                                                         std::string_view out);
 

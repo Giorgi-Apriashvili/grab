@@ -167,15 +167,15 @@ TEST_CASE("listing commands and their output") {
                                       {"learning/x", false, 7, std::nullopt},
                                       {"learning/tab\there", true, std::nullopt, std::nullopt}});
 
-    const auto listed = file_list::parse_lsf("1697354553;-1;movies/\r\n1697354554;941563904;movies/a;b.avi\n"
-                                             "-62135596800;-1;tv/\nmissing-fields\n5;x;y\n",
+    const auto listed = file_list::parse_lsf("1697354553,-1,movies/\r\n1697354554,941563904,movies/a;b.avi\n"
+                                             "-62135596800,-1,tv/\nmissing-fields\n5,x,y\n",
                                              "/home");
     CHECK(listed == std::vector<Entry>{{"/home/movies", true, std::nullopt, 1697354553},
                                        {"/home/movies/a;b.avi", false, 941563904, 1697354554},
                                        {"/home/tv", true, std::nullopt, std::nullopt}});
-    CHECK(file_list::parse_lsf("5;3;x\n", "")[0] == Entry{"x", false, 3, 5});
+    CHECK(file_list::parse_lsf("5,3,x\n", "")[0] == Entry{"x", false, 3, 5});
     // An rclone without --time-format's "unix" prints its name: the entry stays, undated.
-    CHECK(file_list::parse_lsf("unix;3;x\n", "") == std::vector<Entry>{{"x", false, 3, std::nullopt}});
+    CHECK(file_list::parse_lsf("unix,3,x\n", "") == std::vector<Entry>{{"x", false, 3, std::nullopt}});
 }
 
 TEST_CASE("searching a list matches and ranks like a live search") {

@@ -151,20 +151,19 @@ std::vector<Entry> parse_find(std::string_view out) {
 
 std::vector<Entry> parse_lsf(std::string_view out, std::string_view root) {
     std::vector<Entry> entries;
-    split_records(out, '\n', [&](std::string_view line) {
-        if (line.ends_with('\r')) line.remove_suffix(1);
-        const auto fields = parse_lsf_line(line);
-        if (!fields) return;
+    for (const auto& record : parse_csv(out)) {
+        const auto fields = parse_lsf_record(record);
+        if (!fields) continue;
         Entry e;
-        line = fields->path;
+        std::string_view line = fields->path;
         e.dir = line.ends_with('/');
         if (e.dir) line.remove_suffix(1);
         else e.size = fields->size;
         e.modified = fields->modified;
-        if (line.empty()) return;
+        if (line.empty()) continue;
         e.path = join_remote(root, line);
         entries.push_back(std::move(e));
-    });
+    }
     return entries;
 }
 

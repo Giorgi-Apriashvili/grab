@@ -200,7 +200,7 @@ TEST_CASE("live searches return dates: find over ssh and rclone lsf") {
     list.mode = Mode::file;
     list.target = "lioness";
     list.root = "/home";
-    const auto by_lsf = engine::make_result(ctx, req, parse_lsf_output(list, "1697354554;300;tv/Lioness.S03E08.mkv\n"));
+    const auto by_lsf = engine::make_result(ctx, req, parse_lsf_output(list, "1697354554,300,tv/Lioness.S03E08.mkv\n"));
     REQUIRE(by_lsf.hits.size() == 1);
     CHECK(by_lsf.hits[0].path == "/home/tv/Lioness.S03E08.mkv");
     CHECK(by_lsf.hits[0].size == 300ULL);
@@ -208,7 +208,7 @@ TEST_CASE("live searches return dates: find over ssh and rclone lsf") {
 
     req.mode = Mode::folder;
     list.mode = Mode::folder;
-    const auto folder = engine::make_result(ctx, req, parse_lsf_output(list, "1697000000;-1;tv/Lioness/\n"));
+    const auto folder = engine::make_result(ctx, req, parse_lsf_output(list, "1697000000,-1,tv/Lioness/\n"));
     REQUIRE(folder.hits.size() == 1);
     CHECK_FALSE(folder.hits[0].size.has_value());
     CHECK(folder.hits[0].modified == 1697000000);
@@ -230,8 +230,8 @@ TEST_CASE("a search for folders and files walks the server once over rclone (G19
     std::ofstream(dir / "rclone.cmd", std::ios::binary)
         << "@echo off\r\n"
            ">> \"%~dp0calls.log\" echo %*\r\n" // (redirect first: "...connections 3>>" would be handle 3)
-           "echo 1697000000;-1;tv/Lioness/\r\n"
-           "echo 1697354554;300;tv/Lioness/Lioness.S03E08.mkv\r\n";
+           "echo 1697000000,-1,tv/Lioness/\r\n"
+           "echo 1697354554,300,tv/Lioness/Lioness.S03E08.mkv\r\n";
     engine::Context ctx;
     ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
     ctx.method = FindMethod::rclone;
