@@ -754,6 +754,9 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
 /* Centred where it fits, from its edge where it doesn't (so all of it scrolls into view), as the
    fitted image is centred. */
 .viewer-body.full img { margin: auto; }
+/* Zoomed: drag it to move around (app.js). */
+.viewer-body.full, .viewer-body.full img { cursor: grab; }
+.viewer-body.full.panning, .viewer-body.full.panning img { cursor: grabbing; }
 .viewer-body.text { align-items: stretch; }
 .viewer-text {
   margin: 0 auto;

@@ -250,7 +250,7 @@ too and goes on without them.
     - A Store app as the default player (Films & TV) can't open a stream; grab says so.
   - **Images, text files and PDFs** open in a viewer over the list: ←/→ go through the list's
     others (fetched ahead), Esc or Space closes, and Download saves the one shown.
-    - Images fit the window; a click shows full size. jpg, png, gif, webp, avif, bmp, ico, svg.
+    - Images fit the window; a click shows full size, zoomed on the spot clicked. Zoomed in, drag with any mouse button to move around; a click goes back. jpg, png, gif, webp, avif, bmp, ico, svg.
     - Text (.nfo, .txt, .srt, .log, .md, .json and more) shows its first MiB; .nfo files use
       the DOS code page, so their ASCII art lines up.
     - PDFs use the browser engine's built-in viewer (up to 128 MiB). A link inside one opens

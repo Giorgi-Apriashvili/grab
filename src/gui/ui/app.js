@@ -797,16 +797,16 @@ function showViewerItem() {
       fetchAhead();
     };
     img.onerror = reason;
-    // A click: the full size (scroll to see the rest), the spot clicked staying under the
-    // pointer; and back.
+    img.draggable = false; // a drag moves the view (below), never the picture itself
+    // A click: the full size (scroll or drag to see the rest), the spot clicked staying under
+    // the pointer. A click on it at full size goes back (the panning handlers below).
     img.addEventListener('click', (ev) => {
-      const zoomIn = img.classList.contains('fit');
+      if (!img.classList.contains('fit')) return;
       const was = img.getBoundingClientRect();
       const fx = (ev.clientX - was.left) / was.width;
       const fy = (ev.clientY - was.top) / was.height;
-      img.classList.toggle('fit', !zoomIn);
-      body.classList.toggle('full', zoomIn);
-      if (!zoomIn) return;
+      img.classList.remove('fit');
+      body.classList.add('full');
       const now = img.getBoundingClientRect(); // at full size, centred where it fits
       body.scrollLeft += now.left + fx * now.width - ev.clientX;
       body.scrollTop += now.top + fy * now.height - ev.clientY;
@@ -857,6 +857,48 @@ $('#viewer-download').addEventListener('click', () => {
   const h = viewer.list[viewer.index];
   if (h) download([h]);
 });
+
+// A zoomed image moves with the pointer, dragged with any button; a left click on it without
+// moving goes back to the fitted image. Right and middle start no menu or auto-scroll there.
+const pan = { id: null, x: 0, y: 0, left: 0, top: 0, moved: false, onImage: false };
+{
+  const body = $('#viewer-body');
+  const zoomed = () => body.classList.contains('full');
+  body.addEventListener('pointerdown', (ev) => {
+    if (!zoomed() || ev.button > 2 || pan.id !== null) return;
+    // Not on a scrollbar: those still scroll.
+    const r = body.getBoundingClientRect();
+    if (ev.clientX - r.left >= body.clientLeft + body.clientWidth || ev.clientY - r.top >= body.clientTop + body.clientHeight) {
+      return;
+    }
+    ev.preventDefault();
+    Object.assign(pan, { id: ev.pointerId, x: ev.clientX, y: ev.clientY, left: body.scrollLeft, top: body.scrollTop,
+      moved: false, onImage: ev.target.tagName === 'IMG' });
+    body.setPointerCapture(ev.pointerId);
+    body.classList.add('panning');
+  });
+  body.addEventListener('pointermove', (ev) => {
+    if (ev.pointerId !== pan.id) return;
+    const dx = ev.clientX - pan.x;
+    const dy = ev.clientY - pan.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) pan.moved = true;
+    body.scrollLeft = pan.left - dx;
+    body.scrollTop = pan.top - dy;
+  });
+  const endPan = (ev) => {
+    if (ev.pointerId !== pan.id) return;
+    pan.id = null;
+    body.classList.remove('panning');
+    if (ev.type === 'pointerup' && ev.button === 0 && !pan.moved && pan.onImage) {
+      body.querySelector('img')?.classList.add('fit');
+      body.classList.remove('full');
+    }
+  };
+  body.addEventListener('pointerup', endPan);
+  body.addEventListener('pointercancel', endPan);
+  body.addEventListener('mousedown', (ev) => { if (ev.button === 1 && zoomed()) ev.preventDefault(); });
+  body.addEventListener('contextmenu', (ev) => { if (zoomed()) ev.preventDefault(); });
+}
 // Esc or Space closes, ←/→ go through the others; nothing else reaches the list meanwhile.
 document.addEventListener('keydown', (ev) => {
   if (!viewer.open || modal) return;
