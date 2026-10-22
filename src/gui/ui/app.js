@@ -797,10 +797,19 @@ function showViewerItem() {
       fetchAhead();
     };
     img.onerror = reason;
-    // A click: the full size (scroll to see the rest), and back.
-    img.addEventListener('click', () => {
-      img.classList.toggle('fit');
-      body.classList.toggle('full', !img.classList.contains('fit'));
+    // A click: the full size (scroll to see the rest), the spot clicked staying under the
+    // pointer; and back.
+    img.addEventListener('click', (ev) => {
+      const zoomIn = img.classList.contains('fit');
+      const was = img.getBoundingClientRect();
+      const fx = (ev.clientX - was.left) / was.width;
+      const fy = (ev.clientY - was.top) / was.height;
+      img.classList.toggle('fit', !zoomIn);
+      body.classList.toggle('full', zoomIn);
+      if (!zoomIn) return;
+      const now = img.getBoundingClientRect(); // at full size, centred where it fits
+      body.scrollLeft += now.left + fx * now.width - ev.clientX;
+      body.scrollTop += now.top + fy * now.height - ev.clientY;
     });
     img.src = url;
   } else if (kind === 'text') {
