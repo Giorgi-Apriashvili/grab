@@ -1,0 +1,2 @@
+# vcpkg applies these patches to LF sources: keep them byte for byte (no CRLF on checkout).
+cmake/vcpkg-ports/** -text

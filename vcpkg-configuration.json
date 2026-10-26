@@ -1,0 +1,11 @@
+{
+  "$comment": "baseline: the microsoft/vcpkg commit vcpkg's own helper ports (vcpkg-cmake, ...) come from. OpenSSL itself comes from the overlay.",
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "0e5030f583a5427123cd3b714255e5ae62faa3ba"
+  },
+  "overlay-ports": [
+    "cmake/vcpkg-ports"
+  ]
+}

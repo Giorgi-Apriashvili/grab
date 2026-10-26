@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
+include(cmake/vcpkg.cmake) # OpenSSL on Windows; sets the toolchain, so before project()
+
 project(grab
     VERSION 0.19.0
     DESCRIPTION "Grab a file or folder from a Linux server by name: ssh+find to locate, rclone to download"
@@ -84,6 +86,33 @@ if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 else()
     target_compile_options(grab_core PUBLIC -Wall -Wextra -Wpedantic)
 endif()
+
+# ---------------------------------------------------------------------------
+# SSH: libssh2 (BSD-3-Clause) on OpenSSL's libcrypto (Apache-2.0), both static; grab's own SFTP
+# client runs on its channels (the rclone replacement). libssh2 has made no release since 1.11.1
+# (2024) while its security fixes land on master, so grab pins a master commit. To bump: take a
+# newer commit from https://github.com/libssh2/libssh2/commits/master, download
+# https://github.com/libssh2/libssh2/archive/<commit>.tar.gz and put its SHA-256 here.
+# OpenSSL: Windows gets 3.5 LTS from vcpkg (cmake/vcpkg.cmake, cmake/vcpkg-ports/openssl);
+# elsewhere the system's.
+# ---------------------------------------------------------------------------
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+include(FetchContent)
+FetchContent_Declare(libssh2
+    URL https://github.com/libssh2/libssh2/archive/6e7b2076a6ced2230968b27ee7c1abb77fe5a88d.tar.gz
+    URL_HASH SHA256=F45F441FB476E5C5DFF3B96F770D7925203A5DB5FB407124B68914327CCD65C6)
+block() # libssh2's options, without them leaking into grab's own settings
+    set(CRYPTO_BACKEND OpenSSL)
+    set(BUILD_SHARED_LIBS OFF)
+    set(BUILD_STATIC_LIBS ON)
+    set(BUILD_EXAMPLES OFF)
+    set(BUILD_TESTING OFF)
+    set(LIBSSH2_BUILD_DOCS OFF)
+    set(ENABLE_ZLIB_COMPRESSION OFF)
+    set(LIBSSH2_DISABLE_INSTALL ON)
+    FetchContent_MakeAvailable(libssh2)
+endblock()
+target_link_libraries(grab_core PUBLIC libssh2::libssh2_static)
 
 # ---------------------------------------------------------------------------
 # Executable

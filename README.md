@@ -49,7 +49,11 @@ passphrase from its encrypted store (see [Servers](#servers)).
 
 ## Build
 
-Toolchain: CMake ≥ 3.28, Ninja, and either LLVM clang-cl (default presets) or MSVC.
+Toolchain: CMake ≥ 3.28, Ninja, and either LLVM clang-cl (default presets) or MSVC, plus
+vcpkg for OpenSSL on Windows: the "vcpkg package manager" component of Visual Studio (found on
+its own), or any vcpkg checkout named by `VCPKG_ROOT`. The first configure builds OpenSSL
+(a few minutes); vcpkg keeps it in its cache for every later build. A build folder configured
+before vcpkg was needed must be configured once with `--fresh`.
 
 ```powershell
 cmake --preset clang-cl-debug
@@ -851,6 +855,16 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
     SHA-256, which is rclone's own published `SHA256SUMS` value.
   - **To bump:** change `GRAB_RCLONE_VERSION` and the hash in `CMakeLists.txt`, then rebuild.
     `grab update` delivers the new rclone together with grab.
+- **[libssh2](https://libssh2.org)**, BSD-3-Clause ([licenses/libssh2.txt](licenses/libssh2.txt)),
+  and **[OpenSSL](https://openssl-library.org)** 3.5 LTS, Apache-2.0
+  ([licenses/openssl.txt](licenses/openssl.txt)): built into grab, statically, for the SSH client
+  that is replacing rclone (in progress; not used by the programs yet).
+  - **Pins:** libssh2 is a master commit (it has made no release since 1.11.1 in 2024 and its
+    security fixes land on master), checked by SHA-256 in `CMakeLists.txt`. OpenSSL comes from
+    vcpkg through grab's copy of its port, `cmake/vcpkg-ports/openssl` (vcpkg itself has moved
+    on to 3.6), checked by SHA-512 and built without automatic loading of `openssl.cnf`.
+  - **To bump:** see the comments by the pins (`CMakeLists.txt`,
+    `cmake/vcpkg-ports/openssl/portfile.cmake`). Both are checked at every grab release.
 
 ## License
 

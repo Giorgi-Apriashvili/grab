@@ -38,6 +38,23 @@ jobs:
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
 
+      # OpenSSL comes from vcpkg (cmake/vcpkg.cmake): the runner's own checkout, with vcpkg's
+      # built packages kept between runs so OpenSSL is built only when its port changes.
+      - name: vcpkg
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT"
+          $cache = Join-Path $env:GITHUB_WORKSPACE 'vcpkg-cache'
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_DEFAULT_BINARY_CACHE=$cache"
+
+      - name: vcpkg cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg-ports/**') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
 

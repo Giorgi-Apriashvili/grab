@@ -18,6 +18,7 @@
       "description": "LLVM clang-cl with lld-link and llvm-rc; works from a plain shell, no Developer prompt needed",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_C_COMPILER": "clang-cl",
         "CMAKE_LINKER_TYPE": "LLD",
         "CMAKE_RC_COMPILER": "llvm-rc",
         "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
@@ -43,6 +44,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_COMPILER": "cl",
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
         "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/programs/grab"
@@ -55,6 +57,7 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_C_COMPILER": "cl",
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
         "CMAKE_INSTALL_PREFIX": "$env{USERPROFILE}/programs/grab"

@@ -1,0 +1,10 @@
+{
+  "$comment": "Windows builds take OpenSSL (for libssh2) from vcpkg; the version is pinned by grab's overlay port in cmake/vcpkg-ports/openssl. cmake/vcpkg.cmake finds vcpkg.",
+  "name": "grab",
+  "dependencies": [
+    {
+      "name": "openssl",
+      "platform": "windows"
+    }
+  ]
+}
