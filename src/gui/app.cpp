@@ -2698,6 +2698,12 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
         std::lock_guard lock(mutex_);
         return std::max(1, parallel_ - files_in_use(item.get()));
     };
+    // engine = grab: walked and fetched through grab's own SSH client.
+    if (effective_engine(ctx->settings) == Engine::grab) {
+        auto target = engine::ssh_target(*ctx);
+        if (!target) return fail(target.error());
+        job.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
+    }
 
     if (auto listed = folder::list(job, item->tree, mutex_, item_stop); !listed) return fail(listed.error());
     // Files already complete on disk (an earlier run, or downloaded before) are not fetched
@@ -2797,6 +2803,12 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             // Files paused one by one keep the folder paused until they are resumed or skipped.
             item->status = o.waiting > 0 ? Status::paused : Status::done;
             if (!checked_note.empty()) item->note = checked_note;
+        }
+        // Folders inside it the server wouldn't list: the rest came, and the row says what's missing.
+        if (const auto& u = item->tree.unreadable; !u.empty() && !item_stop.stop_requested()) {
+            const auto missing = std::format("{} couldn't be read: {}{}", u.size() == 1 ? "1 folder" : std::format("{} folders", u.size()),
+                                             u.front(), u.size() > 1 ? ", ..." : "");
+            item->note = item->note.empty() ? missing : item->note + ". " + missing;
         }
     }
     if (cancelled) {

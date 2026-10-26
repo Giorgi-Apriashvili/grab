@@ -51,8 +51,9 @@ inline constexpr int max_retries = 6; // per range, before the download fails
 inline constexpr std::chrono::minutes refused_give_up{5};
 
 // Chunk size for a file of `size` bytes fetched over up to `streams` connections: enough chunks
-// to keep every stream busy, within [min_chunk, max_chunk].
-[[nodiscard]] std::uint64_t chunk_size_for(std::uint64_t size, int streams);
+// to keep every stream busy, within [floor, max_chunk]. rclone's engine pays a login per chunk
+// (min_chunk); grab's a round trip, so a folder's 20 MiB file spreads over its connections too.
+[[nodiscard]] std::uint64_t chunk_size_for(std::uint64_t size, int streams, std::uint64_t floor = min_chunk);
 
 // A byte range of the file and how much of it, from its start, is on disk.
 struct Range {
@@ -177,7 +178,9 @@ public:
     void set_weight(const std::string& server, int id, int weight);
     void leave(const std::string& server, int id);
     // Waits until `id` may open one more connection; false when `stop` was requested first.
-    bool acquire(const std::string& server, int id, std::stop_token stop);
+    // `staggered`: kept ServerPool::stagger after the last start (a login: rclone's); grab's
+    // engine passes false, its pool pacing its own logins.
+    bool acquire(const std::string& server, int id, std::stop_token stop, bool staggered = true);
     // Takes up to `id`'s whole share at once (for an rclone copy or listing that manages its own
     // connections), at most `at_most`; at least 1 unless stopped (0). With `settle`, it waits that
     // long for downloads above their shares to hand connections back first.

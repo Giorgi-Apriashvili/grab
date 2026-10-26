@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -183,6 +184,77 @@ std::optional<std::string> too_long(const std::filesystem::path& p, std::size_t 
                        "while long paths are off): turn them on (\"Enable Win32 long paths\"), or save to a "
                        "shorter folder",
                        path_to_utf8(p), n, max_path);
+}
+
+std::expected<void, std::string> place_file(const std::filesystem::path& p, std::string_view data,
+                                            std::optional<std::int64_t> unix_ns) {
+    const auto failed = [&](unsigned long code) {
+        return failf("cannot write {}: {}", path_to_utf8(p), error_message(code));
+    };
+    std::error_code ec;
+    if (p.has_parent_path()) std::filesystem::create_directories(p.parent_path(), ec);
+    std::filesystem::path tmp;
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; ++attempt) {
+        tmp = p.parent_path() / ("~grab-" + random_suffix() + ".tmp");
+        h = CreateFileW(tmp.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) return failed(GetLastError());
+    }
+    if (h == INVALID_HANDLE_VALUE) return failed(ERROR_FILE_EXISTS);
+    DWORD e = 0;
+    while (e == 0 && !data.empty()) {
+        DWORD written = 0;
+        const DWORD n = static_cast<DWORD>(std::min<std::size_t>(data.size(), 1u << 30));
+        if (!WriteFile(h, data.data(), n, &written, nullptr)) e = GetLastError();
+        else if (written == 0) e = ERROR_WRITE_FAULT;
+        data.remove_prefix(written);
+    }
+    if (e == 0 && unix_ns) {
+        const std::int64_t ticks = *unix_ns / 100 + 116444736000000000LL; // 100 ns since 1601
+        const FILETIME ft{static_cast<DWORD>(ticks & 0xFFFFFFFF), static_cast<DWORD>(ticks >> 32)};
+        if (!SetFileTime(h, nullptr, nullptr, &ft)) e = GetLastError();
+    }
+    if (e == 0) {
+        e = replace_with(h, tmp, p);
+    } else {
+        CloseHandle(h);
+    }
+    if (e != 0) {
+        DeleteFileW(tmp.c_str());
+        return failed(e);
+    }
+#else
+    int fd = -1;
+    for (int attempt = 0; attempt < 8 && fd < 0; ++attempt) {
+        tmp = p.parent_path() / ("~grab-" + random_suffix() + ".tmp");
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0 && errno != EEXIST) return failed(errno);
+    }
+    if (fd < 0) return failed(EEXIST);
+    int e = 0;
+    while (e == 0 && !data.empty()) {
+        const ssize_t written = ::write(fd, data.data(), data.size());
+        if (written > 0) data.remove_prefix(static_cast<std::size_t>(written));
+        else if (written == 0) e = EIO;
+        else if (errno != EINTR) e = errno;
+    }
+    if (e == 0 && unix_ns) {
+        timespec times[2];
+        times[0].tv_sec = 0;
+        times[0].tv_nsec = UTIME_OMIT;
+        times[1].tv_sec = static_cast<time_t>(*unix_ns / 1'000'000'000);
+        times[1].tv_nsec = static_cast<long>(*unix_ns % 1'000'000'000);
+        if (futimens(fd, times) != 0) e = errno;
+    }
+    if (::close(fd) != 0 && e == 0) e = errno;
+    if (e == 0 && ::rename(tmp.c_str(), p.c_str()) != 0) e = errno;
+    if (e != 0) {
+        ::unlink(tmp.c_str());
+        return failed(static_cast<unsigned long>(e));
+    }
+#endif
+    return {};
 }
 
 std::expected<void, std::string> write_file_atomic(const std::filesystem::path& p, std::string_view text) {

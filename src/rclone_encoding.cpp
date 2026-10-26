@@ -327,6 +327,21 @@ std::string decode(std::string_view in, Mask mask) {
     return out + suffix;
 }
 
+std::string from_raw_name(std::string_view raw) { return encode(raw, grab_path); }
+
+std::string raw_path(std::string_view path) {
+    std::string out;
+    out.reserve(path.size());
+    for (std::size_t start = 0;;) {
+        const std::size_t sep = path.find('/', start);
+        out += decode(path.substr(start, sep == std::string_view::npos ? std::string_view::npos : sep - start), grab_path);
+        if (sep == std::string_view::npos) break;
+        out += '/';
+        start = sep + 1;
+    }
+    return out;
+}
+
 std::string from_standard_name(std::string_view name) { return encode(decode(name, standard), windows); }
 
 std::string to_standard_name(std::string_view name) { return encode(decode(name, windows), standard); }

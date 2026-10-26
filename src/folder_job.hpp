@@ -6,6 +6,11 @@
 // dominate. Big ones take grab's resumable ranged download (fetch::run), up to three at a time.
 // The whole folder is one user of its server's connection budget.
 //
+// With grab's own engine (Job::pool, engine = grab) the folder is walked over SFTP instead; files
+// from small_limit up take fetch::run as many at once as "At once" says, their pieces spread over
+// the folder's connections, and smaller ones go beside them on every free connection, many in
+// flight on each (RCLONE-REPLACEMENT.md, phase 3).
+//
 // The caller owns the folder's state (Tree) and the mutex guarding it, so it can show the
 // files and act on single ones (pause, resume, skip) while the download runs.
 
@@ -22,6 +27,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -32,6 +38,13 @@ namespace grab::folder {
 
 // Why a running big file is being stopped; the folder's own stop ends every file.
 enum class StopReason { none, pause, skip };
+
+// grab's engine: files under this size go beside the At once files on any free connection, many
+// in flight on each (the user's choice, 2026-10-27). One can't be split over connections, so
+// counting them against At once would leave most connections idle in a folder of small files.
+// From here up a file is fetched as a single download is (fetch::run): resumable, its pieces
+// spread over the folder's connections, and At once counts it.
+inline constexpr std::uint64_t small_limit = std::uint64_t{2} << 20;
 
 struct File {
     std::string path; // relative to the folder, '/'-separated
@@ -59,6 +72,10 @@ struct File {
 // so each of them is fetched by grab; and a file whose name an earlier file or any folder of the
 // listing has on Windows gets a numbered one, as Keep both names them: "readme (2)".
 void settle_names(std::vector<File>& files);
+// Which files take fetch::run (File::big), by engine: grab's sends every file from small_limit up
+// that way; rclone's batch takes the small ones except those it would write under another name or
+// keep only one of (make_file, settle_names, apply). Run again whenever the engine may differ.
+void set_big(std::vector<File>& files, bool grab_engine);
 
 // A folder download's state. Every access holds the caller's mutex.
 struct Tree {
@@ -69,6 +86,9 @@ struct Tree {
     bool batch_running = false;
     int connections = 0;   // open right now
     int files_at_once = 0; // files it downloads right now: the batch's at once, or its big files running
+    // Folders below the folder that grab's engine couldn't read ("a/b: permission denied"): the
+    // rest is downloaded and these are said (review G55).
+    std::vector<std::string> unreadable;
 };
 
 struct Totals {
@@ -157,6 +177,9 @@ struct Job {
     std::vector<std::string> extra; // added to every rclone call
     engine::CommandHook on_command; // sees every rclone command line before it runs
     std::function<void(Event)> on_event; // called without the mutex held
+    // The server's pool of grab's own SSH connections (engine = grab): set, the folder is walked
+    // and fetched through it instead of rclone. Needs `connections`.
+    std::shared_ptr<ssh::Pool> pool;
 };
 
 // Lists the folder into the tree, unless it is listed already. A stop returns early with the

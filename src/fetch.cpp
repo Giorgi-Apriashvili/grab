@@ -37,10 +37,10 @@ using Clock = std::chrono::steady_clock;
 
 // ---- pure parts ----------------------------------------------------------------------------
 
-std::uint64_t chunk_size_for(std::uint64_t size, int streams) {
+std::uint64_t chunk_size_for(std::uint64_t size, int streams, std::uint64_t floor) {
     const std::uint64_t n = static_cast<std::uint64_t>(std::max(streams, 1));
     const std::uint64_t per_stream = (size + n - 1) / n;
-    return std::clamp(per_stream, min_chunk, max_chunk);
+    return std::clamp(per_stream, std::min(floor, max_chunk), max_chunk);
 }
 
 std::uint64_t State::bytes_done() const {
@@ -323,7 +323,7 @@ void Connections::leave(const std::string& server, int id) {
     changed_.notify_all(); // shares grow for the others
 }
 
-bool Connections::acquire(const std::string& server, int id, std::stop_token stop) {
+bool Connections::acquire(const std::string& server, int id, std::stop_token stop, bool staggered) {
     std::unique_lock lock(mutex_);
     bool counted = false; // registered as waiting, so downloads borrowing our share give it back
     auto done_waiting = [&] {
@@ -336,7 +336,7 @@ bool Connections::acquire(const std::string& server, int id, std::stop_token sto
         }
         auto& p = pool(server);
         const auto now = budget::ServerPool::Clock::now();
-        if (p.may_start(id, now)) {
+        if (p.may_start(id, now, staggered)) {
             done_waiting();
             p.started(id, now);
             return true;
@@ -629,7 +629,7 @@ Look look_sftp(const Download& d, const std::stop_token& stop) {
     try {
         lease = d.pool->acquire(stop);
         if (!lease) return look; // stopped
-        auto a = sftp::stat((*lease)->sftp(), d.source.path);
+        auto a = sftp::stat((*lease)->sftp(), rclone_enc::raw_path(d.source.path));
         if (!a) {
             look.failure = budget::Failure::fatal;
             look.error = sftp::describe(a.error());
@@ -675,7 +675,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
     auto failed = [](std::string why) { return Result{Outcome::failed, std::move(why), {}}; };
     const Source& src = d.source;
     // Bytes that aren't UTF-8 can't reach rclone: said at once, not as "directory not found" (G17).
-    if (!rclone_enc::valid_utf8(src.path)) return failed(std::string(not_utf8_error));
+    // grab's engine hands the server the raw bytes.
+    if (!d.pool && !rclone_enc::valid_utf8(src.path)) return failed(std::string(not_utf8_error));
     // Past what Windows takes here, the partial download's record could never be written (G19).
     if (auto why = util::too_long(d.target, std::string_view(".2.grabpart.json").size())) return failed(std::move(*why));
     auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
@@ -689,7 +690,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
     std::optional<RemoteStat> remote;
     const auto stat_from = Clock::now();
     for (int attempt = 0;; ++attempt) {
-        if (!connections.acquire(d.server, d.id, stop)) return Result{Outcome::stopped, {}, {}};
+        if (!connections.acquire(d.server, d.id, stop, !d.pool)) return Result{Outcome::stopped, {}, {}};
         Look look = d.pool ? look_sftp(d, stop) : look_rclone(d, quiet, stop);
         const bool refused = !look.stat && !stop.stop_requested() && look.failure == budget::Failure::refused;
         if (refused) connections.refused(d.server);
@@ -740,9 +741,11 @@ Result run(const Download& d, Connections& connections, const std::function<void
         result.note = "the file changed on the server, or its partial copy was damaged; started over";
         discard_own(*own);
     }
+    // As many chunks as streams will fetch it: the folder's even part for a folder's file.
+    const int expected_streams = d.pool && d.streams_cap ? d.streams_cap() : connections.budget(d.server);
     State state = reuse ? own->state
                         : new_state(src.rclone_remote, src.path, remote->size, remote->modtime,
-                                    chunk_size_for(remote->size, connections.budget(d.server)));
+                                    chunk_size_for(remote->size, expected_streams, d.pool ? min_split_grab : min_chunk));
 
     const auto remaining = state.size - state.bytes_done();
     if (auto space = fs::space(d.target.parent_path(), ec); !ec && space.available < remaining) {
@@ -943,7 +946,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         if (!lease) return; // stopped
         sftp::Client& c = (*lease)->sftp();
         try {
-            auto handle = sftp::open_file(c, src.path);
+            auto handle = sftp::open_file(c, rclone_enc::raw_path(src.path));
             if (!handle) {
                 const auto code = handle.error().code;
                 a.failure = code == sftp::Code::no_such_file || code == sftp::Code::permission_denied
@@ -1066,7 +1069,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 continue;
             }
             // A connection first: work found while waiting for one could be gone by then.
-            if (!connections.acquire(d.server, d.id, token)) {
+            if (!connections.acquire(d.server, d.id, token, !d.pool)) {
                 --holding;
                 return;
             }

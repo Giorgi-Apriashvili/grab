@@ -43,6 +43,16 @@ inline constexpr Mask windows = slash | dot | colon | question | double_quote | 
 [[nodiscard]] std::string encode(std::string_view in, Mask mask);
 [[nodiscard]] std::string decode(std::string_view in, Mask mask);
 
+// grab's form of a server path is rclone's Standard one (a literal ‛ quoted, control characters
+// as symbols), with bytes that aren't UTF-8 as ‛XX as well: what rclone shows for every name it
+// can handle, and valid UTF-8 always, for the window and queue.json (review G17, G60). grab's own
+// SFTP client hands the server the raw bytes.
+inline constexpr Mask grab_path = standard | invalid_utf8;
+// A server's name (one part of a path, raw bytes) in grab's form.
+[[nodiscard]] std::string from_raw_name(std::string_view raw);
+// A path in grab's form as raw bytes for the server, part by part ('/' stays the separator).
+[[nodiscard]] std::string raw_path(std::string_view path);
+
 // rclone's FromStandardName(windows, name): what rclone writes on Windows for `name`.
 [[nodiscard]] std::string from_standard_name(std::string_view name);
 // rclone's ToStandardName(windows, name): the Standard form of a Windows name.

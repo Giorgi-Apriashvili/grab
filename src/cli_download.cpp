@@ -290,7 +290,7 @@ struct Session {
     const std::map<std::string, existing::Choice>* answered = nullptr;
     std::optional<existing::Choice>* for_rest = nullptr;
     bool several = false; // more than one pick: the question offers "the same for the rest"
-    // engine = grab: single files through grab's own SSH client (folders still through rclone).
+    // engine = grab: files and folders through grab's own SSH client.
     std::shared_ptr<ssh::Pool> pool = nullptr;
 };
 
@@ -455,6 +455,7 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
     job.files_at_once = [&s] { return s.files_at_once; }; // the window's "At once"
     job.extra = s.opts.extra;
     job.on_command = s.trace;
+    job.pool = s.pool;
     job.on_event = [&](folder::Event) {
         folder::Totals t;
         int conns = 0;
@@ -478,8 +479,10 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
         return proc::exit_stopped;
     }
     {
-        // Files that have another file's name on Windows ("README" and "readme"), numbered (G25).
+        // Folders inside it the server wouldn't list: the rest is fetched (review G55).
         std::lock_guard lock(m);
+        for (const auto& u : tree.unreadable) s.line.message("grab: couldn't read the folder " + u);
+        // Files that have another file's name on Windows ("README" and "readme"), numbered (G25).
         for (const auto& f : tree.files) {
             if (f.local.empty()) continue;
             s.line.message(std::format("grab: {} is saved as \"{}\": another file of the folder has its name on Windows",
@@ -589,6 +592,7 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
         job.extra = s.opts.extra;
         job.on_command = s.trace;
         job.id = id;
+        job.pool = s.pool;
         if (auto listed = folder::list(job, tree, m, s.stop); !listed) {
             what = std::format(" (cannot list it: {})", listed.error());
         } else {
@@ -730,7 +734,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
 
     DownloadTally tally;
     ssh::Pools pools; // closes its connections when the command ends
-    if (opts.mode == Mode::file && effective_engine(ctx.settings) == Engine::grab) {
+    if (effective_engine(ctx.settings) == Engine::grab) {
         auto target = engine::ssh_target(ctx);
         if (!target) {
             std::println(stderr, "grab: {}", target.error());

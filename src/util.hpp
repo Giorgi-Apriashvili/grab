@@ -59,6 +59,13 @@ namespace grab::util {
 // Writes `text` to a new file `p`; false when anything exists at `p` already (it is left alone)
 // or the write fails (the new file is removed again).
 bool write_new_file(const std::filesystem::path& p, std::string_view text);
+// A downloaded file into place: `data` goes to a new file of a random name beside `p`, which gets
+// the modification time `unix_ns` (nanoseconds since 1970, when given) and then takes p's place,
+// replacing a file there. Not flushed to the disk first: a download lost to a power cut is fetched
+// again, and flushing each of a folder's small files would slow it down. On failure `p` is
+// unchanged and the new file is gone. Creates the parent folder.
+[[nodiscard]] std::expected<void, std::string> place_file(const std::filesystem::path& p, std::string_view data,
+                                                          std::optional<std::int64_t> unix_ns);
 
 // Moves the file `p` aside as "<p>.<tag>-YYYYMMDD-HHMMSS" (local time), so what replaces it never
 // overwrites it: a damaged file is kept for whoever wants to look at it. Returns the new path.

@@ -137,7 +137,10 @@ bool is_short_name(std::string_view local_name) {
 }
 
 std::string name(std::string_view remote_name) {
-    std::string out = rclone_enc::from_standard_name(without_bidi(remote_name));
+    // rclone's mapping (FromStandardName), the name read in grab's form: a byte that isn't UTF-8
+    // may come as ‛XX (rclone_enc::grab_path) or raw, and lands the same either way.
+    std::string out = rclone_enc::encode(rclone_enc::decode(without_bidi(remote_name), rclone_enc::grab_path),
+                                         rclone_enc::windows);
     if (out.empty()) return "_"; // nothing but bidi controls
     if (is_device(out) || is_short_name(out)) out.insert(std::min(out.find('.'), out.size()), "_");
     return out;

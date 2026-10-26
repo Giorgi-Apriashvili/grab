@@ -28,6 +28,8 @@ public:
     std::map<std::string, std::string> files;               // path -> content
     std::map<std::string, std::vector<std::string>> dirs;   // path -> entry names (". and .." too)
     std::map<std::string, std::uint64_t> listed_size;       // sizes to claim in ATTRS instead
+    std::map<std::string, std::uint64_t> readdir_size;      // sizes to claim in folder listings only (a file changed since)
+    std::map<std::string, std::string> links;               // path -> where the link points (a full path)
     std::set<std::string> denied;                           // answered with permission denied
     std::uint32_t max_data = sftp::max_read;                // a DATA carries at most this
     bool reverse = false;                                   // answer each batch last first
@@ -118,7 +120,18 @@ private:
         str(b, "en");
         reply(101, id, b);
     }
-    void attrs(std::string& b, const std::string& path) {
+    // Where a path leads through links (a few levels; a loop stays on the link).
+    std::string resolve(std::string path) const {
+        for (int i = 0; i < 8 && links.contains(path); ++i) path = links.at(path);
+        return path;
+    }
+    void link_attrs(std::string& b) {
+        u32(b, 0x4 | 0x8);
+        u32(b, 0120777);
+        u32(b, 0);
+        u32(b, 1700000000);
+    }
+    void attrs(std::string& b, const std::string& path, bool in_listing = false) {
         if (dirs.contains(path)) {
             u32(b, 0x4 | 0x8);
             u32(b, 040755);
@@ -127,7 +140,7 @@ private:
             return;
         }
         u32(b, 0x1 | 0x4 | 0x8);
-        u64(b, listed_size.contains(path) ? listed_size[path] : all_files().at(path).size());
+        u64(b, in_listing && readdir_size.contains(path) ? readdir_size[path] : listed_size.contains(path) ? listed_size[path] : all_files().at(path).size());
         u32(b, 0100644);
         u32(b, 0);
         u32(b, 1700000000);
@@ -159,7 +172,7 @@ private:
         switch (type) {
         case 3: // OPEN
         case 11: { // OPENDIR
-            std::string path = in.str();
+            std::string path = resolve(in.str());
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (type == 3 ? !all_files().contains(path) : !dirs.contains(path)) return status(id, 2, "No such file");
             std::string b;
@@ -192,7 +205,8 @@ private:
                 str(b, name);
                 str(b, "-rw-r--r-- 1 u g 0 Jan 1 00:00 " + name);
                 std::string full = h.path == "/" ? "/" + name : h.path + "/" + name;
-                attrs(b, name == "." || name == ".." ? h.path : full);
+                if (name != "." && name != ".." && links.contains(full)) link_attrs(b);
+                else attrs(b, name == "." || name == ".." ? h.path : full, true);
             }
             h.pos += n;
             return reply(104, id, b);
@@ -200,8 +214,13 @@ private:
         case 7: // LSTAT
         case 17: { // STAT
             std::string path = in.str();
-            if (!known(path)) return status(id, 2, "No such file");
             std::string b;
+            if (type == 7 && links.contains(path)) {
+                link_attrs(b);
+                return reply(105, id, b);
+            }
+            path = resolve(path);
+            if (!known(path)) return status(id, 2, "No such file");
             attrs(b, path);
             return reply(105, id, b);
         }
@@ -214,7 +233,7 @@ private:
             std::string path = in.str();
             std::string b;
             u32(b, 1);
-            str(b, path == "." ? "/home/test" : path);
+            str(b, path == "." ? "/home/test" : resolve(path));
             str(b, "");
             u32(b, 0);
             return reply(104, id, b);

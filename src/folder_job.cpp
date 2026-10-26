@@ -8,12 +8,20 @@
 #include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
 #include "server_ops.hpp"
+#include "sftp.hpp"
+#include "ssh.hpp"
+#include "ssh_pool.hpp"
+#include "ssh_walk.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <format>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -227,6 +235,308 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     }
 }
 
+// Waits `d` unless `stop` comes first.
+void pause_for(std::chrono::milliseconds d, const std::stop_token& stop) {
+    std::mutex wait_m;
+    std::condition_variable_any wait_cv;
+    std::unique_lock lock(wait_m);
+    wait_cv.wait_for(lock, stop, d, [] { return false; });
+}
+
+// What one worker's turn on a connection came to.
+struct SmallRun {
+    std::size_t landed = 0;            // files put in place (or failed for their own reasons)
+    bool worked = false;               // data came: the pool counts the connection as working
+    bool yielded = false;              // handed its connection to another download, which released it
+    std::optional<std::string> broken; // the connection broke: why
+};
+
+// Small files on one connection (run_small_grab): up to 32 in flight, each OPEN, then its READs
+// and an FSTAT (the size and time now, which may have changed since the listing), then CLOSE, all
+// pipelined; 8 MiB of READs in flight at most. Under a speed limit one file and one READ at a
+// time, its tokens taken before it, so the replies are never left unread through a token wait.
+// Files left half-way (a stop, a broken connection) go back to the queue.
+SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, sftp::Client& c, const fs::path& dir,
+                  const std::stop_token& stop) {
+    const bool limited = job.limiter != nullptr && job.limiter->rate() > 0;
+    const std::size_t max_files = limited ? 1 : 32;
+    constexpr std::uint64_t max_bytes = std::uint64_t{8} << 20;
+    const bool replace = job.existing == existing::Choice::replace;
+    struct Slot {
+        std::size_t index = 0;
+        std::string raw;
+        fs::path target;
+        std::uint64_t size = 0;
+        std::string modtime;
+        std::string handle;
+        std::string data;
+        std::uint64_t asked = 0;
+        std::uint64_t got = 0;
+        int reads = 0;   // READs on their way
+        int pending = 0; // requests of any kind on their way
+        bool opened = false;
+        bool stated = false;
+        bool done = false; // landed or failed: the slot goes once its replies are in
+        std::optional<std::string> error;
+    };
+    std::map<int, Slot> slots;
+    int next_id = 0;
+    int reads_in_flight = 0;
+    std::uint64_t bytes_in_flight = 0;
+    bool taking = true;
+    SmallRun run;
+    auto last_progress = std::chrono::steady_clock::now();
+    const int weight = job.weight != nullptr ? job.weight->load() : 2;
+
+    // Back to the queue: the slots' files not landed yet.
+    auto requeue = [&] {
+        std::lock_guard lock(m);
+        for (auto& [id, s] : slots) {
+            if (s.done) continue;
+            auto& f = tree.files[s.index];
+            if (f.status != State::running) continue;
+            f.status = State::queued;
+            f.bytes = 0;
+            f.speed = 0;
+        }
+    };
+    std::function<void(int, std::uint64_t, std::uint32_t)> send_read = [&](int id, std::uint64_t at, std::uint32_t n) {
+        Slot& s = slots.at(id);
+        ++s.reads;
+        ++s.pending;
+        ++reads_in_flight;
+        bytes_in_flight += n;
+        c.read(s.handle, at, n, [&, id, at, n](std::expected<std::string_view, sftp::Status> r) {
+            Slot& s = slots.at(id);
+            --s.reads;
+            --s.pending;
+            --reads_in_flight;
+            bytes_in_flight -= n;
+            if (!r) {
+                // The end of the file where the FSTAT says it ends is no error.
+                if (r.error().code != sftp::Code::eof || at < s.size) {
+                    if (!s.error) s.error = r.error().code == sftp::Code::eof
+                                                ? "the server sent less data than expected; was the file changed?"
+                                                : sftp::describe(r.error());
+                }
+                return;
+            }
+            const std::uint64_t room = s.size > at ? std::min<std::uint64_t>(r->size(), s.size - at) : 0;
+            std::memcpy(s.data.data() + at, r->data(), static_cast<std::size_t>(room));
+            s.got += room;
+            if (!run.worked) {
+                run.worked = true;
+                job.connections->working(job.server, job.id);
+            }
+            if (r->size() < n && at + r->size() < s.size) {
+                send_read(id, at + r->size(), static_cast<std::uint32_t>(n - r->size())); // the rest, exactly
+            }
+            {
+                std::lock_guard lock(m);
+                auto& f = tree.files[s.index];
+                if (f.status == State::running) f.bytes = s.got;
+            }
+            if (const auto now = std::chrono::steady_clock::now(); now - last_progress >= std::chrono::milliseconds(100)) {
+                last_progress = now;
+                notify(job, Event::progress);
+            }
+        });
+    };
+    // A file whose bytes are all in, or that failed: closed on the server, put in place or failed.
+    auto finish = [&](int id) {
+        Slot& s = slots.at(id);
+        s.done = true;
+        if (s.opened) {
+            ++s.pending;
+            c.close(s.handle, [&, id](std::expected<void, sftp::Status>) { --slots.at(id).pending; });
+        }
+        std::string why = s.error.value_or("");
+        bool present = false;
+        {
+            std::lock_guard lock(m);
+            if (tree.files[s.index].status != State::running) return; // paused or skipped meanwhile
+        }
+        if (why.empty()) {
+            std::error_code ec;
+            if (!replace && fs::exists(fs::symlink_status(s.target, ec))) {
+                // Conflicts were answered before; one that appeared since stays, as with rclone.
+                if (fetch::up_to_date(s.target, s.size, s.modtime)) present = true;
+                else why = "a different file is already at " + util::path_to_utf8(s.target);
+            } else if (auto placed = util::place_file(s.target, s.data, util::parse_rfc3339(s.modtime)); !placed) {
+                why = placed.error();
+            }
+        }
+        s.data = std::string(); // its memory back now, not when its CLOSE comes
+        {
+            std::lock_guard lock(m);
+            auto& f = tree.files[s.index];
+            f.speed = 0;
+            f.eta.reset();
+            if (why.empty()) {
+                f.status = State::done;
+                f.fetched = f.fetched || !present;
+                f.bytes = f.size;
+            } else {
+                f.status = State::failed;
+                f.error = std::move(why);
+            }
+        }
+        ++run.landed;
+        notify(job, Event::progress); // many a second in a folder of small files
+        // A download that just joined this server gets its share now: no more files for this one.
+        if (taking && job.connections->yield_if_over_share(job.server, job.id)) {
+            run.yielded = true;
+            taking = false;
+        }
+    };
+
+    try {
+        for (;;) {
+            // New files, up to the slots this connection keeps.
+            while (taking && slots.size() < max_files && !stop.stop_requested()) {
+                Slot s;
+                std::string path;
+                {
+                    std::lock_guard lock(m);
+                    auto it = std::ranges::find_if(tree.files, [](const File& f) { return !f.big && f.status == State::queued; });
+                    if (it == tree.files.end()) {
+                        taking = false;
+                        break;
+                    }
+                    it->status = State::running;
+                    it->bytes = 0;
+                    it->error.clear();
+                    s.index = static_cast<std::size_t>(it - tree.files.begin());
+                    s.size = it->size;
+                    s.modtime = it->modtime;
+                    s.target = target_of(dir, *it);
+                    path = it->path;
+                }
+                s.raw = rclone_enc::raw_path(child_remote_path(job.remote_path, path));
+                s.data.resize(static_cast<std::size_t>(s.size));
+                const int id = next_id++;
+                Slot& slot = slots.emplace(id, std::move(s)).first->second;
+                ++slot.pending;
+                c.open(slot.raw, [&, id](std::expected<std::string, sftp::Status> h) {
+                    Slot& s = slots.at(id);
+                    --s.pending;
+                    if (!h) {
+                        s.error = sftp::describe(h.error());
+                        return;
+                    }
+                    s.handle = std::move(*h);
+                    s.opened = true;
+                    ++s.pending;
+                    c.fstat(s.handle, [&, id](std::expected<sftp::Attrs, sftp::Status> a) {
+                        Slot& s = slots.at(id);
+                        --s.pending;
+                        s.stated = true;
+                        if (!a) return; // the listing's size and time stand
+                        if (a->size && *a->size != s.size) {
+                            s.size = *a->size;
+                            s.data.resize(static_cast<std::size_t>(s.size));
+                        }
+                        if (a->mtime) s.modtime = std::format("{:%FT%TZ}", std::chrono::sys_seconds{std::chrono::seconds{*a->mtime}});
+                    });
+                });
+                notify(job, Event::progress);
+            }
+            // READs for what the open files still lack.
+            for (auto& [id, s] : slots) {
+                while (s.opened && !s.error && !s.done && s.asked < s.size && !stop.stop_requested()) {
+                    const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(sftp::max_read, s.size - s.asked));
+                    if (limited ? reads_in_flight >= 1 : reads_in_flight > 0 && bytes_in_flight + n > max_bytes) break;
+                    if (limited && !job.limiter->acquire(n, stop, job.id, weight)) break;
+                    send_read(id, s.asked, n);
+                    s.asked += n;
+                }
+            }
+            if (stop.stop_requested()) break;
+            // Files complete or failed: put in place; slots whose replies are all in go.
+            for (auto it = slots.begin(); it != slots.end();) {
+                Slot& s = it->second;
+                const bool complete = s.opened && s.stated && s.asked >= s.size && s.reads == 0;
+                if (!s.done && (s.error || complete)) finish(it->first);
+                it = s.done && s.pending == 0 ? slots.erase(it) : std::next(it);
+            }
+            if (slots.empty() && !taking) break;
+            if (c.pending() == 0) {
+                if (slots.empty()) continue; // take more
+                requeue(); // nothing on its way and nothing to send: should not happen; never spin
+                return run;
+            }
+            c.pump();
+        }
+    } catch (const sftp::Broken& e) {
+        requeue();
+        run.broken = e.what();
+        return run;
+    }
+    if (stop.stop_requested()) requeue();
+    return run;
+}
+
+// The queued small files (under small_limit) through grab's engine: as many workers as the
+// server's budget, each holding one of the folder's connections while small files are left, many
+// files in flight on each (small_on). They don't count against At once; the folder's big files,
+// fetched beside them (run_big), do.
+void run_small_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& stop) {
+    const auto dir = job_dir(job);
+    auto any_queued = [&] {
+        std::lock_guard lock(m);
+        return std::ranges::any_of(tree.files, [](const File& f) { return !f.big && f.status == State::queued; });
+    };
+    auto fail_queued = [&](const std::string& why) {
+        {
+            std::lock_guard lock(m);
+            for (auto& f : tree.files) {
+                if (f.big || f.status != State::queued) continue;
+                f.status = State::failed;
+                f.error = why;
+            }
+        }
+        notify(job, Event::changed);
+    };
+    auto worker = [&] {
+        int failures = 0; // in a row, nothing landing
+        for (;;) {
+            if (stop.stop_requested() || !any_queued()) return;
+            if (!job.connections->acquire(job.server, job.id, stop, false)) return;
+            std::optional<ssh::Pool::Lease> lease;
+            std::string why;
+            auto kind = budget::Failure::other;
+            try {
+                lease = job.pool->acquire(stop);
+            } catch (const ssh::Error& e) {
+                why = e.what();
+                kind = e.kind;
+            }
+            if (!lease) {
+                if (!why.empty() && kind == budget::Failure::refused) job.connections->refused(job.server);
+                job.connections->release(job.server, job.id);
+                if (why.empty()) return; // stopped
+                if (kind == budget::Failure::fatal || ++failures > fetch::max_retries) return fail_queued(why);
+                // A full server is asked again 1, 2, 4, 8, then 15 s apart (as fetch does, G9).
+                pause_for(std::min(std::chrono::seconds(1 << std::min(failures - 1, 4)), std::chrono::seconds(15)), stop);
+                continue;
+            }
+            {
+                std::lock_guard lock(m);
+                tree.connections = job.connections->active(job.server, job.id);
+            }
+            const SmallRun run = small_on(job, tree, m, (*lease)->sftp(), dir, stop);
+            if (stop.stop_requested() || run.broken) lease->broken(); // replies still on their way
+            lease.reset();
+            if (!run.yielded) job.connections->release(job.server, job.id, 1, run.worked);
+            if (run.landed > 0) failures = 0;
+            if (run.broken && run.landed == 0 && ++failures > fetch::max_retries) return fail_queued(*run.broken);
+            if (run.broken) pause_for(std::chrono::seconds(2), stop);
+        }
+    };
+    std::vector<std::jthread> workers;
+    for (int k = 0; k < std::max(1, job.connections->budget(job.server)); ++k) workers.emplace_back(worker);
+}
+
 // The queued big files, each resumable like a single-file download, as many at a time as the
 // folder may download ("At once": Job::files_at_once, asked again as each file ends). They share
 // the folder's connections (same pool id) and split ranges to keep them busy.
@@ -296,6 +606,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             d.weight = job.weight;
             d.streams_cap = even_part;
             d.on_command = job.on_command;
+            d.pool = job.pool;
             std::error_code ec;
             fs::create_directories(d.target.parent_path(), ec);
             const auto result = fetch::run(d, *job.connections, [&](const fetch::Progress& p) {
@@ -394,6 +705,20 @@ void settle_names(std::vector<File>& files) {
             f.status = State::failed;
             f.error = "no free name for it: other files of the folder have its name on Windows";
         }
+    }
+}
+
+void set_big(std::vector<File>& files, bool grab_engine) {
+    if (grab_engine) {
+        for (auto& f : files) f.big = f.size >= small_limit;
+        return;
+    }
+    std::vector<std::string> paths;
+    paths.reserve(files.size());
+    for (const auto& f : files) paths.push_back(f.path);
+    const auto clash = local::clashing(paths);
+    for (auto& f : files) {
+        f.big = is_big(f.size) || local::differs_from_rclone(f.path) || !f.local.empty() || clash.contains(f.path);
     }
 }
 
@@ -522,11 +847,59 @@ void discard_partials(const std::string& remote_path, const fs::path& dir, const
     }
 }
 
+namespace {
+
+// A folder's listing into its tree: its files (settled names, which take fetch::run), and those
+// whose path Windows can't take here failed saying why.
+void take_listing(const Job& job, Tree& tree, std::mutex& m, std::vector<FolderFile> listing,
+                  std::vector<std::string> unreadable) {
+    {
+        std::lock_guard lock(m);
+        tree.files.clear();
+        tree.files.reserve(listing.size());
+        for (auto& f : listing) tree.files.push_back(make_file(std::move(f.path), f.size, std::move(f.modtime)));
+        settle_names(tree.files);
+        set_big(tree.files, job.pool != nullptr);
+        // Without long paths, a file past what Windows takes here: grab couldn't see it on disk
+        // or keep a partial download beside it, so it fails saying why (review G19).
+        const auto dir = job_dir(job);
+        for (auto& f : tree.files) {
+            if (auto why = util::too_long(target_of(dir, f), f.big ? std::string_view(".2.grabpart.json").size() : 0)) {
+                f.status = State::failed;
+                f.error = std::move(*why);
+            }
+        }
+        tree.unreadable = std::move(unreadable);
+        tree.listed = true;
+    }
+    notify(job, Event::checkpoint);
+}
+
+// The listing through grab's engine: an SFTP walk on the folder's pooled connections, as many
+// as a listing may take from the server's budget (fetch::Listing, review G191).
+std::expected<void, std::string> list_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& stop) {
+    fetch::Listing seat(*job.connections, job.server, stop);
+    if (stop.stop_requested()) return {};
+    if (job.on_command) job.on_command({"sftp", "walk", job.remote_path});
+    auto walked = ssh::walk(*job.pool, job.remote_path, ssh::WalkOptions{.connections = std::max(1, seat.connections())},
+                            stop);
+    if (stop.stop_requested()) return {};
+    if (!walked) return util::fail("cannot list the folder: " + walked.error());
+    std::vector<FolderFile> listing;
+    listing.reserve(walked->entries.size());
+    for (auto& e : walked->entries) listing.push_back(FolderFile{std::move(e.path), e.size, std::move(e.modtime)});
+    take_listing(job, tree, m, std::move(listing), std::move(walked->unreadable));
+    return {};
+}
+
+} // namespace
+
 std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
     {
         std::lock_guard lock(m);
         if (tree.listed) return {};
     }
+    if (job.pool) return list_grab(job, tree, m, stop);
     const auto& ctx = *job.ctx;
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", "-R", "--files-only",
                                   remote_spec(ctx.settings.rclone_remote, job.remote_path)};
@@ -554,24 +927,7 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     if (run->exit_code != 0) return util::fail("cannot list the folder: " + server_ops::clean_rclone_error(run->err));
     auto listing = parse_listing(run->out);
     if (!listing) return util::fail(listing.error());
-    {
-        std::lock_guard lock(m);
-        tree.files.clear();
-        tree.files.reserve(listing->size());
-        for (auto& f : *listing) tree.files.push_back(make_file(std::move(f.path), f.size, std::move(f.modtime)));
-        settle_names(tree.files);
-        // Without long paths, a file past what Windows takes here: grab couldn't see it on disk
-        // or keep a partial download beside it, so it fails saying why (review G19).
-        const auto dir = job_dir(job);
-        for (auto& f : tree.files) {
-            if (auto why = util::too_long(target_of(dir, f), f.big ? std::string_view(".2.grabpart.json").size() : 0)) {
-                f.status = State::failed;
-                f.error = std::move(*why);
-            }
-        }
-        tree.listed = true;
-    }
-    notify(job, Event::checkpoint);
+    take_listing(job, tree, m, std::move(*listing), {});
     return {};
 }
 
@@ -589,6 +945,7 @@ void mark_existing(const Job& job, Tree& tree, std::mutex& m) {
     fetch::Reserved reserved;
     {
         std::lock_guard lock(m);
+        set_big(tree.files, job.pool != nullptr); // which ones may have a partial download
         for (std::size_t i = 0; i < tree.files.size(); ++i) {
             const auto& f = tree.files[i];
             if (f.status == State::queued) queued.push_back({i, f.path, f.size, f.modtime, f.big, target_of(dir, f)});
@@ -666,15 +1023,38 @@ void apply(existing::Choice choice, const std::vector<Conflict>& found, const fs
 }
 
 void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
-    // A folder whose name rclone can't be told (rclone_encoding.hpp: a "\" in the server's name,
-    // or a ‛ in the Save-to folder's): grab fetches every file itself rather than letting the batch
-    // write somewhere else (G80).
-    if (!rclone_enc::local_path(job_dir(job))) {
+    {
         std::lock_guard lock(m);
-        for (auto& f : tree.files) f.big = true;
+        set_big(tree.files, job.pool != nullptr);
+        // A folder whose name rclone can't be told (rclone_encoding.hpp: a "\" in the server's
+        // name, or a ‛ in the Save-to folder's): grab fetches every file itself rather than letting
+        // the batch write somewhere else (G80).
+        if (!job.pool && !rclone_enc::local_path(job_dir(job))) {
+            for (auto& f : tree.files) f.big = true;
+        }
     }
     job.connections->join(job.server, job.id, job.weight != nullptr ? job.weight->load() : 2);
-    while (!stop.stop_requested()) {
+    // grab's engine: the small files on every free connection beside the big ones under At once,
+    // a pass at a time until none is queued (a paused one resumed, a failed one retried).
+    while (job.pool && !stop.stop_requested()) {
+        bool small_left = false;
+        bool big_left = false;
+        {
+            std::lock_guard lock(m);
+            for (const auto& f : tree.files) {
+                if (f.status != State::queued) continue;
+                (f.big ? big_left : small_left) = true;
+            }
+        }
+        if (!small_left && !big_left) break;
+        {
+            std::jthread small_files;
+            if (small_left) small_files = std::jthread([&] { run_small_grab(job, tree, m, stop); });
+            if (big_left) run_big(job, tree, m, stop);
+        }
+        notify(job, Event::checkpoint);
+    }
+    while (!job.pool && !stop.stop_requested()) {
         // (not "small": windows.h defines that as a macro)
         std::vector<std::size_t> small_files;
         bool big_waiting = false;
@@ -719,6 +1099,10 @@ Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token 
         std::lock_guard lock(m);
         for (const auto& f : tree.files) {
             if (f.status != State::done || !f.fetched || f.verified) continue;
+            // A name that isn't UTF-8 (fetched by grab's engine) can't reach rclone's check, which
+            // would call it missing and so have the good copy deleted: left unchecked until the
+            // check is grab's own (RCLONE-REPLACEMENT.md, phase 5).
+            if (!rclone_enc::valid_utf8(rclone_enc::raw_path(f.path))) continue;
             r.paths.push_back(f.path);
             if (!f.local.empty()) r.renamed.emplace(f.path, f.local);
         }

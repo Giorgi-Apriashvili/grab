@@ -355,3 +355,21 @@ TEST_CASE("a replaced file's temp name is short, whatever its own (G70)") {
     std::filesystem::remove_all(dir);
 }
 #endif
+
+TEST_CASE("place_file: a download put in place with the server's time, replacing what was there") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-tests-place" / "sub";
+    std::filesystem::remove_all(dir.parent_path());
+    const auto p = dir / "f.bin";
+    const std::int64_t when = 1'700'000'000LL * 1'000'000'000LL; // 2023-11-14T22:13:20Z
+    REQUIRE(util::place_file(p, "first", when));
+    CHECK(util::read_file(p) == "first");
+    const auto written = std::filesystem::last_write_time(p);
+    const auto since_1970 = std::chrono::clock_cast<std::chrono::system_clock>(written).time_since_epoch();
+    CHECK(std::chrono::duration_cast<std::chrono::seconds>(since_1970).count() == 1'700'000'000);
+    REQUIRE(util::place_file(p, "second", std::nullopt));
+    CHECK(util::read_file(p) == "second");
+    std::size_t files = 0;
+    for ([[maybe_unused]] const auto& e : std::filesystem::directory_iterator(dir)) ++files;
+    CHECK(files == 1); // no temporary file left
+    std::filesystem::remove_all(dir.parent_path());
+}

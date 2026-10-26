@@ -51,7 +51,8 @@ add_executable(grab_tests
     test_ssh.cpp
     test_sftp.cpp
     test_ssh_pool.cpp
-    test_fetch_grab.cpp)
+    test_fetch_grab.cpp
+    test_folder_grab.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)
 if(WIN32)

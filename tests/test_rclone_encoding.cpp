@@ -47,6 +47,27 @@ TEST_CASE("rclone's mapping of a server name agrees with grab's local names") {
     }
 }
 
+TEST_CASE("grab's form of server paths: rclone's Standard one, and bytes that aren't UTF-8 as ‛XX") {
+    // As rclone shows them, for every name rclone can handle.
+    for (const std::string raw : {"plain name.mkv", "x\x01y", "q‛y", "a:b*c", "␀nul", "a／b", ".."}) {
+        CHECK_MESSAGE(enc::from_raw_name(raw) == enc::encode(raw, enc::standard), raw);
+    }
+    // Names rclone can't show: valid UTF-8 now, and back to their bytes for the server.
+    CHECK(enc::from_raw_name("caf\xE9.mp3") == "caf‛E9.mp3");
+    CHECK(enc::valid_utf8(enc::from_raw_name("\xFF\xFE bytes \x80")));
+    for (const std::string raw : {"caf\xE9.mp3", "q‛y", "x\x01y", "\xFF\xFE", "a‛41b", "plain"}) {
+        CHECK_MESSAGE(enc::raw_path(enc::from_raw_name(raw)) == raw, raw);
+    }
+    // A path part by part, '/' as the separator; absolute and relative.
+    const std::string path = "/srv/" + enc::from_raw_name("caf\xE9") + "/" + enc::from_raw_name("x\x01y") + "/f.bin";
+    CHECK(enc::raw_path(path) == "/srv/caf\xE9/x\x01y/f.bin");
+    CHECK(enc::raw_path("movies/a b.mkv") == "movies/a b.mkv");
+    CHECK(enc::raw_path("") == "");
+    // The local name is the same from either form.
+    CHECK(local::name(enc::from_raw_name("caf\xE9.mp3")) == local::name("caf\xE9.mp3"));
+    CHECK(local::name("caf\xE9.mp3") == "caf‛E9.mp3");
+}
+
 TEST_CASE("a local name goes to rclone in the form that comes back as itself (G80)") {
     for (const std::string raw : {"Mission: Impossible (1996)", "a*b?c", "trail.", "trail ", "x\x01y", "already\uFF1Acolon",
                                   "q\u201By", "\u2400nul"}) {

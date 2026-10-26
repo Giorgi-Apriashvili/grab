@@ -73,7 +73,8 @@ add_library(grab_core STATIC
     src/sftp.cpp
     src/ssh.cpp
     src/ssh_pool.cpp
-    src/ssh_target.cpp)
+    src/ssh_target.cpp
+    src/ssh_walk.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).

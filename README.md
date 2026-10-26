@@ -581,11 +581,14 @@ saved passwords and known_hosts are shared by all of them.
 Add one `[section]` per server and choose with `-r NAME`.
 
 **grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
-`engine = grab` in a server's section to try it: single files then download through it (folders,
-listings, previews and checks still go through rclone). It logs in once and keeps the connections
-open between files, asks the server for exactly the bytes it needs, and continues partial downloads
-rclone started (and the other way round). `GRAB_ENGINE=grab` or `rclone` in the environment
-overrides every server.
+`engine = grab` in a server's section to try it: files and folders then download through it
+(searches, file lists, browsing, previews and checks still go through rclone). It logs in once and
+keeps the connections open between files, asks the server for exactly the bytes it needs, and
+continues partial downloads rclone started (and the other way round). In a folder, files of 2 MiB
+and more follow "At once" and spread over the connections; smaller ones go beside them on every
+free connection, many at a time. It also downloads names that aren't UTF-8, and a subfolder the
+server won't list is reported instead of failing the whole folder. `GRAB_ENGINE=grab` or `rclone`
+in the environment overrides every server.
 
 ## Usage
 

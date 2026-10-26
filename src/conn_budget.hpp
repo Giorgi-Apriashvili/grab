@@ -66,7 +66,9 @@ public:
     // ahead of a waiting user that has none, and either below its share or borrowing capacity no
     // other download is waiting for (a small file that can only use one connection leaves the
     // rest of its share to the others).
-    [[nodiscard]] bool may_start(int id, Clock::time_point now) const;
+    // `staggered`: this start may be a login (rclone's are); grab's engine logs in through its
+    // pool, which paces logins itself, so its starts aren't kept `stagger` apart.
+    [[nodiscard]] bool may_start(int id, Clock::time_point now, bool staggered = true) const;
     // Downloads waiting for a connection, so borrowed ones are handed back.
     void waiting(int id, int delta);
     // Whether `id` should hand a connection back: it holds more than its share while another
