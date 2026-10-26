@@ -822,6 +822,11 @@ src/browse.*    browse mode: a server's folders from its file list, deeper ones 
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
 src/ui_origin.* what the window may show and whose messages count (exact addresses)
+src/ssh.*       grab's own SSH connections (libssh2): host keys, login, SFTP channels, commands
+src/sftp.*      grab's own SFTP client: pipelined reads with exact bounds, listings, stat
+src/ssh_pool.*  a server's connections kept open and lent to downloads
+src/ssh_target.* a server's rclone.conf section and stored secrets as an SSH login
+cmake/vcpkg*    OpenSSL from vcpkg; cmake/vcpkg-ports/openssl pins 3.5 LTS
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (fetched by CMake)
