@@ -335,6 +335,14 @@ std::expected<Attrs, Status> stat(Client& client, std::string_view path) {
     return wait_for<Attrs>(client, [&](Client::Done<Attrs> done) { client.stat(path, std::move(done)); });
 }
 
+std::expected<std::string, Status> open_file(Client& client, std::string_view path) {
+    return wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.open(path, std::move(done)); });
+}
+
+std::expected<void, Status> close_file(Client& client, std::string_view handle) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.close(handle, std::move(done)); });
+}
+
 std::expected<std::string, Status> realpath(Client& client, std::string_view path) {
     return wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.realpath(path, std::move(done)); });
 }

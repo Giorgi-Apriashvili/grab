@@ -580,6 +580,13 @@ default keeps its own window settings, queue and recent searches in
 saved passwords and known_hosts are shared by all of them.
 Add one `[section]` per server and choose with `-r NAME`.
 
+**grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
+`engine = grab` in a server's section to try it: single files then download through it (folders,
+listings, previews and checks still go through rclone). It logs in once and keeps the connections
+open between files, asks the server for exactly the bytes it needs, and continues partial downloads
+rclone started (and the other way round). `GRAB_ENGINE=grab` or `rclone` in the environment
+overrides every server.
+
 ## Usage
 
 ```

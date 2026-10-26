@@ -5,6 +5,9 @@
 #include "rclone.hpp"
 #include "rclone_encoding.hpp"
 #include "server_ops.hpp"
+#include "sftp.hpp"
+#include "ssh.hpp"
+#include "ssh_pool.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -14,6 +17,7 @@
 #include <deque>
 #include <format>
 #include <limits>
+#include <map>
 #include <system_error>
 #include <thread>
 
@@ -63,15 +67,23 @@ State new_state(std::string rclone_remote, std::string path, std::uint64_t size,
     return s;
 }
 
-std::optional<std::size_t> split(State& s, std::size_t i) {
+std::optional<std::size_t> split(State& s, std::size_t i, std::uint64_t asked, std::uint64_t min_piece) {
     Range& r = s.ranges[i];
     constexpr std::uint64_t align = 64 * 1024;
-    const std::uint64_t half = r.remaining() / 2 / align * align;
-    if (half < min_split || r.remaining() - half < min_split) return std::nullopt;
+    const std::uint64_t open = r.remaining() > asked ? r.remaining() - asked : 0;
+    const std::uint64_t half = open / 2 / align * align;
+    if (half < min_piece || r.remaining() - half < min_piece) return std::nullopt;
     const Range tail{r.start + r.length - half, half, 0};
     r.length -= half; // the stream on `r` stops at the new end
     s.ranges.push_back(tail);
     return s.ranges.size() - 1;
+}
+
+bool same_modtime(std::string_view a, std::string_view b) {
+    if (a == b) return true;
+    const auto x = util::parse_rfc3339(a);
+    const auto y = util::parse_rfc3339(b);
+    return x && y && *x == *y;
 }
 
 std::string state_to_json(const State& s) {
@@ -583,6 +595,57 @@ std::chrono::seconds backoff(int attempt) {
     return std::chrono::seconds(steps[std::clamp(attempt - 1, 0, 5)]);
 }
 
+// One look at the server's file, through either engine: what it is, or why that failed.
+struct Look {
+    std::optional<RemoteStat> stat;
+    budget::Failure failure = budget::Failure::other;
+    std::string error;
+};
+
+Look look_rclone(const Download& d, const proc::RunOptions& quiet, const std::stop_token& stop) {
+    const auto argv = stat_argv(d.source);
+    if (d.on_command) d.on_command(argv);
+    auto run = proc::run_capture(argv, quiet);
+    if (!run) return Look{std::nullopt, budget::Failure::other, run.error()};
+    if (run->exit_code != 0) {
+        const auto failure = stop.stop_requested() ? budget::Failure::other : budget::classify_failure(run->err);
+        return Look{std::nullopt, failure,
+                    name_not_utf8(d.source.path) ? std::string(not_utf8_error) : server_ops::clean_rclone_error(run->err)};
+    }
+    auto parsed = parse_stat(run->out);
+    if (!parsed) return Look{std::nullopt, budget::Failure::fatal, parsed.error()};
+    return Look{*parsed, {}, {}};
+}
+
+// "2023-05-06T11:18:12Z": SFTP gives whole seconds since 1970, in UTC.
+std::string utc_rfc3339(std::uint32_t seconds) {
+    return std::format("{:%FT%TZ}", std::chrono::sys_seconds{std::chrono::seconds{seconds}});
+}
+
+Look look_sftp(const Download& d, const std::stop_token& stop) {
+    if (d.on_command) d.on_command({"sftp", "stat", d.source.path});
+    Look look;
+    std::optional<ssh::Pool::Lease> lease;
+    try {
+        lease = d.pool->acquire(stop);
+        if (!lease) return look; // stopped
+        auto a = sftp::stat((*lease)->sftp(), d.source.path);
+        if (!a) {
+            look.failure = budget::Failure::fatal;
+            look.error = sftp::describe(a.error());
+            return look;
+        }
+        look.stat = RemoteStat{a->size.value_or(0), a->mtime ? utc_rfc3339(*a->mtime) : std::string(), a->is_dir()};
+    } catch (const ssh::Error& e) {
+        look.failure = e.kind;
+        look.error = e.what();
+    } catch (const sftp::Broken& e) {
+        if (lease) lease->broken();
+        look.error = e.what();
+    }
+    return look;
+}
+
 // The download's place in its server's pool, from the size check on, left on every way out.
 class Seat {
 public:
@@ -621,33 +684,28 @@ Result run(const Download& d, Connections& connections, const std::function<void
     proc::RunOptions quiet;
     quiet.detached = true;
     quiet.stop = stop;
-    const auto stat = stat_argv(src);
     // The size check is a connection like the others: taken from the pool, and when the server
     // is full, asked again 1, 2, 4, 8, then 15 s apart rather than failing the file (review G193).
-    std::expected<proc::CaptureResult, std::string> stat_run;
+    std::optional<RemoteStat> remote;
     const auto stat_from = Clock::now();
     for (int attempt = 0;; ++attempt) {
         if (!connections.acquire(d.server, d.id, stop)) return Result{Outcome::stopped, {}, {}};
-        if (d.on_command) d.on_command(stat);
-        stat_run = proc::run_capture(stat, quiet);
-        const bool refused = stat_run && stat_run->exit_code != 0 && !stop.stop_requested() &&
-                             budget::classify_failure(stat_run->err) == budget::Failure::refused;
+        Look look = d.pool ? look_sftp(d, stop) : look_rclone(d, quiet, stop);
+        const bool refused = !look.stat && !stop.stop_requested() && look.failure == budget::Failure::refused;
         if (refused) connections.refused(d.server);
         connections.release(d.server, d.id);
         if (stop.stop_requested()) return Result{Outcome::stopped, {}, {}};
-        if (!stat_run) return failed(stat_run.error());
-        if (stat_run->exit_code == 0) break;
-        if (!refused || Clock::now() - stat_from >= refused_give_up) {
-            return failed(name_not_utf8(src.path) ? std::string(not_utf8_error) : server_ops::clean_rclone_error(stat_run->err));
+        if (look.stat) {
+            remote = std::move(look.stat);
+            break;
         }
+        if (!refused || Clock::now() - stat_from >= refused_give_up) return failed(look.error);
         std::mutex wait_m;
         std::condition_variable_any wait_cv;
         std::unique_lock wait_lock(wait_m);
         wait_cv.wait_for(wait_lock, stop, std::min(std::chrono::seconds(1 << std::min(attempt, 4)), std::chrono::seconds(15)),
                          [] { return false; });
     }
-    auto remote = parse_stat(stat_run->out);
-    if (!remote) return failed(remote.error());
     if (remote->is_dir) return failed("this is a folder on the server; download it as a folder");
 
     Result result;
@@ -674,9 +732,10 @@ Result run(const Download& d, Connections& connections, const std::function<void
         result.error = "a different file is already at " + util::path_to_utf8(d.target);
         return result;
     }
+    // Either engine's partial goes on under the other: the same server, size and moment.
     const bool reuse = own && own->state.rclone_remote == src.rclone_remote && own->state.size == remote->size &&
-                       own->state.modtime == remote->modtime && fs::file_size(own->files.part, ec) == remote->size &&
-                       !ec;
+                       same_modtime(own->state.modtime, remote->modtime) &&
+                       fs::file_size(own->files.part, ec) == remote->size && !ec;
     if (own && !reuse) {
         result.note = "the file changed on the server, or its partial copy was damaged; started over";
         discard_own(*own);
@@ -712,6 +771,13 @@ Result run(const Download& d, Connections& connections, const std::function<void
     std::vector<char> busy(state.ranges.size(), 0);
     std::vector<int> tries(state.ranges.size(), 0);
     std::vector<Clock::time_point> not_before(state.ranges.size(), Clock::time_point{});
+    // grab's engine: how far each busy range's stream has asked the server for (a file offset;
+    // 0 when nothing past its done bytes), which a split leaves with it.
+    std::vector<std::uint64_t> asked_to(state.ranges.size(), 0);
+    auto asked_past_done = [&](std::size_t r) -> std::uint64_t {
+        const std::uint64_t at = state.ranges[r].start + state.ranges[r].done;
+        return busy[r] && asked_to[r] > at ? asked_to[r] - at : 0;
+    };
     // While the server refuses this download and no data comes (it is full with something else's
     // connections): since when, how many times in a row, and until when no stream may try. Then
     // one stream at a time asks, 1, 2, 4, 8, then 15 s apart (review G9).
@@ -743,22 +809,248 @@ Result run(const Download& d, Connections& connections, const std::function<void
             retry_at = retry_at ? std::min(*retry_at, not_before[r]) : not_before[r];
         }
         if (retry_at) return std::nullopt;
+        // The busy range with the most bytes nobody asked for yet.
+        auto open = [&](std::size_t r) { return state.ranges[r].remaining() - asked_past_done(r); };
         std::optional<std::size_t> busiest;
         for (std::size_t r = 0; r < state.ranges.size(); ++r) {
-            if (busy[r] && (!busiest || state.ranges[r].remaining() > state.ranges[*busiest].remaining())) busiest = r;
+            if (busy[r] && (!busiest || open(r) > open(*busiest))) busiest = r;
         }
         if (!busiest) return std::nullopt;
-        auto tail = split(state, *busiest);
+        auto tail = fetch::split(state, *busiest, asked_past_done(*busiest), d.pool ? min_split_grab : min_split);
         if (tail) {
             busy.push_back(0);
             tries.push_back(0);
             not_before.push_back(Clock::time_point{});
+            asked_to.push_back(0);
         }
         return tail;
     };
 
     // Connections this file's streams hold, against Download::streams_cap.
     std::atomic<int> holding{0};
+
+    // What one go at a range came to.
+    struct Attempt {
+        std::uint64_t got = 0;
+        bool worked = false;       // counted as working in the pool, from its first data
+        bool write_failed = false;
+        bool yielded = false;      // gave the connection to another download mid-range
+        bool restarted = false;    // rclone: the speed limit went on or off, so start again with fitting flags
+        bool gave_way = false;     // over its part of the folder's connections: one for another file
+        std::optional<budget::Failure> failure; // it ended in an error: refused, fatal or other
+        std::string error;
+    };
+    // Bytes of range `i` that arrived, written where they belong. False: stop, as the range is
+    // done (a split may have shortened it meanwhile) or the write failed (`a.write_failed`).
+    auto put = [&](std::size_t i, std::string_view data, Attempt& a) {
+        std::lock_guard lock(m);
+        if (token.stop_requested()) return false;
+        Range& r = state.ranges[i];
+        data = data.substr(0, static_cast<std::size_t>(std::min<std::uint64_t>(data.size(), r.remaining())));
+        if (!data.empty() && !file.write_at(r.start + r.done, data)) {
+            a.write_failed = true;
+            return false;
+        }
+        r.done += data.size();
+        a.got += data.size();
+        refused_since.reset(); // the server takes this download's connections
+        refused_streak = 0;
+        if (!a.worked && !data.empty()) {
+            a.worked = true;
+            connections.working(d.server, d.id);
+        }
+        return r.remaining() > 0;
+    };
+    // Whether the stream hands its connection over now; sets `a.yielded` or `a.gave_way`. What it
+    // wrote stays, and the range is picked up again later.
+    auto step_aside = [&](Attempt& a) {
+        // A download that just joined this server gets its share now, not when this range ends.
+        if (connections.yield_if_over_share(d.server, d.id)) {
+            a.yielded = true;
+            return true;
+        }
+        // Another file of the folder started: this one keeps only its even part (taken off here,
+        // so its other streams don't all give theirs up at once).
+        if (d.streams_cap) {
+            const int cap = d.streams_cap();
+            int h = holding.load();
+            while (h > cap && !holding.compare_exchange_weak(h, h - 1)) {
+            }
+            if (h > cap) {
+                a.gave_way = true;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Range `i` from `offset` (its first byte not on disk), `count` bytes, as one rclone cat.
+    auto rclone_range = [&](std::size_t i, std::uint64_t offset, std::uint64_t count, Attempt& a) {
+        // Whether a speed limit is on as this stream starts: its read-ahead depends on that,
+        // not on the limit's value, so only switching it on or off restarts the stream (G76).
+        const bool limited = d.limiter != nullptr && d.limiter->rate() > 0;
+        proc::RunOptions opts;
+        opts.detached = true;
+        opts.stop = token;
+        const auto cat = cat_argv(src, offset, count, limited);
+        if (d.on_command) d.on_command(cat);
+        auto run = proc::run_piped(cat, [&](std::string_view chunk) {
+            // Under a speed limit, in slices of 64 KiB: bytes pass evenly rather than a pipe's
+            // worth (up to 1 MiB) at a time, and no slice waits for a full bucket, whose excess
+            // a late wake-up would lose (the limit came out 5% short).
+            const std::size_t slice = limited ? std::size_t{64} << 10 : chunk.size();
+            while (!chunk.empty()) {
+                std::string_view data = chunk.substr(0, slice);
+                chunk.remove_prefix(data.size());
+                // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
+                if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token, d.id, weight())) return false;
+                if (!put(i, data, a) || step_aside(a)) return false;
+                if (d.limiter != nullptr && (d.limiter->rate() > 0) != limited) {
+                    a.restarted = true;
+                    return false;
+                }
+            }
+            return true;
+        }, opts);
+        if (a.write_failed || a.yielded || a.restarted || a.gave_way || token.stop_requested()) return;
+        if (!run) {
+            a.failure = budget::Failure::other;
+            a.error = run.error();
+        } else if (run->exit_code != 0) {
+            // A failure before any data arrived says why the connection failed: the server is
+            // full (it wants fewer connections), or trying again can't help (review G9).
+            a.failure = a.got == 0 ? budget::classify_failure(run->err) : budget::Failure::other;
+            a.error = server_ops::clean_rclone_error(run->err);
+        } else {
+            a.failure = budget::Failure::other; // only counts when the range isn't done
+            a.error = "the server sent less data than expected; was the file changed?";
+        }
+    };
+
+    // Range `i` from `offset` through grab's engine: a connection borrowed from the pool, READs of
+    // exact bounds pipelined (grab_depth in flight), each asked for up to the range's end as it
+    // is then (a split for an idle stream takes only bytes not asked for yet), the speed limit
+    // taken before each READ so the network follows it, data written in order.
+    auto sftp_range = [&](std::size_t i, std::uint64_t offset, Attempt& a) {
+        std::optional<ssh::Pool::Lease> lease;
+        try {
+            lease = d.pool->acquire(token);
+        } catch (const ssh::Error& e) {
+            a.failure = e.kind;
+            a.error = e.what();
+            return;
+        }
+        if (!lease) return; // stopped
+        sftp::Client& c = (*lease)->sftp();
+        try {
+            auto handle = sftp::open_file(c, src.path);
+            if (!handle) {
+                const auto code = handle.error().code;
+                a.failure = code == sftp::Code::no_such_file || code == sftp::Code::permission_denied
+                                ? budget::Failure::fatal
+                                : budget::Failure::other;
+                a.error = sftp::describe(handle.error());
+                return;
+            }
+            std::uint64_t next = offset;    // the next byte to ask for
+            std::uint64_t deliver = offset; // the next byte to write
+            std::map<std::uint64_t, std::string> early; // arrived before the bytes ahead of them
+            int in_flight = 0;
+            bool asking = true;  // false: no more READs (the range is done, the stream steps aside, a failure)
+            bool writing = true; // false: a write failed; what still comes is dropped
+            std::optional<sftp::Status> read_failed;
+            // Stepping aside ends the stream now, its connection closed rather than drained: up to
+            // 16 MiB is still on its way, and the download waiting for the connection (its permission
+            // just handed over) would wait for that too, the pool being at the server's budget.
+            bool stepped_aside = false;
+            auto hand_over = [&](std::string_view data) {
+                if (!writing || stepped_aside) return;
+                if (!put(i, data, a)) {
+                    asking = false;
+                    writing = !a.write_failed;
+                } else if (asking && step_aside(a)) {
+                    asking = false;
+                    stepped_aside = true;
+                }
+            };
+            std::function<void(std::uint64_t, std::uint32_t)> send = [&](std::uint64_t at, std::uint32_t n) {
+                ++in_flight;
+                c.read(*handle, at, n, [&, at, n](std::expected<std::string_view, sftp::Status> r) {
+                    --in_flight;
+                    if (!r) {
+                        if (!read_failed) read_failed = std::move(r.error());
+                        asking = false;
+                        return;
+                    }
+                    const auto got = static_cast<std::uint32_t>(r->size());
+                    if (got < n) send(at + got, n - got); // a short read: the rest at once, exactly
+                    if (at != deliver) {
+                        early.emplace(at, std::string(*r));
+                        return;
+                    }
+                    hand_over(*r);
+                    deliver += got;
+                    for (auto it = early.begin(); it != early.end() && it->first == deliver; it = early.erase(it)) {
+                        hand_over(it->second);
+                        deliver += it->second.size();
+                    }
+                });
+            };
+            // Under a speed limit, READs no bigger than an eighth of a second's worth, so data
+            // comes evenly; otherwise as big as servers take.
+            auto read_size = [&]() -> std::uint64_t {
+                const std::uint64_t rate = d.limiter != nullptr ? d.limiter->rate() : 0;
+                return rate == 0 ? sftp::max_read : std::clamp<std::uint64_t>(rate / 8, 32 * 1024, sftp::max_read);
+            };
+            for (;;) {
+                // Under a limit, one READ at a time: it waits for its tokens (its turn among the
+                // download's other streams), and a reply already here would otherwise wait unread
+                // through the next turns, arriving on time but written in bursts. One READ is an
+                // eighth of a second of the limit's worth, so a connection still carries it all.
+                const int depth = d.limiter != nullptr && d.limiter->rate() > 0 ? 1 : grab_depth;
+                while (asking && in_flight < depth && !token.stop_requested()) {
+                    std::uint64_t n = 0;
+                    {
+                        std::lock_guard lock(m);
+                        const Range& r = state.ranges[i];
+                        const std::uint64_t end = r.start + r.length;
+                        if (next < end) {
+                            n = std::min(read_size(), end - next);
+                            asked_to[i] = next + n;
+                        }
+                    }
+                    if (n == 0) {
+                        asking = false;
+                        break;
+                    }
+                    if (d.limiter != nullptr && !d.limiter->acquire(n, token, d.id, weight())) break;
+                    send(next, static_cast<std::uint32_t>(n));
+                    next += n;
+                }
+                if (token.stop_requested() || stepped_aside || in_flight == 0) break;
+                c.pump();
+            }
+            if (token.stop_requested() || stepped_aside) {
+                lease->broken(); // its replies still on the way: closed, not waited for
+                return;
+            }
+            if (read_failed) {
+                a.failure = budget::Failure::other; // only counts when the range isn't done
+                a.error = read_failed->code == sftp::Code::eof
+                              ? "the server sent less data than expected; was the file changed?"
+                              : sftp::describe(*read_failed);
+            }
+            // A handle that won't close leaves nothing behind that matters here.
+            [[maybe_unused]] auto closed = sftp::close_file(c, *handle);
+        } catch (const sftp::Broken& e) {
+            lease->broken();
+            if (!a.write_failed) {
+                a.failure = budget::Failure::other;
+                a.error = e.what();
+            }
+        }
+    };
+
     auto stream = [&] {
         for (;;) {
             // No more than its part of a folder's connections: a place under it is taken before the
@@ -799,98 +1091,34 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 offset = state.ranges[i].start + state.ranges[i].done;
                 count = state.ranges[i].remaining();
             }
-            std::uint64_t got = 0;
-            bool worked = false; // counted as working in the pool, from its first data
-            bool write_failed = false;
-            bool yielded = false;  // gave the connection to another download mid-range
-            bool restarted = false; // the speed limit went on or off: start again with fitting flags
-            bool gave_way = false;  // over its part of the folder's connections: one for another file
-            // Whether a speed limit is on as this stream starts: its read-ahead depends on that,
-            // not on the limit's value, so only switching it on or off restarts the stream (G76).
-            const bool limited = d.limiter != nullptr && d.limiter->rate() > 0;
-            proc::RunOptions opts;
-            opts.detached = true;
-            opts.stop = token;
-            const auto cat = cat_argv(src, offset, count, limited);
-            if (d.on_command) d.on_command(cat);
-            auto run = proc::run_piped(cat, [&](std::string_view chunk) {
-                // Under a speed limit, in slices of 64 KiB: bytes pass evenly rather than a pipe's
-                // worth (up to 1 MiB) at a time, and no slice waits for a full bucket, whose excess
-                // a late wake-up would lose (the limit came out 5% short).
-                const std::size_t slice = limited ? std::size_t{64} << 10 : chunk.size();
-                while (!chunk.empty()) {
-                    std::string_view data = chunk.substr(0, slice);
-                    chunk.remove_prefix(data.size());
-                    // The speed limit: while this waits, rclone's pipe fills and its SSH reads pause.
-                    if (d.limiter != nullptr && !d.limiter->acquire(data.size(), token, d.id, weight())) return false;
-                    {
-                        // Under the lock: the range may have been shortened by a split meanwhile.
-                        std::lock_guard lock(m);
-                        if (token.stop_requested()) return false;
-                        Range& r = state.ranges[i];
-                        data = data.substr(0, static_cast<std::size_t>(std::min<std::uint64_t>(data.size(), r.remaining())));
-                        if (!data.empty() && !file.write_at(r.start + r.done, data)) {
-                            write_failed = true;
-                            return false;
-                        }
-                        r.done += data.size();
-                        got += data.size();
-                        refused_since.reset(); // the server takes this download's connections
-                        refused_streak = 0;
-                        if (!worked && !data.empty()) {
-                            worked = true;
-                            connections.working(d.server, d.id);
-                        }
-                        if (r.remaining() == 0) return false;
-                    }
-                    // A download that just joined this server gets its share now, not when this
-                    // range ends; what was written stays and the range is picked up again later.
-                    if (connections.yield_if_over_share(d.server, d.id)) {
-                        yielded = true;
-                        return false;
-                    }
-                    // Another file of the folder started: this one keeps only its even part (taken off
-                    // here, so its other streams don't all give theirs up at once).
-                    if (d.streams_cap) {
-                        const int cap = d.streams_cap();
-                        int h = holding.load();
-                        while (h > cap && !holding.compare_exchange_weak(h, h - 1)) {
-                        }
-                        if (h > cap) {
-                            gave_way = true;
-                            return false;
-                        }
-                    }
-                    if (d.limiter != nullptr && (d.limiter->rate() > 0) != limited) {
-                        restarted = true;
-                        return false;
-                    }
+            Attempt a;
+            if (d.pool) {
+                if (d.on_command) {
+                    d.on_command({"sftp", "read", src.path, "--offset", std::to_string(offset), "--count",
+                                  std::to_string(count)});
                 }
-                return true;
-            }, opts);
-            // A failure before any data arrived says why the connection failed: the server is full
-            // (it wants fewer connections), or trying again can't help (review G9).
-            const auto failure = run && run->exit_code != 0 && got == 0 && !yielded && !restarted && !gave_way &&
-                                         !token.stop_requested()
-                                     ? budget::classify_failure(run->err)
-                                     : budget::Failure::other;
-            const bool refused = failure == budget::Failure::refused;
+                sftp_range(i, offset, a);
+            } else {
+                rclone_range(i, offset, count, a);
+            }
+            const bool refused = a.failure == budget::Failure::refused && !token.stop_requested();
             if (refused) connections.refused(d.server);
-            if (!yielded) connections.release(d.server, d.id, 1, worked);
-            if (!gave_way) --holding; // given up, it was taken off already
+            if (!a.yielded) connections.release(d.server, d.id, 1, a.worked);
+            if (!a.gave_way) --holding; // given up, it was taken off already
 
             std::lock_guard lock(m);
             busy[i] = 0;
+            asked_to[i] = 0;
             wake.notify_all();
             if (token.stop_requested()) return;
-            if (yielded || restarted || gave_way) continue; // not a failure; the range goes on from its bytes
-            if (write_failed) {
+            if (a.write_failed) {
                 error = "cannot write " + util::path_to_utf8(part) + " (disk full?)";
                 inner.request_stop();
                 return;
             }
-            if (failure == budget::Failure::fatal) {
-                error = server_ops::clean_rclone_error(run->err);
+            if (a.yielded || a.restarted || a.gave_way) continue; // not a failure; the range goes on from its bytes
+            if (a.failure == budget::Failure::fatal) {
+                error = a.error;
                 inner.request_stop();
                 return;
             }
@@ -899,7 +1127,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 const auto now = Clock::now();
                 if (!refused_since) refused_since = now;
                 if (now - *refused_since >= refused_give_up) {
-                    error = "the server keeps refusing connections: " + server_ops::clean_rclone_error(run->err);
+                    error = "the server keeps refusing connections: " + a.error;
                     inner.request_stop();
                     return;
                 }
@@ -907,11 +1135,9 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 not_before[i] = now + std::chrono::seconds(1); // also while others' data keeps coming
                 continue;
             }
-            if (got > 0) tries[i] = 0; // it made progress: only repeated failures in a row count
+            if (a.got > 0) tries[i] = 0; // it made progress: only repeated failures in a row count
             if (++tries[i] > max_retries) {
-                error = !run ? run.error()
-                        : run->exit_code == 0 ? "the server sent less data than expected; was the file changed?"
-                                              : server_ops::clean_rclone_error(run->err);
+                error = a.error.empty() ? "the server sent less data than expected; was the file changed?" : a.error;
                 inner.request_stop();
                 return;
             }

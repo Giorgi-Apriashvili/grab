@@ -2493,6 +2493,12 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.replace = choice == existing::Choice::replace;
     d.limiter = &limiter_;
     d.weight = &item->weight;
+    // engine = grab: through grab's own SSH client, its connections kept open between files.
+    if (effective_engine(ctx->settings) == Engine::grab) {
+        auto target = engine::ssh_target(*ctx);
+        if (!target) return set(Status::failed, target.error());
+        d.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
+    }
     auto fetch_once = [&] {
         return fetch::run(d, connections_, [&](const fetch::Progress& p) {
             if (update_item(mutex_, last_progress_post_, [&] {

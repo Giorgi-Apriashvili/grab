@@ -7,6 +7,7 @@
 #include "config.hpp"
 #include "process.hpp"
 #include "remote.hpp"
+#include "ssh.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -33,6 +34,11 @@ struct Context {
 // Also performs the one-time import of referenced remotes into grab's own rclone.conf.
 [[nodiscard]] std::expected<Context, std::string>
 load_context(const std::filesystem::path& config_path, const std::optional<std::string>& remote_name);
+
+// How grab's own SSH client logs in to the context's server (engine = grab): its rclone.conf
+// section, with the secrets of grab's encrypted store, and any the rclone.conf in use keeps
+// itself (obscured, as rclone writes them when it isn't grab's own file).
+[[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx);
 
 // rclone's version from `rclone version`'s output ("rclone v1.75.1").
 struct RcloneVersion {

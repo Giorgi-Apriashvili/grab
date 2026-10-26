@@ -14,6 +14,7 @@
 #include "rclone_flags.hpp"
 #include "schedule.hpp"
 #include "space.hpp"
+#include "ssh_pool.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -289,6 +290,8 @@ struct Session {
     const std::map<std::string, existing::Choice>* answered = nullptr;
     std::optional<existing::Choice>* for_rest = nullptr;
     bool several = false; // more than one pick: the question offers "the same for the rest"
+    // engine = grab: single files through grab's own SSH client (folders still through rclone).
+    std::shared_ptr<ssh::Pool> pool = nullptr;
 };
 
 // "name  (yours: 1.2 GiB, 2024-01-02; the server's: 1.4 GiB, 2025-03-04)"
@@ -319,6 +322,7 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
     d.id = id;
     d.limiter = &s.limiter;
     d.on_command = s.trace;
+    d.pool = s.pool;
     const auto start = Clock::now();
     auto choice = [&] {
         if (const auto it = s.answered->find(path); it != s.answered->end()) return it->second;
@@ -725,6 +729,18 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     DownloadTally tally;
+    ssh::Pools pools; // closes its connections when the command ends
+    if (opts.mode == Mode::file && effective_engine(ctx.settings) == Engine::grab) {
+        auto target = engine::ssh_target(ctx);
+        if (!target) {
+            std::println(stderr, "grab: {}", target.error());
+            tally.code = exit_download_failed;
+            tally.failed = paths;
+            return tally;
+        }
+        s.pool = pools.get(server, *target, budget);
+        if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client (engine = grab)", server);
+    }
     const std::size_t total = paths.size();
     const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
     // A picked file's size and time (nanoseconds), when the pick list had them.

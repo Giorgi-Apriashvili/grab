@@ -18,10 +18,12 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -34,6 +36,9 @@ public:
     [[nodiscard]] virtual sftp::Client& sftp() = 0;
     // For commands (find, md5sum); nullptr where there is none (tests).
     [[nodiscard]] virtual Connection* connection() { return nullptr; }
+    // Whether the next borrower may have it: no SFTP reply still on its way, which would reach
+    // a request the next one never made.
+    [[nodiscard]] virtual bool reusable() { return true; }
 };
 
 // Logs in to `target` and starts SFTP. Throws Error.
@@ -113,6 +118,29 @@ private:
     int leased_ = 0;
     int logging_in_ = 0;
     std::jthread timer_;
+};
+
+// The pools of the servers on grab's engine, one per server, made on first use, for a program
+// (the window, a command) to share among its downloads. A server whose login changed (a password
+// edited in Settings) gets a new pool; downloads on the old one keep it until they end.
+// Thread-safe.
+class Pools {
+public:
+    // How downloads use their pools: refusals are left to fetch, which backs off across all its
+    // streams and learns the server's limit (conn_budget); idle connections close after 15 s, as
+    // rclone's own folder copies and listings still open theirs beside them (phase 2).
+    [[nodiscard]] static Pool::Options download_options(int limit);
+
+    // `limit`: the server's connection budget now.
+    [[nodiscard]] std::shared_ptr<Pool> get(const std::string& server, const Target& target, int limit);
+
+private:
+    struct Entry {
+        Target target;
+        std::shared_ptr<Pool> pool;
+    };
+    std::mutex mutex_;
+    std::map<std::string, Entry> pools_;
 };
 
 } // namespace grab::ssh

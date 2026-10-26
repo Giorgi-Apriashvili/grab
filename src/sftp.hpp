@@ -136,6 +136,9 @@ private:
 // Blocking helpers: send one request and pump until its reply (other replies run their callbacks
 // on the way).
 [[nodiscard]] std::expected<Attrs, Status> stat(Client& client, std::string_view path);
+// A file opened for reading: its handle.
+[[nodiscard]] std::expected<std::string, Status> open_file(Client& client, std::string_view path);
+[[nodiscard]] std::expected<void, Status> close_file(Client& client, std::string_view handle);
 [[nodiscard]] std::expected<std::string, Status> realpath(Client& client, std::string_view path);
 // Every entry of a folder except "." and "..", in the server's order.
 [[nodiscard]] std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir);

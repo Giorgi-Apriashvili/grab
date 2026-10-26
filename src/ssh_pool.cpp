@@ -24,6 +24,7 @@ public:
     }
     sftp::Client& sftp() override { return client_; }
     Connection* connection() override { return &connection_; }
+    bool reusable() override { return client_.pending() == 0; }
 
 private:
     Connection connection_;
@@ -107,7 +108,7 @@ void Pool::give_back(std::unique_ptr<Session> session, bool broken) {
     {
         std::lock_guard lock(mutex_);
         --leased_;
-        if (broken || open_locked() >= options_.limit) drop = std::move(session);
+        if (broken || !session->reusable() || open_locked() >= options_.limit) drop = std::move(session);
         else idle_.push_back({std::move(session), Clock::now()});
     }
     changed_.notify_all();
@@ -171,6 +172,26 @@ Pool::Lease::~Lease() { release(); }
 void Pool::Lease::release() {
     if (pool_ && session_) pool_->give_back(std::move(session_), broken_);
     pool_ = nullptr;
+}
+
+Pool::Options Pools::download_options(int limit) {
+    Pool::Options o;
+    o.limit = limit;
+    o.idle_close = std::chrono::seconds(15);
+    o.retry_refused = {};
+    return o;
+}
+
+std::shared_ptr<Pool> Pools::get(const std::string& server, const Target& target, int limit) {
+    std::lock_guard lock(mutex_);
+    auto it = pools_.find(server);
+    if (it != pools_.end() && it->second.target == target) {
+        it->second.pool->set_limit(limit);
+        return it->second.pool;
+    }
+    auto pool = std::make_shared<Pool>([target] { return open_session(target); }, download_options(limit));
+    pools_[server] = Entry{target, pool};
+    return pool;
 }
 
 } // namespace grab::ssh

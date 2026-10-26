@@ -40,6 +40,7 @@ struct Target {
     std::string key_passphrase;
     std::string password;
     std::chrono::milliseconds timeout{30'000}; // connecting, and any single wait after that
+    bool operator==(const Target&) const = default;
 };
 
 // Why a connection failed, in the terms conn_budget uses: refused (the server turned it away

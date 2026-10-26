@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -30,12 +31,20 @@
 #include <utility>
 #include <vector>
 
+namespace grab::ssh {
+class Pool;
+} // namespace grab::ssh
+
 namespace grab::fetch {
 
 inline constexpr std::uint64_t min_chunk = std::uint64_t{16} << 20;
 inline constexpr std::uint64_t max_chunk = std::uint64_t{128} << 20;
-// A busy range is split for an idle stream only when both halves get at least this much.
+// A busy range is split for an idle stream only when both halves get at least this much: a piece
+// costs rclone a new login, and grab's engine one round trip on a connection it keeps.
 inline constexpr std::uint64_t min_split = std::uint64_t{4} << 20;
+inline constexpr std::uint64_t min_split_grab = std::uint64_t{1} << 20;
+// READs grab's engine keeps in flight per connection (a Storage Box connection's speed follows it).
+inline constexpr int grab_depth = 64;
 inline constexpr int max_retries = 6; // per range, before the download fails
 // A server that refuses every connection this long, with no data meanwhile, fails the download:
 // it is full with something else's connections (review G9).
@@ -71,10 +80,14 @@ struct State {
 
 [[nodiscard]] State new_state(std::string rclone_remote, std::string path, std::uint64_t size, std::string modtime,
                               std::uint64_t chunk);
-// Splits the unfinished tail of range `i`: its second half (rounded to 64 KiB) becomes a new range
-// appended at the end, whose index is returned. nullopt when either half would be below
-// min_split.
-std::optional<std::size_t> split(State& s, std::size_t i);
+// Splits the unfinished tail of range `i`: of its bytes not asked for yet, the second half
+// (rounded to 64 KiB) becomes a new range appended at the end, whose index is returned. `asked`:
+// bytes past its done ones that its stream has already asked the server for (grab's engine), which
+// stay with it so none is fetched twice. nullopt when either part would be below `min_piece`.
+std::optional<std::size_t> split(State& s, std::size_t i, std::uint64_t asked = 0, std::uint64_t min_piece = min_split);
+// Whether two modification times are the same moment, however written: rclone writes them in this
+// PC's time zone (so a time zone change, or summer time, changes the text), grab's engine in UTC.
+[[nodiscard]] bool same_modtime(std::string_view a, std::string_view b);
 [[nodiscard]] std::string state_to_json(const State& s);
 // nullopt for malformed or inconsistent state (ranges not covering the file exactly, progress
 // beyond a range).
@@ -268,7 +281,11 @@ struct Download {
     // over it gives its connection up and goes on later from its bytes. Unset: no cap.
     std::function<int()> streams_cap;
     // Sees every rclone command line before it runs (`grab -v`); called from several threads.
+    // grab's engine shows what it does the same way ("sftp read <path> --offset N --count M").
     std::function<void(const std::vector<std::string>&)> on_command;
+    // The server's pool of grab's own SSH connections (engine = grab): set, the download's size
+    // check and byte ranges go through it instead of rclone; `source` then only gives the path.
+    std::shared_ptr<ssh::Pool> pool;
 };
 
 // Fetches `d.source` into `d.target`, continuing a partial download. A target that is already

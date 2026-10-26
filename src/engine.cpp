@@ -7,7 +7,9 @@
 #include "rclone.hpp"
 #include "rclone_flags.hpp"
 #include "remote.hpp"
+#include "ini.hpp"
 #include "secrets.hpp"
+#include "ssh_target.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -121,6 +123,22 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
     const FindMethod method = resolve_find_method(settings, *remote);
     return Context{std::move(*cfg), std::move(settings), std::move(*remote), method,
                    std::move(imported.imported)};
+}
+
+std::expected<ssh::Target, std::string> ssh_target(const Context& ctx) {
+    const auto& conf = ctx.config.rclone_config ? *ctx.config.rclone_config : grab_rclone_config_path();
+    secrets::Store store;
+    if (auto stored = secrets::load(secrets::path_beside(conf)); stored) store = std::move(*stored);
+    else return util::fail(stored.error());
+    // An rclone.conf that isn't grab's own keeps its secrets inside, as rclone writes them.
+    if (auto doc = ini::parse_file(conf); doc) {
+        if (const auto* section = doc->find(ctx.remote.name)) {
+            for (const auto& [key, value] : section->values) {
+                if (secrets::is_secret_key(key) && !util::trim(value).empty()) store[ctx.remote.name][key] = value;
+            }
+        }
+    }
+    return ssh::target_for(ctx.remote, store, grab_known_hosts_path());
 }
 
 namespace {

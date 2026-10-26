@@ -14,6 +14,7 @@
 #include "schedule.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
+#include "ssh_pool.hpp"
 #include "update.hpp"
 #include "webview.hpp"
 
@@ -405,6 +406,7 @@ private:
     GuiState state_;
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
     fetch::Connections connections_;
+    ssh::Pools pools_;          // grab's own SSH connections, for servers with engine = grab
     rate::RateLimiter limiter_; // shared by every download's streams
     std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers
     std::string limit_posted_;  // the last "limit" message, so only changes are sent

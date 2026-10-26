@@ -40,6 +40,10 @@ max_depth = 4
 max_connections =
 # Skip dot-directories such as .cache and .config while searching.
 skip_hidden = true
+# What downloads from this server: rclone, or grab's own SSH client (being built to replace
+# rclone; so far it does single files, folders still go through rclone). grab's keeps its
+# connections open between files and never fetches a byte twice.
+engine = rclone
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
 ssh_options =
 # rclone flags for --rclone copies; grab's own downloads, listings, previews and checks use
