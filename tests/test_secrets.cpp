@@ -231,3 +231,13 @@ TEST_CASE("a change of an undecryptable store sets it aside; one that can't be r
 #endif
     std::filesystem::remove_all(dir);
 }
+TEST_CASE("reveal: rclone's obscured values, made plain") {
+    // Made with `rclone obscure -` (rclone 1.75.1); each has its own random IV.
+    CHECK(secrets::reveal("gLZBxgITy_HxlUNmOsLeEByAksnrlA") == "potato");
+    CHECK(secrets::reveal("SQVNqPZeUEyKRI-mMCI1_q10s7JJ37ILmZMGTNXvhLHgK8mjn-hU5Ae3JHRuRK3I3cA") ==
+          "p\xC3\xA4ssw\xC3\xB6rd with spaces & \xC3\xBCn\xC3\xAF" "code");
+    CHECK(secrets::reveal("GhD9RfOnFe2AioBbLF8h2w") == "");
+    CHECK_FALSE(secrets::reveal("not base64!"));
+    CHECK_FALSE(secrets::reveal("c2hvcnQ")); // shorter than an IV
+    CHECK_FALSE(secrets::reveal("gLZBxgITy_HxlUNmOsLeEB+AksnrlA")); // '+' isn't URL-safe base64
+}

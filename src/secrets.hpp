@@ -54,6 +54,12 @@ struct ForChange {
 // starts inherit them, and removes the ones it put there before that `store` no longer has.
 void export_to_env(const Store& store);
 
+// A value as rclone obscures it, made plain again, for grab's own SSH client (which takes
+// secrets in memory, never through the environment). rclone's lib/obscure: URL-safe base64
+// without padding of a 16-byte IV and the text encrypted with AES-256-CTR under a key rclone
+// publishes (obscuring hides a value from a glance, nothing more). nullopt when it isn't one.
+[[nodiscard]] std::optional<std::string> reveal(std::string_view obscured);
+
 // rclone.conf text without its secret lines, and the secrets taken from it. Comments, other
 // keys, order and line endings stay as they were.
 struct Taken {

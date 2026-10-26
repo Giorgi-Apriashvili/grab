@@ -1,0 +1,118 @@
+#pragma once
+
+// A server's SSH connections, kept open between uses: a download's thread borrows one (a Lease),
+// reads through it and gives it back for the next. A login costs about 1 s on Main and 1-3.5 s
+// on a Storage Box, which rclone paid for every byte range; here it is paid once per connection.
+//
+// At most `limit` connections are open (idle ones count: Storage Boxes count them against the
+// account), at most `logins_at_once` log in at the same time (OpenSSH's MaxStartups; Main drops
+// connections above 5 and runs fail2ban), a login the server turned away is tried again after a
+// pause, and a connection idle for a minute is closed.
+//
+// libssh2 sessions aren't thread-safe; a Lease gives one thread a session until it's returned.
+
+#include "sftp.hpp"
+#include "ssh.hpp"
+
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stop_token>
+#include <thread>
+#include <vector>
+
+namespace grab::ssh {
+
+// One pooled login and what borrowers use of it.
+class Session {
+public:
+    virtual ~Session() = default;
+    [[nodiscard]] virtual sftp::Client& sftp() = 0;
+    // For commands (find, md5sum); nullptr where there is none (tests).
+    [[nodiscard]] virtual Connection* connection() { return nullptr; }
+};
+
+// Logs in to `target` and starts SFTP. Throws Error.
+[[nodiscard]] std::unique_ptr<Session> open_session(const Target& target);
+
+class Pool {
+public:
+    using Clock = std::chrono::steady_clock;
+    using Connect = std::function<std::unique_ptr<Session>()>; // throws Error
+
+    struct Options {
+        int limit = 4;
+        int logins_at_once = 4;
+        std::chrono::milliseconds idle_close{60'000};
+        // Pauses before each new try of a login the server turned away (budget::Failure::refused).
+        std::vector<std::chrono::milliseconds> retry_refused{std::chrono::milliseconds{500}, std::chrono::seconds{1},
+                                                             std::chrono::seconds{2}, std::chrono::seconds{4},
+                                                             std::chrono::seconds{8}};
+        bool idle_timer = true; // the pool's own thread closes idle connections (tests call close_idle)
+    };
+
+    Pool(Connect connect, Options options);
+    // Every Lease must be gone first.
+    ~Pool();
+    Pool(const Pool&) = delete;
+    Pool& operator=(const Pool&) = delete;
+
+    class Lease {
+    public:
+        Lease(Lease&& other) noexcept;
+        Lease& operator=(Lease&& other) noexcept;
+        ~Lease();
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        Session& operator*() const { return *session_; }
+        Session* operator->() const { return session_.get(); }
+        // The session broke (sftp::Broken, a lost connection): it's closed instead of reused.
+        void broken() { broken_ = true; }
+        // Gives it back now.
+        void release();
+
+    private:
+        friend class Pool;
+        Lease(Pool* pool, std::unique_ptr<Session> session) : pool_(pool), session_(std::move(session)) {}
+        Pool* pool_ = nullptr;
+        std::unique_ptr<Session> session_;
+        bool broken_ = false;
+    };
+
+    // A session: an idle one, else a new login once there is room under the limit and among the
+    // logins at once, else waiting for one to come back. nullopt once `stop` is requested. Throws
+    // Error: a fatal one at once, a refusal after the retries.
+    [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {});
+
+    // Lowering it closes idle connections over it; borrowed ones close when they come back.
+    void set_limit(int limit);
+    [[nodiscard]] int limit() const;
+    // Connections open: idle, borrowed and logging in.
+    [[nodiscard]] int open() const;
+    [[nodiscard]] int idle() const;
+    // Closes connections idle longer than idle_close at `now`.
+    void close_idle(Clock::time_point now);
+
+private:
+    struct Idle {
+        std::unique_ptr<Session> session;
+        Clock::time_point since;
+    };
+    void give_back(std::unique_ptr<Session> session, bool broken);
+    [[nodiscard]] int open_locked() const { return leased_ + logging_in_ + static_cast<int>(idle_.size()); }
+
+    Connect connect_;
+    Options options_;
+    mutable std::mutex mutex_;
+    std::condition_variable_any changed_;
+    std::deque<Idle> idle_; // most recently used at the back
+    int leased_ = 0;
+    int logging_in_ = 0;
+    std::jthread timer_;
+};
+
+} // namespace grab::ssh

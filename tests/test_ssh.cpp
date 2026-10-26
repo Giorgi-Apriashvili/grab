@@ -3,16 +3,21 @@
 #include "conn_budget.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
+#include "ssh_pool.hpp"
 #include "util.hpp"
 
 #include <libssh2.h>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 using namespace grab;
 
@@ -109,6 +114,34 @@ TEST_CASE("ssh: live login, SFTP and a command (GRAB_TEST_SSH)") {
     REQUIRE(entries);
     CHECK_FALSE(entries->empty());
     CHECK(c.received() > 0);
+}
+
+TEST_CASE("ssh: live pool, 4 threads twice over, 4 logins (GRAB_TEST_SSH)") {
+    auto t = live_target();
+    if (!t) {
+        MESSAGE("skipped: GRAB_TEST_SSH / GRAB_TEST_KNOWN_HOSTS not set");
+        return;
+    }
+    std::atomic<int> logins = 0;
+    ssh::Pool::Options o;
+    o.limit = 4;
+    ssh::Pool pool([&] { ++logins; return ssh::open_session(*t); }, o);
+    for (int round = 0; round < 2; ++round) {
+        std::atomic<int> ok = 0;
+        {
+            std::vector<std::jthread> threads;
+            for (int i = 0; i < 4; ++i) {
+                threads.emplace_back([&] {
+                    auto lease = pool.acquire();
+                    if (lease && sftp::realpath((*lease)->sftp(), ".")) ++ok;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200)); // all four held at once
+                });
+            }
+        }
+        CHECK(ok == 4);
+    }
+    CHECK(logins == 4);
+    CHECK(pool.idle() == 4);
 }
 
 TEST_CASE("ssh: live, a changed or missing host key ends it before the login (GRAB_TEST_SSH)") {

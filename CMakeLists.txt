@@ -70,7 +70,8 @@ add_library(grab_core STATIC
     src/rclone_flags.cpp
     src/ui_origin.cpp
     src/sftp.cpp
-    src/ssh.cpp)
+    src/ssh.cpp
+    src/ssh_pool.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
@@ -114,7 +115,7 @@ block() # libssh2's options, without them leaking into grab's own settings
     set(LIBSSH2_DISABLE_INSTALL ON)
     FetchContent_MakeAvailable(libssh2)
 endblock()
-target_link_libraries(grab_core PUBLIC libssh2::libssh2_static)
+target_link_libraries(grab_core PUBLIC libssh2::libssh2_static PRIVATE OpenSSL::Crypto)
 
 # ---------------------------------------------------------------------------
 # Executable
