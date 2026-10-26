@@ -423,6 +423,27 @@ TEST_CASE("RCLONE_CONFIG overrides the default rclone.conf path") {
     set_env("RCLONE_CONFIG", previous ? previous->c_str() : nullptr);
 }
 
+TEST_CASE("engine: rclone by default, grab when asked, GRAB_ENGINE over every server") {
+    const auto cfg = parse_ok("[a]\n[b]\nengine = grab\n[c]\nengine = RClone\n");
+    REQUIRE(cfg.remotes.size() == 3);
+    CHECK(cfg.remotes[0].engine == Engine::rclone);
+    CHECK(cfg.remotes[1].engine == Engine::grab);
+    CHECK(cfg.remotes[2].engine == Engine::rclone);
+    CHECK_FALSE(parse_grab_config(*ini::parse("[h]\nengine = libssh\n")).has_value());
+
+    const auto previous = util::getenv_utf8("GRAB_ENGINE");
+    set_env("GRAB_ENGINE", nullptr);
+    CHECK(effective_engine(cfg.remotes[0]) == Engine::rclone);
+    CHECK(effective_engine(cfg.remotes[1]) == Engine::grab);
+    set_env("GRAB_ENGINE", "grab");
+    CHECK(effective_engine(cfg.remotes[0]) == Engine::grab);
+    set_env("GRAB_ENGINE", "rclone");
+    CHECK(effective_engine(cfg.remotes[1]) == Engine::rclone);
+    set_env("GRAB_ENGINE", "something else"); // ignored
+    CHECK(effective_engine(cfg.remotes[1]) == Engine::grab);
+    set_env("GRAB_ENGINE", previous ? previous->c_str() : nullptr);
+}
+
 TEST_CASE("example config parses and matches the defaults") {
     const auto cfg = parse_ok(example_config);
     CHECK(cfg.default_remote == "hetzner");

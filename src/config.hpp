@@ -18,6 +18,10 @@ enum class FindMethod {
     rclone       // rclone lsf: SFTP walk, no shell and no prompt needed
 };
 
+// What moves a server's files: rclone, or grab's own SSH/SFTP client (the rclone replacement,
+// taking over phase by phase while rclone stays the default).
+enum class Engine { rclone, grab };
+
 // One [section] of grab.conf describing how to search and download from a server.
 struct RemoteSettings {
     std::string name;                      // grab.conf section name, used with -r
@@ -27,6 +31,7 @@ struct RemoteSettings {
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
     bool skip_hidden = true;
+    Engine engine = Engine::rclone; // `engine = rclone | grab`
     std::vector<std::string> ssh_options;
     std::vector<std::string> common_flags;
     std::vector<std::string> folder_flags;
@@ -55,6 +60,10 @@ struct RcloneRemote {
     std::optional<std::string> known_hosts_file; // rclone's "none" becomes nullopt
     bool key_use_agent = false;                   // authenticates through ssh-agent
 };
+
+// The server's engine, unless GRAB_ENGINE (grab or rclone) overrides it for every server, as
+// tests comparing both do.
+[[nodiscard]] Engine effective_engine(const RemoteSettings& settings);
 
 // Resolve auto_detect: ssh when the remote authenticates with a key file (a shell is very
 // likely), otherwise rclone (password remotes and storage boxes usually have no shell).

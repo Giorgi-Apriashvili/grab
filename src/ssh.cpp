@@ -1,5 +1,7 @@
 #include "ssh.hpp"
 
+#include "util.hpp"
+
 #ifdef _WIN32
 #include <winsock2.h> // IWYU pragma: keep
 #include <ws2tcpip.h> // IWYU pragma: keep
@@ -336,50 +338,63 @@ void Connection::check_host_key(const Target& target) {
     throw Error(budget::Failure::fatal, std::format("{}'s host key isn't trusted yet", target.host));
 }
 
+// Tries what the target has, in rclone's order: ssh-agent's keys, the key file, the password.
 void Connection::log_in(const Target& target) {
     const char* user = target.user.c_str();
     auto ulen = static_cast<unsigned>(target.user.size());
+    std::vector<std::string> tried; // why each way failed, for the message
     if (target.agent) {
         LIBSSH2_AGENT* agent = libssh2_agent_init(session_);
-        if (!agent || libssh2_agent_connect(agent) != 0) {
-            if (agent) libssh2_agent_free(agent);
-            throw Error(budget::Failure::fatal, "can't reach ssh-agent (is the OpenSSH Authentication Agent running?)");
-        }
-        bool ok = false;
-        if (libssh2_agent_list_identities(agent) == 0) {
-            libssh2_agent_publickey* identity = nullptr;
-            libssh2_agent_publickey* previous = nullptr;
-            while (!ok && libssh2_agent_get_identity(agent, &identity, previous) == 0) {
-                ok = libssh2_agent_userauth(agent, user, identity) == 0;
-                previous = identity;
+        if (agent && libssh2_agent_connect(agent) == 0) {
+            bool ok = false;
+            if (libssh2_agent_list_identities(agent) == 0) {
+                libssh2_agent_publickey* identity = nullptr;
+                libssh2_agent_publickey* previous = nullptr;
+                while (!ok && libssh2_agent_get_identity(agent, &identity, previous) == 0) {
+                    ok = libssh2_agent_userauth(agent, user, identity) == 0;
+                    previous = identity;
+                }
             }
+            libssh2_agent_disconnect(agent);
+            libssh2_agent_free(agent);
+            if (ok) return;
+            tried.emplace_back("it accepted none of ssh-agent's keys");
+        } else {
+            if (agent) libssh2_agent_free(agent);
+            tried.emplace_back("ssh-agent can't be reached (is the OpenSSH Authentication Agent running?)");
         }
-        libssh2_agent_disconnect(agent);
-        libssh2_agent_free(agent);
-        if (!ok) throw Error(budget::Failure::fatal, std::format("{} accepted none of ssh-agent's keys", target.host));
-        return;
     }
     if (!target.key_file.empty()) {
         // Read here (libssh2's own reader takes a narrow path).
         std::ifstream in{target.key_file, std::ios::binary};
-        if (!in) throw Error(budget::Failure::fatal, "can't read the key file " + target.key_file.string());
-        std::string key{std::istreambuf_iterator<char>(in), {}};
-        const char* passphrase = target.key_passphrase.empty() ? nullptr : target.key_passphrase.c_str();
-        int rc = libssh2_userauth_publickey_frommemory(session_, user, target.user.size(), nullptr, 0, key.data(),
-                                                       key.size(), passphrase);
-        std::fill(key.begin(), key.end(), '\0');
-        if (rc != 0) fail(budget::Failure::fatal, std::format("{} refused the key", target.host));
-        return;
+        if (in) {
+            std::string key{std::istreambuf_iterator<char>(in), {}};
+            const char* passphrase = target.key_passphrase.empty() ? nullptr : target.key_passphrase.c_str();
+            int rc = libssh2_userauth_publickey_frommemory(session_, user, target.user.size(), nullptr, 0,
+                                                           key.data(), key.size(), passphrase);
+            std::fill(key.begin(), key.end(), '\0');
+            if (rc == 0) return;
+            tried.push_back("it refused the key file (" + last_error(session_) + ")");
+        } else {
+            tried.push_back("the key file can't be read: " + util::path_to_utf8(target.key_file));
+        }
     }
-    const char* listed = libssh2_userauth_list(session_, user, ulen);
-    std::string methods = listed ? listed : "";
-    int rc = -1;
-    if (methods.find("password") != std::string::npos)
-        rc = libssh2_userauth_password_ex(session_, user, ulen, password_.c_str(),
-                                          static_cast<unsigned>(password_.size()), nullptr);
-    if (rc != 0 && methods.find("keyboard-interactive") != std::string::npos)
-        rc = libssh2_userauth_keyboard_interactive_ex(session_, user, ulen, &SessionAccess::answer);
-    if (rc != 0) throw Error(budget::Failure::fatal, std::format("{} refused the password", target.host));
+    if (!password_.empty()) {
+        const char* listed = libssh2_userauth_list(session_, user, ulen);
+        std::string methods = listed ? listed : "";
+        int rc = -1;
+        if (methods.find("password") != std::string::npos)
+            rc = libssh2_userauth_password_ex(session_, user, ulen, password_.c_str(),
+                                              static_cast<unsigned>(password_.size()), nullptr);
+        if (rc != 0 && methods.find("keyboard-interactive") != std::string::npos)
+            rc = libssh2_userauth_keyboard_interactive_ex(session_, user, ulen, &SessionAccess::answer);
+        if (rc == 0) return;
+        tried.emplace_back("it refused the password");
+    }
+    if (tried.empty()) tried.emplace_back("there is no agent, key or password to log in with");
+    std::string why;
+    for (const auto& t : tried) why += (why.empty() ? "" : "; ") + t;
+    throw Error(budget::Failure::fatal, std::format("{} refused the login: {}", target.host, why));
 }
 
 std::unique_ptr<sftp::Channel> Connection::open_sftp() {

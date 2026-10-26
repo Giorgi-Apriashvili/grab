@@ -129,6 +129,15 @@ FindMethod resolve_find_method(const RemoteSettings& settings, const RcloneRemot
     return remote.key_file || remote.key_use_agent ? FindMethod::ssh : FindMethod::rclone;
 }
 
+Engine effective_engine(const RemoteSettings& settings) {
+    if (auto env = util::getenv_utf8("GRAB_ENGINE")) {
+        const std::string e = util::to_lower(util::trim(*env));
+        if (e == "grab") return Engine::grab;
+        if (e == "rclone") return Engine::rclone;
+    }
+    return settings.engine;
+}
+
 std::filesystem::path default_grab_config_path() {
     if (auto env = util::getenv_utf8("GRAB_CONFIG"); env && !util::trim(*env).empty()) {
         return util::path_from_utf8(util::trim(*env));
@@ -377,6 +386,12 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
         auto hidden = bool_value(s, "skip_hidden", true);
         if (!hidden) return util::fail(hidden.error());
         r.skip_hidden = *hidden;
+        if (auto v = nonblank(s, "engine")) {
+            const std::string engine = util::to_lower(*v);
+            if (engine == "rclone") r.engine = Engine::rclone;
+            else if (engine == "grab") r.engine = Engine::grab;
+            else return util::failf("[{}] engine must be rclone or grab, got '{}'", s.name, *v);
+        }
         r.ssh_options = flag_list(s, "ssh_options", "");
         r.common_flags = flag_list(s, "common_flags", default_common_flags);
         r.folder_flags = flag_list(s, "folder_flags", default_folder_flags);

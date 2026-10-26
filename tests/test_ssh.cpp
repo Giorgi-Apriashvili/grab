@@ -1,9 +1,12 @@
 #include <doctest/doctest.h>
 
+#include "config.hpp"
 #include "conn_budget.hpp"
+#include "secrets.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
+#include "ssh_target.hpp"
 #include "util.hpp"
 
 #include <libssh2.h>
@@ -48,6 +51,56 @@ TEST_CASE("ssh: the offered algorithms leave out the weak ones") {
         CHECK(ssh::kex_algorithms.find(weak) == std::string_view::npos);
         CHECK(ssh::cipher_algorithms.find(weak) == std::string_view::npos);
         CHECK(ssh::mac_algorithms.find(weak) == std::string_view::npos);
+    }
+}
+
+TEST_CASE("ssh: a server's target from its rclone.conf section and its stored secrets") {
+    RcloneRemote r;
+    r.name = "Box";
+    r.host = "box.example";
+    r.user = "u1";
+    r.port = 23;
+    secrets::Store store;
+    const std::filesystem::path grab_known = "C:/grab/known_hosts";
+
+    SUBCASE("a password: revealed, grab's known_hosts by default") {
+        store["Box"]["pass"] = "gLZBxgITy_HxlUNmOsLeEByAksnrlA"; // "potato", obscured by rclone
+        auto t = ssh::target_for(r, store, grab_known);
+        REQUIRE(t);
+        CHECK(t->host == "box.example");
+        CHECK(t->port == 23);
+        CHECK(t->user == "u1");
+        CHECK(t->password == "potato");
+        CHECK_FALSE(t->agent);
+        CHECK(t->known_hosts == grab_known);
+    }
+    SUBCASE("ssh-agent, the remote's own known_hosts") {
+        r.key_use_agent = true;
+        r.known_hosts_file = "D:/keys/known_hosts";
+        auto t = ssh::target_for(r, store, grab_known);
+        REQUIRE(t);
+        CHECK(t->agent);
+        CHECK(t->password.empty());
+        CHECK(t->known_hosts == std::filesystem::path("D:/keys/known_hosts"));
+    }
+    SUBCASE("a key file and its passphrase") {
+        r.key_file = "C:/keys/id_ed25519";
+        store["Box"]["key_file_pass"] = "gLZBxgITy_HxlUNmOsLeEByAksnrlA";
+        auto t = ssh::target_for(r, store, grab_known);
+        REQUIRE(t);
+        CHECK(t->key_file == std::filesystem::path("C:/keys/id_ed25519"));
+        CHECK(t->key_passphrase == "potato");
+    }
+    SUBCASE("what it can't use is said, not guessed") {
+        CHECK_FALSE(ssh::target_for(r, store, grab_known)); // no way to log in
+        store["Box"]["key_pem"] = "x";
+        CHECK_FALSE(ssh::target_for(r, store, grab_known)); // an inline key: not yet
+        store["Box"].erase("key_pem");
+        store["Box"]["pass"] = "not obscured!";
+        CHECK_FALSE(ssh::target_for(r, store, grab_known));
+        r.user.clear();
+        store["Box"]["pass"] = "gLZBxgITy_HxlUNmOsLeEByAksnrlA";
+        CHECK_FALSE(ssh::target_for(r, store, grab_known));
     }
 }
 
@@ -142,6 +195,30 @@ TEST_CASE("ssh: live pool, 4 threads twice over, 4 logins (GRAB_TEST_SSH)") {
     }
     CHECK(logins == 4);
     CHECK(pool.idle() == 4);
+}
+
+// From a server's rclone.conf section to a login through the pool, as the engine will do it:
+// GRAB_TEST_RCLONE_CONF names an rclone.conf (no passwords needed for an agent server) and
+// GRAB_TEST_REMOTE its section.
+TEST_CASE("ssh: live, a server from its rclone.conf section through the pool (GRAB_TEST_REMOTE)") {
+    auto conf = util::getenv_utf8("GRAB_TEST_RCLONE_CONF");
+    auto name = util::getenv_utf8("GRAB_TEST_REMOTE");
+    if (!conf || !name) {
+        MESSAGE("skipped: GRAB_TEST_RCLONE_CONF / GRAB_TEST_REMOTE not set");
+        return;
+    }
+    auto remote = load_rclone_remote(util::path_from_utf8(*conf), *name);
+    REQUIRE_MESSAGE(remote, remote.error_or(""));
+    auto target = ssh::target_for(*remote, secrets::Store{}, grab_known_hosts_path());
+    REQUIRE_MESSAGE(target, target.error_or(""));
+    ssh::Pool::Options o;
+    o.limit = 2;
+    ssh::Pool pool([&] { return ssh::open_session(*target); }, o);
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto home = sftp::realpath((*lease)->sftp(), ".");
+    REQUIRE(home);
+    MESSAGE("home: " << *home);
 }
 
 TEST_CASE("ssh: live, a changed or missing host key ends it before the login (GRAB_TEST_SSH)") {
