@@ -48,7 +48,8 @@ add_executable(grab_tests
     test_rclone_flags.cpp
     test_ui_origin.cpp
     test_update.cpp
-    test_ssh.cpp)
+    test_ssh.cpp
+    test_sftp.cpp)
 
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)
 if(WIN32)
