@@ -1847,8 +1847,12 @@ void App::test_server(const std::string& name, std::stop_token stop) {
     auto result = server_ops::test_connection(*env, name, stop);
     if (stop.stop_requested()) return;
     // The test asked the find check again and saved its answer: the window's searches go by that
-    // one now, not the one their pool kept.
-    if (result && result->grab_ok.value_or(false)) pools_.forget_find_check(name);
+    // one now, not the one their pool kept. A login that works now also ends a failed login the
+    // pool's hash check kept (a host key trusted since, an agent started since).
+    if (result && result->grab_ok.value_or(false)) {
+        pools_.forget_find_check(name);
+        pools_.forget_hash_check(name);
+    }
     if (!result) {
         v.set("ok", Value::make_bool(false));
         v.set("rcloneError", str(result.error()));

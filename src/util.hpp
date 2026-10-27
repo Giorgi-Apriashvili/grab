@@ -5,7 +5,9 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -45,8 +47,19 @@ namespace grab::util {
 
 // Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
 [[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
-// Lowercase hex MD5 of a file, as `rclone hashsum md5` prints it (Windows CNG).
-[[nodiscard]] std::expected<std::string, std::string> md5_file(const std::filesystem::path& p);
+
+// How md5_file reads a file.
+struct FileHashOptions {
+    std::stop_token stop;                        // looked at before each read: the hash fails with "stopped"
+    std::function<void(std::uint64_t)> progress; // bytes hashed so far, after each read
+};
+// md5_file's at once in a program (a verification's files, rows verifying side by side); the
+// others wait for a turn.
+inline constexpr int local_hashes_at_once = 4;
+// Lowercase hex MD5 of a file, as md5sum and `rclone hashsum md5` print it: OpenSSL's EVP in 1 MiB
+// reads, 1.45x Windows CNG's speed on this PC (RCLONE-REPLACEMENT.md, phase 5).
+[[nodiscard]] std::expected<std::string, std::string> md5_file(const std::filesystem::path& p,
+                                                               const FileHashOptions& options = {});
 
 // Replaces `p` with `text` in one step. The text goes to a new file of a random name beside it,
 // which is flushed to the disk before it takes p's place, so `p` holds the old text or the new

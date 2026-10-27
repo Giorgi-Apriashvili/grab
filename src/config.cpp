@@ -458,6 +458,9 @@ std::expected<RcloneRemote, std::string> parse_rclone_remote(const ini::Document
     }
     auto agent = bool_value(*s, "key_use_agent", false);
     r.key_use_agent = agent && *agent;
+    r.shell_type = nonblank(*s, "shell_type");
+    r.md5sum_command = nonblank(*s, "md5sum_command");
+    r.path_override = nonblank(*s, "path_override");
     return r;
 }
 

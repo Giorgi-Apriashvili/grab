@@ -67,6 +67,12 @@ struct RcloneRemote {
     std::optional<std::string> key_file;
     std::optional<std::string> known_hosts_file; // rclone's "none" becomes nullopt
     bool key_use_agent = false;                   // authenticates through ssh-agent
+    // How rclone runs commands there, as it saved what it found (read only; grab's verification
+    // keeps to what it can do the same way, ssh::hash_blocked): the shell ("unix", "cmd",
+    // "powershell", "none"), the MD5 command ("md5sum", "none"...), a path prefix for commands.
+    std::optional<std::string> shell_type;
+    std::optional<std::string> md5sum_command;
+    std::optional<std::string> path_override;
 };
 
 // The server's engine, unless GRAB_ENGINE (grab or rclone) overrides it for every server, as

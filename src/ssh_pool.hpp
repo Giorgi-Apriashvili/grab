@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace grab::ssh {
@@ -106,6 +107,34 @@ struct Lookup {
     std::string redone = {};  // why it was asked again (find failing on the answer known before)
 };
 
+// Why grab's verification has no server sum for a file (ssh_hash.hpp). None of them says the file
+// differs: a check that can't run keeps the copy.
+enum class HashFailure {
+    no_checksums, // the server can't compute them: no md5sum, a Windows shell, an SFTP-only account, a banner
+    unsupported,  // grab can't ask for this one: rclone.conf's keys, a name the server's shell can't be given
+    login,        // no login to the server
+    refused,      // the server refused the command, also on a login with nothing else open
+    deadline,     // the server took too long
+    stopped,      // the stop token
+    lost,         // the connection broke, or md5sum ended in a way that says nothing (a signal, too much output)
+    unpaired,     // md5sum ran, but no record named the file: missing or unreadable there, or a record grab can't read
+};
+
+// What a server answered grab's hash check (ssh_hash.hpp): whether its md5sum works as grab needs
+// it, and the folder its paths start from.
+struct HashCheck {
+    bool works = false;
+    bool z = false;     // with -z: each record ends in a NUL and names the file exactly as it was given
+    std::string home;   // the login folder (SFTP REALPATH of "."), raw bytes: files go to md5sum absolute from it
+    std::string answer; // what it said, in a few words, for -v and "not verified"
+    HashFailure failure = HashFailure::no_checksums; // why not, when it doesn't work
+    // false: it may pass (no answer in time, a lost connection, a login that failed for now), so it
+    // holds only find_check_fresh; else for the pool's life. A refusal (a channel refused even on
+    // a new login) is never lasting.
+    bool lasting = true;
+    bool operator==(const HashCheck&) const = default;
+};
+
 class Pool {
 public:
     using Clock = std::chrono::steady_clock;
@@ -123,9 +152,11 @@ public:
                                                              std::chrono::seconds{2}, std::chrono::seconds{4},
                                                              std::chrono::seconds{8}};
         bool idle_timer = true; // the pool's own thread closes idle connections (tests call close_idle)
-        // How long find_check keeps an answer that isn't lasting, and one that is.
+        // How long find_check keeps an answer that isn't lasting, and one that is. hash_check keeps
+        // one that isn't lasting as long, one that is for the pool's life.
         std::chrono::milliseconds find_check_expiry{ssh::find_check_fresh};
         std::chrono::milliseconds find_check_trust{ssh::find_check_trust};
+        int hashes_at_once = 1; // hash commands on this server at once (hash_turn)
     };
 
     Pool(Connect connect, Options options);
@@ -165,6 +196,31 @@ public:
     // logins at once, else waiting for one to come back. nullopt once `stop` is requested. Throws
     // Error: a fatal one at once, a refusal after the retries (`retry_refused`, else the pool's).
     [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {}, Retry retry_refused = std::nullopt);
+    // A new login, never an idle connection, for a command the server refused beside the SFTP
+    // session of a reused one (MaxSessions 1): nothing else runs on it. When the pool is full, its
+    // oldest idle connection is closed to make room (idle ones count toward the limit); else as
+    // acquire.
+    [[nodiscard]] std::optional<Lease> acquire_new(std::stop_token stop = {}, Retry retry_refused = std::nullopt);
+
+    // A turn to run a hash command (ssh_hash.hpp), held while it runs: at most
+    // Options::hashes_at_once of them at once on this server, however many verifications share the
+    // pool. nullopt once `stop` is requested.
+    class Turn {
+    public:
+        Turn(Turn&& other) noexcept : pool_(std::exchange(other.pool_, nullptr)) {}
+        Turn& operator=(Turn&& other) noexcept;
+        ~Turn() { release(); }
+        Turn(const Turn&) = delete;
+        Turn& operator=(const Turn&) = delete;
+
+    private:
+        friend class Pool;
+        explicit Turn(Pool* pool) : pool_(pool) {}
+        void release();
+        Pool* pool_ = nullptr;
+    };
+    [[nodiscard]] std::optional<Turn> hash_turn(std::stop_token stop = {});
+    [[nodiscard]] int hashes_at_once() const;
 
     // Lowering it closes idle connections over it; borrowed ones close when they come back.
     void set_limit(int limit);
@@ -188,11 +244,39 @@ public:
     // works (a saved answer gone stale, ssh::recheck_lookup).
     void forget_find_check();
 
+    // The hash check of this pool's server (ssh::hash_check), asked as find_check is: once, a second
+    // caller waiting for the first one's answer. An answer that is lasting holds for the pool's life
+    // (it isn't saved across runs), one that isn't for find_check_expiry. A refusal is one that isn't
+    // lasting: the check already asked again on a new login with nothing else open (a server that
+    // allows one channel per login refuses a command beside a busy SFTP session), so asking for
+    // every verification would only cost a login each time.
+    [[nodiscard]] std::optional<HashCheck> hash_check(std::stop_token stop,
+                                                      const std::function<std::optional<HashCheck>()>& check);
+    // Keeps `answer` in place of the check's (a login that failed after it: later verifications get
+    // its answer instead of trying again), or drops it (nullopt).
+    void set_hash_check(std::optional<HashCheck> answer);
+
 private:
     struct Idle {
         std::unique_ptr<Session> session;
         Clock::time_point since;
     };
+    // A question about the server the pool asks once (find_check, hash_check).
+    template <class Check>
+    struct Asked {
+        bool asking = false; // a caller is asking; the others wait for its answer
+        std::optional<Check> answer;
+        Clock::time_point since; // when the answer was given
+    };
+    template <class Check>
+    [[nodiscard]] std::optional<Check> ask(Asked<Check>& asked, const std::stop_token& stop,
+                                           const std::function<std::optional<Check>()>& check);
+    // How long an answer holds, from when it was given.
+    [[nodiscard]] Clock::duration holds(const FindCheck& check) const;
+    [[nodiscard]] Clock::duration holds(const HashCheck& check) const;
+    // A new login under the lock, which it gives up while logging in.
+    [[nodiscard]] std::optional<Lease> log_in(std::unique_lock<std::mutex>& lock, const std::stop_token& stop,
+                                              std::span<const std::chrono::milliseconds> pauses);
     void give_back(std::unique_ptr<Session> session, bool broken);
     [[nodiscard]] int open_locked() const { return leased_ + logging_in_ + static_cast<int>(idle_.size()); }
 
@@ -203,11 +287,16 @@ private:
     std::deque<Idle> idle_; // most recently used at the back
     int leased_ = 0;
     int logging_in_ = 0;
-    bool checking_ = false; // a find check is running
-    std::optional<FindCheck> find_check_;
-    Clock::time_point find_checked_;
+    int hashing_ = 0; // hash turns out
+    Asked<FindCheck> find_asked_;
+    Asked<HashCheck> hash_asked_;
     std::jthread timer_;
 };
+
+// Hash commands at once on a server (Pool::Options::hashes_at_once), as phase 5 measured them:
+// 2 on a Storage Box (*.your-storagebox.de; 475 MiB/s with one, 900 with two, 953 with four),
+// 1 elsewhere (Main's disks: 198 MiB/s with one, 167 with two, 158 with four).
+[[nodiscard]] int hashes_at_once_for(std::string_view host);
 
 // The pools of the servers on grab's engine, one per server, made on first use, for a program
 // (the window, a command) to share among its downloads. A server whose login changed (a password
@@ -227,6 +316,10 @@ public:
     // The server's pool (if any) drops its find check's answer, so its next search loads the one
     // saved since (the window's server Test asked again) instead of keeping the old one for a week.
     void forget_find_check(const std::string& server);
+    // The server's pool (if any) drops its hash check's answer, so its next verification asks
+    // again: a login that failed for good (a host key not trusted yet, an agent without the key)
+    // may work after Trust or a server Test.
+    void forget_hash_check(const std::string& server);
 
 private:
     struct Entry {

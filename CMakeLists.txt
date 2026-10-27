@@ -74,6 +74,7 @@ add_library(grab_core STATIC
     src/ssh.cpp
     src/ssh_pool.cpp
     src/ssh_find.cpp
+    src/ssh_hash.cpp
     src/ssh_target.cpp
     src/ssh_walk.cpp)
 
@@ -96,8 +97,9 @@ endif()
 
 # ---------------------------------------------------------------------------
 # SSH: libssh2 (BSD-3-Clause) on OpenSSL's libcrypto (Apache-2.0), both static; grab's own SFTP
-# client runs on its channels (the rclone replacement). libssh2 has made no release since 1.11.1
-# (2024) while its security fixes land on master, so grab pins a master commit. To bump: take a
+# client runs on its channels (the rclone replacement), and libcrypto's MD5 verifies downloads.
+# libssh2 has made no release since 1.11.1 (2024) while its security fixes land on master, so grab
+# pins a master commit. To bump: take a
 # newer commit from https://github.com/libssh2/libssh2/commits/master, download
 # https://github.com/libssh2/libssh2/archive/<commit>.tar.gz and put its SHA-256 here.
 # OpenSSL: Windows gets 3.5 LTS from vcpkg (cmake/vcpkg.cmake, cmake/vcpkg-ports/openssl);

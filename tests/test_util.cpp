@@ -14,8 +14,10 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace grab;
@@ -372,4 +374,85 @@ TEST_CASE("place_file: a download put in place with the server's time, replacing
     for ([[maybe_unused]] const auto& e : std::filesystem::directory_iterator(dir)) ++files;
     CHECK(files == 1); // no temporary file left
     std::filesystem::remove_all(dir.parent_path());
+}
+TEST_CASE("md5_file: RFC 1321's vectors, progress in 1 MiB reads, a stop, a missing file") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-tests-md5";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "f.bin";
+    const auto sum_of = [&](const std::string& text) {
+        REQUIRE(util::write_file_atomic(file, text));
+        return util::md5_file(file).value_or("failed");
+    };
+    CHECK(sum_of("") == "d41d8cd98f00b204e9800998ecf8427e");
+    CHECK(sum_of("a") == "0cc175b9c0f1b6a831c399e269772661");
+    CHECK(sum_of("abc") == "900150983cd24fb0d6963f7d28e17f72");
+    CHECK(sum_of("message digest") == "f96b697d7cb7938d525a2f31aaf161d0");
+    CHECK(sum_of("abcdefghijklmnopqrstuvwxyz") == "c3fcd3d76192e4007dfb496cca67e13b");
+    CHECK(sum_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") == "d174ab98d277d9f5a5611c2c9f419d9f");
+    CHECK(sum_of(std::string(1'000'000, 'a')) == "7707d6ae4e027c70eea2a935c2296f21");
+
+    // Past 1 MiB: progress after each read, the same sum as in one piece.
+    std::string big(std::size_t{3} << 20, '\0');
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>((i * 131 + i / 977) & 0xFF);
+    big += "tail!";
+    const std::string whole = sum_of(big);
+    std::vector<std::uint64_t> seen;
+    util::FileHashOptions o;
+    o.progress = [&](std::uint64_t done) { seen.push_back(done); };
+    CHECK(util::md5_file(file, o) == whole);
+    CHECK(seen == std::vector<std::uint64_t>{std::uint64_t{1} << 20, std::uint64_t{2} << 20, std::uint64_t{3} << 20,
+                                             (std::uint64_t{3} << 20) + 5});
+
+    // Stopped before it starts, or between reads.
+    std::stop_source stop;
+    o.stop = stop.get_token();
+    o.progress = [&](std::uint64_t) { stop.request_stop(); };
+    CHECK(util::md5_file(file, o).error_or("") == "stopped");
+    CHECK(util::md5_file(file, o).error_or("") == "stopped");
+
+    const auto missing = util::md5_file(dir / "none.bin");
+    REQUIRE_FALSE(missing);
+    CHECK(missing.error().starts_with("cannot open"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("md5_file: at most local_hashes_at_once at a time in a program") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-tests-md5-cap";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    constexpr int n = util::local_hashes_at_once + 1;
+    for (int i = 0; i < n; ++i) REQUIRE(util::write_file_atomic(dir / std::to_string(i), std::string(std::size_t{2} << 20, 'x')));
+    std::atomic<int> inside{0}, most{0};
+    std::atomic<bool> go{false};
+    std::vector<std::string> sums(n);
+    {
+        std::vector<std::jthread> threads;
+        for (int i = 0; i < n; ++i) {
+            threads.emplace_back([&, i] {
+                bool first = true;
+                util::FileHashOptions o;
+                // Each holds its turn after its first read until let go.
+                o.progress = [&](std::uint64_t) {
+                    if (!std::exchange(first, false)) return;
+                    const int now = ++inside;
+                    for (int seen = most; now > seen && !most.compare_exchange_weak(seen, now);) {
+                    }
+                    while (!go) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    --inside;
+                };
+                sums[static_cast<std::size_t>(i)] = util::md5_file(dir / std::to_string(i), o).value_or("failed");
+            });
+        }
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (inside < util::local_hashes_at_once && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(inside == util::local_hashes_at_once); // the last one waits for a turn
+        go = true;
+    }
+    CHECK(most == util::local_hashes_at_once);
+    for (const auto& s : sums) CHECK(s == sums.front());
+    CHECK(sums.front() != "failed");
+    std::filesystem::remove_all(dir);
 }

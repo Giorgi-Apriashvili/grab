@@ -258,3 +258,137 @@ TEST_CASE("ssh pool: a caller may bring its own pauses for turned-away logins") 
     CHECK(ssh::interactive_retry.front() == 500ms);
     CHECK(ssh::interactive_retry.back() == 4s);
 }
+
+TEST_CASE("ssh pool: a new login on request, an idle connection closed to make room") {
+    Logins logins;
+    ssh::Pool pool(logins.connect(), options(2));
+    {
+        auto a = pool.acquire();
+        auto b = pool.acquire();
+        REQUIRE((a && b));
+    }
+    CHECK(pool.idle() == 2);
+    // Full: the oldest idle connection goes, never one handed out.
+    auto fresh = pool.acquire_new();
+    REQUIRE(fresh);
+    CHECK(id_of(*fresh) == 3);
+    CHECK_FALSE(fresh->reused());
+    CHECK(logins.alive == 2);
+    CHECK(pool.open() == 2);
+    // Room under the limit: no connection closed.
+    fresh.reset();
+    auto held = pool.acquire();
+    REQUIRE(held);
+    pool.set_limit(3);
+    auto another = pool.acquire_new();
+    REQUIRE(another);
+    CHECK(id_of(*another) == 4);
+    CHECK(logins.alive == 3);
+    // Nothing idle and no room: it waits, and stops when asked.
+    std::stop_source stop;
+    std::jthread stopper([&] {
+        std::this_thread::sleep_for(20ms);
+        stop.request_stop();
+    });
+    auto third = pool.acquire();
+    REQUIRE(third);
+    CHECK_FALSE(pool.acquire_new(stop.get_token()));
+}
+
+TEST_CASE("ssh pool: hash commands take turns, as many at once as the server allows") {
+    Logins logins;
+    auto o = options(4);
+    o.hashes_at_once = 2;
+    ssh::Pool pool(logins.connect(), o);
+    CHECK(pool.hashes_at_once() == 2);
+    auto first = pool.hash_turn();
+    auto second = pool.hash_turn();
+    REQUIRE((first && second));
+    // A third waits for one to end.
+    std::atomic<bool> got{false};
+    std::jthread third([&] {
+        auto turn = pool.hash_turn();
+        got = turn.has_value();
+    });
+    std::this_thread::sleep_for(30ms);
+    CHECK_FALSE(got);
+    first.reset();
+    third.join();
+    CHECK(got);
+    // A waiter stops when asked.
+    auto again = pool.hash_turn();
+    std::stop_source stop;
+    stop.request_stop();
+    CHECK_FALSE(pool.hash_turn(stop.get_token()));
+    CHECK(ssh::hashes_at_once_for("u123-sub1.Your-StorageBox.de") == 2);
+    CHECK(ssh::hashes_at_once_for("65.21.224.123") == 1);
+}
+
+TEST_CASE("ssh pool: the hash check is asked once; one that may pass is asked again after a while") {
+    Logins logins;
+    auto o = options(2);
+    o.find_check_expiry = 0ms;
+    ssh::Pool pool(logins.connect(), o);
+    int asked = 0;
+    auto check = [&](bool lasting) {
+        return [&asked, lasting]() -> std::optional<ssh::HashCheck> {
+            ++asked;
+            return ssh::HashCheck{.works = lasting, .z = true, .home = "/home/u", .answer = "md5sum -z", .failure = {},
+                                  .lasting = lasting};
+        };
+    };
+    REQUIRE(pool.hash_check({}, check(true)));
+    REQUIRE(pool.hash_check({}, check(true)));
+    CHECK(asked == 1); // for the pool's life
+    // Replaced by a login that failed later, then dropped.
+    pool.set_hash_check(ssh::HashCheck{.works = false, .z = false, .home = {}, .answer = "refused the login",
+                                       .failure = ssh::HashFailure::login, .lasting = true});
+    const ssh::HashCheck refused{.works = false, .z = false, .home = {}, .answer = "refused the login",
+                                 .failure = ssh::HashFailure::login, .lasting = true};
+    CHECK(pool.hash_check({}, check(true)) == refused);
+    CHECK(asked == 1);
+    pool.set_hash_check(std::nullopt);
+    REQUIRE(pool.hash_check({}, check(false)));
+    CHECK(asked == 2);
+    REQUIRE(pool.hash_check({}, check(false)));
+    CHECK(asked == 3); // not lasting: held only find_check_expiry
+    // A refusal (already asked again on a new login): held as one that may pass, so an account
+    // that refuses every command costs no login per verification.
+    auto o2 = options(2);
+    ssh::Pool other(logins.connect(), o2);
+    const auto refused_answer = [&asked]() -> std::optional<ssh::HashCheck> {
+        ++asked;
+        return ssh::HashCheck{.works = false, .z = false, .home = {}, .answer = "the server refused to run the command",
+                              .failure = ssh::HashFailure::refused, .lasting = false};
+    };
+    REQUIRE(other.hash_check({}, refused_answer));
+    REQUIRE(other.hash_check({}, refused_answer));
+    CHECK(asked == 4);
+    ssh::Pool brief(logins.connect(), o);
+    REQUIRE(brief.hash_check({}, refused_answer));
+    REQUIRE(brief.hash_check({}, refused_answer));
+    CHECK(asked == 6);
+}
+
+TEST_CASE("ssh pools: a login that failed for good is kept until the server's Test drops it") {
+    ssh::Pools pools;
+    ssh::Target t;
+    t.user = "u";
+    t.host = "example.invalid";
+    auto pool = pools.get("srv", t, 2); // no login until a lease is asked for
+    int asked = 0;
+    const auto check = [&asked]() -> std::optional<ssh::HashCheck> {
+        ++asked;
+        return ssh::HashCheck{.works = false, .z = false, .home = {}, .answer = "the host key isn't trusted yet",
+                              .failure = ssh::HashFailure::login, .lasting = true};
+    };
+    REQUIRE(pool->hash_check({}, check));
+    REQUIRE(pool->hash_check({}, check));
+    CHECK(asked == 1);
+    pools.forget_hash_check("other"); // another server's: nothing
+    REQUIRE(pool->hash_check({}, check));
+    CHECK(asked == 1);
+    pools.forget_hash_check("srv");
+    REQUIRE(pool->hash_check({}, check));
+    CHECK(asked == 2);
+}

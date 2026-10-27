@@ -9,6 +9,8 @@
 #include <exception>
 #include <span>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace grab::ssh {
@@ -69,9 +71,12 @@ std::expected<ExecResult, ExecError> Session::exec(std::string_view /*command*/,
 
 std::unique_ptr<Session> open_session(const Target& target) { return std::make_unique<SshSession>(target); }
 
+int hashes_at_once_for(std::string_view host) { return budget::is_storage_box(host) ? 2 : 1; }
+
 Pool::Pool(Connect connect, Options options) : connect_(std::move(connect)), options_(std::move(options)) {
     options_.limit = std::max(options_.limit, 1);
     options_.logins_at_once = std::max(options_.logins_at_once, 1);
+    options_.hashes_at_once = std::max(options_.hashes_at_once, 1);
     if (options_.idle_timer) {
         timer_ = std::jthread([this](std::stop_token stop) {
             while (!stop.stop_requested()) {
@@ -105,7 +110,35 @@ std::optional<Pool::Lease> Pool::acquire(std::stop_token stop, Retry retry_refus
         if (room()) break;
         changed_.wait(lock, stop, [&] { return !idle_.empty() || room(); });
     }
+    return log_in(lock, stop, pauses);
+}
 
+std::optional<Pool::Lease> Pool::acquire_new(std::stop_token stop, Retry retry_refused) {
+    const std::span<const std::chrono::milliseconds> pauses = retry_refused.value_or(options_.retry_refused);
+    std::unique_lock lock(mutex_);
+    auto room = [this] { return open_locked() < options_.limit && logging_in_ < options_.logins_at_once; };
+    // Closing an idle connection makes room under the limit, not among the logins at once.
+    auto closable = [this] {
+        return !idle_.empty() && open_locked() >= options_.limit && logging_in_ < options_.logins_at_once;
+    };
+    for (;;) {
+        if (stop.stop_requested()) return std::nullopt;
+        if (room()) break;
+        if (closable()) {
+            std::unique_ptr<Session> drop = std::move(idle_.front().session);
+            idle_.pop_front();
+            lock.unlock();
+            drop.reset(); // outside the lock: a disconnect talks to the server
+            lock.lock();
+            continue;
+        }
+        changed_.wait(lock, stop, [&] { return room() || closable(); });
+    }
+    return log_in(lock, stop, pauses);
+}
+
+std::optional<Pool::Lease> Pool::log_in(std::unique_lock<std::mutex>& lock, const std::stop_token& stop,
+                                        std::span<const std::chrono::milliseconds> pauses) {
     // A new login, outside the lock: it takes a second or more.
     ++logging_in_;
     lock.unlock();
@@ -191,37 +224,38 @@ void Pool::close_idle(Clock::time_point now) {
     if (!drop.empty()) changed_.notify_all();
 }
 
-std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::function<std::optional<FindCheck>()>& check) {
+template <class Check>
+std::optional<Check> Pool::ask(Asked<Check>& asked, const std::stop_token& stop,
+                               const std::function<std::optional<Check>()>& check) {
     std::unique_lock lock(mutex_);
-    auto known = [&] {
-        return find_check_ && Clock::now() - find_checked_ < (find_check_->lasting ? options_.find_check_trust
-                                                                                    : options_.find_check_expiry);
-    };
-    if (!changed_.wait(lock, stop, [&] { return known() || !checking_; })) return std::nullopt;
-    if (known()) return find_check_;
+    auto known = [&] { return asked.answer && Clock::now() - asked.since < holds(*asked.answer); };
+    if (!changed_.wait(lock, stop, [&] { return known() || !asked.asking; })) return std::nullopt;
+    if (known()) return asked.answer;
     // This caller asks; the others wait for its answer.
-    checking_ = true;
+    asked.asking = true;
     lock.unlock();
-    std::optional<FindCheck> answer;
+    std::optional<Check> answer;
     try {
         answer = check();
     } catch (...) {
         lock.lock();
-        checking_ = false;
+        asked.asking = false;
         lock.unlock();
         changed_.notify_all();
         throw;
     }
     lock.lock();
-    checking_ = false;
+    asked.asking = false;
     if (answer) {
-        find_check_ = answer;
-        find_checked_ = Clock::now();
+        asked.answer = answer;
+        asked.since = Clock::now();
         // An answer an earlier run saved holds from when the server gave it.
-        if (answer->checked > 0) {
-            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                 std::chrono::system_clock::now().time_since_epoch()).count();
-            find_checked_ -= std::chrono::seconds(std::max<std::int64_t>(0, now - answer->checked));
+        if constexpr (std::is_same_v<Check, FindCheck>) {
+            if (answer->checked > 0) {
+                const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count();
+                asked.since -= std::chrono::seconds(std::max<std::int64_t>(0, now - answer->checked));
+            }
         }
     }
     lock.unlock();
@@ -229,9 +263,61 @@ std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::funct
     return answer;
 }
 
+Pool::Clock::duration Pool::holds(const FindCheck& check) const {
+    return check.lasting ? options_.find_check_trust : options_.find_check_expiry;
+}
+
+Pool::Clock::duration Pool::holds(const HashCheck& check) const {
+    return check.lasting ? Clock::duration::max() : Clock::duration(options_.find_check_expiry);
+}
+
+std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::function<std::optional<FindCheck>()>& check) {
+    return ask(find_asked_, stop, check);
+}
+
 void Pool::forget_find_check() {
     std::scoped_lock lock(mutex_);
-    find_check_.reset();
+    find_asked_.answer.reset();
+}
+
+std::optional<HashCheck> Pool::hash_check(std::stop_token stop, const std::function<std::optional<HashCheck>()>& check) {
+    return ask(hash_asked_, stop, check);
+}
+
+void Pool::set_hash_check(std::optional<HashCheck> answer) {
+    std::scoped_lock lock(mutex_);
+    hash_asked_.answer = std::move(answer);
+    hash_asked_.since = Clock::now();
+}
+
+std::optional<Pool::Turn> Pool::hash_turn(std::stop_token stop) {
+    std::unique_lock lock(mutex_);
+    if (!changed_.wait(lock, stop, [this] { return hashing_ < options_.hashes_at_once; })) return std::nullopt;
+    ++hashing_;
+    return Turn(this);
+}
+
+int Pool::hashes_at_once() const {
+    std::scoped_lock lock(mutex_);
+    return options_.hashes_at_once;
+}
+
+Pool::Turn& Pool::Turn::operator=(Turn&& other) noexcept {
+    if (this != &other) {
+        release();
+        pool_ = std::exchange(other.pool_, nullptr);
+    }
+    return *this;
+}
+
+void Pool::Turn::release() {
+    if (!pool_) return;
+    {
+        std::scoped_lock lock(pool_->mutex_);
+        --pool_->hashing_;
+    }
+    pool_->changed_.notify_all();
+    pool_ = nullptr;
 }
 
 Pool::Lease::Lease(Lease&& other) noexcept
@@ -272,7 +358,9 @@ std::shared_ptr<Pool> Pools::get(const std::string& server, const Target& target
         it->second.pool->set_limit(limit);
         return it->second.pool;
     }
-    auto pool = std::make_shared<Pool>([target] { return open_session(target); }, download_options(limit));
+    auto options = download_options(limit);
+    options.hashes_at_once = hashes_at_once_for(target.host);
+    auto pool = std::make_shared<Pool>([target] { return open_session(target); }, std::move(options));
     pools_[server] = Entry{target, pool};
     return pool;
 }
@@ -280,6 +368,11 @@ std::shared_ptr<Pool> Pools::get(const std::string& server, const Target& target
 void Pools::forget_find_check(const std::string& server) {
     std::lock_guard lock(mutex_);
     if (const auto it = pools_.find(server); it != pools_.end() && it->second.pool) it->second.pool->forget_find_check();
+}
+
+void Pools::forget_hash_check(const std::string& server) {
+    std::lock_guard lock(mutex_);
+    if (const auto it = pools_.find(server); it != pools_.end() && it->second.pool) it->second.pool->set_hash_check(std::nullopt);
 }
 
 } // namespace grab::ssh

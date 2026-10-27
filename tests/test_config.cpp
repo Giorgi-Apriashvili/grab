@@ -165,6 +165,18 @@ TEST_CASE("rclone remote defaults and validation") {
     CHECK(minimal->port == 22);
     CHECK_FALSE(minimal->key_file.has_value());
     CHECK_FALSE(minimal->known_hosts_file.has_value());
+    CHECK_FALSE(minimal->shell_type.has_value());
+    CHECK_FALSE(minimal->md5sum_command.has_value());
+    CHECK_FALSE(minimal->path_override.has_value());
+
+    // What rclone saved of the server's shell and commands, read for grab's verification.
+    auto saved = parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nhost=h\nuser=u\nshell_type = unix\n"
+                                                 "md5sum_command = md5sum\npath_override = @/volume1\n"),
+                                     "s");
+    REQUIRE(saved.has_value());
+    CHECK(saved->shell_type == "unix");
+    CHECK(saved->md5sum_command == "md5sum");
+    CHECK(saved->path_override == "@/volume1");
 
     CHECK_FALSE(parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nuser=u\n"), "s").has_value());
     CHECK_FALSE(parse_rclone_remote(*ini::parse("[s]\ntype=sftp\nhost=h\n"), "s").has_value());

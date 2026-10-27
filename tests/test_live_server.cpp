@@ -37,8 +37,8 @@
 //   GRAB_TEST_HASH_SILENT_GIB  the most the long silent md5sum reads, in GiB (default 20)
 //   GRAB_TEST_HASH_SILENCE     seconds `tail -f` stays silent (default 90)
 //
-// And one on this PC: GRAB_TEST_MD5_FILE, a big local file hashed by Windows CNG (util::md5_file,
-// and 1 MiB reads) and by OpenSSL's EVP, timed (phase 5 step 3: which local hasher).
+// And one on this PC: GRAB_TEST_MD5_FILE, a big local file hashed by util::md5_file, by Windows
+// CNG and by OpenSSL's EVP, timed (phase 5 step 3: which local hasher; util::md5_file took EVP).
 //
 // At most 4 logins at once. Lines start with "hook: ".
 
@@ -1279,9 +1279,9 @@ template <class Hash> std::string md5_by_readfile(const std::filesystem::path& p
 
 } // namespace
 
-// Which local hasher phase 5 takes: Windows CNG (util::md5_file, today's 64 KiB reads through a
-// C++ stream, and 1 MiB reads) against OpenSSL's EVP MD5 (1 MiB reads), on a big file read from
-// the cache, and on a buffer in memory. Printed only.
+// Which local hasher phase 5 takes: Windows CNG (in 64 KiB and 1 MiB reads) against OpenSSL's EVP
+// MD5 (the same; util::md5_file is EVP in 1 MiB reads since), on a big file read from the cache,
+// and on a buffer in memory. Printed only.
 TEST_CASE("local MD5: Windows CNG against OpenSSL's EVP, timed only (GRAB_TEST_MD5_FILE)") {
     const auto file = util::getenv_utf8("GRAB_TEST_MD5_FILE");
     if (!file) {
@@ -1311,7 +1311,7 @@ TEST_CASE("local MD5: Windows CNG against OpenSSL's EVP, timed only (GRAB_TEST_M
                         rates[2]));
     };
     say("the file, from the cache:");
-    timed("util::md5_file (CNG, 64 KiB stream reads)", size, [&] { return util::md5_file(path).value_or(""); }, *reference);
+    timed("util::md5_file (EVP, 1 MiB ReadFile)", size, [&] { return util::md5_file(path).value_or(""); }, *reference);
     timed("CNG, 1 MiB ReadFile", size, [&] { return md5_by_readfile<CngMd5>(path, std::size_t{1} << 20); }, *reference);
     timed("EVP, 1 MiB ReadFile", size, [&] { return md5_by_readfile<EvpMd5>(path, std::size_t{1} << 20); }, *reference);
     timed("CNG, 64 KiB ReadFile", size, [&] { return md5_by_readfile<CngMd5>(path, std::size_t{64} << 10); }, *reference);

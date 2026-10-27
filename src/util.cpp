@@ -1,8 +1,12 @@
 #include "util.hpp"
 
+#include <openssl/evp.h>
+
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +14,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <system_error>
 #include <utility>
@@ -699,6 +705,87 @@ std::expected<std::string, std::string> read_file(const std::filesystem::path& p
     return std::move(**text);
 }
 
+namespace {
+
+// md5_file's turns (local_hashes_at_once).
+struct LocalHashes {
+    std::mutex mutex;
+    std::condition_variable_any changed;
+    int running = 0;
+};
+
+LocalHashes& local_hashes() {
+    static LocalHashes hashes;
+    return hashes;
+}
+
+} // namespace
+
+std::expected<std::string, std::string> md5_file(const std::filesystem::path& p, const FileHashOptions& options) {
+    LocalHashes& hashes = local_hashes();
+    {
+        std::unique_lock lock(hashes.mutex);
+        if (!hashes.changed.wait(lock, options.stop, [&] { return hashes.running < local_hashes_at_once; }))
+            return fail("stopped");
+        ++hashes.running;
+    }
+    struct Turn {
+        LocalHashes& hashes;
+        ~Turn() {
+            {
+                std::scoped_lock lock(hashes.mutex);
+                --hashes.running;
+            }
+            hashes.changed.notify_all();
+        }
+    } turn{hashes};
+
+    // Read with the system's own calls: a C++ stream took a fifth off the speed (phase 5).
+#ifdef _WIN32
+    const HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return failf("cannot open '{}': {}", path_to_utf8(p), error_message(GetLastError()));
+    struct Closer {
+        HANDLE h;
+        ~Closer() { CloseHandle(h); }
+    } closer{h};
+#else
+    const int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return failf("cannot open '{}': {}", path_to_utf8(p), error_message(static_cast<unsigned long>(errno)));
+    struct Closer {
+        int fd;
+        ~Closer() { ::close(fd); }
+    } closer{fd};
+#endif
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1) return fail("MD5 is not available (OpenSSL)");
+    std::vector<char> buffer(std::size_t{1} << 20);
+    std::uint64_t done = 0;
+    for (;;) {
+        if (options.stop.stop_requested()) return fail("stopped");
+#ifdef _WIN32
+        DWORD got = 0;
+        if (!ReadFile(h, buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr))
+            return failf("cannot read '{}': {}", path_to_utf8(p), error_message(GetLastError()));
+#else
+        const ssize_t got = ::read(fd, buffer.data(), buffer.size());
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) return failf("cannot read '{}': {}", path_to_utf8(p), error_message(static_cast<unsigned long>(errno)));
+#endif
+        if (got == 0) break;
+        if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<std::size_t>(got)) != 1) return fail("MD5 failed (OpenSSL)");
+        done += static_cast<std::uint64_t>(got);
+        if (options.progress) options.progress(done);
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int size = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), digest.data(), &size) != 1) return fail("MD5 failed (OpenSSL)");
+    std::string hex;
+    hex.reserve(std::size_t{size} * 2);
+    for (unsigned int i = 0; i < size; ++i) hex += std::format("{:02x}", digest[i]);
+    return hex;
+}
+
 #ifdef _WIN32
 
 std::string error_message(unsigned long code) {
@@ -842,10 +929,6 @@ std::expected<std::string, std::string> sha256_file(const std::filesystem::path&
     return hash_file(p, BCRYPT_SHA256_ALGORITHM, 32, "SHA-256");
 }
 
-std::expected<std::string, std::string> md5_file(const std::filesystem::path& p) {
-    return hash_file(p, BCRYPT_MD5_ALGORITHM, 16, "MD5");
-}
-
 namespace {
 
 DATA_BLOB blob_of(std::string_view s) {
@@ -929,10 +1012,6 @@ std::filesystem::path self_exe_path() {
 
 std::expected<std::string, std::string> sha256_file(const std::filesystem::path&) {
     return fail("SHA-256 hashing is only implemented on Windows");
-}
-
-std::expected<std::string, std::string> md5_file(const std::filesystem::path&) {
-    return fail("MD5 hashing is only implemented on Windows");
 }
 
 std::optional<std::string> protect_for_user(std::string_view data, std::string_view) { return std::string(data); }
