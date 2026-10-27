@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -41,9 +42,11 @@ struct Fake {
     std::atomic<int> logins{0};
     std::atomic<int> refuse_logins{0}; // the next this many logins are turned away (a full server)
     bool fatal_login = false;          // every login refused for good (a wrong password)
+    std::set<int> sftp_fails;          // the logins (from 1) that can't start SFTP
+    int no_sftp_from = 0;              // from this login on, the server refuses SFTP (0: never)
 
     struct Session : ssh::Session {
-        explicit Session(Fake& f) : fake(f), client(server) {
+        Session(Fake& f, bool fails, bool refuses) : fake(f), no_sftp(fails), refuses_sftp(refuses), client(server) {
             server.shared_files = &f.files;
             server.max_data = f.max_data;
             server.reverse = f.reverse;
@@ -57,9 +60,16 @@ struct Fake {
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;
-        sftp::Client& sftp() override { return client; }
-        bool reusable() override { return client.pending() == 0; }
+        // As the real session's SFTP, started on first use, fails to start on a broken link.
+        sftp::Client& sftp() override {
+            if (refuses_sftp) throw sftp::Unavailable("the server doesn't offer SFTP");
+            if (no_sftp) throw sftp::Broken("SFTP didn't start: the server closed the SFTP channel");
+            return client;
+        }
+        bool reusable() override { return !no_sftp && !refuses_sftp && client.pending() == 0; }
         Fake& fake;
+        bool no_sftp;
+        bool refuses_sftp;
         test::FakeServer server;
         sftp::Client client;
     };
@@ -68,10 +78,11 @@ struct Fake {
         auto o = ssh::Pools::download_options(limit);
         o.idle_timer = false;
         return std::make_shared<ssh::Pool>([this]() -> std::unique_ptr<ssh::Session> {
-            ++logins;
+            const int login = ++logins;
             if (fatal_login) throw ssh::Error(budget::Failure::fatal, "Fake refused the login: it refused the password");
             if (refuse_logins-- > 0) throw ssh::Error(budget::Failure::refused, "SSH handshake with Fake failed");
-            return std::make_unique<Session>(*this);
+            return std::make_unique<Session>(*this, sftp_fails.contains(login),
+                                             no_sftp_from > 0 && login >= no_sftp_from);
         }, o);
     }
     std::uint64_t asked() {
@@ -216,6 +227,38 @@ TEST_CASE("grab engine: turned-away logins are waited out and lower the budget; 
         CHECK(r.error == "Fake refused the login: it refused the password");
         CHECK(fake.logins == 1);
     }
+}
+
+TEST_CASE("grab engine: a connection whose SFTP doesn't start is dropped, and the download goes on with others") {
+    Fake fake;
+    const std::string content = test::pattern(8u << 20);
+    fake.files["/data/f.bin"] = content;
+    fake.delay = 1ms; // long enough for the other connections to join
+    fake.sftp_fails = {2, 3}; // the size check's login works; the next two ranges' don't
+    Dir dir("no-sftp");
+    auto pool = fake.pool(3);
+    fetch::Connections connections;
+    connections.configure("Fake", 3);
+    auto d = download(dir.path / "f.bin", pool);
+    const auto r = fetch::run(d, connections, {}, {});
+    REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+    CHECK(util::read_file(dir.path / "f.bin") == content);
+    CHECK(fake.logins >= 4);
+}
+
+TEST_CASE("grab engine: a server that refuses SFTP fails the download at once, without logging in again") {
+    Fake fake;
+    fake.files["/data/f.bin"] = test::pattern(8u << 20);
+    fake.delay = 1ms;
+    fake.no_sftp_from = 2; // the size check's login has it; the other ranges' logins don't
+    Dir dir("sftp-refused");
+    auto pool = fake.pool(3);
+    fetch::Connections connections;
+    connections.configure("Fake", 3);
+    const auto r = fetch::run(download(dir.path / "f.bin", pool), connections, {}, {});
+    CHECK(r.outcome == fetch::Outcome::failed);
+    CHECK(r.error == "the server doesn't offer SFTP");
+    CHECK(fake.logins <= 3);
 }
 
 TEST_CASE("grab engine: a file changed on the server since the partial download starts over, and says so") {

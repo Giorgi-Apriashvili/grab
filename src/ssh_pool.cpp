@@ -15,27 +15,50 @@ namespace grab::ssh {
 
 namespace {
 
-// A Connection with its SFTP session started. Members go in reverse: client, channel, login.
+// A Connection whose SFTP session starts when it's first used: a run that only needs commands (a
+// search or a list by find) saves its 3 round trips, ~0.3 s on Main. Members go in reverse:
+// client, channel, login.
 class SshSession : public Session {
 public:
-    explicit SshSession(const Target& target) : connection_(target), channel_(connection_.open_sftp()), client_(*channel_) {
-        try {
-            client_.start();
-        } catch (const sftp::Broken& e) {
-            throw Error(budget::Failure::other, std::string("SFTP didn't start: ") + e.what());
-        }
+    explicit SshSession(const Target& target) : connection_(target) {}
+    sftp::Client& sftp() override {
+        if (!client_) start_sftp();
+        return *client_;
     }
-    sftp::Client& sftp() override { return client_; }
     std::expected<ExecResult, ExecError> exec(std::string_view command, const ExecOptions& options) override {
         return connection_.exec(command, options);
     }
     Connection* connection() override { return &connection_; }
-    bool reusable() override { return !connection_.dropped() && client_.pending() == 0; }
+    bool reusable() override {
+        return !connection_.dropped() && !sftp_failed_ && (!client_ || client_->pending() == 0);
+    }
 
 private:
+    void start_sftp() {
+        auto reset = [this] {
+            client_.reset();
+            channel_.reset();
+            sftp_failed_ = true;
+        };
+        try {
+            channel_ = connection_.open_sftp();
+            client_.emplace(*channel_);
+            client_->start();
+        } catch (const Error& e) {
+            reset();
+            // A server that refuses SFTP refuses it on every connection: no retries.
+            if (e.kind == budget::Failure::fatal) throw sftp::Unavailable(e.what());
+            throw sftp::Broken(e.what());
+        } catch (const sftp::Broken& e) {
+            reset();
+            throw sftp::Broken(std::string("SFTP didn't start: ") + e.what());
+        }
+    }
+
     Connection connection_;
     std::unique_ptr<sftp::Channel> channel_;
-    sftp::Client client_;
+    std::optional<sftp::Client> client_;
+    bool sftp_failed_ = false; // it couldn't start: the session isn't reused
 };
 
 } // namespace

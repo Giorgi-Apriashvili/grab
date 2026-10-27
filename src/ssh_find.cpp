@@ -46,6 +46,14 @@ std::optional<FindCheck> probe(Pool& pool, const std::stop_token& stop, Retry re
             out += piece;
             return true;
         };
+        // SFTP started first, so the check sees what a pooled connection sees: a server allowing one
+        // channel per login (MaxSessions 1) refuses the command on one whose SFTP runs, every time,
+        // and walks, whatever order the connections were used in. A server without SFTP may still
+        // run find; that connection isn't reused.
+        try {
+            [[maybe_unused]] const sftp::Client& started = (*lease)->sftp();
+        } catch (const sftp::Broken&) {
+        }
         std::expected<ExecResult, ExecError> ran;
         try {
             ran = (*lease)->exec(find_probe, o);

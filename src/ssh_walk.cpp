@@ -207,24 +207,33 @@ void Walker::work() {
             }
             if (!lease) return; // stopped
         }
-        std::vector<Folder> taken;
-        {
-            std::scoped_lock lock(m_);
-            // Its share of what waits, so that the other connections get some too.
-            const auto workers = static_cast<std::size_t>(workers_);
-            const std::size_t share = std::max<std::size_t>(1, (pending_.size() + workers - 1) / workers);
-            for (std::size_t n = std::min(in_flight_ - here.size(), share); n > 0 && !pending_.empty(); --n) {
-                taken.push_back(std::move(pending_.front()));
-                pending_.pop_front();
-                ++reading_;
-            }
-        }
-        sftp::Client& c = (*lease)->sftp();
-        for (auto& f : taken) start(c, here, std::move(f));
-        if (here.empty()) continue; // another worker took them meanwhile
         try {
+            // SFTP first (it starts on a connection's first use), then the folders: one that can't
+            // start it has taken none.
+            sftp::Client& c = (*lease)->sftp();
+            std::vector<Folder> taken;
+            {
+                std::scoped_lock lock(m_);
+                // Its share of what waits, so that the other connections get some too.
+                const auto workers = static_cast<std::size_t>(workers_);
+                const std::size_t share = std::max<std::size_t>(1, (pending_.size() + workers - 1) / workers);
+                for (std::size_t n = std::min(in_flight_ - here.size(), share); n > 0 && !pending_.empty(); --n) {
+                    taken.push_back(std::move(pending_.front()));
+                    pending_.pop_front();
+                    ++reading_;
+                }
+            }
+            for (auto& f : taken) start(c, here, std::move(f));
+            if (here.empty()) continue; // another worker took them meanwhile
             c.pump();
             broken_in_a_row = 0;
+        } catch (const sftp::Unavailable& e) { // the server has no SFTP: the walk can't go on
+            lease.reset();
+            std::scoped_lock lock(m_);
+            last_failure_ = e.what();
+            if (!error_) error_ = e.what();
+            changed_.notify_all();
+            return;
         } catch (const sftp::Broken& e) {
             lease->broken();
             lease.reset();

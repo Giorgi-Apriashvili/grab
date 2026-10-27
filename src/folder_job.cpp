@@ -524,7 +524,16 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_t
                 std::lock_guard lock(m);
                 tree.connections = job.connections->active(job.server, job.id);
             }
-            const SmallRun run = small_on(job, tree, m, (*lease)->sftp(), dir, stop);
+            SmallRun run;
+            try {
+                run = small_on(job, tree, m, (*lease)->sftp(), dir, stop);
+            } catch (const sftp::Unavailable& e) { // the server has no SFTP: no use trying again
+                lease.reset();
+                job.connections->release(job.server, job.id);
+                return fail_queued(e.what());
+            } catch (const sftp::Broken& e) {
+                run.broken = e.what(); // SFTP didn't start on it
+            }
             if (stop.stop_requested() || run.broken) lease->broken(); // replies still on their way
             lease.reset();
             if (!run.yielded) job.connections->release(job.server, job.id, 1, run.worked);

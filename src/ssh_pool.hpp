@@ -48,6 +48,9 @@ inline constexpr std::array<std::chrono::milliseconds, 4> interactive_retry{
 class Session {
 public:
     virtual ~Session() = default;
+    // Its SFTP session, started on the first call (open_session). Throws sftp::Broken when it can't
+    // start, as when the link breaks later: a borrower drops the lease and, if it was reused, may
+    // try another.
     [[nodiscard]] virtual sftp::Client& sftp() = 0;
     // Runs a command (find, md5sum) on this login: Connection::exec, or canned output in tests.
     // Where there is none, the server refuses it.
@@ -56,11 +59,13 @@ public:
     // The login itself; nullptr where there is none (tests).
     [[nodiscard]] virtual Connection* connection() { return nullptr; }
     // Whether the next borrower may have it: no SFTP reply still on its way, which would reach
-    // a request the next one never made, and no command cut short on it (Connection::dropped).
+    // a request the next one never made, no command cut short on it (Connection::dropped), and
+    // no SFTP that failed to start.
     [[nodiscard]] virtual bool reusable() { return true; }
 };
 
-// Logs in to `target` and starts SFTP. Throws Error.
+// Logs in to `target`; SFTP starts when the session's sftp() is first called, so a login used only
+// for commands (find) never pays for it. Throws Error.
 [[nodiscard]] std::unique_ptr<Session> open_session(const Target& target);
 
 // What a server answered grab's find check (ssh_find.hpp): whether its GNU find works as grab

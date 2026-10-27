@@ -47,10 +47,14 @@ struct Shell {
     std::vector<std::string> commands;
     std::vector<std::string> log; // every command's channel log, one after another
     std::atomic<int> logins{0};
+    std::atomic<int> sftp_starts{0}; // tries to start SFTP, which this server doesn't have
 
     struct Session : ssh::Session {
         explicit Session(Shell& s) : shell(s) {}
-        sftp::Client& sftp() override { throw std::logic_error("no SFTP in this test"); }
+        sftp::Client& sftp() override {
+            ++shell.sftp_starts;
+            throw sftp::Broken("no SFTP in this test");
+        }
         std::expected<ssh::ExecResult, ssh::ExecError> exec(std::string_view command,
                                                              const ssh::ExecOptions& options) override {
             test::FakeCommand c;
@@ -183,6 +187,8 @@ TEST_CASE("ssh find: the check runs once per pool, and a stopped one is asked ag
     CHECK(s.commands == std::vector<std::string>{std::string(ssh::find_probe)});
     CHECK(s.log == std::vector<std::string>{"start", "eof", "close"});
     CHECK(pool->idle() == 1); // kept for the search that follows
+    // SFTP tried first, as a pooled connection has it running (MaxSessions 1 then refuses find).
+    CHECK(s.sftp_starts == 1);
 
     // Stopped before it ran, then while it ran (a server that never answers): not kept.
     Shell slow;
@@ -452,6 +458,23 @@ TEST_CASE("ssh find: records parsed as they stream, paths in grab's form under t
     CHECK(pool->idle() == 1);
     // Back to the server's bytes: what downloads hand the server.
     CHECK(rclone_enc::raw_path(found->entries[1].path) == "downloads/tv/caf\xE9.mkv");
+}
+
+TEST_CASE("ssh find: a name with a tab or a line break comes whole, in grab's form") {
+    Shell s;
+    // The path is the record's last field: a tab in it is part of the name, and records end at NUL,
+    // not at a line break.
+    s.answer = [](test::FakeCommand& c, std::string_view) {
+        c.out = {"f\t1\t1700000000\t./a\tb.txt\0d\t1700000000\t./nl\nname\0f\t22\t1700000000\t./nl\nname/x\t1\t2\0"s};
+    };
+    auto pool = s.pool();
+    ssh::FindSpec spec;
+    spec.roots = {""};
+    auto found = ssh::run_find(*pool, spec, {});
+    REQUIRE_MESSAGE(found, why(found));
+    CHECK(paths_of(found->entries) == std::vector<std::string>{"a␉b.txt", "nl␊name", "nl␊name/x␉1␉2"});
+    CHECK(found->entries[2].size == 22);
+    CHECK(rclone_enc::raw_path(found->entries[2].path) == "nl\nname/x\t1\t2");
 }
 
 TEST_CASE("ssh find: output that isn't find's records fails it, as being about find") {

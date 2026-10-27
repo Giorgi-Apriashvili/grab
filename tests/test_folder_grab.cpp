@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -45,9 +46,11 @@ struct Tree {
     std::atomic<int> logins{0};
     std::atomic<int> break_first_after{0}; // the next login's stream breaks on that read
     std::size_t readdir_batch = 3;          // names per READDIR answer
+    std::atomic<int> sftp_fails{0};         // the next this many logins can't start SFTP
+    std::atomic<bool> no_sftp_server{false}; // the server refuses SFTP on every login
 
     struct Session : ssh::Session {
-        explicit Session(Tree& t) : tree(t), client(server) {
+        explicit Session(Tree& t) : tree(t), no_sftp(t.sftp_fails-- > 0), client(server) {
             server.shared_files = &t.files;
             server.dirs = t.dirs;
             server.links = t.links;
@@ -64,9 +67,18 @@ struct Tree {
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;
-        sftp::Client& sftp() override { return client; }
-        bool reusable() override { return client.pending() == 0; }
+        // As the real session's SFTP, started on first use, fails to start on a broken link.
+        sftp::Client& sftp() override {
+            if (tree.no_sftp_server) {
+                no_sftp = true;
+                throw sftp::Unavailable("the server doesn't offer SFTP");
+            }
+            if (no_sftp) throw sftp::Broken("SFTP didn't start: the server closed the SFTP channel");
+            return client;
+        }
+        bool reusable() override { return !no_sftp && client.pending() == 0; }
         Tree& tree;
+        bool no_sftp;
         test::FakeServer server;
         sftp::Client client;
     };
@@ -454,6 +466,71 @@ TEST_CASE("ssh walk: a connection that breaks mid-walk loses nothing: its folder
     CHECK(w->entries.size() == 30);
     CHECK(w->unreadable.empty());
     CHECK(t.logins >= 2);
+}
+
+TEST_CASE("ssh walk: a connection whose SFTP doesn't start takes no folders; the others read them") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 30; ++i) {
+        t.dir(std::format("/data/d{:02}", i));
+        t.file(std::format("/data/d{:02}/f.txt", i), "x");
+    }
+    t.sftp_fails = 1;
+    auto pool = t.pool(2);
+    auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 2}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(w->entries.size() == 30);
+    CHECK(w->unreadable.empty());
+    CHECK(t.logins >= 2);
+}
+
+TEST_CASE("grab engine folders: a connection whose SFTP doesn't start is dropped; the small files come on others") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 12; ++i) t.file(std::format("/data/s{:02}.txt", i), test::pattern(1000 + i));
+    Run r(t.pool(4), "no-sftp");
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    // New logins for the files, the first two of which can't start SFTP.
+    t.sftp_fails = 2;
+    r.job.pool = t.pool(4);
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) {
+        CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+        CHECK_MESSAGE(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path), f.path);
+    }
+    CHECK(t.sftp_fails <= 0); // both were tried
+}
+
+TEST_CASE("ssh walk: a server without SFTP ends the walk at once, one login per connection") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 30; ++i) t.dir(std::format("/data/d{:02}", i));
+    t.no_sftp_server = true;
+    auto pool = t.pool(4);
+    auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 4}, {});
+    REQUIRE_FALSE(w);
+    CHECK(w.error().find("doesn't offer SFTP") != std::string::npos);
+    CHECK(t.logins <= 4);
+}
+
+TEST_CASE("grab engine folders: a server without SFTP fails the small files at once, one login per worker") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 12; ++i) t.file(std::format("/data/s{:02}.txt", i), test::pattern(1000 + i));
+    Run r(t.pool(4), "no-sftp-server");
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    // As if the list came by find: the files' logins are the first to try SFTP.
+    t.no_sftp_server = true;
+    t.logins = 0;
+    r.job.pool = t.pool(4);
+    const auto started = std::chrono::steady_clock::now();
+    folder::run(r.job, r.tree, r.m, {});
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2)); // no 2 s retry pauses
+    for (const auto& f : r.tree.files) {
+        CHECK_MESSAGE(f.status == folder::State::failed, f.path);
+        CHECK_MESSAGE(f.error.find("doesn't offer SFTP") != std::string::npos, f.path, ": ", f.error);
+    }
+    CHECK(t.logins <= 4);
 }
 
 TEST_CASE("ssh walk: no entry without a name to save it under (G15); odd names in grab's form") {

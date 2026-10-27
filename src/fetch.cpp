@@ -944,8 +944,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
             return;
         }
         if (!lease) return; // stopped
-        sftp::Client& c = (*lease)->sftp();
         try {
+            sftp::Client& c = (*lease)->sftp();
             auto handle = sftp::open_file(c, rclone_enc::raw_path(src.path));
             if (!handle) {
                 const auto code = handle.error().code;
@@ -1045,6 +1045,9 @@ Result run(const Download& d, Connections& connections, const std::function<void
             }
             // A handle that won't close leaves nothing behind that matters here.
             [[maybe_unused]] auto closed = sftp::close_file(c, *handle);
+        } catch (const sftp::Unavailable& e) { // the server has no SFTP: no use trying again
+            a.failure = budget::Failure::fatal;
+            a.error = e.what();
         } catch (const sftp::Broken& e) {
             lease->broken();
             if (!a.write_failed) {

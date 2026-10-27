@@ -758,9 +758,11 @@ std::unique_ptr<sftp::Channel> Connection::open_sftp() {
     LIBSSH2_CHANNEL* ch =
         libssh2_channel_open_ex(session_, "session", 7, window_size, LIBSSH2_CHANNEL_PACKET_DEFAULT, nullptr, 0);
     if (!ch) fail(budget::Failure::other, "can't open a channel");
-    if (libssh2_channel_process_startup(ch, "subsystem", 9, "sftp", 4) != 0) {
+    if (const int rc = libssh2_channel_process_startup(ch, "subsystem", 9, "sftp", 4); rc != 0) {
         libssh2_channel_free(ch);
-        fail(budget::Failure::fatal, "the server doesn't offer SFTP");
+        // Refused is the server's answer; anything else is trouble on the link.
+        if (rc == LIBSSH2_ERROR_CHANNEL_REQUEST_DENIED) fail(budget::Failure::fatal, "the server doesn't offer SFTP");
+        fail(budget::Failure::other, "SFTP didn't start");
     }
     return std::make_unique<ChannelStream>(session_, ch);
 }

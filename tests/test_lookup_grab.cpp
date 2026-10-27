@@ -53,6 +53,10 @@ struct Server {
     std::set<std::string> denied;
     std::function<void(test::FakeCommand&, std::string_view command)> answer = [](test::FakeCommand&, std::string_view) {};
     bool never_eof = false; // READDIR past the last name gets empty NAMEs, not EOF
+    // SFTP starts on a session's first use, as grab's own sessions start it: on a connection the
+    // server closed, that start fails.
+    bool lazy_sftp = false;
+    bool one_channel = false; // MaxSessions 1: a command's channel is refused on a login whose SFTP runs
     std::mutex mutex;
     std::vector<std::string> commands;
     std::atomic<int> logins{0};
@@ -68,6 +72,9 @@ struct Server {
             client.start();
         }
         sftp::Client& sftp() override {
+            if (server.lazy_sftp && !started && login <= server.dropped)
+                throw sftp::Broken("SFTP didn't start: can't open a channel: the server closed the connection");
+            started = true;
             fake.dropped = login <= server.dropped;
             return client;
         }
@@ -76,6 +83,7 @@ struct Server {
             if (login <= server.dropped) throw ssh::Error(budget::Failure::other, "the server closed the connection");
             test::FakeCommand c;
             server.answer(c, command);
+            if (server.one_channel && started) c.refuse_channel = "the server refused the channel";
             auto r = ssh::run_command(c, command, options);
             std::scoped_lock lock(server.mutex);
             server.commands.emplace_back(command);
@@ -84,6 +92,7 @@ struct Server {
         bool reusable() override { return client.pending() == 0; }
         Server& server;
         int login;
+        bool started = false; // its SFTP was used
         test::FakeServer fake;
         sftp::Client client;
     };
@@ -560,6 +569,72 @@ TEST_CASE("grab engine: a reused connection the server closed while idle is drop
     auto failed = browse::list_live(ctx, "/data", {}, {}, side);
     REQUIRE_FALSE(failed);
     CHECK(failed.error().message == "fake server: the server closed the connection");
+}
+
+TEST_CASE("grab engine: a find's connection, its SFTP never started, closed while idle: the next one is tried") {
+    Server s;
+    fill(s);
+    s.lazy_sftp = true;
+    s.with_find({"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s});
+    const auto ctx = grab_context();
+    engine::GrabSide side;
+    engine::SearchRequest req;
+    req.grab = side;
+    // A search by find: the check and find on one login, which runs commands only.
+    auto find_once = [&] {
+        req.grab.pool = side.pool = s.pool(2);
+        req.target = "lioness";
+        auto hits = engine::search(ctx, req);
+        REQUIRE_MESSAGE(hits, hits.error_or(""));
+        CHECK(paths_of(hits->hits) == std::vector<std::string>{"/data/tv/lioness-notes.txt"});
+    };
+    find_once();
+    CHECK(s.logins == 1);
+
+    // Browse: its SFTP can't start on the closed one; a new login reads the folder.
+    s.dropped = 1;
+    auto items = browse::list_live(ctx, "/data/tv", {}, {}, side);
+    REQUIRE_MESSAGE(items, (items ? "" : items.error().message));
+    CHECK(items->size() == 2);
+    CHECK(s.logins == 2);
+
+    // A path target's STAT, the same way.
+    find_once();
+    CHECK(s.logins == 3);
+    s.dropped = 3;
+    req.target = "/data/tv/lioness-notes.txt";
+    auto hits = engine::search(ctx, req);
+    REQUIRE_MESSAGE(hits, hits.error_or(""));
+    CHECK(paths_of(hits->hits) == std::vector<std::string>{"/data/tv/lioness-notes.txt"});
+    CHECK(s.logins == 4);
+
+    // A new login whose SFTP can't start is the error: no second try.
+    s.dropped = 100;
+    req.grab.pool = side.pool = s.pool(2);
+    auto failed = browse::list_live(ctx, "/data", {}, {}, side);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error().message == "SFTP didn't start: can't open a channel: the server closed the connection");
+}
+
+TEST_CASE("grab engine: a server allowing one channel per login walks, even when the check gets a fresh login") {
+    // The check starts SFTP first, as a pooled connection has it running: the command's channel
+    // is refused every time, not only after Browse or a walk used the connection.
+    Server s;
+    fill(s);
+    s.one_channel = true;
+    s.with_find({"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s});
+    const auto ctx = grab_context();
+    engine::SearchRequest req;
+    req.grab.pool = s.pool(2);
+    std::vector<ssh::Lookup> ways;
+    req.grab.on_lookup = [&](const ssh::Lookup& way) { ways.push_back(way); };
+    req.target = "lioness";
+    auto hits = engine::search(ctx, req);
+    REQUIRE_MESSAGE(hits, hits.error_or(""));
+    CHECK_FALSE(hits->hits.empty());
+    REQUIRE_FALSE(ways.empty());
+    CHECK_FALSE(ways.back().find);
+    CHECK(s.ran() == std::vector<std::string>{std::string(ssh::find_probe)}); // no find ran
 }
 
 namespace {

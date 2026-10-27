@@ -36,6 +36,10 @@ public:
 struct Broken : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+// The server refused to start SFTP at all (no sftp subsystem): another connection can't help.
+struct Unavailable : Broken {
+    using Broken::Broken;
+};
 
 // SSH_FX_* status codes (version 3 defines 0-8; servers may send more).
 enum class Code : std::uint32_t {
