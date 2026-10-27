@@ -13,6 +13,7 @@
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "local_name.hpp"
+#include "progress_line.hpp"
 #include "rclone_encoding.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
@@ -459,4 +460,49 @@ TEST_CASE("verify: what the row and the command say") {
     CHECK(verify::summary(none, true) == "not verified: the server can't compute checksums (shell_type = cmd in rclone.conf)");
     none.files.resize(1);
     CHECK(verify::summary(none) == "not verified: the server can't compute checksums (shell_type = cmd in rclone.conf)");
+}
+
+TEST_CASE("verify: a folder whose files failed still says what was verified: the row after the failure, the command before") {
+    Check c("failed-folder");
+    folder::Job job;
+    job.ctx = &c.ctx;
+    job.connections = &c.connections;
+    job.server = "Fake";
+    job.id = 4;
+    job.remote_path = "/data";
+    job.dest = c.dir / "dest";
+    folder::Tree tree;
+    std::mutex m;
+    const fs::path dir = folder::job_dir(job);
+    for (const std::string name : {"a.mkv", "b.mkv"}) {
+        c.box.files["/data/" + name] = name;
+        auto f = folder::make_file(name, name.size(), std::string(server_time));
+        f.status = folder::State::done;
+        f.fetched = true;
+        REQUIRE(util::place_file(folder::target_of(dir, f), name, server_ns));
+        tree.files.push_back(std::move(f));
+    }
+    // One the download couldn't fetch (rclone's engine and a name that isn't UTF-8, a lost link).
+    tree.files.push_back(folder::make_file("c.mkv", 5, std::string(server_time)));
+    tree.files.back().status = folder::State::failed;
+    tree.files.back().error = "connection lost";
+
+    verify::Request base;
+    base.pool = c.pool;
+    const auto checked = folder::verify_files(job, tree, m, std::move(base), {});
+    REQUIRE(checked.files == 2);
+    const auto o = folder::outcome(tree);
+    REQUIRE(o.failed == 1);
+    // The window: a failed row shows only its error, so what was verified goes after it.
+    CHECK(folder::failed_text(o) == "1 file failed. c.mkv: connection lost");
+    CHECK(folder::failed_text(o, checked.summary()) == "1 file failed. c.mkv: connection lost · 2 files verified (MD5)");
+    // The command: the summary first, as a finished line, then the failure.
+    CHECK(progress::folder_failed(folder::failed_text(o), checked.summary() + " in 0:01") ==
+          "  2 files verified (MD5) in 0:01\n"
+          "grab: error: 1 file failed. c.mkv: connection lost\n"
+          "grab: the other files are on disk; run the same command again to retry\n");
+    // Nothing verified (Verify downloads off, or a stop): the failure alone, as before.
+    CHECK(progress::folder_failed("2 files failed. c.mkv: connection lost", "") ==
+          "grab: error: 2 files failed. c.mkv: connection lost\n"
+          "grab: the other files are on disk; run the same command again to retry\n");
 }

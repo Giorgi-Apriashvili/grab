@@ -629,9 +629,10 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
         return proc::exit_stopped;
     }
     if (o.failed > 0) {
+        // What verification found of the files that came, then the failure.
         s.line.clear();
-        std::println(stderr, "grab: error: {} file{} failed. {}", o.failed, o.failed == 1 ? "" : "s", o.first_error);
-        std::println(stderr, "grab: the other files are on disk; run the same command again to retry");
+        std::print(stderr, "{}", progress::folder_failed(folder::failed_text(o), checked_text));
+        std::fflush(stderr);
         return exit_download_failed;
     }
     if (already == t.files && t.files > 0) {

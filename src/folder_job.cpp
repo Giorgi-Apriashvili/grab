@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -834,6 +835,12 @@ Outcome outcome(const Tree& tree) {
         }
     }
     return o;
+}
+
+std::string failed_text(const Outcome& o, std::string_view checked) {
+    std::string text = std::format("{} file{} failed. {}", o.failed, o.failed == 1 ? "" : "s", o.first_error);
+    if (!checked.empty()) text += std::format(" · {}", checked);
+    return text;
 }
 
 fs::path target_of(const fs::path& dir, const File& f) {

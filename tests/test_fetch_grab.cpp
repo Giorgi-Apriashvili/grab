@@ -44,9 +44,11 @@ struct Fake {
     bool fatal_login = false;          // every login refused for good (a wrong password)
     std::set<int> sftp_fails;          // the logins (from 1) that can't start SFTP
     int no_sftp_from = 0;              // from this login on, the server refuses SFTP (0: never)
+    std::atomic<int> closed{0};        // logins up to this one the server has closed: their reads break
 
     struct Session : ssh::Session {
-        Session(Fake& f, bool fails, bool refuses) : fake(f), no_sftp(fails), refuses_sftp(refuses), client(server) {
+        Session(Fake& f, int n, bool fails, bool refuses)
+            : fake(f), login(n), no_sftp(fails), refuses_sftp(refuses), client(server) {
             server.shared_files = &f.files;
             server.max_data = f.max_data;
             server.reverse = f.reverse;
@@ -64,10 +66,12 @@ struct Fake {
         sftp::Client& sftp() override {
             if (refuses_sftp) throw sftp::Unavailable("the server doesn't offer SFTP");
             if (no_sftp) throw sftp::Broken("SFTP didn't start: the server closed the SFTP channel");
+            if (login <= fake.closed) server.dropped = true; // found out at the next read
             return client;
         }
         bool reusable() override { return !no_sftp && !refuses_sftp && client.pending() == 0; }
         Fake& fake;
+        int login;
         bool no_sftp;
         bool refuses_sftp;
         test::FakeServer server;
@@ -81,7 +85,7 @@ struct Fake {
             const int login = ++logins;
             if (fatal_login) throw ssh::Error(budget::Failure::fatal, "Fake refused the login: it refused the password");
             if (refuse_logins-- > 0) throw ssh::Error(budget::Failure::refused, "SSH handshake with Fake failed");
-            return std::make_unique<Session>(*this, sftp_fails.contains(login),
+            return std::make_unique<Session>(*this, login, sftp_fails.contains(login),
                                              no_sftp_from > 0 && login >= no_sftp_from);
         }, o);
     }
@@ -259,6 +263,54 @@ TEST_CASE("grab engine: a server that refuses SFTP fails the download at once, w
     CHECK(r.outcome == fetch::Outcome::failed);
     CHECK(r.error == "the server doesn't offer SFTP");
     CHECK(fake.logins <= 3);
+}
+
+TEST_CASE("grab engine: the size check on a reused connection the server closed while idle tries the next one, once") {
+    Fake fake;
+    fake.files["/data/f.bin"] = "first";
+    const std::string content = test::pattern(3u << 10);
+    fake.files["/data/g.bin"] = content;
+    Dir dir("closed-idle");
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+
+    SUBCASE("one connection: the size check's new login fetches the file") {
+        auto pool = fake.pool(1);
+        connections.configure("Fake", 1);
+        REQUIRE(fetch::run(download(dir.path / "f.bin", pool), connections, {}, {}).outcome == fetch::Outcome::done);
+        REQUIRE(fake.logins == 1);
+        REQUIRE(pool->idle() == 1);
+        fake.closed = 1;
+        const auto r = fetch::run(download(dir.path / "g.bin", pool, "/data/g.bin"), connections, {}, {});
+        REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+        CHECK(util::read_file(dir.path / "g.bin") == content);
+        CHECK(fake.logins == 2);
+    }
+    SUBCASE("two closed while idle: the second is the answer, no third try") {
+        auto pool = fake.pool(2);
+        {
+            auto a = pool->acquire();
+            auto b = pool->acquire();
+            REQUIRE(a);
+            REQUIRE(b);
+        }
+        REQUIRE(fake.logins == 2);
+        REQUIRE(pool->idle() == 2);
+        fake.closed = 2;
+        const auto r = fetch::run(download(dir.path / "g.bin", pool, "/data/g.bin"), connections, {}, {});
+        CHECK(r.outcome == fetch::Outcome::failed);
+        CHECK(r.error == "fake server: the server closed the connection");
+        CHECK(fake.logins == 2);
+        CHECK(pool->idle() == 0); // neither went back
+    }
+    SUBCASE("a new login that breaks is the answer") {
+        auto pool = fake.pool(2);
+        fake.closed = 100;
+        const auto r = fetch::run(download(dir.path / "g.bin", pool, "/data/g.bin"), connections, {}, {});
+        CHECK(r.outcome == fetch::Outcome::failed);
+        CHECK(r.error == "fake server: the server closed the connection");
+        CHECK(fake.logins == 1);
+    }
 }
 
 TEST_CASE("grab engine: a file changed on the server since the partial download starts over, and says so") {

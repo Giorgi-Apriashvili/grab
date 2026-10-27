@@ -20,6 +20,7 @@
 #include <map>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
@@ -622,28 +623,38 @@ std::string utc_rfc3339(std::uint32_t seconds) {
     return std::format("{:%FT%TZ}", std::chrono::sys_seconds{std::chrono::seconds{seconds}});
 }
 
+// The server's file by one SFTP STAT. A STAT is safe to repeat: a reused connection the server
+// closed while it sat idle is dropped and the next one tried, once; a new login's failure, or a
+// server that refuses SFTP, is the answer.
 Look look_sftp(const Download& d, const std::stop_token& stop) {
     if (d.on_command) d.on_command({"sftp", "stat", d.source.path});
     Look look;
-    std::optional<ssh::Pool::Lease> lease;
-    try {
-        lease = d.pool->acquire(stop);
-        if (!lease) return look; // stopped
-        auto a = sftp::stat((*lease)->sftp(), rclone_enc::raw_path(d.source.path));
-        if (!a) {
-            look.failure = budget::Failure::fatal;
-            look.error = sftp::describe(a.error());
-            return look;
+    for (bool retried = false;;) {
+        std::optional<ssh::Pool::Lease> lease;
+        try {
+            lease = d.pool->acquire(stop);
+            if (!lease) return look; // stopped
+            auto a = sftp::stat((*lease)->sftp(), rclone_enc::raw_path(d.source.path));
+            if (!a) {
+                look.failure = budget::Failure::fatal;
+                look.error = sftp::describe(a.error());
+                return look;
+            }
+            look.stat = RemoteStat{a->size.value_or(0), a->mtime ? utc_rfc3339(*a->mtime) : std::string(), a->is_dir()};
+        } catch (const ssh::Error& e) {
+            look.failure = e.kind;
+            look.error = e.what();
+        } catch (const sftp::Unavailable& e) {
+            // The server refuses SFTP: the same on every login.
+            if (lease) lease->broken();
+            look.error = e.what();
+        } catch (const sftp::Broken& e) {
+            if (lease) lease->broken();
+            if (lease && lease->reused() && !std::exchange(retried, true) && !stop.stop_requested()) continue;
+            look.error = e.what();
         }
-        look.stat = RemoteStat{a->size.value_or(0), a->mtime ? utc_rfc3339(*a->mtime) : std::string(), a->is_dir()};
-    } catch (const ssh::Error& e) {
-        look.failure = e.kind;
-        look.error = e.what();
-    } catch (const sftp::Broken& e) {
-        if (lease) lease->broken();
-        look.error = e.what();
+        return look;
     }
-    return look;
 }
 
 // The download's place in its server's pool, from the size check on, left on every way out.

@@ -32,6 +32,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace grab::folder {
@@ -129,6 +130,10 @@ struct Outcome {
     std::string first_error; // "<path>: <error>"
 };
 [[nodiscard]] Outcome outcome(const Tree& tree);
+// A folder whose files failed, as its row and the command say it: "2 files failed. <first
+// error>", then what verification found of the files that came (`checked`, Checked::summary;
+// empty when none ran), since a failed row shows only this.
+[[nodiscard]] std::string failed_text(const Outcome& o, std::string_view checked = {});
 
 // Where a file of the folder goes (dir: the folder's local directory): its server name made
 // safe, or its Keep-both name.

@@ -2989,7 +2989,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             item->status = cancelled ? Status::cancelled : Status::paused;
         } else if (const auto o = folder::outcome(item->tree); o.failed > 0) {
             item->status = Status::failed;
-            item->error = std::format("{} file{} failed. {}", o.failed, o.failed == 1 ? "" : "s", o.first_error);
+            item->error = folder::failed_text(o, checked_note); // a failed row shows only this
         } else {
             // Files paused one by one keep the folder paused until they are resumed or skipped.
             item->status = o.waiting > 0 ? Status::paused : Status::done;

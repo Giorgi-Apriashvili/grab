@@ -38,6 +38,14 @@ struct Status {
 [[nodiscard]] std::string done(std::uint64_t total, std::uint64_t fetched, double seconds,
                                std::optional<std::size_t> files = std::nullopt);
 
+// The end of a folder download in which files failed, each line ending in '\n': what verification
+// found of the files that came first, as a finished line (`checked`; none when it didn't run), then
+// `failed` (folder::failed_text) and what to do.
+// "  13 files verified (MD5) in 0:02"
+// "grab: error: 2 files failed. a.bin: connection lost"
+// "grab: the other files are on disk; run the same command again to retry"
+[[nodiscard]] std::string folder_failed(std::string_view failed, std::string_view checked);
+
 // `text` cut to `width` columns (UTF-8 aware, one column per code point), ending in "…" when
 // cut; for redrawing in place, a line must not wrap.
 [[nodiscard]] std::string fit(std::string_view text, std::size_t width);

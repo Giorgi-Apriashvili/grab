@@ -49,6 +49,14 @@ std::string done(std::uint64_t total, std::uint64_t fetched, double seconds, std
     return out;
 }
 
+std::string folder_failed(std::string_view failed, std::string_view checked) {
+    std::string out;
+    if (!checked.empty()) out = std::format("  {}\n", checked);
+    out += std::format("grab: error: {}\n", failed);
+    out += "grab: the other files are on disk; run the same command again to retry\n";
+    return out;
+}
+
 std::string fit(std::string_view text, std::size_t width) {
     if (width == 0) return {};
     // Count code points: continuation bytes (10xxxxxx) don't start a column.
