@@ -2,7 +2,13 @@
 
 #include "util.hpp"
 
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
+#include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstring>
 #include <format>
 #include <set>
 
@@ -36,65 +42,80 @@ RcloneRemote to_remote(const NewServer& s, const std::filesystem::path& known_ho
 
 // ---- host keys -------------------------------------------------------------------------------
 
-std::vector<std::string> keyscan_argv(const std::string& host, int port) {
-    return {"ssh-keyscan", "-T", "10", "-p", std::to_string(port), host};
+std::string key_label(std::string_view type) {
+    if (type == "ssh-ed25519") return "ED25519";
+    if (type.starts_with("ecdsa-")) return "ECDSA";
+    if (type == "ssh-rsa") return "RSA";
+    return std::string(type);
 }
 
-std::vector<std::string> handshake_argv(const std::string& ssh, const std::string& host, int port,
-                                        const std::filesystem::path& record_to,
-                                        const std::string& host_key_algorithm) {
-#ifdef _WIN32
-    const char* no_file = "NUL";
-#else
-    const char* no_file = "/dev/null";
-#endif
-    std::vector<std::string> argv{ssh,
-                                  "-T",
-                                  "-o", "BatchMode=yes",
-                                  "-o", "StrictHostKeyChecking=accept-new",
-                                  "-o", "UserKnownHostsFile=" + util::path_to_utf8(record_to),
-                                  "-o", std::string("GlobalKnownHostsFile=") + no_file,
-                                  "-o", "PreferredAuthentications=none",
-                                  "-o", "ConnectTimeout=10"};
-    if (!host_key_algorithm.empty()) argv.insert(argv.end(), {"-o", "HostKeyAlgorithms=" + host_key_algorithm});
-    argv.insert(argv.end(), {"-p", std::to_string(port), "grab-hostkey@" + host, "exit"});
-    return argv;
-}
-
-const std::vector<std::string>& handshake_key_algorithms() {
-    static const std::vector<std::string> algorithms{
-        "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "rsa-sha2-512"};
-    return algorithms;
-}
-
-std::vector<std::string> parse_keyscan(std::string_view out) {
-    std::vector<std::string> lines;
-    std::size_t start = 0;
-    while (start < out.size()) {
-        auto end = out.find('\n', start);
-        if (end == std::string_view::npos) end = out.size();
-        const auto line = util::trim(out.substr(start, end - start));
-        start = end + 1;
-        if (!line.empty() && !line.starts_with('#')) lines.emplace_back(line);
+bool names_host(std::string_view name, std::string_view host, int port) {
+    // Plain names as written: libssh2, rclone and pinned_algorithms all compare them exactly, so a
+    // line for "BOX.example" is another host's pin than one for "box.example".
+    const std::string bracketed = std::format("[{}]:{}", host, port);
+    if (!name.starts_with("|1|")) return name == bracketed || (port == 22 && name == host);
+    // "|1|salt|hash": HMAC-SHA1 of the name under the salt, both in base64 (OpenSSH's
+    // HashKnownHosts). OpenSSH hashes the name lower-cased; as written is tried too.
+    name.remove_prefix(3);
+    const auto bar = name.find('|');
+    if (bar == std::string_view::npos) return false;
+    const auto salt = util::base64_decode(name.substr(0, bar));
+    const auto hash = util::base64_decode(name.substr(bar + 1));
+    if (!salt || !hash || hash->size() != 20) return false;
+    std::vector<std::string> candidates{std::format("[{}]:{}", util::to_lower(host), port), bracketed};
+    if (port == 22) candidates.insert(candidates.end(), {util::to_lower(host), std::string(host)});
+    for (const auto& candidate : candidates) {
+        std::array<unsigned char, EVP_MAX_MD_SIZE> mac{};
+        unsigned int len = 0;
+        if (HMAC(EVP_sha1(), salt->data(), static_cast<int>(salt->size()),
+                 reinterpret_cast<const unsigned char*>(candidate.data()), candidate.size(), mac.data(), &len) &&
+            len == hash->size() && std::memcmp(mac.data(), hash->data(), len) == 0) {
+            return true;
+        }
     }
-    return lines;
+    return false;
 }
 
-std::vector<Fingerprint> parse_fingerprints(std::string_view out) {
-    std::vector<Fingerprint> result;
+std::string forget_host(std::string_view text, std::string_view host, int port) {
+    std::string out;
+    out.reserve(text.size());
     std::size_t start = 0;
-    while (start < out.size()) {
-        auto end = out.find('\n', start);
-        if (end == std::string_view::npos) end = out.size();
-        const auto line = util::trim(out.substr(start, end - start));
-        start = end + 1;
-        const auto parts = util::split_args(line);
-        if (parts.size() < 3 || !parts[1].starts_with("SHA256:")) continue;
-        std::string type = parts.back();
-        if (type.size() >= 2 && type.front() == '(' && type.back() == ')') type = type.substr(1, type.size() - 2);
-        result.push_back(Fingerprint{parts[1], type});
+    while (start < text.size()) {
+        auto end = text.find('\n', start);
+        end = end == std::string_view::npos ? text.size() : end + 1;
+        const std::string_view line = text.substr(start, end - start); // with its line break
+        start = end;
+        // The host list: the first field after any indent. Comments and marker lines
+        // (@revoked, @cert-authority) aren't pins and stay.
+        const auto first = line.find_first_not_of(" \t");
+        if (first == std::string_view::npos || line[first] == '#' || line[first] == '@' || line[first] == '\r' ||
+            line[first] == '\n') {
+            out += line;
+            continue;
+        }
+        auto last = line.find_first_of(" \t\r\n", first);
+        if (last == std::string_view::npos) last = line.size();
+        std::vector<std::string_view> kept;
+        bool dropped = false;
+        for (std::size_t b = first; b <= last;) {
+            const std::size_t e = std::min(line.find(',', b), last);
+            const auto name = line.substr(b, e - b);
+            if (names_host(name, host, port)) dropped = true;
+            else if (!name.empty()) kept.push_back(name);
+            b = e + 1;
+        }
+        if (!dropped) {
+            out += line;
+        } else if (!kept.empty()) {
+            out += line.substr(0, first);
+            for (std::size_t i = 0; i < kept.size(); ++i) {
+                if (i > 0) out += ',';
+                out += kept[i];
+            }
+            out += line.substr(last);
+        }
     }
-    return result;
+    return out;
 }
 
 std::string merge_known_hosts(std::string_view existing, const std::vector<std::string>& lines) {

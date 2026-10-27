@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace grab;
@@ -23,42 +24,87 @@ TEST_CASE("server names") {
     CHECK(servers::validate_name(std::string(65, 'a')).has_value());
 }
 
-TEST_CASE("keyscan output and fingerprints") {
-    const std::string scan = "# 203.0.113.10:2222 SSH-2.0-OpenSSH_9.6\n"
-                             "[203.0.113.10]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB6Bsa4\r\n"
-                             "\n"
-                             "[203.0.113.10]:2222 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ\n";
-    const auto lines = servers::parse_keyscan(scan);
-    REQUIRE(lines.size() == 2);
-    CHECK(lines[0] == "[203.0.113.10]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB6Bsa4");
+namespace {
+// Test keys (made for these tests), and OpenSSH's hashed names for them (ssh-keygen -H).
+constexpr std::string_view ed25519_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINXtya8ykvjW/uP06S6LBhpJ4oA2XyaMoBsjOTzK04lA";
+constexpr std::string_view ecdsa_key = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBImRejS9"
+                                       "ErAh1OOdC47ZSRieKYuog30KmbjNe2eU1a83lUtUlQ4zWKV3as/jvRuK0Y3ZoA59R25yQ3xwJpQyNMU=";
+constexpr std::string_view hashed_box_23 = "|1|63e5q7mt43md8U/bjWpnzvn8MwI=|hYRuAw/Is4vG99BeZ3UIYjHhdfY="; // [box.example]:23
+constexpr std::string_view hashed_plain_22 = "|1|w0BT/nrCcP1DHthwczpGUg9UMMI=|v3uHQtErA9kyMH4iIIW+tcsfwUY="; // plain.example
+} // namespace
 
-    const std::string keygen = "256 SHA256:B6xZKyaND/JObPaHUZjijNrOUF32cgF/ECkNT8d4mQQ [203.0.113.10]:2222 (ED25519)\n"
-                               "3072 SHA256:abc+def [203.0.113.10]:2222 (RSA)\n"
-                               "garbage\n";
-    CHECK(servers::parse_fingerprints(keygen) ==
-          std::vector<servers::Fingerprint>{{"SHA256:B6xZKyaND/JObPaHUZjijNrOUF32cgF/ECkNT8d4mQQ", "ED25519"},
-                                            {"SHA256:abc+def", "RSA"}});
-    CHECK(servers::keyscan_argv("h", 23) ==
-          std::vector<std::string>{"ssh-keyscan", "-T", "10", "-p", "23", "h"});
+TEST_CASE("known_hosts: the names that stand for a host and port (G87)") {
+    CHECK(servers::names_host("[box.example]:23", "box.example", 23));
+    // Plain names as written: libssh2 and rclone compare them exactly, so another case is
+    // another host's pin.
+    CHECK_FALSE(servers::names_host("[Box.Example]:23", "box.example", 23));
+    CHECK_FALSE(servers::names_host("[box.example]:23", "BOX.example", 23));
+    CHECK_FALSE(servers::names_host("Plain.Example", "plain.example", 22));
+    CHECK_FALSE(servers::names_host("box.example", "box.example", 23)); // port 22's
+    CHECK_FALSE(servers::names_host("[box.example]:2222", "box.example", 23));
+    CHECK_FALSE(servers::names_host("[box.example.org]:23", "box.example", 23));
+    // Port 22: the plain host, or the bracketed form.
+    CHECK(servers::names_host("plain.example", "plain.example", 22));
+    CHECK(servers::names_host("[plain.example]:22", "plain.example", 22));
+    CHECK_FALSE(servers::names_host("[plain.example]:23", "plain.example", 22));
+    // Patterns stand for many hosts: never this one's alone.
+    CHECK_FALSE(servers::names_host("*.example", "box.example", 22));
+    CHECK_FALSE(servers::names_host("!box.example", "box.example", 22));
+    // Hashed names, by their HMAC.
+    CHECK(servers::names_host(hashed_box_23, "box.example", 23));
+    CHECK(servers::names_host(hashed_box_23, "Box.Example", 23));
+    CHECK_FALSE(servers::names_host(hashed_box_23, "box.example", 22));
+    CHECK_FALSE(servers::names_host(hashed_box_23, "other.example", 23));
+    CHECK(servers::names_host(hashed_plain_22, "plain.example", 22));
+    CHECK_FALSE(servers::names_host("|1|not base64!|x", "box.example", 23));
+    CHECK_FALSE(servers::names_host("|1|63e5q7mt43md8U/bjWpnzvn8MwI=", "box.example", 23));
 }
 
-TEST_CASE("handshake fallback: records the key, offers no login, one key type at a time") {
-    const auto argv = servers::handshake_argv("ssh", "box.example.com", 23, util::path_from_utf8("C:\\t\\k.txt"),
-                                              "rsa-sha2-512");
-    auto has = [&](std::string_view s) { return std::ranges::find(argv, s) != argv.end(); };
-    CHECK(has("StrictHostKeyChecking=accept-new"));
-    CHECK(has("PreferredAuthentications=none")); // nothing secret is ever sent
-    CHECK(has("BatchMode=yes"));
-    CHECK(has("UserKnownHostsFile=C:\\t\\k.txt"));
-    CHECK(has("HostKeyAlgorithms=rsa-sha2-512"));
-    CHECK(argv[argv.size() - 2] == "grab-hostkey@box.example.com");
-    const auto any = servers::handshake_argv("ssh", "h", 22, util::path_from_utf8("C:\\t\\k.txt"));
-    CHECK(std::ranges::none_of(any, [](const std::string& a) { return a.starts_with("HostKeyAlgorithms="); }));
-    // ED25519, ECDSA and RSA are all covered: rclone may use any of them.
-    const auto& algs = servers::handshake_key_algorithms();
-    CHECK(std::ranges::find(algs, "ssh-ed25519") != algs.end());
-    CHECK(std::ranges::find(algs, "ecdsa-sha2-nistp521") != algs.end());
-    CHECK(std::ranges::find(algs, "rsa-sha2-512") != algs.end());
+TEST_CASE("known_hosts: forgetting a host and port takes out its pins and nothing else (G87)") {
+    const std::string ed25519(ed25519_key);
+    const std::string ecdsa(ecdsa_key);
+    const std::string text = "# grab's pins\n"
+                             "[box.example]:23 " + ed25519 + "\n" +
+                             "[box.example]:23 " + ecdsa + " a comment\r\n" +
+                             "other.example,[box.example]:23,10.0.0.5 " + ed25519 + "\n" +
+                             "  [BOX.example]:23\t" + ed25519 + "\n" +
+                             "box.example " + ed25519 + "\n" +              // port 22's
+                             "[box.example]:2222 " + ed25519 + "\n" +       // another port
+                             std::string(hashed_box_23) + " " + ed25519 + "\n" +
+                             "@revoked [box.example]:23 " + ecdsa + "\n" + // not a pin
+                             "*.example " + ed25519 + "\n" +
+                             "\n" +
+                             "[box.example]:23 " + ed25519;                  // no line break at the end
+    CHECK(servers::forget_host(text, "box.example", 23) == "# grab's pins\n"
+                                                           "other.example,10.0.0.5 " + ed25519 + "\n" +
+                                                           "  [BOX.example]:23\t" + ed25519 + "\n" + // another case
+                                                           "box.example " + ed25519 + "\n" +
+                                                           "[box.example]:2222 " + ed25519 + "\n" +
+                                                           "@revoked [box.example]:23 " + ecdsa + "\n" +
+                                                           "*.example " + ed25519 + "\n" +
+                                                           "\n");
+    CHECK(servers::forget_host(text, "nowhere.example", 23) == text);
+    CHECK(servers::forget_host("", "box.example", 23).empty());
+
+    // Port 22: the plain host and [host]:22 go, other ports stay; CRLF stays CRLF.
+    const std::string plain = "plain.example " + ed25519 + "\r\n" +
+                              "[plain.example]:22 " + ecdsa + "\r\n" +
+                              "[plain.example]:23 " + ed25519 + "\r\n" +
+                              std::string(hashed_plain_22) + " " + ed25519 + "\r\n" +
+                              "plain.example,plain2.example " + ecdsa + "\r\n";
+    CHECK(servers::forget_host(plain, "plain.example", 22) == "[plain.example]:23 " + ed25519 + "\r\n" +
+                                                                "plain2.example " + ecdsa + "\r\n");
+
+    // Pinning again: the old pins replaced by the new ones, the rest kept.
+    const std::string pinned = "[box.example]:23 " + ecdsa + "\nother.example " + ed25519 + "\n";
+    CHECK(servers::merge_known_hosts(servers::forget_host(pinned, "box.example", 23), {"[box.example]:23 " + ed25519}) ==
+          "other.example " + ed25519 + "\n[box.example]:23 " + ed25519 + "\n");
+}
+
+TEST_CASE("key types as ssh-keygen names them") {
+    CHECK(servers::key_label("ssh-ed25519") == "ED25519");
+    CHECK(servers::key_label("ecdsa-sha2-nistp521") == "ECDSA");
+    CHECK(servers::key_label("ssh-rsa") == "RSA");
 }
 
 TEST_CASE("merge_known_hosts appends only new lines") {

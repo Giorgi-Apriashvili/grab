@@ -686,7 +686,7 @@ void App::on_message(const std::string& text) {
             auto it = std::ranges::find(list, name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + name);
             if (!it->error.empty()) return settings_error(it->error);
-            auto keys = server_ops::scan_host_keys(env->cfg.ssh, it->host, it->port, stop);
+            auto keys = server_ops::scan_host_keys(it->host, it->port, stop);
             if (stop.stop_requested()) return;
             if (!keys) return settings_error(keys.error());
             Pending p;
@@ -745,7 +745,8 @@ void App::send_init() {
             if (ctx) {
                 entry.set("host", str(ctx->remote.host));
                 entry.set("user", str(ctx->remote.user));
-                entry.set("method", str(ctx->method == FindMethod::ssh ? "ssh" : "rclone"));
+                // ssh, rclone; on engine = grab find, walk or probe (search_method).
+                entry.set("method", str(std::string(search_method(ctx->settings, ctx->remote, ctx->engine))));
             } else {
                 entry.set("error", str(ctx.error()));
             }
@@ -1032,7 +1033,8 @@ void App::start_refresh(const std::string& server, bool asked) {
         proc::RunOptions run;
         run.stop = stop;
         run.detached = true;
-        const std::string doing = std::format("{} {}'s file list", before > 0 ? "Refreshing" : "Building", server);
+        const std::string base = std::format("{} {}'s file list", before > 0 ? "Refreshing" : "Building", server);
+        std::string doing = base; // engine = grab: and how, once that's chosen
         Activity act(*this, doing + "…", "list:" + server, true);
         if (before > 0) act.progress(0, before); // against the last list's count, from the start
         auto counted_text = [&](std::uint64_t n) {
@@ -1061,7 +1063,10 @@ void App::start_refresh(const std::string& server, bool asked) {
             if (auto got = grab_side(*ctx, server, walk, stop)) {
                 side = std::move(*got);
                 side.on_lookup = [&](const ssh::Lookup& way) {
+                    doing = std::format("{} {}", base, way.find ? "with find" : "by listing folders");
                     act.timing(std::format("{}:{}", way.find ? "list.find" : "list.walk", server));
+                    if (before > 0) act.progress(0, before, doing + "…");
+                    else act.text(doing + "…");
                 };
                 side.progress = counted_text;
             } else {
@@ -1166,10 +1171,12 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
     below.settings.search_roots = {under};
     const bool on_grab = ctx.engine == Engine::grab;
     bool over_ssh = !on_grab && ctx.method == FindMethod::ssh; // engine = grab: once find is chosen
-    const std::string doing = !under.empty() ? std::format("Searching below {} on {}", under, server)
-                              : on_grab      ? std::format("Searching all of {}", server)
-                                             : std::format("Searching all of {} with {}", server,
-                                                           over_ssh ? "ssh + find" : "rclone lsf");
+    const std::string base = !under.empty() ? std::format("Searching below {} on {}", under, server)
+                                            : std::format("Searching all of {}", server);
+    // engine = grab: how it goes is said once it's chosen.
+    std::string doing = on_grab || !under.empty()
+                            ? base
+                            : std::format("{} with {}", base, over_ssh ? "ssh + find" : "rclone lsf");
     Activity act(*this, doing + "…", "search:" + server);
     auto counted_text = [&](std::size_t n) {
         act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(n))
@@ -1194,7 +1201,9 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
         r.grab = std::move(*side);
         r.grab.on_lookup = [&](const ssh::Lookup& way) {
             over_ssh = way.find;
+            doing = std::format("{} {}", base, way.find ? "with find" : "by listing folders");
             act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
+            act.text(doing + "…");
         };
         r.grab.progress = counted_text;
     } else if (!over_ssh) {
@@ -1659,13 +1668,16 @@ void App::post_servers(const server_ops::Env& env) const {
         v.set("port", num(s.port));
         v.set("auth", str(auth_name(s.auth)));
         v.set("keyFile", str(s.key_file));
-        v.set("search", str(s.ssh_search ? "ssh" : "rclone"));
+        v.set("search", str(s.search)); // search_method(): ssh, rclone; find, walk, probe on grab
+        v.set("engine", str(s.engine == Engine::grab ? "grab" : "rclone"));
         v.set("pinned", Value::make_bool(s.host_key_pinned));
         items.push(std::move(v));
     }
     Value msg = Value::make_object();
     msg.set("type", str("servers"));
     msg.set("configPath", str(util::path_to_utf8(env.grab_conf)));
+    // A new server's (GRAB_ENGINE can make it grab), for the form's hints.
+    msg.set("engine", str(effective_engine(RemoteSettings{}) == Engine::grab ? "grab" : "rclone"));
     msg.set("items", std::move(items));
     post(msg);
 }
@@ -1769,7 +1781,7 @@ void App::save_server(const Value& msg) {
         }
         if (!need_keys) return apply_pending(std::move(p), stop);
 
-        auto keys = server_ops::scan_host_keys(env->cfg.ssh, s.host, s.port, stop);
+        auto keys = server_ops::scan_host_keys(s.host, s.port, stop);
         if (stop.stop_requested()) return;
         if (!keys) return settings_error(keys.error());
         p.keys = std::move(*keys);
@@ -1839,6 +1851,10 @@ void App::test_server(const std::string& name, std::stop_token stop) const {
         v.set("rcloneError", str(result->rclone_error));
         v.set("sshOk", result->ssh_ok ? Value::make_bool(*result->ssh_ok) : Value{});
         v.set("sshError", str(result->ssh_error));
+        // engine = grab: grab's own login, and how its searches go ("with find (GNU find)").
+        v.set("grabOk", result->grab_ok ? Value::make_bool(*result->grab_ok) : Value{});
+        v.set("grabError", str(result->grab_error));
+        v.set("grabSearch", str(result->grab_search));
     }
     post(v);
 }

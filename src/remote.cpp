@@ -25,7 +25,8 @@ std::string build_find_command(const FindRequest& req) {
     const char* type = folder ? "d" : "f";
     // Folder sizes would need du; files report theirs cheaply. Both report when they changed.
     const char* print = folder ? "-printf '%T@\\t%p\\0'" : "-printf '%s\\t%T@\\t%p\\0'";
-    std::string cmd = "find";
+    // -L: links are followed (review G54); a loop is a message on stderr, which goes nowhere.
+    std::string cmd = "find -L";
 
     if (is_path_target(req.target)) {
         cmd += ' ';
@@ -74,7 +75,15 @@ std::vector<std::string> build_ssh_argv(const std::string& ssh_exe, const Rclone
         argv.insert(argv.end(), {"-i", *remote.key_file, "-o", "IdentitiesOnly=yes"});
     }
     if (remote.known_hosts_file) {
-        argv.insert(argv.end(), {"-o", "UserKnownHostsFile=" + *remote.known_hosts_file});
+#ifdef _WIN32
+        const char* no_file = "NUL";
+#else
+        const char* no_file = "/dev/null";
+#endif
+        // Only grab's pins count, and ssh adds none behind grab's back (review G4, G87).
+        argv.insert(argv.end(), {"-o", "UserKnownHostsFile=" + *remote.known_hosts_file, "-o",
+                                 "StrictHostKeyChecking=yes", "-o", std::string("GlobalKnownHostsFile=") + no_file,
+                                 "-o", "UpdateHostKeys=no"});
     }
     argv.insert(argv.end(), ssh_options.begin(), ssh_options.end());
     argv.push_back(remote.user + "@" + remote.host);

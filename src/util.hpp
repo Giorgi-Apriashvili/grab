@@ -133,6 +133,11 @@ private:
 // ASCII lower-casing, for case-insensitive keywords.
 [[nodiscard]] std::string to_lower(std::string_view s);
 
+// Standard base64 (RFC 4648, '+' and '/'), with '=' padding, as known_hosts holds keys.
+[[nodiscard]] std::string base64_encode(std::string_view bytes);
+// The bytes of standard base64, padded or not; nullopt for any other character.
+[[nodiscard]] std::optional<std::string> base64_decode(std::string_view text);
+
 // Unix seconds as find's %T@ or rclone's --time-format unix print them: an optional '-', digits
 // and an optional fraction ("1697354553.1234567000"), which is dropped. nullopt for anything else.
 [[nodiscard]] std::optional<std::int64_t> parse_unix_time(std::string_view text);

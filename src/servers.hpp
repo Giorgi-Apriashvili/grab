@@ -40,32 +40,28 @@ struct NewServer {
 [[nodiscard]] RcloneRemote to_remote(const NewServer& s, const std::filesystem::path& known_hosts);
 
 // ---- host keys ---------------------------------------------------------------------------
-
-[[nodiscard]] std::vector<std::string> keyscan_argv(const std::string& host, int port);
-
-// Fallback when ssh-keyscan cannot negotiate (Windows OpenSSH 9.5's keyscan fails on servers
-// that pick the sntrup761 key exchange): a real ssh handshake that records the server's key
-// into `record_to` (StrictHostKeyChecking=accept-new) and offers no login method, so nothing
-// secret is sent. The connection is expected to fail after the key is recorded.
-// With `host_key_algorithm` set, only that key type is requested; running once per entry of
-// handshake_key_algorithms() collects every key the server has, like ssh-keyscan would. That
-// matters because rclone's SSH library prefers ECDSA/RSA where OpenSSH picks ED25519, and a
-// key type missing from known_hosts is a "key mismatch" for it.
-[[nodiscard]] std::vector<std::string> handshake_argv(const std::string& ssh, const std::string& host,
-                                                      int port, const std::filesystem::path& record_to,
-                                                      const std::string& host_key_algorithm = {});
-[[nodiscard]] const std::vector<std::string>& handshake_key_algorithms();
-// known_hosts lines from ssh-keyscan's stdout (comments and blanks dropped).
-[[nodiscard]] std::vector<std::string> parse_keyscan(std::string_view out);
+// Scanned by ssh::scan_host_keys (grab's own client, for every server); grab's known_hosts holds
+// the lines ssh::known_host_line writes, which OpenSSH, rclone and grab's client all read.
 
 struct Fingerprint {
     std::string hash; // "SHA256:..."
-    std::string type; // "ED25519", "RSA", ...
+    std::string type; // "ED25519", "ECDSA", "RSA", as ssh-keygen -l names them
     bool operator==(const Fingerprint&) const = default;
 };
-// Lines of `ssh-keygen -lf -`: "256 SHA256:abc host (ED25519)".
-[[nodiscard]] std::vector<Fingerprint> parse_fingerprints(std::string_view out);
+// ssh-keygen's name for a key type: "ssh-ed25519" -> "ED25519", "ecdsa-sha2-nistp521" ->
+// "ECDSA", "ssh-rsa" -> "RSA".
+[[nodiscard]] std::string key_label(std::string_view type);
 
+// Whether `name`, one name of a known_hosts line's host list, stands for host:port as OpenSSH
+// reads it: "[host]:port", for port 22 also the plain "host"; a hashed name ("|1|salt|hash")
+// when it is the hash of one of those. Plain names match as written, as libssh2 and rclone
+// compare them (a hashed one also lower-cased, as OpenSSH hashes it); patterns
+// ("*.example.com", "!host") never match.
+[[nodiscard]] bool names_host(std::string_view name, std::string_view host, int port);
+// `text` (a known_hosts file) without what pins host:port (review G87): such names leave a
+// line's host list ("a,[host]:23,b" keeps a and b), and a line left with none goes. Comments,
+// marker lines (@revoked, @cert-authority) and other hosts' lines stay as they are.
+[[nodiscard]] std::string forget_host(std::string_view text, std::string_view host, int port);
 // `existing` known_hosts text plus the lines it does not already contain.
 [[nodiscard]] std::string merge_known_hosts(std::string_view existing, const std::vector<std::string>& lines);
 

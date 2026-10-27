@@ -43,8 +43,12 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 
 // How grab's own SSH client logs in to the context's server (engine = grab): its rclone.conf
 // section, with the secrets of grab's encrypted store, and any the rclone.conf in use keeps
-// itself (obscured, as rclone writes them when it isn't grab's own file).
+// itself (obscured, as rclone writes them when it isn't grab's own file). --bind, --contimeout and
+// --timeout in its common_flags apply (ssh::apply_flags; an error when one can't be read).
 [[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx);
+// The connection flags of the context's common_flags that grab's own client doesn't use (all but
+// --bind, --contimeout and --timeout), with their values, for a -v line.
+[[nodiscard]] std::vector<std::string> unused_flags(const Context& ctx);
 
 // rclone's version from `rclone version`'s output ("rclone v1.75.1").
 struct RcloneVersion {

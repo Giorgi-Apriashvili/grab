@@ -151,7 +151,19 @@ std::expected<ssh::Target, std::string> ssh_target(const Context& ctx) {
             }
         }
     }
-    return ssh::target_for(ctx.remote, store, grab_known_hosts_path());
+    auto target = ssh::target_for(ctx.remote, store, grab_known_hosts_path());
+    if (!target) return target;
+    // --bind, --contimeout and --timeout reach grab's connections as they reached rclone's (G189).
+    if (auto flags = ssh::apply_flags(*target, rclone_flags::connection(ctx.settings.common_flags)); !flags) {
+        return util::failf("[{}] common_flags: {}", ctx.settings.name, flags.error());
+    }
+    return target;
+}
+
+std::vector<std::string> unused_flags(const Context& ctx) {
+    ssh::Target ignored;
+    auto unused = ssh::apply_flags(ignored, rclone_flags::connection(ctx.settings.common_flags));
+    return unused ? std::move(*unused) : std::vector<std::string>{};
 }
 
 namespace {

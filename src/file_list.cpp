@@ -90,7 +90,7 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 }
 
 std::string find_command(const std::vector<std::string>& roots, int max_depth, bool skip_hidden) {
-    std::string cmd = "find";
+    std::string cmd = "find -L"; // links followed, as searches follow them (review G54)
     for (const auto& root : roots) {
         cmd += ' ';
         cmd += root.empty() ? std::string(".") : quote::sh_single(root);

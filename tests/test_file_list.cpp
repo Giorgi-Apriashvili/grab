@@ -152,7 +152,7 @@ TEST_CASE("a list is fresh for 15 minutes") {
 
 TEST_CASE("listing commands and their output") {
     CHECK(file_list::find_command({"", "learning"}, 4, true) ==
-          "find . 'learning' -mindepth 1 -maxdepth 4 \\( -name '.*' -prune \\) -o "
+          "find -L . 'learning' -mindepth 1 -maxdepth 4 \\( -name '.*' -prune \\) -o "
           "\\( -type d -printf 'd\\t%T@\\t%p\\0' -o -type f -printf 'f\\t%s\\t%T@\\t%p\\0' \\) 2>/dev/null");
     CHECK(file_list::find_command({"/srv"}, 2, false).find("-prune") == std::string::npos);
 

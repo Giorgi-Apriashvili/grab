@@ -477,6 +477,13 @@ int run(const Options& opts) {
         std::println(stderr, "grab: imported {} from rclone.conf into {} (one time)",
                      util::join(ctx->imported, ", "), util::path_to_utf8(grab_rclone_config_path()));
     }
+    // grab's own client takes --bind, --contimeout and --timeout of them (review G189).
+    if (opts.verbose && ctx->engine == Engine::grab) {
+        if (const auto unused = engine::unused_flags(*ctx); !unused.empty()) {
+            std::println(stderr, "grab: [{}] common_flags grab's own SSH client doesn't use: {}", ctx->settings.name,
+                         util::join(unused, " "));
+        }
+    }
 
     // destination: a given DEST is checked before the search so a typo fails fast; a missing
     // one is asked for after the pick, which needs a terminal.

@@ -16,14 +16,19 @@
 #endif
 
 #include <libssh2.h>
+#include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -65,19 +70,65 @@ void set_blocking(socket_t s, bool blocking) {
 #endif
 }
 
-// A TCP connection to host:port within `timeout`.
+// The addresses of `name` (port 0 when empty), freed with them.
+struct Addresses {
+    addrinfo* first = nullptr;
+    Addresses() = default;
+    Addresses(const Addresses&) = delete;
+    Addresses& operator=(const Addresses&) = delete;
+    ~Addresses() {
+        if (first) freeaddrinfo(first);
+    }
+    bool resolve(const std::string& name, int port) {
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = port == 0 ? AI_PASSIVE : 0;
+        return getaddrinfo(name.c_str(), std::to_string(port).c_str(), &hints, &first) == 0 && first;
+    }
+};
+
+// A time in ms as Winsock's select and libssh2 take it (32 bits): one longer than that is no limit
+// (0) rather than one wrapped round to something short (parse_duration already maps these).
+std::int32_t ms_or_none(std::chrono::milliseconds t) {
+    const auto ms = t.count();
+    return ms > 0 && ms <= std::numeric_limits<std::int32_t>::max() ? static_cast<std::int32_t>(ms) : 0;
+}
+
+// A TCP connection to host:port within `connect_timeout`, from the `bind` address when one is set
+// (an address of the same family as the server's).
 socket_t connect_tcp(const Target& t) {
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* found = nullptr;
-    if (getaddrinfo(t.host.c_str(), std::to_string(t.port).c_str(), &hints, &found) != 0 || !found)
+    Addresses found;
+    if (!found.resolve(t.host, t.port))
         throw Error(budget::Failure::other, std::format("can't find the server {}", t.host));
+    Addresses local;
+    if (!t.bind.empty() && !local.resolve(t.bind, 0))
+        throw Error(budget::Failure::fatal, std::format("can't find the address {} to connect from (--bind)", t.bind));
+    auto from_for = [&](const addrinfo* a) -> const addrinfo* {
+        for (const addrinfo* l = local.first; l; l = l->ai_next) {
+            if (l->ai_family == a->ai_family) return l;
+        }
+        return nullptr;
+    };
+    if (local.first) {
+        bool any = false;
+        for (const addrinfo* a = found.first; a && !any; a = a->ai_next) any = from_for(a) != nullptr;
+        if (!any)
+            throw Error(budget::Failure::fatal,
+                        std::format("{} (--bind) and {} have no address of the same kind (IPv4, IPv6)", t.bind, t.host));
+    }
     std::string why = "no address";
     socket_t s = no_socket;
-    for (addrinfo* a = found; a && s == no_socket; a = a->ai_next) {
+    for (addrinfo* a = found.first; a && s == no_socket; a = a->ai_next) {
+        const addrinfo* from = from_for(a);
+        if (local.first && !from) continue;
         socket_t c = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (c == no_socket) continue;
+        if (from && ::bind(c, from->ai_addr, static_cast<int>(from->ai_addrlen)) != 0) {
+            const int e = last_socket_error();
+            close_socket(c);
+            throw Error(budget::Failure::fatal, std::format("can't connect from {} (--bind): error {}", t.bind, e));
+        }
         set_blocking(c, false);
         int rc = ::connect(c, a->ai_addr, static_cast<int>(a->ai_addrlen));
         bool ok = rc == 0;
@@ -95,13 +146,14 @@ socket_t connect_tcp(const Target& t) {
                 FD_ZERO(&x);
                 FD_SET(c, &w);
                 FD_SET(c, &x);
-                auto ms = t.timeout.count();
-                timeval tv{static_cast<long>(ms / 1000), static_cast<long>((ms % 1000) * 1000)};
-                if (select(static_cast<int>(c + 1), nullptr, &w, &x, &tv) > 0 && FD_ISSET(c, &w)) {
+                const std::int32_t ms = ms_or_none(t.connect_timeout);
+                timeval tv{.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
+                // No limit: as long as the system tries. A refusal comes as an exception (Windows).
+                if (select(static_cast<int>(c + 1), nullptr, &w, &x, ms > 0 ? &tv : nullptr) > 0) {
                     int err = 0;
                     socklen_t len = sizeof err;
                     getsockopt(c, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
-                    ok = err == 0;
+                    ok = err == 0 && FD_ISSET(c, &w);
                     why = ok ? "" : std::format("connection failed ({})", err);
                 } else {
                     why = "no answer";
@@ -117,7 +169,6 @@ socket_t connect_tcp(const Target& t) {
             close_socket(c);
         }
     }
-    freeaddrinfo(found);
     if (s == no_socket) throw Error(budget::Failure::other, std::format("can't reach {}:{}: {}", t.host, t.port, why));
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
@@ -353,6 +404,177 @@ std::string pinned_algorithms(std::string_view known_hosts_text, std::string_vie
     return out;
 }
 
+// ---- host keys -------------------------------------------------------------------------------
+
+std::string key_type(std::string_view blob) {
+    if (blob.size() < 4) return {};
+    std::size_t len = 0;
+    for (int i = 0; i < 4; ++i) len = (len << 8) | static_cast<unsigned char>(blob[static_cast<std::size_t>(i)]);
+    if (len == 0 || len > 64 || len > blob.size() - 4) return {};
+    std::string type(blob.substr(4, len));
+    const bool plain = std::ranges::all_of(type, [](char c) { return c > ' ' && c < 0x7F; });
+    return plain ? type : std::string();
+}
+
+std::string fingerprint(std::string_view blob) {
+    std::array<unsigned char, 32> digest{};
+    unsigned int len = 0;
+    EVP_Digest(blob.data(), blob.size(), digest.data(), &len, EVP_sha256(), nullptr);
+    std::string hash = util::base64_encode(std::string_view(reinterpret_cast<const char*>(digest.data()), len));
+    while (hash.ends_with('=')) hash.pop_back();
+    return "SHA256:" + hash;
+}
+
+std::optional<HostKey> host_key(std::string_view blob) {
+    std::string type = key_type(blob);
+    if (type.empty()) return std::nullopt;
+    return HostKey{.type = std::move(type), .key = util::base64_encode(blob), .fingerprint = fingerprint(blob)};
+}
+
+std::string known_host_line(std::string_view host, int port, const HostKey& key) {
+    const std::string name = port == 22 ? std::string(host) : std::format("[{}]:{}", host, port);
+    return std::format("{} {} {}", name, key.type, key.key);
+}
+
+namespace {
+
+int knownhost_key_bit(std::string_view type) {
+    if (type == "ssh-rsa") return LIBSSH2_KNOWNHOST_KEY_SSHRSA;
+    if (type == "ecdsa-sha2-nistp256") return LIBSSH2_KNOWNHOST_KEY_ECDSA_256;
+    if (type == "ecdsa-sha2-nistp384") return LIBSSH2_KNOWNHOST_KEY_ECDSA_384;
+    if (type == "ecdsa-sha2-nistp521") return LIBSSH2_KNOWNHOST_KEY_ECDSA_521;
+    if (type == "ssh-ed25519") return LIBSSH2_KNOWNHOST_KEY_ED25519;
+    return 0;
+}
+
+// check_known_host on a session's known-hosts store (libssh2 needs a session for one).
+KnownHost check_known(LIBSSH2_SESSION* session, std::string_view text, std::string_view host, int port,
+                      std::string_view blob) {
+    const int keybit = knownhost_key_bit(key_type(blob));
+    if (keybit == 0) return KnownHost::unknown;
+    LIBSSH2_KNOWNHOSTS* known = libssh2_knownhost_init(session);
+    if (!known) throw Error(budget::Failure::other, "can't check the host key");
+    for (std::size_t start = 0; start < text.size();) {
+        std::size_t end = std::min(text.find('\n', start), text.size());
+        std::string line(text.substr(start, end - start));
+        start = end + 1;
+        if (line.ends_with('\r')) line.pop_back();
+        if (line.empty() || line.front() == '#') continue;
+        // A line libssh2 can't read (a key type it doesn't know) holds nothing it could match.
+        (void)libssh2_knownhost_readline(known, line.c_str(), line.size(), LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+    }
+    libssh2_knownhost* match = nullptr;
+    const int check = libssh2_knownhost_checkp(known, std::string(host).c_str(), port, blob.data(), blob.size(),
+                                               LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW | keybit, &match);
+    libssh2_knownhost_free(known);
+    if (check == LIBSSH2_KNOWNHOST_CHECK_MATCH) return KnownHost::match;
+    if (check == LIBSSH2_KNOWNHOST_CHECK_MISMATCH) return KnownHost::mismatch;
+    return KnownHost::unknown;
+}
+
+// One handshake that asks for the host key algorithms in `offer` and logs in to nothing: the blob
+// of the key the server showed.
+std::expected<std::string, ShakeError> read_host_key(const Target& t, std::string_view offer) {
+    socket_t s = no_socket;
+    try {
+        s = connect_tcp(t);
+    } catch (const Error& e) {
+        return std::unexpected(ShakeError{.no_match = false, .message = e.what()});
+    }
+    LIBSSH2_SESSION* session = libssh2_session_init_ex(nullptr, nullptr, nullptr, nullptr);
+    std::expected<std::string, ShakeError> result = std::unexpected(ShakeError{.message = "can't start an SSH session"});
+    if (session) {
+        libssh2_session_set_blocking(session, 1);
+        libssh2_session_set_timeout(session, ms_or_none(t.timeout));
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_KEX, std::string(kex_algorithms).c_str());
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_CS, std::string(cipher_algorithms).c_str());
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_CRYPT_SC, std::string(cipher_algorithms).c_str());
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_CS, std::string(mac_algorithms).c_str());
+        libssh2_session_method_pref(session, LIBSSH2_METHOD_MAC_SC, std::string(mac_algorithms).c_str());
+        std::size_t len = 0;
+        int type = 0;
+        if (libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, std::string(offer).c_str()) != 0) {
+            result = std::unexpected(ShakeError{.message = last_error(session)});
+        } else if (int rc = libssh2_session_handshake(session, s); rc != 0) {
+            // No algorithm in common; with the same key exchanges and ciphers as the first
+            // handshake, that is the host key types asked for.
+            const bool no_match = rc == LIBSSH2_ERROR_KEX_FAILURE || rc == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED;
+            result = std::unexpected(ShakeError{.no_match = no_match, .message = last_error(session)});
+        } else if (const char* key = libssh2_session_hostkey(session, &len, &type); key && len > 0) {
+            result = std::string(key, len);
+        } else {
+            result = std::unexpected(ShakeError{.message = "the server showed no host key"});
+        }
+        libssh2_session_disconnect(session, "grab has read the host key");
+        libssh2_session_free(session);
+    }
+    close_socket(s);
+    return result;
+}
+
+} // namespace
+
+KnownHost check_known_host(std::string_view known_hosts_text, std::string_view host, int port, std::string_view blob) {
+    init_once();
+    LIBSSH2_SESSION* session = libssh2_session_init_ex(nullptr, nullptr, nullptr, nullptr);
+    if (!session) throw Error(budget::Failure::other, "can't check the host key");
+    try {
+        const KnownHost known = check_known(session, known_hosts_text, host, port, blob);
+        libssh2_session_free(session);
+        return known;
+    } catch (...) {
+        libssh2_session_free(session);
+        throw;
+    }
+}
+
+std::expected<std::vector<HostKey>, std::string> scan_host_keys(const Shake& shake, std::string_view where,
+                                                               const std::stop_token& stop) {
+    std::vector<std::string_view> left(scan_algorithms.begin(), scan_algorithms.end());
+    std::vector<HostKey> keys;
+    while (!left.empty()) {
+        if (stop.stop_requested()) return util::fail("cancelled");
+        std::string offer;
+        for (const auto alg : left) offer += (offer.empty() ? "" : ",") + std::string(alg);
+        auto blob = shake(offer);
+        if (!blob) {
+            // The types left aren't the server's: every key it has of the others was read.
+            if (blob.error().no_match && !keys.empty()) break;
+            if (blob.error().no_match) {
+                return util::failf("{} has no host key grab can check (ssh-ed25519, ECDSA, or RSA with SHA-2 "
+                                   "signatures), or only key exchanges too old for it: {}",
+                                   where, blob.error().message);
+            }
+            return util::failf("can't read the host keys of {}: {}", where, blob.error().message);
+        }
+        auto key = host_key(*blob);
+        if (!key) return util::failf("{} showed a host key grab can't read", where);
+        // An RSA key answers both rsa-sha2 algorithms; a type that answers none of those asked
+        // (or was found already) would never end the scan.
+        auto covered = [&](std::string_view alg) {
+            return key->type == "ssh-rsa" ? alg.starts_with("rsa-sha2-") : alg == key->type;
+        };
+        if (std::ranges::none_of(left, covered)) {
+            return util::failf("{} showed a {} key when grab asked for {}", where, key->type, offer);
+        }
+        std::erase_if(left, covered);
+        keys.push_back(std::move(*key));
+    }
+    return keys;
+}
+
+std::expected<std::vector<HostKey>, std::string> scan_host_keys(const std::string& host, int port,
+                                                               std::chrono::milliseconds timeout, std::stop_token stop) {
+    init_once();
+    Target t;
+    t.host = host;
+    t.port = port;
+    t.connect_timeout = timeout;
+    t.timeout = timeout;
+    const Shake shake = [&t](std::string_view offer) { return read_host_key(t, offer); };
+    return scan_host_keys(shake, std::format("{}:{}", host, port), stop);
+}
+
 // libssh2 callbacks reach the Connection through the session's abstract pointer.
 struct SessionAccess {
     static LIBSSH2_RECV_FUNC(recv) {
@@ -417,7 +639,7 @@ void Connection::open(const Target& target) {
     libssh2_session_callback_set2(session_, LIBSSH2_CALLBACK_RECV,
                                   reinterpret_cast<libssh2_cb_generic*>(&SessionAccess::recv));
     libssh2_session_set_blocking(session_, 1);
-    libssh2_session_set_timeout(session_, static_cast<long>(target.timeout.count()));
+    libssh2_session_set_timeout(session_, ms_or_none(target.timeout));
 
     std::string text;
     if (std::ifstream in{target.known_hosts, std::ios::binary}) text.assign(std::istreambuf_iterator<char>(in), {});
@@ -440,7 +662,7 @@ void Connection::open(const Target& target) {
         fail(hopeless ? budget::Failure::fatal : slow ? budget::Failure::other : budget::Failure::refused,
              "SSH handshake with " + target.host + " failed");
     }
-    check_host_key(target);
+    check_host_key(target, text);
     log_in(target);
     login_time_ =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
@@ -450,39 +672,26 @@ void Connection::fail(budget::Failure kind, std::string_view what) const {
     throw Error(kind, session_ ? std::format("{}: {}", what, last_error(session_)) : std::string(what));
 }
 
-void Connection::check_host_key(const Target& target) {
+void Connection::check_host_key(const Target& target, std::string_view known_hosts_text) {
     std::size_t len = 0;
     int type = 0;
     const char* key = libssh2_session_hostkey(session_, &len, &type);
-    int keybit = 0;
     switch (type) {
-    case LIBSSH2_HOSTKEY_TYPE_RSA: keybit = LIBSSH2_KNOWNHOST_KEY_SSHRSA; break;
-    case LIBSSH2_HOSTKEY_TYPE_ECDSA_256: keybit = LIBSSH2_KNOWNHOST_KEY_ECDSA_256; break;
-    case LIBSSH2_HOSTKEY_TYPE_ECDSA_384: keybit = LIBSSH2_KNOWNHOST_KEY_ECDSA_384; break;
-    case LIBSSH2_HOSTKEY_TYPE_ECDSA_521: keybit = LIBSSH2_KNOWNHOST_KEY_ECDSA_521; break;
-    case LIBSSH2_HOSTKEY_TYPE_ED25519: keybit = LIBSSH2_KNOWNHOST_KEY_ED25519; break;
+    case LIBSSH2_HOSTKEY_TYPE_RSA:
+    case LIBSSH2_HOSTKEY_TYPE_ECDSA_256:
+    case LIBSSH2_HOSTKEY_TYPE_ECDSA_384:
+    case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:
+    case LIBSSH2_HOSTKEY_TYPE_ED25519: break;
     default: throw Error(budget::Failure::fatal, std::format("{} offered a host key grab can't check", target.host));
     }
-    // known_hosts is read here line by line (libssh2's own reader takes a narrow path).
-    LIBSSH2_KNOWNHOSTS* known = libssh2_knownhost_init(session_);
-    if (!known) fail(budget::Failure::other, "can't check the host key");
-    if (std::ifstream in{target.known_hosts, std::ios::binary}) {
-        std::string line;
-        while (std::getline(in, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty() || line[0] == '#') continue;
-            // A line libssh2 can't read (a key type it doesn't know) holds nothing it could match.
-            (void)libssh2_knownhost_readline(known, line.c_str(), line.size(), LIBSSH2_KNOWNHOST_FILE_OPENSSH);
-        }
-    }
-    libssh2_knownhost* match = nullptr;
-    int check = libssh2_knownhost_checkp(known, target.host.c_str(), target.port, key, len,
-                                         LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW | keybit, &match);
-    libssh2_knownhost_free(known);
-    if (check == LIBSSH2_KNOWNHOST_CHECK_MATCH) return;
-    if (check == LIBSSH2_KNOWNHOST_CHECK_MISMATCH)
+    // known_hosts was read by open() (libssh2's own reader takes a narrow path).
+    switch (check_known(session_, known_hosts_text, target.host, target.port, std::string_view(key, len))) {
+    case KnownHost::match: return;
+    case KnownHost::mismatch:
         throw Error(budget::Failure::fatal,
                     std::format("{}'s host key has changed: grab won't log in until you trust it again", target.host));
+    case KnownHost::unknown: break;
+    }
     throw Error(budget::Failure::fatal, std::format("{}'s host key isn't trusted yet", target.host));
 }
 

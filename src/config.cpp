@@ -42,6 +42,8 @@ default_remote = hetzner
 rclone_remote = hetzner
 # How TARGET is located: auto = ssh + find when the rclone remote has a key_file, otherwise
 # an rclone listing (password remotes and storage boxes have no shell). Force with ssh | rclone.
+# With engine = grab: auto = find where grab's check finds GNU find on the server, else by
+# listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.
 find = auto
 # Comma-separated directories to search: absolute (/srv) or relative to the login home
 # (learning). Blank or . = the home directory itself.
@@ -549,11 +551,25 @@ std::vector<RcloneRemote> missing_remotes(const GrabConfig& cfg, const ini::Docu
     return out;
 }
 
-std::string describe_remote(const RcloneRemote& remote) {
-    const bool ssh = resolve_find_method(RemoteSettings{}, remote) == FindMethod::ssh;
+std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote, Engine engine) {
+    if (engine == Engine::rclone) return resolve_find_method(settings, remote) == FindMethod::ssh ? "ssh" : "rclone";
+    switch (resolve_grab_method(settings, remote)) {
+    case GrabMethod::find: return "find";
+    case GrabMethod::walk: return "walk";
+    case GrabMethod::probe: break;
+    }
+    return "probe";
+}
+
+std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings) {
+    const auto method = search_method(settings, remote, settings.engine);
+    const char* lookup = method == "ssh"    ? "via ssh + find"
+                         : method == "rclone" ? "via rclone lsf"
+                         : method == "find"   ? "with find"
+                         : method == "walk"   ? "by listing folders"
+                                              : "with find, else by listing folders";
     const char* auth = remote.key_use_agent ? "ssh-agent" : remote.key_file ? "key file" : "password";
-    return std::format("{}@{}:{}, {}, lookup via {}", remote.user, remote.host, remote.port, auth,
-                       ssh ? "ssh + find" : "rclone lsf");
+    return std::format("{}@{}:{}, {}, lookup {}", remote.user, remote.host, remote.port, auth, lookup);
 }
 
 std::string remote_section(const RcloneRemote& remote, const std::vector<std::string>& search_roots,
@@ -563,6 +579,8 @@ std::string remote_section(const RcloneRemote& remote, const std::vector<std::st
     s += std::format("[{}]\n", section_name_for(remote.name));
     s += std::format("rclone_remote = {}\n", remote.name);
     s += "# auto = ssh + find when the server uses a key file or ssh-agent, otherwise rclone lsf.\n";
+    s += "# With engine = grab: auto = find where grab's check finds GNU find on the server, else by\n";
+    s += "# listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.\n";
     s += "find = auto\n";
     s += "# Where to search: comma-separated absolute (/srv) or home-relative (media) dirs.\n";
     s += "# Blank = the login home. Narrow it to speed up searches on big servers.\n";

@@ -316,7 +316,7 @@ too and goes on without them.
     folder is spelled (`D:/Media/` and `d:\media` are one): one already queued, running or paused
     stays as it is, and a failed one starts again from its partial file.
   - **A downloaded program never runs in place of a tool.** The programs grab starts by name
-    (ssh, curl, tar, ssh-keyscan, the editor, Explorer) come from System32, the Windows folder or
+    (ssh, curl, tar, the editor, Explorer) come from System32, the Windows folder or
     PATH's full folders, never from the current folder or grab's own, so an `ssh.exe` that lands
     in the folder you run `grab` from is never started. A full path in grab.conf is used as given.
 
@@ -493,12 +493,17 @@ grab server remove NAME
 
 Then it:
 - **pins the host key:** shows the server's fingerprints (ED25519, ECDSA and RSA, whichever
-  it has) and saves them to `%APPDATA%\grab\known_hosts` once you confirm. From then on ssh
-  and rclone refuse a server that presents a different key.
+  it has; grab reads them itself, without logging in) and saves them to
+  `%APPDATA%\grab\known_hosts` once you confirm, in place of any it held for that address. From
+  then on grab, ssh and rclone refuse a server that presents a different key. Changing a
+  server's host or port, or removing it, takes its keys out again unless another server uses the
+  same host and port. A server that offers only old key types (SHA-1 `ssh-rsa`, DSA) or old key
+  exchanges can't be added.
 - **writes both config files:** the connection goes into grab's own
   `%APPDATA%\grab\rclone.conf`, the search settings into grab.conf.
 - **tests the connection:** one check through rclone and, for key or agent logins, one
-  through ssh.
+  through ssh; with `engine = grab`, a login through grab's own client instead of ssh, which
+  also says whether searches will use find or list folders.
 
 Passwords and passphrases are never shown and never put on a command line. They are not kept
 in rclone.conf either, where rclone would store them only "obscured", which anyone who can read
@@ -528,7 +533,8 @@ the input runs out, the command stops without changing anything.
 
 Password servers are searched with rclone. Key and ssh-agent servers are searched with ssh +
 find, which is faster; with a passphrase-protected key that needs the key in ssh-agent
-(`ssh-add <key file>`).
+(`ssh-add <key file>`). With `engine = grab` every server is searched with find where it has
+GNU find (grab checks once per run), else by listing its folders.
 
 **Coming from an earlier grab:** grab.conf used to point at remotes in the standard
 rclone.conf. The first run of this version copies the remotes grab.conf uses into grab's own
@@ -589,8 +595,10 @@ keeps the connections open between files, asks the server for exactly the bytes 
 continues partial downloads rclone started (and the other way round). In a folder, files of 2 MiB
 and more follow "At once" and spread over the connections; smaller ones go beside them on every
 free connection, many at a time. It also downloads names that aren't UTF-8, and a subfolder the
-server won't list is reported instead of failing the whole folder. `GRAB_ENGINE=grab` or `rclone`
-in the environment overrides every server.
+server won't list is reported instead of failing the whole folder. Of `common_flags` it takes
+`--bind`, `--contimeout` and `--timeout` (`-v` names the ones it leaves out). Test in Settings
+logs in through it and says whether searches use find or list folders. `GRAB_ENGINE=grab` or
+`rclone` in the environment overrides every server.
 
 ## Usage
 

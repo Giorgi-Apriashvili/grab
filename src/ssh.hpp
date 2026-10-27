@@ -13,6 +13,7 @@
 #include "conn_budget.hpp"
 #include "sftp.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -27,6 +28,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <vector>
 
 struct _LIBSSH2_SESSION;
 struct _LIBSSH2_CHANNEL;
@@ -44,7 +46,12 @@ struct Target {
     std::filesystem::path key_file;
     std::string key_passphrase;
     std::string password;
-    std::chrono::milliseconds timeout{30'000}; // connecting, and any single wait after that
+    // rclone's connection flags, as engine::ssh_target takes them from common_flags (review G189):
+    // the local address to connect from (--bind; empty: any), the time to reach the server
+    // (--contimeout) and any single wait after that (--timeout). A time of 0 is no limit.
+    std::string bind;
+    std::chrono::milliseconds connect_timeout{30'000};
+    std::chrono::milliseconds timeout{30'000};
     bool operator==(const Target&) const = default;
 };
 
@@ -139,7 +146,7 @@ private:
     void open(const Target& target);
     void close();
     [[noreturn]] void fail(budget::Failure kind, std::string_view what) const;
-    void check_host_key(const Target& target);
+    void check_host_key(const Target& target, std::string_view known_hosts_text);
     void log_in(const Target& target);
 
     std::uintptr_t socket_ = ~std::uintptr_t{0};
@@ -204,5 +211,64 @@ inline constexpr std::string_view mac_algorithms =
 // ("[host]:port" lines, or "host" for port 22): the server then proves a key grab has.
 // Empty when none is pinned.
 [[nodiscard]] std::string pinned_algorithms(std::string_view known_hosts_text, std::string_view host, int port);
+
+// ---- host keys -------------------------------------------------------------------------------
+
+// A server's public host key, as a scan read it.
+struct HostKey {
+    std::string type;        // the type the key names itself: "ssh-ed25519", "ecdsa-sha2-nistp521", "ssh-rsa"
+    std::string key;         // its blob in base64, as known_hosts holds it
+    std::string fingerprint; // "SHA256:...", as ssh-keygen -l shows it
+    bool operator==(const HostKey&) const = default;
+};
+
+// The type a public key blob names (its first field: "ssh-rsa" for an RSA key, whichever
+// signature was agreed); empty when it names none.
+[[nodiscard]] std::string key_type(std::string_view blob);
+// "SHA256:" and the blob's SHA-256 in base64 without padding, as ssh-keygen -l shows it.
+[[nodiscard]] std::string fingerprint(std::string_view blob);
+// The HostKey of a blob; nullopt when it names no type.
+[[nodiscard]] std::optional<HostKey> host_key(std::string_view blob);
+// The known_hosts line that pins `key` for host:port: "[host]:port type key", the plain host for
+// port 22, never hashed, so rclone's Go knownhosts and OpenSSH read it as well as grab.
+[[nodiscard]] std::string known_host_line(std::string_view host, int port, const HostKey& key);
+
+// What known_hosts says of the key a server at host:port presented, as a login checks it
+// (libssh2's matching: "[host]:port", then the plain host; hashed names too).
+enum class KnownHost {
+    match,    // a pin of this type holds this key
+    mismatch, // a pin of this type holds another key: the key changed
+    unknown,  // nothing of this type is pinned (or the type isn't one grab checks)
+};
+[[nodiscard]] KnownHost check_known_host(std::string_view known_hosts_text, std::string_view host, int port,
+                                         std::string_view blob);
+
+// The host key algorithms a scan asks for, best first: one handshake gets the first of them the
+// server has, the next one the first of those left, and so on.
+inline constexpr std::array<std::string_view, 6> scan_algorithms{
+    "ssh-ed25519",         "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521", "rsa-sha2-512",        "rsa-sha2-256"};
+
+// One scanning handshake's outcome: the blob of the host key the server showed for `offer`, else
+// why not; `no_match` when it ended only for want of an algorithm both sides know.
+struct ShakeError {
+    bool no_match = false;
+    std::string message;
+};
+using Shake = std::function<std::expected<std::string, ShakeError>(std::string_view offer)>;
+
+// Every host key `host`:`port` has of the types grab checks (scan_algorithms), read without a
+// login and without looking at any known_hosts: handshakes one after another, each offering the
+// algorithms whose key wasn't found yet (an RSA key covers both rsa-sha2 ones); the first one the
+// server can't agree on ends the scan (Main: 2 handshakes, a Storage Box 4, at most 6). Each
+// handshake has `timeout`; `stop` is looked at between them ("cancelled"). Nothing is written. An
+// error when no key could be read (the server has only key types or key exchanges grab doesn't
+// support: SHA-1 ssh-rsa, DSA, old Diffie-Hellman) or a handshake fails for another reason.
+[[nodiscard]] std::expected<std::vector<HostKey>, std::string> scan_host_keys(const std::string& host, int port,
+                                                                             std::chrono::milliseconds timeout,
+                                                                             std::stop_token stop = {});
+// The same over any handshake (exposed for tests); `where` ("host:port") is for messages.
+[[nodiscard]] std::expected<std::vector<HostKey>, std::string> scan_host_keys(const Shake& shake, std::string_view where,
+                                                                             const std::stop_token& stop = {});
 
 } // namespace grab::ssh

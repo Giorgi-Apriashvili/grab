@@ -186,8 +186,16 @@ load_rclone_remote(const std::filesystem::path& p, std::string_view name);
 [[nodiscard]] std::vector<RcloneRemote> missing_remotes(const GrabConfig& cfg,
                                                         const ini::Document& rclone);
 
-// "alice@host:22, key file, lookup via ssh + find"
-[[nodiscard]] std::string describe_remote(const RcloneRemote& remote);
+// How a server's searches and file lists go, as lists and texts name it. engine = rclone, as
+// resolve_find_method says: "ssh" (ssh + find) or "rclone" (rclone lsf). engine = grab, as
+// resolve_grab_method says: "find" (find only), "walk" (by listing folders) or "probe" (find where
+// grab's check finds GNU find, else by listing folders).
+[[nodiscard]] std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote,
+                                             Engine engine);
+
+// "alice@host:22, key file, lookup via ssh + find": the lookup as `settings` (its engine as
+// grab.conf says it, and its find setting) has it.
+[[nodiscard]] std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings = {});
 
 // A commented grab.conf section for one rclone remote. search_roots is left blank (the login
 // home, correct for both lookup methods) and the rclone flag keys are written commented out,

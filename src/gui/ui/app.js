@@ -160,7 +160,7 @@ function renderRemoteInfo() {
   if (!r) { info.hidden = true; return; }
   info.hidden = false;
   info.classList.toggle('error', !!r.error);
-  info.textContent = r.error ? 'misconfigured' : `${r.user}@${r.host} · ${r.method === 'ssh' ? 'ssh + find' : 'rclone listing'}`;
+  info.textContent = r.error ? 'misconfigured' : `${r.user}@${r.host} · ${SEARCH_TEXT[r.method] || 'rclone listing'}`;
   info.title = r.error || '';
 }
 
@@ -2710,7 +2710,8 @@ $('#limit-hint').addEventListener('click', () => {
 const settings = {
   open: false,
   servers: [],
-  form: null,     // null, or { editing, name, origAuth } while the add/edit form is shown
+  engine: 'rclone', // a new server's engine (GRAB_ENGINE can make it grab)
+  form: null,     // null, or { editing, name, origAuth, engine } while the add/edit form is shown
   auth: 'password',
   tests: {},      // server name -> serverTested message, or { pending: true }
   busy: false,
@@ -2718,6 +2719,23 @@ const settings = {
 };
 
 const AUTH_TEXT = { password: 'password', key: 'key file', agent: 'ssh-agent' };
+// How a server is searched (the backend's search_method): ssh + find or rclone's listing on
+// engine = rclone; on engine = grab find, the folders listed by grab, or find where grab's check
+// finds it.
+const SEARCH_TEXT = {
+  ssh: 'ssh + find',
+  rclone: 'rclone listing',
+  find: 'find',
+  walk: 'listing folders',
+  probe: 'find or listing folders',
+};
+const SEARCHED_TEXT = {
+  ssh: 'with ssh + find',
+  rclone: 'with rclone listing',
+  find: 'with find',
+  walk: 'by listing folders',
+  probe: 'with find, else by listing folders',
+};
 
 function showSettingsBanner(text) {
   const b = $('#settings-banner');
@@ -2765,10 +2783,16 @@ function closeSettings() {
 function testLine(t) {
   if (!t) return '';
   if (t.pending) return '<span class="muted"><span class="spinner"></span>Testing the connection…</span>';
-  if (t.ok) return '<span class="good">✓ Connection OK</span>';
+  // engine = grab: grab's own client downloads and searches, rclone still verifies and previews.
+  const grab = t.grabOk === true || t.grabOk === false;
+  const how = grab && t.grabOk ? ` · searches ${esc(t.grabSearch)}` : '';
+  if (t.ok) return `<span class="good">✓ Connection OK</span>${how ? `<span class="muted">${how}</span>` : ''}`;
   const parts = [];
-  if (t.rcloneOk) parts.push('<span class="good">✓ Downloads (rclone)</span>');
-  else parts.push(`<span class="bad">✗ Downloads (rclone):</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
+  const rclone = grab ? 'Verify and previews (rclone)' : 'Downloads (rclone)';
+  if (t.rcloneOk) parts.push(`<span class="good">✓ ${rclone}</span>`);
+  else parts.push(`<span class="bad">✗ ${rclone}:</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
+  if (t.grabOk === true) parts.push(`<span class="good">✓ Downloads and searches (grab)</span><span class="muted">${how}</span>`);
+  else if (t.grabOk === false) parts.push(`<span class="bad">✗ Downloads and searches (grab):</span> <span class="detail">${esc(t.grabError || 'failed')}</span>`);
   if (t.sshOk === true) parts.push('<span class="good">✓ Searches (ssh)</span>');
   else if (t.sshOk === false) parts.push(`<span class="bad">✗ Searches (ssh):</span> <span class="detail">${esc(t.sshError || 'failed')}</span>`);
   return parts.map((p) => `<span>${p}</span>`).join('');
@@ -2789,7 +2813,8 @@ function serverCard(s) {
   const where = s.roots.length ? s.roots.join(', ') : '~';
   const meta = s.error
     ? `<span class="bad">${esc(s.error)}</span>`
-    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${AUTH_TEXT[s.auth]} · searched with ${s.search === 'ssh' ? 'ssh + find' : 'rclone listing'} in ${esc(where)}, depth ${s.depth}` +
+    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${AUTH_TEXT[s.auth]}${s.engine === 'grab' ? ' · grab\'s engine' : ''}` +
+      ` · searched ${SEARCHED_TEXT[s.search] || 'with rclone listing'} in ${esc(where)}, depth ${s.depth}` +
       ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}`;
   const status = [];
   if (!s.error) {
@@ -2843,14 +2868,22 @@ function setAuth(auth) {
   for (const el of document.querySelectorAll('[data-auth-only]')) el.hidden = !el.dataset.authOnly.split(' ').includes(auth);
   $('#secret-label').textContent = auth === 'key' ? 'Passphrase' : 'Password';
   setSecretPlaceholder();
-  $('#secret-hint').textContent = auth === 'key'
+  // engine = grab logs in by itself, with the passphrase too, and searches every server the same
+  // way: find where the server has GNU find, else by listing folders.
+  const grab = (settings.form ? settings.form.engine : settings.engine) === 'grab';
+  $('#secret-hint').textContent = auth === 'key' && !grab
     ? 'Searches use ssh, which cannot ask for a passphrase here: load such a key into ssh-agent (ssh-add) and choose ssh-agent instead.'
     : 'Stored obscured in grab\'s rclone.conf, never in plain text on a command line.';
-  $('#auth-hint').textContent = {
+  const searches = 'searches use find where the server has it, else grab lists its folders.';
+  $('#auth-hint').textContent = (grab ? {
+    password: `Works without a shell (e.g. storage boxes); ${searches}`,
+    key: 'Searches use find where the server has it, else grab lists its folders.',
+    agent: `Uses the keys loaded in the Windows ssh-agent (ssh-add); ${searches}`,
+  } : {
     password: 'Works without a shell (e.g. storage boxes); searches use rclone\'s listing.',
     key: 'Searches use ssh + find on the server, which is fastest.',
     agent: 'Uses the keys loaded in the Windows ssh-agent (ssh-add); searches use ssh + find.',
-  }[auth];
+  })[auth];
 }
 
 function clearFieldErrors() {
@@ -2860,7 +2893,7 @@ function clearFieldErrors() {
 function openForm(name) {
   const s = name ? settings.servers.find((x) => x.name === name) : null;
   settings.form = { editing: !!s, name: s ? s.name : '', origAuth: s ? s.auth : null,
-    origHost: s ? s.host : '', origUser: s ? s.user : '' };
+    origHost: s ? s.host : '', origUser: s ? s.user : '', engine: s ? s.engine : settings.engine };
   $('#form-title').textContent = s ? `Edit ${s.name}` : 'Add a server';
   $('#f-name').value = s ? s.name : '';
   $('#f-name').disabled = !!s;
@@ -3046,7 +3079,11 @@ if (webview) {
         showBanner(msg.message);
         break;
       case 'played': flash(`Playing ${msg.name} in ${msg.program}`); break;
-      case 'servers': settings.servers = msg.items; renderServers(); break;
+      case 'servers':
+        settings.servers = msg.items;
+        settings.engine = msg.engine || 'rclone';
+        renderServers();
+        break;
       case 'settingsBusy':
         settings.busy = msg.busy;
         if (!msg.busy) {

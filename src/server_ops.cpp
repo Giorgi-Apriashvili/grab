@@ -1,11 +1,18 @@
 #include "server_ops.hpp"
 
 #include "conn_budget.hpp"
+#include "engine.hpp"
 #include "process.hpp"
 #include "remote.hpp"
+#include "sftp.hpp"
+#include "ssh.hpp"
+#include "ssh_find.hpp"
+#include "ssh_pool.hpp"
 #include "util.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <format>
 #include <functional>
 #include <system_error>
@@ -76,37 +83,47 @@ std::expected<Locked, std::string> lock_current(const Env& loaded) {
     return Locked{.lock = std::move(*lock), .env = std::move(env)};
 }
 
-// The server's host key lines via real ssh handshakes, one per key type (see
-// servers::handshake_argv): the fallback for when ssh-keyscan cannot negotiate.
-std::expected<std::vector<std::string>, std::string> handshake_host_key(const std::string& ssh,
-                                                                        const std::string& host, int port,
-                                                                        const std::stop_token& stop) {
-    std::error_code ec;
-    std::string last_error;
-    std::vector<std::string> lines;
-    for (const auto& algorithm : servers::handshake_key_algorithms()) {
-        if (stop.stop_requested()) return util::fail("cancelled");
-        // A fresh record file each time: once a host is known with one key type, accept-new
-        // would not record another.
-        const auto record = std::filesystem::temp_directory_path() /
-                            util::path_from_utf8(std::format("grab-hostkey-{}-{}-{}.txt", host, port, algorithm));
-        std::filesystem::remove(record, ec);
-        auto run = proc::run_capture(servers::handshake_argv(ssh, host, port, record, algorithm), quiet(stop));
-        auto text = util::read_file(record);
-        std::filesystem::remove(record, ec);
-        if (!run) return util::fail(run.error());
-        if (auto why = first_line(run->err); !why.empty()) last_error = why;
-        if (text) {
-            for (auto& l : servers::parse_keyscan(*text)) {
-                if (std::ranges::find(lines, l) == lines.end()) lines.push_back(std::move(l));
-            }
+// Whether a remote in the rclone.conf in use (as it is now) still needs host:port's keys in grab's
+// known_hosts: the remote of a grab server but `except` (two logins on one machine share its host
+// keys), or any remote whose known_hosts_file is grab's, such as one an explicit rclone_config
+// keeps after its server left grab. Host names as written, as known_hosts readers compare them.
+// An rclone.conf that can't be read counts as needing them.
+bool used_by_another(const Env& env, std::string_view host, int port, std::string_view except) {
+    auto text = util::read_file_if_exists(env.rclone_conf);
+    if (!text) return true;
+    if (!*text) return false;
+    if (is_encrypted_rclone_config(**text)) return true;
+    auto doc = ini::parse(**text);
+    if (!doc) return true;
+    const std::string grab_known = util::to_lower(util::path_to_utf8(env.known_hosts.lexically_normal()));
+    for (const auto& section : doc->sections) {
+        if (section.name.empty()) continue;
+        const auto at = section.get("host");
+        if (!at || util::trim(*at) != host) continue;
+        int other_port = 22;
+        if (const auto p = section.get("port"); p && !util::trim(*p).empty()) {
+            const auto v = util::trim(*p);
+            if (std::from_chars(v.data(), v.data() + v.size(), other_port).ec != std::errc{}) continue;
         }
+        if (other_port != port) continue;
+        const bool grab_server = std::ranges::any_of(env.cfg.remotes,
+                                                     [&](const auto& r) { return r.name != except && r.rclone_remote == section.name; });
+        const auto file = section.get("known_hosts_file");
+        const bool uses_grab_file =
+            file && !util::trim(*file).empty() &&
+            util::to_lower(util::path_to_utf8(util::path_from_utf8(util::trim(*file)).lexically_normal())) == grab_known;
+        if (grab_server || uses_grab_file) return true;
     }
-    if (lines.empty()) {
-        return util::failf("could not read a host key from {}:{}{}", host, port,
-                           last_error.empty() ? "" : ": " + last_error);
-    }
-    return lines;
+    return false;
+}
+
+// host:port's keys out of grab's known_hosts once no remote needs them but the grab server
+// `except`'s (review G87): why not, else "".
+std::string forget_unused_keys(const Env& env, std::string_view host, int port, std::string_view except) {
+    if (host.empty() || used_by_another(env, host, port, except)) return {};
+    auto forgot = forget_host_keys(env.known_hosts, host, port);
+    return forgot ? std::string{} : std::format("its host keys could not be removed from {}: {}",
+                                                util::path_to_utf8(env.known_hosts), forgot.error());
 }
 
 bool truthy(std::string_view v) {
@@ -236,7 +253,8 @@ std::vector<ServerInfo> list_servers(const Env& env) {
                         : remote->key_file    ? servers::Auth::key_file
                                               : servers::Auth::password;
             info.key_file = remote->key_file.value_or("");
-            info.ssh_search = resolve_find_method(s, *remote) == FindMethod::ssh;
+            info.engine = effective_engine(s);
+            info.search = std::string(search_method(s, *remote, info.engine));
             info.host_key_pinned = remote->known_hosts_file.has_value();
             info.default_connections = budget::default_budget(remote->host);
         }
@@ -247,34 +265,53 @@ std::vector<ServerInfo> list_servers(const Env& env) {
 
 // ---- host keys -----------------------------------------------------------------------------
 
-std::expected<HostKeys, std::string> scan_host_keys(const std::string& ssh, const std::string& host, int port,
-                                                    std::stop_token stop) {
+std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port, std::stop_token stop) {
+    auto scanned = ssh::scan_host_keys(host, port, std::chrono::seconds(10), std::move(stop));
+    if (!scanned) return util::fail(scanned.error());
     HostKeys keys;
-    auto scan = proc::run_capture(servers::keyscan_argv(host, port), quiet(stop));
-    if (stop.stop_requested()) return util::fail("cancelled");
-    if (scan) keys.lines = servers::parse_keyscan(scan->out);
-    if (keys.lines.empty()) {
-        auto shake = handshake_host_key(ssh, host, port, stop);
-        if (!shake) return util::fail(shake.error());
-        keys.lines = std::move(*shake);
-    }
-    auto opts = quiet(stop);
-    opts.input = util::join(keys.lines, "\n") + "\n";
-    if (auto fp = proc::run_capture(std::vector<std::string>{"ssh-keygen", "-lf", "-"}, opts)) {
-        keys.fingerprints = servers::parse_fingerprints(fp->out);
+    for (const auto& key : *scanned) {
+        keys.lines.push_back(ssh::known_host_line(host, port, key));
+        keys.fingerprints.push_back(servers::Fingerprint{.hash = key.fingerprint, .type = servers::key_label(key.type)});
     }
     return keys;
 }
 
-std::expected<void, std::string> pin_host_keys(const std::filesystem::path& known_hosts,
-                                               const std::vector<std::string>& lines) {
+namespace {
+
+// known_hosts changed by `edit` under the settings lock, written in one step when it changed. One
+// that can't be read is never replaced: every other server's pins would go with it (review G89).
+std::expected<void, std::string> edit_known_hosts(const std::filesystem::path& known_hosts,
+                                                  const std::function<std::string(std::string_view)>& edit) {
     auto lock = lock_settings();
     if (!lock) return util::fail(lock.error());
     auto existing = util::read_file_if_exists(known_hosts);
-    // One that can't be read is never replaced by the new lines alone: every other server's
-    // pins would go with it (review G89).
     if (!existing) return util::fail(existing.error());
-    return util::write_file_atomic(known_hosts, servers::merge_known_hosts(existing->value_or(""), lines));
+    const std::string before = existing->value_or("");
+    std::string after = edit(before);
+    if (after == before && (existing->has_value() || after.empty())) return {}; // nothing to write
+    return util::write_file_atomic(known_hosts, after);
+}
+
+} // namespace
+
+std::expected<void, std::string> pin_host_keys(const std::filesystem::path& known_hosts, std::string_view host,
+                                               int port, const std::vector<std::string>& lines) {
+    if (lines.empty()) return util::failf("no host keys of {}:{} to pin", host, port);
+    for (const auto& line : lines) {
+        const auto t = util::trim(line);
+        const auto names = util::split(t.substr(0, t.find_first_of(" \t")), ',');
+        if (std::ranges::none_of(names, [&](const std::string& n) { return servers::names_host(n, host, port); })) {
+            return util::failf("the host keys to pin aren't {}:{}'s; read them again", host, port);
+        }
+    }
+    return edit_known_hosts(known_hosts, [&](std::string_view text) {
+        return servers::merge_known_hosts(servers::forget_host(text, host, port), lines);
+    });
+}
+
+std::expected<void, std::string> forget_host_keys(const std::filesystem::path& known_hosts, std::string_view host,
+                                                  int port) {
+    return edit_known_hosts(known_hosts, [&](std::string_view text) { return servers::forget_host(text, host, port); });
 }
 
 std::expected<ini::Document, std::string> read_rclone_conf(const Env& env) {
@@ -313,7 +350,9 @@ std::expected<std::string, std::string> add_server(const Env& loaded, const serv
     if (!rclone_doc) return util::fail(rclone_doc.error());
     if (auto why = name_taken(env, *rclone_doc, s.name)) return util::fail(*why);
 
-    if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return util::fail(pinned.error());
+    if (auto pinned = pin_host_keys(env.known_hosts, s.host, s.port, keys.lines); !pinned) {
+        return util::fail(pinned.error());
+    }
     std::error_code ec;
     std::filesystem::create_directories(env.rclone_conf.parent_path(), ec);
     // grab's own rclone.conf gets no secret (nor does the command line): the store keeps it.
@@ -437,8 +476,12 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     }
     const bool own = !env.cfg.rclone_config; // own: the secret goes to the store, not rclone.conf
     auto updates = rclone_edit_updates(*section, wanted, own ? std::nullopt : obscured_secret);
+    // The address it had, whose keys go once it has moved and no other server is there.
+    const auto before = load_rclone_remote(env.rclone_conf, settings->rclone_remote);
     if (keys) {
-        if (auto pinned = pin_host_keys(env.known_hosts, keys->lines); !pinned) return util::fail(pinned.error());
+        if (auto pinned = pin_host_keys(env.known_hosts, wanted.host, wanted.port, keys->lines); !pinned) {
+            return util::fail(pinned.error());
+        }
         const std::string known = util::path_to_utf8(env.known_hosts);
         if (section->get("known_hosts_file").value_or("") != known) updates.emplace_back("known_hosts_file", known);
     }
@@ -447,14 +490,20 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
                                      quiet());
         if (!ok(run)) return run_failed("rclone config update", run);
     }
-    std::string note;
+    std::vector<std::string> notes;
+    if (before && (before->host != wanted.host || before->port != wanted.port)) {
+        if (auto why = forget_unused_keys(env, before->host, before->port, wanted.name); !why.empty()) {
+            notes.push_back(std::move(why));
+        }
+    }
     if (own) {
         auto kept = change_secrets(env, [&](secrets::Store& st) {
             apply_auth(st, settings->rclone_remote, wanted.auth, obscured_secret);
         });
         if (!kept) return util::fail(kept.error());
-        note = std::move(*kept);
+        if (!kept->empty()) notes.push_back(std::move(*kept));
     }
+    const std::string note = util::join(notes, "; ");
 
     std::string text = servers::set_value(env.grab_text, wanted.name, "search_roots",
                                           search_roots_value(wanted.search_roots));
@@ -467,8 +516,8 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     servers::NewServer described = wanted;
     described.name = settings->rclone_remote;
     RcloneRemote remote = servers::to_remote(described, {});
-    text = servers::replace_lead_in(text, wanted.name,
-                                    std::format("# rclone remote [{}]: {}", remote.name, describe_remote(remote)));
+    text = servers::replace_lead_in(
+        text, wanted.name, std::format("# rclone remote [{}]: {}", remote.name, describe_remote(remote, *settings)));
     if (auto written = write_grab_conf(env, text); !written) return util::fail(written.error());
     return note;
 }
@@ -479,7 +528,9 @@ std::expected<void, std::string> trust_server(const Env& loaded, std::string_vie
     const Env& env = locked->env;
     const auto* s = find_server(env.cfg, name);
     if (s == nullptr) return util::failf("no server called {} in grab.conf", name);
-    if (auto pinned = pin_host_keys(env.known_hosts, keys.lines); !pinned) return pinned;
+    auto remote = load_rclone_remote(env.rclone_conf, s->rclone_remote);
+    if (!remote) return util::fail(remote.error());
+    if (auto pinned = pin_host_keys(env.known_hosts, remote->host, remote->port, keys.lines); !pinned) return pinned;
     auto updated = proc::run_capture(servers::update_argv(env.rclone, env.rclone_conf, s->rclone_remote,
                                                           "known_hosts_file", util::path_to_utf8(env.known_hosts)),
                                      quiet());
@@ -494,6 +545,7 @@ std::expected<std::string, std::string> remove_server(const Env& loaded, std::st
     const auto* s = find_server(env.cfg, name);
     if (s == nullptr) return util::failf("no server called {} in grab.conf", name);
     const std::string rclone_name = s->rclone_remote;
+    const auto remote = load_rclone_remote(env.rclone_conf, rclone_name); // its address, for its keys
     std::string text = servers::remove_section(env.grab_text, name);
     if (env.cfg.default_remote == name) {
         std::string next;
@@ -506,10 +558,21 @@ std::expected<std::string, std::string> remove_server(const Env& loaded, std::st
         text = servers::set_value(text, "grab", "default_remote", next);
     }
     if (auto written = write_grab_conf(env, text); !written) return util::fail(written.error());
-    // Only grab's own rclone.conf is edited; an explicitly configured shared one is left alone.
-    if (env.cfg.rclone_config) return std::string{};
     // The server is gone from grab either way; what couldn't be cleaned up is said.
     std::vector<std::string> notes;
+    // Then its host keys leave grab's own known_hosts unless a remote still needs them (review G87):
+    // one left in an explicit rclone_config keeps them when it points at grab's known_hosts.
+    auto forget_keys = [&] {
+        if (!remote) return;
+        if (auto why = forget_unused_keys(env, remote->host, remote->port, name); !why.empty()) {
+            notes.push_back(std::move(why));
+        }
+    };
+    // Only grab's own rclone.conf is edited; an explicitly configured shared one is left alone.
+    if (env.cfg.rclone_config) {
+        forget_keys();
+        return util::join(notes, "; ");
+    }
     if (auto forgot = change_secrets(env, [&](secrets::Store& st) { st.erase(rclone_name); }, rclone_name); !forgot) {
         notes.push_back(std::format("its saved password could not be removed: {}", forgot.error()));
     } else if (!forgot->empty()) {
@@ -520,6 +583,7 @@ std::expected<std::string, std::string> remove_server(const Env& loaded, std::st
         notes.push_back(std::format("rclone config delete {} failed: {}", rclone_name,
                                     deleted ? clean_rclone_error(deleted->err) : deleted.error()));
     }
+    forget_keys();
     return util::join(notes, "; ");
 }
 
@@ -530,6 +594,42 @@ std::expected<void, std::string> set_default(const Env& loaded, std::string_view
     if (find_server(env.cfg, name) == nullptr) return util::failf("no server called {} in grab.conf", name);
     return write_grab_conf(env, servers::set_value(env.grab_text, "grab", "default_remote", name));
 }
+
+namespace {
+
+// engine = grab's part of a test: a login through grab's own client (the target downloads use),
+// the home folder listed, then the find check on that connection, which says how searches go.
+// Nothing is set when stopped.
+void test_grab(const engine::Context& ctx, const std::stop_token& stop, TestResult& result) {
+    auto failed = [&](std::string why) {
+        result.grab_ok = false;
+        result.grab_error = std::move(why);
+    };
+    auto target = engine::ssh_target(ctx);
+    if (!target) return failed(target.error());
+    ssh::Pool::Options options;
+    options.limit = 1;
+    options.idle_timer = false;
+    ssh::Pool pool([&target] { return ssh::open_session(*target); }, options);
+    try {
+        auto lease = pool.acquire(stop, ssh::interactive_retry);
+        if (!lease) return;
+        if (auto listed = sftp::list((*lease)->sftp(), "."); !listed) {
+            return failed("its home folder can't be listed: " + sftp::describe(listed.error()));
+        }
+    } catch (const ssh::Error& e) {
+        return failed(e.what());
+    } catch (const sftp::Broken& e) {
+        return failed(e.what());
+    }
+    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry);
+    if (stop.stop_requested()) return;
+    if (!way) return failed(way.error());
+    result.grab_ok = true;
+    result.grab_search = engine::lookup_text(ctx, *way);
+}
+
+} // namespace
 
 std::expected<TestResult, std::string> test_connection(const Env& env, std::string_view name,
                                                        std::stop_token stop) {
@@ -547,7 +647,17 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
         if (!env.secrets_error.empty()) result.rclone_error += " (" + env.secrets_error + ")";
     }
 
-    if (resolve_find_method(*s, *remote) == FindMethod::ssh) {
+    if (effective_engine(*s) == Engine::grab) {
+        const engine::Context ctx{.config = env.cfg,
+                                  .settings = *s,
+                                  .remote = *remote,
+                                  .method = resolve_find_method(*s, *remote),
+                                  .imported = {},
+                                  .engine = Engine::grab,
+                                  .grab_method = resolve_grab_method(*s, *remote)};
+        test_grab(ctx, stop, result);
+        if (stop.stop_requested()) return util::fail("cancelled");
+    } else if (resolve_find_method(*s, *remote) == FindMethod::ssh) {
         std::vector<std::string> options{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"};
         options.insert(options.end(), s->ssh_options.begin(), s->ssh_options.end());
         auto ssh = proc::run_capture(build_ssh_argv(env.cfg.ssh, *remote, options, "echo grab-ok"), quiet(stop));

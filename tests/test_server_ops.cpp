@@ -11,10 +11,13 @@
 #include <windows.h> // IWYU pragma: keep (LockFileEx, SetFileAttributesW)
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -228,12 +231,13 @@ TEST_CASE("server list from grab.conf and rclone.conf") {
     CHECK(list[0].is_default);
     CHECK(list[0].auth == Auth::password);
     CHECK(list[0].host_key_pinned);
-    CHECK_FALSE(list[0].ssh_search);
+    CHECK(list[0].engine == Engine::rclone);
+    CHECK(list[0].search == "rclone");
     CHECK(list[0].search_roots == std::vector<std::string>{"/home/movies"});
     CHECK(list[1].name == "agent");
     CHECK_FALSE(list[1].is_default);
     CHECK(list[1].auth == Auth::agent);
-    CHECK(list[1].ssh_search);
+    CHECK(list[1].search == "ssh");
     CHECK_FALSE(list[1].host_key_pinned);
     CHECK(list[1].max_depth == 6);
     CHECK(list[1].error.empty());
@@ -372,10 +376,101 @@ TEST_CASE("a new server's name is checked against an rclone.conf that has to be 
     auto nas = server(Auth::agent);
     nas.name = "nas";
     nas.host = "new.example.invalid";
-    const server_ops::HostKeys keys{.lines = {"new.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}, .fingerprints = {}};
+    const server_ops::HostKeys keys{.lines = {"[new.example.invalid]:23 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}, .fingerprints = {}};
     CHECK_FALSE(server_ops::add_server(*env, nas, std::nullopt, keys).has_value());
     CHECK(s.read("rclone.conf") == broken);
     CHECK(s.read("grab.conf") == grab_conf(s.dir));
+}
+
+TEST_CASE("pinning replaces a host's old keys and keeps every other line (G87)") {
+    Scratch s;
+    const auto file = s.dir / "known_hosts";
+    s.write("known_hosts", "# mine\n"
+                           "[box.example.com]:23 ssh-ed25519 OLD1\n"
+                           "box.example.com,[box.example.com]:23 ssh-rsa OLD2\n"
+                           "[other.example.com]:23 ssh-ed25519 KEEP\n");
+    REQUIRE(server_ops::pin_host_keys(file, "box.example.com", 23, {"[box.example.com]:23 ssh-ed25519 NEW"}));
+    CHECK(s.read("known_hosts") == "# mine\n"
+                                   "box.example.com ssh-rsa OLD2\n"
+                                   "[other.example.com]:23 ssh-ed25519 KEEP\n"
+                                   "[box.example.com]:23 ssh-ed25519 NEW\n");
+    // Keys read for another address, or none, are refused, and nothing changes.
+    const auto before = s.read("known_hosts");
+    CHECK_FALSE(server_ops::pin_host_keys(file, "box.example.com", 23, {"box.example.com ssh-ed25519 PORT22"}));
+    CHECK_FALSE(server_ops::pin_host_keys(file, "box.example.com", 23, {}));
+    CHECK(s.read("known_hosts") == before);
+    REQUIRE(server_ops::forget_host_keys(file, "box.example.com", 23));
+    CHECK(s.read("known_hosts") == "# mine\nbox.example.com ssh-rsa OLD2\n[other.example.com]:23 ssh-ed25519 KEEP\n");
+    // A missing known_hosts has nothing to forget, and isn't made.
+    REQUIRE(server_ops::forget_host_keys(s.dir / "none", "box.example.com", 23));
+    CHECK_FALSE(std::filesystem::exists(s.dir / "none"));
+}
+
+namespace {
+// A second login on box's host and port (the same machine): its host keys are box's too.
+constexpr std::string_view twin_remote =
+    "\n[twin]\ntype = sftp\nhost = box.example.com\nport = 23\nuser = u2\nkey_use_agent = true\n";
+} // namespace
+
+TEST_CASE("removing a server takes its host keys out, unless another server is at its host and port (G87)") {
+    // grab's own known_hosts in the test runner's scratch APPDATA (test_main.cpp).
+    const auto known = grab_known_hosts_path();
+    REQUIRE(util::path_to_utf8(known).find("grab-tests-home") != std::string::npos);
+    std::filesystem::create_directories(known.parent_path());
+    Scratch s;
+    s.write("rclone.conf", rclone_conf + std::string(twin_remote));
+    s.write("grab.conf", grab_conf(s.dir) + "\n[twin]\n");
+    const std::string others = "[box.example.com]:2222 ssh-ed25519 OTHERPORT\nunrelated.example ssh-ed25519 KEEP\n";
+    std::ofstream(known, std::ios::binary) << "[box.example.com]:23 ssh-ed25519 BOX\n"
+                                              "h.example.com ssh-ed25519 H\n"
+                                              "[h.example.com]:22 ssh-rsa H22\n" + others;
+    auto remove = [&](const char* name) {
+        auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+        REQUIRE(env.has_value());
+        // An explicit rclone_config: the remote stays there, but its known_hosts_file isn't
+        // grab's, so it doesn't need grab's keys.
+        auto note = server_ops::remove_server(*env, name);
+        REQUIRE(note.has_value());
+        CHECK(note->empty());
+        return util::read_file(known).value_or("");
+    };
+    // twin is still at box's host and port: the keys stay.
+    CHECK(remove("box").find("[box.example.com]:23 ssh-ed25519 BOX\n") != std::string::npos);
+    // Now nobody is.
+    CHECK(remove("twin").find("BOX") == std::string::npos);
+    // Port 22: the plain host's line and [host]:22's.
+    CHECK(remove("agent") == others);
+    CHECK(s.read("rclone.conf") == rclone_conf + std::string(twin_remote));
+    std::filesystem::remove(known);
+}
+
+TEST_CASE("a remote that points at grab's known_hosts keeps its host's keys when a server is removed (G87)") {
+    const auto known = grab_known_hosts_path();
+    REQUIRE(util::path_to_utf8(known).find("grab-tests-home") != std::string::npos);
+    std::filesystem::create_directories(known.parent_path());
+    Scratch s;
+    // box's remote uses grab's known_hosts, as `grab server add` makes it; [mine] isn't a grab
+    // server's, but uses grab's known_hosts too (spelled in capitals: the same file all the same).
+    std::string conf = rclone_conf;
+    conf.replace(conf.find("C:\\kh"), 5, util::path_to_utf8(known));
+    std::string upper = util::path_to_utf8(known);
+    std::ranges::transform(upper, upper.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    conf += "\n[mine]\ntype = sftp\nhost = h.example.com\nuser = me\nknown_hosts_file = " + upper + "\n";
+    s.write("rclone.conf", conf);
+    s.write("grab.conf", grab_conf(s.dir));
+    const std::string pins = "[box.example.com]:23 ssh-ed25519 BOX\nh.example.com ssh-ed25519 H\n";
+    std::ofstream(known, std::ios::binary) << pins;
+    for (const char* name : {"box", "agent"}) {
+        auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+        REQUIRE(env.has_value());
+        auto note = server_ops::remove_server(*env, name);
+        REQUIRE(note.has_value());
+        CHECK(note->empty());
+    }
+    // box's remote stays in the explicit rclone_config, still trusting grab's keys; [mine] too.
+    CHECK(util::read_file(known).value_or("") == pins);
+    CHECK(s.read("rclone.conf") == conf);
+    std::filesystem::remove(known);
 }
 
 #ifdef _WIN32
@@ -390,13 +485,16 @@ TEST_CASE("a known_hosts that can't be read is never replaced by the new pins al
     REQUIRE(other != INVALID_HANDLE_VALUE);
     OVERLAPPED at{};
     REQUIRE(LockFileEx(other, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 100000, 0, &at));
-    const auto result = server_ops::pin_host_keys(file, {"new.example.invalid ssh-ed25519 BBBB"});
+    const auto result = server_ops::pin_host_keys(file, "new.example.invalid", 22, {"new.example.invalid ssh-ed25519 BBBB"});
+    const auto forgot = server_ops::forget_host_keys(file, "other.example.invalid", 22);
     UnlockFileEx(other, 0, 100000, 0, &at);
     CloseHandle(other);
     CHECK_FALSE(result.has_value());
+    CHECK_FALSE(forgot.has_value());
     CHECK(s.read("known_hosts") == pinned);
     // A missing one is simply started.
-    REQUIRE(server_ops::pin_host_keys(s.dir / "new_known_hosts", {"new.example.invalid ssh-ed25519 BBBB"}).has_value());
+    REQUIRE(server_ops::pin_host_keys(s.dir / "new_known_hosts", "new.example.invalid", 22,
+                                      {"new.example.invalid ssh-ed25519 BBBB"}).has_value());
     CHECK(s.read("new_known_hosts").find("new.example.invalid ssh-ed25519 BBBB") != std::string::npos);
 }
 
@@ -416,7 +514,7 @@ TEST_CASE("an add that fails after rclone made the remote takes it out again, so
     auto fresh = server(Auth::agent);
     fresh.name = "fresh";
     fresh.host = "fresh.example.invalid";
-    const server_ops::HostKeys keys{.lines = {"fresh.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}, .fingerprints = {}};
+    const server_ops::HostKeys keys{.lines = {"[fresh.example.invalid]:23 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"}, .fingerprints = {}};
 
     // grab.conf can't be replaced (read-only), so the last step fails.
     const auto conf = s.dir / "grab.conf";
@@ -435,6 +533,87 @@ TEST_CASE("an add that fails after rclone made the remote takes it out again, so
     CHECK(s.read("rclone.conf").find("[fresh]") != std::string::npos);
     CHECK(s.read("grab.conf").find("[fresh]") != std::string::npos);
     std::filesystem::remove(grab_known_hosts_path(), ec);
+}
+
+TEST_CASE("an edit to another host or port takes the old one's keys out, unless another server is there (G87)") {
+    const auto rclone_dir = util::self_exe_path().parent_path().parent_path();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(rclone_dir / "rclone.exe", ec)) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    const auto known = grab_known_hosts_path();
+    REQUIRE(util::path_to_utf8(known).find("grab-tests-home") != std::string::npos);
+    std::filesystem::create_directories(known.parent_path());
+    Scratch s;
+    s.write("rclone.conf", rclone_conf + std::string(twin_remote));
+    s.write("grab.conf", grab_conf(s.dir) + "\n[twin]\n");
+    std::ofstream(known, std::ios::binary) << "[box.example.com]:23 ssh-ed25519 BOX\nh.example.com ssh-ed25519 H\n";
+    auto load = [&] {
+        auto env = server_ops::load_env(s.dir / "grab.conf", rclone_dir);
+        REQUIRE(env.has_value());
+        return std::move(*env);
+    };
+    auto pins = [&] { return util::read_file(known).value_or(""); };
+
+    // agent moves to another port, with its keys there: the old port's go.
+    NewServer agent;
+    agent.name = "agent";
+    agent.host = "h.example.com";
+    agent.port = 2200;
+    agent.user = "me";
+    agent.auth = Auth::agent;
+    agent.max_depth = 6;
+    auto done = server_ops::update_server(load(), agent, std::nullopt,
+                                          server_ops::HostKeys{.lines = {"[h.example.com]:2200 ssh-ed25519 H2200"}, .fingerprints = {}});
+    REQUIRE_MESSAGE(done.has_value(), done.error_or(""));
+    CHECK(done->empty());
+    CHECK(pins() == "[box.example.com]:23 ssh-ed25519 BOX\n[h.example.com]:2200 ssh-ed25519 H2200\n");
+
+    // box moves to another host; twin stays at the old one, whose keys stay.
+    NewServer box = server(Auth::agent);
+    box.host = "box2.example.com";
+    done = server_ops::update_server(load(), box, std::nullopt,
+                                     server_ops::HostKeys{.lines = {"[box2.example.com]:23 ssh-ed25519 BOX2"}, .fingerprints = {}});
+    REQUIRE_MESSAGE(done.has_value(), done.error_or(""));
+    CHECK(pins() == "[box.example.com]:23 ssh-ed25519 BOX\n[h.example.com]:2200 ssh-ed25519 H2200\n"
+                    "[box2.example.com]:23 ssh-ed25519 BOX2\n");
+
+    // Trusting twin again replaces its host and port's keys.
+    REQUIRE(server_ops::trust_server(load(), "twin",
+                                     server_ops::HostKeys{.lines = {"[box.example.com]:23 ssh-ed25519 BOXNEW"}, .fingerprints = {}}));
+    CHECK(pins() == "[h.example.com]:2200 ssh-ed25519 H2200\n[box2.example.com]:23 ssh-ed25519 BOX2\n"
+                    "[box.example.com]:23 ssh-ed25519 BOXNEW\n");
+    CHECK(s.read("rclone.conf").find("known_hosts_file = " + util::path_to_utf8(known)) != std::string::npos);
+    std::filesystem::remove(known, ec);
+}
+
+TEST_CASE("removing a server from grab's own rclone.conf deletes its remote, and with it its host keys (G87)") {
+    const auto rclone_dir = util::self_exe_path().parent_path().parent_path();
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(rclone_dir / "rclone.exe", ec)) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    const auto own = grab_rclone_config_path();
+    const auto known = grab_known_hosts_path();
+    REQUIRE(util::path_to_utf8(own).find("grab-tests-home") != std::string::npos);
+    std::filesystem::create_directories(own.parent_path());
+    std::ofstream(own, std::ios::binary) << "[box]\ntype = sftp\nhost = box.example.com\nport = 23\nuser = u1\n"
+                                            "key_use_agent = true\nknown_hosts_file = " + util::path_to_utf8(known) + "\n";
+    std::ofstream(known, std::ios::binary) << "[box.example.com]:23 ssh-ed25519 BOX\nh.example.com ssh-ed25519 H\n";
+    Scratch s;
+    s.write("grab.conf", "[grab]\ndefault_remote = box\n\n[box]\nmax_depth = 4\n");
+    auto env = server_ops::load_env(s.dir / "grab.conf", rclone_dir);
+    REQUIRE(env.has_value());
+    auto note = server_ops::remove_server(*env, "box");
+    REQUIRE(note.has_value());
+    CHECK_MESSAGE(note->empty(), *note);
+    CHECK(util::read_file(own).value_or("").find("[box]") == std::string::npos);
+    CHECK(util::read_file(known).value_or("") == "h.example.com ssh-ed25519 H\n");
+    std::filesystem::remove(own, ec);
+    std::filesystem::remove(secrets::path_beside(own), ec);
+    std::filesystem::remove(known, ec);
 }
 #endif
 

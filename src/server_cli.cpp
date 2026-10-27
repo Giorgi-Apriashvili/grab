@@ -45,19 +45,15 @@ bool confirm(std::string_view prompt) {
     return lower == "y" || lower == "yes";
 }
 
-// Scans the server's host keys, shows their fingerprints and asks to trust them.
-std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::string& ssh, const std::string& host,
-                                                                int port) {
+// Scans the server's host keys, shows their fingerprints and asks to trust them. Nothing is
+// written before the yes.
+std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::string& host, int port) {
     std::println(stderr, "Fetching the host key of {}:{} ...", host, port);
-    auto keys = server_ops::scan_host_keys(ssh, host, port);
+    auto keys = server_ops::scan_host_keys(host, port);
     if (!keys) return keys;
 
     std::println(stderr, "\nThe server presents these keys:");
-    if (keys->fingerprints.empty()) {
-        for (const auto& l : keys->lines) std::println(stderr, "  {}", l);
-    } else {
-        for (const auto& f : keys->fingerprints) std::println(stderr, "  {:<8} {}", f.type, f.hash);
-    }
+    for (const auto& f : keys->fingerprints) std::println(stderr, "  {:<8} {}", f.type, f.hash);
     std::println(stderr, "Compare with the fingerprint your provider shows, or run on the server:");
     std::println(stderr, "  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub\n");
     if (!confirm("Trust this server?")) return util::fail("host key not trusted; nothing was changed");
@@ -84,8 +80,13 @@ int server_list(const Env& env) {
                                                                : "password";
         const std::string hostkey =
             s.host_key_pinned ? "host key pinned" : "host key NOT checked (grab server trust " + s.name + ")";
-        std::println("{} {:<14} {}@{}:{}  {}, search via {}, {}", mark, s.name, s.user, s.host, s.port, auth,
-                     s.ssh_search ? "ssh" : "rclone", hostkey);
+        // engine = grab: grab's own client, with find or by listing folders.
+        const char* search = s.search == "ssh"    ? "search via ssh"
+                             : s.search == "rclone" ? "search via rclone"
+                             : s.search == "find"   ? "engine grab, search with find"
+                             : s.search == "walk"   ? "engine grab, search by listing folders"
+                                                    : "engine grab, search with find or by listing folders";
+        std::println("{} {:<14} {}@{}:{}  {}, {}, {}", mark, s.name, s.user, s.host, s.port, auth, search, hostkey);
     }
     return exit_ok;
 }
@@ -201,7 +202,7 @@ int server_add(const Env& env, const std::string& prefill) {
     s.max_depth = *parse_int(*depth, 1, 64);
 
     // Host key first: nothing is written unless the user trusts the server.
-    auto keys = fetch_host_key(env.cfg.ssh, s.host, s.port);
+    auto keys = fetch_host_key(s.host, s.port);
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -238,7 +239,13 @@ int server_add(const Env& env, const std::string& prefill) {
         error(test.error());
         return exit_config;
     }
-    std::println(stderr, "  rclone (downloads): {}", test->rclone_ok ? "OK" : "FAILED: " + test->rclone_error);
+    // engine = grab: grab's own client downloads and searches; rclone still verifies and previews.
+    std::println(stderr, "  rclone ({}): {}", test->grab_ok ? "verify, previews" : "downloads",
+                 test->rclone_ok ? "OK" : "FAILED: " + test->rclone_error);
+    if (test->grab_ok) {
+        std::println(stderr, "  grab (downloads, searches): {}",
+                     *test->grab_ok ? "OK, searches " + test->grab_search : "FAILED: " + test->grab_error);
+    }
     if (test->ssh_ok) {
         std::string why = test->ssh_error;
         if (s.auth == servers::Auth::key_file && secret) {
@@ -267,7 +274,7 @@ int server_trust(const Env& env, const std::string& name) {
         error(remote.error());
         return exit_config;
     }
-    auto keys = fetch_host_key(env.cfg.ssh, remote->host, remote->port);
+    auto keys = fetch_host_key(remote->host, remote->port);
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -276,7 +283,9 @@ int server_trust(const Env& env, const std::string& name) {
         error(trusted.error());
         return exit_config;
     }
-    std::println(stderr, "Pinned the host key of {}; ssh and rclone now refuse a server that presents another.",
+    std::println(stderr,
+                 "Pinned the host key of {} in place of any it had; grab, ssh and rclone now refuse a server that "
+                 "presents another.",
                  name);
     return exit_ok;
 }

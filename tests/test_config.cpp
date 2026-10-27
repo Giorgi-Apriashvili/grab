@@ -403,6 +403,35 @@ TEST_CASE("agent remotes are searched over ssh") {
     CHECK(describe_remote(*r).find("ssh-agent") != std::string::npos);
 }
 
+TEST_CASE("a server's search method as lists and comments name it, per engine") {
+    RcloneRemote key;
+    key.user = "u";
+    key.host = "h";
+    key.key_file = "E:\\k.pem";
+    RcloneRemote box;
+    box.user = "u1";
+    box.host = "u1.your-storagebox.de";
+    box.port = 23;
+    RemoteSettings s;
+    CHECK(search_method(s, key, Engine::rclone) == "ssh");
+    CHECK(search_method(s, box, Engine::rclone) == "rclone");
+    CHECK(search_method(s, key, Engine::grab) == "probe");
+    CHECK(search_method(s, box, Engine::grab) == "walk"); // a Storage Box isn't asked
+    s.find = FindMethod::ssh;
+    CHECK(search_method(s, box, Engine::grab) == "find");
+    s.find = FindMethod::rclone;
+    CHECK(search_method(s, key, Engine::grab) == "walk");
+
+    // grab.conf's comment follows the section's own engine and find setting.
+    CHECK(describe_remote(key) == "u@h:22, key file, lookup via ssh + find");
+    RemoteSettings grab;
+    grab.engine = Engine::grab;
+    CHECK(describe_remote(key, grab) == "u@h:22, key file, lookup with find, else by listing folders");
+    CHECK(describe_remote(box, grab) == "u1@u1.your-storagebox.de:23, password, lookup by listing folders");
+    grab.find = FindMethod::ssh;
+    CHECK(describe_remote(key, grab) == "u@h:22, key file, lookup with find");
+}
+
 TEST_CASE("a remote named grab gets a non-colliding section name") {
     auto rclone = ini::parse("[grab]\ntype = sftp\nhost = h\nuser = u\n");
     REQUIRE(rclone.has_value());

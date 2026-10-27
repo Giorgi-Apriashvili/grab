@@ -487,6 +487,44 @@ std::string to_lower(std::string_view s) {
     return out;
 }
 
+namespace {
+constexpr std::string_view base64_digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+} // namespace
+
+std::string base64_encode(std::string_view bytes) {
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const std::size_t n = std::min<std::size_t>(3, bytes.size() - i);
+        std::uint32_t group = 0;
+        for (std::size_t k = 0; k < 3; ++k) {
+            group = (group << 8) | (k < n ? static_cast<unsigned char>(bytes[i + k]) : 0U);
+        }
+        for (std::size_t k = 0; k < 4; ++k) {
+            out += k <= n ? base64_digits[(group >> (18 - 6 * k)) & 0x3F] : '=';
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> base64_decode(std::string_view text) {
+    while (text.ends_with('=')) text.remove_suffix(1);
+    std::string out;
+    std::uint32_t acc = 0;
+    int bits = 0;
+    for (const char c : text) {
+        const auto v = base64_digits.find(c);
+        if (v == std::string_view::npos) return std::nullopt;
+        acc = (acc << 6) | static_cast<std::uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 std::optional<std::int64_t> parse_unix_time(std::string_view text) {
     if (const auto dot = text.find('.'); dot != std::string_view::npos) {
         const auto fraction = text.substr(dot + 1);

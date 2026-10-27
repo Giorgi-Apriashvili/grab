@@ -40,13 +40,17 @@ struct FindRequest {
 // rather than a name to be searched for.
 [[nodiscard]] bool is_path_target(std::string_view target);
 
-// The `find` command run by the remote shell. Name matching happens on the server: one
+// The `find -L` command run by the remote shell: links are followed, as rclone's listing and
+// grab's walk follow them (review G54). Name matching happens on the server: one
 // `-iname '*word*'` per word, `-iname` for a glob, `-name` for --exact. Files are printed
 // as "<size>\t<mtime>\t<path>\0" (GNU find -printf), folders as "<mtime>\t<path>\0"; <mtime>
 // is %T@, Unix seconds with a fraction.
 [[nodiscard]] std::string build_find_command(const FindRequest& req);
 
-// ssh argv: options first, then user@host, then the remote command as one argument.
+// ssh argv: options first, then user@host, then the remote command as one argument. With a
+// known_hosts_file the host key must be in it (StrictHostKeyChecking=yes), only it is read
+// (GlobalKnownHostsFile=NUL) and ssh never adds keys to it (UpdateHostKeys=no, whatever
+// ~/.ssh/config says), before `ssh_options` so these come first (review G4).
 [[nodiscard]] std::vector<std::string> build_ssh_argv(const std::string& ssh_exe,
                                                       const RcloneRemote& remote,
                                                       std::span<const std::string> ssh_options,

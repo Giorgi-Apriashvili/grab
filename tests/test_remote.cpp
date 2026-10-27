@@ -23,7 +23,7 @@ TEST_CASE("find command: words become one -iname per word, over several roots") 
     req.max_depth = 4;
     req.skip_hidden = true;
     CHECK(build_find_command(req) ==
-          "find '/home/alice' '/srv/my data' -mindepth 1 -maxdepth 4 "
+          "find -L '/home/alice' '/srv/my data' -mindepth 1 -maxdepth 4 "
           "\\( -name '.*' -prune \\) -o -iname '*lioness*' -iname '*s03e08*' -type f -printf '%s\\t%T@\\t%p\\0' "
           "2>/dev/null");
 }
@@ -36,7 +36,7 @@ TEST_CASE("find command: words are glob-escaped and shell-quoted") {
     req.max_depth = 2;
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
-          "find '/home/alice' -mindepth 1 -maxdepth 2 -iname '*movie'\\''s*' -iname '*50%\\]*' "
+          "find -L '/home/alice' -mindepth 1 -maxdepth 2 -iname '*movie'\\''s*' -iname '*50%\\]*' "
           "-type f -printf '%s\\t%T@\\t%p\\0' 2>/dev/null");
 }
 
@@ -48,12 +48,12 @@ TEST_CASE("find command: glob gets -iname, --exact gets -name") {
     req.max_depth = 3;
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
-          "find '/home/alice' -mindepth 1 -maxdepth 3 -iname 'Release*' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
+          "find -L '/home/alice' -mindepth 1 -maxdepth 3 -iname 'Release*' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 
     req.target = "releases";
     req.exact = true;
     CHECK(build_find_command(req) ==
-          "find '/home/alice' -mindepth 1 -maxdepth 3 -name 'releases' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
+          "find -L '/home/alice' -mindepth 1 -maxdepth 3 -name 'releases' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 }
 
 TEST_CASE("looking for a dot-name disables pruning") {
@@ -73,16 +73,16 @@ TEST_CASE("a path target only validates existence and type") {
     req.target = "/home/alice/releases";
     req.roots = {"/ignored"};
     CHECK(build_find_command(req) ==
-          "find '/home/alice/releases' -maxdepth 0 -type d -printf '%T@\\t%p\\0' 2>/dev/null");
+          "find -L '/home/alice/releases' -maxdepth 0 -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 
     req.target = "learning/Course - Intro to Testing - Jane Doe";
     CHECK(build_find_command(req) ==
-          "find 'learning/Course - Intro to Testing - Jane Doe' -maxdepth 0 "
+          "find -L 'learning/Course - Intro to Testing - Jane Doe' -maxdepth 0 "
           "-type d -printf '%T@\\t%p\\0' 2>/dev/null");
 
     req.mode = Mode::file;
     req.target = "/srv/a.mkv";
-    CHECK(build_find_command(req) == "find '/srv/a.mkv' -maxdepth 0 -type f -printf '%s\\t%T@\\t%p\\0' 2>/dev/null");
+    CHECK(build_find_command(req) == "find -L '/srv/a.mkv' -maxdepth 0 -type f -printf '%s\\t%T@\\t%p\\0' 2>/dev/null");
 
     CHECK(is_path_target("/x"));
     CHECK(is_path_target("a/b"));
@@ -97,7 +97,7 @@ TEST_CASE("a blank root searches the login home") {
     req.max_depth = 2;
     req.skip_hidden = false;
     CHECK(build_find_command(req) ==
-          "find . 'projects' -mindepth 1 -maxdepth 2 -iname '*releases*' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
+          "find -L . 'projects' -mindepth 1 -maxdepth 2 -iname '*releases*' -type d -printf '%T@\\t%p\\0' 2>/dev/null");
 }
 
 TEST_CASE("ssh argv: options, identity, known_hosts, extras, host, command") {
@@ -110,9 +110,16 @@ TEST_CASE("ssh argv: options, identity, known_hosts, extras, host, command") {
     const std::vector<std::string> extra{"-o", "ServerAliveInterval=30"};
 
     const auto argv = build_ssh_argv("ssh", rc, extra, "find / -print0");
+#ifdef _WIN32
+    const std::string no_file = "GlobalKnownHostsFile=NUL";
+#else
+    const std::string no_file = "GlobalKnownHostsFile=/dev/null";
+#endif
+    // The known_hosts options come before the user's own, so theirs can't loosen them (G4).
     CHECK(argv == std::vector<std::string>{
                       "ssh", "-T", "-p", "2222", "-i", "E:\\keys\\server.pem", "-o",
                       "IdentitiesOnly=yes", "-o", "UserKnownHostsFile=C:\\Users\\alice\\.ssh\\known_hosts",
+                      "-o", "StrictHostKeyChecking=yes", "-o", no_file, "-o", "UpdateHostKeys=no",
                       "-o", "ServerAliveInterval=30", "alice@203.0.113.10", "find / -print0"});
 }
 

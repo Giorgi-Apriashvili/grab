@@ -28,6 +28,8 @@ default_remote = hetzner
 rclone_remote = hetzner
 # How TARGET is located: auto = ssh + find when the rclone remote has a key_file, otherwise
 # an rclone listing (password remotes and storage boxes have no shell). Force with ssh | rclone.
+# With engine = grab: auto = find where grab's check finds GNU find on the server, else by
+# listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.
 find = auto
 # Comma-separated directories to search: absolute (/srv) or relative to the login home
 # (learning). Blank or . = the home directory itself.
@@ -41,8 +43,10 @@ max_connections =
 # Skip dot-directories such as .cache and .config while searching.
 skip_hidden = true
 # What downloads from this server: rclone, or grab's own SSH client (being built to replace
-# rclone; so far it does file and folder downloads). grab's keeps its connections open between
-# files, never fetches a byte twice, and uses every connection on a folder of small files.
+# rclone; so far it does file and folder downloads, searches, file lists and Browse). grab's
+# keeps its connections open between files, never fetches a byte twice, and uses every
+# connection on a folder of small files. It takes --bind, --contimeout and --timeout from
+# common_flags.
 engine = rclone
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
 ssh_options =
