@@ -1231,6 +1231,10 @@ std::expected<engine::GrabSide, std::string> App::grab_side(const engine::Contex
     connections_.configure(server, connection_budget(server, ctx.remote.host, ctx.settings.max_connections));
     engine::GrabSide side;
     side.pool = pools_.get(server, *target, connections_.budget(server));
+    // The find check as a command or an earlier run left it, beside the learned limits.
+    side.memory = engine::find_memory(limits_path_, *target, [this](const std::expected<void, std::string>& saved) {
+        report_save("the find checks", saved, limits_unsaved_);
+    });
     seat.emplace(connections_, server, stop, 1);
     side.walk_seat = [this, &seat, server, stop] {
         seat.reset();
@@ -1834,7 +1838,7 @@ void App::apply_pending(Pending p, std::stop_token stop) {
     test_server(p.server.name, stop);
 }
 
-void App::test_server(const std::string& name, std::stop_token stop) const {
+void App::test_server(const std::string& name, std::stop_token stop) {
     auto env = load_env();
     if (!env) return settings_error(env.error());
     Value v = Value::make_object();
@@ -1842,6 +1846,9 @@ void App::test_server(const std::string& name, std::stop_token stop) const {
     v.set("name", str(name));
     auto result = server_ops::test_connection(*env, name, stop);
     if (stop.stop_requested()) return;
+    // The test asked the find check again and saved its answer: the window's searches go by that
+    // one now, not the one their pool kept.
+    if (result && result->grab_ok.value_or(false)) pools_.forget_find_check(name);
     if (!result) {
         v.set("ok", Value::make_bool(false));
         v.set("rcloneError", str(result.error()));

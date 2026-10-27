@@ -98,6 +98,12 @@ std::vector<std::string> paths_of(const std::vector<file_list::Entry>& entries) 
     return paths;
 }
 
+// Why find failed, for a message; "" when it didn't.
+template <class T>
+std::string why(const std::expected<T, ssh::FindFailed>& r) {
+    return r ? std::string() : r.error().message;
+}
+
 } // namespace
 
 TEST_CASE("ssh find: the command: -L, the C locale, raw roots quoted safely, stderr kept") {
@@ -149,7 +155,13 @@ TEST_CASE("ssh find: the check counts exactly grab-find-ok with exit 0; everythi
     CHECK_FALSE(ssh::read_find_probe(ended("", 1), "grab-find-ok\n").works);
     CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok").works);
     CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok\r\n").works);
-    CHECK(ssh::read_find_probe(ended("", -1, "TERM"), "") == ssh::FindCheck{false, "nothing, ended by SIGTERM"});
+    // Killed from outside: asked again after a while, never saved for a week.
+    CHECK(ssh::read_find_probe(ended("", -1, "TERM"), "") ==
+          ssh::FindCheck{.works = false, .answer = "nothing, ended by SIGTERM", .lasting = false});
+    CHECK(ssh::read_find_probe(ended("", 137), "") ==
+          ssh::FindCheck{.works = false, .answer = "nothing, exit 137", .lasting = false});
+    // A server that sends no exit status does so every time.
+    CHECK(ssh::read_find_probe(ended("", -1), "").lasting);
     // An answer is shown safely: control characters and bytes that aren't UTF-8 as rclone_enc does.
     CHECK(ssh::read_find_probe(ended("", 2), "bad\x01\xFF\n").answer == "\"bad␁‛FF\", exit 2");
     // Refused, or no answer in time.
@@ -294,6 +306,85 @@ TEST_CASE("ssh find: no answer in time is asked again after a while; a definite 
     CHECK(asked == 1);
 }
 
+TEST_CASE("ssh find: a lasting answer holds for find_check_trust, a saved one from when it was checked") {
+    ssh::Pool::Options o;
+    o.idle_timer = false;
+    o.find_check_trust = std::chrono::hours(1);
+    ssh::Pool pool([]() -> std::unique_ptr<ssh::Session> { throw std::logic_error("no logins here"); }, o);
+    int asked = 0;
+    const auto now =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    auto saved_at = [&](std::int64_t checked) {
+        return [&asked, checked] {
+            ++asked;
+            return std::optional(
+                ssh::FindCheck{.works = true, .answer = "GNU find", .lasting = true, .checked = checked, .saved = true});
+        };
+    };
+    // Checked half an hour ago: kept for the rest of the hour.
+    REQUIRE(pool.find_check({}, saved_at(now - 1800)));
+    auto kept = pool.find_check({}, saved_at(now));
+    REQUIRE(kept);
+    CHECK(kept->checked == now - 1800);
+    CHECK(asked == 1);
+    // Forgotten: asked again. Checked two hours ago: past it at once, so the next caller asks.
+    pool.forget_find_check();
+    REQUIRE(pool.find_check({}, saved_at(now - 7200)));
+    REQUIRE(pool.find_check({}, saved_at(now)));
+    CHECK(asked == 3);
+    REQUIRE(pool.find_check({}, saved_at(now)));
+    CHECK(asked == 3);
+}
+
+TEST_CASE("ssh find: the check takes an answer from memory, keeps a new lasting one there, never a late one") {
+    Shell s;
+    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"grab-find-ok\n"}; };
+    std::vector<std::optional<ssh::FindCheck>> saves;
+    ssh::FindMemory memory;
+    memory.save = [&](const std::optional<ssh::FindCheck>& c) { saves.push_back(c); };
+    // Nothing saved: the probe, its answer dated and saved.
+    auto pool = s.pool();
+    auto asked = ssh::choose_lookup(*pool, GrabMethod::probe, "Main", {}, std::nullopt, memory);
+    REQUIRE(asked);
+    CHECK(asked->asked);
+    CHECK_FALSE(asked->saved);
+    REQUIRE(saves.size() == 1);
+    REQUIRE(saves[0]);
+    CHECK(saves[0]->works);
+    CHECK(saves[0]->checked > 0);
+    CHECK(asked->checked == saves[0]->checked);
+    // Known to the pool now: neither asked nor saved again.
+    auto known = ssh::choose_lookup(*pool, GrabMethod::probe, "Main", {}, std::nullopt, memory);
+    REQUIRE(known);
+    CHECK_FALSE(known->asked);
+    CHECK(saves.size() == 1);
+    CHECK(s.commands.size() == 1);
+
+    // Saved by an earlier run: a new pool takes it, nothing asked.
+    memory.load = [] {
+        return std::optional(
+            ssh::FindCheck{.works = false, .answer = "nothing, exit 0", .lasting = true, .checked = 1'800'000'000, .saved = true});
+    };
+    pool = s.pool();
+    auto recalled = ssh::choose_lookup(*pool, GrabMethod::probe, "Main", {}, std::nullopt, memory);
+    REQUIRE(recalled);
+    CHECK_FALSE(recalled->find);
+    CHECK(recalled->saved);
+    CHECK_FALSE(recalled->asked);
+    CHECK(recalled->checked == 1'800'000'000);
+    CHECK(s.commands.size() == 1);
+    // Asked again: the saved one dropped first, then the new one saved.
+    auto again = ssh::recheck_lookup(*pool, GrabMethod::probe, "Main", {}, std::nullopt, memory);
+    REQUIRE(again);
+    CHECK(again->find);
+    CHECK(again->asked);
+    REQUIRE(saves.size() == 3);
+    CHECK_FALSE(saves[1]);
+    REQUIRE(saves[2]);
+    CHECK(saves[2]->works);
+    CHECK(s.commands.size() == 2);
+}
+
 TEST_CASE("ssh find: walk asks nothing; auto walks where find fails; ssh insists, naming the answer") {
     Shell box;
     box.answer = [](test::FakeCommand& c, std::string_view) {
@@ -335,8 +426,8 @@ TEST_CASE("ssh find: records parsed as they stream, paths in grab's form under t
     s.answer = [](test::FakeCommand& c, std::string_view) {
         c.out = {"d\t1700000000.5\t./downloads/tv\0f\t12"s,
                  "34\t1700000001.0\t./downloads/tv/caf\xE9.mkv\0f\t5\t1700000002\t/srv/x\x01y/a.txt\0"s,
-                 // Nothing to save these under (G15), and a malformed one.
-                 "f\t1\t1\t/\0d\t1\t.\0d\t1\t./..\0f\t1\t1\t./downloads/..\0garbage\0"s,
+                 // Nothing to save these under (G15).
+                 "f\t1\t1\t/\0d\t1\t.\0d\t1\t./..\0f\t1\t1\t./downloads/..\0"s,
                  "f\t3\t1700000003\t./notes.txt\0f\t9\t1700000004\t./la"s, "st.txt"s};
     };
     auto pool = s.pool();
@@ -346,7 +437,7 @@ TEST_CASE("ssh find: records parsed as they stream, paths in grab's form under t
     ssh::FindOptions o;
     o.progress = [&](std::size_t n) { progress.push_back(n); };
     auto found = ssh::run_find(*pool, spec, o);
-    REQUIRE_MESSAGE(found, found.error_or(""));
+    REQUIRE_MESSAGE(found, why(found));
     CHECK(paths_of(found->entries) == std::vector<std::string>{"downloads/tv", "downloads/tv/caf‛E9.mkv",
                                                                "/srv/x␁y/a.txt", "notes.txt", "last.txt"});
     CHECK(found->entries[0].dir);
@@ -355,12 +446,39 @@ TEST_CASE("ssh find: records parsed as they stream, paths in grab's form under t
     CHECK(found->entries[4].size == 9);
     CHECK(found->notes.empty());
     REQUIRE_FALSE(progress.empty());
-    CHECK(progress.back() == 9); // NUL-ended records
+    CHECK(progress.back() == 8); // NUL-ended records
     REQUIRE(s.commands.size() == 1);
     CHECK(s.commands[0] == ssh::find_command(spec));
     CHECK(pool->idle() == 1);
     // Back to the server's bytes: what downloads hand the server.
     CHECK(rclone_enc::raw_path(found->entries[1].path) == "downloads/tv/caf\xE9.mkv");
+}
+
+TEST_CASE("ssh find: output that isn't find's records fails it, as being about find") {
+    ssh::FindSpec spec;
+    spec.roots = {""};
+    Shell s;
+    auto pool = s.pool();
+    // A malformed record among good ones: find is stopped there.
+    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"f\t1\t1\t./a.txt\0garbage\0f\t1\t1\t./b.txt\0"s}; };
+    auto found = ssh::run_find(*pool, spec, {});
+    REQUIRE_FALSE(found);
+    CHECK(found.error().message == "the server's find printed something that isn't a find record: \"garbage\"");
+    CHECK(found.error().about_find);
+    // A banner before the first record (review G61), and a restricted shell's answer with no NUL.
+    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"Welcome to the box\nf\t1\t1\t./a.txt\0"s}; };
+    found = ssh::run_find(*pool, spec, {});
+    REQUIRE_FALSE(found);
+    CHECK(found.error().message == "the server's find printed something that isn't a find record: \"Welcome to the box\"");
+    CHECK(found.error().about_find);
+    s.answer = [](test::FakeCommand& c, std::string_view) {
+        c.out = {"Command not found. Use 'help' to get a list of available commands.\n"};
+        c.status = 1;
+    };
+    found = ssh::run_find(*pool, spec, {});
+    REQUIRE_FALSE(found);
+    CHECK(found.error().message.find("isn't a find record: \"Command not found.") != std::string::npos);
+    CHECK(found.error().about_find);
 }
 
 TEST_CASE("ssh find: stderr: unreadable folders and loops are notes; anything else, or every root, an error") {
@@ -372,23 +490,42 @@ TEST_CASE("ssh find: stderr: unreadable folders and loops are notes; anything el
                             "find: './self': Too many levels of symbolic links\n"
                             "find: File system loop detected; './a/up' is part of the same file system loop as '.'.\n";
     auto notes = ssh::read_find_errors(spec, err, 1);
-    REQUIRE_MESSAGE(notes, notes.error_or(""));
+    REQUIRE_MESSAGE(notes, why(notes));
     CHECK(*notes == std::vector<std::string>{"den‛E9 it's: permission denied", "downloads/again/up: a link loop, skipped",
                                              "self: a link loop, skipped", "a/up: a link loop, skipped"});
-    // One root missing: a note; every root failing: an error.
+    // One root missing: a note; every root failing: an error, though not about find.
     notes = ssh::read_find_errors(spec, "find: './downloads': No such file or directory\n", 1);
     REQUIRE(notes);
     CHECK(*notes == std::vector<std::string>{"downloads: no such file or folder"});
     notes = ssh::read_find_errors(spec, "find: '.': Permission denied\nfind: './downloads': No such file or directory\n", 1);
     REQUIRE_FALSE(notes);
-    CHECK(notes.error() == "cannot search ~: permission denied; downloads: no such file or folder");
-    // Anything else fails the search with that line.
+    CHECK(notes.error().message == "cannot search ~: permission denied; downloads: no such file or folder");
+    CHECK_FALSE(notes.error().about_find);
+    // Anything else fails the search with that line: about find itself when the line names no
+    // path, as a find that isn't GNU's or a shell without one says it.
     notes = ssh::read_find_errors(spec, "find: './x': Permission denied\nfind: unknown predicate `-printf'\n", 1);
     REQUIRE_FALSE(notes);
-    CHECK(notes.error() == "find on the server failed: find: unknown predicate `-printf'");
+    CHECK(notes.error().message == "find on the server failed: find: unknown predicate `-printf'");
+    CHECK(notes.error().about_find);
+    notes = ssh::read_find_errors(spec, "find: './x': Input/output error\n", 1);
+    REQUIRE_FALSE(notes);
+    CHECK(notes.error().message == "find on the server failed: find: './x': Input/output error");
+    CHECK_FALSE(notes.error().about_find);
     notes = ssh::read_find_errors(spec, "Segmentation fault\n", 139);
     REQUIRE_FALSE(notes);
-    CHECK(notes.error() == "find on the server failed (exit 139): Segmentation fault");
+    CHECK(notes.error().message == "find on the server failed (exit 139): Segmentation fault");
+    CHECK_FALSE(notes.error().about_find); // ended by a signal
+    // Statuses GNU find doesn't give: no find there, a command the shell can't run, no status.
+    for (const int status : {127, 126, 2, -1}) {
+        notes = ssh::read_find_errors(spec, "bash: line 1: env: command not found\n", status);
+        REQUIRE_FALSE(notes);
+        CHECK(notes.error().about_find);
+    }
+    CHECK(notes.error().message == "find on the server failed (no exit status): bash: line 1: env: command not found");
+    notes = ssh::read_find_errors(spec, "", 127);
+    REQUIRE_FALSE(notes);
+    CHECK(notes.error().message == "find on the server failed (exit 127)");
+    CHECK(notes.error().about_find);
     // Exit 0: the results are whole, a warning is a note.
     notes = ssh::read_find_errors(spec, "", 0);
     REQUIRE(notes);
@@ -407,11 +544,12 @@ TEST_CASE("ssh find: stderr: unreadable folders and loops are notes; anything el
     spec.roots = {""};
     const std::string cut_err = "find: './a': Permission denied\nfind: './b': Permiss";
     notes = ssh::read_find_errors(spec, cut_err, 1, true);
-    REQUIRE_MESSAGE(notes, notes.error_or(""));
+    REQUIRE_MESSAGE(notes, why(notes));
     CHECK(*notes == std::vector<std::string>{"a: permission denied", "(more find messages not kept)"});
     notes = ssh::read_find_errors(spec, cut_err, 1);
     REQUIRE_FALSE(notes);
-    CHECK(notes.error() == "find on the server failed: find: './b': Permiss");
+    CHECK(notes.error().message == "find on the server failed: find: './b': Permiss");
+    CHECK_FALSE(notes.error().about_find);
     notes = ssh::read_find_errors(spec, "find: './a': Permiss", 0, true);
     REQUIRE(notes);
     CHECK(*notes == std::vector<std::string>{"(more find messages not kept)"});
@@ -429,22 +567,25 @@ TEST_CASE("ssh find: run_find's notes, refusals, signals, and its caps drop the 
         c.status = 1;
     };
     auto found = ssh::run_find(*pool, spec, {});
-    REQUIRE_MESSAGE(found, found.error_or(""));
+    REQUIRE_MESSAGE(found, why(found));
     CHECK(paths_of(found->entries) == std::vector<std::string>{"a.txt"});
     CHECK(found->notes == std::vector<std::string>{"x: permission denied"});
     CHECK(pool->idle() == 1);
 
-    // A refused command leaves the connection as it was.
+    // A refused command leaves the connection as it was; it's about find (an account that may
+    // run no commands now).
     s.answer = [](test::FakeCommand& c, std::string_view) { c.refuse = true; };
     found = ssh::run_find(*pool, spec, {});
     REQUIRE_FALSE(found);
-    CHECK(found.error() == "find on the server failed: the server refused to run the command");
+    CHECK(found.error().message == "find on the server failed: the server refused to run the command");
+    CHECK(found.error().about_find);
     CHECK(pool->idle() == 1);
 
     s.answer = [](test::FakeCommand& c, std::string_view) { c.signal = "KILL"; };
     found = ssh::run_find(*pool, spec, {});
     REQUIRE_FALSE(found);
-    CHECK(found.error() == "find on the server was ended by SIGKILL");
+    CHECK(found.error().message == "find on the server was ended by SIGKILL");
+    CHECK_FALSE(found.error().about_find);
 
     // Past the entry cap: told to end, and the connection isn't used again.
     s.answer = [](test::FakeCommand& c, std::string_view) {
@@ -455,7 +596,8 @@ TEST_CASE("ssh find: run_find's notes, refusals, signals, and its caps drop the 
     capped.max_entries = 5;
     found = ssh::run_find(*pool, spec, capped);
     REQUIRE_FALSE(found);
-    CHECK(found.error() == "listing too large: more than 5 entries");
+    CHECK(found.error().message == "listing too large: more than 5 entries");
+    CHECK_FALSE(found.error().about_find);
     CHECK(std::ranges::count(s.log, "TERM") == 1);
     CHECK(pool->idle() == 0);
 
@@ -465,7 +607,8 @@ TEST_CASE("ssh find: run_find's notes, refusals, signals, and its caps drop the 
     bytes_capped.max_bytes = 15;
     found = ssh::run_find(*pool, spec, bytes_capped);
     REQUIRE_FALSE(found);
-    CHECK(found.error() == "listing too large: more than 15 B of paths");
+    CHECK(found.error().message == "listing too large: more than 15 B of paths");
+    CHECK_FALSE(found.error().about_find);
     CHECK(std::ranges::count(s.log, "TERM") == 1);
     CHECK(pool->idle() == 0);
 
@@ -476,7 +619,7 @@ TEST_CASE("ssh find: run_find's notes, refusals, signals, and its caps drop the 
         c.status = 1;
     };
     found = ssh::run_find(*pool, spec, {});
-    REQUIRE_MESSAGE(found, found.error_or(""));
+    REQUIRE_MESSAGE(found, why(found));
     CHECK(paths_of(found->entries) == std::vector<std::string>{"a.txt"});
     REQUIRE(found->notes.size() > 100);
     CHECK(found->notes.back() == "(more find messages not kept)");
@@ -485,7 +628,8 @@ TEST_CASE("ssh find: run_find's notes, refusals, signals, and its caps drop the 
     s.answer = [](test::FakeCommand& c, std::string_view) { c.endless = true; };
     found = ssh::run_find(*pool, spec, {});
     REQUIRE_FALSE(found);
-    CHECK(found.error() == "the server's find printed a path of more than 64 KiB");
+    CHECK(found.error().message == "the server's find printed a path of more than 64 KiB");
+    CHECK_FALSE(found.error().about_find);
     CHECK(pool->idle() == 0);
 
     // Stopped: nothing, and no error.
@@ -618,7 +762,7 @@ TEST_CASE("ssh find: live, find and the walk agree on odd names and links (GRAB_
     spec.roots = {tree};
     spec.max_depth = 4;
     auto found = ssh::run_find(*pool, spec, {});
-    REQUIRE_MESSAGE(found, found.error_or(""));
+    REQUIRE_MESSAGE(found, why(found));
     auto walked = ssh::walk_roots(*pool, spec.roots,
                                   ssh::WalkOptions{.connections = 2, .folders = true, .max_depth = 4, .skip_hidden = true}, {});
     REQUIRE_MESSAGE(walked, walked.error_or(""));
@@ -653,7 +797,7 @@ TEST_CASE("ssh find: live, find and the walk agree on odd names and links (GRAB_
     // A root that is a link, and one that isn't there.
     spec.roots = {base + "/rootlink", base + "/missing"};
     found = ssh::run_find(*pool, spec, {});
-    REQUIRE_MESSAGE(found, found.error_or(""));
+    REQUIRE_MESSAGE(found, why(found));
     walked = ssh::walk_roots(*pool, spec.roots, ssh::WalkOptions{.connections = 2, .folders = true, .max_depth = 4}, {});
     REQUIRE_MESSAGE(walked, walked.error_or(""));
     CHECK(keys(found->entries) == keys(*walked));
@@ -703,7 +847,7 @@ TEST_CASE("ssh find: live timings of find and the walk on a tree (GRAB_TEST_WALK
     spec.max_depth = depth > 0 ? depth : 1000;
     started = Clock::now();
     auto found = ssh::run_find(*pool, spec, {});
-    REQUIRE_MESSAGE(found, found.error_or(""));
+    REQUIRE_MESSAGE(found, why(found));
     MESSAGE("find: " << found->entries.size() << " entries in " << seconds(Clock::now() - started) << " s, "
                      << found->notes.size() << " notes");
     std::vector<std::string> lines;

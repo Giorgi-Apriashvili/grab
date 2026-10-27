@@ -349,7 +349,7 @@ private:
     void servers_changed(); // settings thread: refresh the settings list and the search view
     void save_server(const json::Value& msg);
     void apply_pending(Pending pending, std::stop_token stop);
-    void test_server(const std::string& name, std::stop_token stop) const;
+    void test_server(const std::string& name, std::stop_token stop);
     void cancel_pending();
 
     // Updates (UI thread unless noted). The banner's state, sent to the page as "update".

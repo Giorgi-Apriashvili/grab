@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <span>
 #include <string>
@@ -170,7 +171,8 @@ void Pool::close_idle(Clock::time_point now) {
 std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::function<std::optional<FindCheck>()>& check) {
     std::unique_lock lock(mutex_);
     auto known = [&] {
-        return find_check_ && (find_check_->lasting || Clock::now() - find_checked_ < options_.find_check_expiry);
+        return find_check_ && Clock::now() - find_checked_ < (find_check_->lasting ? options_.find_check_trust
+                                                                                    : options_.find_check_expiry);
     };
     if (!changed_.wait(lock, stop, [&] { return known() || !checking_; })) return std::nullopt;
     if (known()) return find_check_;
@@ -192,10 +194,21 @@ std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::funct
     if (answer) {
         find_check_ = answer;
         find_checked_ = Clock::now();
+        // An answer an earlier run saved holds from when the server gave it.
+        if (answer->checked > 0) {
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch()).count();
+            find_checked_ -= std::chrono::seconds(std::max<std::int64_t>(0, now - answer->checked));
+        }
     }
     lock.unlock();
     changed_.notify_all();
     return answer;
+}
+
+void Pool::forget_find_check() {
+    std::scoped_lock lock(mutex_);
+    find_check_.reset();
 }
 
 Pool::Lease::Lease(Lease&& other) noexcept
@@ -239,6 +252,11 @@ std::shared_ptr<Pool> Pools::get(const std::string& server, const Target& target
     auto pool = std::make_shared<Pool>([target] { return open_session(target); }, download_options(limit));
     pools_[server] = Entry{target, pool};
     return pool;
+}
+
+void Pools::forget_find_check(const std::string& server) {
+    std::lock_guard lock(mutex_);
+    if (const auto it = pools_.find(server); it != pools_.end() && it->second.pool) it->second.pool->forget_find_check();
 }
 
 } // namespace grab::ssh

@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <format>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <print>
 #include <string>
@@ -399,13 +400,22 @@ std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ct
     auto target = engine::ssh_target(ctx);
     if (!target) return util::fail(target.error());
     // The download's budget, as download_with_grab counts it (limits.json: what refusals taught).
-    const auto limits = load_learned_limits(learned_limits_path(opts.config.value_or(default_grab_config_path())));
+    const auto limits_file = learned_limits_path(opts.config.value_or(default_grab_config_path()));
+    // gui.json's limits from grab 0.17 and older, while limits.json doesn't exist yet (review G195).
+    // Read quietly: the download says so when gui.json can't be used.
+    const auto gui = read_gui_state(limits_file.parent_path() / "gui.json");
+    const auto old_limits = gui && *gui ? (*gui)->server_limits : std::map<std::string, int>{};
+    const auto limits = load_learned_limits(limits_file, old_limits);
     const auto learned = limits.find(ctx.settings.name);
     const int budget = budget::effective_budget(ctx.settings.max_connections, budget::default_budget(ctx.remote.host),
                                                 learned == limits.end() ? std::nullopt : std::optional(learned->second));
     engine::GrabSide side;
     side.pool = pools.get(ctx.settings.name, *target, budget);
     side.walk_seat = [budget] { return std::min(budget, 8); };
+    // The find check as the window or an earlier command left it (limits.json too).
+    side.memory = engine::find_memory(limits_file, *target, [](const std::expected<void, std::string>& saved) {
+        if (!saved) std::println(stderr, "grab: {}", saved.error());
+    }, old_limits);
     if (opts.verbose) {
         side.on_lookup = [&ctx, said = std::move(said)](const ssh::Lookup& way) {
             std::println(stderr, "grab: {} {}", said, engine::lookup_text(ctx, way));

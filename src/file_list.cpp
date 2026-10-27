@@ -203,17 +203,18 @@ std::expected<void, std::string> fetch_grab(const engine::Context& ctx, List& li
                                  .query = std::nullopt,
                                  .folders = true,
                                  .files = true};
-        if (on_command) on_command({"exec", ssh::find_command(spec)});
         ssh::FindOptions options;
         options.stop = stop;
         options.progress = grab.progress;
         options.retry_refused = ssh::interactive_retry;
-        auto found = ssh::run_find(**pool, spec, options);
-        if (stop.stop_requested()) return util::fail("search cancelled");
+        auto found = engine::grab_find(ctx, **pool, grab, *way, spec, options, on_command);
         if (!found) return util::fail(found.error());
-        list.entries = std::move(found->entries);
-        list.notes = std::move(found->notes);
-        return {};
+        if (*found) {
+            list.entries = std::move((*found)->entries);
+            list.notes = std::move((*found)->notes);
+            return {};
+        }
+        // Asked again, the check says walk.
     }
     const int seat = grab.walk_seat ? grab.walk_seat() : 4;
     if (stop.stop_requested()) return util::fail("search cancelled");

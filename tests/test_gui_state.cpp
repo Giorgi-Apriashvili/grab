@@ -273,3 +273,60 @@ TEST_CASE("learned connection limits are one file for the window and the command
     CHECK(gui_state_to_json(s).find("serverLimits") == std::string::npos);
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("find checks are kept in limits.json per login, beside the limits, old ones dropped") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-find-checks";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "limits.json";
+    const std::string main = "dragon@65.21.224.123:39909";
+    CHECK_FALSE(load_find_check(file, main)); // no file
+    // Dropping what isn't there writes nothing.
+    REQUIRE(save_find_check(file, main, std::nullopt, 0));
+    CHECK_FALSE(std::filesystem::exists(file));
+
+    const SavedFindCheck works{.works = true, .answer = "GNU find", .checked = 1'800'000'000};
+    REQUIRE(save_learned_limit(file, "Main", 4));
+    REQUIRE(save_find_check(file, main, works, 0));
+    CHECK(load_find_check(file, main) == works);
+    CHECK_FALSE(load_find_check(file, "dragon@65.21.224.123:22")); // another login
+    // Both writers keep what the other wrote.
+    REQUIRE(save_learned_limit(file, "Box", 8));
+    CHECK(load_find_check(file, main) == works);
+    CHECK(load_learned_limits(file) == std::map<std::string, int>{{"Box", 8}, {"Main", 4}});
+    const SavedFindCheck walks{.works = false, .answer = "\"Command not found\", exit 1", .checked = 1'800'000'100};
+    REQUIRE(save_find_check(file, "u1@u1.example:23", walks, 0));
+    CHECK(load_find_check(file, "u1@u1.example:23") == walks);
+    CHECK(load_learned_limits(file) == std::map<std::string, int>{{"Box", 8}, {"Main", 4}});
+    // The limits' reader takes no find check for a server, nor a server called "find checks".
+    REQUIRE(save_learned_limit(file, "find checks", 3));
+    CHECK(load_learned_limits(file) == std::map<std::string, int>{{"Box", 8}, {"Main", 4}});
+    CHECK(load_find_check(file, main) == works);
+
+    // Dropped; and answers checked before the given time go with any save.
+    REQUIRE(save_find_check(file, main, std::nullopt, 0));
+    CHECK_FALSE(load_find_check(file, main));
+    CHECK(load_find_check(file, "u1@u1.example:23") == walks);
+    const SavedFindCheck later{.works = true, .answer = "GNU find", .checked = 1'800'000'200};
+    REQUIRE(save_find_check(file, main, later, 1'800'000'150));
+    CHECK_FALSE(load_find_check(file, "u1@u1.example:23"));
+    CHECK(load_find_check(file, main) == later);
+    CHECK(load_learned_limits(file) == std::map<std::string, int>{{"Box", 8}, {"Main", 4}});
+
+    // Damaged entries are left out; a damaged file is none.
+    REQUIRE(util::write_file_atomic(
+        file, R"({"Main":4,"find checks":{"a@b:22":{"works":"yes","answer":"x","checked":1},"c@d:22":{"works":false,"answer":"x","checked":5}}})"));
+    CHECK_FALSE(load_find_check(file, "a@b:22"));
+    CHECK(load_find_check(file, "c@d:22") == SavedFindCheck{.works = false, .answer = "x", .checked = 5});
+    REQUIRE(util::write_file_atomic(file, "not json"));
+    CHECK_FALSE(load_find_check(file, "c@d:22"));
+
+    // The first answer saved makes the file with gui.json's old limits (grab 0.17), as a limit
+    // would (review G195).
+    std::filesystem::remove(file);
+    const std::map<std::string, int> before{{"Box", 3}};
+    REQUIRE(save_find_check(file, main, works, 0, before));
+    CHECK(load_learned_limits(file) == before);
+    CHECK(load_find_check(file, main) == works);
+    std::filesystem::remove_all(dir);
+}

@@ -25,6 +25,94 @@ FindCheck walk_because(std::string answer, bool lasting = true) {
     return FindCheck{.works = false, .answer = std::move(answer), .lasting = lasting};
 }
 
+std::int64_t unix_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// The probe on one of the pool's connections, its answer dated; nullopt when stopped. Throws
+// Error.
+std::optional<FindCheck> probe(Pool& pool, const std::stop_token& stop, Retry retry) {
+    // The probe is safe to repeat: a reused connection the server closed while it sat idle is
+    // dropped and the next one tried.
+    for (;;) {
+        auto lease = pool.acquire(stop, retry);
+        if (!lease) return std::nullopt;
+        std::string out;
+        ExecOptions o;
+        o.stop = stop;
+        o.deadline = find_probe_deadline;
+        o.out_limit = std::uint64_t{64} * 1024;
+        o.out = [&](std::string_view piece) {
+            out += piece;
+            return true;
+        };
+        std::expected<ExecResult, ExecError> ran;
+        try {
+            ran = (*lease)->exec(find_probe, o);
+        } catch (const Error&) {
+            lease->broken();
+            if (lease->reused() && out.empty()) continue;
+            throw;
+        }
+        if (!ran && ran.error().kind == ExecFailure::stopped) return std::nullopt;
+        auto check = read_find_probe(ran, out);
+        check.checked = unix_now();
+        return check;
+    }
+}
+
+// What the pool's check runs: the answer `memory` kept, else the probe (`asked` set), whose
+// answer `memory` keeps when it's lasting.
+std::optional<FindCheck> recall_or_probe(Pool& pool, const std::stop_token& stop, Retry retry,
+                                         const FindMemory& memory, bool& asked) {
+    if (memory.load) {
+        if (auto saved = memory.load()) return saved;
+    }
+    asked = true;
+    auto check = probe(pool, stop, retry);
+    if (check && check->lasting && memory.save) memory.save(*check);
+    return check;
+}
+
+// choose_lookup; `again` for recheck_lookup's, which doesn't ask a second time.
+std::expected<Lookup, std::string> lookup(Pool& pool, GrabMethod method, std::string_view server,
+                                          const std::stop_token& stop, Retry retry, const FindMemory& memory,
+                                          bool again) {
+    if (method == GrabMethod::walk) return Lookup{};
+    bool asked = false;
+    std::optional<FindCheck> check;
+    try {
+        check = pool.find_check(stop, [&] { return recall_or_probe(pool, stop, retry, memory, asked); });
+    } catch (const Error& e) {
+        return std::unexpected(std::string(e.what()));
+    }
+    if (!check) return std::unexpected(std::string("stopped"));
+    if (!check->works && method == GrabMethod::find) {
+        // An earlier run's answer fails nothing: the server may have a find by now.
+        if (check->saved && !again) return recheck_lookup(pool, method, server, stop, retry, memory);
+        return std::unexpected(std::format("{} has no GNU find for grab to use (find = ssh): its answer to `{}` was {}. "
+                                           "Set find = auto or walk in [{}] to search it by listing folders",
+                                           server, find_probe, check->answer, server));
+    }
+    return Lookup{.find = check->works,
+                  .answer = check->answer,
+                  .checked = check->checked,
+                  .saved = check->saved,
+                  .asked = asked,
+                  .redone = {}};
+}
+
+// Whether `record` has the shape find_command prints, "d\t<time>\t<path>" or
+// "f\t<size>\t<time>\t<path>", whatever its fields hold.
+bool is_record(std::string_view record) {
+    const std::ptrdiff_t tabs = record.starts_with("d\t") ? 2 : record.starts_with("f\t") ? 3 : 0;
+    return tabs > 0 && std::ranges::count(record, '\t') >= tabs;
+}
+
+// Whether an exit status says something other than GNU find ran: it gives 0 or 1, a shell 126 or
+// 127 for a command it can't run, a restricted shell what it likes. 128 and up: ended by a signal.
+bool not_find_status(int status) { return status < 0 || (status >= 2 && status < 128); }
+
 // A search word or pattern as the server's names are spelled: raw bytes, as raw_path makes
 // grab's form of a name (‛E9 is the byte 0xE9). One that would hold a NUL goes as typed.
 std::string raw_term(std::string_view term) {
@@ -168,58 +256,31 @@ FindCheck read_find_probe(const std::expected<ExecResult, ExecError>& ran, std::
     const std::string status = ran->status >= 0     ? std::format("exit {}", ran->status)
                                : ran->signal.empty() ? std::string("no exit status")
                                                      : "ended by SIG" + ran->signal;
+    // Ended by a signal (128 and up from a shell): something outside killed it, which may not
+    // happen again, so it's asked again after a while rather than saved for a week.
+    const bool lasting = ran->signal.empty() && ran->status < 128;
     std::string said = rclone_enc::shown_line(out);
     if (said.empty()) said = rclone_enc::shown_line(ran->err);
-    if (said.empty()) return walk_because("nothing, " + status);
-    return walk_because(std::format("\"{}\", {}", said, status));
+    if (said.empty()) return walk_because("nothing, " + status, lasting);
+    return walk_because(std::format("\"{}\", {}", said, status), lasting);
 }
 
-std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop, Retry retry) {
-    return pool.find_check(stop, [&]() -> std::optional<FindCheck> {
-        // The probe is safe to repeat: a reused connection the server closed while it sat idle is
-        // dropped and the next one tried.
-        for (;;) {
-            auto lease = pool.acquire(stop, retry);
-            if (!lease) return std::nullopt;
-            std::string out;
-            ExecOptions o;
-            o.stop = stop;
-            o.deadline = find_probe_deadline;
-            o.out_limit = std::uint64_t{64} * 1024;
-            o.out = [&](std::string_view piece) {
-                out += piece;
-                return true;
-            };
-            std::expected<ExecResult, ExecError> ran;
-            try {
-                ran = (*lease)->exec(find_probe, o);
-            } catch (const Error&) {
-                lease->broken();
-                if (lease->reused() && out.empty()) continue;
-                throw;
-            }
-            if (!ran && ran.error().kind == ExecFailure::stopped) return std::nullopt;
-            return read_find_probe(ran, out);
-        }
-    });
+std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop, Retry retry, const FindMemory& memory) {
+    bool asked = false;
+    return pool.find_check(stop, [&] { return recall_or_probe(pool, stop, retry, memory, asked); });
 }
 
 std::expected<Lookup, std::string> choose_lookup(Pool& pool, GrabMethod method, std::string_view server,
-                                                 std::stop_token stop, Retry retry) {
-    if (method == GrabMethod::walk) return Lookup{};
-    std::optional<FindCheck> check;
-    try {
-        check = check_find(pool, std::move(stop), retry);
-    } catch (const Error& e) {
-        return std::unexpected(std::string(e.what()));
-    }
-    if (!check) return std::unexpected(std::string("stopped"));
-    if (!check->works && method == GrabMethod::find) {
-        return std::unexpected(std::format("{} has no GNU find for grab to use (find = ssh): its answer to `{}` was {}. "
-                                           "Set find = auto or walk in [{}] to search it by listing folders",
-                                           server, find_probe, check->answer, server));
-    }
-    return Lookup{.find = check->works, .answer = check->answer};
+                                                 std::stop_token stop, Retry retry, const FindMemory& memory) {
+    return lookup(pool, method, server, stop, retry, memory, false);
+}
+
+std::expected<Lookup, std::string> recheck_lookup(Pool& pool, GrabMethod method, std::string_view server,
+                                                  std::stop_token stop, Retry retry, const FindMemory& memory) {
+    pool.forget_find_check();
+    if (memory.save) memory.save(std::nullopt);
+    // Asked now, whatever was saved.
+    return lookup(pool, method, server, stop, retry, FindMemory{.load = {}, .save = memory.save}, true);
 }
 
 std::string find_command(const FindSpec& spec) {
@@ -254,12 +315,13 @@ std::string find_command(const FindSpec& spec) {
     return cmd;
 }
 
-std::expected<std::vector<std::string>, std::string> read_find_errors(const FindSpec& spec, std::string_view err,
-                                                                     int status, bool cut) {
+std::expected<std::vector<std::string>, FindFailed> read_find_errors(const FindSpec& spec, std::string_view err,
+                                                                    int status, bool cut) {
     const PathMap paths(spec);
     std::vector<std::string> notes;
     std::vector<bool> failed(paths.roots(), false);
-    std::string other; // the first line that isn't one of those
+    std::string other;       // the first line that isn't one of those
+    bool about_find = false; // a line among them not about a path: "command not found", an option refused
     // A cut most likely falls inside a line, which is left out rather than taken for an unknown one.
     std::string_view whole = err;
     if (cut) {
@@ -274,6 +336,9 @@ std::expected<std::vector<std::string>, std::string> read_find_errors(const Find
         auto e = read_error_line(line);
         if (!e) {
             if (other.empty()) other = rclone_enc::shown_line(line);
+            // GNU find names the path first ("find: './x': ..."); a line that doesn't is about
+            // find itself, or about a shell that has none.
+            about_find = about_find || !line.starts_with("find: '");
             if (status == 0) notes.push_back(rclone_enc::shown_line(line)); // the results are whole all the same
             continue;
         }
@@ -283,41 +348,56 @@ std::expected<std::vector<std::string>, std::string> read_find_errors(const Find
     if (cut) notes.emplace_back("(more find messages not kept)");
     if (status != 0 && status != 1) {
         const std::string said = rclone_enc::shown_line(err);
-        return std::unexpected(std::format("find on the server failed ({}){}",
-                                           status < 0 ? std::string("no exit status") : std::format("exit {}", status),
-                                           said.empty() ? std::string() : ": " + said));
+        return std::unexpected(FindFailed{
+            .message = std::format("find on the server failed ({}){}",
+                                   status < 0 ? std::string("no exit status") : std::format("exit {}", status),
+                                   said.empty() ? std::string() : ": " + said),
+            .about_find = not_find_status(status)});
     }
-    if (status == 1 && !other.empty()) return std::unexpected("find on the server failed: " + other);
+    if (status == 1 && !other.empty()) {
+        return std::unexpected(FindFailed{.message = "find on the server failed: " + other, .about_find = about_find});
+    }
     if (!failed.empty() && std::ranges::all_of(failed, [](bool f) { return f; }))
-        return std::unexpected("cannot search " + util::join(notes, "; "));
+        return std::unexpected(FindFailed{.message = "cannot search " + util::join(notes, "; "), .about_find = false});
     return notes;
 }
 
-std::expected<Found, std::string> run_find(Pool& pool, const FindSpec& spec, const FindOptions& options) {
+std::expected<Found, FindFailed> run_find(Pool& pool, const FindSpec& spec, const FindOptions& options) {
+    // Not about find unless said: no login, a lost connection, a cap.
+    auto failed = [](std::string message, bool about_find = false) {
+        return std::unexpected(FindFailed{.message = std::move(message), .about_find = about_find});
+    };
     std::optional<Pool::Lease> lease;
     try {
         lease = pool.acquire(options.stop, options.retry_refused);
     } catch (const Error& e) {
-        return std::unexpected(std::string(e.what()));
+        return failed(e.what());
     }
     if (!lease) return Found{}; // stopped
     const PathMap paths(spec);
     Found found;
     std::string partial; // a record whose NUL hasn't come yet
     std::size_t records = 0;
-    std::uint64_t bytes = 0; // of the paths kept
-    std::optional<std::string> too_much;
+    std::uint64_t bytes = 0;         // of the paths kept
+    std::optional<FindFailed> ended; // why the output was cut short
     const std::string too_many_bytes =
         std::format("listing too large: more than {} of paths", util::format_size(options.max_bytes));
-    // false past max_bytes.
-    auto take = [&](std::string_view record) {
-        if (auto e = file_list::parse_find_record(record)) {
-            e->path = paths.grab_form(e->path);
-            bytes += e->path.size();
-            if (bytes > options.max_bytes) return false;
-            found.entries.push_back(std::move(*e));
+    // Keeps a record (one with nothing to save it under is left out, review G15); else why find
+    // is to stop.
+    auto take = [&](std::string_view record) -> std::optional<FindFailed> {
+        auto e = file_list::parse_find_record(record);
+        if (!e) {
+            if (is_record(record)) return std::nullopt;
+            // A shell's banner or a restricted shell's answer: not the find the check found.
+            return FindFailed{.message = std::format("the server's find printed something that isn't a find record: \"{}\"",
+                                                     rclone_enc::shown_line(record)),
+                              .about_find = true};
         }
-        return true;
+        e->path = paths.grab_form(e->path);
+        bytes += e->path.size();
+        if (bytes > options.max_bytes) return FindFailed{.message = too_many_bytes, .about_find = false};
+        found.entries.push_back(std::move(*e));
+        return std::nullopt;
     };
     ExecOptions exec;
     exec.stop = options.stop;
@@ -325,26 +405,23 @@ std::expected<Found, std::string> run_find(Pool& pool, const FindSpec& spec, con
     exec.out = [&](std::string_view piece) {
         for (auto nul = piece.find('\0'); nul != std::string_view::npos; nul = piece.find('\0')) {
             if (++records > options.max_entries) {
-                too_much = std::format("listing too large: more than {} entries", options.max_entries);
+                ended = FindFailed{.message = std::format("listing too large: more than {} entries", options.max_entries),
+                                   .about_find = false};
                 return false;
             }
-            bool kept = true;
             if (partial.empty()) {
-                kept = take(piece.substr(0, nul));
+                ended = take(piece.substr(0, nul));
             } else {
                 partial.append(piece.substr(0, nul));
-                kept = take(partial);
+                ended = take(partial);
                 partial.clear();
             }
-            if (!kept) {
-                too_much = too_many_bytes;
-                return false;
-            }
+            if (ended) return false;
             piece.remove_prefix(nul + 1);
         }
         partial.append(piece);
         if (partial.size() > max_record) {
-            too_much = "the server's find printed a path of more than 64 KiB";
+            ended = FindFailed{.message = "the server's find printed a path of more than 64 KiB", .about_find = false};
             return false;
         }
         if (options.progress) options.progress(records);
@@ -360,26 +437,29 @@ std::expected<Found, std::string> run_find(Pool& pool, const FindSpec& spec, con
             // Before any record, find is safe to repeat: a reused connection the server closed
             // while it sat idle is dropped and the next one tried.
             if (!lease->reused() || records > 0 || !partial.empty()) {
-                return std::unexpected(std::format("find on the server failed: {}", e.what()));
+                return failed(std::format("find on the server failed: {}", e.what()));
             }
         }
         lease.reset();
         try {
             lease = pool.acquire(options.stop, options.retry_refused);
         } catch (const Error& e) {
-            return std::unexpected(std::string(e.what()));
+            return failed(e.what());
         }
         if (!lease) return Found{}; // stopped
     }
     if (!ran) {
         if (ran.error().kind == ExecFailure::stopped) return Found{};
-        if (too_much) return std::unexpected(std::move(*too_much));
-        if (ran.error().kind == ExecFailure::too_much) return std::unexpected(too_many_bytes);
-        return std::unexpected("find on the server failed: " + ran.error().message);
+        if (ended) return std::unexpected(std::move(*ended));
+        if (ran.error().kind == ExecFailure::too_much) return failed(too_many_bytes);
+        // Refused: an account that may run no commands (any more).
+        return failed("find on the server failed: " + ran.error().message, ran.error().kind == ExecFailure::refused);
     }
-    if (!ran->signal.empty()) return std::unexpected("find on the server was ended by SIG" + ran->signal);
+    if (!ran->signal.empty()) return failed("find on the server was ended by SIG" + ran->signal);
     // The last record, without its NUL.
-    if (!partial.empty() && !take(partial)) return std::unexpected(too_many_bytes);
+    if (!partial.empty()) {
+        if (auto e = take(partial)) return std::unexpected(std::move(*e));
+    }
     auto notes = read_find_errors(spec, ran->err, ran->status, ran->err_cut);
     if (!notes) return std::unexpected(std::move(notes.error()));
     found.notes = std::move(*notes);

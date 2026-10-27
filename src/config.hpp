@@ -25,7 +25,7 @@ enum class Engine { rclone, grab };
 // How searches and file lists run on engine = grab: GNU find over an SSH command on a pooled
 // connection, or grab's walk of the folders over SFTP.
 enum class GrabMethod {
-    probe, // find = auto: a check once per program run picks find where the server has it
+    probe, // find = auto: a check (its answer kept a week) picks find where the server has it
     find,  // find = ssh: find only; an error naming the server's answer where it doesn't work
     walk,  // find = rclone or walk, and Storage Boxes on auto (no find in their shell)
 };

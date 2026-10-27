@@ -11,15 +11,21 @@
 #include "fake_command.hpp"
 #include "fake_sftp.hpp"
 #include "file_list.hpp"
+#include "gui_state.hpp"
 #include "process.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_find.hpp"
 #include "ssh_pool.hpp"
+#include "util.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -354,6 +360,21 @@ TEST_CASE("grab engine: the way chosen in words, for -v and the window") {
     CHECK(engine::lookup_text(ctx, ssh::Lookup{.find = true, .answer = "GNU find"}) == "with find (GNU find)");
     CHECK(engine::lookup_text(ctx, ssh::Lookup{.find = false, .answer = "\"Command not found\", exit 1"}) ==
           "by listing folders (its answer to grab's find check: \"Command not found\", exit 1)");
+    // A saved answer, with its date; one asked again after find failed, with why.
+    const std::int64_t checked = 1'800'000'000;
+    const std::string on = util::local_date(checked);
+    CHECK(engine::lookup_text(ctx, ssh::Lookup{.find = true, .answer = "GNU find", .checked = checked, .saved = true}) ==
+          "with find (GNU find, checked on " + on + ")");
+    CHECK(engine::lookup_text(ctx, ssh::Lookup{.find = false, .answer = "nothing, exit 0", .checked = checked, .saved = true}) ==
+          "by listing folders (its answer to grab's find check on " + on + ": nothing, exit 0)");
+    CHECK(engine::lookup_text(ctx, ssh::Lookup{.find = false,
+                                               .answer = "nothing, exit 127",
+                                               .checked = checked,
+                                               .saved = false,
+                                               .asked = true,
+                                               .redone = "find on the server failed (exit 127)"}) ==
+          "by listing folders (its answer to grab's find check: nothing, exit 127); asked again after: find on the "
+          "server failed (exit 127)");
     ctx.remote.host = "u1.your-storagebox.de";
     CHECK(engine::lookup_text(ctx, ssh::Lookup{}) == "by listing folders (a Storage Box has no find, so grab doesn't ask)");
     ctx.settings.find = FindMethod::rclone; // find = walk
@@ -539,4 +560,393 @@ TEST_CASE("grab engine: a reused connection the server closed while idle is drop
     auto failed = browse::list_live(ctx, "/data", {}, {}, side);
     REQUIRE_FALSE(failed);
     CHECK(failed.error().message == "fake server: the server closed the connection");
+}
+
+namespace {
+
+// A folder of its own for a limits.json, empty.
+std::filesystem::path fresh_dir(const char* name) {
+    auto dir = std::filesystem::temp_directory_path() / name;
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+std::int64_t unix_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+ssh::Target login_of(std::string user, std::string host, int port) {
+    ssh::Target t;
+    t.user = std::move(user);
+    t.host = std::move(host);
+    t.port = port;
+    return t;
+}
+
+constexpr std::int64_t day = std::int64_t{24} * 60 * 60;
+
+} // namespace
+
+TEST_CASE("grab engine: the find check is saved per login, so the next run asks nothing; old or another login's is asked") {
+    const auto dir = fresh_dir("grab-test-find-memory");
+    const auto file = dir / "limits.json";
+    Server s;
+    fill(s);
+    s.with_find({"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s});
+    const auto ctx = grab_context();
+    const auto main = login_of("me", "main.example", 22);
+    std::vector<std::string> reports;
+    struct Run {
+        ssh::Lookup way;
+        std::size_t hits = 0;
+    };
+    // A search as a new program run makes it: a pool of its own.
+    auto run = [&](const ssh::Target& target) {
+        engine::SearchRequest req;
+        req.target = "lioness";
+        req.mode = Mode::file;
+        req.grab.pool = s.pool();
+        req.grab.memory = engine::find_memory(file, target, [&](const std::expected<void, std::string>& saved) {
+            reports.push_back(saved ? "saved" : saved.error());
+        });
+        std::vector<ssh::Lookup> ways;
+        req.grab.on_lookup = [&](const ssh::Lookup& way) { ways.push_back(way); };
+        auto hits = engine::search(ctx, req);
+        REQUIRE_MESSAGE(hits, hits.error_or(""));
+        REQUIRE(ways.size() == 1);
+        return Run{.way = ways[0], .hits = hits->hits.size()};
+    };
+    auto probes = [&] { return std::ranges::count(s.ran(), std::string(ssh::find_probe)); };
+
+    const auto before = unix_now();
+    const auto first = run(main);
+    CHECK(first.way.find);
+    CHECK(first.way.asked);
+    CHECK_FALSE(first.way.saved);
+    CHECK(probes() == 1);
+    auto saved = load_find_check(file, "me@main.example:22");
+    REQUIRE(saved);
+    CHECK(saved->works);
+    CHECK(saved->answer == "GNU find");
+    CHECK(saved->checked >= before);
+    CHECK(saved->checked <= unix_now());
+    CHECK(reports == std::vector<std::string>{"saved"});
+
+    // The next run takes it: no check, straight to find.
+    const auto second = run(main);
+    CHECK(second.way.find);
+    CHECK(second.way.saved);
+    CHECK_FALSE(second.way.asked);
+    CHECK(second.way.checked == saved->checked);
+    CHECK(engine::lookup_text(ctx, second.way).starts_with("with find (GNU find, checked on "));
+    CHECK(probes() == 1);
+    CHECK(s.ran().size() == 3); // the check and two finds
+    CHECK(reports.size() == 1); // nothing new to save
+
+    // Another user, host or port is another login: asked, and saved beside the first.
+    run(login_of("you", "main.example", 22));
+    run(login_of("me", "other.example", 22));
+    run(login_of("me", "main.example", 2222));
+    CHECK(probes() == 4);
+    CHECK(load_find_check(file, "you@main.example:22"));
+    CHECK(load_find_check(file, "me@main.example:2222"));
+    CHECK(load_find_check(file, "me@main.example:22") == saved);
+
+    // A week old is asked again (and saved anew); six days old still holds, whatever it says.
+    REQUIRE(save_find_check(file, "me@main.example:22",
+                            SavedFindCheck{.works = false, .answer = "nothing, exit 0", .checked = unix_now() - 7 * day}, 0));
+    const auto old = run(main);
+    CHECK(old.way.find);
+    CHECK(old.way.asked);
+    CHECK(probes() == 5);
+    saved = load_find_check(file, "me@main.example:22");
+    REQUIRE(saved);
+    CHECK(saved->works);
+    CHECK(saved->checked >= before);
+    REQUIRE(save_find_check(file, "me@main.example:22",
+                            SavedFindCheck{.works = false, .answer = "nothing, exit 0", .checked = unix_now() - 6 * day}, 0));
+    const auto recent = run(main);
+    CHECK_FALSE(recent.way.find);
+    CHECK(recent.way.saved);
+    CHECK(recent.hits == 3); // walked
+    CHECK(probes() == 5);
+    // One from the future (a clock set back) isn't trusted.
+    REQUIRE(save_find_check(file, "me@main.example:22",
+                            SavedFindCheck{.works = false, .answer = "nothing, exit 0", .checked = unix_now() + day}, 0));
+    CHECK(run(main).way.asked);
+    CHECK(probes() == 6);
+    CHECK(std::ranges::all_of(reports, [](const std::string& r) { return r == "saved"; }));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("grab engine: a saved 'find works' that find contradicts is asked again at once; the walk takes over") {
+    const auto dir = fresh_dir("grab-test-find-fallback");
+    const auto file = dir / "limits.json";
+    const std::string login = "me@main.example:22";
+    const auto main = login_of("me", "main.example", 22);
+    const SavedFindCheck works{.works = true, .answer = "GNU find", .checked = unix_now() - day};
+    // find has gone from the server since: the shell can't run it, nor the check.
+    Server s;
+    fill(s);
+    s.answer = [](test::FakeCommand& c, std::string_view) {
+        c.err = "env: 'find': No such file or directory\n";
+        c.status = 127;
+    };
+    const auto ctx = grab_context();
+    REQUIRE(save_find_check(file, login, works, 0));
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.mode = Mode::file;
+    req.grab.pool = s.pool();
+    req.grab.memory = engine::find_memory(file, main, {});
+    std::vector<ssh::Lookup> ways;
+    req.grab.on_lookup = [&](const ssh::Lookup& way) { ways.push_back(way); };
+    std::vector<std::string> shown;
+    const auto hook = [&](const std::vector<std::string>& argv) { shown.push_back(argv.front()); };
+    auto hits = engine::search(ctx, req, {}, hook);
+    REQUIRE_MESSAGE(hits, hits.error_or(""));
+    CHECK(paths_of(hits->hits) == std::vector<std::string>{"/data/lioness-link.mkv", "/data/tv/lioness-notes.txt",
+                                                           "/data/tv/Lioness/Lioness.S03E08.mkv"});
+    // find, then the check, then the walk; told twice.
+    auto ran = s.ran();
+    REQUIRE(ran.size() == 2);
+    CHECK(ran[0].starts_with("env LC_ALL=C find -L '/data' "));
+    CHECK(ran[1] == ssh::find_probe);
+    CHECK(shown == std::vector<std::string>{"exec", "sftp"});
+    REQUIRE(ways.size() == 2);
+    CHECK(ways[0].find);
+    CHECK(ways[0].saved);
+    CHECK_FALSE(ways[1].find);
+    CHECK(ways[1].asked);
+    CHECK(ways[1].redone == "find on the server failed (exit 127): env: 'find': No such file or directory");
+    // The new answer replaces the saved one.
+    auto saved = load_find_check(file, login);
+    REQUIRE(saved);
+    CHECK_FALSE(saved->works);
+    CHECK(saved->answer == "\"env: 'find': No such file or directory\", exit 127");
+    CHECK(saved->checked > works.checked);
+    // The next search walks at once, in this program and the next.
+    REQUIRE(engine::search(ctx, req));
+    req.grab.pool = s.pool();
+    REQUIRE(engine::search(ctx, req));
+    CHECK(s.ran().size() == 2);
+
+    // A file list the same way.
+    REQUIRE(save_find_check(file, login, works, 0));
+    engine::GrabSide side;
+    side.pool = s.pool();
+    side.memory = engine::find_memory(file, main, {});
+    auto list = file_list::fetch(ctx, 1234, false, {}, {}, {}, side);
+    REQUIRE_MESSAGE(list, list.error_or(""));
+    CHECK(list->entries.size() == 6);
+    CHECK(s.ran().size() == 4);
+    saved = load_find_check(file, login);
+    REQUIRE(saved);
+    CHECK_FALSE(saved->works);
+
+    // Asked again, the check may still say find works (a banner came and went): find runs again.
+    Server flaky;
+    std::atomic<int> finds{0};
+    flaky.answer = [&](test::FakeCommand& c, std::string_view command) {
+        if (command == ssh::find_probe) {
+            c.out = {"grab-find-ok\n"};
+            return;
+        }
+        if (finds++ == 0) {
+            c.out = {"Welcome!\n"};
+            return;
+        }
+        c.out = {"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s};
+    };
+    REQUIRE(save_find_check(file, login, works, 0));
+    req.grab.pool = flaky.pool();
+    ways.clear();
+    hits = engine::search(ctx, req);
+    REQUIRE_MESSAGE(hits, hits.error_or(""));
+    CHECK(paths_of(hits->hits) == std::vector<std::string>{"/data/tv/lioness-notes.txt"});
+    ran = flaky.ran();
+    REQUIRE(ran.size() == 3);
+    CHECK(ran[1] == ssh::find_probe);
+    REQUIRE(ways.size() == 2);
+    CHECK(ways[1].find);
+    CHECK(ways[1].redone == "the server's find printed something that isn't a find record: \"Welcome!\"");
+    saved = load_find_check(file, login);
+    REQUIRE(saved);
+    CHECK(saved->works);
+    CHECK(saved->checked > works.checked);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("grab engine: find failing on an answer just asked, or for reasons not about find, isn't asked again") {
+    const auto dir = fresh_dir("grab-test-find-no-recheck");
+    const auto file = dir / "limits.json";
+    const std::string login = "me@main.example:22";
+    const auto main = login_of("me", "main.example", 22);
+    const SavedFindCheck works{.works = true, .answer = "GNU find", .checked = unix_now() - day};
+    const auto ctx = grab_context();
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.mode = Mode::file;
+    req.grab.memory = engine::find_memory(file, main, {});
+
+    // The check, asked for this search, says find works and find says otherwise: the error.
+    Server odd;
+    odd.answer = [](test::FakeCommand& c, std::string_view command) {
+        if (command == ssh::find_probe) {
+            c.out = {"grab-find-ok\n"};
+            return;
+        }
+        c.status = 127;
+    };
+    int writes = 0;
+    req.grab.memory = engine::find_memory(file, main, [&](const std::expected<void, std::string>&) { ++writes; });
+    const auto odd_pool = odd.pool();
+    req.grab.pool = odd_pool;
+    auto failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error() == "find on the server failed (exit 127)");
+    CHECK(odd.ran().size() == 2);
+    // Nor in the next search on that pool (the window's), nor in the next run's right after: the
+    // answer is minutes old, so asking again would only repeat it.
+    failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    req.grab.pool = odd.pool();
+    failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    const std::string probe(ssh::find_probe);
+    const auto find_ran = odd.ran();
+    REQUIRE(find_ran.size() == 4);
+    CHECK(find_ran[0] == probe);
+    for (std::size_t i = 1; i < find_ran.size(); ++i) CHECK(find_ran[i] != probe);
+    CHECK(writes == 1);
+    req.grab.memory = engine::find_memory(file, main, {});
+
+    // A login that fails: its error, nothing asked, the saved answer kept.
+    REQUIRE(save_find_check(file, login, works, 0));
+    ssh::Pool::Options o = ssh::Pools::download_options(2);
+    o.idle_timer = false;
+    req.grab.pool = std::make_shared<ssh::Pool>(
+        []() -> std::unique_ptr<ssh::Session> { throw ssh::Error(budget::Failure::fatal, "the password was refused"); },
+        o);
+    failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error() == "the password was refused");
+    CHECK(load_find_check(file, login) == works);
+
+    // Every root unreadable, a find ended by a signal, a lost connection: errors about the search,
+    // not about find.
+    Server s;
+    std::string why;
+    s.answer = [&](test::FakeCommand& c, std::string_view) {
+        if (why == "denied") {
+            c.err = "find: '/data': Permission denied\n";
+            c.status = 1;
+        } else {
+            c.signal = "KILL";
+        }
+    };
+    req.grab.pool = s.pool();
+    why = "denied";
+    failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error() == "cannot search /data: permission denied");
+    why = "killed";
+    failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error() == "find on the server was ended by SIGKILL");
+    s.dropped = 100;
+    req.grab.pool = s.pool(); // a new login, which then breaks: no other try
+    failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error() == "find on the server failed: the server closed the connection");
+    for (const auto& command : s.ran()) CHECK(command != ssh::find_probe);
+    CHECK(load_find_check(file, login) == works);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("grab engine: a pool that forgets its find check takes the answer saved since (the window's server Test)") {
+    const auto dir = fresh_dir("grab-test-find-forget");
+    const auto file = dir / "limits.json";
+    const std::string login = "me@main.example:22";
+    const auto main = login_of("me", "main.example", 22);
+    const auto ctx = grab_context();
+    // No find at first (nothing, exit 0, as an SFTP-only account); GNU find installed since.
+    Server s;
+    fill(s);
+    bool installed = false;
+    s.answer = [&](test::FakeCommand& c, std::string_view command) {
+        if (!installed) return;
+        if (command == ssh::find_probe) {
+            c.out = {"grab-find-ok\n"};
+            return;
+        }
+        c.out = {"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s};
+    };
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.mode = Mode::file;
+    const auto pool = s.pool();
+    req.grab.pool = pool;
+    req.grab.memory = engine::find_memory(file, main, {});
+    std::vector<ssh::Lookup> ways;
+    req.grab.on_lookup = [&](const ssh::Lookup& way) { ways.push_back(way); };
+    REQUIRE(engine::search(ctx, req));
+    REQUIRE(ways.size() == 1);
+    CHECK_FALSE(ways[0].find);
+    // The test saves its fresh answer, and the window's pool drops the one it kept.
+    installed = true;
+    REQUIRE(save_find_check(file, login, SavedFindCheck{.works = true, .answer = "GNU find", .checked = unix_now()}, 0));
+    REQUIRE(engine::search(ctx, req));
+    CHECK_FALSE(ways[1].find); // kept until forgotten
+    pool->forget_find_check();
+    auto hits = engine::search(ctx, req);
+    REQUIRE_MESSAGE(hits, hits.error_or(""));
+    REQUIRE(ways.size() == 3);
+    CHECK(ways[2].find);
+    CHECK(ways[2].saved);
+    CHECK(paths_of(hits->hits) == std::vector<std::string>{"/data/tv/lioness-notes.txt"});
+    const auto ran = s.ran();
+    REQUIRE(ran.size() == 2); // the first check, then find: no second check
+    CHECK(ran[0] == ssh::find_probe);
+    CHECK(ran[1].starts_with("env LC_ALL=C find -L "));
+    // Pools: a server it has no pool for is nothing to forget.
+    ssh::Pools pools;
+    pools.forget_find_check("nowhere");
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("grab engine: find = ssh asks again before a saved 'no find' fails the search") {
+    const auto dir = fresh_dir("grab-test-find-insist");
+    const auto file = dir / "limits.json";
+    const std::string login = "me@main.example:22";
+    auto ctx = grab_context();
+    ctx.grab_method = GrabMethod::find;
+    Server s;
+    s.with_find({"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s});
+    REQUIRE(save_find_check(file, login,
+                            SavedFindCheck{.works = false, .answer = "nothing, exit 0", .checked = unix_now() - day}, 0));
+    engine::SearchRequest req;
+    req.target = "lioness";
+    req.grab.pool = s.pool();
+    req.grab.memory = engine::find_memory(file, login_of("me", "main.example", 22), {});
+    auto hits = engine::search(ctx, req);
+    REQUIRE_MESSAGE(hits, hits.error_or(""));
+    CHECK(hits->hits.size() == 1);
+    CHECK(s.ran().size() == 2); // the check, then find
+    auto saved = load_find_check(file, login);
+    REQUIRE(saved);
+    CHECK(saved->works);
+
+    // Still none there: the error names the server's answer as it is now.
+    Server none;
+    REQUIRE(save_find_check(file, login,
+                            SavedFindCheck{.works = false, .answer = "old answer", .checked = unix_now() - day}, 0));
+    req.grab.pool = none.pool();
+    auto failed = engine::search(ctx, req);
+    REQUIRE_FALSE(failed);
+    CHECK(failed.error().find("its answer to `" + std::string(ssh::find_probe) + "` was nothing, exit 0.") !=
+          std::string::npos);
+    CHECK(none.ran() == std::vector<std::string>{std::string(ssh::find_probe)});
+    std::filesystem::remove_all(dir);
 }

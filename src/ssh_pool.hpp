@@ -17,6 +17,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <expected>
 #include <functional>
@@ -67,14 +68,37 @@ public:
 struct FindCheck {
     bool works = false;
     std::string answer;
-    bool lasting = true; // false: no answer in time, which may pass (Pool::find_check asks again)
+    bool lasting = true;      // false: no answer in time, which may pass (Pool::find_check asks again)
+    std::int64_t checked = 0; // when the server gave it (Unix seconds); 0: not known
+    bool saved = false;       // kept by an earlier run (FindMemory, ssh_find.hpp), not asked in this one
     bool operator==(const FindCheck&) const = default;
+};
+
+// How long an answer that is lasting holds, in a pool and saved across runs: a server's find
+// rarely comes or goes, and a "find works" gone stale is caught when find fails
+// (engine::grab_find).
+inline constexpr std::chrono::hours find_check_trust{24 * 7};
+// How long an answer that isn't lasting holds in a pool, and how long any answer counts as just
+// asked: find failing on one this fresh isn't worth asking again (engine::grab_find).
+inline constexpr std::chrono::minutes find_check_fresh{5};
+
+// The check's answers kept across runs (limits.json, engine::find_memory), so a command doesn't
+// ask a server again each run: `load` gives the one saved for the server while it holds
+// (find_check_trust; FindCheck::saved and `checked` set), `save` keeps a new lasting one or,
+// with nullopt, drops the saved one. Either may be empty.
+struct FindMemory {
+    std::function<std::optional<FindCheck>()> load;
+    std::function<void(const std::optional<FindCheck>&)> save;
 };
 
 // How a search or list goes on engine = grab (choose_lookup, ssh_find.hpp).
 struct Lookup {
-    bool find = false;  // find; else the walk
-    std::string answer; // what the check found, for -v; empty when it wasn't asked
+    bool find = false;        // find; else the walk
+    std::string answer;       // what the check found, for -v; empty when it wasn't asked
+    std::int64_t checked = 0; // when the server gave the answer (Unix seconds); 0: not known
+    bool saved = false;       // the answer an earlier run kept
+    bool asked = false;       // the check ran for this lookup (else its answer was known before)
+    std::string redone = {};  // why it was asked again (find failing on the answer known before)
 };
 
 class Pool {
@@ -94,8 +118,9 @@ public:
                                                              std::chrono::seconds{2}, std::chrono::seconds{4},
                                                              std::chrono::seconds{8}};
         bool idle_timer = true; // the pool's own thread closes idle connections (tests call close_idle)
-        // How long find_check keeps an answer that isn't lasting.
-        std::chrono::milliseconds find_check_expiry{std::chrono::minutes(5)};
+        // How long find_check keeps an answer that isn't lasting, and one that is.
+        std::chrono::milliseconds find_check_expiry{ssh::find_check_fresh};
+        std::chrono::milliseconds find_check_trust{ssh::find_check_trust};
     };
 
     Pool(Connect connect, Options options);
@@ -148,11 +173,15 @@ public:
 
     // The find check of this pool's server, asked once: `check` runs on the first call (one at a
     // time: a second caller waits for the first one's answer, or until its `stop`, then nullopt)
-    // and its answer is kept for the pool's life, so a program asks each server once; one that
-    // isn't lasting only for find_check_expiry. nullopt (stopped) isn't kept; an Error `check`
-    // throws goes to the caller and isn't kept either, and a caller waiting runs its own check.
+    // and its answer is kept for find_check_trust, counted from its `checked` when it has one (an
+    // answer an earlier run saved), so a program asks each server once; one that isn't lasting
+    // only for find_check_expiry. nullopt (stopped) isn't kept; an Error `check` throws goes to
+    // the caller and isn't kept either, and a caller waiting runs its own check.
     [[nodiscard]] std::optional<FindCheck> find_check(std::stop_token stop,
                                                       const std::function<std::optional<FindCheck>()>& check);
+    // Drops the answer kept, so the next find_check asks again: find failed where it said find
+    // works (a saved answer gone stale, ssh::recheck_lookup).
+    void forget_find_check();
 
 private:
     struct Idle {
@@ -190,6 +219,9 @@ public:
 
     // `limit`: the server's connection budget now.
     [[nodiscard]] std::shared_ptr<Pool> get(const std::string& server, const Target& target, int limit);
+    // The server's pool (if any) drops its find check's answer, so its next search loads the one
+    // saved since (the window's server Test asked again) instead of keeping the old one for a week.
+    void forget_find_check(const std::string& server);
 
 private:
     struct Entry {

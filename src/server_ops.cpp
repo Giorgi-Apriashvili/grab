@@ -2,6 +2,7 @@
 
 #include "conn_budget.hpp"
 #include "engine.hpp"
+#include "gui_state.hpp"
 #include "process.hpp"
 #include "remote.hpp"
 #include "sftp.hpp"
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <format>
 #include <functional>
+#include <map>
 #include <system_error>
 
 namespace grab::server_ops {
@@ -598,9 +600,12 @@ std::expected<void, std::string> set_default(const Env& loaded, std::string_view
 namespace {
 
 // engine = grab's part of a test: a login through grab's own client (the target downloads use),
-// the home folder listed, then the find check on that connection, which says how searches go.
-// Nothing is set when stopped.
-void test_grab(const engine::Context& ctx, const std::stop_token& stop, TestResult& result) {
+// the home folder listed, then the find check on that connection, which says how searches go;
+// its answer replaces the one saved in `limits_file` (engine::find_memory), so a server changed
+// since is searched the new way by the next command (the window drops its pool's answer,
+// App::test_server). Nothing is set when stopped.
+void test_grab(const engine::Context& ctx, const std::filesystem::path& limits_file, const std::stop_token& stop,
+               TestResult& result) {
     auto failed = [&](std::string why) {
         result.grab_ok = false;
         result.grab_error = std::move(why);
@@ -622,7 +627,13 @@ void test_grab(const engine::Context& ctx, const std::stop_token& stop, TestResu
     } catch (const sftp::Broken& e) {
         return failed(e.what());
     }
-    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry);
+    // Asked whatever was saved; a save that fails is only asked again by the next search.
+    // gui.json's old limits, kept if this answer makes limits.json (review G195).
+    auto gui = read_gui_state(limits_file.parent_path() / "gui.json");
+    auto old_limits = gui && *gui ? std::move((*gui)->server_limits) : std::map<std::string, int>{};
+    auto memory = engine::find_memory(limits_file, *target, {}, std::move(old_limits));
+    memory.load = {};
+    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry, memory);
     if (stop.stop_requested()) return;
     if (!way) return failed(way.error());
     result.grab_ok = true;
@@ -655,7 +666,7 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
                                   .imported = {},
                                   .engine = Engine::grab,
                                   .grab_method = resolve_grab_method(*s, *remote)};
-        test_grab(ctx, stop, result);
+        test_grab(ctx, learned_limits_path(env.grab_conf), stop, result);
         if (stop.stop_requested()) return util::fail("cancelled");
     } else if (resolve_find_method(*s, *remote) == FindMethod::ssh) {
         std::vector<std::string> options{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"};

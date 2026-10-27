@@ -15,6 +15,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -22,6 +23,13 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace grab::ssh {
+// ssh_find.hpp, which includes this file by way of file_list.hpp.
+struct FindSpec;
+struct FindOptions;
+struct Found;
+} // namespace grab::ssh
 
 namespace grab::engine {
 
@@ -80,6 +88,8 @@ struct GrabSide {
     std::function<void(const ssh::Lookup&)> on_lookup;
     // Entries so far, now and then: found by find, looked at by the walk (from the walk's threads).
     std::function<void(std::size_t)> progress;
+    // The find check's answers kept across runs (find_memory). None: asked once per pool.
+    ssh::FindMemory memory;
 };
 
 struct SearchRequest {
@@ -149,12 +159,31 @@ search_both(const Context& ctx, const SearchRequest& req, const proc::RunOptions
 [[nodiscard]] std::expected<std::shared_ptr<ssh::Pool>, std::string> grab_pool(const Context& ctx,
                                                                               const GrabSide& side);
 // How a search or list goes there: ssh::choose_lookup with the context's method (the check asked
-// once per pool), told to side.on_lookup. "search cancelled" when stopped.
+// once per pool, unless side.memory has its answer), told to side.on_lookup. "search cancelled"
+// when stopped.
 [[nodiscard]] std::expected<ssh::Lookup, std::string> grab_lookup(const Context& ctx, ssh::Pool& pool,
                                                                   const GrabSide& side, std::stop_token stop);
+// find for a search or list on the way grab_lookup chose, shown to `on_command`. When it fails as
+// it does where there's no find for grab (ssh::FindFailed::about_find) on an answer known from
+// before (saved by an earlier run, or asked earlier in the program), the check is asked again at
+// once (ssh::recheck_lookup) and `way` becomes its answer, told to side.on_lookup: find runs
+// again, or nullopt says to walk. "search cancelled" when stopped.
+[[nodiscard]] std::expected<std::optional<ssh::Found>, std::string>
+grab_find(const Context& ctx, ssh::Pool& pool, const GrabSide& side, ssh::Lookup& way, const ssh::FindSpec& spec,
+          const ssh::FindOptions& options, const CommandHook& on_command);
+// The find check's answers for `target`'s login (user@host:port), kept in limits.json
+// (`limits_file`, learned_limits_path) beside the learned connection limits, so the window and
+// the command ask a server once a week rather than once per run (ssh::find_check_trust); a host,
+// port or user changed is another login, asked again. `report` (may be empty) hears how each
+// write went. `before`: gui.json's old "serverLimits", kept when an answer makes the file
+// (save_find_check).
+[[nodiscard]] ssh::FindMemory find_memory(const std::filesystem::path& limits_file, const ssh::Target& target,
+                                          std::function<void(const std::expected<void, std::string>&)> report,
+                                          std::map<std::string, int> before = {});
 // The way chosen in words, after "searching" or "listing" (-v, the window): "with find (GNU
 // find)", "by listing folders (a Storage Box has no find)", "by listing folders (its answer to
-// grab's find check: ...)".
+// grab's find check: ...)"; a saved answer with its date ("with find (GNU find, checked on
+// 2026-10-27)"), one asked again with why.
 [[nodiscard]] std::string lookup_text(const Context& ctx, const ssh::Lookup& way);
 
 // rclone argv for downloading `remote_path` into `dest_dir` (DEST\<name>), with the remote's

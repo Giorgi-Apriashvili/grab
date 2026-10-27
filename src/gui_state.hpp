@@ -142,8 +142,9 @@ read_queue(const std::filesystem::path& p);
 // isn't a JSON object, so that the defaults never replace it unseen (review G213).
 [[nodiscard]] std::expected<std::optional<GuiState>, std::string> read_gui_state(const std::filesystem::path& p);
 // The connection limits grab learned per server from refusals, shared by the window and the
-// command (review G195): state_dir's "limits.json", {"server": n}. `before`: what gui.json held
-// as "serverLimits" (grab 0.17 and older), used while the file doesn't exist yet.
+// command (review G195): state_dir's "limits.json", {"server": n, "find checks": {...}} (see
+// save_find_check). `before`: what gui.json held as "serverLimits" (grab 0.17 and older), used
+// while the file doesn't exist yet.
 [[nodiscard]] std::filesystem::path learned_limits_path(const std::filesystem::path& grab_conf);
 [[nodiscard]] std::map<std::string, int> load_learned_limits(const std::filesystem::path& file,
                                                              const std::map<std::string, int>& before = {});
@@ -152,6 +153,25 @@ read_queue(const std::filesystem::path& p);
 [[nodiscard]] std::expected<void, std::string> save_learned_limit(const std::filesystem::path& file,
                                                                   const std::string& server, std::optional<int> limit,
                                                                   const std::map<std::string, int>& before = {});
+
+// A server's answer to grab's find check (ssh_find.hpp), which limits.json keeps beside the
+// limits under "find checks", per login ("user@host:port"), so that neither program asks it
+// again each run (engine::find_memory says how long it holds).
+struct SavedFindCheck {
+    bool works = false;
+    std::string answer;
+    std::int64_t checked = 0; // Unix seconds
+    bool operator==(const SavedFindCheck&) const = default;
+};
+// `login`'s saved answer; nullopt when there is none (or no file, or a damaged one).
+[[nodiscard]] std::optional<SavedFindCheck> load_find_check(const std::filesystem::path& file, std::string_view login);
+// Sets `login`'s answer, or drops it (nullopt), under the settings lock and from the file as it
+// is then; answers checked before `drop_before` (Unix seconds) go too. The limits stay; `before`
+// as for save_learned_limit, so the first answer saved doesn't lose gui.json's old limits.
+[[nodiscard]] std::expected<void, std::string> save_find_check(const std::filesystem::path& file, std::string_view login,
+                                                               const std::optional<SavedFindCheck>& check,
+                                                               std::int64_t drop_before,
+                                                               const std::map<std::string, int>& before = {});
 
 // Replaced in one step (util::write_file_atomic); the error says why it couldn't be.
 [[nodiscard]] std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state);

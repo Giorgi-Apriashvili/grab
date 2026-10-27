@@ -2,8 +2,9 @@
 
 // Searches and file lists through grab's own SSH client with the server's GNU find, run over an
 // exec channel on a pooled connection instead of ssh.exe (RCLONE-REPLACEMENT.md, phase 4). Which
-// servers get find is decided once per program run by a short check (the probe); the others are
-// walked over SFTP (ssh_walk.hpp).
+// servers get find is decided by a short check (the probe), asked once a week per login, its
+// answer saved across runs (FindMemory), and again at once when find fails as it does where
+// there's none; the others are walked over SFTP (ssh_walk.hpp).
 //
 // find runs as `env LC_ALL=C find -L`: links are followed as the walk follows them (review G54),
 // and the C locale makes its messages and quote marks predictable and -iname fold only ASCII, as
@@ -40,16 +41,26 @@ inline constexpr std::chrono::seconds find_probe_deadline{10};
 // What the server's answer to find_probe means: `ran` is what exec gave, `out` its stdout.
 [[nodiscard]] FindCheck read_find_probe(const std::expected<ExecResult, ExecError>& ran, std::string_view out);
 
-// The probe on one of the pool's connections, asked once per pool (Pool::find_check). nullopt
-// when stopped. Throws Error when no login works (`retry`: as Pool::acquire). The caller holds
-// none of the pool's leases (with a pool of one, it would wait for its own).
-[[nodiscard]] std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop, Retry retry = std::nullopt);
+// The probe on one of the pool's connections, asked once per pool (Pool::find_check) and only
+// when `memory` has no answer; a new lasting answer goes to `memory`. nullopt when stopped.
+// Throws Error when no login works (`retry`: as Pool::acquire). The caller holds none of the
+// pool's leases (with a pool of one, it would wait for its own).
+[[nodiscard]] std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop, Retry retry = std::nullopt,
+                                                  const FindMemory& memory = {});
 
 // `method` as the server's answer bears it out (a Lookup, ssh_pool.hpp): probe uses find where
 // the check says it works and walks elsewhere; find needs it to work, else it's an error naming
-// the server's answer; walk asks nothing. An error too when the check's login fails, or "stopped".
+// the server's answer (one an earlier run saved is asked again first: the server may have changed);
+// walk asks nothing. An error too when the check's login fails, or "stopped".
 [[nodiscard]] std::expected<Lookup, std::string> choose_lookup(Pool& pool, GrabMethod method, std::string_view server,
-                                                               std::stop_token stop, Retry retry = std::nullopt);
+                                                               std::stop_token stop, Retry retry = std::nullopt,
+                                                               const FindMemory& memory = {});
+// After find failed as it does where there's no find for grab (FindFailed::about_find) on an
+// answer known from before (a saved one, or one asked earlier in the program): drops that answer
+// from the pool and from `memory`, then asks the check again at once, as choose_lookup.
+[[nodiscard]] std::expected<Lookup, std::string> recheck_lookup(Pool& pool, GrabMethod method, std::string_view server,
+                                                                std::stop_token stop, Retry retry = std::nullopt,
+                                                                const FindMemory& memory = {});
 
 // What a find on grab's engine looks for.
 struct FindSpec {
@@ -80,19 +91,33 @@ struct Found {
     std::vector<std::string> notes;        // as engine::SearchResult::notes
 };
 
+// Why find failed, and whether that says the server has no find for grab (any more) rather than
+// something about this search: the command refused, exit 126 or 127, no exit status, a line such
+// as "command not found" or a complaint about an option find_command uses, output that isn't
+// find's records (a banner, a restricted shell's answer). Then a check's answer known from
+// before is worth asking again (recheck_lookup). A login, a lost connection, a signal, a cap, or
+// roots find couldn't read are not about find.
+struct FindFailed {
+    std::string message;
+    bool about_find = false;
+};
+
 // What find's stderr and exit status mean for its results (exposed for tests). Exit 0, or exit 1
 // with only lines about folders it couldn't read ("Permission denied", "No such file or
 // directory") and link loops ("File system loop detected", "Too many levels of symbolic links"),
 // keep the results; those lines become notes ("a/b: permission denied"). A root among them doesn't
-// stop the other roots, but every root failing is an error; so is anything else, with the first
-// line of stderr. `cut`: `err` is only the start of stderr (ExecResult::err_cut), so its last
-// line, most likely cut short, is left out and a note says more wasn't kept.
-[[nodiscard]] std::expected<std::vector<std::string>, std::string>
+// stop the other roots, but every root failing is an error. At exit 1 so is any other line (the
+// first one is the message), marked about_find when it names no path (doesn't start with
+// "find: '"); at exit 0 such lines are notes. Any other exit status fails it, about find for 126,
+// 127, no status and other codes find doesn't give, not for 128 and up (a signal). `cut`: `err` is only
+// the start of stderr (ExecResult::err_cut), so its last line, most likely cut short, is left out
+// and a note says more wasn't kept.
+[[nodiscard]] std::expected<std::vector<std::string>, FindFailed>
 read_find_errors(const FindSpec& spec, std::string_view err, int status, bool cut = false);
 
 // Runs find_command(spec) on one of the pool's connections, its output parsed as it streams.
 // Empty when stopped. Past max_entries records or max_bytes it's stopped and an error ("listing
 // too large"), and the connection isn't used again.
-[[nodiscard]] std::expected<Found, std::string> run_find(Pool& pool, const FindSpec& spec, const FindOptions& options);
+[[nodiscard]] std::expected<Found, FindFailed> run_find(Pool& pool, const FindSpec& spec, const FindOptions& options);
 
 } // namespace grab::ssh

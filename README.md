@@ -534,7 +534,8 @@ the input runs out, the command stops without changing anything.
 Password servers are searched with rclone. Key and ssh-agent servers are searched with ssh +
 find, which is faster; with a passphrase-protected key that needs the key in ssh-agent
 (`ssh-add <key file>`). With `engine = grab` every server is searched with find where it has
-GNU find (grab checks once per run), else by listing its folders.
+GNU find (grab checks once a week and remembers the answer in `limits.json`; Test checks again),
+else by listing its folders.
 
 **Coming from an earlier grab:** grab.conf used to point at remotes in the standard
 rclone.conf. The first run of this version copies the remotes grab.conf uses into grab's own

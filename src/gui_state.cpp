@@ -6,10 +6,13 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <expected>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -347,41 +350,108 @@ std::filesystem::path learned_limits_path(const std::filesystem::path& grab_conf
 
 namespace {
 
-// The file's limits; nullopt when there is no file. A damaged one counts as empty: these are
-// only hints, learned again from the next refusal.
-std::optional<std::map<std::string, int>> read_limits(const std::filesystem::path& file) {
+// limits.json's key for the find checks; a server's limit can't take it (a number there).
+constexpr std::string_view find_checks_key = "find checks";
+
+// What limits.json holds: the learned limits by server and the find checks by login.
+struct Learned {
+    std::map<std::string, int> limits;
+    std::map<std::string, SavedFindCheck, std::less<>> find_checks;
+};
+
+// The file as it is; nullopt when there is no file. A damaged one counts as empty: these are
+// only hints, learned again (a limit from the next refusal, a find check by asking).
+std::optional<Learned> read_learned(const std::filesystem::path& file) {
     auto text = util::read_file_if_exists(file);
     if (text && !*text) return std::nullopt;
-    std::map<std::string, int> out;
+    Learned out;
     if (!text) return out;
-    if (auto doc = json::parse(**text); doc && doc->kind == json::Value::Kind::object) {
-        for (std::size_t i = 0; i < doc->keys.size(); ++i) {
-            const auto& v = doc->items[i];
-            if (v.kind == json::Value::Kind::number && v.number >= 1 && v.number <= 1000) {
-                out[doc->keys[i]] = static_cast<int>(v.number);
+    auto doc = json::parse(**text);
+    if (!doc || doc->kind != json::Value::Kind::object) return out;
+    for (std::size_t i = 0; i < doc->keys.size(); ++i) {
+        const auto& v = doc->items[i];
+        if (v.kind == json::Value::Kind::number && v.number >= 1 && v.number <= 1000 && doc->keys[i] != find_checks_key) {
+            out.limits[doc->keys[i]] = static_cast<int>(v.number);
+        }
+    }
+    if (const auto* checks = doc->find(find_checks_key); checks && checks->kind == json::Value::Kind::object) {
+        for (std::size_t i = 0; i < checks->keys.size(); ++i) {
+            const auto& c = checks->items[i];
+            const auto* works = c.find("works");
+            const auto* checked = c.find("checked");
+            auto answer = c.string_of("answer");
+            if (works == nullptr || works->kind != json::Value::Kind::boolean || checked == nullptr ||
+                checked->kind != json::Value::Kind::number || !answer) {
+                continue;
             }
+            out.find_checks[checks->keys[i]] = SavedFindCheck{
+                .works = works->boolean, .answer = std::move(*answer), .checked = static_cast<std::int64_t>(checked->number)};
         }
     }
     return out;
+}
+
+std::expected<void, std::string> write_learned(const std::filesystem::path& file, const Learned& learned) {
+    json::Value v = json::Value::make_object();
+    for (const auto& [name, n] : learned.limits) {
+        if (name != find_checks_key) v.set(name, json::Value::make_number(n));
+    }
+    if (!learned.find_checks.empty()) {
+        json::Value checks = json::Value::make_object();
+        for (const auto& [login, c] : learned.find_checks) {
+            json::Value one = json::Value::make_object();
+            one.set("works", json::Value::make_bool(c.works));
+            one.set("answer", json::Value::make_string(c.answer));
+            one.set("checked", json::Value::make_number(static_cast<double>(c.checked)));
+            checks.set(login, std::move(one));
+        }
+        v.set(std::string(find_checks_key), std::move(checks));
+    }
+    return util::write_file_atomic(file, json::stringify(v));
 }
 
 } // namespace
 
 std::map<std::string, int> load_learned_limits(const std::filesystem::path& file,
                                                const std::map<std::string, int>& before) {
-    return read_limits(file).value_or(before);
+    auto learned = read_learned(file);
+    return learned ? std::move(learned->limits) : before;
 }
 
 std::expected<void, std::string> save_learned_limit(const std::filesystem::path& file, const std::string& server,
                                                     std::optional<int> limit, const std::map<std::string, int>& before) {
     auto lock = lock_settings();
     if (!lock) return util::fail(lock.error());
-    auto limits = read_limits(file).value_or(before);
-    if (limit) limits[server] = *limit;
-    else limits.erase(server);
-    json::Value v = json::Value::make_object();
-    for (const auto& [name, n] : limits) v.set(name, json::Value::make_number(n));
-    return util::write_file_atomic(file, json::stringify(v));
+    auto learned = read_learned(file).value_or(Learned{.limits = before, .find_checks = {}});
+    if (limit) learned.limits[server] = *limit;
+    else learned.limits.erase(server);
+    return write_learned(file, learned);
+}
+
+std::optional<SavedFindCheck> load_find_check(const std::filesystem::path& file, std::string_view login) {
+    auto learned = read_learned(file);
+    if (!learned) return std::nullopt;
+    const auto it = learned->find_checks.find(login);
+    if (it == learned->find_checks.end()) return std::nullopt;
+    return std::move(it->second);
+}
+
+std::expected<void, std::string> save_find_check(const std::filesystem::path& file, std::string_view login,
+                                                 const std::optional<SavedFindCheck>& check, std::int64_t drop_before,
+                                                 const std::map<std::string, int>& before) {
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
+    auto learned = read_learned(file).value_or(Learned{.limits = before, .find_checks = {}});
+    auto changed = std::erase_if(learned.find_checks, [&](const auto& kept) { return kept.second.checked < drop_before; });
+    if (check) {
+        learned.find_checks.insert_or_assign(std::string(login), *check);
+        ++changed;
+    } else if (const auto it = learned.find_checks.find(login); it != learned.find_checks.end()) {
+        learned.find_checks.erase(it);
+        ++changed;
+    }
+    if (changed == 0) return {}; // nothing to drop
+    return write_learned(file, learned);
 }
 
 std::expected<void, std::string> save_gui_state(const std::filesystem::path& p, const GuiState& state) {

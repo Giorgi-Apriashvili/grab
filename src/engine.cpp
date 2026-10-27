@@ -2,6 +2,7 @@
 
 #include "conn_budget.hpp"
 #include "folder.hpp"
+#include "gui_state.hpp"
 #include "json.hpp"
 #include "listing.hpp"
 #include "match.hpp"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -168,6 +170,10 @@ std::vector<std::string> unused_flags(const Context& ctx) {
 
 namespace {
 
+std::int64_t unix_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 // The last non-empty line of a child's stderr, without a trailing period (the caller's
 // message continues after it).
 std::string last_line(std::string_view text) {
@@ -315,19 +321,20 @@ std::expected<GrabFound, std::string> lookup_via_grab(const Context& ctx, const 
                                  .query = query,
                                  .folders = folders,
                                  .files = files};
-        if (on_command) on_command({"exec", ssh::find_command(spec)});
         ssh::FindOptions options;
         options.stop = stop;
         options.progress = req.grab.progress;
         options.retry_refused = ssh::interactive_retry;
-        auto got = ssh::run_find(**pool, spec, options);
-        if (stop.stop_requested()) return util::fail("search cancelled");
+        auto got = grab_find(ctx, **pool, req.grab, *way, spec, options, on_command);
         if (!got) return util::fail(got.error());
-        for (auto& e : got->entries) {
-            if (auto* into = kind_of(e.dir)) into->push_back(RemoteEntry{std::move(e.path), e.size, e.modified});
+        if (*got) {
+            for (auto& e : (*got)->entries) {
+                if (auto* into = kind_of(e.dir)) into->push_back(RemoteEntry{std::move(e.path), e.size, e.modified});
+            }
+            found.notes = std::move((*got)->notes);
+            return found;
         }
-        found.notes = std::move(got->notes);
-        return found;
+        // Asked again, the check says walk.
     }
 
     const int seat = req.grab.walk_seat ? req.grab.walk_seat() : 4;
@@ -374,21 +381,88 @@ std::expected<std::shared_ptr<ssh::Pool>, std::string> grab_pool(const Context& 
 
 std::expected<ssh::Lookup, std::string> grab_lookup(const Context& ctx, ssh::Pool& pool, const GrabSide& side,
                                                     std::stop_token stop) {
-    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry);
+    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry, side.memory);
     if (stop.stop_requested()) return util::fail("search cancelled");
     if (!way) return util::fail(way.error());
     if (side.on_lookup) side.on_lookup(*way);
     return way;
 }
 
-std::string lookup_text(const Context& ctx, const ssh::Lookup& way) {
-    if (way.find) return std::format("with find ({})", way.answer);
-    if (!way.answer.empty()) return std::format("by listing folders (its answer to grab's find check: {})", way.answer);
-    // The check wasn't asked.
-    if (ctx.settings.find == FindMethod::auto_detect && budget::is_storage_box(ctx.remote.host)) {
-        return "by listing folders (a Storage Box has no find, so grab doesn't ask)";
+std::expected<std::optional<ssh::Found>, std::string> grab_find(const Context& ctx, ssh::Pool& pool,
+                                                                const GrabSide& side, ssh::Lookup& way,
+                                                                const ssh::FindSpec& spec,
+                                                                const ssh::FindOptions& options,
+                                                                const CommandHook& on_command) {
+    for (bool again = false;; again = true) {
+        if (on_command) on_command({"exec", ssh::find_command(spec)});
+        auto found = ssh::run_find(pool, spec, options);
+        if (options.stop.stop_requested()) return util::fail("search cancelled");
+        if (found) return std::optional(std::move(*found));
+        // The check's answer was asked just now (for this search, an earlier one in the program
+        // or another caller's), or asked again already: asking once more would only repeat it.
+        const bool fresh =
+            way.checked > 0 && unix_now() - way.checked < std::chrono::seconds(ssh::find_check_fresh).count();
+        if (!found.error().about_find || way.asked || fresh || again) {
+            return util::fail(std::move(found.error().message));
+        }
+        // A saved answer (or one from earlier in the program) says find works, and find says it
+        // doesn't (any more): asked again now, so this search goes the way that works.
+        auto asked = ssh::recheck_lookup(pool, ctx.grab_method, ctx.settings.name, options.stop,
+                                         ssh::interactive_retry, side.memory);
+        if (options.stop.stop_requested()) return util::fail("search cancelled");
+        if (!asked) return util::fail(asked.error());
+        way = std::move(*asked);
+        way.redone = std::move(found.error().message);
+        if (side.on_lookup) side.on_lookup(way);
+        if (!way.find) return std::nullopt;
     }
-    return std::format("by listing folders, as [{}]'s find setting says", ctx.settings.name);
+}
+
+ssh::FindMemory find_memory(const std::filesystem::path& limits_file, const ssh::Target& target,
+                            std::function<void(const std::expected<void, std::string>&)> report,
+                            std::map<std::string, int> before) {
+    const std::string login = std::format("{}@{}:{}", target.user, target.host, target.port);
+    ssh::FindMemory memory;
+    memory.load = [limits_file, login]() -> std::optional<ssh::FindCheck> {
+        auto kept = load_find_check(limits_file, login);
+        if (!kept) return std::nullopt;
+        // Trusted for a week; one from the future (a clock set back) isn't.
+        const auto age = std::chrono::seconds(unix_now() - kept->checked);
+        if (age < std::chrono::seconds(0) || age >= ssh::find_check_trust) return std::nullopt;
+        return ssh::FindCheck{.works = kept->works,
+                              .answer = std::move(kept->answer),
+                              .lasting = true,
+                              .checked = kept->checked,
+                              .saved = true};
+    };
+    memory.save = [limits_file, login, report = std::move(report),
+                   before = std::move(before)](const std::optional<ssh::FindCheck>& check) {
+        std::optional<SavedFindCheck> keep;
+        if (check) keep = SavedFindCheck{.works = check->works, .answer = check->answer, .checked = check->checked};
+        // Answers past their week go as well.
+        const auto saved = save_find_check(limits_file, login, keep,
+                                           unix_now() - std::chrono::seconds(ssh::find_check_trust).count(), before);
+        if (report) report(saved);
+    };
+    return memory;
+}
+
+std::string lookup_text(const Context& ctx, const ssh::Lookup& way) {
+    // An answer an earlier run saved, with its date.
+    const std::string on = way.saved && way.checked > 0 ? " on " + util::local_date(way.checked) : std::string();
+    std::string text;
+    if (way.find) {
+        text = std::format("with find ({}{})", way.answer, way.saved ? ", checked" + on : std::string());
+    } else if (!way.answer.empty()) {
+        text = std::format("by listing folders (its answer to grab's find check{}: {})", on, way.answer);
+    } else if (ctx.settings.find == FindMethod::auto_detect && budget::is_storage_box(ctx.remote.host)) {
+        // The check wasn't asked.
+        text = "by listing folders (a Storage Box has no find, so grab doesn't ask)";
+    } else {
+        text = std::format("by listing folders, as [{}]'s find setting says", ctx.settings.name);
+    }
+    if (!way.redone.empty()) text += "; asked again after: " + way.redone;
+    return text;
 }
 
 std::vector<std::string> search_roots(const Context& ctx) {
