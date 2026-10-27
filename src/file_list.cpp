@@ -7,11 +7,16 @@
 #include "quote.hpp"
 #include "rclone.hpp"
 #include "rclone_flags.hpp"
+#include "ssh_find.hpp"
+#include "ssh_pool.hpp"
+#include "ssh_walk.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <format>
+#include <optional>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -21,10 +26,17 @@ namespace grab::file_list {
 namespace fs = std::filesystem;
 
 std::string fingerprint(const engine::Context& ctx) {
-    return std::format("1|{}|{}|{}@{}:{}|depth={}|hidden={}|roots={}", ctx.settings.rclone_remote,
-                       ctx.method == FindMethod::ssh ? "ssh" : "rclone", ctx.remote.user, ctx.remote.host,
-                       ctx.remote.port, ctx.settings.max_depth, ctx.settings.skip_hidden ? "skip" : "keep",
-                       util::join(engine::search_roots(ctx), "\x1f"));
+    // On grab's engine its find setting, not the check's answer, so no check is needed to compare.
+    // Lists made on the other engine differ (links, names in grab's form) and are fetched again.
+    std::string method = ctx.method == FindMethod::ssh ? "ssh" : "rclone";
+    if (ctx.engine == Engine::grab) {
+        method = ctx.grab_method == GrabMethod::find   ? "grab+find"
+                 : ctx.grab_method == GrabMethod::walk ? "grab+walk"
+                                                        : "grab+probe";
+    }
+    return std::format("1|{}|{}|{}@{}:{}|depth={}|hidden={}|roots={}", ctx.settings.rclone_remote, method,
+                       ctx.remote.user, ctx.remote.host, ctx.remote.port, ctx.settings.max_depth,
+                       ctx.settings.skip_hidden ? "skip" : "keep", util::join(engine::search_roots(ctx), "\x1f"));
 }
 
 bool fresh(std::int64_t fetched, std::int64_t now) {
@@ -174,13 +186,76 @@ std::vector<Entry> parse_lsf(std::string_view out, std::string_view root) {
     return entries;
 }
 
+namespace {
+
+// The list through grab's own SSH client: one find of both kinds, or one walk of every root.
+std::expected<void, std::string> fetch_grab(const engine::Context& ctx, List& list, const std::vector<std::string>& roots,
+                                            const std::stop_token& stop, const engine::CommandHook& on_command,
+                                            const engine::GrabSide& grab) {
+    auto pool = engine::grab_pool(ctx, grab);
+    if (!pool) return util::fail(pool.error());
+    auto way = engine::grab_lookup(ctx, **pool, grab, stop);
+    if (!way) return util::fail(way.error());
+    if (way->find) {
+        const ssh::FindSpec spec{.roots = roots,
+                                 .max_depth = ctx.settings.max_depth,
+                                 .skip_hidden = ctx.settings.skip_hidden,
+                                 .query = std::nullopt,
+                                 .folders = true,
+                                 .files = true};
+        if (on_command) on_command({"exec", ssh::find_command(spec)});
+        ssh::FindOptions options;
+        options.stop = stop;
+        options.progress = grab.progress;
+        options.retry_refused = ssh::interactive_retry;
+        auto found = ssh::run_find(**pool, spec, options);
+        if (stop.stop_requested()) return util::fail("search cancelled");
+        if (!found) return util::fail(found.error());
+        list.entries = std::move(found->entries);
+        list.notes = std::move(found->notes);
+        return {};
+    }
+    const int seat = grab.walk_seat ? grab.walk_seat() : 4;
+    if (stop.stop_requested()) return util::fail("search cancelled");
+    ssh::WalkOptions options{.connections = std::max(1, seat),
+                             .folders = true,
+                             .max_depth = ctx.settings.max_depth,
+                             .skip_hidden = ctx.settings.skip_hidden};
+    options.progress = grab.progress;
+    options.retry_refused = ssh::interactive_retry;
+    if (on_command) {
+        std::vector<std::string> argv{"sftp", "walk"};
+        for (const auto& r : roots) argv.push_back(r.empty() ? std::string(".") : r);
+        argv.insert(argv.end(), {"--max-depth", std::to_string(ctx.settings.max_depth)});
+        on_command(argv);
+    }
+    auto walked = ssh::walk_roots(**pool, roots, options, stop);
+    if (stop.stop_requested()) return util::fail("search cancelled");
+    if (!walked) return util::fail(walked.error());
+    list.entries.reserve(walked->entries.size());
+    for (auto& e : walked->entries) {
+        list.entries.push_back(Entry{.path = std::move(e.path),
+                                     .dir = e.dir,
+                                     .size = e.dir ? std::nullopt : std::optional(e.size),
+                                     .modified = e.modified});
+    }
+    list.notes = std::move(walked->unreadable);
+    return {};
+}
+
+} // namespace
+
 std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh,
                                        const proc::RunOptions& run, const engine::CommandHook& on_command,
-                                       const std::vector<std::string>& walk_flags) {
+                                       const std::vector<std::string>& walk_flags, const engine::GrabSide& grab) {
     List list;
     list.fetched = now;
     list.fingerprint = fingerprint(ctx);
     const auto roots = engine::search_roots(ctx);
+    if (ctx.engine == Engine::grab) {
+        if (auto got = fetch_grab(ctx, list, roots, run.stop, on_command, grab); !got) return util::fail(got.error());
+        return list;
+    }
     if (ctx.method == FindMethod::ssh) {
         auto out = engine::run_over_ssh(ctx, find_command(roots, ctx.settings.max_depth, ctx.settings.skip_hidden),
                                         batch_ssh, run, on_command);

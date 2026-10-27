@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cli.hpp"
+#include "match.hpp"
 #include "remote.hpp"
 
 #include <cstdint>
@@ -57,6 +58,25 @@ struct LsfLine {
 // nullopt unless it is the three fields with a size (or -1); a time that doesn't parse gives an
 // unknown date.
 [[nodiscard]] std::optional<LsfLine> parse_lsf_record(const std::vector<std::string>& fields);
+
+// Which entries of a listing a lookup keeps: of the kind asked for, with no dot-name below where
+// the listing started when those are skipped (unless the query wants one), and named as the query
+// asks (see match.hpp; a path target: exactly its name). parse_lsf_output's filters, which grab's
+// own walk uses too (RCLONE-REPLACEMENT.md, phase 4).
+class HitFilter {
+public:
+    HitFilter(Mode mode, std::string_view target, bool exact, bool skip_hidden);
+    // `path`: the entry's path below the listing's start, without a trailing '/' (only its name
+    // counts when dot-names aren't skipped here).
+    [[nodiscard]] bool keeps(std::string_view path, bool dir) const;
+
+private:
+    Mode mode_;
+    bool path_target_;
+    std::string want_; // a path target's name
+    Query query_;
+    bool filter_hidden_;
+};
 
 // Entries from lsf output whose last component matches the query (see match.hpp); paths are
 // joined onto the root / parent.

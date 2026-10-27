@@ -15,7 +15,8 @@ namespace grab::activity {
 // leaning on the latest, so a server that got slower shows it soon.
 [[nodiscard]] int blend(std::optional<int> before, int now_ms);
 // The first guess for a step never timed, by its kind: the part of `key` before ':' ("lsjson",
-// "search", "list", "serve", "update").
+// "search", "list", "serve", "update"; on engine = grab "readdir", "find", "walk", "list.find",
+// "list.walk").
 [[nodiscard]] int guess(std::string_view key);
 // Remembered times outside this range are dropped as nonsense.
 inline constexpr int min_ms = 1;

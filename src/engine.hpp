@@ -8,13 +8,17 @@
 #include "process.hpp"
 #include "remote.hpp"
 #include "ssh.hpp"
+#include "ssh_pool.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -58,6 +62,22 @@ inline constexpr RcloneVersion min_rclone{1, 67, 0};
 [[nodiscard]] std::expected<void, std::string> check_rclone(const std::string& rclone,
                                                             const std::filesystem::path& exe_dir, bool configured);
 
+// A search, list or Browse through grab's own SSH client (engine = grab): find over an exec
+// channel where the server's check says it works, else the SFTP walk (RCLONE-REPLACEMENT.md,
+// phase 4).
+struct GrabSide {
+    // The server's pool, shared with the program's other users of it (the window's downloads; a
+    // command's download after its search, so it logs in once). None: one made for the call.
+    std::shared_ptr<ssh::Pool> pool;
+    // How many connections a walk takes, asked once the walk is chosen (the window takes its
+    // fetch::Listing seat of up to 8 then). Unset: 4.
+    std::function<int()> walk_seat;
+    // How it goes (find or the walk), once chosen and before it starts.
+    std::function<void(const ssh::Lookup&)> on_lookup;
+    // Entries so far, now and then: found by find, looked at by the walk (from the walk's threads).
+    std::function<void(std::size_t)> progress;
+};
+
 struct SearchRequest {
     std::string target; // words, glob, or a remote path containing '/'
     Mode mode = Mode::file;
@@ -66,6 +86,7 @@ struct SearchRequest {
     bool batch_ssh = false;   // never let ssh prompt (GUI): -o BatchMode=yes
     // For a walk with rclone: its connections from the pool (fetch::Listing::flags).
     std::vector<std::string> walk_flags;
+    GrabSide grab; // engine = grab
 };
 
 struct Hit {
@@ -107,16 +128,30 @@ run_listing(std::span<const std::string> argv, const proc::RunOptions& run = {},
 [[nodiscard]] SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vector<RemoteEntry> entries);
 
 // Runs the lookup the context's method calls for. An error means the lookup itself failed
-// (ssh or rclone exited non-zero); no matches is a successful, empty result.
+// (ssh or rclone exited non-zero); no matches is a successful, empty result. On engine = grab:
+// a path target is one SFTP STAT; a name search runs find or the walk (req.grab), and only
+// `run.stop` of `run` counts.
 [[nodiscard]] std::expected<SearchResult, std::string>
 search(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run = {},
        const CommandHook& on_command = {});
 // Folders and files at once (the window's searches), `req.mode` aside: over rclone one walk lists
 // both kinds, where a search per kind walked the server twice (review G197); over ssh, a find
-// per kind.
+// per kind; on engine = grab one find or one walk.
 [[nodiscard]] std::expected<std::pair<SearchResult, SearchResult>, std::string>
 search_both(const Context& ctx, const SearchRequest& req, const proc::RunOptions& run = {},
             const CommandHook& on_command = {});
+
+// engine = grab: the pool a lookup uses, `side`'s, else one made for it (of 4 connections).
+[[nodiscard]] std::expected<std::shared_ptr<ssh::Pool>, std::string> grab_pool(const Context& ctx,
+                                                                              const GrabSide& side);
+// How a search or list goes there: ssh::choose_lookup with the context's method (the check asked
+// once per pool), told to side.on_lookup. "search cancelled" when stopped.
+[[nodiscard]] std::expected<ssh::Lookup, std::string> grab_lookup(const Context& ctx, ssh::Pool& pool,
+                                                                  const GrabSide& side, std::stop_token stop);
+// The way chosen in words, after "searching" or "listing" (-v, the window): "with find (GNU
+// find)", "by listing folders (a Storage Box has no find)", "by listing folders (its answer to
+// grab's find check: ...)".
+[[nodiscard]] std::string lookup_text(const Context& ctx, const ssh::Lookup& way);
 
 // rclone argv for downloading `remote_path` into `dest_dir` (DEST\<name>), with the remote's
 // flags as configured (including -P for the console). Fails as build_rclone_argv does.

@@ -16,6 +16,13 @@ int guess(std::string_view key) {
     if (kind == "lsjson") return 2000;
     if (kind == "search") return 5000;
     if (kind == "list") return 10000;
+    // grab's own SSH client (engine = grab), by method: one folder on a kept connection, find, the
+    // walk; a file list's find or walk.
+    if (kind == "readdir") return 1000;
+    if (kind == "find") return 3000;
+    if (kind == "walk") return 10000;
+    if (kind == "list.find") return 4000;
+    if (kind == "list.walk") return 20000;
     if (kind == "serve") return 2000;
     if (kind == "update") return 2000;
     return 3000;

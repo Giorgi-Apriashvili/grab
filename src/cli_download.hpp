@@ -9,6 +9,7 @@
 #include "engine.hpp"
 #include "gui_state.hpp"
 #include "schedule.hpp"
+#include "ssh_pool.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -67,11 +68,13 @@ struct DownloadTally {
                                                        const schedule::Now& now);
 
 // Downloads `paths` (picked search hits, files or folders by opts.mode) into `dest`. `sizes` and
-// `modified` (Unix seconds) are the hits', for the checks before fetching and --dry-run.
+// `modified` (Unix seconds) are the hits', for the checks before fetching and --dry-run. `pools`:
+// the command's grab's own SSH connections (engine = grab), its search's among them, so the
+// download uses the connection the search logged in with.
 [[nodiscard]] DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts,
                                                const std::vector<std::string>& paths,
                                                const std::unordered_map<std::string, std::uint64_t>& sizes,
                                                const std::unordered_map<std::string, std::int64_t>& modified,
-                                               const std::filesystem::path& dest);
+                                               const std::filesystem::path& dest, ssh::Pools& pools);
 
 } // namespace grab

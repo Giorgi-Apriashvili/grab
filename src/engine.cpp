@@ -1,15 +1,20 @@
 #include "engine.hpp"
 
+#include "conn_budget.hpp"
 #include "folder.hpp"
 #include "json.hpp"
 #include "listing.hpp"
 #include "match.hpp"
 #include "rclone.hpp"
+#include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
 #include "remote.hpp"
 #include "ini.hpp"
 #include "secrets.hpp"
+#include "sftp.hpp"
+#include "ssh_find.hpp"
 #include "ssh_target.hpp"
+#include "ssh_walk.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -19,6 +24,7 @@
 #include <cstdint>
 #include <format>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <system_error>
 #include <optional>
@@ -212,7 +218,166 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, std::span<const 
     return found;
 }
 
+// A path target on grab's engine: one STAT, which follows links as find -L and the walk do.
+// nullopt when nothing is there (or a socket, a device: nothing to download).
+struct Stated {
+    RemoteEntry entry;
+    bool dir = false;
+};
+std::expected<std::optional<Stated>, std::string> stat_target(ssh::Pool& pool, std::string_view target,
+                                                              const std::stop_token& stop, const CommandHook& on_command) {
+    // As a listing of its parent names it (parse_lsf_output).
+    const std::string path = join_remote(parent_of(target), remote_basename(target));
+    if (!has_name(path)) return std::nullopt; // ".", "..": never an entry of a listing (review G15)
+    if (on_command) on_command({"sftp", "stat", path});
+    std::expected<sftp::Attrs, sftp::Status> attrs;
+    // A STAT is safe to repeat: a reused connection the server closed while it sat idle is dropped
+    // and the next one tried.
+    for (bool done = false; !done;) {
+        std::optional<ssh::Pool::Lease> lease;
+        try {
+            lease = pool.acquire(stop, ssh::interactive_retry);
+        } catch (const ssh::Error& e) {
+            return util::fail(e.what());
+        }
+        if (!lease) return util::fail("search cancelled");
+        try {
+            attrs = sftp::stat((*lease)->sftp(), rclone_enc::raw_path(path));
+            done = true;
+        } catch (const sftp::Broken& e) {
+            lease->broken();
+            if (!lease->reused()) return util::failf("cannot look at {}: {}", path, e.what());
+        }
+    }
+    if (!attrs) {
+        if (attrs.error().code == sftp::Code::no_such_file) return std::nullopt;
+        return util::failf("cannot look at {}: {}", path, sftp::describe(attrs.error()));
+    }
+    if (!attrs->is_dir() && !attrs->is_file()) return std::nullopt;
+    const bool dir = attrs->is_dir();
+    return Stated{.entry = RemoteEntry{path, dir ? std::nullopt : attrs->size,
+                                       attrs->mtime ? std::optional<std::int64_t>(*attrs->mtime) : std::nullopt},
+                  .dir = dir};
+}
+
+// What a lookup on grab's engine found: the entries of each kind asked for, and the notes.
+struct GrabFound {
+    std::vector<std::vector<RemoteEntry>> kinds;
+    std::vector<std::string> notes;
+};
+
+// The entries of each kind in `kinds` through grab's own SSH client: a path target with one STAT;
+// a name search with one find (both kinds at once) or one walk, whatever their number.
+std::expected<GrabFound, std::string> lookup_via_grab(const Context& ctx, const SearchRequest& req,
+                                                      std::span<const Mode> kinds, const std::vector<std::string>& roots,
+                                                      int max_depth, const std::stop_token& stop,
+                                                      const CommandHook& on_command) {
+    auto pool = grab_pool(ctx, req.grab);
+    if (!pool) return util::fail(pool.error());
+    GrabFound found;
+    found.kinds.resize(kinds.size());
+    auto kind_of = [&](bool dir) -> std::vector<RemoteEntry>* {
+        for (std::size_t k = 0; k < kinds.size(); ++k) {
+            if ((kinds[k] == Mode::folder) == dir) return &found.kinds[k];
+        }
+        return nullptr;
+    };
+    if (is_path_target(req.target)) {
+        auto stated = stat_target(**pool, req.target, stop, on_command);
+        if (!stated) return util::fail(stated.error());
+        if (*stated) {
+            if (auto* into = kind_of((*stated)->dir)) into->push_back(std::move((*stated)->entry));
+        }
+        return found;
+    }
+
+    auto way = grab_lookup(ctx, **pool, req.grab, stop);
+    if (!way) return util::fail(way.error());
+    const Query query = make_query(req.target, req.exact);
+    const bool folders = std::ranges::find(kinds, Mode::folder) != kinds.end();
+    const bool files = std::ranges::find(kinds, Mode::file) != kinds.end();
+    if (way->find) {
+        const ssh::FindSpec spec{.roots = roots,
+                                 .max_depth = max_depth,
+                                 .skip_hidden = ctx.settings.skip_hidden,
+                                 .query = query,
+                                 .folders = folders,
+                                 .files = files};
+        if (on_command) on_command({"exec", ssh::find_command(spec)});
+        ssh::FindOptions options;
+        options.stop = stop;
+        options.progress = req.grab.progress;
+        options.retry_refused = ssh::interactive_retry;
+        auto got = ssh::run_find(**pool, spec, options);
+        if (stop.stop_requested()) return util::fail("search cancelled");
+        if (!got) return util::fail(got.error());
+        for (auto& e : got->entries) {
+            if (auto* into = kind_of(e.dir)) into->push_back(RemoteEntry{std::move(e.path), e.size, e.modified});
+        }
+        found.notes = std::move(got->notes);
+        return found;
+    }
+
+    const int seat = req.grab.walk_seat ? req.grab.walk_seat() : 4;
+    if (stop.stop_requested()) return util::fail("search cancelled");
+    ssh::WalkOptions options{.connections = std::max(1, seat),
+                             .folders = folders,
+                             .max_depth = max_depth,
+                             .skip_hidden = ctx.settings.skip_hidden && !wants_hidden(query)};
+    options.progress = req.grab.progress;
+    options.retry_refused = ssh::interactive_retry;
+    if (on_command) {
+        std::vector<std::string> argv{"sftp", "walk"};
+        for (const auto& r : roots) argv.push_back(r.empty() ? std::string(".") : r);
+        argv.insert(argv.end(), {"--max-depth", std::to_string(max_depth)});
+        on_command(argv);
+    }
+    auto walked = ssh::walk_roots(**pool, roots, options, stop);
+    if (stop.stop_requested()) return util::fail("search cancelled");
+    if (!walked) return util::fail(walked.error());
+    // The walk left dot-names out already, as a listing's filter would.
+    std::vector<HitFilter> filters;
+    filters.reserve(kinds.size());
+    for (const Mode k : kinds) filters.emplace_back(k, req.target, req.exact, false);
+    for (auto& e : walked->entries) {
+        for (std::size_t k = 0; k < kinds.size(); ++k) {
+            if (!filters[k].keeps(e.path, e.dir)) continue;
+            found.kinds[k].push_back(RemoteEntry{std::move(e.path), e.dir ? std::nullopt : std::optional(e.size), e.modified});
+            break;
+        }
+    }
+    found.notes = std::move(walked->unreadable);
+    return found;
+}
+
 } // namespace
+
+std::expected<std::shared_ptr<ssh::Pool>, std::string> grab_pool(const Context& ctx, const GrabSide& side) {
+    if (side.pool) return side.pool;
+    auto target = ssh_target(ctx);
+    if (!target) return util::fail(target.error());
+    return std::make_shared<ssh::Pool>([t = std::move(*target)] { return ssh::open_session(t); },
+                                       ssh::Pools::download_options(4));
+}
+
+std::expected<ssh::Lookup, std::string> grab_lookup(const Context& ctx, ssh::Pool& pool, const GrabSide& side,
+                                                    std::stop_token stop) {
+    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry);
+    if (stop.stop_requested()) return util::fail("search cancelled");
+    if (!way) return util::fail(way.error());
+    if (side.on_lookup) side.on_lookup(*way);
+    return way;
+}
+
+std::string lookup_text(const Context& ctx, const ssh::Lookup& way) {
+    if (way.find) return std::format("with find ({})", way.answer);
+    if (!way.answer.empty()) return std::format("by listing folders (its answer to grab's find check: {})", way.answer);
+    // The check wasn't asked.
+    if (ctx.settings.find == FindMethod::auto_detect && budget::is_storage_box(ctx.remote.host)) {
+        return "by listing folders (a Storage Box has no find, so grab doesn't ask)";
+    }
+    return std::format("by listing folders, as [{}]'s find setting says", ctx.settings.name);
+}
 
 std::vector<std::string> search_roots(const Context& ctx) {
     auto roots = ctx.settings.search_roots;
@@ -271,6 +436,14 @@ std::expected<SearchResult, std::string> search(const Context& ctx, const Search
                                                 const CommandHook& on_command) {
     const auto roots = search_roots(ctx);
     const int max_depth = req.depth.value_or(ctx.settings.max_depth);
+    if (ctx.engine == Engine::grab) {
+        const Mode kind = req.mode;
+        auto found = lookup_via_grab(ctx, req, std::span(&kind, 1), roots, max_depth, run.stop, on_command);
+        if (!found) return util::fail(found.error());
+        auto result = make_result(ctx, req, std::move(found->kinds.front()));
+        result.notes = std::move(found->notes);
+        return result;
+    }
     if (ctx.method == FindMethod::ssh) {
         auto entries = lookup_via_ssh(ctx, req, roots, max_depth, run, on_command);
         if (!entries) return util::fail(entries.error());
@@ -288,6 +461,17 @@ search_both(const Context& ctx, const SearchRequest& req, const proc::RunOptions
     folders.mode = Mode::folder;
     auto files = req;
     files.mode = Mode::file;
+    if (ctx.engine == Engine::grab) {
+        constexpr std::array kinds{Mode::folder, Mode::file};
+        auto found = lookup_via_grab(ctx, req, kinds, search_roots(ctx), req.depth.value_or(ctx.settings.max_depth),
+                                     run.stop, on_command);
+        if (!found) return util::fail(found.error());
+        auto f = make_result(ctx, folders, std::move(found->kinds[0]));
+        auto g = make_result(ctx, files, std::move(found->kinds[1]));
+        f.notes = found->notes; // one lookup's, the same for both kinds
+        g.notes = std::move(found->notes);
+        return std::pair{std::move(f), std::move(g)};
+    }
     if (ctx.method == FindMethod::ssh) {
         auto f = search(ctx, folders, run, on_command);
         if (!f) return util::fail(f.error());

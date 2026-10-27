@@ -39,6 +39,8 @@ public:
     const std::map<std::string, std::string>* shared_files = nullptr; // instead of files: one copy for many sessions
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
     int broken_after = 0;                                   // the stream breaks on this read (0: never)
+    bool dropped = false;                                   // the server closed the connection: every read breaks
+    bool never_eof = false;                                 // past the last name, READDIR gets empty NAMEs, not EOF
 
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
     std::size_t most_waiting = 0;                               // most requests answered in one batch
@@ -56,6 +58,7 @@ public:
     std::size_t read(std::span<char> buffer) override {
         if (delay.count() > 0) std::this_thread::sleep_for(delay);
         if (broken_after > 0 && ++read_calls_ >= broken_after) throw sftp::Broken("fake server: the connection broke");
+        if (dropped) throw sftp::Broken("fake server: the server closed the connection");
         if (out_.empty()) {
             most_waiting = std::max(most_waiting, queue_.size());
             if (reverse) std::ranges::reverse(queue_);
@@ -198,7 +201,7 @@ private:
         case 12: { // READDIR
             auto& h = handles_.at(in.str());
             const auto& names = dirs[h.path];
-            if (h.pos >= names.size()) return status(id, 1, "EOF");
+            if (h.pos >= names.size() && !never_eof) return status(id, 1, "EOF");
             std::string b;
             std::size_t n = std::min(readdir_batch, names.size() - h.pos);
             u32(b, static_cast<std::uint32_t>(n));

@@ -363,6 +363,7 @@ std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view 
             if (batch.error().code != Code::eof) failed = batch.error();
             break;
         }
+        if (batch->empty()) break; // no names but no end either: the end, as OpenSSH's sftp takes it
         for (Entry& e : *batch)
             if (e.name != "." && e.name != "..") all.push_back(std::move(e));
         if (all.size() > limit)

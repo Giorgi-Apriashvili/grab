@@ -114,6 +114,19 @@ TEST_CASE("sftp: listing a folder over several replies, without . and ..") {
     CHECK(missing.error().code == sftp::Code::no_such_file);
 }
 
+TEST_CASE("sftp: an empty NAME reply ends a listing, as OpenSSH's sftp takes it") {
+    FakeServer srv;
+    srv.dirs["/d"] = {".", "..", "one", "two", "three"};
+    for (const char* n : {"/d/one", "/d/two", "/d/three"}) srv.files[n] = "x";
+    srv.never_eof = true;
+    sftp::Client c(srv);
+    c.start();
+    auto entries = sftp::list(c, "/d");
+    REQUIRE(entries);
+    CHECK(entries->size() == 3);
+    CHECK(c.pending() == 0);
+}
+
 TEST_CASE("sftp: a listing stops past its entry cap, and its handle is closed") {
     FakeServer srv;
     for (int i = 0; i < 10; ++i) {

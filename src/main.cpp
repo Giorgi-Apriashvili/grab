@@ -4,6 +4,7 @@
 #include "cli.hpp"
 #include "cli_download.hpp"
 #include "config.hpp"
+#include "conn_budget.hpp"
 #include "engine.hpp"
 #include "existing.hpp"
 #include "fetch.hpp"
@@ -22,17 +23,22 @@
 #include "schedule.hpp"
 #include "server_cli.hpp"
 #include "server_ops.hpp"
+#include "ssh_pool.hpp"
 #include "update.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <format>
 #include <iostream>
+#include <optional>
 #include <print>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -385,12 +391,44 @@ std::string age_text(std::int64_t seconds) {
     return std::format("{} days", (seconds + 43200) / 86400);
 }
 
+// engine = grab: the server's pool, which the download after the search uses too, so the command
+// logs in once; a walk takes up to 8 of the server's connections. With -v, the way chosen is said
+// as `said` + its lookup_text.
+std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ctx, const Options& opts,
+                                                       ssh::Pools& pools, std::string said) {
+    auto target = engine::ssh_target(ctx);
+    if (!target) return util::fail(target.error());
+    // The download's budget, as download_with_grab counts it (limits.json: what refusals taught).
+    const auto limits = load_learned_limits(learned_limits_path(opts.config.value_or(default_grab_config_path())));
+    const auto learned = limits.find(ctx.settings.name);
+    const int budget = budget::effective_budget(ctx.settings.max_connections, budget::default_budget(ctx.remote.host),
+                                                learned == limits.end() ? std::nullopt : std::optional(learned->second));
+    engine::GrabSide side;
+    side.pool = pools.get(ctx.settings.name, *target, budget);
+    side.walk_seat = [budget] { return std::min(budget, 8); };
+    if (opts.verbose) {
+        side.on_lookup = [&ctx, said = std::move(said)](const ssh::Lookup& way) {
+            std::println(stderr, "grab: {} {}", said, engine::lookup_text(ctx, way));
+        };
+    }
+    return side;
+}
+
 // The search, from the server's saved file list when it can answer it: the list is used while
 // it is fresh, else fetched again first (and saved). Other searches go live.
-std::expected<engine::SearchResult, std::string> search(const engine::Context& ctx, const engine::SearchRequest& req,
-                                                        const Options& opts, const engine::CommandHook& trace) {
+std::expected<engine::SearchResult, std::string> search(const engine::Context& ctx, engine::SearchRequest req,
+                                                        const Options& opts, const engine::CommandHook& trace,
+                                                        ssh::Pools& pools) {
+    const bool on_grab = ctx.engine == Engine::grab;
     if (!file_list::can_answer(ctx, req)) {
-        if (opts.verbose) {
+        if (on_grab) {
+            auto side = grab_side(ctx, opts, pools, std::format("looking up '{}' on {}", opts.target, ctx.settings.name));
+            if (!side) return util::fail(side.error());
+            req.grab = std::move(*side);
+            if (opts.verbose && is_path_target(req.target)) {
+                std::println(stderr, "grab: looking up '{}' on {} with one SFTP stat", opts.target, ctx.settings.name);
+            }
+        } else if (opts.verbose) {
             std::println(stderr, "grab: looking up '{}' via {}", opts.target,
                          ctx.method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
         }
@@ -409,7 +447,13 @@ std::expected<engine::SearchResult, std::string> search(const engine::Context& c
         return file_list::search(ctx, *list, req);
     }
     std::println(stderr, "grab: fetching the file list of {}...", ctx.settings.name);
-    auto fetched = file_list::fetch(ctx, now, false, {}, trace);
+    engine::GrabSide side;
+    if (on_grab) {
+        auto made = grab_side(ctx, opts, pools, std::format("the file list of {} comes", ctx.settings.name));
+        if (!made) return util::fail(made.error());
+        side = std::move(*made);
+    }
+    auto fetched = file_list::fetch(ctx, now, false, {}, trace, {}, side);
     if (!fetched) return util::fail(fetched.error());
     if (!file_list::save(file, *fetched) && opts.verbose) {
         std::println(stderr, "grab: could not save the file list to {}", util::path_to_utf8(file));
@@ -459,7 +503,10 @@ int run(const Options& opts) {
     const engine::CommandHook trace = [&](const std::vector<std::string>& argv) {
         if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
     };
-    auto found = search(*ctx, req, opts, trace);
+    // grab's own SSH connections (engine = grab), for the search and the download after it, so
+    // `grab -s x DEST` logs in once; closed when the command ends.
+    std::optional<ssh::Pools> pools(std::in_place);
+    auto found = search(*ctx, req, opts, trace, *pools);
     if (!found) {
         error(found.error());
         return exit_lookup;
@@ -538,8 +585,10 @@ int run(const Options& opts) {
     }
 
     // 4 + 5. download each chosen item -------------------------------------------------
+    // rclone's downloads open connections of their own: the search's, idle, aren't kept beside them.
+    if (opts.rclone) pools.reset();
     const DownloadTally tally = opts.rclone ? download_with_rclone(*ctx, opts, *chosen, dest)
-                                            : download_with_grab(*ctx, opts, *chosen, sizes, modified, dest);
+                                            : download_with_grab(*ctx, opts, *chosen, sizes, modified, dest, *pools);
     if (opts.dry_run) return exit_ok;
 
     if (const std::size_t total = chosen->size(); total > 1) {

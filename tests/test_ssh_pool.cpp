@@ -6,6 +6,7 @@
 #include "ssh_pool.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -207,4 +208,53 @@ TEST_CASE("ssh pool: a waiting borrower stops when asked") {
     stop.request_stop();
     waiter.join();
     CHECK_FALSE(got);
+}
+
+TEST_CASE("ssh pool: the most recently used idle connection stays longer than the others") {
+    Logins logins;
+    auto o = options(4);
+    o.idle_close = 15s;
+    o.keep_newest = 60s;
+    ssh::Pool pool(logins.connect(), o);
+    {
+        auto a = pool.acquire();
+        auto b = pool.acquire();
+        REQUIRE(a);
+        REQUIRE(b);
+        a->release();
+        std::this_thread::sleep_for(5ms);
+        b->release(); // the most recently used
+    }
+    CHECK(pool.idle() == 2);
+    pool.close_idle(ssh::Pool::Clock::now() + 16s);
+    CHECK(pool.idle() == 1);
+    pool.close_idle(ssh::Pool::Clock::now() + 59s);
+    CHECK(pool.idle() == 1);
+    auto again = pool.acquire();
+    REQUIRE(again);
+    CHECK(id_of(*again) == 2);
+    again->release();
+    pool.close_idle(ssh::Pool::Clock::now() + 61s);
+    CHECK(pool.idle() == 0);
+    // As the program's pools are made.
+    CHECK(ssh::Pools::download_options(4).keep_newest == 60s);
+    CHECK(ssh::Pools::download_options(4).idle_close == 15s);
+    CHECK(ssh::Pools::download_options(4).retry_refused.empty());
+}
+
+TEST_CASE("ssh pool: a caller may bring its own pauses for turned-away logins") {
+    Logins logins;
+    logins.refuse_first = 2;
+    auto o = options(2);
+    o.retry_refused = {}; // the pool's own: none, as downloads have it
+    ssh::Pool pool(logins.connect(), o);
+    CHECK_THROWS_AS((void)pool.acquire(), ssh::Error);
+    CHECK(logins.made == 1);
+    const std::array pauses{1ms, 1ms};
+    auto lease = pool.acquire({}, pauses);
+    CHECK(lease);
+    CHECK(logins.made == 3); // the refusal left, then in
+    CHECK(ssh::interactive_retry.size() == 4);
+    CHECK(ssh::interactive_retry.front() == 500ms);
+    CHECK(ssh::interactive_retry.back() == 4s);
 }

@@ -629,6 +629,7 @@ function onActivity(msg) {
   } else {
     if (msg.text) a.text = msg.text;
     if (msg.detail) a.detail = msg.detail;
+    if (msg.estimate) a.estimate = msg.estimate; // the step turned out to be another (find, a walk)
     if (msg.total) {
       // Counted from now on: the real numbers fill what the estimate left, so the bar goes on.
       if (!a.total) a.base = a.fill || 0;

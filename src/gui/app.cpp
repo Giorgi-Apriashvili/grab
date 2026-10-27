@@ -289,6 +289,20 @@ void App::Activity::detail(std::string detail) {
     send(true);
 }
 
+void App::Activity::timing(std::string key) {
+    std::lock_guard lock(mutex_);
+    timing_ = std::move(key);
+    Value v = Value::make_object();
+    v.set("type", str("activity"));
+    v.set("id", num(id_));
+    {
+        std::lock_guard times(app_.timings_mutex_);
+        const auto it = app_.timings_.find(timing_);
+        v.set("estimate", num(it != app_.timings_.end() ? it->second : activity::guess(timing_)));
+    }
+    app_.post(v);
+}
+
 void App::Activity::send(bool force) {
     const auto now = std::chrono::steady_clock::now();
     if (!force && now - sent_ < std::chrono::milliseconds(100)) return;
@@ -883,27 +897,49 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             // One server without a usable list, or a search lists can't answer: live, as before.
             if (!found && (!all || !listable)) {
-                const bool over_ssh = ctx->method == FindMethod::ssh;
-                const std::string doing = std::format("Searching {} with {}", server, over_ssh ? "ssh + find" : "rclone lsf");
+                const bool on_grab = ctx->engine == Engine::grab;
+                bool over_ssh = !on_grab && ctx->method == FindMethod::ssh; // engine = grab: once find is chosen
+                std::string doing = on_grab ? std::format("Searching {}", server)
+                                            : std::format("Searching {} with {}", server, over_ssh ? "ssh + find" : "rclone lsf");
                 Activity act(*this, doing + "…", "search:" + server);
+                auto counted_text = [&](std::size_t n) {
+                    act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(n))
+                                      : std::format("{}… {} looked at", doing, count_of(n, "entry", "entries")));
+                };
                 activity::Records records; // ssh + find prints the matches; rclone lsf everything
                 auto counted = run;
                 counted.on_output = [&](std::string_view chunk) {
                     records.feed(chunk);
-                    act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(records.count()))
-                                      : std::format("{}… {} looked at", doing, count_of(records.count(), "entry", "entries")));
+                    counted_text(records.count());
                 };
                 // Over rclone the walk's connections come from the pool (review G191), and one walk
-                // lists both kinds (G197).
+                // lists both kinds (G197); on grab's engine the seat is one connection, widened for
+                // a walk.
                 auto r = req;
                 std::optional<fetch::Listing> walk;
-                if (!over_ssh) {
+                std::optional<std::string> no_way; // grab's engine couldn't be set up
+                if (on_grab) {
+                    if (auto side = grab_side(*ctx, server, walk, stop)) {
+                        r.grab = std::move(*side);
+                        r.grab.on_lookup = [&](const ssh::Lookup& way) {
+                            over_ssh = way.find;
+                            doing = std::format("Searching {} {}", server, way.find ? "with find" : "by listing folders");
+                            act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
+                            act.text(doing + "…");
+                        };
+                        r.grab.progress = counted_text;
+                    } else {
+                        no_way = side.error();
+                    }
+                } else if (!over_ssh) {
                     walk.emplace(connections_, server, stop);
                     r.walk_flags = walk->flags();
                 }
                 const auto hook = [&](const std::vector<std::string>& argv) { act.detail(quote::display_cmdline(argv)); };
                 std::vector<std::pair<Mode, std::expected<engine::SearchResult, std::string>>> results;
-                if (kinds.size() == 2) {
+                if (no_way) {
+                    results.emplace_back(kinds.front(), std::unexpected(*no_way));
+                } else if (kinds.size() == 2) {
                     if (auto walked = engine::search_both(*ctx, r, counted, hook)) {
                         results.emplace_back(Mode::folder, std::move(walked->first));
                         results.emplace_back(Mode::file, std::move(walked->second));
@@ -999,10 +1035,7 @@ void App::start_refresh(const std::string& server, bool asked) {
         const std::string doing = std::format("{} {}'s file list", before > 0 ? "Refreshing" : "Building", server);
         Activity act(*this, doing + "…", "list:" + server, true);
         if (before > 0) act.progress(0, before); // against the last list's count, from the start
-        activity::Records records;
-        run.on_output = [&](std::string_view chunk) {
-            records.feed(chunk);
-            const auto n = records.count();
+        auto counted_text = [&](std::uint64_t n) {
             if (before > 0) {
                 act.progress(std::min<std::uint64_t>(n, before), before,
                              std::format("{}: {} of ~{} entries", doing, thousands(n), thousands(before)));
@@ -1010,18 +1043,38 @@ void App::start_refresh(const std::string& server, bool asked) {
                 act.text(std::format("{}: {}", doing, count_of(n, "entry", "entries")));
             }
         };
+        activity::Records records;
+        run.on_output = [&](std::string_view chunk) {
+            records.feed(chunk);
+            counted_text(records.count());
+        };
         auto ctx = engine::load_context(config_path_, server);
-        // Over rclone the walk's connections come from the pool (review G191).
+        // Over rclone the walk's connections come from the pool (review G191); on grab's engine
+        // the seat is one connection, widened for a walk.
         std::optional<fetch::Listing> walk;
         std::vector<std::string> walk_flags;
-        if (ctx && ctx->method != FindMethod::ssh) {
+        engine::GrabSide side;
+        std::expected<void, std::string> ready;
+        if (!ctx) {
+            ready = std::unexpected(ctx.error());
+        } else if (ctx->engine == Engine::grab) {
+            if (auto got = grab_side(*ctx, server, walk, stop)) {
+                side = std::move(*got);
+                side.on_lookup = [&](const ssh::Lookup& way) {
+                    act.timing(std::format("{}:{}", way.find ? "list.find" : "list.walk", server));
+                };
+                side.progress = counted_text;
+            } else {
+                ready = std::unexpected(got.error());
+            }
+        } else if (ctx->method != FindMethod::ssh) {
             walk.emplace(connections_, server, stop);
             walk_flags = walk->flags();
         }
-        auto fetched = ctx ? file_list::fetch(*ctx, unix_now(), true, run, [&](const std::vector<std::string>& argv) {
+        auto fetched = ready ? file_list::fetch(*ctx, unix_now(), true, run, [&](const std::vector<std::string>& argv) {
             act.detail(quote::display_cmdline(argv));
-        }, walk_flags)
-                           : std::expected<file_list::List, std::string>(std::unexpected(ctx.error()));
+        }, walk_flags, side)
+                             : std::expected<file_list::List, std::string>(std::unexpected(ready.error()));
         walk.reset();
         if (!fetched) act.failed();
         if (fetched) (void)file_list::save(file_list::path_for(lists_dir_, server), *fetched);
@@ -1111,23 +1164,40 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
     // Deeper than the list (or a search lists can't answer): live, the folder the only root.
     engine::Context below = ctx;
     below.settings.search_roots = {under};
-    const bool over_ssh = ctx.method == FindMethod::ssh;
-    const std::string doing = under.empty() ? std::format("Searching all of {} with {}", server,
-                                                          over_ssh ? "ssh + find" : "rclone lsf")
-                                            : std::format("Searching below {} on {}", under, server);
+    const bool on_grab = ctx.engine == Engine::grab;
+    bool over_ssh = !on_grab && ctx.method == FindMethod::ssh; // engine = grab: once find is chosen
+    const std::string doing = !under.empty() ? std::format("Searching below {} on {}", under, server)
+                              : on_grab      ? std::format("Searching all of {}", server)
+                                             : std::format("Searching all of {} with {}", server,
+                                                           over_ssh ? "ssh + find" : "rclone lsf");
     Activity act(*this, doing + "…", "search:" + server);
+    auto counted_text = [&](std::size_t n) {
+        act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(n))
+                          : std::format("{}… {} looked at", doing, count_of(n, "entry", "entries")));
+    };
     activity::Records records;
     auto counted = run;
     counted.on_output = [&](std::string_view chunk) {
         records.feed(chunk);
-        act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(records.count()))
-                          : std::format("{}… {} looked at", doing, count_of(records.count(), "entry", "entries")));
+        counted_text(records.count());
     };
     // Over rclone the walk's connections come from the pool (review G191), and one walk lists both
-    // kinds (G197).
+    // kinds (G197); on grab's engine the seat is one connection, widened for a walk.
     auto r = req;
     std::optional<fetch::Listing> walk;
-    if (!over_ssh) {
+    if (on_grab) {
+        auto side = grab_side(ctx, server, walk, run.stop);
+        if (!side) {
+            act.failed();
+            return util::fail(side.error());
+        }
+        r.grab = std::move(*side);
+        r.grab.on_lookup = [&](const ssh::Lookup& way) {
+            over_ssh = way.find;
+            act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
+        };
+        r.grab.progress = counted_text;
+    } else if (!over_ssh) {
         walk.emplace(connections_, server, run.stop);
         r.walk_flags = walk->flags();
     }
@@ -1143,6 +1213,22 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
     add(std::move(found->second), false);
     status.set("live", Value::make_bool(true));
     return hits;
+}
+
+std::expected<engine::GrabSide, std::string> App::grab_side(const engine::Context& ctx, const std::string& server,
+                                                            std::optional<fetch::Listing>& seat, std::stop_token stop) {
+    auto target = engine::ssh_target(ctx);
+    if (!target) return util::fail(target.error());
+    connections_.configure(server, connection_budget(server, ctx.remote.host, ctx.settings.max_connections));
+    engine::GrabSide side;
+    side.pool = pools_.get(server, *target, connections_.budget(server));
+    seat.emplace(connections_, server, stop, 1);
+    side.walk_seat = [this, &seat, server, stop] {
+        seat.reset();
+        seat.emplace(connections_, server, stop, 8);
+        return seat->connections();
+    };
+    return side;
 }
 
 namespace {
@@ -1230,7 +1316,9 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             std::int64_t listed = 0;
             bool new_listing = false; // listed live just now, not kept yet
         };
-        auto rows_of = [&](const std::string& at, const std::string& what = {}) -> std::expected<Rows, std::string> {
+        const bool on_grab = ctx->engine == Engine::grab;
+        auto rows_of = [&](const std::string& at,
+                           const std::string& what = {}) -> std::expected<Rows, browse::ListError> {
             std::optional<LiveFolder> cached;
             if (!live) {
                 std::lock_guard lock(browse_mutex_);
@@ -1247,15 +1335,26 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             run.stop = stop;
             run.detached = true;
             const std::string doing = what.empty() ? std::format("Listing {} on {}", at.empty() ? "~" : at, remote) : what;
-            Activity act(*this, doing + "…", "lsjson:" + remote);
+            Activity act(*this, doing + "…", (on_grab ? "readdir:" : "lsjson:") + remote);
             activity::Records records('{'); // lsjson: "[", an item a line, "]"
             run.on_output = [&](std::string_view chunk) {
                 records.feed(chunk);
                 if (records.count() > 0) act.text(std::format("{}… {} so far", doing, count_of(records.count(), "item", "items")));
             };
+            // On grab's engine one connection of the server's budget (fetch::Listing, review G191).
+            std::optional<fetch::Listing> seat;
+            engine::GrabSide side;
+            if (on_grab) {
+                auto made = grab_side(*ctx, remote, seat, stop);
+                if (!made) {
+                    act.failed();
+                    return std::unexpected(browse::ListError{.kind = browse::ListError::Kind::other, .message = made.error()});
+                }
+                side = std::move(*made);
+            }
             auto got = browse::list_live(*ctx, at, run, [&](const std::vector<std::string>& argv) {
                 act.detail(quote::display_cmdline(argv));
-            });
+            }, side);
             if (!got) {
                 act.failed();
                 return std::unexpected(got.error());
@@ -1285,7 +1384,20 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             }
             auto rows = rows_of(folder);
             if (stop.stop_requested()) return; // the next request answers instead
-            if (rows && typed && select.empty() && rows->new_listing && browse::maybe_file(rows->items, folder)) {
+            if (!rows && typed && select.empty() && rows.error().kind == browse::ListError::Kind::file) {
+                // grab's engine: one STAT said it's a file; its folder opens with it picked, when
+                // the folder shows it (a dot-name may be left out).
+                const std::string parent = parent_of(folder);
+                if (auto up = rows_of(parent)) {
+                    const auto name = remote_basename(folder);
+                    if (std::ranges::find(up->items, name, &browse::Item::name) != up->items.end()) select = folder;
+                    folder = parent;
+                    rows = std::move(up);
+                }
+                if (stop.stop_requested()) return;
+            }
+            if (rows && typed && select.empty() && rows->new_listing && !on_grab &&
+                browse::maybe_file(rows->items, folder)) {
                 // lsjson lists a file as that one file: its folder opens instead, when the file is
                 // there (rather than a folder of the same name holding just that file).
                 const std::string parent = parent_of(folder);
@@ -1301,13 +1413,13 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
                 if (stop.stop_requested()) return;
             }
             if (!rows) {
-                if (typed && rows.error().find("directory not found") != std::string::npos) {
+                if (typed && rows.error().kind == browse::ListError::Kind::not_found) {
                     return fail(std::format("Not found on {}: {}", remote, folder.empty() ? "~" : folder));
                 }
-                if (typed && rows.error().find("permission denied") != std::string::npos) {
+                if (typed && rows.error().kind == browse::ListError::Kind::denied) {
                     return fail(std::format("{} doesn't let you list {}", remote, folder.empty() ? "~" : folder));
                 }
-                return fail(rows.error());
+                return fail(rows.error().message);
             }
             if (rows->new_listing) {
                 std::lock_guard lock(browse_mutex_);

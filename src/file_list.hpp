@@ -41,8 +41,9 @@ struct List {
     bool operator==(const List&) const = default;
 };
 
-// What a list covers: the server's address and login, lookup method, search roots, depth and
-// whether dot-entries are skipped. A list whose fingerprint differs is stale.
+// What a list covers: the server's address and login, lookup method (on engine = grab, the
+// engine and its find setting), search roots, depth and whether dot-entries are skipped. A list
+// whose fingerprint differs is stale.
 [[nodiscard]] std::string fingerprint(const engine::Context& ctx);
 
 // Whether a list made at `fetched` is still fresh at `now` (both Unix seconds). A clock that
@@ -83,10 +84,13 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 // Fetches the server's list now (ssh + find, or rclone lsf per root). `batch_ssh`: never let
 // ssh prompt (the window).
 // `walk_flags`: an rclone walk's connections from the pool (fetch::Listing::flags).
+// On engine = grab, one find or one walk through grab's own SSH client (`grab`), the same list
+// format; only `run.stop` of `run` counts.
 [[nodiscard]] std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh = false,
                                                      const proc::RunOptions& run = {},
                                                      const engine::CommandHook& on_command = {},
-                                                     const std::vector<std::string>& walk_flags = {});
+                                                     const std::vector<std::string>& walk_flags = {},
+                                                     const engine::GrabSide& grab = {});
 
 // %LOCALAPPDATA%\grab\lists (Windows), else $XDG_CACHE_HOME or ~/.cache, /grab/lists.
 [[nodiscard]] std::filesystem::path default_dir();

@@ -174,37 +174,42 @@ FindCheck read_find_probe(const std::expected<ExecResult, ExecError>& ran, std::
     return walk_because(std::format("\"{}\", {}", said, status));
 }
 
-std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop) {
+std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop, Retry retry) {
     return pool.find_check(stop, [&]() -> std::optional<FindCheck> {
-        auto lease = pool.acquire(stop);
-        if (!lease) return std::nullopt;
-        std::string out;
-        ExecOptions o;
-        o.stop = stop;
-        o.deadline = find_probe_deadline;
-        o.out_limit = std::uint64_t{64} * 1024;
-        o.out = [&](std::string_view piece) {
-            out += piece;
-            return true;
-        };
-        std::expected<ExecResult, ExecError> ran;
-        try {
-            ran = (*lease)->exec(find_probe, o);
-        } catch (const Error&) {
-            lease->broken();
-            throw;
+        // The probe is safe to repeat: a reused connection the server closed while it sat idle is
+        // dropped and the next one tried.
+        for (;;) {
+            auto lease = pool.acquire(stop, retry);
+            if (!lease) return std::nullopt;
+            std::string out;
+            ExecOptions o;
+            o.stop = stop;
+            o.deadline = find_probe_deadline;
+            o.out_limit = std::uint64_t{64} * 1024;
+            o.out = [&](std::string_view piece) {
+                out += piece;
+                return true;
+            };
+            std::expected<ExecResult, ExecError> ran;
+            try {
+                ran = (*lease)->exec(find_probe, o);
+            } catch (const Error&) {
+                lease->broken();
+                if (lease->reused() && out.empty()) continue;
+                throw;
+            }
+            if (!ran && ran.error().kind == ExecFailure::stopped) return std::nullopt;
+            return read_find_probe(ran, out);
         }
-        if (!ran && ran.error().kind == ExecFailure::stopped) return std::nullopt;
-        return read_find_probe(ran, out);
     });
 }
 
 std::expected<Lookup, std::string> choose_lookup(Pool& pool, GrabMethod method, std::string_view server,
-                                                 std::stop_token stop) {
+                                                 std::stop_token stop, Retry retry) {
     if (method == GrabMethod::walk) return Lookup{};
     std::optional<FindCheck> check;
     try {
-        check = check_find(pool, std::move(stop));
+        check = check_find(pool, std::move(stop), retry);
     } catch (const Error& e) {
         return std::unexpected(std::string(e.what()));
     }
@@ -291,7 +296,7 @@ std::expected<std::vector<std::string>, std::string> read_find_errors(const Find
 std::expected<Found, std::string> run_find(Pool& pool, const FindSpec& spec, const FindOptions& options) {
     std::optional<Pool::Lease> lease;
     try {
-        lease = pool.acquire(options.stop);
+        lease = pool.acquire(options.stop, options.retry_refused);
     } catch (const Error& e) {
         return std::unexpected(std::string(e.what()));
     }
@@ -346,11 +351,25 @@ std::expected<Found, std::string> run_find(Pool& pool, const FindSpec& spec, con
         return true;
     };
     std::expected<ExecResult, ExecError> ran;
-    try {
-        ran = (*lease)->exec(find_command(spec), exec);
-    } catch (const Error& e) {
-        lease->broken();
-        return std::unexpected(std::format("find on the server failed: {}", e.what()));
+    for (;;) {
+        try {
+            ran = (*lease)->exec(find_command(spec), exec);
+            break;
+        } catch (const Error& e) {
+            lease->broken();
+            // Before any record, find is safe to repeat: a reused connection the server closed
+            // while it sat idle is dropped and the next one tried.
+            if (!lease->reused() || records > 0 || !partial.empty()) {
+                return std::unexpected(std::format("find on the server failed: {}", e.what()));
+            }
+        }
+        lease.reset();
+        try {
+            lease = pool.acquire(options.stop, options.retry_refused);
+        } catch (const Error& e) {
+            return std::unexpected(std::string(e.what()));
+        }
+        if (!lease) return Found{}; // stopped
     }
     if (!ran) {
         if (ran.error().kind == ExecFailure::stopped) return Found{};

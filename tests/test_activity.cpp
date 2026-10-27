@@ -20,6 +20,12 @@ TEST_CASE("remembered step times") {
     CHECK(activity::guess("search:Box") == 5000);
     CHECK(activity::guess("update") == 2000);
     CHECK(activity::guess("other") == 3000);
+    // grab's own SSH client, by the way chosen.
+    CHECK(activity::guess("readdir:Main") == 1000);
+    CHECK(activity::guess("find:Main") == 3000);
+    CHECK(activity::guess("walk:Box") == 10000);
+    CHECK(activity::guess("list.find:Main") == 4000);
+    CHECK(activity::guess("list.walk:Box") == 20000);
 }
 
 TEST_CASE("counting a listing's records as it streams") {

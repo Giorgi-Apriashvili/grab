@@ -195,7 +195,7 @@ void Walker::work() {
         }
         if (!lease) {
             try {
-                lease = pool_.acquire(stop_);
+                lease = pool_.acquire(stop_, options_.retry_refused);
             } catch (const Error& e) {
                 // Refused for good ends the walk; turned away (a full server), this worker
                 // leaves the folders to the others.
@@ -291,6 +291,10 @@ void Walker::read_more(sftp::Client& c, Reading& r) {
                 // The end, or a failure before it; after the end, the READDIRs sent ahead answer
                 // with it again.
                 if (!r.listed && batch.error().code != sftp::Code::eof) r.failed = sftp::describe(batch.error());
+                r.listed = true;
+            } else if (batch->empty()) {
+                // No names but no end either: taken as the end, as OpenSSH's sftp does, so a server
+                // that never says EOF can't keep the walk asking.
                 r.listed = true;
             } else if (looked_.fetch_add(batch->size()) + batch->size() > options_.max_entries) {
                 fail(std::format("listing too large: more than {} entries", options_.max_entries));

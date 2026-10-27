@@ -110,38 +110,32 @@ std::optional<LsfLine> parse_lsf_record(const std::vector<std::string>& fields) 
     return LsfLine{.path = fields[2], .size = size, .modified = util::known_time(time)};
 }
 
+HitFilter::HitFilter(Mode mode, std::string_view target, bool exact, bool skip_hidden)
+    : mode_(mode), path_target_(is_path_target(target)), want_(path_target_ ? remote_basename(target) : std::string()),
+      query_(make_query(target, exact)), filter_hidden_(skip_hidden && !path_target_ && !wants_hidden(query_)) {}
+
+bool HitFilter::keeps(std::string_view path, bool dir) const {
+    if (path.empty() || dir != (mode_ == Mode::folder)) return false;
+    if (filter_hidden_) {
+        for (const auto& part : util::split(path, '/')) {
+            if (part.starts_with('.')) return false;
+        }
+    }
+    return path_target_ ? remote_basename(path) == want_ : matches(query_, path);
+}
+
 std::vector<RemoteEntry> parse_lsf_output(const ListRequest& req, std::string_view out) {
-    const bool path_target = is_path_target(req.target);
-    const std::string want = path_target ? remote_basename(req.target) : req.target;
-    const std::string base = path_target ? parent_of(req.target) : req.root;
-    const Query query = make_query(req.target, req.exact);
-    const bool filter_hidden = req.skip_hidden && !path_target && !wants_hidden(query);
+    const std::string base = is_path_target(req.target) ? parent_of(req.target) : req.root;
+    const HitFilter filter(req.mode, req.target, req.exact, req.skip_hidden);
 
     std::vector<RemoteEntry> found;
     for (const auto& record : parse_csv(out)) {
         const auto fields = parse_lsf_record(record);
         if (!fields) continue; // never a path on its own: a split name would be one (G59)
         std::string_view line = fields->path;
-        const auto size = fields->size;
-        const auto modified = fields->modified;
         const bool is_dir = line.ends_with('/');
         if (is_dir) line.remove_suffix(1);
-        if (line.empty() || is_dir != (req.mode == Mode::folder)) continue;
-
-        if (filter_hidden) {
-            bool hidden = false;
-            for (const auto& part : util::split(line, '/')) {
-                if (part.starts_with('.')) {
-                    hidden = true;
-                    break;
-                }
-            }
-            if (hidden) continue;
-        }
-
-        const std::string name = remote_basename(line);
-        const bool hit = path_target ? name == want : matches(query, name);
-        if (hit) found.push_back(RemoteEntry{join_remote(base, line), size, modified});
+        if (filter.keeps(line, is_dir)) found.push_back(RemoteEntry{join_remote(base, line), fields->size, fields->modified});
     }
     return found;
 }

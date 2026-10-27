@@ -41,20 +41,15 @@ inline constexpr std::chrono::seconds find_probe_deadline{10};
 [[nodiscard]] FindCheck read_find_probe(const std::expected<ExecResult, ExecError>& ran, std::string_view out);
 
 // The probe on one of the pool's connections, asked once per pool (Pool::find_check). nullopt
-// when stopped. Throws Error when no login works. The caller holds none of the pool's leases
-// (with a pool of one, it would wait for its own).
-[[nodiscard]] std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop);
+// when stopped. Throws Error when no login works (`retry`: as Pool::acquire). The caller holds
+// none of the pool's leases (with a pool of one, it would wait for its own).
+[[nodiscard]] std::optional<FindCheck> check_find(Pool& pool, std::stop_token stop, Retry retry = std::nullopt);
 
-// How a search or list goes on engine = grab.
-struct Lookup {
-    bool find = false;  // find; else the walk
-    std::string answer; // what the probe found, for -v; empty when it wasn't asked
-};
-// `method` as the server's answer bears it out: probe uses find where the check says it works and
-// walks elsewhere; find needs it to work, else it's an error naming the server's answer; walk
-// asks nothing. An error too when the check's login fails, or "stopped".
+// `method` as the server's answer bears it out (a Lookup, ssh_pool.hpp): probe uses find where
+// the check says it works and walks elsewhere; find needs it to work, else it's an error naming
+// the server's answer; walk asks nothing. An error too when the check's login fails, or "stopped".
 [[nodiscard]] std::expected<Lookup, std::string> choose_lookup(Pool& pool, GrabMethod method, std::string_view server,
-                                                               std::stop_token stop);
+                                                               std::stop_token stop, Retry retry = std::nullopt);
 
 // What a find on grab's engine looks for.
 struct FindSpec {
@@ -77,6 +72,7 @@ struct FindOptions {
     std::size_t max_entries = sftp::max_listing;       // records past which find is stopped (review G168)
     std::uint64_t max_bytes = sftp::max_listing_bytes; // ...and bytes of the paths kept
     std::function<void(std::size_t)> progress;   // records so far, as the output arrives
+    Retry retry_refused = std::nullopt;          // for its login (Pool::acquire)
 };
 
 struct Found {

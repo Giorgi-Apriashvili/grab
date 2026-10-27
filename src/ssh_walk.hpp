@@ -58,6 +58,8 @@ struct WalkOptions {
     int in_flight = 32;
     // The names read so far, now and then (from the walk's threads, one call at a time).
     std::function<void(std::size_t)> progress{};
+    // For its logins (Pool::acquire): interactive_retry for a search or list a person waits on.
+    Retry retry_refused = std::nullopt;
 };
 
 // Every file below `root` (a path in grab's form; "" or "." for the login folder). Links are

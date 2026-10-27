@@ -96,6 +96,9 @@ public:
         // Counted progress with its message, in one update; the first one is sent at once.
         void progress(std::uint64_t done, std::uint64_t total, std::string text = {});
         void detail(std::string detail);
+        // The step it times turned out to be another ("search:Main" became "find:Main" once the
+        // way was chosen): its remembered time is that one's, and the bar's estimate follows.
+        void timing(std::string key);
         void failed() { failed_ = true; }
 
     private:
@@ -228,6 +231,14 @@ private:
     [[nodiscard]] std::expected<std::vector<engine::Hit>, std::string> search_below(
         const engine::Context& ctx, const std::string& server, const engine::SearchRequest& req,
         const std::string& under, bool update, const proc::RunOptions& run, json::Value& status);
+    // A search, list or Browse through grab's own SSH client on `server` (engine = grab): its pool
+    // (the budget configured first), shared with the downloads, and a seat of one connection
+    // taken from the budget into `seat` now (fetch::Listing, review G191), which a walk widens to
+    // up to 8 (GrabSide::walk_seat). Any thread.
+    [[nodiscard]] std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ctx,
+                                                                         const std::string& server,
+                                                                         std::optional<fetch::Listing>& seat,
+                                                                         std::stop_token stop);
 
     // Browse mode: a folder of one server, from its file list when the list holds the folder's
     // contents, else listed live (kept for the session per server and folder). One request at a

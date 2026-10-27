@@ -679,7 +679,7 @@ std::expected<Answer, int> choose_existing(const Options& opts, const std::vecto
 DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts, const std::vector<std::string>& paths,
                                  const std::unordered_map<std::string, std::uint64_t>& sizes,
                                  const std::unordered_map<std::string, std::int64_t>& modified,
-                                 const std::filesystem::path& dest) {
+                                 const std::filesystem::path& dest, ssh::Pools& pools) {
     LiveLine line;
     const std::string& server = ctx.settings.name;
     const auto config = opts.config.value_or(default_grab_config_path());
@@ -733,7 +733,6 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     DownloadTally tally;
-    ssh::Pools pools; // closes its connections when the command ends
     if (effective_engine(ctx.settings) == Engine::grab) {
         auto target = engine::ssh_target(ctx);
         if (!target) {

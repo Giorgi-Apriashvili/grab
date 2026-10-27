@@ -3,8 +3,10 @@
 #include "conn_budget.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <exception>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -64,7 +66,8 @@ Pool::~Pool() {
     if (timer_.joinable()) timer_.join();
 }
 
-std::optional<Pool::Lease> Pool::acquire(std::stop_token stop) {
+std::optional<Pool::Lease> Pool::acquire(std::stop_token stop, Retry retry_refused) {
+    const std::span<const std::chrono::milliseconds> pauses = retry_refused.value_or(options_.retry_refused);
     std::unique_lock lock(mutex_);
     auto room = [this] { return open_locked() < options_.limit && logging_in_ < options_.logins_at_once; };
     for (;;) {
@@ -73,7 +76,7 @@ std::optional<Pool::Lease> Pool::acquire(std::stop_token stop) {
             std::unique_ptr<Session> session = std::move(idle_.back().session);
             idle_.pop_back();
             ++leased_;
-            return Lease(this, std::move(session));
+            return Lease(this, std::move(session), true);
         }
         if (room()) break;
         changed_.wait(lock, stop, [&] { return !idle_.empty() || room(); });
@@ -89,7 +92,7 @@ std::optional<Pool::Lease> Pool::acquire(std::stop_token stop) {
             session = connect_();
             break;
         } catch (const Error& e) {
-            if (e.kind != budget::Failure::refused || attempt >= options_.retry_refused.size()) {
+            if (e.kind != budget::Failure::refused || attempt >= pauses.size()) {
                 failed = std::current_exception();
                 break;
             }
@@ -98,7 +101,7 @@ std::optional<Pool::Lease> Pool::acquire(std::stop_token stop) {
             break;
         }
         std::unique_lock pause(mutex_);
-        changed_.wait_for(pause, stop, options_.retry_refused[attempt], [] { return false; });
+        changed_.wait_for(pause, stop, pauses[attempt], [] { return false; });
         if (stop.stop_requested()) break;
     }
     lock.lock();
@@ -107,7 +110,7 @@ std::optional<Pool::Lease> Pool::acquire(std::stop_token stop) {
     changed_.notify_all();
     if (failed) std::rethrow_exception(failed);
     if (!session) return std::nullopt;
-    return Lease(this, std::move(session));
+    return Lease(this, std::move(session), false);
 }
 
 void Pool::give_back(std::unique_ptr<Session> session, bool broken) {
@@ -153,7 +156,10 @@ void Pool::close_idle(Clock::time_point now) {
     std::vector<std::unique_ptr<Session>> drop;
     {
         std::lock_guard lock(mutex_);
-        while (!idle_.empty() && now - idle_.front().since >= options_.idle_close) {
+        while (!idle_.empty()) {
+            // The oldest first; the last one left is the most recently used.
+            const auto after = idle_.size() == 1 ? std::max(options_.idle_close, options_.keep_newest) : options_.idle_close;
+            if (now - idle_.front().since < after) break;
             drop.push_back(std::move(idle_.front().session));
             idle_.pop_front();
         }
@@ -193,7 +199,8 @@ std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::funct
 }
 
 Pool::Lease::Lease(Lease&& other) noexcept
-    : pool_(std::exchange(other.pool_, nullptr)), session_(std::move(other.session_)), broken_(other.broken_) {}
+    : pool_(std::exchange(other.pool_, nullptr)), session_(std::move(other.session_)), broken_(other.broken_),
+      reused_(other.reused_) {}
 
 Pool::Lease& Pool::Lease::operator=(Lease&& other) noexcept {
     if (this != &other) {
@@ -201,6 +208,7 @@ Pool::Lease& Pool::Lease::operator=(Lease&& other) noexcept {
         pool_ = std::exchange(other.pool_, nullptr);
         session_ = std::move(other.session_);
         broken_ = other.broken_;
+        reused_ = other.reused_;
     }
     return *this;
 }
@@ -216,6 +224,7 @@ Pool::Options Pools::download_options(int limit) {
     Pool::Options o;
     o.limit = limit;
     o.idle_close = std::chrono::seconds(15);
+    o.keep_newest = std::chrono::seconds(60);
     o.retry_refused = {};
     return o;
 }

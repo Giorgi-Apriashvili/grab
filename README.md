@@ -581,8 +581,10 @@ saved passwords and known_hosts are shared by all of them.
 Add one `[section]` per server and choose with `-r NAME`.
 
 **grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
-`engine = grab` in a server's section to try it: files and folders then download through it
-(searches, file lists, browsing, previews and checks still go through rclone). It logs in once and
+`engine = grab` in a server's section to try it: files and folders then download through it, and
+searches, file lists and Browse go through it too (previews and checks still go through rclone).
+A search or a list uses the server's GNU find when it has one and the `find` setting allows it,
+else it lists folders over SFTP, several at a time; links are followed. It logs in once and
 keeps the connections open between files, asks the server for exactly the bytes it needs, and
 continues partial downloads rclone started (and the other way round). In a folder, files of 2 MiB
 and more follow "At once" and spread over the connections; smaller ones go beside them on every
@@ -834,7 +836,7 @@ src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rc
 src/ui_origin.* what the window may show and whose messages count (exact addresses)
 src/ssh.*       grab's own SSH connections (libssh2): host keys, login, SFTP channels, commands
 src/sftp.*      grab's own SFTP client: pipelined reads with exact bounds, listings, stat
-src/ssh_pool.*  a server's connections kept open and lent to downloads
+src/ssh_pool.*  a server's connections kept open and lent to downloads, searches and Browse
 src/ssh_target.* a server's rclone.conf section and stored secrets as an SSH login
 src/ssh_walk.*  a server's folder tree over SFTP: several folders in flight per connection
 src/ssh_find.*  searches and lists with the server's GNU find over a command; the find check

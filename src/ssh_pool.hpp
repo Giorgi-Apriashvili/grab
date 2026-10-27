@@ -14,6 +14,7 @@
 #include "sftp.hpp"
 #include "ssh.hpp"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -30,6 +32,16 @@
 #include <vector>
 
 namespace grab::ssh {
+
+// Pauses before each new try of a login the server turned away (budget::Failure::refused), for
+// one call of Pool::acquire; nullopt: the pool's own (Options::retry_refused).
+using Retry = std::optional<std::span<const std::chrono::milliseconds>>;
+// Those of a caller a person waits on (Browse, a search, a list): a busy server, such as a full
+// Storage Box, doesn't fail it at once. Downloads take none: fetch backs off across all its
+// streams and learns the server's limit (conn_budget).
+inline constexpr std::array<std::chrono::milliseconds, 4> interactive_retry{
+    std::chrono::milliseconds{500}, std::chrono::milliseconds{1000}, std::chrono::milliseconds{2000},
+    std::chrono::milliseconds{4000}};
 
 // One pooled login and what borrowers use of it.
 class Session {
@@ -59,6 +71,12 @@ struct FindCheck {
     bool operator==(const FindCheck&) const = default;
 };
 
+// How a search or list goes on engine = grab (choose_lookup, ssh_find.hpp).
+struct Lookup {
+    bool find = false;  // find; else the walk
+    std::string answer; // what the check found, for -v; empty when it wasn't asked
+};
+
 class Pool {
 public:
     using Clock = std::chrono::steady_clock;
@@ -68,6 +86,9 @@ public:
         int limit = 4;
         int logins_at_once = 4;
         std::chrono::milliseconds idle_close{60'000};
+        // The most recently used idle connection stays this long instead, when that is longer: a
+        // Browse click a minute later needs no new login.
+        std::chrono::milliseconds keep_newest{0};
         // Pauses before each new try of a login the server turned away (budget::Failure::refused).
         std::vector<std::chrono::milliseconds> retry_refused{std::chrono::milliseconds{500}, std::chrono::seconds{1},
                                                              std::chrono::seconds{2}, std::chrono::seconds{4},
@@ -94,21 +115,26 @@ public:
         Session* operator->() const { return session_.get(); }
         // The session broke (sftp::Broken, a lost connection): it's closed instead of reused.
         void broken() { broken_ = true; }
+        // It sat idle in the pool: the server may have closed it meanwhile (ClientAliveInterval, a
+        // NAT timeout), so a read-only call that finds it broken is worth one more try.
+        [[nodiscard]] bool reused() const { return reused_; }
         // Gives it back now.
         void release();
 
     private:
         friend class Pool;
-        Lease(Pool* pool, std::unique_ptr<Session> session) : pool_(pool), session_(std::move(session)) {}
+        Lease(Pool* pool, std::unique_ptr<Session> session, bool reused)
+            : pool_(pool), session_(std::move(session)), reused_(reused) {}
         Pool* pool_ = nullptr;
         std::unique_ptr<Session> session_;
         bool broken_ = false;
+        bool reused_ = false;
     };
 
     // A session: an idle one, else a new login once there is room under the limit and among the
     // logins at once, else waiting for one to come back. nullopt once `stop` is requested. Throws
-    // Error: a fatal one at once, a refusal after the retries.
-    [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {});
+    // Error: a fatal one at once, a refusal after the retries (`retry_refused`, else the pool's).
+    [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {}, Retry retry_refused = std::nullopt);
 
     // Lowering it closes idle connections over it; borrowed ones close when they come back.
     void set_limit(int limit);
@@ -116,7 +142,8 @@ public:
     // Connections open: idle, borrowed and logging in.
     [[nodiscard]] int open() const;
     [[nodiscard]] int idle() const;
-    // Closes connections idle longer than idle_close at `now`.
+    // Closes connections idle longer than idle_close at `now` (the most recently used one: longer
+    // than keep_newest, when that is longer).
     void close_idle(Clock::time_point now);
 
     // The find check of this pool's server, asked once: `check` runs on the first call (one at a
@@ -154,9 +181,11 @@ private:
 // Thread-safe.
 class Pools {
 public:
-    // How downloads use their pools: refusals are left to fetch, which backs off across all its
-    // streams and learns the server's limit (conn_budget); idle connections close after 15 s, as
-    // rclone's own folder copies and listings still open theirs beside them (phase 2).
+    // How the program's users share their pools: refusals are left to the caller (fetch backs off
+    // across all its streams and learns the server's limit, conn_budget; Browse, searches and lists
+    // pass interactive_retry); idle connections close after 15 s, as rclone's own folder copies
+    // and listings still open theirs beside them (phase 2), but the most recently used one stays
+    // for 60 s, so a Browse click or a search a minute later doesn't pay a login (phase 4).
     [[nodiscard]] static Pool::Options download_options(int limit);
 
     // `limit`: the server's connection budget now.

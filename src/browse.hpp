@@ -2,7 +2,8 @@
 
 // Browsing a server's folders in grab's window. A folder opens from the server's saved file list
 // (file_list.hpp) when the list holds all of its contents, which is instant; deeper folders,
-// beyond the list's max_depth, are listed live with one `rclone lsjson`.
+// beyond the list's max_depth, are listed live with one `rclone lsjson`, or on engine = grab one
+// SFTP listing on a pooled connection.
 
 #include "engine.hpp"
 #include "file_list.hpp"
@@ -101,9 +102,32 @@ struct Crumb {
 // Its output, as items under `path`; dot-entries dropped when `skip_hidden`.
 [[nodiscard]] std::expected<std::vector<Item>, std::string> parse_lsjson(std::string_view json_text,
                                                                         std::string_view path, bool skip_hidden);
-// Runs it.
-[[nodiscard]] std::expected<std::vector<Item>, std::string> list_live(const engine::Context& ctx, std::string_view path,
-                                                                     const proc::RunOptions& run,
-                                                                     const engine::CommandHook& on_command = {});
+
+// Why a folder couldn't be listed live, by kind on both engines, so the window tells a typed path
+// that isn't there or isn't yours to list without reading rclone's text.
+struct ListError {
+    enum class Kind {
+        not_found,
+        denied,
+        file, // grab's engine: the path is a file (lsjson lists a file as itself instead)
+        other,
+    };
+    Kind kind = Kind::other;
+    std::string message; // ready to show
+    bool operator==(const ListError&) const = default;
+};
+// The kind of an rclone lsjson failure, from its message.
+[[nodiscard]] ListError::Kind rclone_error_kind(std::string_view message);
+
+// Lists one folder live: `rclone lsjson`, or on engine = grab its SFTP listing on one of the
+// server's pooled connections (`grab`; OPENDIR and READDIRs, a STAT for each link, whose target
+// decides as the walk decides; a broken link, a socket or a device is left out). There, a path
+// that can't be opened as a folder gets one STAT, which tells a file (ListError::Kind::file) from
+// nothing there, and names that aren't UTF-8 are in grab's ‛XX form, so such folders open too
+// (review G60). Only `run.stop` of `run` counts there.
+[[nodiscard]] std::expected<std::vector<Item>, ListError> list_live(const engine::Context& ctx, std::string_view path,
+                                                                   const proc::RunOptions& run,
+                                                                   const engine::CommandHook& on_command = {},
+                                                                   const engine::GrabSide& grab = {});
 
 } // namespace grab::browse
