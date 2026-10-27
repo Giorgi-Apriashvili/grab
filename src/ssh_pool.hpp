@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -34,10 +36,14 @@ class Session {
 public:
     virtual ~Session() = default;
     [[nodiscard]] virtual sftp::Client& sftp() = 0;
-    // For commands (find, md5sum); nullptr where there is none (tests).
+    // Runs a command (find, md5sum) on this login: Connection::exec, or canned output in tests.
+    // Where there is none, the server refuses it.
+    [[nodiscard]] virtual std::expected<ExecResult, ExecError> exec(std::string_view command,
+                                                                    const ExecOptions& options);
+    // The login itself; nullptr where there is none (tests).
     [[nodiscard]] virtual Connection* connection() { return nullptr; }
     // Whether the next borrower may have it: no SFTP reply still on its way, which would reach
-    // a request the next one never made.
+    // a request the next one never made, and no command cut short on it (Connection::dropped).
     [[nodiscard]] virtual bool reusable() { return true; }
 };
 

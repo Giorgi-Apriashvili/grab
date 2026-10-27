@@ -23,8 +23,11 @@ public:
         }
     }
     sftp::Client& sftp() override { return client_; }
+    std::expected<ExecResult, ExecError> exec(std::string_view command, const ExecOptions& options) override {
+        return connection_.exec(command, options);
+    }
     Connection* connection() override { return &connection_; }
-    bool reusable() override { return client_.pending() == 0; }
+    bool reusable() override { return !connection_.dropped() && client_.pending() == 0; }
 
 private:
     Connection connection_;
@@ -33,6 +36,10 @@ private:
 };
 
 } // namespace
+
+std::expected<ExecResult, ExecError> Session::exec(std::string_view /*command*/, const ExecOptions& /*options*/) {
+    return std::unexpected(ExecError{.kind = ExecFailure::refused, .message = "no commands here", .err = {}});
+}
 
 std::unique_ptr<Session> open_session(const Target& target) { return std::make_unique<SshSession>(target); }
 

@@ -130,17 +130,27 @@ std::string last_error(LIBSSH2_SESSION* s) {
     return msg && *msg ? std::string(msg) : std::format("libssh2 error {}", code);
 }
 
-// Waits until the socket can move what libssh2 is blocked on (non-blocking mode), at most 1 s.
-void wait_socket(socket_t s, LIBSSH2_SESSION* session) {
-    int dir = libssh2_session_block_directions(session);
+// Waits at most `most` (at most 1 s) for the socket to bring something, or to take what libssh2
+// is blocked on sending (non-blocking mode).
+void wait_socket(socket_t s, LIBSSH2_SESSION* session, std::chrono::milliseconds most) {
     fd_set r;
     fd_set w;
     FD_ZERO(&r);
     FD_ZERO(&w);
-    if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) FD_SET(s, &r);
-    if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) FD_SET(s, &w);
-    timeval tv{1, 0};
+    FD_SET(s, &r);
+    if (libssh2_session_block_directions(session) & LIBSSH2_SESSION_BLOCK_OUTBOUND) FD_SET(s, &w);
+    auto ms = std::clamp<long long>(most.count(), 0, 1000);
+    timeval tv{.tv_sec = static_cast<long>(ms / 1000), .tv_usec = static_cast<long>((ms % 1000) * 1000)};
     select(static_cast<int>(s + 1), &r, &w, nullptr, &tv);
+}
+
+// Ends the TCP connection under libssh2, so whatever it still sends or awaits fails at once.
+void cut(socket_t s) {
+#ifdef _WIN32
+    ::shutdown(s, SD_BOTH);
+#else
+    ::shutdown(s, SHUT_RDWR);
+#endif
 }
 
 // An SSH channel as the byte stream an sftp::Client reads and writes.
@@ -173,6 +183,144 @@ private:
 // The receive window offered per channel: more than the 64 READs of 255 KiB a connection keeps in
 // flight (sftp.hpp), so the window never holds the server back.
 constexpr unsigned window_size = 32 * 1024 * 1024;
+// A command's: plenty for find's output, and little still on its way when a command is dropped
+// (the drop reads it while it waits for the server's close).
+constexpr unsigned command_window = 2 * 1024 * 1024;
+
+// A command's channel on a libssh2 session, which is non-blocking while it lives.
+class SshCommand final : public CommandChannel {
+public:
+    SshCommand(LIBSSH2_SESSION* session, socket_t socket, const std::atomic<std::uint64_t>& received, bool& dropped)
+        : session_(session), socket_(socket), received_(received), dropped_(dropped) {
+        libssh2_session_set_blocking(session_, 0);
+        libssh2_keepalive_config(session_, 1, 1); // with want_reply; 1 is libssh2's least, 2 s
+    }
+    ~SshCommand() override {
+        if (channel_) drop(true); // left by an exception: the connection is done for
+        // Keepalives off again: in blocking mode libssh2's waits would send one every 2 s and give
+        // up after a second or two of silence instead of the session's timeout.
+        libssh2_keepalive_config(session_, 0, 0);
+        libssh2_session_set_blocking(session_, 1);
+    }
+    SshCommand(const SshCommand&) = delete;
+    SshCommand& operator=(const SshCommand&) = delete;
+
+    std::optional<bool> start(std::string_view command) override {
+        if (!channel_) {
+            channel_ = libssh2_channel_open_ex(session_, "session", 7, command_window, LIBSSH2_CHANNEL_PACKET_DEFAULT,
+                                               nullptr, 0);
+            if (!channel_) {
+                int code = libssh2_session_last_errno(session_);
+                if (code == LIBSSH2_ERROR_EAGAIN) return std::nullopt;
+                if (code == LIBSSH2_ERROR_CHANNEL_FAILURE) { // the server refused the channel (MaxSessions 1)
+                    refusal_ = last_error(session_);
+                    return false;
+                }
+                fail("can't open a channel");
+            }
+        }
+        int rc = libssh2_channel_process_startup(channel_, "exec", 4, command.data(),
+                                                 static_cast<unsigned>(command.size()));
+        if (rc == LIBSSH2_ERROR_EAGAIN) return std::nullopt;
+        if (rc == LIBSSH2_ERROR_CHANNEL_REQUEST_DENIED) return false;
+        if (rc != 0) fail("the server didn't run the command");
+        ran_ = true;
+        return true;
+    }
+    bool send_eof() override {
+        int rc = libssh2_channel_send_eof(channel_);
+        if (rc == LIBSSH2_ERROR_EAGAIN) return false;
+        if (rc != 0) fail("ending the command's input failed");
+        return true;
+    }
+    std::size_t read(bool err, std::span<char> buffer) override {
+        auto n = libssh2_channel_read_ex(channel_, err ? SSH_EXTENDED_DATA_STDERR : 0, buffer.data(), buffer.size());
+        if (n == LIBSSH2_ERROR_EAGAIN) return 0;
+        if (n < 0) fail("reading the command's output failed");
+        return static_cast<std::size_t>(n);
+    }
+    bool ended() override { return libssh2_channel_eof(channel_) != 0; }
+    bool close() override {
+        if (!channel_) return true; // refused at the open: there is nothing to close
+        // Sends our close (0 at once on later calls), but returns after any one packet, which may
+        // be a keepalive's answer. The server's close comes after the exit status (OpenSSH), so it
+        // is awaited too; not after a refused exec request, which sent no EOF (wait_closed wants one).
+        int rc = libssh2_channel_close(channel_);
+        if (rc == LIBSSH2_ERROR_EAGAIN) return false;
+        if (rc != 0) fail("closing the command's channel failed");
+        if (ran_) {
+            rc = libssh2_channel_wait_closed(channel_);
+            if (rc == LIBSSH2_ERROR_EAGAIN) return false;
+            if (rc != 0) fail("closing the command's channel failed");
+        }
+        char* name = nullptr;
+        std::size_t len = 0;
+        libssh2_channel_get_exit_signal(channel_, &name, &len, nullptr, nullptr, nullptr, nullptr);
+        if (name) {
+            signal_.assign(name, len);
+            libssh2_free(session_, name);
+        }
+        // libssh2 says 0 when no status came: -1 then.
+        status_ = signal_.empty() && libssh2_channel_has_exit_status(channel_) != 0
+                      ? libssh2_channel_get_exit_status(channel_)
+                      : -1;
+        libssh2_channel_free(channel_); // closed both ways, or refused (a late close is ignored)
+        channel_ = nullptr;
+        return true;
+    }
+    int exit_status() override { return status_; }
+    std::string exit_signal() override { return signal_; }
+    std::string refusal() override { return refusal_; }
+    void terminate() override {
+        if (!channel_) return;
+        auto until = Clock::now() + std::chrono::seconds(1);
+        while (libssh2_channel_signal_ex(channel_, "TERM", 4) == LIBSSH2_ERROR_EAGAIN && Clock::now() < until)
+            wait(std::chrono::milliseconds(100));
+    }
+    void drop(bool dead) override {
+        dropped_ = true;
+        if (dead) cut(socket_);
+        if (!channel_) return; // still opening: it goes with the session
+        // The server's close is awaited a little, reading what is still on its way; past that the
+        // link is cut, so that the channel goes at once.
+        auto until = Clock::now() + std::chrono::seconds(2);
+        for (int after_cut = 0; libssh2_channel_free(channel_) == LIBSSH2_ERROR_EAGAIN && after_cut < 3;) {
+            if (Clock::now() < until) {
+                wait(std::chrono::milliseconds(100));
+            } else {
+                cut(socket_);
+                ++after_cut;
+            }
+        }
+        channel_ = nullptr; // freed, or else freed with the session
+    }
+    void keepalive() override {
+        int next = 0;
+        if (libssh2_keepalive_send(session_, &next) != 0) fail("sending a keepalive failed");
+    }
+    std::uint64_t received() override { return received_.load(std::memory_order_relaxed); }
+    void wait(std::chrono::milliseconds most) override { wait_socket(socket_, session_, most); }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    // The link failed: the connection is dropped and cut, so that nothing waits on it.
+    [[noreturn]] void fail(std::string_view what) {
+        std::string why = std::format("{}: {}", what, last_error(session_));
+        dropped_ = true;
+        cut(socket_);
+        throw Error(budget::Failure::other, why);
+    }
+
+    LIBSSH2_SESSION* session_;
+    socket_t socket_;
+    const std::atomic<std::uint64_t>& received_;
+    bool& dropped_;
+    LIBSSH2_CHANNEL* channel_ = nullptr;
+    bool ran_ = false; // the server took the exec request
+    int status_ = -1;
+    std::string signal_;
+    std::string refusal_;
+};
 
 } // namespace
 
@@ -408,47 +556,123 @@ std::unique_ptr<sftp::Channel> Connection::open_sftp() {
     return std::make_unique<ChannelStream>(session_, ch);
 }
 
+std::expected<ExecResult, ExecError> Connection::exec(std::string_view command, const ExecOptions& options) {
+    SshCommand channel(session_, static_cast<socket_t>(socket_), received_, dropped_);
+    return run_command(channel, command, options);
+}
+
 Output Connection::run(std::string_view command, std::size_t limit) {
-    LIBSSH2_CHANNEL* ch =
-        libssh2_channel_open_ex(session_, "session", 7, window_size, LIBSSH2_CHANNEL_PACKET_DEFAULT, nullptr, 0);
-    if (!ch) fail(budget::Failure::other, "can't open a channel");
-    std::string cmd(command);
-    if (libssh2_channel_process_startup(ch, "exec", 4, cmd.c_str(), static_cast<unsigned>(cmd.size())) != 0) {
-        libssh2_channel_free(ch);
-        fail(budget::Failure::other, "the server didn't run the command");
-    }
-    // Both streams at once, so a command filling one can't stall on the other.
     Output result;
-    libssh2_session_set_blocking(session_, 0);
-    auto restore = [&] { libssh2_session_set_blocking(session_, 1); };
-    std::vector<char> buf(64 * 1024);
-    auto take = [&](std::string& to, int stream) {
-        auto n = libssh2_channel_read_ex(ch, stream, buf.data(), buf.size());
-        if (n > 0) {
-            std::size_t room = limit > to.size() ? limit - to.size() : 0;
-            to.append(buf.data(), std::min<std::size_t>(room, static_cast<std::size_t>(n)));
-            if (static_cast<std::size_t>(n) > room) result.cut = true;
-        }
-        return n;
+    ExecOptions options;
+    options.out = [&](std::string_view piece) {
+        std::size_t room = limit - std::min(limit, result.out.size());
+        result.out.append(piece.substr(0, room));
+        result.cut = result.cut || piece.size() > room;
+        return true; // read on to the end, for the exit status
+    };
+    options.err_limit = limit;
+    auto done = exec(command, options);
+    if (!done) throw Error(budget::Failure::other, done.error().message);
+    result.err = std::move(done->err);
+    result.cut = result.cut || done->err_cut;
+    result.status = done->status;
+    return result;
+}
+
+std::expected<ExecResult, ExecError> run_command(CommandChannel& channel, std::string_view command,
+                                                 const ExecOptions& options) {
+    using Clock = std::chrono::steady_clock;
+    using std::chrono::milliseconds;
+    auto seconds = [](milliseconds d) { return std::chrono::duration<double>(d).count(); };
+    const auto started = Clock::now();
+    const bool has_deadline = options.deadline > milliseconds::zero();
+    ExecResult result;
+    enum class Step { start, eof, running, closing } step = Step::start;
+    bool refused = false;
+    std::uint64_t seen = channel.received();
+    auto heard = started;  // when the server last sent anything
+    auto pinged = started; // when the last keepalive went out
+    std::vector<char> buffer(std::size_t{64} * 1024);
+    // Cut short: the command is told to end and its channel dropped.
+    auto cut_short = [&](ExecFailure kind, std::string message) {
+        channel.terminate();
+        channel.drop(false);
+        return std::unexpected(ExecError{.kind = kind, .message = std::move(message), .err = std::move(result.err)});
     };
     for (;;) {
-        auto o = take(result.out, 0);
-        auto e = take(result.err, SSH_EXTENDED_DATA_STDERR);
-        if ((o < 0 && o != LIBSSH2_ERROR_EAGAIN) || (e < 0 && e != LIBSSH2_ERROR_EAGAIN)) {
-            restore();
-            libssh2_channel_free(ch);
-            fail(budget::Failure::other, "reading the command's output failed");
+        if (options.stop.stop_requested()) return cut_short(ExecFailure::stopped, "stopped");
+        auto now = Clock::now();
+        if (has_deadline && now - started >= options.deadline)
+            return cut_short(ExecFailure::deadline,
+                             std::format("the command took longer than {:g} s", seconds(options.deadline)));
+        bool busy = false; // something moved: round again before waiting
+        if (step == Step::start) {
+            if (auto ran = channel.start(command)) {
+                refused = !*ran;
+                step = refused ? Step::closing : Step::eof;
+                busy = true;
+            }
+        } else if (step == Step::eof) {
+            // Right after the exec request: nothing comes on stdin.
+            if (channel.send_eof()) {
+                step = Step::running;
+                busy = true;
+            }
+        } else if (step == Step::running) {
+            // Both streams in turn, so a command filling one can't stall on the other.
+            if (std::size_t n = channel.read(false, buffer)) {
+                busy = true;
+                std::string_view piece(buffer.data(), n);
+                bool over = options.out_limit > 0 && result.out_bytes + n > options.out_limit;
+                if (over) piece = piece.substr(0, static_cast<std::size_t>(options.out_limit - result.out_bytes));
+                result.out_bytes += piece.size();
+                if (!piece.empty() && options.out && !options.out(piece)) over = true;
+                if (over) return cut_short(ExecFailure::too_much, "the command's output is too large");
+            }
+            if (std::size_t n = channel.read(true, buffer)) {
+                busy = true;
+                std::size_t room = options.err_limit - std::min(options.err_limit, result.err.size());
+                result.err.append(buffer.data(), std::min(room, n));
+                result.err_cut = result.err_cut || n > room;
+            }
+            if (!busy && channel.ended()) {
+                step = Step::closing;
+                busy = true;
+            }
+        } else if (channel.close()) {
+            break;
         }
-        if (o > 0 || e > 0) continue;
-        if (libssh2_channel_eof(ch)) break;
-        wait_socket(static_cast<socket_t>(socket_), session_);
+        if (auto now_seen = channel.received(); now_seen != seen) {
+            seen = now_seen;
+            heard = now;
+        }
+        if (busy) continue;
+
+        // Nothing to do until the server sends something. While it's silent keepalives go out,
+        // and each gets an answer: a link silent through them is dead.
+        if (now - heard >= options.dead_after) {
+            channel.drop(true);
+            throw Error(budget::Failure::other,
+                        std::format("the server stopped answering (nothing for {:g} s)", seconds(options.dead_after)));
+        }
+        if (now - std::max(heard, pinged) >= options.keepalive) {
+            channel.keepalive();
+            pinged = now;
+        }
+        auto due = std::min(std::max(heard, pinged) + options.keepalive, heard + options.dead_after);
+        if (has_deadline) due = std::min(due, started + options.deadline);
+        auto most = std::chrono::duration_cast<milliseconds>(due - now);
+        channel.wait(std::clamp(most, milliseconds(1), milliseconds(1000)));
     }
-    while (libssh2_channel_close(ch) == LIBSSH2_ERROR_EAGAIN) wait_socket(static_cast<socket_t>(socket_), session_);
-    while (libssh2_channel_wait_closed(ch) == LIBSSH2_ERROR_EAGAIN)
-        wait_socket(static_cast<socket_t>(socket_), session_);
-    result.status = libssh2_channel_get_exit_status(ch);
-    restore();
-    libssh2_channel_free(ch);
+    if (refused) {
+        std::string why = channel.refusal();
+        return std::unexpected(ExecError{.kind = ExecFailure::refused,
+                                         .message = why.empty() ? "the server refused to run the command"
+                                                                : "the server refused to run the command: " + why,
+                                         .err = {}});
+    }
+    result.status = channel.exit_status();
+    result.signal = channel.exit_signal();
     return result;
 }
 
