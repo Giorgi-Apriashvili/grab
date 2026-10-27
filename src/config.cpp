@@ -60,8 +60,10 @@ ssh_options =
 # rclone flags for --rclone copies; grab's own downloads, listings, previews and checks use
 # only the connection ones (--sftp-*, --bind, --timeout...). 255Ki is the largest SFTP packet OpenSSH accepts and
 # cuts round trips roughly 8x compared with the 32Ki default. --sftp-disable-hashcheck skips
-# the post-transfer md5sum rclone would otherwise run on the server (minutes for a 30 GB
-# file); SSH already guarantees integrity in flight.
+# the md5sum rclone would otherwise run on the server after each of its own copies (minutes
+# for a 30 GB file); SSH already guarantees integrity in flight. To check downloads against
+# the server's copy, turn on Verify downloads (or grab --verify): grab's own check, which no
+# rclone flag changes.
 common_flags = -P --sftp-chunk-size 255Ki --sftp-disable-hashcheck
 # rclone flags for -f/--folder (rclone copy). More transfers hide per-file round trips on
 # trees of small files; 8 keeps connections (transfers x multi-thread streams) modest.

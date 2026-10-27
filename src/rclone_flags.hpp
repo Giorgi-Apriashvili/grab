@@ -3,11 +3,12 @@
 // Which of the user's rclone settings grab's own rclone calls use (review G8, G182, G184-G187,
 // 2026-10-21). grab.conf's common_flags / file_flags / folder_flags and the command's `--` flags
 // are meant for rclone copies; grab's internal calls (the size check, `cat` ranges, listings, the
-// small-file batch, verify's check and sums, rclone serve) depend on rclone's exact output, so a
-// progress, logging, filter or comparison flag there broke downloads, previews and verification
-// ("-vP": every download failed; "--exclude": `cat` refused; "-- --dry-run": big files were
-// downloaded for real; "--size-only": a corrupt copy was "verified"). They take only flags about
-// reaching the server; everything else is for --rclone, the plain rclone copy.
+// small-file batch, rclone serve; verification's check and sums until phase 5 moved them to grab's
+// own client) depend on rclone's exact output, so a progress, logging, filter or comparison flag
+// there broke downloads, previews and verification ("-vP": every download failed; "--exclude":
+// `cat` refused; "-- --dry-run": big files were downloaded for real; "--size-only": a corrupt copy
+// was "verified"). They take only flags about reaching the server; everything else is for
+// --rclone, the plain rclone copy.
 
 #include <optional>
 #include <span>

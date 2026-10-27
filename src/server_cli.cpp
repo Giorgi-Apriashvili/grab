@@ -239,12 +239,17 @@ int server_add(const Env& env, const std::string& prefill) {
         error(test.error());
         return exit_config;
     }
-    // engine = grab: grab's own client downloads and searches; rclone still verifies and previews.
-    std::println(stderr, "  rclone ({}): {}", test->grab_ok ? "verify, previews" : "downloads",
+    // grab's own client verifies on every server; on engine = grab it also downloads and searches,
+    // and rclone previews.
+    std::println(stderr, "  rclone ({}): {}", test->grab_engine ? "previews" : "downloads",
                  test->rclone_ok ? "OK" : "FAILED: " + test->rclone_error);
     if (test->grab_ok) {
-        std::println(stderr, "  grab (downloads, searches): {}",
-                     *test->grab_ok ? "OK, searches " + test->grab_search : "FAILED: " + test->grab_error);
+        std::string how = test->grab_engine ? "OK, searches " + test->grab_search : std::string("OK");
+        if (!test->checksums.empty()) how += ", " + test->checksums;
+        // On engine = rclone grab's login only verifies: a failure there is a warning.
+        const std::string failed = (test->grab_engine ? "FAILED: " : "can't run: ") + test->grab_error;
+        std::println(stderr, "  grab ({}): {}", test->grab_engine ? "downloads, searches, verify" : "verify",
+                     *test->grab_ok ? how : failed);
     }
     if (test->ssh_ok) {
         std::string why = test->ssh_error;

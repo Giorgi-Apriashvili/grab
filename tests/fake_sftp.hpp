@@ -37,6 +37,7 @@ public:
     std::size_t readdir_batch = 2;                          // entries per NAME
     bool corrupt = false;                                   // send a packet claiming 1 GiB
     const std::map<std::string, std::string>* shared_files = nullptr; // instead of files: one copy for many sessions
+    const std::map<std::string, std::uint32_t>* shared_mtimes = nullptr; // files' times instead of 1700000000
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
     int broken_after = 0;                                   // the stream breaks on this read (0: never)
     bool dropped = false;                                   // the server closed the connection: every read breaks
@@ -148,7 +149,7 @@ private:
         u64(b, in_listing && readdir_size.contains(path) ? readdir_size[path] : listed_size.contains(path) ? listed_size[path] : all_files().at(path).size());
         u32(b, 0100644);
         u32(b, 0);
-        u32(b, 1700000000);
+        u32(b, shared_mtimes != nullptr && shared_mtimes->contains(path) ? shared_mtimes->at(path) : 1700000000);
     }
     const std::map<std::string, std::string>& all_files() const { return shared_files ? *shared_files : files; }
     bool known(const std::string& path) const { return all_files().contains(path) || dirs.contains(path); }

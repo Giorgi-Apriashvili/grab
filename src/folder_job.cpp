@@ -375,6 +375,9 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, sftp::Client& c, co
             if (why.empty()) {
                 f.status = State::done;
                 f.fetched = f.fetched || !present;
+                // The server's file as fetched (FSTAT), which verification proves against.
+                f.size = s.size;
+                f.modtime = s.modtime;
                 f.bytes = f.size;
             } else {
                 f.status = State::failed;
@@ -642,6 +645,9 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                 case fetch::Outcome::done:
                     f.status = State::done;
                     f.fetched = f.fetched || !result.present;
+                    // The server's file as fetched, which verification proves against.
+                    f.size = result.size;
+                    f.modtime = result.modtime;
                     f.bytes = f.size;
                     break;
                 case fetch::Outcome::failed:
@@ -1096,61 +1102,58 @@ void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
     notify(job, Event::changed);
 }
 
-std::string Checked::summary() const {
-    if (!error.empty()) return "not verified: " + error;
-    return verify::summary(report, files, true);
-}
+std::string Checked::summary() const { return verify::summary(report, true); }
 
-Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
+Checked verify_files(const Job& job, Tree& tree, std::mutex& m, verify::Request base, std::stop_token stop) {
     Checked c;
-    verify::Request r;
+    verify::Request& r = base;
+    const fs::path dir = job_dir(job);
+    std::vector<std::size_t> which; // r.files[k] is tree.files[which[k]]
     {
         std::lock_guard lock(m);
-        for (const auto& f : tree.files) {
+        for (std::size_t i = 0; i < tree.files.size(); ++i) {
+            const auto& f = tree.files[i];
             if (f.status != State::done || !f.fetched || f.verified) continue;
-            // A name that isn't UTF-8 (fetched by grab's engine) can't reach rclone's check, which
-            // would call it missing and so have the good copy deleted: left unchecked until the
-            // check is grab's own (RCLONE-REPLACEMENT.md, phase 5).
-            if (!rclone_enc::valid_utf8(rclone_enc::raw_path(f.path))) continue;
-            r.paths.push_back(f.path);
-            if (!f.local.empty()) r.renamed.emplace(f.path, f.local);
+            // By its own path, the name not UTF-8 too (review G17): grab hashes the raw bytes.
+            r.files.push_back(verify::File{.path = f.path, .local = target_of(dir, f), .size = f.size, .modtime = f.modtime});
+            which.push_back(i);
         }
     }
-    if (r.paths.empty()) return c;
-    c.files = r.paths.size();
+    if (r.files.empty()) return c;
+    c.files = r.files.size();
     r.ctx = job.ctx;
     r.remote_dir = job.remote_path;
-    r.local_dir = job_dir(job);
-    r.extra = job.extra;
     r.connections = job.connections;
     r.server = job.server;
     r.id = job.id;
+    r.joined = false;
     r.many = true;
-    r.on_command = job.on_command;
-    auto report = verify::run(r, stop);
-    if (!report) {
-        c.error = report.error();
-        return c;
-    }
-    c.report = std::move(*report);
-    {
+    if (job.on_command) r.on_command = job.on_command;
+    // Each file's state as its result comes, so a stop keeps the files checked so far.
+    r.on_file = [&](std::size_t k, const verify::Result& result, std::size_t) {
         std::lock_guard lock(m);
-        const std::unordered_set<std::string> differ(c.report.differ.begin(), c.report.differ.end());
-        const std::unordered_set<std::string> same(c.report.same.begin(), c.report.same.end());
-        for (auto& f : tree.files) {
-            if (f.status != State::done || !f.fetched || f.verified) continue;
-            if (differ.contains(f.path)) {
-                std::error_code ec;
-                fs::remove(target_of(r.local_dir, f), ec); // not the server's file
-                f.status = State::failed;
-                f.error = "differs from the server's copy; deleted";
-                f.fetched = false;
-                f.bytes = 0;
-            } else if (same.contains(f.path)) {
-                f.verified = true;
-            }
+        auto& f = tree.files[which[k]];
+        switch (result.verdict) {
+        case verify::Verdict::same: f.verified = true; break;
+        case verify::Verdict::differs: {
+            std::error_code ec;
+            fs::remove(target_of(dir, f), ec); // not the server's file
+            f.status = State::failed;
+            f.error = "differs from the server's copy; deleted";
+            f.fetched = false;
+            f.bytes = 0;
+            break;
         }
-    }
+        case verify::Verdict::missing:
+            f.status = State::failed;
+            f.error = "the downloaded copy is gone";
+            f.fetched = false;
+            f.bytes = 0;
+            break;
+        case verify::Verdict::unchecked: break; // kept, done; checked again by the next run
+        }
+    };
+    c.report = verify::run(r, std::move(stop));
     notify(job, Event::changed);
     return c;
 }

@@ -1862,10 +1862,13 @@ void App::test_server(const std::string& name, std::stop_token stop) {
         v.set("rcloneError", str(result->rclone_error));
         v.set("sshOk", result->ssh_ok ? Value::make_bool(*result->ssh_ok) : Value{});
         v.set("sshError", str(result->ssh_error));
-        // engine = grab: grab's own login, and how its searches go ("with find (GNU find)").
+        // grab's own login (every server verifies through it), how searches go on engine = grab
+        // ("with find (GNU find)"), and whether downloads can be verified ("checksums: md5sum").
         v.set("grabOk", result->grab_ok ? Value::make_bool(*result->grab_ok) : Value{});
         v.set("grabError", str(result->grab_error));
+        v.set("grabEngine", Value::make_bool(result->grab_engine));
         v.set("grabSearch", str(result->grab_search));
+        v.set("checksums", str(result->checksums));
     }
     post(v);
 }
@@ -2716,30 +2719,31 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         }
         if (!check) return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
         post_queue();
-        verify::Request base;
-        base.ctx = &*ctx;
-        base.connections = &connections_;
-        base.server = item->remote;
-        base.id = item->id;
-        const auto checked = verify::file(base, item->path, d.target, item_stop);
+        // Against the server's file as this download fetched it: its size and time.
+        const auto checked = verify::file(verify_request(*ctx, item, d.pool),
+                                          verify::File{.path = item->path, .local = d.target, .size = result.size,
+                                                       .modtime = result.modtime},
+                                          item_stop);
         {
             std::lock_guard lock(mutex_);
             item->verifying = false;
             if (!item_stop.stop_requested()) item->verify_pending = false;
         }
         if (!item_stop.stop_requested()) {
-            if (!checked) return set(Status::done, {}, "not verified: " + checked.error());
-            if (!checked->differ.empty()) {
+            const auto verdict = checked.files.front().verdict;
+            if (verdict == verify::Verdict::differs || verdict == verify::Verdict::missing) {
                 std::error_code ec;
-                std::filesystem::remove(d.target, ec); // not the server's file
+                if (verdict == verify::Verdict::differs) std::filesystem::remove(d.target, ec); // not the server's file
                 {
                     std::lock_guard lock(mutex_);
                     item->bytes = 0; // starts over: the row offers Retry, not Resume
                 }
-                return set(Status::failed, std::format("The downloaded copy {}, so it was deleted. Retry downloads it again.",
-                                                       verify::summary(*checked, 1)));
+                return set(Status::failed, verdict == verify::Verdict::differs
+                                               ? std::format("The downloaded copy {}, so it was deleted. Retry downloads it again.",
+                                                             verify::summary(checked))
+                                               : "The downloaded copy is gone. Retry downloads it again.");
             }
-            return set(Status::done, {}, verify::summary(*checked, 1));
+            return set(Status::done, {}, verify::summary(checked));
         }
     }
     StopReason reason{};
@@ -2748,6 +2752,40 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         reason = item->stop_reason;
     }
     set(reason == StopReason::cancel ? Status::cancelled : Status::paused);
+}
+
+verify::Request App::verify_request(const engine::Context& ctx, const std::shared_ptr<Item>& item,
+                                    const std::shared_ptr<ssh::Pool>& download_pool) {
+    verify::Request r;
+    r.ctx = &ctx;
+    r.connections = &connections_;
+    r.server = item->remote;
+    r.id = item->id;
+    // Every server verifies through grab's own client (RCLONE-REPLACEMENT.md, phase 5), engine =
+    // rclone too: its pool, shared with Browse and searches, logs in once.
+    if (download_pool) {
+        r.pool = download_pool;
+    } else if (auto target = engine::ssh_target(ctx)) {
+        r.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
+        r.close_idle_after = true; // only verifies: rclone downloads don't count its connections
+    } else {
+        r.no_pool = target.error();
+    }
+    // A folder's "12 of 40", and its verified files saved now and then, so a crash keeps them.
+    auto saved = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    r.on_progress = [this, item, saved](std::size_t done, std::size_t total) {
+        if (update_item(mutex_, last_progress_post_, [&] {
+                item->verify_done = done;
+                item->verify_total = total;
+            })) {
+            post_queue();
+        }
+        if (const auto now = std::chrono::steady_clock::now(); item->mode == Mode::folder && now - *saved >= std::chrono::seconds(2)) {
+            *saved = now;
+            save_queue();
+        }
+    };
+    return r;
 }
 
 void App::folder_totals(Item& item) const {
@@ -2928,10 +2966,12 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
                 return f.status == folder::State::done && f.fetched && !f.verified;
             });
             item->verifying = any;
+            item->verify_done = 0;
+            item->verify_total = 0;
         }
         if (any) {
             post_queue();
-            const auto checked = folder::verify_files(job, item->tree, mutex_, item_stop);
+            const auto checked = folder::verify_files(job, item->tree, mutex_, verify_request(*ctx, item, job.pool), item_stop);
             {
                 std::lock_guard lock(mutex_);
                 item->verifying = false;
@@ -2991,6 +3031,13 @@ json::Value App::queue_snapshot() const {
         v.set("note", str(i->note));
         v.set("connections", num(i->connections));
         if (i->verifying) v.set("verifying", Value::make_bool(true));
+        // A folder's files checked so far: "Verifying the checksums… 12 of 40".
+        if (i->verifying && i->mode == Mode::folder && i->verify_total > 0) {
+            Value checked = Value::make_object();
+            checked.set("done", num(static_cast<double>(i->verify_done)));
+            checked.set("total", num(static_cast<double>(i->verify_total)));
+            v.set("verified", std::move(checked));
+        }
         v.set("priority", str(priority_name(i->weight.load())));
         if (i->status == Status::queued) v.set("position", num(++waiting_position)); // "Queued · #2"
         if (i->mode == Mode::folder && i->tree.listed) {

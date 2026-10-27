@@ -15,7 +15,6 @@ namespace grab::ssh {
 
 namespace {
 
-constexpr std::string_view probe_ok = "grab-find-ok\n";
 // The longest record taken from find: a path that long is a broken or hostile server. With
 // -maxdepth N a real one is at most its root, N names of 255 bytes and about 40 more.
 constexpr std::size_t max_record = std::size_t{64} * 1024;
@@ -260,7 +259,7 @@ FindCheck read_find_probe(const std::expected<ExecResult, ExecError>& ran, std::
         }
         return walk_because("stopped");
     }
-    if (ran->status == 0 && out == probe_ok) return FindCheck{.works = true, .answer = "GNU find"};
+    if (ran->status == 0 && out == find_probe_ok) return FindCheck{.works = true, .answer = "GNU find"};
     const std::string status = ran->status >= 0     ? std::format("exit {}", ran->status)
                                : ran->signal.empty() ? std::string("no exit status")
                                                      : "ended by SIG" + ran->signal;

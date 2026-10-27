@@ -8,6 +8,7 @@
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_find.hpp"
+#include "ssh_hash.hpp"
 #include "ssh_pool.hpp"
 #include "util.hpp"
 
@@ -599,17 +600,20 @@ std::expected<void, std::string> set_default(const Env& loaded, std::string_view
 
 namespace {
 
-// engine = grab's part of a test: a login through grab's own client (the target downloads use),
-// the home folder listed, then the find check on that connection, which says how searches go;
-// its answer replaces the one saved in `limits_file` (engine::find_memory), so a server changed
-// since is searched the new way by the next command (the window drops its pool's answer,
-// App::test_server). Nothing is set when stopped.
+// grab's own client's part of a test: a login through it (the target downloads use), then on
+// engine = grab the home folder listed and the find check on that connection, which says how
+// searches go; its answer replaces the one saved in `limits_file` (engine::find_memory), so a
+// server changed since is searched the new way by the next command (the window drops its pool's
+// answer, App::test_server). On every server the hash check last, which says whether downloads can
+// be verified there (phase 5). Nothing is set when stopped.
 void test_grab(const engine::Context& ctx, const std::filesystem::path& limits_file, const std::stop_token& stop,
                TestResult& result) {
     auto failed = [&](std::string why) {
         result.grab_ok = false;
         result.grab_error = std::move(why);
     };
+    const bool grab_engine = ctx.engine == Engine::grab;
+    result.grab_engine = grab_engine;
     auto target = engine::ssh_target(ctx);
     if (!target) return failed(target.error());
     ssh::Pool::Options options;
@@ -619,25 +623,39 @@ void test_grab(const engine::Context& ctx, const std::filesystem::path& limits_f
     try {
         auto lease = pool.acquire(stop, ssh::interactive_retry);
         if (!lease) return;
-        if (auto listed = sftp::list((*lease)->sftp(), "."); !listed) {
-            return failed("its home folder can't be listed: " + sftp::describe(listed.error()));
+        if (grab_engine) {
+            if (auto listed = sftp::list((*lease)->sftp(), "."); !listed) {
+                return failed("its home folder can't be listed: " + sftp::describe(listed.error()));
+            }
         }
     } catch (const ssh::Error& e) {
         return failed(e.what());
     } catch (const sftp::Broken& e) {
         return failed(e.what());
     }
-    // Asked whatever was saved; a save that fails is only asked again by the next search.
-    // gui.json's old limits, kept if this answer makes limits.json (review G195).
-    auto gui = read_gui_state(limits_file.parent_path() / "gui.json");
-    auto old_limits = gui && *gui ? std::move((*gui)->server_limits) : std::map<std::string, int>{};
-    auto memory = engine::find_memory(limits_file, *target, {}, std::move(old_limits));
-    memory.load = {};
-    auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry, memory);
-    if (stop.stop_requested()) return;
-    if (!way) return failed(way.error());
+    if (grab_engine) {
+        // Asked whatever was saved; a save that fails is only asked again by the next search.
+        // gui.json's old limits, kept if this answer makes limits.json (review G195).
+        auto gui = read_gui_state(limits_file.parent_path() / "gui.json");
+        auto old_limits = gui && *gui ? std::move((*gui)->server_limits) : std::map<std::string, int>{};
+        auto memory = engine::find_memory(limits_file, *target, {}, std::move(old_limits));
+        memory.load = {};
+        auto way = ssh::choose_lookup(pool, ctx.grab_method, ctx.settings.name, stop, ssh::interactive_retry, memory);
+        if (stop.stop_requested()) return;
+        if (!way) return failed(way.error());
+        result.grab_search = engine::lookup_text(ctx, *way);
+    }
+    // Whether verification can run: rclone.conf's keys, then the server's md5sum.
+    if (auto blocked = ssh::hash_blocked(ctx.remote)) {
+        result.checksums = "verify can't run: " + blocked->why;
+    } else {
+        const auto check = ssh::hash_check(pool, stop, ssh::interactive_retry);
+        if (!check) return; // stopped
+        // The login worked a moment ago: one failing now is the test's failure, not the check's.
+        if (!check->works && check->failure == ssh::HashFailure::login) return failed(check->answer);
+        result.checksums = check->works ? "checksums: md5sum" : "verify can't run: " + ssh::hash_check_failed(*check).why;
+    }
     result.grab_ok = true;
-    result.grab_search = engine::lookup_text(ctx, *way);
 }
 
 } // namespace
@@ -658,17 +676,7 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
         if (!env.secrets_error.empty()) result.rclone_error += " (" + env.secrets_error + ")";
     }
 
-    if (effective_engine(*s) == Engine::grab) {
-        const engine::Context ctx{.config = env.cfg,
-                                  .settings = *s,
-                                  .remote = *remote,
-                                  .method = resolve_find_method(*s, *remote),
-                                  .imported = {},
-                                  .engine = Engine::grab,
-                                  .grab_method = resolve_grab_method(*s, *remote)};
-        test_grab(ctx, learned_limits_path(env.grab_conf), stop, result);
-        if (stop.stop_requested()) return util::fail("cancelled");
-    } else if (resolve_find_method(*s, *remote) == FindMethod::ssh) {
+    if (effective_engine(*s) != Engine::grab && resolve_find_method(*s, *remote) == FindMethod::ssh) {
         std::vector<std::string> options{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"};
         options.insert(options.end(), s->ssh_options.begin(), s->ssh_options.end());
         auto ssh = proc::run_capture(build_ssh_argv(env.cfg.ssh, *remote, options, "echo grab-ok"), quiet(stop));
@@ -676,6 +684,17 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
         result.ssh_ok = ok(ssh) && ssh->out.find("grab-ok") != std::string::npos;
         if (!*result.ssh_ok) result.ssh_error = ssh ? first_line(ssh->err) : ssh.error();
     }
+    // Every server: grab's own login, which downloads and searches use on engine = grab, and
+    // verification on any.
+    const engine::Context ctx{.config = env.cfg,
+                              .settings = *s,
+                              .remote = *remote,
+                              .method = resolve_find_method(*s, *remote),
+                              .imported = {},
+                              .engine = effective_engine(*s),
+                              .grab_method = resolve_grab_method(*s, *remote)};
+    test_grab(ctx, learned_limits_path(env.grab_conf), stop, result);
+    if (stop.stop_requested()) return util::fail("cancelled");
     return result;
 }
 

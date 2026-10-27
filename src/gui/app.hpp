@@ -204,6 +204,9 @@ private:
         // is checked when it resumes, although it is complete on disk.
         bool verifying = false;
         bool verify_pending = false;
+        // A folder being checked: its files with their result so far, of how many.
+        std::size_t verify_done = 0;
+        std::size_t verify_total = 0;
         // The free-space check is done: "Download anyway" was chosen, or Resume after the check
         // paused it (a folder too big for the drive once listed).
         bool space_ok = false;
@@ -378,6 +381,11 @@ private:
     void run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
     void folder_event(Item& item, folder::Event e); // a running folder's progress, for the page
     void folder_totals(Item& item) const;          // caller holds mutex_
+    // What a verification of `item`'s download needs: grab's own connections to its server, which
+    // every server verifies through (the download's pool on engine = grab, else the server's from
+    // pools_), or why there are none; the budget and its id; the row's "12 of 40" as files end.
+    [[nodiscard]] verify::Request verify_request(const engine::Context& ctx, const std::shared_ptr<Item>& item,
+                                                 const std::shared_ptr<ssh::Pool>& download_pool);
     void discard_folder_partials(const Item& item) const; // cancelled folder: big files' .grabpart
     // grab.conf's rclone remote for `server` (else the name): partial downloads are told apart by
     // it, so another server's of the same path is left alone (review G20).
@@ -417,7 +425,7 @@ private:
     GuiState state_;
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
     fetch::Connections connections_;
-    ssh::Pools pools_;          // grab's own SSH connections, for servers with engine = grab
+    ssh::Pools pools_;          // grab's own SSH connections: engine = grab servers, every server's verification
     rate::RateLimiter limiter_; // shared by every download's streams
     std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers
     std::string limit_posted_;  // the last "limit" message, so only changes are sent

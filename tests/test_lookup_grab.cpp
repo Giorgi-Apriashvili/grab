@@ -119,7 +119,7 @@ struct Server {
     void with_find(std::vector<std::string> records, std::string err = {}, int status = 0) {
         answer = [records = std::move(records), err = std::move(err), status](test::FakeCommand& c, std::string_view command) {
             if (command == ssh::find_probe) {
-                c.out = {"grab-find-ok\n"};
+                c.out = {std::string(ssh::find_probe_ok)};
                 return;
             }
             c.out = records;
@@ -825,7 +825,7 @@ TEST_CASE("grab engine: a saved 'find works' that find contradicts is asked agai
     std::atomic<int> finds{0};
     flaky.answer = [&](test::FakeCommand& c, std::string_view command) {
         if (command == ssh::find_probe) {
-            c.out = {"grab-find-ok\n"};
+            c.out = {std::string(ssh::find_probe_ok)};
             return;
         }
         if (finds++ == 0) {
@@ -869,7 +869,7 @@ TEST_CASE("grab engine: find failing on an answer just asked, or for reasons not
     Server odd;
     odd.answer = [](test::FakeCommand& c, std::string_view command) {
         if (command == ssh::find_probe) {
-            c.out = {"grab-find-ok\n"};
+            c.out = {std::string(ssh::find_probe_ok)};
             return;
         }
         c.status = 127;
@@ -953,7 +953,7 @@ TEST_CASE("grab engine: a pool that forgets its find check takes the answer save
     s.answer = [&](test::FakeCommand& c, std::string_view command) {
         if (!installed) return;
         if (command == ssh::find_probe) {
-            c.out = {"grab-find-ok\n"};
+            c.out = {std::string(ssh::find_probe_ok)};
             return;
         }
         c.out = {"f\t1\t1700000000.0\t/data/tv/lioness-notes.txt\0"s};

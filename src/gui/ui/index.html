@@ -178,10 +178,11 @@
           <span>Verify downloads against the server's checksum</span>
         </label>
       </div>
-      <div class="hint">After each download, the server computes an MD5 checksum of its copy and grab
-        compares it with yours, here and in the grab command. Both sides read the file once more: about
-        3 seconds per GB in tests. A copy that differs is deleted and the download fails, so Retry gets it
-        again.</div>
+      <div class="hint">After each download, the server computes an MD5 checksum of its copy (md5sum,
+        through grab's own SSH connection) while grab computes yours, here and in the grab command. Both
+        read the file once more, at the same time: about 2 seconds per GB in tests. A copy that differs is
+        deleted and the download fails, so Retry gets it again. A copy that changed on either side since
+        the download, or a server without md5sum, is kept as "not verified".</div>
     </section>
 
     <section id="schedule-panel" class="updates-panel schedule-panel">

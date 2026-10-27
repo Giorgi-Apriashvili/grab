@@ -114,16 +114,6 @@ std::optional<HashCheck> ask(Pool& pool, const std::stop_token& stop, Retry retr
     }
 }
 
-// Why the check leaves every file without a sum.
-HashFailed check_failed(const HashCheck& check) {
-    if (check.failure == HashFailure::no_checksums) {
-        return HashFailed{.kind = check.failure,
-                          .why = std::format("the server can't compute checksums (its answer to `{}` was {})", hash_probe,
-                                             check.answer)};
-    }
-    return HashFailed{.kind = check.failure, .why = check.answer};
-}
-
 // Why `path` (absolute, raw) can't go to the server's shell, if it can't.
 std::optional<HashFailed> unsendable(std::string_view path, bool z, bool storage_box, const BatchLimits& limits) {
     const auto control = [](char c) {
@@ -233,6 +223,15 @@ HashCheck read_hash_probe(const std::expected<ExecResult, ExecError>& ran, std::
 
 std::optional<HashCheck> hash_check(Pool& pool, std::stop_token stop, Retry retry) {
     return pool.hash_check(stop, [&] { return ask(pool, stop, retry); });
+}
+
+HashFailed hash_check_failed(const HashCheck& check) {
+    if (check.failure == HashFailure::no_checksums) {
+        return HashFailed{.kind = check.failure,
+                          .why = std::format("the server can't compute checksums (its answer to `{}` was {})", hash_probe,
+                                             check.answer)};
+    }
+    return HashFailed{.kind = check.failure, .why = check.answer};
 }
 
 std::optional<HashFailed> hash_blocked(const RcloneRemote& remote) {
@@ -362,7 +361,7 @@ std::vector<HashResult> run_hashes(Pool& pool, std::span<const HashFile> files, 
         return results;
     }
     if (!check->works) {
-        give_all(check_failed(*check));
+        give_all(hash_check_failed(*check));
         return results;
     }
     const bool z = check->z;
@@ -426,7 +425,7 @@ std::vector<HashResult> run_hashes(Pool& pool, std::span<const HashFile> files, 
                 } catch (const Error& e) {
                     const HashCheck failed = login_failed(e);
                     pool.set_hash_check(failed);
-                    const HashFailed why = check_failed(failed);
+                    const HashFailed why = hash_check_failed(failed);
                     {
                         std::scoped_lock lock(mutex);
                         no_login = why;
@@ -440,6 +439,10 @@ std::vector<HashResult> run_hashes(Pool& pool, std::span<const HashFile> files, 
                 return;
             }
             out.clear();
+            if (options.on_command) {
+                std::scoped_lock lock(mutex);
+                options.on_command(paths, z);
+            }
             try {
                 ran = (*lease)->exec(command, x);
             } catch (const Error& e) {

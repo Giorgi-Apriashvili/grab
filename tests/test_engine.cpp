@@ -6,6 +6,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -253,3 +254,29 @@ TEST_CASE("a search for folders and files walks the server once over rclone (G19
     std::filesystem::remove_all(dir);
 }
 #endif
+TEST_CASE("grab's own target: common_flags, then the command's flags after --, which win") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-tests-engine-target";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    engine::Context ctx;
+    ctx.config.rclone_config = dir / "rclone.conf"; // none there: no secrets either
+    ctx.settings.name = "Main";
+    ctx.settings.common_flags = {"-P", "--contimeout", "10s", "--bind", "10.0.0.1"};
+    ctx.remote.name = "Main";
+    ctx.remote.host = "main.example";
+    ctx.remote.user = "me";
+    ctx.remote.key_use_agent = true;
+    auto plain = engine::ssh_target(ctx);
+    REQUIRE_MESSAGE(plain, plain.error_or(""));
+    CHECK(plain->connect_timeout == std::chrono::seconds(10));
+    CHECK(plain->bind == "10.0.0.1");
+    const std::vector<std::string> extra{"--bind", "10.8.0.2", "--timeout=1m"};
+    auto given = engine::ssh_target(ctx, extra);
+    REQUIRE_MESSAGE(given, given.error_or(""));
+    CHECK(given->connect_timeout == std::chrono::seconds(10));
+    CHECK(given->bind == "10.8.0.2");
+    CHECK(given->timeout == std::chrono::minutes(1));
+    const std::vector<std::string> bad{"--timeout", "soon"};
+    CHECK(engine::ssh_target(ctx, bad).error_or("").starts_with("the flags after --: --timeout soon"));
+    std::filesystem::remove_all(dir);
+}

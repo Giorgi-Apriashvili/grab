@@ -66,6 +66,10 @@ struct HashFailed {
 // A file's sum on the server (32 lower-case hex digits), or why there's none.
 using HashResult = std::expected<std::string, HashFailed>;
 
+// Why a check that doesn't work leaves every file without a sum ("the server can't compute
+// checksums (its answer to ... was ...)"), as run_hashes gives it for each.
+[[nodiscard]] HashFailed hash_check_failed(const HashCheck& check);
+
 // Whether the keys rclone saved for the server in rclone.conf keep grab's check from it, without
 // running anything: shell_type cmd, powershell or none, or md5sum_command none (rclone found no
 // way to hash there); another md5sum_command or any path_override (not supported by grab's check
@@ -137,6 +141,9 @@ struct HashOptions {
     Retry retry_refused = std::nullopt;                          // for its logins (Pool::acquire)
     // Each file's result as its command ends (one call at a time, from the run's threads).
     std::function<void(std::size_t file, const HashResult& result)> done;
+    // Each md5sum command as it is sent, by the paths it names (absolute, raw) and whether with -z,
+    // for -v (one call at a time).
+    std::function<void(std::span<const std::string> paths, bool z)> on_command;
 };
 
 // The server's MD5 of each of `files`, in their order: hash_blocked, then the pool's check, then

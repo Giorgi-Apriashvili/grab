@@ -397,7 +397,8 @@ std::string age_text(std::int64_t seconds) {
 // as `said` + its lookup_text.
 std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ctx, const Options& opts,
                                                        ssh::Pools& pools, std::string said) {
-    auto target = engine::ssh_target(ctx);
+    // The connection flags after `--` too, as the download's target takes them: one pool for both.
+    auto target = engine::ssh_target(ctx, rclone_flags::connection(opts.extra));
     if (!target) return util::fail(target.error());
     // The download's budget, as download_with_grab counts it (limits.json: what refusals taught).
     const auto limits_file = learned_limits_path(opts.config.value_or(default_grab_config_path()));

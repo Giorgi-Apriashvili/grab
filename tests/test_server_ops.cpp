@@ -654,3 +654,16 @@ TEST_CASE("a change sets aside a password store it can't decrypt, and names who 
     std::filesystem::remove(own);
     std::filesystem::remove(store);
 }
+TEST_CASE("server ops: a test fails on grab's login only where grab downloads (engine = grab)") {
+    server_ops::TestResult t;
+    t.rclone_ok = true;
+    t.grab_ok = false;
+    t.grab_error = "h's host key isn't trusted yet";
+    CHECK(t.ok()); // engine = rclone: grab only verifies there, a warning
+    t.grab_engine = true;
+    CHECK_FALSE(t.ok());
+    t.grab_ok = true;
+    CHECK(t.ok());
+    t.rclone_ok = false;
+    CHECK_FALSE(t.ok());
+}

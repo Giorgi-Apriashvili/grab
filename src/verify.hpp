@@ -1,83 +1,100 @@
 #pragma once
 
-// Checking downloads against the server's copy (optional: Settings → Downloads, `grab --verify`).
-// One `rclone check` per download compares checksums that the server computes (md5sum over SSH)
-// with the local files'. Both sides read the files once more. rclone check pairs files by name,
-// so files with a Windows device name (CON, nul.txt), which grab names otherwise than rclone
-// (CON_, local_name.hpp), are compared by `rclone hashsum md5` on both sides instead.
+// Checking downloads against the server's copy (optional: Settings → Downloads, `grab --verify`),
+// on every server through grab's own SSH client (RCLONE-REPLACEMENT.md, phase 5): the server's
+// md5sum over the pool's connections (ssh_hash.hpp) and grab's MD5 of the local copy, both at the
+// same time once the download is done, each file compared by its own path, whatever its local name
+// (Keep both, a device name, a case clash, a name that isn't UTF-8).
+//
+// Only a proven mismatch costs a copy: the sums differ, one SFTP STAT shows the server's file as
+// the download left it, and the copy's size and time are what the download set. Anything else
+// keeps the copy as "not verified: <why>": no login, a refused command, no md5sum, a name the
+// server's shell can't be given, a server that took too long, a stop, or either copy changed since
+// the download.
 
 #include "engine.hpp"
 #include "fetch.hpp"
+#include "ssh_pool.hpp"
 
+#include <chrono>
 #include <cstddef>
-#include <expected>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <stop_token>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace grab::verify {
 
-enum class Verdict { same, differs, missing, error };
-struct Line {
-    Verdict verdict = Verdict::same;
-    std::string path;
-    bool operator==(const Line&) const = default;
+// One downloaded file to check.
+struct File {
+    std::string path;            // on the server, relative to Request::remote_dir (grab's form)
+    std::filesystem::path local; // the copy
+    std::uint64_t size = 0;      // the server's file as the download fetched it
+    std::string modtime;         // ...and its time (RFC 3339); "" when not known
 };
-// `rclone check --combined -` output: "= path" same, "* path" differs, "+ path" missing locally,
-// "! path" could not be read or hashed. Other lines are skipped.
-[[nodiscard]] std::vector<Line> parse_combined(std::string_view out);
 
-// From rclone's log: the checksum it compared ("md5"), "" when the two sides have none in common
-// (it then compared sizes only), and how many files it could not hash.
-[[nodiscard]] std::string hash_used(std::string_view log);
-[[nodiscard]] std::size_t unhashed(std::string_view log);
-
-// `rclone hashsum md5` output: "<32 hex>  <path>" per file, as path -> lowercase hex. Other lines
-// (the files it could not hash) are skipped.
-[[nodiscard]] std::unordered_map<std::string, std::string> parse_sums(std::string_view out);
+enum class Verdict {
+    same,      // the sums agree
+    differs,   // proven: the sums differ and neither copy changed since the download (delete it)
+    missing,   // the copy is gone (nothing to delete; downloading it again brings it back)
+    unchecked, // not verified: `why`
+};
+struct Result {
+    Verdict verdict = Verdict::unchecked;
+    std::string why; // unchecked: in a few words ("the server's copy changed since the download")
+    bool operator==(const Result&) const = default;
+};
 
 struct Request {
-    const engine::Context* ctx = nullptr;
-    std::string remote_dir;           // the server folder the paths are relative to
-    std::filesystem::path local_dir;  // the local copy of that folder
-    std::vector<std::string> paths;   // relative, '/'-separated
-    // Copies under another name than the server's (Keep both): path -> local path relative to
-    // local_dir. Compared by their sums, like device names.
-    std::unordered_map<std::string, std::filesystem::path> renamed;
-    std::vector<std::string> extra;   // added to the rclone call (`grab ... -- extra`)
-    // The connections the check takes from the server's pool: one for a file, up to the
-    // download's share for a folder.
+    const engine::Context* ctx = nullptr; // the server: rclone.conf's keys for it (ssh::hash_blocked)
+    // grab's own connections to the server, which every server's verification uses; nullptr when
+    // its login can't be made, `no_pool` saying why (engine::ssh_target).
+    std::shared_ptr<ssh::Pool> pool;
+    std::string no_pool;
+    // The pool is only for verifying (engine = rclone): its idle connections close when the check
+    // ends, as rclone check's did, so rclone's downloads in the freed seats stay under the cap.
+    bool close_idle_after = false;
+    std::string remote_dir; // the server folder the files' paths are relative to; "": as they are
+    std::vector<File> files;
+    // The seats the check takes from the server's budget: one for a file, up to the download's
+    // share for a folder (no more than the hash commands the pool runs at once).
     fetch::Connections* connections = nullptr;
     std::string server;
     int id = 0;
-    bool joined = false; // the caller is in the pool under `id` already
+    bool joined = false; // the caller is in the budget under `id` already
     bool many = false;
-    engine::CommandHook on_command;
+    engine::CommandHook on_command; // -v: each md5sum command, as "exec md5sum -z <path>"
+    // Each md5sum command's time: this, and its bytes at 10 MiB/s (ssh::hash_deadline).
+    std::chrono::milliseconds deadline{std::chrono::minutes(5)};
+    // Each file's result as soon as it is known (one call at a time, from the check's threads):
+    // a match or an unchecked one as its command and its local sum end, a mismatch once proven
+    // (at the end). `done` of `files.size()` have their result.
+    std::function<void(std::size_t file, const Result& result, std::size_t done)> on_file;
+    // After each on_file: how many files have their result, of how many (the row's "12 of 40").
+    std::function<void(std::size_t done, std::size_t total)> on_progress;
 };
-[[nodiscard]] std::expected<std::vector<std::string>, std::string>
-check_argv(const Request& r, const std::filesystem::path& list_file, int connections);
 
 struct Report {
-    std::string hash;                // "md5"; "" when the server can't compute checksums
-    std::vector<std::string> differ; // copies that differ from the server's, or are missing
-    std::vector<std::string> same;   // copies that match, when rclone says which
-    std::size_t unchecked = 0;       // files either side could not hash
-    std::size_t matched = 0;
-    [[nodiscard]] bool verified() const { return !hash.empty() && differ.empty() && unchecked == 0; }
+    std::vector<Result> files; // in Request::files' order
+    [[nodiscard]] std::size_t count(Verdict v) const;
 };
-// Runs the check. An error means it could not run at all (the server unreachable, say); a
-// stop returns an error too.
-[[nodiscard]] std::expected<Report, std::string> run(const Request& r, std::stop_token stop);
-// One downloaded file, `target` being the local copy of `remote_path` (under the server's name,
-// or another); `base` gives the context, the pool and the hooks.
-[[nodiscard]] std::expected<Report, std::string> file(Request base, const std::string& remote_path,
-                                                      const std::filesystem::path& target, std::stop_token stop);
+
+// Runs the check: every file gets a result, a stop leaves the rest unchecked ("stopped").
+[[nodiscard]] Report run(const Request& r, std::stop_token stop);
+// One downloaded file, `copy.path` being its path on the server; `base` gives the server, the pool
+// and the hooks.
+[[nodiscard]] Report file(Request base, File copy, std::stop_token stop);
 
 // For the queue row and the command: "checksum verified (MD5)", or for a folder's files "3 files
-// verified (MD5)", or why not ("not verified: the server can't compute checksums").
-[[nodiscard]] std::string summary(const Report& r, std::size_t files, bool folder = false);
+// verified (MD5)", or why not ("not verified: the server can't compute checksums (...)").
+[[nodiscard]] std::string summary(const Report& r, bool folder = false);
+
+// The copy's look after a differing sum (exposed for tests): whether its size and time are what
+// the download left (`size`, and `modtime` within 2 s, as FAT keeps times).
+[[nodiscard]] bool copy_unchanged(const std::filesystem::path& local, std::uint64_t size, std::string_view modtime);
 
 } // namespace grab::verify

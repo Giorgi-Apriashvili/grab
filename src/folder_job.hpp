@@ -206,14 +206,17 @@ void apply(existing::Choice choice, const std::vector<Conflict>& found, const st
 void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop);
 
 // After run(): checks the files this download fetched, and has not checked yet, against the
-// server's checksums in one rclone check. Copies that differ are deleted and marked failed, so a
-// retry fetches them again.
+// server's checksums (verify::run), each by its own path, whatever its local name. A file is
+// marked verified as soon as its result is known, so a stop keeps what was done. Copies proven to
+// differ are deleted and marked failed, as are copies that are gone, so a retry fetches them again;
+// the others stay done. `base` gives the server's pool (or why there is none) and the caller's
+// hooks (on_progress, on_command when the job has none); the rest comes from the job.
 struct Checked {
     std::size_t files = 0; // checked; 0 when there was nothing to check
     verify::Report report;
-    std::string error;     // the check could not run
     [[nodiscard]] std::string summary() const; // for the row and the command
 };
-[[nodiscard]] Checked verify_files(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop);
+[[nodiscard]] Checked verify_files(const Job& job, Tree& tree, std::mutex& m, verify::Request base,
+                                   std::stop_token stop);
 
 } // namespace grab::folder

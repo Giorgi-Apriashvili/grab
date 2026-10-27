@@ -172,16 +172,25 @@ struct TestResult {
     std::string rclone_error;
     std::optional<bool> ssh_ok; // only for engine = rclone servers searched with ssh + find
     std::string ssh_error;
-    std::optional<bool> grab_ok; // only for engine = grab servers: grab's own client
+    // grab's own client: on engine = grab for downloads, searches and verification, on the others
+    // for verification, which every server runs through it.
+    std::optional<bool> grab_ok;
     std::string grab_error;
-    std::string grab_search; // grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
-    [[nodiscard]] bool ok() const { return rclone_ok && ssh_ok.value_or(true) && grab_ok.value_or(true); }
+    bool grab_engine = false; // engine = grab
+    std::string grab_search;  // engine = grab, grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
+    std::string checksums;    // grab_ok: "checksums: md5sum", or why verification can't run there
+    // grab's own login counts on engine = grab only: on engine = rclone it only verifies (off by
+    // default), so a failure there is a warning, not a failed test.
+    [[nodiscard]] bool ok() const {
+        return rclone_ok && ssh_ok.value_or(true) && (!grab_engine || grab_ok.value_or(true));
+    }
 };
 
-// The paths searches and downloads use: an rclone listing (on engine = grab still the way to
-// verify and preview), plus an ssh login (BatchMode) for engine = rclone servers searched with ssh
-// + find. On engine = grab: a login through grab's own client, the home folder listed over SFTP,
-// and the find check, which says how its searches go.
+// The paths searches, downloads and verification use: an rclone listing (on engine = grab still
+// the way to preview), plus an ssh login (BatchMode) for engine = rclone servers searched with ssh
+// + find. Then a login through grab's own client and its hash check, which says whether downloads
+// can be verified there (ssh_hash.hpp); on engine = grab also the home folder listed over SFTP and
+// the find check, which says how its searches go.
 [[nodiscard]] std::expected<TestResult, std::string> test_connection(const Env& env, std::string_view name,
                                                                      std::stop_token stop = {});
 

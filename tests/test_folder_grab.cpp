@@ -274,6 +274,22 @@ TEST_CASE("grab engine folders: a file grown since the listing comes whole") {
     folder::run(r.job, r.tree, r.m, {});
     CHECK(r.tree.files[0].status == folder::State::done);
     CHECK(util::read_file(r.local("grew.log")) == content);
+    // The tree keeps the size fetched, which verification proves against, not the listing's.
+    CHECK(r.tree.files[0].size == 300'000);
+
+    // A big file too (fetched alone, resumable).
+    Tree big;
+    big.dir("/data");
+    big.file("/data/grew.log", content);
+    big.readdir_size["/data/grew.log"] = 100'000;
+    Run b(big.pool(1), "grew-big");
+    { auto listed = folder::list(b.job, b.tree, b.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    REQUIRE(b.tree.files.size() == 1);
+    b.tree.files[0].big = true;
+    folder::run(b.job, b.tree, b.m, {});
+    CHECK(b.tree.files[0].status == folder::State::done);
+    CHECK(util::read_file(b.local("grew.log")) == content);
+    CHECK(b.tree.files[0].size == 300'000);
 }
 
 TEST_CASE("grab engine folders: under a speed limit too") {

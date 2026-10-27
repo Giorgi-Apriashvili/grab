@@ -52,8 +52,10 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 // How grab's own SSH client logs in to the context's server (engine = grab): its rclone.conf
 // section, with the secrets of grab's encrypted store, and any the rclone.conf in use keeps
 // itself (obscured, as rclone writes them when it isn't grab's own file). --bind, --contimeout and
-// --timeout in its common_flags apply (ssh::apply_flags; an error when one can't be read).
-[[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx);
+// --timeout in its common_flags apply (ssh::apply_flags; an error when one can't be read), then
+// those of `extra`, the command's connection flags after `--`, so they win as they did for rclone.
+[[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx,
+                                                                 std::span<const std::string> extra = {});
 // The connection flags of the context's common_flags that grab's own client doesn't use (all but
 // --bind, --contimeout and --timeout), with their values, for a -v line.
 [[nodiscard]] std::vector<std::string> unused_flags(const Context& ctx);
@@ -66,7 +68,7 @@ struct RcloneVersion {
     auto operator<=>(const RcloneVersion&) const = default;
 };
 [[nodiscard]] std::optional<RcloneVersion> parse_rclone_version(std::string_view out);
-// The oldest rclone grab works with: --sftp-connections (every folder batch, verify) came in 1.67.
+// The oldest rclone grab works with: --sftp-connections (every folder batch) came in 1.67.
 inline constexpr RcloneVersion min_rclone{1, 67, 0};
 // Whether `rclone` can be used: the one grab ships always; another (grab.conf's `rclone =`
 // when `configured`, else PATH's because the bundled one is missing) is asked its version once

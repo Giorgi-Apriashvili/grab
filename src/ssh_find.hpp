@@ -31,11 +31,25 @@
 
 namespace grab::ssh {
 
-// The check: exactly "grab-find-ok\n" with exit 0 means a GNU find grab can use (-L, -printf).
-// Anything else means walking: an SFTP-only account (nothing, exit 0), a restricted shell or a
-// Storage Box ("Command not found"), no find (exit 127), a refused command, a shell that prints a
-// banner first (review G61), BusyBox or BSD find, Windows. About 3 round trips.
-inline constexpr std::string_view find_probe = "env LC_ALL=C find -L . -maxdepth 0 -printf 'grab-find-ok\\n'";
+// The check: exactly find_probe_ok with exit 0 means a GNU find grab can use (-L, -printf) under a
+// shell that reads single quotes as POSIX sh does. Anything else means walking: an SFTP-only
+// account (nothing, exit 0), a restricted shell or a Storage Box ("Command not found"), no find
+// (exit 127), a refused command, a shell that prints a banner first (review G61), BusyBox or BSD
+// find, Windows. About 3 round trips.
+//
+// find_command puts names from the server inside single quotes (quote::sh_single), where a POSIX
+// shell takes every byte as it is. fish reads \\ and \' as escapes even there, so a name ending in
+// a backslash, or holding \', would end its quotes early and run the rest (a hostile folder name
+// from Browse). The probe's format holds both: sh hands find `grab-find-ok\\\n\c\` (find prints
+// "grab-find-ok\" and a line break, then stops at \c), while fish sees \\ as one backslash and \'
+// as a quote that doesn't close (a syntax error), so such a server is walked. pwsh (a Linux login
+// shell too) also ends single quotes at ‘ ’ ‚ ‛ (U+2018 to U+201B), so a name holding one could
+// end them as well: the probe's ’ after \c ends pwsh's string, and its last ' opens one that
+// doesn't close. sh hands find the ’ after \c, which it never prints. The ’ is spelled in bytes
+// (UTF-8), so the probe doesn't depend on the compiler's source character set.
+inline constexpr std::string_view find_probe =
+    R"(env LC_ALL=C find -L . -maxdepth 0 -printf 'grab-find-ok\\\n\c)" "\xE2\x80\x99" R"(\')";
+inline constexpr std::string_view find_probe_ok = "grab-find-ok\\\n";
 inline constexpr std::chrono::seconds find_probe_deadline{10};
 
 // What the server's answer to find_probe means: `ran` is what exec gave, `out` its stdout.

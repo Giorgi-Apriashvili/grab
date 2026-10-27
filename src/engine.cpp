@@ -80,7 +80,7 @@ std::expected<void, std::string> check_rclone(const std::string& rclone, const s
     if (ran && ran->exit_code == 0) {
         if (const auto v = parse_rclone_version(ran->out); v && *v < min_rclone) {
             why = std::format("{} is rclone {}.{}.{}, too old for grab, which needs {}.{} or newer (its folder downloads "
-                              "and verification use --sftp-connections). {}",
+                              "use --sftp-connections). {}",
                               rclone, v->major, v->minor, v->patch, min_rclone.major, min_rclone.minor,
                               configured ? "Remove `rclone =` from grab.conf to use the rclone that comes with grab"
                                          : "The rclone.exe that comes with grab is missing next to grab.exe; "
@@ -140,7 +140,7 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
                    .grab_method = grab_method};
 }
 
-std::expected<ssh::Target, std::string> ssh_target(const Context& ctx) {
+std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span<const std::string> extra) {
     const auto& conf = ctx.config.rclone_config ? *ctx.config.rclone_config : grab_rclone_config_path();
     secrets::Store store;
     if (auto stored = secrets::load(secrets::path_beside(conf)); stored) store = std::move(*stored);
@@ -159,6 +159,7 @@ std::expected<ssh::Target, std::string> ssh_target(const Context& ctx) {
     if (auto flags = ssh::apply_flags(*target, rclone_flags::connection(ctx.settings.common_flags)); !flags) {
         return util::failf("[{}] common_flags: {}", ctx.settings.name, flags.error());
     }
+    if (auto flags = ssh::apply_flags(*target, extra); !flags) return util::failf("the flags after --: {}", flags.error());
     return target;
 }
 

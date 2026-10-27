@@ -108,6 +108,91 @@ std::string why(const std::expected<T, ssh::FindFailed>& r) {
     return r ? std::string() : r.error().message;
 }
 
+enum class Login { sh, fish, pwsh };
+
+// The bytes of a single quote at command[i] as `shell` reads it, 0 for none: ' everywhere, and
+// under pwsh also the typographic ones, U+2018 to U+201B (UTF-8 E2 80 98 to E2 80 9B).
+std::size_t quote_at(std::string_view command, std::size_t i, Login shell) {
+    if (command[i] == '\'') return 1;
+    if (shell != Login::pwsh || command.substr(i, 2) != "\xE2\x80" || i + 2 >= command.size()) return 0;
+    const auto third = static_cast<unsigned char>(command[i + 2]);
+    return third >= 0x98 && third <= 0x9B ? 3 : 0;
+}
+
+// The words of a command as a login shell reads them: POSIX sh takes everything inside single
+// quotes as it is; fish reads \\ and \' there as escapes; pwsh also opens and closes them with
+// U+2018 to U+201B, takes a doubled quote inside as one, and a backslash as a plain byte anywhere.
+// A backslash outside quotes escapes the next character in sh and fish. nullopt: quotes that
+// don't close (fish and pwsh: a syntax error).
+std::optional<std::vector<std::string>> shell_words(std::string_view command, Login shell) {
+    const bool fish = shell == Login::fish;
+    std::vector<std::string> words;
+    std::string word;
+    bool in_word = false;
+    for (std::size_t i = 0; i < command.size(); ++i) {
+        const char c = command[i];
+        if (const std::size_t open = quote_at(command, i, shell); open > 0) {
+            in_word = true;
+            bool closed = false;
+            for (i += open; i < command.size(); ++i) {
+                const std::size_t quote = quote_at(command, i, shell);
+                const std::size_t next = quote > 0 && i + quote < command.size() ? quote_at(command, i + quote, shell) : 0;
+                if (fish && command[i] == '\\' && i + 1 < command.size() && (command[i + 1] == '\\' || command[i + 1] == '\'')) {
+                    word += command[++i];
+                } else if (shell == Login::pwsh && next > 0) {
+                    word += command.substr(i, quote); // a doubled quote: one
+                    i += quote + next - 1;
+                } else if (quote > 0) {
+                    i += quote - 1;
+                    closed = true;
+                    break;
+                } else {
+                    word += command[i];
+                }
+            }
+            if (!closed) return std::nullopt;
+        } else if (c == '\\' && shell != Login::pwsh && i + 1 < command.size()) {
+            in_word = true;
+            word += command[++i];
+        } else if (c == ' ') {
+            if (in_word) words.push_back(std::exchange(word, {}));
+            in_word = false;
+        } else {
+            in_word = true;
+            word += c;
+        }
+    }
+    if (in_word) words.push_back(word);
+    return words;
+}
+
+// The check run by a server whose login shell is sh, fish or pwsh, its GNU find's -printf reading
+// \\, \n and \c (stop printing).
+void check_under(test::FakeCommand& c, std::string_view command, Login shell) {
+    const auto words = shell_words(command, shell);
+    if (!words) {
+        c.err = shell == Login::pwsh ? "The string is missing the terminator: '.\n"
+                                     : "fish: Unexpected end of string, quotes are not balanced\n";
+        c.status = 127;
+        return;
+    }
+    const auto format = std::ranges::find(*words, "-printf");
+    REQUIRE(format != words->end());
+    REQUIRE(format + 1 != words->end());
+    const std::string& f = *(format + 1);
+    std::string out;
+    for (std::size_t i = 0; i < f.size(); ++i) {
+        if (f[i] != '\\' || i + 1 == f.size()) {
+            out += f[i];
+            continue;
+        }
+        const char e = f[++i];
+        if (e == 'c') break;
+        out += e == 'n' ? '\n' : e;
+    }
+    c.out = {out};
+}
+
 } // namespace
 
 TEST_CASE("ssh find: the command: -L, the C locale, raw roots quoted safely, stderr kept") {
@@ -143,11 +228,14 @@ TEST_CASE("ssh find: the command: -L, the C locale, raw roots quoted safely, std
     CHECK(ssh::find_command(spec).find("2>") == std::string::npos);
 }
 
-TEST_CASE("ssh find: the check counts exactly grab-find-ok with exit 0; everything else walks") {
-    CHECK(ssh::read_find_probe(ended("", 0), "grab-find-ok\n") == ssh::FindCheck{true, "GNU find"});
+TEST_CASE("ssh find: the check counts exactly grab-find-ok\\ with exit 0; everything else walks") {
+    CHECK(ssh::find_probe_ok == "grab-find-ok\\\n");
+    CHECK(ssh::read_find_probe(ended("", 0), ssh::find_probe_ok) == ssh::FindCheck{true, "GNU find"});
+    // What the check gave before it held backslashes, as a shell that takes them otherwise could.
+    CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok\n").works);
     // A shell that prints a banner first (G61), an SFTP-only account, no find or no env, a
     // restricted shell (a Storage Box), BusyBox or BSD find.
-    CHECK(ssh::read_find_probe(ended("", 0), "Welcome to the box\ngrab-find-ok\n") ==
+    CHECK(ssh::read_find_probe(ended("", 0), "Welcome to the box\ngrab-find-ok\\\n") ==
           ssh::FindCheck{false, "\"Welcome to the box\", exit 0"});
     CHECK(ssh::read_find_probe(ended("", 0), "") == ssh::FindCheck{false, "nothing, exit 0"});
     CHECK(ssh::read_find_probe(ended("bash: line 1: find: command not found\n", 127), "") ==
@@ -156,9 +244,9 @@ TEST_CASE("ssh find: the check counts exactly grab-find-ok with exit 0; everythi
           ssh::FindCheck{false, "\"Command not found. Use 'help' to get a list of available commands.\", exit 1"});
     CHECK(ssh::read_find_probe(ended("find: unrecognized: -printf\n", 1), "") ==
           ssh::FindCheck{false, "\"find: unrecognized: -printf\", exit 1"});
-    CHECK_FALSE(ssh::read_find_probe(ended("", 1), "grab-find-ok\n").works);
-    CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok").works);
-    CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok\r\n").works);
+    CHECK_FALSE(ssh::read_find_probe(ended("", 1), ssh::find_probe_ok).works);
+    CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok\\").works);
+    CHECK_FALSE(ssh::read_find_probe(ended("", 0), "grab-find-ok\\\r\n").works);
     // Killed from outside: asked again after a while, never saved for a week.
     CHECK(ssh::read_find_probe(ended("", -1, "TERM"), "") ==
           ssh::FindCheck{.works = false, .answer = "nothing, ended by SIGTERM", .lasting = false});
@@ -176,9 +264,70 @@ TEST_CASE("ssh find: the check counts exactly grab-find-ok with exit 0; everythi
           ssh::FindCheck{false, "no answer within 10 s", false});
 }
 
+TEST_CASE("ssh find: a login shell that reads backslashes inside single quotes (fish) is walked") {
+    // The danger: a folder from the server ending in a backslash (Browse lists it) ends its quotes
+    // early under fish, and the rest of the command runs as the shell reads it.
+    ssh::FindSpec spec;
+    spec.roots = {"x\\"};
+    const std::string command = ssh::find_command(spec);
+    const auto words = shell_words(command, Login::sh).value_or(std::vector<std::string>{});
+    REQUIRE(words.size() > 4);
+    CHECK(words[4] == "./x\\");
+    CHECK(shell_words(command, Login::fish) != shell_words(command, Login::sh));
+    // The check before it held backslashes passed there too.
+    test::FakeCommand old;
+    check_under(old, "env LC_ALL=C find -L . -maxdepth 0 -printf 'grab-find-ok\\n'", Login::fish);
+    CHECK(old.out == std::vector<std::string>{"grab-find-ok\n"});
+
+    Shell sh;
+    sh.answer = [](test::FakeCommand& c, std::string_view command) { check_under(c, command, Login::sh); };
+    CHECK(ssh::check_find(*sh.pool(), {}).value_or(ssh::FindCheck{}).works);
+    Shell fish;
+    fish.answer = [](test::FakeCommand& c, std::string_view command) { check_under(c, command, Login::fish); };
+    auto pool = fish.pool();
+    const auto walked = ssh::check_find(*pool, {}).value_or(ssh::FindCheck{.works = true, .answer = "stopped"});
+    CHECK_FALSE(walked.works);
+    CHECK(walked.answer == "\"fish: Unexpected end of string, quotes are not balanced\", exit 127");
+    const auto way = ssh::choose_lookup(*pool, GrabMethod::probe, "Fish", {});
+    REQUIRE(way);
+    CHECK_FALSE(way->find);
+    CHECK(fish.commands == std::vector<std::string>{std::string(ssh::find_probe)}); // no find ran
+}
+
+TEST_CASE("ssh find: a pwsh login shell, whose single quotes also end at U+2018 to U+201B, is walked") {
+    // The danger: a folder named x’; touch pwned; ’y ends its quotes under pwsh, and touch runs.
+    ssh::FindSpec spec;
+    spec.roots = {"x\xE2\x80\x99; touch pwned; \xE2\x80\x99y"};
+    const std::string command = ssh::find_command(spec);
+    const auto words = shell_words(command, Login::sh).value_or(std::vector<std::string>{});
+    REQUIRE(words.size() > 4);
+    CHECK(words[4] == "./x\xE2\x80\x99; touch pwned; \xE2\x80\x99y");
+    const auto pwsh_words = shell_words(command, Login::pwsh).value_or(std::vector<std::string>{});
+    CHECK(std::ranges::find(pwsh_words, "touch") != pwsh_words.end());
+    // The check before it passed there: backslashes are plain bytes in pwsh's single quotes.
+    test::FakeCommand old;
+    check_under(old, R"(env LC_ALL=C find -L . -maxdepth 0 -printf 'grab-find-ok\\\n\c\')", Login::pwsh);
+    CHECK(old.out == std::vector<std::string>{std::string(ssh::find_probe_ok)});
+    CHECK(old.status == 0);
+
+    // The probe's ’ ends pwsh's string, and its last ' opens one that doesn't close.
+    test::FakeCommand sh;
+    check_under(sh, ssh::find_probe, Login::sh);
+    CHECK(sh.out == std::vector<std::string>{std::string(ssh::find_probe_ok)});
+    Shell pwsh;
+    pwsh.answer = [](test::FakeCommand& c, std::string_view command) { check_under(c, command, Login::pwsh); };
+    auto pool = pwsh.pool();
+    const auto walked = ssh::check_find(*pool, {}).value_or(ssh::FindCheck{.works = true, .answer = "stopped"});
+    CHECK_FALSE(walked.works);
+    const auto way = ssh::choose_lookup(*pool, GrabMethod::probe, "Pwsh", {});
+    REQUIRE(way);
+    CHECK_FALSE(way->find);
+    CHECK(pwsh.commands == std::vector<std::string>{std::string(ssh::find_probe)}); // no find ran
+}
+
 TEST_CASE("ssh find: the check runs once per pool, and a stopped one is asked again") {
     Shell s;
-    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"grab-find-", "ok\n"}; };
+    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"grab-find-", "ok\\\n"}; };
     auto pool = s.pool();
     auto first = ssh::check_find(*pool, {});
     REQUIRE(first);
@@ -207,7 +356,7 @@ TEST_CASE("ssh find: the check runs once per pool, and a stopped one is asked ag
     stopper.join();
     CHECK(slow.commands.size() == 1);
     CHECK(other->idle() == 0); // cut short: that connection isn't used again
-    slow.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"grab-find-ok\n"}; };
+    slow.answer = [](test::FakeCommand& c, std::string_view) { c.out = {std::string(ssh::find_probe_ok)}; };
     auto again = ssh::check_find(*other, {});
     REQUIRE(again);
     CHECK(again->works);
@@ -278,7 +427,7 @@ TEST_CASE("ssh find: no answer in time is asked again after a while; a definite 
     int asked = 0;
     s.answer = [&](test::FakeCommand& c, std::string_view) {
         ++asked;
-        c.out = {"grab-find-ok\n"};
+        c.out = {std::string(ssh::find_probe_ok)};
     };
     ssh::Pool::Options o;
     o.idle_timer = false;
@@ -344,7 +493,7 @@ TEST_CASE("ssh find: a lasting answer holds for find_check_trust, a saved one fr
 
 TEST_CASE("ssh find: the check takes an answer from memory, keeps a new lasting one there, never a late one") {
     Shell s;
-    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"grab-find-ok\n"}; };
+    s.answer = [](test::FakeCommand& c, std::string_view) { c.out = {std::string(ssh::find_probe_ok)}; };
     std::vector<std::optional<ssh::FindCheck>> saves;
     ssh::FindMemory memory;
     memory.save = [&](const std::optional<ssh::FindCheck>& c) { saves.push_back(c); };
@@ -417,7 +566,7 @@ TEST_CASE("ssh find: walk asks nothing; auto walks where find fails; ssh insists
     CHECK(box.commands.size() == 1); // asked once
 
     Shell full;
-    full.answer = [](test::FakeCommand& c, std::string_view) { c.out = {"grab-find-ok\n"}; };
+    full.answer = [](test::FakeCommand& c, std::string_view) { c.out = {std::string(ssh::find_probe_ok)}; };
     auto good = full.pool();
     for (const auto method : {GrabMethod::probe, GrabMethod::find}) {
         auto chosen = ssh::choose_lookup(*good, method, "Main", {});

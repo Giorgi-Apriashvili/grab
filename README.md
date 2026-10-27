@@ -372,14 +372,26 @@ too and goes on without them.
     limited, rclone is told not to read ahead, so the network really follows the limit.
   - A folder's small-file batch gets rclone's `--bwlimit` and counts against the same total.
 - **Verify downloads** (Settings → Downloads, off by default): after each download, the server
-  computes an MD5 checksum of its copy (`md5sum` over SSH, one `rclone check`) and grab compares
-  it with yours. The row shows "Verifying the checksum…", then "checksum verified (MD5)".
-  - Both sides read the file once more: about 3 seconds per GB in tests (898 MiB from a Storage
-    Box and 440 MiB from a VPS each took 3 s; a 13-file, 570 MiB folder 5 s).
+  computes an MD5 checksum of its copy (`md5sum`, run through grab's own SSH connection) while
+  grab computes yours, and the two are compared. The row shows "Verifying the checksum…" (a
+  folder: "Verifying the checksums… 12 of 40"), then "checksum verified (MD5)".
+  - Both sides read the file once more, at the same time: about 2 seconds per GB in tests (an
+    858 MiB file from a VPS took 1.8 s, a 15-file, 352 MiB folder 1.1 s; `rclone check` took 3.0
+    and 4.1 s).
+  - Each file is compared by its own path, whatever its name here: a Keep-both copy, a device
+    name such as `CON.txt`, names that differ only in case or in how é is spelled, a name that
+    isn't UTF-8.
   - A copy that differs is deleted and the download fails; Retry downloads it again. In a
-    folder, only the files that differ are deleted and fetched again.
-  - Files that were already there are not checked, since nothing was downloaded. A server that
-    can't compute checksums leaves the download done, marked "not verified".
+    folder, only the files that differ are deleted and fetched again. grab deletes a copy only
+    after one more look shows that neither side changed since the download: a file changed on
+    the server since, or your copy changed since (a player writing its tags, say), is kept and
+    marked "not verified: the server's copy changed since the download" (or "your copy").
+  - Every server is checked this way, whatever its engine, so grab logs in with its own client
+    (its host key pinned; Trust… once for a server set up outside grab). A server it can't log in
+    to, one without `md5sum` (Windows, an SFTP-only account), a name the server's shell can't be
+    given, or a server that takes too long leaves the download done and the copy kept, marked
+    "not verified" and why. The server's Test says "checksums: md5sum", or why not.
+  - Files that were already there are not checked, since nothing was downloaded.
   - The `grab` command follows the same setting (see [Usage](#usage)).
 - **Speed schedule** (Settings → Speed schedule) caps the speed at set times, for example 5
   MiB/s on weekdays from 18:00 to 24:00.
@@ -698,9 +710,10 @@ grab config [-c PATH]
     under numbered names in pick order: `sample (2).txt`, `Season 1 (2)`.
   - `--limit` caps all connections together, exactly.
   - `--verify` (or the window's Verify downloads setting) checks each download against the
-    server's MD5 afterwards: `checksum verified (MD5) in 0:03`. A copy that differs is deleted
-    and grab exits with 6; the same command again downloads it again. `--no-verify` skips the
-    check for one run.
+    server's MD5 afterwards: `checksum verified (MD5) in 0:02`. A copy that differs is deleted
+    and grab exits with 6; the same command again downloads it again. One that can't be checked
+    is kept: `not verified: <why>`. `--no-verify` skips the check for one run. With `-v`, each
+    check shows as `+ exec md5sum -z <folder> (N files)`.
   - Without `--limit`, grab follows the window's [speed schedule](#gui), also mid-download:
     `grab: speed limited to 5 MiB/s until 24:00 by the speed schedule`, and a line at each
     change. `--limit RATE` replaces the schedule, and `--limit off` downloads without a limit.
@@ -797,7 +810,7 @@ Defaults (override per remote in grab.conf):
 | `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
 All three are for `--rclone`, the plain rclone copy, which gets them as they are. grab's own
-rclone calls (its downloads, listings, searches, previews, Play and verification) take only
+rclone calls (its downloads, listings, searches, previews and Play) take only
 their connection flags: `--sftp-*`, `--bind`, `--contimeout`, `--timeout`,
 `--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and
 `--password-command`. Those calls depend on rclone's exact output, so a progress, logging,
@@ -812,9 +825,10 @@ in the window and in the `grab` command alike.
 
 With `--rclone`, concurrent SFTP connections ≈ `transfers × multi-thread-streams`
 (+ checkers). If the server logs `MaxStartups` drops, lower one of them.
-`--sftp-disable-hashcheck` trades end-to-end checksum verification for speed; SSH already
-protects the bytes in flight, so what remains undetected is disk-level corruption. Remove it
-from `common_flags` if that matters more than minutes saved on large files.
+`--sftp-disable-hashcheck` skips the `md5sum` rclone runs on the server after each of its own
+copies (`--rclone`, and the small-file batch of an engine = rclone server); SSH already protects
+the bytes in flight. It doesn't touch grab's own check: to compare downloads with the server's
+copy end to end, turn on Verify downloads (or `--verify`), whatever `common_flags` say.
 
 ## Layout
 
@@ -833,7 +847,7 @@ src/cli_download.*  the command's downloads: live progress line, Ctrl+C
 src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
-src/verify.*    checking downloads against the server's checksum (rclone check)
+src/verify.*    checking downloads: the server's md5sum and grab's MD5, by path; what proves a mismatch
 src/gui/play_server.* Play's warm start: the player's local stream (start and end from memory)
 src/local_name.* server names as safe Windows names (rclone's encoding, device names)
 src/rclone_encoding.* rclone's own name encoding; local paths as rclone must be told them
@@ -849,6 +863,7 @@ src/ssh_pool.*  a server's connections kept open and lent to downloads, searches
 src/ssh_target.* a server's rclone.conf section and stored secrets as an SSH login
 src/ssh_walk.*  a server's folder tree over SFTP: several folders in flight per connection
 src/ssh_find.*  searches and lists with the server's GNU find over a command; the find check
+src/ssh_hash.*  the server's MD5 for verification: md5sum over a command, batched; the hash check
 cmake/vcpkg*    OpenSSL from vcpkg; cmake/vcpkg-ports/openssl pins 3.5 LTS
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
@@ -876,7 +891,7 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
   ([licenses/rclone.txt](licenses/rclone.txt)). `rclone.exe` ships next to `grab.exe`
   (81 MB, which is why the installer is about 22 MB), and grab uses it rather than any rclone
   on PATH (only when it is missing does grab look on PATH). Set `rclone = <path>` in `[grab]`
-  to use another copy. Another copy must be 1.67 or newer (folder downloads and verification use
+  to use another copy. Another copy must be 1.67 or newer (folder downloads use
   `--sftp-connections`); grab checks once and says so when it's older. For dates in listings it
   must also understand `--time-format unix` (1.72 and newer; older ones show rows without dates).
   - **Pin:** the build downloads the official Windows zip and checks it against the pinned

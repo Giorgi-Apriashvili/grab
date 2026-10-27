@@ -2295,7 +2295,9 @@ function renderQueue() {
     const files = q.files ? `${q.files.done} of ${q.files.total - q.files.skipped} files · ` : '';
     let meta = '';
     if (q.status === 'running' && q.verifying) {
-      meta = `${files}Verifying the checksum…`;
+      // A folder counts its files as their results come: "Verifying the checksums… 12 of 40".
+      const checked = q.verified ? ` ${q.verified.done} of ${q.verified.total}` : '';
+      meta = q.mode === 'folder' ? `${files}Verifying the checksums…${checked}` : 'Verifying the checksum…';
     } else if (q.status === 'running') {
       meta = files + sizes;
       if (q.speed > 0) meta += ` · ${fmtSize(q.speed)}/s`;
@@ -2783,16 +2785,24 @@ function closeSettings() {
 function testLine(t) {
   if (!t) return '';
   if (t.pending) return '<span class="muted"><span class="spinner"></span>Testing the connection…</span>';
-  // engine = grab: grab's own client downloads and searches, rclone still verifies and previews.
-  const grab = t.grabOk === true || t.grabOk === false;
-  const how = grab && t.grabOk ? ` · searches ${esc(t.grabSearch)}` : '';
-  if (t.ok) return `<span class="good">✓ Connection OK</span>${how ? `<span class="muted">${how}</span>` : ''}`;
+  // grab's own client verifies on every server; on engine = grab it also downloads and searches,
+  // and rclone previews.
+  const grab = t.grabEngine === true;
+  const how = (t.grabOk && grab ? ` · searches ${esc(t.grabSearch)}` : '') + (t.grabOk && t.checksums ? ` · ${esc(t.checksums)}` : '');
+  if (t.ok) {
+    // On engine = rclone grab's login only verifies: a failure there is a warning, not a failed test.
+    const trust = /host key/.test(t.grabError || '') ? ' Use Trust… to pin the host key.' : '';
+    const verify = !grab && t.grabOk === false
+      ? ` · <span class="warn">Verify (grab) can't run: ${esc(t.grabError || 'failed')}.${trust}</span>` : '';
+    return `<span class="good">✓ Connection OK</span>${how ? `<span class="muted">${how}</span>` : ''}${verify}`;
+  }
   const parts = [];
-  const rclone = grab ? 'Verify and previews (rclone)' : 'Downloads (rclone)';
+  const rclone = grab ? 'Previews (rclone)' : 'Downloads (rclone)';
+  const mine = grab ? 'Downloads, searches and verify (grab)' : 'Verify (grab)';
   if (t.rcloneOk) parts.push(`<span class="good">✓ ${rclone}</span>`);
   else parts.push(`<span class="bad">✗ ${rclone}:</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
-  if (t.grabOk === true) parts.push(`<span class="good">✓ Downloads and searches (grab)</span><span class="muted">${how}</span>`);
-  else if (t.grabOk === false) parts.push(`<span class="bad">✗ Downloads and searches (grab):</span> <span class="detail">${esc(t.grabError || 'failed')}</span>`);
+  if (t.grabOk === true) parts.push(`<span class="good">✓ ${mine}</span><span class="muted">${how}</span>`);
+  else if (t.grabOk === false) parts.push(`<span class="bad">✗ ${mine}:</span> <span class="detail">${esc(t.grabError || 'failed')}</span>`);
   if (t.sshOk === true) parts.push('<span class="good">✓ Searches (ssh)</span>');
   else if (t.sshOk === false) parts.push(`<span class="bad">✗ Searches (ssh):</span> <span class="detail">${esc(t.sshError || 'failed')}</span>`);
   return parts.map((p) => `<span>${p}</span>`).join('');

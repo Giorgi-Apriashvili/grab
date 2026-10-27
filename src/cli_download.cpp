@@ -292,7 +292,75 @@ struct Session {
     bool several = false; // more than one pick: the question offers "the same for the rest"
     // engine = grab: files and folders through grab's own SSH client.
     std::shared_ptr<ssh::Pool> pool = nullptr;
+    // With `verify`: grab's own connections to the server, which every server verifies through
+    // (`pool` on engine = grab), or why there are none.
+    std::shared_ptr<ssh::Pool> verify_pool = nullptr;
+    std::string no_verify_pool = {};
 };
+
+// The live line while a verification runs: its text, a folder's files so far ("12 of 40"), and
+// after 5 s the time taken, redrawn every second, as md5sum says nothing until it ends.
+class VerifyLine {
+public:
+    VerifyLine(LiveLine& line, std::string text) : line_(line), text_(std::move(text)), start_(Clock::now()) {
+        draw(true);
+        thread_ = std::jthread([this](const std::stop_token& stop) {
+            std::mutex sleep_m;
+            std::condition_variable_any sleep;
+            for (;;) {
+                {
+                    std::unique_lock lock(sleep_m);
+                    sleep.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+                }
+                if (stop.stop_requested()) return;
+                draw(true);
+            }
+        });
+    }
+    VerifyLine(const VerifyLine&) = delete;
+    VerifyLine& operator=(const VerifyLine&) = delete;
+    ~VerifyLine() = default;
+
+    void files(std::size_t done, std::size_t total) {
+        {
+            std::scoped_lock lock(m_);
+            files_ = std::format(" {} of {}", done, total);
+        }
+        draw(false);
+    }
+
+private:
+    void draw(bool now) {
+        std::string text;
+        {
+            std::scoped_lock lock(m_);
+            text = text_ + files_;
+        }
+        if (const double secs = seconds_since(start_); secs >= 5) text += std::format(" ({})", progress::duration(secs));
+        line_.show(text, now);
+    }
+
+    LiveLine& line_;
+    const std::string text_;
+    const Clock::time_point start_;
+    std::mutex m_; // files_
+    std::string files_;
+    std::jthread thread_; // last: stops and joins first
+};
+
+// What a verification of download `id` needs from the session.
+verify::Request verify_request(const Session& s, int id) {
+    verify::Request r;
+    r.ctx = &s.ctx;
+    r.pool = s.verify_pool;
+    r.no_pool = s.no_verify_pool;
+    r.close_idle_after = !s.pool; // engine = rclone: a pool only to verify, closed between files
+    r.connections = &s.connections;
+    r.server = s.ctx.settings.name;
+    r.id = id;
+    r.on_command = s.trace;
+    return r;
+}
 
 // "name  (yours: 1.2 GiB, 2024-01-02; the server's: 1.4 GiB, 2025-03-04)"
 std::string existing_line(const ExistingFile& f) {
@@ -390,32 +458,36 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
         const auto size = std::filesystem::file_size(target, ec);
         s.line.finish(progress::done(size, size - std::min(before, size), secs));
         if (!s.verify) return 0;
-        s.line.show("verifying against the server's checksum...", true);
         const auto check_start = Clock::now();
-        verify::Request base;
-        base.ctx = &s.ctx;
-        base.connections = &s.connections;
-        base.server = s.ctx.settings.name;
-        base.id = id;
-        base.extra = s.opts.extra;
-        base.on_command = s.trace;
-        const auto checked = verify::file(base, path, target, s.stop);
+        verify::Report checked;
+        {
+            const VerifyLine shown(s.line, "verifying against the server's checksum...");
+            // Against the server's file as this download fetched it: its size and time.
+            checked = verify::file(verify_request(s, id),
+                                   verify::File{.path = path, .local = target, .size = result.size, .modtime = result.modtime},
+                                   s.stop);
+        }
         if (s.stop.stop_requested()) {
             s.line.finish("stopped while verifying: the file is complete, but not verified");
             return proc::exit_stopped;
         }
-        if (!checked) {
-            s.line.finish("not verified: " + checked.error());
-            return 0;
-        }
-        if (!checked->differ.empty()) {
-            std::filesystem::remove(target, ec); // not the server's file
-            s.line.clear();
-            std::println(stderr, "grab: error: the download {}; it was deleted", verify::summary(*checked, 1));
+        switch (checked.files.front().verdict) {
+        case verify::Verdict::differs:
+        case verify::Verdict::missing:
+            if (checked.files.front().verdict == verify::Verdict::differs) {
+                std::filesystem::remove(target, ec); // not the server's file
+                s.line.clear();
+                std::println(stderr, "grab: error: the download {}; it was deleted", verify::summary(checked));
+            } else {
+                s.line.clear();
+                std::println(stderr, "grab: error: {}", verify::summary(checked));
+            }
             std::println(stderr, "grab: run the same command again to download it again");
             return exit_download_failed;
+        case verify::Verdict::unchecked: s.line.finish(verify::summary(checked)); return 0;
+        case verify::Verdict::same: break;
         }
-        s.line.finish(std::format("{} in {}", verify::summary(*checked, 1), progress::duration(seconds_since(check_start))));
+        s.line.finish(std::format("{} in {}", verify::summary(checked), progress::duration(seconds_since(check_start))));
         return 0;
     }
     case fetch::Outcome::stopped: {
@@ -531,9 +603,14 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
     // deleted and count as failed below.
     std::string checked_text;
     if (s.verify && !s.stop.stop_requested()) {
-        s.line.show("verifying against the server's checksums...", true);
         const auto check_start = Clock::now();
-        const auto checked = folder::verify_files(job, tree, m, s.stop);
+        folder::Checked checked;
+        {
+            VerifyLine shown(s.line, "verifying against the server's checksums...");
+            auto base = verify_request(s, id);
+            base.on_progress = [&shown](std::size_t done, std::size_t total) { shown.files(done, total); };
+            checked = folder::verify_files(job, tree, m, std::move(base), s.stop);
+        }
         if (checked.files > 0 && !s.stop.stop_requested()) {
             checked_text = std::format("{} in {}", checked.summary(), progress::duration(seconds_since(check_start)));
         }
@@ -734,7 +811,9 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
 
     DownloadTally tally;
     if (effective_engine(ctx.settings) == Engine::grab) {
-        auto target = engine::ssh_target(ctx);
+        // The connection flags after `--` apply to grab's own connections too, as they did to
+        // rclone's (`--bind`, `--contimeout`, `--timeout`).
+        auto target = engine::ssh_target(ctx, given);
         if (!target) {
             std::println(stderr, "grab: {}", target.error());
             tally.code = exit_download_failed;
@@ -743,6 +822,17 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         }
         s.pool = pools.get(server, *target, budget);
         if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client (engine = grab)", server);
+    }
+    // Every server verifies through grab's own client (RCLONE-REPLACEMENT.md, phase 5); on engine =
+    // rclone it logs in only to verify. Without a login the downloads go on, "not verified".
+    if (verify && !opts.dry_run) {
+        if (s.pool) {
+            s.verify_pool = s.pool;
+        } else if (auto target = engine::ssh_target(ctx, given)) {
+            s.verify_pool = pools.get(server, *target, budget);
+        } else {
+            s.no_verify_pool = target.error();
+        }
     }
     const std::size_t total = paths.size();
     const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
