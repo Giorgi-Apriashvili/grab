@@ -57,7 +57,8 @@ add_executable(grab_tests
     test_lookup_grab.cpp
     test_live_server.cpp)
 
-target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest)
+# OpenSSL's MD5 for the live checks' own sums and the local hash timing (test_live_server.cpp).
+target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest OpenSSL::Crypto)
 if(WIN32)
     # The programs' manifest (long paths), so the tests see paths as grab does.
     target_sources(grab_tests PRIVATE grab_tests.rc)
