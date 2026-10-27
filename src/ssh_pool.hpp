@@ -50,6 +50,15 @@ public:
 // Logs in to `target` and starts SFTP. Throws Error.
 [[nodiscard]] std::unique_ptr<Session> open_session(const Target& target);
 
+// What a server answered grab's find check (ssh_find.hpp): whether its GNU find works as grab
+// needs it, and what it said, in a few words for -v and errors.
+struct FindCheck {
+    bool works = false;
+    std::string answer;
+    bool lasting = true; // false: no answer in time, which may pass (Pool::find_check asks again)
+    bool operator==(const FindCheck&) const = default;
+};
+
 class Pool {
 public:
     using Clock = std::chrono::steady_clock;
@@ -64,6 +73,8 @@ public:
                                                              std::chrono::seconds{2}, std::chrono::seconds{4},
                                                              std::chrono::seconds{8}};
         bool idle_timer = true; // the pool's own thread closes idle connections (tests call close_idle)
+        // How long find_check keeps an answer that isn't lasting.
+        std::chrono::milliseconds find_check_expiry{std::chrono::minutes(5)};
     };
 
     Pool(Connect connect, Options options);
@@ -108,6 +119,14 @@ public:
     // Closes connections idle longer than idle_close at `now`.
     void close_idle(Clock::time_point now);
 
+    // The find check of this pool's server, asked once: `check` runs on the first call (one at a
+    // time: a second caller waits for the first one's answer, or until its `stop`, then nullopt)
+    // and its answer is kept for the pool's life, so a program asks each server once; one that
+    // isn't lasting only for find_check_expiry. nullopt (stopped) isn't kept; an Error `check`
+    // throws goes to the caller and isn't kept either, and a caller waiting runs its own check.
+    [[nodiscard]] std::optional<FindCheck> find_check(std::stop_token stop,
+                                                      const std::function<std::optional<FindCheck>()>& check);
+
 private:
     struct Idle {
         std::unique_ptr<Session> session;
@@ -123,6 +142,9 @@ private:
     std::deque<Idle> idle_; // most recently used at the back
     int leased_ = 0;
     int logging_in_ = 0;
+    bool checking_ = false; // a find check is running
+    std::optional<FindCheck> find_check_;
+    Clock::time_point find_checked_;
     std::jthread timer_;
 };
 

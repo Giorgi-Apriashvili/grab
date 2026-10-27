@@ -7,6 +7,7 @@
 // 2026-10-21): handed "D:\x\Mission： Impossible", it wrote into "Mission‛： Impossible". So a
 // local path grab hands to rclone goes in the Standard form of each part (local_path).
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -52,6 +53,13 @@ inline constexpr Mask grab_path = standard | invalid_utf8;
 [[nodiscard]] std::string from_raw_name(std::string_view raw);
 // A path in grab's form as raw bytes for the server, part by part ('/' stays the separator).
 [[nodiscard]] std::string raw_path(std::string_view path);
+// The reverse: a server's path of raw bytes (as find prints it) in grab's form, part by part.
+[[nodiscard]] std::string from_raw_path(std::string_view raw);
+
+// A server's free text (an SFTP status message, a line find printed) safe to show: its first line
+// that isn't blank, at most `max` bytes of it with "…" after a cut, with control characters, DEL
+// and bytes that aren't UTF-8 as symbols and ‛XX. "" when there is none.
+[[nodiscard]] std::string shown_line(std::string_view text, std::size_t max = 100);
 
 // rclone's FromStandardName(windows, name): what rclone writes on Windows for `name`.
 [[nodiscard]] std::string from_standard_name(std::string_view name);

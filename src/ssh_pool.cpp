@@ -161,6 +161,37 @@ void Pool::close_idle(Clock::time_point now) {
     if (!drop.empty()) changed_.notify_all();
 }
 
+std::optional<FindCheck> Pool::find_check(std::stop_token stop, const std::function<std::optional<FindCheck>()>& check) {
+    std::unique_lock lock(mutex_);
+    auto known = [&] {
+        return find_check_ && (find_check_->lasting || Clock::now() - find_checked_ < options_.find_check_expiry);
+    };
+    if (!changed_.wait(lock, stop, [&] { return known() || !checking_; })) return std::nullopt;
+    if (known()) return find_check_;
+    // This caller asks; the others wait for its answer.
+    checking_ = true;
+    lock.unlock();
+    std::optional<FindCheck> answer;
+    try {
+        answer = check();
+    } catch (...) {
+        lock.lock();
+        checking_ = false;
+        lock.unlock();
+        changed_.notify_all();
+        throw;
+    }
+    lock.lock();
+    checking_ = false;
+    if (answer) {
+        find_check_ = answer;
+        find_checked_ = Clock::now();
+    }
+    lock.unlock();
+    changed_.notify_all();
+    return answer;
+}
+
 Pool::Lease::Lease(Lease&& other) noexcept
     : pool_(std::exchange(other.pool_, nullptr)), session_(std::move(other.session_)), broken_(other.broken_) {}
 

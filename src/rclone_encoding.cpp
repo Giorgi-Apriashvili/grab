@@ -342,6 +342,33 @@ std::string raw_path(std::string_view path) {
     return out;
 }
 
+std::string from_raw_path(std::string_view raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (std::size_t start = 0;;) {
+        const std::size_t sep = raw.find('/', start);
+        out += from_raw_name(raw.substr(start, sep == std::string_view::npos ? std::string_view::npos : sep - start));
+        if (sep == std::string_view::npos) break;
+        out += '/';
+        start = sep + 1;
+    }
+    return out;
+}
+
+std::string shown_line(std::string_view text, std::size_t max) {
+    while (!text.empty()) {
+        const auto nl = text.find('\n');
+        const auto line = util::trim(text.substr(0, nl));
+        if (!line.empty()) {
+            std::string shown = encode(line.substr(0, max), ctl | del | invalid_utf8);
+            return line.size() > max ? shown + "…" : shown;
+        }
+        if (nl == std::string_view::npos) break;
+        text.remove_prefix(nl + 1);
+    }
+    return {};
+}
+
 std::string from_standard_name(std::string_view name) { return encode(decode(name, standard), windows); }
 
 std::string to_standard_name(std::string_view name) { return encode(decode(name, windows), standard); }

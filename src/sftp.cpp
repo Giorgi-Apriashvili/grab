@@ -1,5 +1,7 @@
 #include "sftp.hpp"
 
+#include "rclone_encoding.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <format>
@@ -126,7 +128,8 @@ std::string describe(const Status& status) {
     case Code::no_connection:
     case Code::connection_lost: return "the connection was lost";
     default:
-        if (!status.message.empty()) return status.message;
+        // The server's own text, which can be anything: one short line, safe to show.
+        if (std::string said = rclone_enc::shown_line(status.message); !said.empty()) return said;
         return std::format("the server refused (SFTP status {})", static_cast<std::uint32_t>(status.code));
     }
 }
@@ -347,13 +350,13 @@ std::expected<std::string, Status> realpath(Client& client, std::string_view pat
     return wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.realpath(path, std::move(done)); });
 }
 
-std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir) {
+std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir, std::size_t limit) {
     auto handle =
         wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.opendir(dir, std::move(done)); });
     if (!handle) return std::unexpected(handle.error());
     std::vector<Entry> all;
     std::optional<Status> failed;
-    for (;;) {
+    while (!failed) {
         auto batch = wait_for<std::vector<Entry>>(
             client, [&](Client::Done<std::vector<Entry>> done) { client.readdir(*handle, std::move(done)); });
         if (!batch) {
@@ -362,6 +365,8 @@ std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view 
         }
         for (Entry& e : *batch)
             if (e.name != "." && e.name != "..") all.push_back(std::move(e));
+        if (all.size() > limit)
+            failed = Status{.code = Code::failure, .message = std::format("the folder holds more than {} entries", limit)};
     }
     // A handle that fails to close doesn't spoil a listing that was read in full.
     [[maybe_unused]] auto closed =

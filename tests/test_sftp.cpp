@@ -80,6 +80,17 @@ TEST_CASE("sftp: version, stat, realpath, missing and refused paths") {
     CHECK(c.pending() == 0);
 }
 
+TEST_CASE("sftp: a server's own status text is shown as one short, safe line") {
+    const std::string said = "\x1b[31mred\nsecond" + std::string(std::size_t{1024} * 1024, 'x');
+    CHECK(sftp::describe(sftp::Status{.code = sftp::Code::failure, .message = said}) == "\u241B[31mred");
+    const std::string longer = "\n  \n" + std::string(300, 'y') + "\xFF";
+    CHECK(sftp::describe(sftp::Status{.code = sftp::Code::failure, .message = longer}) ==
+          std::string(100, 'y') + "\u2026");
+    CHECK(sftp::describe(sftp::Status{.code = sftp::Code::failure, .message = "bad\xFF name"}) == "bad\u201BFF name");
+    CHECK(sftp::describe(sftp::Status{.code = sftp::Code::failure, .message = " \n"}) ==
+          "the server refused (SFTP status 4)");
+}
+
 TEST_CASE("sftp: listing a folder over several replies, without . and ..") {
     FakeServer srv;
     srv.dirs["/d"] = {".", "..", "one", "sub", "three", "four", "five"};
@@ -101,6 +112,26 @@ TEST_CASE("sftp: listing a folder over several replies, without . and ..") {
     auto missing = sftp::list(c, "/nowhere");
     REQUIRE_FALSE(missing);
     CHECK(missing.error().code == sftp::Code::no_such_file);
+}
+
+TEST_CASE("sftp: a listing stops past its entry cap, and its handle is closed") {
+    FakeServer srv;
+    for (int i = 0; i < 10; ++i) {
+        const std::string name = "f" + std::to_string(i);
+        srv.dirs["/d"].push_back(name);
+        srv.files["/d/" + name] = "x";
+    }
+    srv.readdir_batch = 3;
+    sftp::Client c(srv);
+    c.start();
+    auto capped = sftp::list(c, "/d", 5);
+    REQUIRE_FALSE(capped);
+    CHECK(capped.error().code == sftp::Code::failure);
+    CHECK(sftp::describe(capped.error()) == "the folder holds more than 5 entries");
+    CHECK(c.pending() == 0);
+    auto whole = sftp::list(c, "/d", 10);
+    REQUIRE(whole);
+    CHECK(whole->size() == 10);
 }
 
 TEST_CASE("sftp: reading a range asks for exactly its bytes, pipelined") {

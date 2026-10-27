@@ -121,8 +121,15 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
                            secrets_error, settings.name, settings.name, settings.name);
     }
     const FindMethod method = resolve_find_method(settings, *remote);
-    return Context{std::move(*cfg), std::move(settings), std::move(*remote), method,
-                   std::move(imported.imported)};
+    const Engine engine = effective_engine(settings);
+    const GrabMethod grab_method = resolve_grab_method(settings, *remote);
+    return Context{.config = std::move(*cfg),
+                   .settings = std::move(settings),
+                   .remote = std::move(*remote),
+                   .method = method,
+                   .imported = std::move(imported.imported),
+                   .engine = engine,
+                   .grab_method = grab_method};
 }
 
 std::expected<ssh::Target, std::string> ssh_target(const Context& ctx) {

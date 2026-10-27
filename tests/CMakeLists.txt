@@ -51,6 +51,7 @@ add_executable(grab_tests
     test_ssh.cpp
     test_sftp.cpp
     test_ssh_pool.cpp
+    test_ssh_find.cpp
     test_fetch_grab.cpp
     test_folder_grab.cpp)
 

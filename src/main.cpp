@@ -464,6 +464,11 @@ int run(const Options& opts) {
         error(found.error());
         return exit_lookup;
     }
+    // What the lookup couldn't look at, in one line however many (review G55).
+    if (const auto& notes = found->notes; !notes.empty()) {
+        std::println(stderr, "grab: not searched: {}{}", notes.front(),
+                     notes.size() > 1 ? std::format(" (and {} more)", notes.size() - 1) : std::string());
+    }
 
     const Query query = make_query(opts.target, opts.exact);
     // --type, --min-size, --max-size: the hits that are such files.

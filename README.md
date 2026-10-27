@@ -836,6 +836,8 @@ src/ssh.*       grab's own SSH connections (libssh2): host keys, login, SFTP cha
 src/sftp.*      grab's own SFTP client: pipelined reads with exact bounds, listings, stat
 src/ssh_pool.*  a server's connections kept open and lent to downloads
 src/ssh_target.* a server's rclone.conf section and stored secrets as an SSH login
+src/ssh_walk.*  a server's folder tree over SFTP: several folders in flight per connection
+src/ssh_find.*  searches and lists with the server's GNU find over a command; the find check
 cmake/vcpkg*    OpenSSL from vcpkg; cmake/vcpkg-ports/openssl pins 3.5 LTS
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)

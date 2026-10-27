@@ -77,6 +77,14 @@ struct Entry {
 // speed follows the bytes in flight (16 READs: about 1 MiB/s; 64: as fast as rclone).
 inline constexpr std::uint32_t max_read = 255 * 1024;
 
+// The most entries grab takes from a server in one listing: one folder, a walk or a find (Main's
+// whole file list is about 17,000), so a broken or hostile server can't exhaust memory or keep
+// grab reading forever (review G168).
+inline constexpr std::size_t max_listing = 1'000'000;
+// ...and the most bytes of paths it keeps from one, since a name can be as long as a packet and a
+// path grows with its depth.
+inline constexpr std::uint64_t max_listing_bytes = std::uint64_t{1} << 30;
+
 class Client {
 public:
     explicit Client(Channel& channel);
@@ -140,8 +148,10 @@ private:
 [[nodiscard]] std::expected<std::string, Status> open_file(Client& client, std::string_view path);
 [[nodiscard]] std::expected<void, Status> close_file(Client& client, std::string_view handle);
 [[nodiscard]] std::expected<std::string, Status> realpath(Client& client, std::string_view path);
-// Every entry of a folder except "." and "..", in the server's order.
-[[nodiscard]] std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir);
+// Every entry of a folder except "." and "..", in the server's order. Past `limit` entries it
+// stops: a Status (Code::failure) saying the folder holds too many.
+[[nodiscard]] std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir,
+                                                             std::size_t limit = max_listing);
 
 // Reads [offset, offset + length) of an open file with up to `depth` READs of at most `chunk`
 // bytes in flight, never asking past the end of the range. A short DATA (servers may send less

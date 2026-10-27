@@ -5,6 +5,7 @@
 #include "listing.hpp"
 #include "match.hpp"
 #include "quote.hpp"
+#include "rclone.hpp"
 #include "rclone_flags.hpp"
 #include "util.hpp"
 
@@ -47,7 +48,9 @@ engine::SearchResult search(const engine::Context& ctx, const List& list, const 
         if (e.dir != folders || !matches(query, e.path)) continue;
         found.push_back(RemoteEntry{e.path, folders ? std::nullopt : e.size, e.modified});
     }
-    return engine::make_result(ctx, req, std::move(found));
+    auto result = engine::make_result(ctx, req, std::move(found));
+    result.notes = list.notes;
+    return result;
 }
 
 void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req) {
@@ -123,28 +126,32 @@ constexpr std::string_view header_v1 = "grab-file-list 1";
 
 } // namespace
 
+std::optional<Entry> parse_find_record(std::string_view rec) {
+    Entry e;
+    if (rec.starts_with("d\t")) {
+        e.dir = true;
+        rec.remove_prefix(2);
+    } else if (rec.starts_with("f\t")) {
+        rec.remove_prefix(2);
+        const auto size = take_field(rec);
+        if (!size) return std::nullopt;
+        e.size = number(*size);
+    } else {
+        return std::nullopt;
+    }
+    const auto time = take_field(rec);
+    if (!time) return std::nullopt;
+    e.modified = util::known_time(util::parse_unix_time(*time));
+    if (rec.starts_with("./")) rec.remove_prefix(2);
+    if (!has_name(rec)) return std::nullopt; // "/", ".": nothing to save it under (review G15)
+    e.path = std::string(rec);
+    return e;
+}
+
 std::vector<Entry> parse_find(std::string_view out) {
     std::vector<Entry> entries;
     split_records(out, '\0', [&](std::string_view rec) {
-        Entry e;
-        if (rec.starts_with("d\t")) {
-            e.dir = true;
-            rec.remove_prefix(2);
-        } else if (rec.starts_with("f\t")) {
-            rec.remove_prefix(2);
-            const auto size = take_field(rec);
-            if (!size) return;
-            e.size = number(*size);
-        } else {
-            return;
-        }
-        const auto time = take_field(rec);
-        if (!time) return;
-        e.modified = util::known_time(util::parse_unix_time(*time));
-        if (rec.starts_with("./")) rec.remove_prefix(2);
-        if (rec.empty()) return;
-        e.path = std::string(rec);
-        entries.push_back(std::move(e));
+        if (auto e = parse_find_record(rec)) entries.push_back(std::move(*e));
     });
     return entries;
 }

@@ -1,5 +1,6 @@
 #include "config.hpp"
 
+#include "conn_budget.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -127,6 +128,15 @@ std::string search_roots_value(const std::vector<std::string>& roots) {
 FindMethod resolve_find_method(const RemoteSettings& settings, const RcloneRemote& remote) {
     if (settings.find != FindMethod::auto_detect) return settings.find;
     return remote.key_file || remote.key_use_agent ? FindMethod::ssh : FindMethod::rclone;
+}
+
+GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemote& remote) {
+    switch (settings.find) {
+    case FindMethod::ssh: return GrabMethod::find;
+    case FindMethod::rclone: return GrabMethod::walk;
+    case FindMethod::auto_detect: break;
+    }
+    return budget::is_storage_box(remote.host) ? GrabMethod::walk : GrabMethod::probe;
 }
 
 Engine effective_engine(const RemoteSettings& settings) {
@@ -365,10 +375,10 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
                 r.find = FindMethod::auto_detect;
             } else if (method == "ssh") {
                 r.find = FindMethod::ssh;
-            } else if (method == "rclone") {
-                r.find = FindMethod::rclone;
+            } else if (method == "rclone" || method == "walk") {
+                r.find = FindMethod::rclone; // `walk` says it plainly on engine = grab
             } else {
-                return util::failf("[{}] find must be auto, ssh or rclone, got '{}'", s.name, *v);
+                return util::failf("[{}] find must be auto, ssh, rclone or walk, got '{}'", s.name, *v);
             }
         }
         auto depth = int_value(s, "max_depth", 4);

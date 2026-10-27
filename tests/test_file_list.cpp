@@ -202,6 +202,17 @@ TEST_CASE("searching a list matches and ranks like a live search") {
     CHECK_FALSE(file_list::search(ctx, l, request("precinct.srt")).hits[0].modified.has_value());
 }
 
+TEST_CASE("a fetched list's notes come with its searches, and aren't saved") {
+    const auto ctx = box_context();
+    auto l = sample();
+    l.notes = {"tv/locked: permission denied"};
+    CHECK(file_list::search(ctx, l, request("lioness")).notes == l.notes);
+    const auto saved = file_list::from_text(file_list::to_text(l));
+    REQUIRE(saved);
+    CHECK(saved->notes.empty());
+    CHECK(saved->entries == l.entries);
+}
+
 TEST_CASE("what a list can't answer goes live") {
     auto ctx = box_context();
     CHECK(file_list::can_answer(ctx, request("lioness")));

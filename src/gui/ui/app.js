@@ -49,7 +49,7 @@ const state = {
   limit: {},             // the backend's "limit" message: source, until, nextMiBps
   schedule: [],          // speed schedule rules, as the backend keeps them
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing
-  lists: [],             // the last search's sources per server: age, live, refreshing, error
+  lists: [],             // the last search's sources per server: age, live, refreshing, error, notes
   updateLater: false,    // "Later": hidden until grab starts again
   // Browse mode: the folder shown, and what it holds. `server` '' is All servers' own top (the
   // servers themselves); `top` a server's top; `under` a search below the folder, while its
@@ -229,10 +229,14 @@ function renderListStatus() {
     if (typeof l.age === 'number') parts.push(`from the file list, ${fmtAge(l.age)} old`);
     if (l.refreshing) parts.push(l.live || typeof l.age !== 'number' ? 'building the file list' : 'refreshing');
   }
+  // What a lookup couldn't look at (folders it couldn't read, a search root, link loops): the
+  // first, and all of them in the tooltip.
+  const notes = lists.flatMap((l) => (l.notes || []).map((n) => `${state.remote === ALL ? `${l.remote}: ` : ''}${n}`));
+  if (notes.length) parts.push(`not searched: ${notes[0]}${notes.length > 1 ? ` (and ${notes.length - 1} more)` : ''}`);
   const errors = lists.filter((l) => l.error).map((l) => `${state.remote === ALL ? `${l.remote}: ` : ''}${l.error}`);
   el.innerHTML = (refreshing.length ? '<span class="spinner"></span>' : '') + esc(parts.join(' · ')) +
     (errors.length ? `${parts.length ? ' · ' : ''}<span class="bad">list refresh failed: ${esc(errors.join('; '))}</span>` : '');
-  el.title = errors.join('\n');
+  el.title = [...errors, ...notes].join('\n');
   $('#refresh-lists').hidden = !lists.some((l) => typeof l.age === 'number') || refreshing.length > 0;
 }
 

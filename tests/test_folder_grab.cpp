@@ -14,9 +14,11 @@
 #include "ssh_walk.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -39,7 +41,10 @@ struct Tree {
     std::set<std::string> denied;
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
+    std::size_t most_waiting = 0; // most requests a session's server answered at once
     std::atomic<int> logins{0};
+    std::atomic<int> break_first_after{0}; // the next login's stream breaks on that read
+    std::size_t readdir_batch = 3;          // names per READDIR answer
 
     struct Session : ssh::Session {
         explicit Session(Tree& t) : tree(t), client(server) {
@@ -48,12 +53,14 @@ struct Tree {
             server.links = t.links;
             server.readdir_size = t.readdir_size;
             server.denied = t.denied;
-            server.readdir_batch = 3;
+            server.readdir_batch = t.readdir_batch;
             client.start();
+            server.broken_after = t.break_first_after.exchange(0);
         }
         ~Session() override {
             std::lock_guard lock(tree.mutex);
             tree.reads.insert(tree.reads.end(), server.reads.begin(), server.reads.end());
+            tree.most_waiting = std::max(tree.most_waiting, server.most_waiting);
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;
@@ -273,4 +280,191 @@ TEST_CASE("grab engine folders: under a speed limit too") {
         CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
         CHECK(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path));
     }
+}
+
+namespace {
+
+std::vector<std::string> paths_of(const ssh::Walk& w) {
+    std::vector<std::string> paths;
+    for (const auto& e : w.entries) paths.push_back(e.path);
+    return paths;
+}
+
+} // namespace
+
+TEST_CASE("ssh walk: depth, folders and Unix times, as a search's walk wants them") {
+    Tree t;
+    t.dir("/data");
+    t.dir("/data/a");
+    t.dir("/data/a/b");
+    t.dir("/data/a/b/c");
+    t.file("/data/top.txt", "1");
+    t.file("/data/a/one.txt", "22");
+    t.file("/data/a/b/two.txt", "333");
+    t.file("/data/a/b/c/deep.txt", "4444");
+    auto pool = t.pool(2);
+    ssh::WalkOptions o{.connections = 2, .folders = true, .max_depth = 2};
+    auto w = ssh::walk(*pool, "/data", o, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{"a", "a/b", "a/one.txt", "top.txt"});
+    CHECK(w->entries[0].dir);
+    CHECK(w->entries[2] == ssh::Walked{"a/one.txt", 2, "2023-11-14T22:13:20Z", false, 1700000000});
+    o.max_depth = 1;
+    w = ssh::walk(*pool, "/data", o, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{"a", "top.txt"});
+    o.max_depth = 0; // all of it
+    w = ssh::walk(*pool, "/data", o, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(w->entries.size() == 7);
+}
+
+TEST_CASE("ssh walk: dot-names are neither listed nor entered when hidden ones are skipped") {
+    Tree t;
+    t.dir("/data");
+    t.dir("/data/.git");
+    t.file("/data/.git/config", "x");
+    t.file("/data/.env", "x");
+    t.file("/data/keep.txt", "x");
+    auto pool = t.pool(1);
+    std::vector<std::size_t> progress;
+    ssh::WalkOptions o{.connections = 1, .folders = true, .skip_hidden = true};
+    o.progress = [&](std::size_t n) { progress.push_back(n); };
+    auto w = ssh::walk(*pool, "/data", o, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{"keep.txt"});
+    REQUIRE_FALSE(progress.empty());
+    CHECK(progress.back() == 3); // the names read: .git wasn't entered
+    // A root that is a dot-name itself is read all the same.
+    w = ssh::walk(*pool, "/data/.git", o, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{"config"});
+    o.skip_hidden = false;
+    progress.clear();
+    w = ssh::walk(*pool, "/data", o, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{".env", ".git", ".git/config", "keep.txt"});
+    CHECK(progress.back() == 4);
+}
+
+TEST_CASE("ssh walk: past its entry cap it stops with an error") {
+    Tree t;
+    t.dir("/data");
+    t.dir("/data/sub");
+    for (int i = 0; i < 20; ++i) t.file(std::format("/data/sub/f{:02}", i), "x");
+    auto pool = t.pool(2);
+    auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 2, .max_entries = 10}, {});
+    REQUIRE_FALSE(w);
+    CHECK(w.error() == "listing too large: more than 10 entries");
+    w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 2, .max_entries = 21}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(w->entries.size() == 20);
+    // Bytes too: "sub" and 20 of "sub/fNN" are 143 (review G168).
+    w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 2, .max_bytes = 100}, {});
+    REQUIRE_FALSE(w);
+    CHECK(w.error() == "listing too large: more than 100 B of paths");
+    w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 2, .max_bytes = 143}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(w->entries.size() == 20);
+}
+
+TEST_CASE("ssh walk: several roots; a failing one is a note, only all failing an error") {
+    Tree t;
+    t.dir("/data");
+    t.file("/data/x.txt", "x");
+    t.dir("/more");
+    t.file("/more/y.txt", "y");
+    t.dir("/locked");
+    t.denied.insert("/locked");
+    t.dirs["."] = {"home.txt"}; // the login folder
+    t.files["./home.txt"] = "h";
+    auto pool = t.pool(3);
+    const std::vector<std::string> roots{"/data", "/missing", "/locked", "/more", ""};
+    auto w = ssh::walk_roots(*pool, roots, ssh::WalkOptions{.connections = 3}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{"/data/x.txt", "/more/y.txt", "home.txt"});
+    CHECK(w->unreadable ==
+          std::vector<std::string>{"/locked: permission denied", "/missing: no such file or folder"});
+    const std::vector<std::string> bad{"/missing", "/locked"};
+    w = ssh::walk_roots(*pool, bad, ssh::WalkOptions{.connections = 3}, {});
+    REQUIRE_FALSE(w);
+    CHECK(w.error() == "cannot list /locked: permission denied; /missing: no such file or folder");
+    // One root alone (a folder download): its failure is the error.
+    w = ssh::walk(*pool, "/missing", {}, {});
+    REQUIRE_FALSE(w);
+    CHECK(w.error() == "cannot list /missing: no such file or folder");
+}
+
+TEST_CASE("ssh walk: several folders in flight on a connection, CLOSE not waited for, the connection kept") {
+    struct Seen {
+        std::size_t most_waiting = 0; // requests the server answered at once
+        int logins = 0;
+    };
+    auto walked = [](int in_flight) {
+        Tree t;
+        t.readdir_batch = 100; // every folder in one answer: no READDIRs ahead
+        t.dir("/data");
+        for (int i = 0; i < 24; ++i) {
+            t.dir(std::format("/data/d{:02}", i));
+            t.file(std::format("/data/d{:02}/f.txt", i), "x");
+        }
+        auto pool = t.pool(1);
+        ssh::WalkOptions o{.connections = 1, .in_flight = in_flight};
+        auto w = ssh::walk(*pool, "/data", o, {});
+        REQUIRE_MESSAGE(w, w.error_or(""));
+        CHECK(w->entries.size() == 24);
+        CHECK(pool->idle() == 1); // its replies all in, so it's reused
+        w = ssh::walk(*pool, "/data", o, {});
+        REQUIRE_MESSAGE(w, w.error_or(""));
+        pool.reset();
+        return Seen{.most_waiting = t.most_waiting, .logins = t.logins};
+    };
+    const Seen one = walked(1);
+    const Seen many = walked(16);
+    CHECK(one.logins == 1);
+    CHECK(many.logins == 1);
+    CHECK(one.most_waiting <= 3);   // a folder at a time (with the last one's CLOSE, the root's REALPATH)
+    CHECK(many.most_waiting >= 16); // OPENDIRs and READDIRs of 16 folders together
+}
+
+TEST_CASE("ssh walk: a big folder has READDIRs in flight ahead, one more for each answer, up to 8") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 60; ++i) t.file(std::format("/data/f{:02}", i), "x"); // 20 answers of 3
+    auto pool = t.pool(1);
+    auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 1, .in_flight = 1}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(w->entries.size() == 60);
+    CHECK(pool->idle() == 1); // the CLOSE went out after the last READDIR, and came back
+    pool.reset();
+    CHECK(t.most_waiting == 8);
+}
+
+TEST_CASE("ssh walk: a connection that breaks mid-walk loses nothing: its folders are read again") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 30; ++i) {
+        t.dir(std::format("/data/d{:02}", i));
+        t.file(std::format("/data/d{:02}/f.txt", i), "x");
+    }
+    t.break_first_after = 3;
+    auto pool = t.pool(2);
+    auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 2}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(w->entries.size() == 30);
+    CHECK(w->unreadable.empty());
+    CHECK(t.logins >= 2);
+}
+
+TEST_CASE("ssh walk: no entry without a name to save it under (G15); odd names in grab's form") {
+    Tree t;
+    t.dir("/data");
+    t.dirs["/data"].insert(t.dirs["/data"].end(), {".", "..", "", "a/b"});
+    t.files["/data/"] = "";    // the empty name, a file as far as the server says
+    t.files["/data/a/b"] = "x"; // a name with a '/' in it
+    t.file("/data/caf\xE9.txt", "x");
+    auto pool = t.pool(1);
+    auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 1, .folders = true}, {});
+    REQUIRE_MESSAGE(w, w.error_or(""));
+    CHECK(paths_of(*w) == std::vector<std::string>{rclone_enc::from_raw_name("a/b"), "caf‛E9.txt"});
 }

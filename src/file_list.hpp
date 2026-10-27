@@ -35,6 +35,9 @@ struct List {
     std::string fingerprint;  // what it covers (see fingerprint())
     std::vector<Entry> entries;
     bool dated = true; // false: saved by an older grab, without dates, so due for a refresh
+    // What the fetch couldn't look at (engine::SearchResult::notes), for the window's status line
+    // and the command's one line; never saved.
+    std::vector<std::string> notes;
     bool operator==(const List&) const = default;
 };
 
@@ -53,7 +56,7 @@ struct List {
 [[nodiscard]] bool can_answer(const engine::Context& ctx, const engine::SearchRequest& req);
 
 // Answers `req` from `list` as engine::search would from the server: the same matching and
-// ranking, files or folders by req.mode.
+// ranking, files or folders by req.mode; the list's notes come along.
 [[nodiscard]] engine::SearchResult search(const engine::Context& ctx, const List& list,
                                           const engine::SearchRequest& req);
 
@@ -69,6 +72,10 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
 // The `find` command that lists everything under `roots` for the ssh lookup: one
 // "d\t<mtime>\t<path>\0" or "f\t<size>\t<mtime>\t<path>\0" record per entry (<mtime>: %T@).
 [[nodiscard]] std::string find_command(const std::vector<std::string>& roots, int max_depth, bool skip_hidden);
+// One record of that output (without its NUL), the path as find printed it less a leading "./";
+// nullopt for a malformed record or one with nothing to save it under ("/", ".", "..": review
+// G15).
+[[nodiscard]] std::optional<Entry> parse_find_record(std::string_view record);
 [[nodiscard]] std::vector<Entry> parse_find(std::string_view out);
 // `rclone lsf --format tsp --time-format unix --csv -R` output of `root` (see parse_lsf_record).
 [[nodiscard]] std::vector<Entry> parse_lsf(std::string_view out, std::string_view root);

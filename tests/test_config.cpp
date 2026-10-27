@@ -221,6 +221,27 @@ TEST_CASE("find method: explicit, or auto from how the rclone remote authenticat
     CHECK(resolve_find_method(forced, with_key) == FindMethod::rclone);
 }
 
+TEST_CASE("find method on grab's engine: auto asks the server, except a Storage Box; walk = rclone") {
+    CHECK(parse_ok("[h]\nfind = walk\n").remotes[0].find == FindMethod::rclone);
+    CHECK(parse_ok("[h]\nfind = Walk\n").remotes[0].find == FindMethod::rclone);
+    auto bad = parse_grab_config(*ini::parse("[h]\nfind = telnet\n"));
+    REQUIRE_FALSE(bad);
+    CHECK(bad.error() == "[h] find must be auto, ssh, rclone or walk, got 'telnet'");
+
+    RcloneRemote server;
+    server.host = "65.21.224.123";
+    RcloneRemote box;
+    box.host = "u123456-sub1.Your-StorageBox.de";
+    RemoteSettings s;
+    CHECK(resolve_grab_method(s, server) == GrabMethod::probe); // key or password alike
+    CHECK(resolve_grab_method(s, box) == GrabMethod::walk);
+    s.find = FindMethod::ssh;
+    CHECK(resolve_grab_method(s, server) == GrabMethod::find);
+    CHECK(resolve_grab_method(s, box) == GrabMethod::find); // asked for: an error naming the answer
+    s.find = FindMethod::rclone;
+    CHECK(resolve_grab_method(s, server) == GrabMethod::walk);
+}
+
 TEST_CASE("known_hosts_file = none is treated as unset, never passed to ssh") {
     auto r = parse_rclone_remote(*ini::parse("[box]\ntype = sftp\nhost = h\nuser = u\nport = 23\n"
                                              "known_hosts_file = none\npass = obscured\n"),

@@ -11,7 +11,7 @@
 
 namespace grab {
 
-// How TARGET is located on the server.
+// How TARGET is located on the server (`find = auto | ssh | rclone`, `walk` the same as rclone).
 enum class FindMethod {
     auto_detect, // ssh when the rclone remote has a key_file, otherwise rclone
     ssh,         // ssh + find: one round trip, needs a shell and a key or password prompt
@@ -21,6 +21,14 @@ enum class FindMethod {
 // What moves a server's files: rclone, or grab's own SSH/SFTP client (the rclone replacement,
 // taking over phase by phase while rclone stays the default).
 enum class Engine { rclone, grab };
+
+// How searches and file lists run on engine = grab: GNU find over an SSH command on a pooled
+// connection, or grab's walk of the folders over SFTP.
+enum class GrabMethod {
+    probe, // find = auto: a check once per program run picks find where the server has it
+    find,  // find = ssh: find only; an error naming the server's answer where it doesn't work
+    walk,  // find = rclone or walk, and Storage Boxes on auto (no find in their shell)
+};
 
 // One [section] of grab.conf describing how to search and download from a server.
 struct RemoteSettings {
@@ -69,6 +77,9 @@ struct RcloneRemote {
 // likely), otherwise rclone (password remotes and storage boxes usually have no shell).
 [[nodiscard]] FindMethod resolve_find_method(const RemoteSettings& settings,
                                              const RcloneRemote& remote);
+// The same for engine = grab: auto asks the server (ssh::check_find), except a Storage Box
+// (*.your-storagebox.de), whose restricted shell has no find, so it walks without asking.
+[[nodiscard]] GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemote& remote);
 
 // "." and "~" mean the login home and become ""; "/" stays; other roots lose trailing '/'.
 [[nodiscard]] std::string normalize_root(std::string_view root);

@@ -73,6 +73,7 @@ add_library(grab_core STATIC
     src/sftp.cpp
     src/ssh.cpp
     src/ssh_pool.cpp
+    src/ssh_find.cpp
     src/ssh_target.cpp
     src/ssh_walk.cpp)
 

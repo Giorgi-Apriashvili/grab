@@ -99,6 +99,14 @@ std::int64_t unix_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// A search's notes (engine::SearchResult::notes) on its server's status, for the status line.
+void set_notes(Value& status, const std::vector<std::string>& notes) {
+    if (notes.empty()) return;
+    Value list = Value::make_array();
+    for (const auto& n : notes) list.push(str(n));
+    status.set("notes", std::move(list));
+}
+
 const char* file_state_name(folder::State s) {
     constexpr const char* names[] = {"queued", "running", "paused", "done", "failed", "skipped"}; // folder::State order
     return names[static_cast<int>(s)];
@@ -866,6 +874,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
                         add(found, file_list::search(*ctx, *list, r), kind);
                     }
                     status.set("age", num(static_cast<double>(now - list->fetched)));
+                    set_notes(status, list->notes);
                 }
                 std::lock_guard lock(lists_mutex_);
                 const auto& s = list_slot(server);
@@ -915,6 +924,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
                         found.reset();
                         break;
                     }
+                    if (kind == results.front().first) set_notes(status, live->notes); // one lookup's, once
                     add(found, std::move(*live), kind);
                     status.set("live", Value::make_bool(true));
                 }
@@ -1095,6 +1105,7 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
             add(file_list::search(ctx, *view.list, r), m == Mode::folder);
         }
         status.set("age", num(static_cast<double>(now - view.list->fetched)));
+        set_notes(status, view.list->notes);
         return hits;
     }
     // Deeper than the list (or a search lists can't answer): live, the folder the only root.
@@ -1127,6 +1138,7 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
         act.failed();
         return util::fail(found.error());
     }
+    set_notes(status, found->first.notes); // one walk's, the same for both kinds
     add(std::move(found->first), true);
     add(std::move(found->second), false);
     status.set("live", Value::make_bool(true));

@@ -38,6 +38,7 @@ public:
     bool corrupt = false;                                   // send a packet claiming 1 GiB
     const std::map<std::string, std::string>* shared_files = nullptr; // instead of files: one copy for many sessions
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
+    int broken_after = 0;                                   // the stream breaks on this read (0: never)
 
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
     std::size_t most_waiting = 0;                               // most requests answered in one batch
@@ -54,6 +55,7 @@ public:
 
     std::size_t read(std::span<char> buffer) override {
         if (delay.count() > 0) std::this_thread::sleep_for(delay);
+        if (broken_after > 0 && ++read_calls_ >= broken_after) throw sftp::Broken("fake server: the connection broke");
         if (out_.empty()) {
             most_waiting = std::max(most_waiting, queue_.size());
             if (reverse) std::ranges::reverse(queue_);
@@ -250,6 +252,7 @@ private:
     std::vector<std::string> queue_;
     std::map<std::string, OpenHandle> handles_;
     int next_handle_ = 1;
+    int read_calls_ = 0;
 };
 
 // Bytes that differ along the file, so a piece in the wrong place shows.

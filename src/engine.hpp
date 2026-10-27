@@ -26,8 +26,10 @@ struct Context {
     GrabConfig config;    // rclone and rclone_config resolved (bundled exe, grab's own file)
     RemoteSettings settings;
     RcloneRemote remote;  // connection details from rclone.conf
-    FindMethod method;    // resolved: ssh or rclone
+    FindMethod method;    // resolved: ssh or rclone (engine = rclone)
     std::vector<std::string> imported; // remotes imported into grab's rclone.conf just now
+    Engine engine = Engine::rclone;    // effective_engine(settings)
+    GrabMethod grab_method = GrabMethod::probe; // how searches and lists run on engine = grab
 };
 
 // grab.conf + the selected remote section + its rclone.conf entry. Errors are ready to show.
@@ -78,6 +80,9 @@ struct SearchResult {
     std::vector<Hit> hits; // ranked best first (see rank_matches)
     std::vector<std::string> roots; // searched roots ("" = login home), for messages
     int max_depth = 0;
+    // What the lookup couldn't look at while the rest was found (review G55): folders it couldn't
+    // read, a search root that failed, find's loop warnings ("a/b: permission denied").
+    std::vector<std::string> notes;
 };
 
 // Called with each external command just before it runs (for --verbose).
