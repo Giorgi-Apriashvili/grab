@@ -193,17 +193,41 @@ TEST_CASE("unused share is borrowed, and handed back when its owner waits") {
     pool.started(2, t);
     t += 1s;
     // User 1 is at its share (4), but user 2 isn't asking for more: borrow the idle capacity.
-    CHECK(pool.may_start(1, t));
-    pool.started(1, t);
-    t += 1s;
+    for (int i = 0; i < 3; ++i) {
+        CHECK(pool.may_start(1, t));
+        pool.started(1, t);
+        t += 1s;
+    }
+    CHECK(pool.total_active() == 8);
     CHECK_FALSE(pool.should_yield(1));
     // Once user 2 waits below its share, user 1 stops borrowing and gives one back.
     pool.waiting(2, +1);
     CHECK_FALSE(pool.may_start(1, t));
     CHECK(pool.should_yield(1));
     pool.finished(1);
-    CHECK_FALSE(pool.should_yield(1)); // back at its share
+    // The free one is user 2's: no more given back for it (streams handing back at once would
+    // give back more than it waits for).
+    CHECK_FALSE(pool.should_yield(1));
     CHECK(pool.may_start(2, t));
+    pool.waiting(2, +1); // two of its streams wait: one more
+    CHECK(pool.should_yield(1));
+}
+
+TEST_CASE("Play's urgency: the server's downloads keep its depth while one of its streams is urgent, and urgent_hold after") {
+    fetch::Connections conns;
+    CHECK(conns.read_depth("box", 64) == 64);
+    conns.urgent("box", -5, 8);
+    conns.urgent("box", -6, 4);
+    CHECK(conns.read_depth("box", 64) == 4); // the smallest
+    CHECK(conns.read_depth("other", 64) == 64);
+    conns.urgent("box", -6, 0);
+    conns.urgent("box", -5, 0);
+    CHECK(conns.read_depth("box", 64) == 4); // held a while
+    const auto until = std::chrono::steady_clock::now() + fetch::urgent_hold + 2s;
+    while (conns.read_depth("box", 64) != 64 && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(50ms);
+    CHECK(conns.read_depth("box", 64) == 64);
+    conns.urgent("box", -7, 0); // never urgent: nothing held
+    CHECK(conns.read_depth("box", 64) == 64);
 }
 
 TEST_CASE("a download over its share hands a connection to one that is waiting") {

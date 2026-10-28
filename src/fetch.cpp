@@ -423,6 +423,38 @@ bool Connections::yield_if_over_share(const std::string& server, int id) {
     return true;
 }
 
+bool Connections::others_present(const std::string& server, int id) {
+    std::scoped_lock lock(mutex_);
+    return pool(server).others_present(id);
+}
+
+void Connections::urgent(const std::string& server, int id, int depth) {
+    std::scoped_lock lock(mutex_);
+    auto& streams = urgent_[server];
+    if (depth > 0) {
+        streams[id] = Urgent{.depth = depth, .until = std::chrono::steady_clock::time_point::max()};
+    } else if (const auto it = streams.find(id); it != streams.end() && it->second.until == std::chrono::steady_clock::time_point::max()) {
+        it->second.until = std::chrono::steady_clock::now() + urgent_hold;
+    }
+}
+
+int Connections::read_depth(const std::string& server, int normal) {
+    std::scoped_lock lock(mutex_);
+    const auto found = urgent_.find(server);
+    if (found == urgent_.end()) return normal;
+    const auto now = std::chrono::steady_clock::now();
+    int depth = normal;
+    for (auto it = found->second.begin(); it != found->second.end();) {
+        if (it->second.until <= now) {
+            it = found->second.erase(it);
+            continue;
+        }
+        depth = std::min(depth, it->second.depth);
+        ++it;
+    }
+    return depth;
+}
+
 void Connections::refused(const std::string& server) {
     int lowered = 0;
     {
@@ -978,15 +1010,18 @@ Result run(const Download& d, Connections& connections, const std::function<void
             std::uint64_t deliver = offset; // the next byte to write
             std::map<std::uint64_t, std::string> early; // arrived before the bytes ahead of them
             int in_flight = 0;
+            std::uint64_t bytes_in_flight = 0;
             bool asking = true;  // false: no more READs (the range is done, the stream steps aside, a failure)
             bool writing = true; // false: a write failed; what still comes is dropped
             std::optional<sftp::Status> read_failed;
-            // Stepping aside ends the stream now, its connection closed rather than drained: up to
-            // 16 MiB is still on its way, and the download waiting for the connection (its permission
-            // just handed over) would wait for that too, the pool being at the server's budget.
+            // Stepping aside ends the stream: with up to hand_over_max on its way it waits for that
+            // (still written) and the connection goes back to the pool for whoever took the seat;
+            // with more, the connection is closed rather than drained, as the one waiting for it
+            // (its permission just handed over) would wait for that too, the pool being at the
+            // server's budget.
             bool stepped_aside = false;
             auto hand_over = [&](std::string_view data) {
-                if (!writing || stepped_aside) return;
+                if (!writing) return;
                 if (!put(i, data, a)) {
                     asking = false;
                     writing = !a.write_failed;
@@ -997,8 +1032,10 @@ Result run(const Download& d, Connections& connections, const std::function<void
             };
             std::function<void(std::uint64_t, std::uint32_t)> send = [&](std::uint64_t at, std::uint32_t n) {
                 ++in_flight;
+                bytes_in_flight += n;
                 c.read(*handle, at, n, [&, at, n](std::expected<std::string_view, sftp::Status> r) {
                     --in_flight;
+                    bytes_in_flight -= n;
                     if (!r) {
                         if (!read_failed) read_failed = std::move(r.error());
                         asking = false;
@@ -1029,7 +1066,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 // download's other streams), and a reply already here would otherwise wait unread
                 // through the next turns, arriving on time but written in bursts. One READ is an
                 // eighth of a second of the limit's worth, so a connection still carries it all.
-                const int depth = d.limiter != nullptr && d.limiter->rate() > 0 ? 1 : grab_depth;
+                // While Play on this server warms up or waits for bytes, its depth (urgent).
+                const int depth = d.limiter != nullptr && d.limiter->rate() > 0 ? 1 : connections.read_depth(d.server, grab_depth);
                 while (asking && in_flight < depth && !token.stop_requested()) {
                     std::uint64_t n = 0;
                     {
@@ -1049,10 +1087,10 @@ Result run(const Download& d, Connections& connections, const std::function<void
                     send(next, static_cast<std::uint32_t>(n));
                     next += n;
                 }
-                if (token.stop_requested() || stepped_aside || in_flight == 0) break;
+                if (token.stop_requested() || in_flight == 0 || (stepped_aside && bytes_in_flight > hand_over_max)) break;
                 c.pump();
             }
-            if (token.stop_requested() || stepped_aside) {
+            if (token.stop_requested() || in_flight > 0) {
                 lease->broken(); // its replies still on the way: closed, not waited for
                 return;
             }

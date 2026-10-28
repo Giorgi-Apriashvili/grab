@@ -134,6 +134,11 @@ public:
     // A command was cut short on it or its link failed: it isn't used any more (a pooled
     // Session isn't reused).
     [[nodiscard]] bool dropped() const { return dropped_; }
+    // Sends the server a keepalive that wants no answer, for a login kept idle: it refreshes a NAT's
+    // or firewall's state, and on a link that died silently TCP gives up while it idles, so the
+    // next request fails at once instead of after the session's timeout. false: the send failed
+    // (the connection is dropped).
+    bool keepalive();
 
     // What was agreed, for -v: "curve25519-sha256 ssh-ed25519 chacha20-poly1305@openssh.com".
     [[nodiscard]] std::string algorithms() const;

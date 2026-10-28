@@ -43,17 +43,21 @@ struct FakePool {
     std::map<int, int> breaks;                     // login -> the read on which its stream breaks
     std::optional<budget::Failure> login_fails;    // every login fails so
     std::atomic<int> closed{0};                    // logins up to this one the server has closed
+    bool shared = false; // the sessions read `files` itself, not a copy each (big files; not changed meanwhile)
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
     std::map<int, std::uint64_t> asked_by; // login -> bytes its READs asked for
+    std::map<int, std::vector<std::pair<std::uint64_t, std::uint32_t>>> reads_by; // login -> its READs
     std::vector<std::string> opened;
     std::atomic<int> logins{0};
+    std::atomic<int> pings{0}; // keepalives sent; one on a login the server closed fails
 
     struct Session : ssh::Session {
         Session(FakePool& f, int n) : fake(f), login(n), client(server) {
             {
                 std::scoped_lock lock(f.mutex);
-                server.files = f.files;
+                if (f.shared) server.shared_files = &f.files;
+                else server.files = f.files;
                 for (const auto& d : f.dirs) server.dirs[d] = {".", ".."};
                 server.fifos = f.fifos;
                 server.no_size = f.no_size;
@@ -72,6 +76,8 @@ struct FakePool {
         ~Session() override {
             std::scoped_lock lock(fake.mutex);
             fake.reads.insert(fake.reads.end(), server.reads.begin(), server.reads.end());
+            auto& mine = fake.reads_by[login];
+            mine.insert(mine.end(), server.reads.begin(), server.reads.end());
             for (const auto& [off, len] : server.reads) fake.asked_by[login] += len;
             fake.opened.insert(fake.opened.end(), server.opened.begin(), server.opened.end());
         }
@@ -82,6 +88,10 @@ struct FakePool {
             if (const int ms = fake.slow_from_now; ms >= 0) server.delay = std::chrono::milliseconds(ms);
             if (const std::size_t n = fake.slice_from_now; n > 0) server.slice = n;
             return client;
+        }
+        bool keepalive() override {
+            ++fake.pings;
+            return login > fake.closed;
         }
         bool reusable() override { return client.pending() == 0; }
         FakePool& fake;

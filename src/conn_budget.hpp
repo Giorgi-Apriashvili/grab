@@ -74,8 +74,11 @@ public:
     [[nodiscard]] bool free_for(int id) const;
     // Downloads waiting for a connection, so borrowed ones are handed back.
     void waiting(int id, int delta);
+    // Whether a user other than `id` holds or waits for a connection.
+    [[nodiscard]] bool others_present(int id) const;
     // Whether `id` should hand a connection back: it holds more than its share while another
-    // download waits below its own.
+    // download waits below its own, and the free connections don't cover those waiting already
+    // (several streams handing one back at once for one waiter would give back more than it needs).
     [[nodiscard]] bool should_yield(int id) const;
     // When the next start could happen, for waiting (now if nothing is in the way but the share).
     [[nodiscard]] Clock::time_point next_start(Clock::time_point now) const;

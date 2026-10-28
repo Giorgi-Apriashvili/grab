@@ -129,9 +129,19 @@ void ServerPool::waiting(int id, int delta) {
     if (it != users_.end()) it->waiting = std::max(0, it->waiting + delta);
 }
 
+bool ServerPool::others_present(int id) const {
+    return std::ranges::any_of(users_, [&](const User& u) { return u.id != id && (u.active > 0 || u.waiting > 0); });
+}
+
 bool ServerPool::should_yield(int id) const {
     const auto* u = find(id);
-    return u != nullptr && u->active > share(id) && other_starved(id);
+    if (u == nullptr || u->active <= share(id)) return false;
+    // The connections those waiting below their shares still lack, against the free ones.
+    int lacking = 0;
+    for (const auto& o : users_) {
+        if (o.id != id && o.waiting > 0 && o.active < share(o.id)) lacking += std::min(o.waiting, share(o.id) - o.active);
+    }
+    return lacking > budget_ - total_active();
 }
 
 ServerPool::Clock::time_point ServerPool::next_start(Clock::time_point now) const {

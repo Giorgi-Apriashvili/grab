@@ -49,6 +49,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
     std::vector<std::string> opened;                            // the paths of each OPEN
     std::size_t most_waiting = 0;                               // most requests answered in one batch
+    std::uint64_t most_read_bytes = 0;                          // most bytes of DATA answered in one batch
 
     void write(std::string_view bytes) override {
         in_ += bytes;
@@ -66,6 +67,11 @@ public:
         if (dropped) throw sftp::Broken("fake server: the server closed the connection");
         if (out_.empty()) {
             most_waiting = std::max(most_waiting, queue_.size());
+            std::uint64_t data = 0;
+            for (const std::string& r : queue_) {
+                if (r.size() >= 13 && static_cast<std::uint8_t>(r[4]) == 103) data += r.size() - 13; // DATA: its bytes
+            }
+            most_read_bytes = std::max(most_read_bytes, data);
             if (reverse) std::ranges::reverse(queue_);
             for (const std::string& r : queue_) out_ += r;
             queue_.clear();

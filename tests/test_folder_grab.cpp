@@ -43,6 +43,7 @@ struct Tree {
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
     std::size_t most_waiting = 0; // most requests a session's server answered at once
+    std::uint64_t most_read_bytes = 0; // most bytes of READs a session's server answered at once
     std::atomic<int> logins{0};
     std::atomic<int> break_first_after{0}; // the next login's stream breaks on that read
     std::size_t readdir_batch = 3;          // names per READDIR answer
@@ -64,6 +65,7 @@ struct Tree {
             std::lock_guard lock(tree.mutex);
             tree.reads.insert(tree.reads.end(), server.reads.begin(), server.reads.end());
             tree.most_waiting = std::max(tree.most_waiting, server.most_waiting);
+            tree.most_read_bytes = std::max(tree.most_read_bytes, server.most_read_bytes);
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;
@@ -308,6 +310,30 @@ TEST_CASE("grab engine folders: under a speed limit too") {
         CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
         CHECK(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path));
     }
+}
+
+TEST_CASE("grab engine folders: small files keep Play's depth while it is urgent on the server") {
+    // Bytes of READs in flight on the one connection, at most, with Play urgent or not.
+    auto peak = [](bool urgent) {
+        Tree t;
+        t.dir("/data");
+        for (int i = 0; i < 6; ++i) t.file(std::format("/data/f{}.bin", i), test::pattern(6 * sftp::max_read + i));
+        auto pool = t.pool(1);
+        Run r(pool, urgent ? "urgent" : "not-urgent", 1, 1);
+        if (urgent) r.connections.urgent("Fake", -100, 4);
+        { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+        CHECK(std::ranges::none_of(r.tree.files, [](const folder::File& f) { return f.big; }));
+        folder::run(r.job, r.tree, r.m, {});
+        for (const auto& f : r.tree.files) {
+            CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+            CHECK(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path));
+        }
+        r.job.pool.reset();
+        pool.reset(); // the sessions close and say what they answered
+        return t.most_read_bytes;
+    };
+    CHECK(peak(true) <= 4 * std::uint64_t{sftp::max_read});
+    CHECK(peak(false) > 8 * std::uint64_t{sftp::max_read});
 }
 
 namespace {

@@ -283,7 +283,7 @@ bool Plan::warm_in() const {
 }
 
 int Plan::add_reader(std::uint64_t pos, std::uint64_t last) {
-    readers_.push_back(Reader{.id = next_reader_, .pos = pos, .last = last});
+    readers_.push_back(Reader{.id = next_reader_, .pos = pos, .last = last, .from = pos});
     return next_reader_++;
 }
 
@@ -298,20 +298,34 @@ void Plan::remove_reader(int id) { std::erase_if(readers_, [id](const Reader& r)
 void Plan::ended_at(std::uint64_t at) { eof_ = std::min(eof_, at); }
 
 std::uint64_t Plan::window_end(const Reader& r) const {
-    return std::min({plus(r.last, 1), plus(r.pos, s_.ahead), end()});
+    // A request that just began (a seek: ffmpeg's first frame, a player scrubbing) gets its next
+    // seek_span bytes; its read-ahead grows by twice what it reads, up to `ahead`, so one that stops
+    // soon leaves most connections idle for the next seek instead of busy with bytes nobody wants.
+    const std::uint64_t reach = std::clamp(plus(s_.seek_span, 2 * (r.pos - r.from)), s_.seek_span, std::max(s_.ahead, s_.seek_span));
+    return std::min({plus(r.last, 1), plus(r.pos, reach), end()});
+}
+
+bool Plan::waits(const Reader& r) const { return r.pos < std::min(plus(r.last, 1), end()) && have.until(r.pos) == r.pos; }
+
+std::uint64_t Plan::seek_end(const Reader& r) const { return std::min({plus(r.last, 1), end(), plus(r.from, s_.seek_span)}); }
+
+bool Plan::waiting() const {
+    return std::ranges::any_of(readers_, [this](const Reader& r) { return waits(r); });
 }
 
 std::optional<Plan::Piece> Plan::pick(const Lanes& lanes, bool room) const {
     const std::uint64_t last = end();
     constexpr auto none = std::numeric_limits<std::uint64_t>::max();
-    // A request waiting for bytes nobody fetches.
+    // A request waiting for its first bytes (a seek): those nobody fetches yet, a small piece to each
+    // idle connection (one box connection would take seconds for a seek's first MiB); a busy
+    // connection only when none is idle, its READs being queued behind its others. Past them, a
+    // request that still waits gets read-ahead, the spares staying idle for the next seek.
     if (!lanes.busy || lanes.idle_others == 0) {
         for (const auto& r : readers_) {
-            if (r.pos >= std::min(plus(r.last, 1), last)) continue;
-            if (have.until(r.pos) > r.pos || taken.until(r.pos) > r.pos) continue; // in, or on its way
-            const auto stop = std::min({plus(r.last, 1), last, plus(r.pos, s_.seek_piece), have.next_after(r.pos, none),
-                                        taken.next_after(r.pos, none)});
-            return Piece{.start = r.pos, .end = stop, .kind = Kind::waiting};
+            if (!waits(r) || r.pos >= seek_end(r)) continue;
+            if (const auto g = gap(have, taken, r.pos, seek_end(r))) {
+                return Piece{.start = g->first, .end = std::min(g->second, plus(g->first, s_.seek_piece)), .kind = Kind::waiting};
+            }
         }
     }
     // The warm part, dealt out: its very start first, then the end, then the rest of the start.
@@ -336,16 +350,17 @@ std::optional<Plan::Piece> Plan::pick(const Lanes& lanes, bool room) const {
             return Piece{.start = g->first, .end = g->first + n, .kind = Kind::warm};
         }
     }
-    // Read-ahead; the last idle connection stays for a seek.
-    if (!room || (!lanes.busy && lanes.idle_others == 0 && lanes.reading > 1)) return std::nullopt;
+    // Read-ahead, while `spares` other connections stay idle for a seek: fewer with fewer
+    // connections (one per three; 3-5 keep one, so at least two read ahead). A busy connection
+    // that would leave fewer goes idle once its READs are in.
+    const int spares = std::min({std::max(s_.spares, 0), lanes.reading - 1, std::max(1, lanes.reading / 3)});
+    if (!room || lanes.idle_others < spares) return std::nullopt;
     std::optional<std::pair<std::uint64_t, std::uint64_t>> best;
     std::uint64_t nearest = none;
     for (const auto& r : readers_) {
         std::uint64_t from = r.pos;
-        // A busy connection leaves a waiting request's first bytes to the idle one taking them.
-        if (lanes.busy && lanes.idle_others > 0 && have.until(r.pos) == r.pos && taken.until(r.pos) == r.pos) {
-            from = std::min(window_end(r), plus(r.pos, s_.seek_piece));
-        }
+        // A busy connection leaves a waiting request's next bytes to the idle ones taking them.
+        if (lanes.busy && lanes.idle_others > 0 && waits(r) && r.pos < seek_end(r)) from = std::min(window_end(r), seek_end(r));
         const auto g = gap(have, taken, from, window_end(r));
         if (g && g->first - r.pos < nearest) {
             nearest = g->first - r.pos;
@@ -442,8 +457,10 @@ struct Server::Stream {
     bool halting = false;                // the keeper is stopping the lanes to free the data
     bool abandoned = false;              // not wanted: its Play stopped, or its data let go (forget_old)
     bool forgotten = false;              // beyond Options::ids: it goes
+    bool urgent = false;                 // downloads from the server keep Play's depth (urgency)
     std::uint64_t ahead_taken = 0;       // bytes of read-ahead handed out (Stats)
 
+    [[nodiscard]] int depth() const { return std::max(file.depth > 0 ? file.depth : server.options_.depth, 1); }
     // Under m.
     [[nodiscard]] bool room() const { return blocks.size() * block < server.options_.stream_cap; }
     [[nodiscard]] std::uint64_t cached() const { return blocks.size() * block; }
@@ -454,6 +471,9 @@ struct Server::Stream {
     // Blocks go until one more piece fits under the cap: room() stays true while some may go.
     void evict();
     void fail(std::string why);
+    // Tells the server's downloads whether to keep Play's depth: while it warms up or a request
+    // waits for bytes (fetch::Connections::urgent). Called where either may change.
+    void urgency();
     void leave_if_unused(); // no lane holds a seat or waits for one: out of the connections
     // Lanes out, for the caller to stop and join outside the lock.
     std::vector<std::unique_ptr<Lane>> take_lanes();
@@ -477,6 +497,7 @@ struct Server::Stream::Lane {
     std::string handle;
     Clock::time_point retry_after{}; // a login failed: none before then
     Clock::time_point last_reply{};
+    Clock::time_point pinged{};      // its last keepalive (or login)
     std::uint32_t size = 0;          // the next READ's
     std::uint64_t pos = 0;           // the piece's next byte to ask for
     std::uint64_t piece_end = 0;
@@ -485,6 +506,7 @@ struct Server::Stream::Lane {
     std::uint64_t in_flight = 0;
     int reads = 0;
     bool yielded = false;
+    bool rested = false; // this read() began after it sat idle rested_after: a break then doesn't count
     std::jthread thread; // last: joined first
 
     void run(const std::stop_token& stop);
@@ -495,6 +517,7 @@ struct Server::Stream::Lane {
     [[nodiscard]] std::uint64_t cap() const;
     void ask(std::uint64_t at, std::uint64_t n);
     void give_back(); // after a break: its bytes not in yet, for the others
+    void ping();      // a keepalive on the idle connection; a failed one drops it
     // The connection back to the pool (closed when `drop`: replies left on it), then the seat
     // (`seat_gone`: handed back already, yield_if_over_share).
     void release(bool drop, bool seat_gone);
@@ -503,7 +526,7 @@ struct Server::Stream::Lane {
 
 Server::Stream::Stream(Server& owner, File f, std::uint64_t file_size, int seat)
     : server(owner), file(std::move(f)), type(media_type(file.name)), size(file_size), seat_id(seat),
-      plan(Plan::Settings{.size = file_size, .ahead = file.ahead}) {}
+      plan(Plan::Settings{.size = file_size, .ahead = file.ahead, .spares = file.spares}) {}
 
 Server::Stream::~Stream() {
     for (auto& lane : lanes) lane->thread.request_stop();
@@ -552,6 +575,7 @@ void Server::Stream::store(std::uint64_t at, std::string_view bytes) {
     }
     if (decided && plan.warming() && plan.warm_in()) plan.warm_done();
     if (cached() > server.options_.stream_cap) evict();
+    urgency();
     cv.notify_all();
 }
 
@@ -587,7 +611,15 @@ void Server::Stream::evict() {
 
 void Server::Stream::fail(std::string why) {
     if (!failure) failure = std::move(why);
+    urgency();
     cv.notify_all();
+}
+
+void Server::Stream::urgency() {
+    const bool now = running && !failure && !abandoned && (plan.warming() || plan.waiting());
+    if (now == urgent) return;
+    urgent = now;
+    server.connections_.urgent(file.server, seat_id, urgent ? depth() : 0);
 }
 
 void Server::Stream::leave_if_unused() {
@@ -617,18 +649,24 @@ void Server::Stream::Lane::run(const std::stop_token& stop) {
             auto check = [&] {
                 const auto now = Clock::now();
                 // A warm part still coming in holds them, unless its reads failed (no bytes come).
+                // Then they stay while nobody else holds or waits for a seat on the server (a seek
+                // after a pause needs no login), until the keeper frees the data (free_after). One
+                // held to its share by Play's weight never waits, so holding is enough.
                 due = (lease || seated) && s.requests == 0 && (!s.plan.warming() || s.failure) &&
-                      now - s.last_request >= o.release_after;
+                      now - s.last_request >= o.release_after &&
+                      (s.failure || s.server.connections_.others_present(s.file.server, s.seat_id));
                 if (s.failure) work = false;
                 else if (lease) work = s.plan.would(s.lane_stats(this, false), s.room());
                 else work = now >= retry_after && s.plan.any_work(s.room());
                 return work || due;
             };
-            if (!s.cv.wait_for(lock, stop, std::chrono::milliseconds(250), check)) continue;
+            // Nothing yet (work and due false): a keepalive, below, if one is due.
+            [[maybe_unused]] const bool woke = s.cv.wait_for(lock, stop, std::chrono::milliseconds(250), check);
             if (stop.stop_requested()) break;
         }
         if (!work) {
             if (due) release(false, false);
+            else if (lease && reads == 0 && Clock::now() - std::max(last_reply, pinged) >= o.keepalive) ping();
             continue;
         }
         if (!lease) {
@@ -649,8 +687,9 @@ void Server::Stream::Lane::run(const std::stop_token& stop) {
             handle.clear();
             std::scoped_lock lock(s.m);
             // A connection the server closed is replaced (the next login); one after another
-            // breaking without bytes ends the reads until the next request.
-            if (++s.breaks >= 3) s.fail(std::format("lost the connection to {}: {}", s.file.server, e.what()));
+            // breaking without bytes ends the reads until the next request. One kept idle that the
+            // server closed meanwhile (several, after a pause) doesn't count.
+            if (!rested && ++s.breaks >= 3) s.fail(std::format("lost the connection to {}: {}", s.file.server, e.what()));
         }
         if (yielded) { // its seat went to a download waiting for its share
             yielded = false;
@@ -743,6 +782,7 @@ bool Server::Stream::Lane::connect(const std::stop_token& stop) {
         std::scoped_lock lock(s.m);
         connected = true;
         last_reply = Clock::time_point{}; // a new connection starts small
+        pinged = Clock::now();
         return true;
     }
 }
@@ -751,7 +791,9 @@ bool Server::Stream::Lane::read(const std::stop_token& stop) {
     const auto& o = s.server.options_;
     auto& client = (*lease)->sftp();
     // An idle connection starts TCP again from a small window: its first READ is small.
-    if (Clock::now() - last_reply >= o.idle_restart) size = std::clamp<std::uint32_t>(o.first_read, 1, sftp::max_read);
+    const auto now = Clock::now();
+    if (now - last_reply >= o.idle_restart) size = std::clamp<std::uint32_t>(o.first_read, 1, sftp::max_read);
+    rested = last_reply != Clock::time_point{} && now - last_reply >= o.rested_after; // until a reply comes
     for (;;) {
         if (stop.stop_requested()) break;
         fill(stop);
@@ -766,7 +808,7 @@ bool Server::Stream::Lane::read(const std::stop_token& stop) {
 }
 
 void Server::Stream::Lane::fill(const std::stop_token& stop) {
-    const int depth = std::max(s.server.options_.depth, 1);
+    const int depth = s.depth();
     while (!stop.stop_requested() && reads < depth) {
         if (pos >= piece_end) {
             if (!take()) return;
@@ -796,6 +838,13 @@ bool Server::Stream::Lane::take() {
         busy = reads > 0;
         return false;
     }
+    // READs on their way that nobody wants any more (their request went, or moved: a seek) are
+    // waited for first, so what it takes next doesn't queue behind them (a seek right after another
+    // one waited behind the first one's read-ahead).
+    if (reads > 0 && std::ranges::none_of(asked, [this](const auto& r) { return s.plan.wanted(r.first); })) {
+        busy = true;
+        return false;
+    }
     auto p = s.plan.next(s.lane_stats(this, reads > 0), s.room());
     if (p && p->kind == Plan::Kind::ahead &&
         s.server.connections_.yield_if_over_share(s.file.server, s.seat_id)) {
@@ -807,6 +856,9 @@ bool Server::Stream::Lane::take() {
     busy = p.has_value() || reads > 0;
     if (!p) return false;
     if (p->kind == Plan::Kind::ahead) s.ahead_taken += p->end - p->start;
+    // A waiting request's piece on a connection with nothing on its way: its first bytes come
+    // sooner in a small READ (they grow from there).
+    if (p->kind == Plan::Kind::waiting && reads == 0) size = std::clamp<std::uint32_t>(s.server.options_.first_read, 1, sftp::max_read);
     pos = p->start;
     piece_end = p->end;
     kind = p->kind;
@@ -814,8 +866,7 @@ bool Server::Stream::Lane::take() {
 }
 
 std::uint64_t Server::Stream::Lane::cap() const {
-    const auto& o = s.server.options_;
-    const std::uint64_t deepest = std::uint64_t{sftp::max_read} * static_cast<std::uint64_t>(std::max(o.depth, 1));
+    const std::uint64_t deepest = std::uint64_t{sftp::max_read} * static_cast<std::uint64_t>(s.depth());
     if (kind != Plan::Kind::warm) return deepest;
     // The warm part: its share of what's left, so the slowest connection doesn't hold the end.
     std::scoped_lock lock(s.m);
@@ -833,6 +884,7 @@ void Server::Stream::Lane::ask(std::uint64_t at, std::uint64_t n) {
         in_flight -= n;
         asked.erase(at);
         last_reply = Clock::now();
+        rested = false; // the connection works
         std::uint64_t got = 0;
         {
             std::scoped_lock lock(s.m);
@@ -864,6 +916,17 @@ void Server::Stream::Lane::give_back() {
     reads = 0;
     in_flight = 0;
     s.cv.notify_all();
+}
+
+void Server::Stream::Lane::ping() {
+    pinged = Clock::now();
+    if ((*lease)->keepalive()) return;
+    // The link is gone: the next piece logs in again (the seat stays). Nothing was on its way.
+    lease->broken();
+    lease.reset();
+    handle.clear();
+    std::scoped_lock lock(s.m);
+    connected = false;
 }
 
 void Server::Stream::Lane::release(bool drop, bool seat_gone) {
@@ -945,6 +1008,8 @@ Server::~Server() {
         {
             std::scoped_lock lock(s->m);
             lanes = s->take_lanes();
+            s->running = false;
+            s->urgency(); // the downloads go back to their depth
         }
         lanes.clear();
     }
@@ -1105,6 +1170,7 @@ std::expected<std::string, std::string> Server::play(File file, const Progress& 
         s->plan.warm_done();
     }
     s->start_lanes(true);
+    s->urgency(); // the server's downloads keep Play's depth while it warms up
 
     // The player starts once what it reads while opening is in (decision 3), or after
     // start_within while bytes still come.
@@ -1140,6 +1206,7 @@ std::expected<std::string, std::string> Server::play(File file, const Progress& 
     }
     if (failed) {
         s->abandoned = true; // the keeper stops its lanes and frees its data
+        s->urgency();
         lock.unlock();
         kick();
         return util::fail(*failed);
@@ -1231,6 +1298,7 @@ void Server::serve(SOCKET c) {
     s->used = Clock::now();
     const std::uint64_t last = a.first + a.length - 1;
     const int reader = s->plan.add_reader(a.first, last);
+    s->urgency();
     s->cv.notify_all();
     std::uint64_t pos = a.first;
     while (pos <= last) {
@@ -1248,6 +1316,7 @@ void Server::serve(SOCKET c) {
         // The blocks behind the request may go now: room for read-ahead again (no store() comes
         // to evict while the cache is full).
         if (!s->room()) s->evict();
+        s->urgency();
         s->cv.notify_all(); // read-ahead moves on
         lock.unlock();
         const bool sent = !piece.empty() && send_all(c, piece);
@@ -1258,6 +1327,7 @@ void Server::serve(SOCKET c) {
     s->plan.remove_reader(reader);
     --s->requests;
     s->last_request = s->used = Clock::now();
+    s->urgency();
     s->cv.notify_all();
 }
 
@@ -1306,6 +1376,7 @@ void Server::housekeep(const std::stop_token& stop) {
             s->running = false;
             s->halting = false;
             s->abandoned = false;
+            s->urgency();
             s->cv.notify_all();
         }
     }
@@ -1329,7 +1400,10 @@ Server::Stats Server::stats() {
         if (!s->blocks.empty()) ++out.with_data;
         out.cached += s->cached();
         out.ahead += s->ahead_taken;
-        for (const auto& lane : s->lanes) out.connected += lane->connected ? 1 : 0;
+        for (const auto& lane : s->lanes) {
+            out.connected += lane->connected ? 1 : 0;
+            out.idle += lane->connected && !lane->busy ? 1 : 0;
+        }
         out.seats += s->joined ? connections_.active(s->file.server, s->seat_id) : 0;
     }
     return out;

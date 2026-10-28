@@ -445,11 +445,15 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, sftp::Client& c, co
                 });
                 notify(job, Event::progress);
             }
-            // READs for what the open files still lack.
+            // READs for what the open files still lack; while Play on this server warms up or waits
+            // for bytes, no more than its depth's worth (fetch::Connections::urgent).
+            const std::uint64_t most = std::min(
+                max_bytes, std::uint64_t{sftp::max_read} *
+                               static_cast<std::uint64_t>(job.connections->read_depth(job.server, fetch::grab_depth)));
             for (auto& [id, s] : slots) {
                 while (s.opened && !s.error && !s.done && s.asked < s.size && !stop.stop_requested()) {
                     const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(sftp::max_read, s.size - s.asked));
-                    if (limited ? reads_in_flight >= 1 : reads_in_flight > 0 && bytes_in_flight + n > max_bytes) break;
+                    if (limited ? reads_in_flight >= 1 : reads_in_flight > 0 && bytes_in_flight + n > most) break;
                     if (limited && !job.limiter->acquire(n, stop, job.id, weight)) break;
                     send_read(id, s.asked, n);
                     s.asked += n;

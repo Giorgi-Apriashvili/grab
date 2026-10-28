@@ -767,6 +767,16 @@ std::unique_ptr<sftp::Channel> Connection::open_sftp() {
     return std::make_unique<ChannelStream>(session_, ch);
 }
 
+bool Connection::keepalive() {
+    // libssh2 sends one only with an interval set; none afterwards, so its blocking waits send none.
+    libssh2_keepalive_config(session_, 0, 1);
+    int next = 0;
+    const int rc = libssh2_keepalive_send(session_, &next);
+    libssh2_keepalive_config(session_, 0, 0);
+    if (rc != 0 && rc != LIBSSH2_ERROR_EAGAIN) dropped_ = true;
+    return !dropped_;
+}
+
 std::expected<ExecResult, ExecError> Connection::exec(std::string_view command, const ExecOptions& options) {
     SshCommand channel(session_, static_cast<socket_t>(socket_), received_, dropped_);
     return run_command(channel, command, options);

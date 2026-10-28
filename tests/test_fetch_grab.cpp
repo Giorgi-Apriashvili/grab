@@ -9,6 +9,7 @@
 #include "ssh_pool.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -39,6 +40,7 @@ struct Fake {
     std::chrono::milliseconds delay{0};
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
+    std::size_t most_waiting = 0; // most requests a session answered in one batch: about its READs in flight
     std::atomic<int> logins{0};
     std::atomic<int> refuse_logins{0}; // the next this many logins are turned away (a full server)
     bool fatal_login = false;          // every login refused for good (a wrong password)
@@ -59,6 +61,7 @@ struct Fake {
         ~Session() override {
             std::lock_guard lock(fake.mutex);
             fake.reads.insert(fake.reads.end(), server.reads.begin(), server.reads.end());
+            fake.most_waiting = std::max(fake.most_waiting, server.most_waiting);
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;
@@ -386,4 +389,66 @@ TEST_CASE("grab engine: stopped mid-file it keeps what came, and goes on from th
     const auto second = fetch::run(d, connections, {}, {});
     REQUIRE_MESSAGE(second.outcome == fetch::Outcome::done, second.error);
     CHECK(util::read_file(d.target) == content);
+}
+
+TEST_CASE("grab engine: while Play on the server warms up or waits for bytes, a download keeps Play's depth") {
+    const std::string content = test::pattern(16u << 20);
+    for (const bool urgent : {true, false}) {
+        CAPTURE(urgent);
+        Fake fake;
+        fake.files["/data/f.bin"] = content;
+        fake.slice = 64u << 10;
+        fake.delay = 1ms; // replies pile up between reads: a batch shows what is in flight
+        Dir dir(urgent ? "urgent" : "own-depth");
+        auto pool = fake.pool(2);
+        fetch::Connections connections;
+        connections.configure("Fake", 2);
+        if (urgent) connections.urgent("Fake", -100, 4); // a Play stream warming up, for good
+        auto d = download(dir.path / "f.bin", pool);
+        const auto r = fetch::run(d, connections, {}, {});
+        REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+        CHECK(util::read_file(dir.path / "f.bin") == content);
+        d.pool.reset();
+        pool.reset();
+        if (urgent) CHECK(fake.most_waiting <= 4);
+        else CHECK(fake.most_waiting > 8);
+    }
+}
+
+TEST_CASE("grab engine: a stream stepping aside with little on its way hands its connection over without a login; nothing is fetched twice") {
+    Fake fake;
+    const std::string content = test::pattern(24u << 20);
+    fake.files["/data/f.bin"] = content;
+    fake.slice = 16u << 10;
+    fake.delay = 2ms; // seconds in all: Play comes while it runs
+    Dir dir("hand-over");
+    auto pool = fake.pool(2);
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+    connections.urgent("Fake", -100, 4); // Play warming up: the download keeps 4 READs in flight
+    auto d = download(dir.path / "f.bin", pool);
+    fetch::Result r;
+    std::jthread running([&] { r = fetch::run(d, connections, {}, {}); });
+    for (int i = 0; i < 250 && (fake.logins.load() < 2 || connections.active("Fake", 1) < 2); ++i) std::this_thread::sleep_for(20ms);
+    REQUIRE(fake.logins.load() == 2);
+    // Play wants a seat at High priority: one of the download's streams steps aside and its
+    // connection, drained, goes to the pool, where Play finds it.
+    const int play = connections.new_id();
+    connections.join("Fake", play, 4);
+    REQUIRE(connections.acquire("Fake", play, {}, false));
+    {
+        const auto lease = pool->acquire();
+        CHECK(lease.has_value());
+        CHECK(fake.logins.load() == 2);
+    }
+    connections.release("Fake", play);
+    connections.leave("Fake", play);
+    connections.urgent("Fake", -100, 0);
+    running.join();
+    REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+    CHECK(util::read_file(dir.path / "f.bin") == content);
+    d.pool.reset();
+    pool.reset();
+    CHECK(fake.asked() == content.size()); // what came while it stepped aside was written
+    CHECK(fake.logins.load() == 2);        // and the download took its connection back from the pool
 }

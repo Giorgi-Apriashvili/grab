@@ -9,13 +9,16 @@
 // it opens a file: its start up to the first video and the end, fetched before the player starts,
 // as MPC-HC gives up after ~10 s), then read-ahead in front of each request. A Storage Box
 // connection gives 0.7-2.5 MiB/s whatever its depth, Main's reaches its link at 8 READs of 255 KiB,
-// and SFTP READs can't be called back: so each connection keeps at most 8 x 255 KiB in flight (a
-// seek on it would wait behind them), its first READ after it sat idle is small and grows (TCP
-// starts again from a small window: 255 KiB took 0.5 s on an idle connection, 32 KiB 0.2 s), and
-// one connection stays idle for a seek while the others read ahead. Pieces of the warm part are
-// dealt out among the connections and shrink near its end, each connection's bytes in flight
-// capped at its share of what's left, so the slowest connection doesn't set the time (a box's ran
-// at 0.7-1.7 MiB/s side by side).
+// and SFTP READs can't be called back: so each connection keeps few READs in flight (4 x 255 KiB
+// on a Storage Box, 8 elsewhere: a seek on it would wait behind them), its first READ after it sat
+// idle is small and grows (TCP starts again from a small window: 255 KiB took 0.5 s on an idle
+// connection, 32 KiB 0.2 s), and some connections stay idle for a seek while the others read ahead
+// (2 on a Storage Box, 1 elsewhere). A seek's first few MiB are dealt out in small pieces over every
+// idle connection at once, as one box connection would take seconds for them. Pieces of the warm
+// part are dealt out among the connections and shrink near its end, each connection's bytes in
+// flight capped at its share of what's left, so the slowest connection doesn't set the time (a
+// box's ran at 0.7-1.7 MiB/s side by side). While a stream warms up or a request waits for bytes,
+// the server's downloads keep Play's depth (fetch::Connections::urgent).
 //
 // The scheduler (Plan), the request parsing and the answers are here without sockets, for tests;
 // Server runs them. src/gui/app.cpp starts the player with the address play() gives.
@@ -105,8 +108,12 @@ public:
         std::uint64_t size = 0;
         std::uint64_t ahead = 16 * mib;      // read-ahead in front of each request
         std::uint64_t piece = 2 * mib;       // what a connection takes at a time
-        std::uint64_t seek_piece = 1 * mib;  // where a request waits for bytes nobody fetches
+        std::uint64_t seek_span = 4 * mib;   // a request's first bytes (a seek), dealt out over the idle connections
+        std::uint64_t seek_piece = mib / 2;  // a connection's piece of them
         std::uint64_t min_piece = mib / 4;   // the warm part's pieces near its end, at least
+        // Connections left idle for a seek while the others read ahead: fewer with fewer connections
+        // (one per three, at least one, never all).
+        int spares = 1;
     };
     explicit Plan(Settings settings) : s_(settings) {}
 
@@ -123,11 +130,14 @@ public:
         int reading = 1;     // connections ready or reading, the one asking too
     };
     // The next piece for a connection, marked as taken; nullopt: nothing for it. A request waiting
-    // for bytes nobody fetches comes first (a busy connection leaves it to an idle one, whose READs
-    // aren't queued behind others); then the warm part, dealt out (its very start first, as it
-    // decides how far the start goes; then the end; pieces shrinking near its end); then
-    // read-ahead, the nearest missing bytes first, which an idle connection takes only while
-    // another one stays idle for a seek. `room`: false when the cache is full (no read-ahead).
+    // for its first bytes (a seek) comes first: of its first seek_span bytes, those nobody fetches
+    // yet, in pieces of seek_piece, one to each idle connection (a busy one leaves them to the idle
+    // ones, whose READs aren't queued behind others, and takes one only when none is idle); then
+    // the warm part, dealt out (its very start first, as it decides how far the start goes; then
+    // the end; pieces shrinking near its end); then read-ahead, the nearest missing bytes first,
+    // which a connection takes only while `spares` others stay idle for a seek (fewer with fewer
+    // connections; a busy one too: it goes idle instead). A request's read-ahead starts at seek_span and grows by twice what it
+    // reads, up to `ahead`. `room`: false when the cache is full (no read-ahead).
     [[nodiscard]] std::optional<Piece> next(const Lanes& lanes, bool room = true);
     // Whether next() would give such a connection a piece.
     [[nodiscard]] bool would(const Lanes& lanes, bool room = true) const { return pick(lanes, room).has_value(); }
@@ -158,6 +168,8 @@ public:
     void move_reader(int id, std::uint64_t pos);
     void remove_reader(int id);
     [[nodiscard]] int readers() const { return static_cast<int>(readers_.size()); }
+    // Whether a request waits for bytes not in the cache.
+    [[nodiscard]] bool waiting() const;
 
     // Where the file turned out to end (an EOF before STAT's size).
     void ended_at(std::uint64_t at);
@@ -173,9 +185,12 @@ private:
         int id = 0;
         std::uint64_t pos = 0;
         std::uint64_t last = 0;
+        std::uint64_t from = 0; // where it began
     };
     [[nodiscard]] std::optional<Piece> pick(const Lanes& lanes, bool room) const;
     [[nodiscard]] std::uint64_t window_end(const Reader& r) const;
+    [[nodiscard]] bool waits(const Reader& r) const;              // its next byte isn't in
+    [[nodiscard]] std::uint64_t seek_end(const Reader& r) const;  // the end of its first seek_span bytes
 
     Settings s_;
     std::vector<Reader> readers_;
@@ -190,9 +205,15 @@ private:
 
 // How the server runs; tests shorten the times.
 struct Options {
-    int depth = 8;                          // READs in flight per connection
+    int depth = 8;                          // READs in flight per connection, unless the file says
     std::uint32_t first_read = 32 * 1024;   // a connection's first READ after it sat idle, doubling
     std::chrono::milliseconds idle_restart{250}; // idle that long: its next READ starts small again
+    // Idle this long, a connection the server closed meanwhile isn't a break that counts (the
+    // reads end after 3 in a row): it is replaced, as the pool does with one that sat idle.
+    std::chrono::milliseconds rested_after{5'000};
+    // A kept connection idle this long gets a keepalive (Session::keepalive): a NAT or firewall
+    // dropping idle links silently would leave a seek after a pause waiting the session's timeout.
+    std::chrono::milliseconds keepalive{45'000};
     std::uint64_t drop_over = 2 * mib;      // a stop with more on its way drops the connection
     std::uint64_t stream_cap = 192 * mib;   // a stream's cache, at most
     std::size_t kept = 2;                   // streams that keep their data while not in use
@@ -200,8 +221,11 @@ struct Options {
     std::size_t max_clients = 16;           // requests at once; more are closed at once
     std::size_t max_head = std::size_t{16} << 10;       // a request's head, at most
     std::chrono::milliseconds head_within{10'000}; // all of it within this
-    std::chrono::milliseconds release_after{10'000}; // connections back this long after the last request
-    std::chrono::milliseconds free_after{300'000};   // data freed this long after the last request
+    // Connections back this long after the last request once another user of the server waits for
+    // a seat (a download, another Play); while none waits they stay until the data goes, so a seek
+    // after a pause needs no login.
+    std::chrono::milliseconds release_after{10'000};
+    std::chrono::milliseconds free_after{300'000};   // data freed (and connections back) this long after the last request
     std::chrono::milliseconds start_within{60'000};  // the player starts by then while bytes come
     std::chrono::milliseconds stalled_after{30'000}; // no bytes this long: the start (or a request) fails
     std::chrono::milliseconds housekeeping{1'000};
@@ -223,6 +247,8 @@ public:
         int connections = 2;              // the burst, for the whole film (decision 2)
         int logins_at_once = 0;           // for its logins; 0: the pool's own
         std::uint64_t ahead = 16 * mib;   // read-ahead in front of each request
+        int depth = 0;                    // READs in flight per connection; 0: Options::depth
+        int spares = 1;                   // connections left idle for a seek once the warm part is in
         bool close_on_release = false;    // engine = rclone: rclone can't see idle pool connections
     };
     // Bytes of the warm part in so far, and in all.
@@ -241,6 +267,7 @@ public:
         std::uint64_t cached = 0; // bytes in all caches
         std::uint64_t ahead = 0;  // bytes of read-ahead handed out, ever
         int connected = 0;        // connections held
+        int idle = 0;             // of them, with nothing on their way
         int seats = 0;            // seats held
         int clients = 0;          // requests being answered
     };

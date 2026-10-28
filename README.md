@@ -252,9 +252,15 @@ too and goes on without them.
     - **Connections:** Play takes up to 8 of a Storage Box's connections (2 elsewhere) for the
       whole video, paused too, ahead of downloads: downloads from that server step aside for
       it (it gets fewer beside several of them) and get them back 10 s after the player stops
-      reading. One of them stays idle for a seek. On a Storage Box its logins go 8 at once.
-    - A seek outside what's in memory goes to that idle connection: 0.4–0.7 s on a fast server,
-      about 1 s on a Storage Box, whose connections give 1–2.5 MB/s each.
+      reading. While nothing else uses that server, Play keeps them until it frees the file
+      (five minutes), so a seek after a pause needs no new login. Two of them stay idle for a
+      seek on a Storage Box (one elsewhere; fewer when Play has only a few). While Play fetches the start or a seek, the downloads from that server
+      keep as few requests on their way as Play does, so they don't hold its bytes back; a
+      download that steps aside with little on its way hands its connection to Play, no login
+      needed. On a Storage Box its logins go 8 at once.
+    - A seek outside what's in memory gets its first 4 MiB in small pieces over every idle
+      connection at once: 0.4–0.7 s on a fast server, longer on a Storage Box, whose
+      connections give 1–2.5 MB/s each.
     - When grab can't log in (a key not in ssh-agent, a host key not trusted yet) Play says why
       ("Can't play <name>: ..."); a file that gets no bytes for 30 s stops with the reason.
     - A Store app as the default player (Films & TV) can't open a stream; grab says so.

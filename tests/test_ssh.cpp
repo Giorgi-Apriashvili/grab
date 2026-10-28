@@ -613,6 +613,12 @@ TEST_CASE("ssh: live login, SFTP and a command (GRAB_TEST_SSH)") {
     REQUIRE(entries);
     CHECK_FALSE(entries->empty());
     CHECK(c.received() > 0);
+    // A keepalive on the idle SFTP session (Play's kept connections): no answer comes, SFTP goes on.
+    CHECK(c.keepalive());
+    const auto again = sftp::realpath(s, ".");
+    REQUIRE(again);
+    CHECK(*again == *home);
+    CHECK_FALSE(c.dropped());
 }
 
 // Phase 4's check of exec on a real server, on one login: EOF, keepalives, cancel and the cap.

@@ -88,6 +88,7 @@ public:
     Socket(const Socket&) = delete;
     Socket& operator=(const Socket&) = delete;
     [[nodiscard]] bool ok() const { return ok_; }
+    [[nodiscard]] SOCKET sock() const { return s_; }
     void close_now() { shutdown(s_, SD_BOTH); } // the server's sends and waits on it end
     bool send(std::string_view data) {
         while (!data.empty()) {
@@ -184,6 +185,31 @@ bool within(std::chrono::milliseconds limit, F done) {
 struct Bare : ssh::Session {
     sftp::Client& sftp() override { throw sftp::Broken("no SFTP here"); }
 };
+
+// A player's seek: a request from `at` to the end, `n` bytes read, then the connection closed (as
+// ffmpeg ends after its first frame). The time it took and whether the bytes were right.
+struct Seek {
+    std::chrono::duration<double> took{};
+    bool right = false;
+};
+Seek seek(const Url& u, const std::string& content, std::uint64_t at, std::uint64_t n) {
+    const auto t0 = std::chrono::steady_clock::now();
+    Socket s(u.port);
+    if (!s.ok()) return {};
+    s.send(std::format("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nRange: bytes={}-\r\n\r\n", u.path, u.port, at));
+    std::string in;
+    std::array<char, 65536> buf{};
+    std::size_t body = std::string::npos;
+    while (body == std::string::npos || in.size() - body < n) {
+        const int got = ::recv(s.sock(), buf.data(), static_cast<int>(buf.size()), 0);
+        if (got <= 0) break;
+        in.append(buf.data(), static_cast<std::size_t>(got));
+        if (body == std::string::npos && in.find("\r\n\r\n") != std::string::npos) body = in.find("\r\n\r\n") + 4;
+    }
+    Seek out{.took = std::chrono::steady_clock::now() - t0};
+    out.right = body != std::string::npos && in.size() - body >= n && in.substr(body, n) == content.substr(at, n);
+    return out;
+}
 
 } // namespace
 
@@ -297,36 +323,61 @@ TEST_CASE("play: answers to whole files, one range, a suffix, past the end, seve
     CHECK_FALSE(play::same_token("", "a"));
 }
 
-TEST_CASE("play: a request waiting for bytes comes first, from an idle connection, then read-ahead with one kept for a seek") {
-    play::Plan p({.size = 100 * mib, .ahead = 16 * mib});
+TEST_CASE("play: a seek's first bytes in small pieces over the idle connections; read-ahead grows with the request, spares stay idle") {
+    play::Plan p({.size = 100 * mib, .ahead = 16 * mib, .spares = 2});
     const int r = p.add_reader(50 * mib, 100 * mib - 1);
-    // A busy connection leaves the waiting request's bytes to an idle one (its READs would wait
-    // behind the busy one's); it may read ahead further on.
-    auto busy = p.next(lanes(true, 1, 3));
-    REQUIRE(busy);
-    CHECK(busy->kind == Kind::ahead);
-    CHECK(busy->start > 50 * mib);
-    p.taken.remove(busy->start, busy->end);
-    // The idle one: a small piece where the request waits.
-    CHECK(p.next(lanes(false, 1, 3)) == Piece{.start = 50 * mib, .end = 51 * mib, .kind = Kind::waiting});
-    // Read-ahead: the nearest missing bytes, while another connection stays idle.
-    CHECK(p.next(lanes(false, 1, 3)) == Piece{.start = 51 * mib, .end = 53 * mib, .kind = Kind::ahead});
-    CHECK_FALSE(p.next(lanes(false, 0, 3)).has_value()); // the last idle one stays for a seek
-    CHECK(p.next(lanes(true, 0, 3)) == Piece{.start = 53 * mib, .end = 55 * mib, .kind = Kind::ahead});
-    CHECK(p.next(lanes(false, 0, 1)) == Piece{.start = 55 * mib, .end = 57 * mib, .kind = Kind::ahead}); // alone: no spare
-    CHECK_FALSE(p.next(lanes(false, 1, 3), false).has_value()); // the cache is full
-    // Up to 16 MiB ahead of the request, no further.
-    while (p.next(lanes(false, 1, 3))) {
+    CHECK(p.waiting());
+    // A busy connection leaves the request's first bytes to the idle ones (its READs would wait
+    // behind its others), and takes no read-ahead while fewer than 2 others are idle.
+    CHECK_FALSE(p.next(lanes(true, 1, 8)).has_value());
+    // Each idle connection: a small piece of the first 4 MiB; a busy one only when none is idle.
+    for (std::uint64_t i = 0; i < 6; ++i) {
+        CHECK(p.next(lanes(false, 7 - static_cast<int>(i), 8)) ==
+              Piece{.start = 50 * mib + i * mib / 2, .end = 50 * mib + (i + 1) * mib / 2, .kind = Kind::waiting});
     }
-    CHECK(p.taken.until(50 * mib) == 66 * mib);
+    CHECK(p.next(lanes(true, 0, 8)) == Piece{.start = 53 * mib, .end = 53 * mib + mib / 2, .kind = Kind::waiting});
+    CHECK(p.next(lanes(false, 0, 8)) == Piece{.start = 53 * mib + mib / 2, .end = 54 * mib, .kind = Kind::waiting});
+    // Until it reads them, they are all its read-ahead: a seek that ends soon (ffmpeg's first frame,
+    // a player scrubbing) leaves the other connections idle.
+    CHECK_FALSE(p.next(lanes(false, 7, 8)).has_value());
+    // It read them: read-ahead grows by twice that (12 MiB in front), nearest first, while 2 others stay idle.
+    p.have.add(50 * mib, 54 * mib);
+    p.taken.remove(50 * mib, 54 * mib);
+    p.move_reader(r, 54 * mib);
+    CHECK(p.waiting()); // for its next byte, past its first ones: read-ahead brings it
+    CHECK(p.next(lanes(false, 2, 8)) == Piece{.start = 54 * mib, .end = 56 * mib, .kind = Kind::ahead});
+    CHECK_FALSE(p.next(lanes(false, 1, 8)).has_value()); // a spare
+    CHECK_FALSE(p.next(lanes(true, 1, 8)).has_value());  // goes idle: a spare again
+    CHECK(p.next(lanes(true, 2, 8)) == Piece{.start = 56 * mib, .end = 58 * mib, .kind = Kind::ahead});
+    CHECK_FALSE(p.next(lanes(false, 0, 2)).has_value());                                                // two: one spare
+    CHECK(p.next(lanes(false, 0, 1)) == Piece{.start = 58 * mib, .end = 60 * mib, .kind = Kind::ahead}); // alone: none
+    // Three to five: one spare (two read ahead); six to eight: two.
+    CHECK_FALSE(p.next(lanes(false, 0, 3)).has_value());
+    CHECK_FALSE(p.next(lanes(false, 1, 6)).has_value());
+    CHECK(p.next(lanes(false, 1, 3)) == Piece{.start = 60 * mib, .end = 62 * mib, .kind = Kind::ahead});
+    CHECK(p.next(lanes(false, 1, 5)) == Piece{.start = 62 * mib, .end = 64 * mib, .kind = Kind::ahead});
+    p.taken.remove(60 * mib, 64 * mib);
+    CHECK_FALSE(p.next(lanes(false, 2, 8), false).has_value()); // the cache is full
+    while (p.next(lanes(false, 2, 8))) {
+    }
+    CHECK(p.taken.until(54 * mib) == 66 * mib);
     CHECK(p.wanted(60 * mib));
     CHECK_FALSE(p.wanted(40 * mib)); // behind it
     CHECK_FALSE(p.wanted(90 * mib)); // far ahead
-    // A seek: the request goes elsewhere; what it no longer needs isn't wanted any more.
-    p.move_reader(r, 10 * mib);
-    CHECK_FALSE(p.wanted(60 * mib));
-    CHECK(p.next(lanes(false, 1, 3)) == Piece{.start = 10 * mib, .end = 11 * mib, .kind = Kind::waiting});
+    // 20 MiB read: 16 MiB in front at most.
+    p.move_reader(r, 70 * mib);
+    CHECK(p.wanted(87 * mib)); // up to a piece past it, for a piece taken at its edge
+    CHECK_FALSE(p.wanted(88 * mib));
+    // Past its first bytes, a request still waiting gets read-ahead, the spares staying idle.
+    CHECK(p.waiting());
+    CHECK_FALSE(p.next(lanes(false, 1, 8)).has_value());
+    CHECK(p.next(lanes(false, 2, 8)) == Piece{.start = 70 * mib, .end = 72 * mib, .kind = Kind::ahead});
+    // A seek: the request goes, another begins elsewhere; what the first wanted isn't wanted any more.
     p.remove_reader(r);
+    CHECK_FALSE(p.wanted(70 * mib));
+    p.add_reader(10 * mib, 100 * mib - 1);
+    CHECK(p.next(lanes(false, 7, 8)) == Piece{.start = 10 * mib, .end = 10 * mib + mib / 2, .kind = Kind::waiting});
+    p.remove_reader(r + 1);
     CHECK_FALSE(p.any_work());
     CHECK_FALSE(p.wanted(10 * mib));
 }
@@ -502,8 +553,8 @@ TEST_CASE("play: a seek is served from the idle connection at once, not behind t
     t.fake.slow_from_now = 2;
     std::atomic<bool> done{false};
     Response early;
-    std::thread reader([&] {
-        early = ask(*u, "Range: bytes=20971520-62914559\r\n");
+    std::thread reader([&] { // from the start, which is in: its read-ahead takes two connections
+        early = ask(*u, "Range: bytes=0-62914559\r\n");
         done = true;
     });
     std::this_thread::sleep_for(500ms); // the reads ahead of it are on their way
@@ -516,13 +567,13 @@ TEST_CASE("play: a seek is served from the idle connection at once, not behind t
     t.fake.slow_from_now = 0; // the other request may finish quickly now
     reader.join();
     CHECK(done);
-    CHECK(early.body == t.content.substr(20971520, 41943040));
+    CHECK(early.body == t.content.substr(0, 62914560));
 }
 
-TEST_CASE("play: an idle stream gives its connections and seats back, then its data, and is played again by its id") {
+TEST_CASE("play: an idle stream nobody waits behind keeps its connections until its data goes; its id stays for a later request") {
     play::Server::Options o;
     o.release_after = 200ms;
-    o.free_after = 600ms;
+    o.free_after = 1500ms;
     o.housekeeping = 50ms;
     const std::uint64_t size = 30 * mib;
     Played t(size, o);
@@ -533,19 +584,20 @@ TEST_CASE("play: an idle stream gives its connections and seats back, then its d
     CHECK(ask(*u, "Range: bytes=10000000-10999999\r\n").body == t.content.substr(10000000, 1000000));
     auto stats = t.server->stats();
     CHECK(stats.connected > 0);
-    // Connections and seats back release_after after the last request.
-    for (int i = 0; i < 100 && (stats.connected > 0 || stats.seats > 0); ++i) {
+    // Nobody waits for a seat: past release_after they stay (a seek after a pause needs no login).
+    std::this_thread::sleep_for(400ms);
+    stats = t.server.value().stats();
+    CHECK(stats.connected == 2);
+    CHECK(stats.seats == 2);
+    // The data free_after after the last request (review G141, G145), and with it the connections
+    // and seats; the id stays.
+    for (int i = 0; i < 100 && (stats.with_data > 0 || stats.connected > 0 || stats.seats > 0); ++i) {
         std::this_thread::sleep_for(50ms);
         stats = t.server->stats();
     }
     CHECK(stats.connected == 0);
     CHECK(stats.seats == 0);
     CHECK(t.pool->idle() > 0); // back in the pool, open for the next user
-    // The data free_after after it (review G141, G145); the id stays.
-    for (int i = 0; i < 100 && stats.with_data > 0; ++i) {
-        std::this_thread::sleep_for(50ms);
-        stats = t.server->stats();
-    }
     CHECK(stats.with_data == 0);
     CHECK(stats.cached == 0);
     CHECK(stats.streams == 1);
@@ -787,6 +839,8 @@ TEST_CASE("play: a Play over its share hands a seat to a waiting download betwee
 TEST_CASE("play: engine = rclone closes Play's connections as they go back, leaving none idle in the pool") {
     play::Server::Options o;
     o.release_after = 200ms;
+    o.free_after = 500ms; // nobody waits for a seat: they go back with the data
+    o.housekeeping = 50ms;
     Played t(30 * mib, o);
     auto f = t.file(2);
     f.close_on_release = true;
@@ -849,4 +903,184 @@ TEST_CASE("play: the server stops at once with a player that stopped reading and
     const auto t0 = std::chrono::steady_clock::now();
     t.server.reset();
     CHECK(std::chrono::steady_clock::now() - t0 < 1500ms);
+}
+
+namespace {
+
+// The logins whose READs asked for some of [from, to): after the server and the pool are gone.
+int asked_by(test::FakePool& fake, std::uint64_t from, std::uint64_t to) {
+    std::scoped_lock lock(fake.mutex);
+    int n = 0;
+    for (const auto& [login, reads] : fake.reads_by) {
+        n += std::ranges::any_of(reads, [&](const auto& r) { return r.first < to && r.first + r.second > from; }) ? 1 : 0;
+    }
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("play: on slow connections a seek's first bytes come over several at once; one right after another and one after a pause need no login") {
+    play::Server::Options o;
+    o.release_after = 300ms;
+    o.housekeeping = 50ms;
+    const std::uint64_t size = 256 * mib; // its 97 % is 3.7 MiB short of the warm part's last 4 MiB
+    Played t(size, o, 14);
+    t.fake.shared = true;
+    t.fake.slice = std::size_t{16} << 10;
+    t.fake.slow_all = 10ms; // about 1.6 MiB/s per connection, as a Storage Box's
+    auto f = t.file(8);     // a Storage Box's counts (src/gui/app.cpp)
+    f.ahead = 32 * mib;
+    f.depth = 4;
+    f.spares = 2;
+    const auto address = t.start(std::move(f));
+    REQUIRE_MESSAGE(address, address.error());
+    const auto u = url_of(*address);
+    REQUIRE(u);
+    const int logins = t.fake.logins.load();
+    // As ffmpeg's first frame: 3 MiB from the seek, then the connection closed (chunk D's box runs:
+    // 1.7-1.9 s, and 3.2-3.6 s for the one right after; here 2.0 and 3.0 s before chunk E).
+    const std::uint64_t half = size / 2;
+    const std::uint64_t near_end = size / 100 * 97;
+    const auto first = seek(*u, t.content, half, 3 * mib);
+    CHECK(first.right);
+    CHECK(first.took < 1500ms);
+    const auto next = seek(*u, t.content, near_end, 3 * mib); // its connections still busy with the first one's
+    CHECK(next.right);
+    CHECK(next.took < 3s);
+    // A pause past release_after with nobody waiting for a seat: the connections stay.
+    std::this_thread::sleep_for(1s);
+    CHECK(t.server.value().stats().connected == 8);
+    const auto after = seek(*u, t.content, size / 4, 3 * mib);
+    CHECK(after.right);
+    CHECK(after.took < 1500ms);
+    CHECK(t.fake.logins.load() == logins);
+    t.server.reset();
+    t.pool.reset(); // the sessions close and say what they were asked for
+    CHECK(asked_by(t.fake, half, half + 4 * mib) >= 6);
+    CHECK(asked_by(t.fake, near_end, near_end + 4 * mib) >= 3);
+}
+
+TEST_CASE("play: an idle stream gives its connections back at once when a download waits for a seat; the download takes them without a login") {
+    play::Server::Options o;
+    o.release_after = 200ms;
+    o.free_after = 30s;
+    o.housekeeping = 50ms;
+    Played t(30 * mib, o, 2);
+    const auto address = t.start(t.file(2));
+    REQUIRE_MESSAGE(address, address.error());
+    const auto u = url_of(*address);
+    REQUIRE(u);
+    CHECK(ask(*u, "Range: bytes=10000000-10999999\r\n").body == t.content.substr(10000000, 1000000));
+    std::this_thread::sleep_for(500ms);
+    CHECK(t.server.value().stats().seats == 2); // nobody waits: kept
+    const int logins = t.fake.logins.load();
+    const int download = t.connections.new_id();
+    t.connections.join("Main", download, 2);
+    std::stop_source give_up;
+    std::jthread limit([&](const std::stop_token& stop) {
+        for (int i = 0; i < 100 && !stop.stop_requested(); ++i) std::this_thread::sleep_for(50ms);
+        give_up.request_stop();
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool seated = t.connections.acquire("Main", download, give_up.get_token(), false);
+    CHECK(seated);
+    CHECK(std::chrono::steady_clock::now() - t0 < 1500ms);
+    limit.request_stop();
+    {
+        const auto lease = t.pool->acquire();
+        CHECK(lease.has_value());
+        CHECK(t.fake.logins.load() == logins); // Play's connection, back in the pool
+    }
+    if (seated) t.connections.release("Main", download);
+    t.connections.leave("Main", download);
+    // The stream plays on, its connections taken again.
+    CHECK(ask(*u, "Range: bytes=20000000-20999999\r\n").body == t.content.substr(20000000, 1000000));
+}
+
+TEST_CASE("play: an idle stream gives its connections back to a download that holds some below its share and never waits") {
+    play::Server::Options o;
+    o.release_after = 200ms;
+    o.free_after = 30s;
+    o.housekeeping = 50ms;
+    Played t(30 * mib, o, 8);
+    const auto address = t.start(t.file(2));
+    REQUIRE_MESSAGE(address, address.error());
+    const auto u = url_of(*address);
+    REQUIRE(u);
+    CHECK(ask(*u, "Range: bytes=10000000-10999999\r\n").body == t.content.substr(10000000, 1000000));
+    std::this_thread::sleep_for(500ms);
+    CHECK(t.server.value().stats().seats == 2); // nobody else on the server: kept
+    // A folder's big file held to its share by Play's weight (8 × 2/6): it takes one at once and
+    // never waits, so only holding one tells Play it's there.
+    const int download = t.connections.new_id();
+    t.connections.join("Main", download, 2);
+    CHECK(t.connections.share("Main", download) < 8);
+    const bool seated = t.connections.acquire("Main", download, {}, false);
+    CHECK(seated);
+    CHECK(within(o.release_after + 1s, [&] { return t.server.value().stats().seats == 0; }));
+    CHECK(within(1s, [&] { return t.connections.share("Main", download) == 8; })); // Play left
+    if (seated) t.connections.release("Main", download);
+    t.connections.leave("Main", download);
+}
+
+TEST_CASE("play: kept idle connections get keepalives; one whose link failed is dropped, and the next request logs in again") {
+    play::Server::Options o;
+    o.keepalive = 200ms;
+    Played t(40 * mib, o, 4);
+    const auto address = t.start(t.file(2));
+    REQUIRE_MESSAGE(address, address.error());
+    const auto u = url_of(*address);
+    REQUIRE(u);
+    CHECK(ask(*u, "Range: bytes=10000000-10999999\r\n").body == t.content.substr(10000000, 1000000));
+    CHECK(within(2s, [&] { return t.fake.pings.load() >= 2; }));
+    CHECK(t.server.value().stats().connected == 2);
+    const int logins = t.fake.logins.load();
+    t.fake.closed = logins; // the links died meanwhile
+    CHECK(within(2s, [&] { return t.server.value().stats().connected == 0; }));
+    CHECK(t.server.value().stats().seats == 2); // the seats stay
+    CHECK(ask(*u, "Range: bytes=30000000-30999999\r\n").body == t.content.substr(30000000, 1000000));
+    CHECK(t.fake.logins.load() > logins);
+}
+
+TEST_CASE("play: kept connections the server closed during a pause are replaced, and the request after it is served") {
+    play::Server::Options o;
+    o.rested_after = 300ms;
+    Played t(40 * mib, o, 4);
+    const auto address = t.start(t.file(4));
+    REQUIRE_MESSAGE(address, address.error());
+    const auto u = url_of(*address);
+    REQUIRE(u);
+    CHECK(ask(*u, "Range: bytes=10000000-10999999\r\n").body == t.content.substr(10000000, 1000000));
+    std::this_thread::sleep_for(600ms);
+    CHECK(t.server.value().stats().connected == 4);
+    const int logins = t.fake.logins.load();
+    t.fake.closed = logins; // every connection kept: closed by the server meanwhile
+    // Four breaks in a row, none of them counting: each connection is replaced.
+    CHECK(ask(*u, "Range: bytes=30000000-30999999\r\n").body == t.content.substr(30000000, 1000000));
+    CHECK(t.fake.logins.load() > logins);
+}
+
+TEST_CASE("play: while a stream warms up or a request waits for bytes, the server's downloads keep Play's depth; then their own again") {
+    Played t(64 * mib);
+    t.fake.slice = std::size_t{16} << 10;
+    t.fake.slow_all = 5ms; // the warm part takes a while
+    auto f = t.file(2);
+    f.depth = 4;
+    CHECK(t.connections.read_depth("Main", fetch::grab_depth) == fetch::grab_depth);
+    std::expected<std::string, std::string> address;
+    std::thread play([&] { address = t.start(f); });
+    CHECK(within(2s, [&] { return t.connections.read_depth("Main", fetch::grab_depth) == 4; }));
+    play.join();
+    REQUIRE_MESSAGE(address, address.error());
+    // In, and no request: back to their own depth urgent_hold later.
+    CHECK(within(fetch::urgent_hold + 2s, [&] { return t.connections.read_depth("Main", fetch::grab_depth) == fetch::grab_depth; }));
+    const auto u = url_of(*address);
+    REQUIRE(u);
+    // A request for bytes not in the cache waits for them.
+    Response r;
+    std::thread player([&] { r = ask(*u, "Range: bytes=40000000-49999999\r\n"); });
+    CHECK(within(2s, [&] { return t.connections.read_depth("Main", fetch::grab_depth) == 4; }));
+    player.join();
+    CHECK(r.body == t.content.substr(40000000, 10000000));
+    CHECK(within(fetch::urgent_hold + 2s, [&] { return t.connections.read_depth("Main", fetch::grab_depth) == fetch::grab_depth; }));
 }

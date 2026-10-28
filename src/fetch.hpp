@@ -45,6 +45,14 @@ inline constexpr std::uint64_t min_split = std::uint64_t{4} << 20;
 inline constexpr std::uint64_t min_split_grab = std::uint64_t{1} << 20;
 // READs grab's engine keeps in flight per connection (a Storage Box connection's speed follows it).
 inline constexpr int grab_depth = 64;
+// A stream stepping aside with at most this much on its way waits for it (and writes it) and hands
+// its connection to the pool, where Play or another download takes it without a login: about a
+// second on a Storage Box connection (1.3-2.5 MiB/s), less than its login (1.3-3.5 s). More is
+// dropped with the connection, as the waiter would wait for it.
+inline constexpr std::uint64_t hand_over_max = std::uint64_t{2} << 20;
+// How long downloads keep Play's depth after its stream stopped being urgent (Connections::urgent):
+// a player reads in bursts, each of which would find the downloads' queues full again.
+inline constexpr std::chrono::seconds urgent_hold{2};
 inline constexpr int max_retries = 6; // per range, before the download fails
 // A server that refuses every connection this long, with no data meanwhile, fails the download:
 // it is full with something else's connections (review G9).
@@ -204,6 +212,17 @@ public:
     // (e.g. one just joined), gives one up and returns true; the caller then stops that stream
     // and must not release it again.
     bool yield_if_over_share(const std::string& server, int id);
+    // Whether a user of the server other than `id` holds or waits for a connection (Play's idle
+    // streams then give theirs back: one held to its share by Play's weight never waits).
+    [[nodiscard]] bool others_present(const std::string& server, int id);
+    // Play (play_stream.hpp): `depth` > 0 while its stream `id` on the server warms up or has a
+    // request waiting for bytes; 0 once it no longer does. Meanwhile, and urgent_hold after, the
+    // server's downloads keep at most that many READs in flight per connection, Play's own: a
+    // Storage Box shares itself among READs in flight and a link fills its queues, so a download's
+    // 64 per connection would hold Play's bytes back.
+    void urgent(const std::string& server, int id, int depth);
+    // READs a download's connection may keep in flight now: `normal`, or Play's depth (above).
+    [[nodiscard]] int read_depth(const std::string& server, int normal);
     // A connection of this server was refused; call while it still counts as open.
     void refused(const std::string& server);
     // How many refusals this server has had so far: a download that ends with the same number it
@@ -223,6 +242,11 @@ private:
     std::condition_variable_any changed_;
     std::map<std::string, budget::ServerPool> pools_;
     std::map<std::string, std::uint64_t> refusals_;
+    struct Urgent {
+        int depth = 0;
+        std::chrono::steady_clock::time_point until; // max: while it is urgent
+    };
+    std::map<std::string, std::map<int, Urgent>> urgent_; // server -> Play's streams
     OnLearned on_learned_;
 };
 

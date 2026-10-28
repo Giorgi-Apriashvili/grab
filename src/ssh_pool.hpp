@@ -60,6 +60,9 @@ public:
                                                                     const ExecOptions& options);
     // The login itself; nullptr where there is none (tests).
     [[nodiscard]] virtual Connection* connection() { return nullptr; }
+    // Connection::keepalive, for a borrower keeping it idle (Play through a pause); true where
+    // there is no login. false: the link failed, drop the lease as broken.
+    virtual bool keepalive() { return connection() == nullptr || connection()->keepalive(); }
     // Whether the next borrower may have it: no SFTP reply still on its way, which would reach
     // a request the next one never made, no command cut short on it (Connection::dropped), and
     // no SFTP that failed to start.

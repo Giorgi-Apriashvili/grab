@@ -353,12 +353,18 @@ constexpr int preview_extra_other = 2;
 // whose connections give 0.7-2.5 MiB/s each, 2 elsewhere (one of Main's reaches its link, the
 // other stays idle for a seek); fewer beside downloads from that server, as Play's High share
 // allows. Its logins 8 at once on a Storage Box (box part 1: accepted, 0.7 s sooner than 4), the
-// pool's 4 elsewhere (Main's fail2ban). Read-ahead in front of each of the player's requests.
+// pool's 4 elsewhere (Main's fail2ban). Read-ahead in front of each of the player's requests. READs
+// in flight per connection: 4 on a Storage Box (as fast there as 8, and half the wait behind them),
+// 8 elsewhere (Main's link fills at 8); connections kept idle for a seek once the warm part is in.
 constexpr int play_burst_box = 8;
 constexpr int play_burst_other = 2;
 constexpr int play_logins_box = 8;
 constexpr std::uint64_t play_ahead_box = std::uint64_t{32} << 20;
 constexpr std::uint64_t play_ahead_other = std::uint64_t{16} << 20;
+constexpr int play_depth_box = 4;
+constexpr int play_depth_other = 8;
+constexpr int play_spares_box = 2;
+constexpr int play_spares_other = 1;
 
 } // namespace
 
@@ -605,6 +611,8 @@ void App::run_play(const PlayJob& job, const std::stop_token& stop) {
                             .connections = box ? play_burst_box : play_burst_other,
                             .logins_at_once = box ? play_logins_box : 0,
                             .ahead = box ? play_ahead_box : play_ahead_other,
+                            .depth = box ? play_depth_box : play_depth_other,
+                            .spares = box ? play_spares_box : play_spares_other,
                             .close_on_release = ctx->engine != Engine::grab};
     std::string address;
     {
