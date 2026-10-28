@@ -23,7 +23,6 @@ int guess(std::string_view key) {
     if (kind == "walk") return 10000;
     if (kind == "list.find") return 4000;
     if (kind == "list.walk") return 20000;
-    if (kind == "serve") return 2000;
     if (kind == "update") return 2000;
     return 3000;
 }

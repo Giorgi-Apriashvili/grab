@@ -168,29 +168,31 @@ rclone_edit_updates(const ini::Section& current, const servers::NewServer& wante
 [[nodiscard]] std::expected<void, std::string> set_default(const Env& env, std::string_view name);
 
 struct TestResult {
-    bool rclone_ok = false;
+    // rclone's listing, only on engine = rclone servers (their downloads, searches and lists go
+    // through rclone); engine = grab ones use rclone for nothing a test can show.
+    std::optional<bool> rclone_ok;
     std::string rclone_error;
     std::optional<bool> ssh_ok; // only for engine = rclone servers searched with ssh + find
     std::string ssh_error;
-    // grab's own client: on engine = grab for downloads, searches and verification, on the others
-    // for verification, which every server runs through it.
+    // grab's own client: on engine = grab for downloads, searches, previews, Play and verification,
+    // on the others for previews, Play and verification, which every server runs through it.
     std::optional<bool> grab_ok;
     std::string grab_error;
     bool grab_engine = false; // engine = grab
     std::string grab_search;  // engine = grab, grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
     std::string checksums;    // grab_ok: "checksums: md5sum", or why verification can't run there
-    // grab's own login counts on engine = grab only: on engine = rclone it only verifies (off by
-    // default), so a failure there is a warning, not a failed test.
+    // grab's own login counts on engine = grab only: on engine = rclone the downloads go through
+    // rclone, so a failure there is a warning (no previews, Play or verification), not a failed test.
     [[nodiscard]] bool ok() const {
-        return rclone_ok && ssh_ok.value_or(true) && (!grab_engine || grab_ok.value_or(true));
+        return rclone_ok.value_or(true) && ssh_ok.value_or(true) && (!grab_engine || grab_ok.value_or(false));
     }
 };
 
-// The paths searches, downloads and verification use: an rclone listing (on engine = grab still
-// the way to preview), plus an ssh login (BatchMode) for engine = rclone servers searched with ssh
-// + find. Then a login through grab's own client and its hash check, which says whether downloads
-// can be verified there (ssh_hash.hpp); on engine = grab also the home folder listed over SFTP and
-// the find check, which says how its searches go.
+// The paths searches, downloads, previews, Play and verification use. On engine = rclone an rclone
+// listing, plus an ssh login (BatchMode) for servers searched with ssh + find. On every server a
+// login through grab's own client and its hash check, which says whether downloads can be verified
+// there (ssh_hash.hpp); on engine = grab also the home folder listed over SFTP and the find check,
+// which says how its searches go.
 [[nodiscard]] std::expected<TestResult, std::string> test_connection(const Env& env, std::string_view name,
                                                                      std::stop_token stop = {});
 

@@ -224,7 +224,7 @@ too and goes on without them.
   - The sort stays, across searches, folders and restarts, until you change it.
 - **The status bar shows what grab is doing** whenever something takes a while, with a loading
   bar: "Listing movies on Box.Guest… 12 items so far", "Searching Main with ssh + find… 37
-  found so far", "Starting a stream from Box.Guest", "Loading cover.jpg: 3.2 of 8.0 MiB",
+  found so far", "Preparing S04E07.mkv: 18 of 38 MiB", "Loading cover.jpg: 3.2 of 8.0 MiB",
   "Refreshing Box.Guest's file list: 3,100 of ~4,925 entries".
   - The bar shows real progress where grab can count (bytes, entries against the last list,
     servers searched); otherwise it fills over how long the same step took last time on that
@@ -238,19 +238,25 @@ too and goes on without them.
   - **Videos and audio** play in the program Windows uses for them (VLC, MPC-HC, mpv...),
     streamed from the server, with seeking and the subtitles inside the file.
     - **Warm start:** what a player reads while it opens a file (its start up to the first
-      video plus 8 MiB, and its last 4 MiB) is fetched first, over up to 6 connections at once
-      from the server's budget, and the player starts once it is in: it then opens at once.
-      The status bar shows "Preparing <name>: 18 of 38 MiB". This matters on a Storage Box,
-      where each read starts slowly: an anime release with 28 MB of subtitle fonts before its
-      first frame opened in ~12 s instead of 20–28 s (MPC-HC gave up after ~10 s), and an AVI
-      in 8 s instead of 29 s.
-    - The player gets grab's own address (a small server on this PC only: 127.0.0.1, a random
-      port and secret path); everything else comes from a read-only `rclone serve http` for the
-      server, started meanwhile and stopped with the window. A file's warm part stays in memory
-      while it is played (two files at most, five minutes after their last read).
-    - A seek outside the warm part takes about 1 s on a fast server and 2–8 s on a Storage Box.
-      A Storage Box streams at about 2.5 MB/s (its cap per connection): plenty for a 1080p
-      release, not for a big remux.
+      video plus 8 MiB, and its last 4 MiB) is fetched first, and the player starts once it is
+      in: it then opens at once (MPC-HC gives up after ~10 s on a file that comes slowly). The
+      status bar shows "Preparing <name>: 18 of 38 MiB". An anime release with 28 MB of
+      subtitle fonts before its first frame shows it about 3 s after the double-click from a
+      fast server (9–15 s when rclone served it).
+    - Every byte comes over grab's own SSH connections to the server, whatever its engine
+      (previews and Play never start rclone). The player gets grab's own address (a small
+      server on this PC only: 127.0.0.1, a random port and secret path); grab reads ahead of
+      what the player reads (32 MiB on a Storage Box, 16 MiB elsewhere) and keeps up to 192 MiB
+      of a file in memory, two files at most once nothing plays them, freed five minutes after
+      their last read.
+    - **Connections:** Play takes up to 8 of a Storage Box's connections (2 elsewhere) for the
+      whole video, paused too, ahead of downloads: downloads from that server step aside for
+      it (it gets fewer beside several of them) and get them back 10 s after the player stops
+      reading. One of them stays idle for a seek. On a Storage Box its logins go 8 at once.
+    - A seek outside what's in memory goes to that idle connection: 0.4–0.7 s on a fast server,
+      about 1 s on a Storage Box, whose connections give 1–2.5 MB/s each.
+    - When grab can't log in (a key not in ssh-agent, a host key not trusted yet) Play says why
+      ("Can't play <name>: ..."); a file that gets no bytes for 30 s stops with the reason.
     - A Store app as the default player (Films & TV) can't open a stream; grab says so.
   - **Images, text files and PDFs** open in a viewer over the list: ←/→ go through the list's
     others (fetched ahead), Esc or Space closes, and Download saves the one shown.
@@ -266,12 +272,8 @@ too and goes on without them.
       for a big image or PDF. Moving on cancels the one still loading. A login that fails is
       tried again only after Test, Trust or a save in Settings (or 30 s, when it may pass by
       itself), so flipping through images never hammers a server that refuses you.
-  - Play's streams come from `rclone serve http`, which reads every folder on the way to a file, so
-    grab serves a file from the search root it is under (or the login home, or else its own
-    folder), never from a `/` the server may not let you list (a Storage Box's). When a folder on
-    the way can't be listed all the same, it serves the file from its own folder; when that
-    can't be listed either, the viewer says so ("Main doesn't let you list /srv/private.").
-    At most 8 such streams run at once.
+  - Previews and Play open the file by its path: no folder on the way needs to be listable (a
+    Storage Box's `/` isn't).
   - Double-click on any other file still downloads it; Enter and the Download button always
     download. Right-click has Play or Preview first; Ctrl+Space ticks a row's checkbox.
 - **Download** takes any mix of folders and files. "Choose…" picks the Save-to folder.
@@ -434,9 +436,9 @@ too and goes on without them.
   - The budget is a hard limit: with more downloads queued for a server than it has
     connections, the window starts only that many, and the rest wait their turn. Each file's
     first look at the server (its size and date) takes one of them too.
-  - Play's player uses its own `rclone serve`, outside the budget, with at most two
-    connections. Previews take one connection of the budget, ahead of downloads, and only free
-    ones beyond it.
+  - Play takes up to 8 connections of a Storage Box's budget (2 elsewhere), ahead of
+    downloads, while a video plays (see Previews). Previews take one connection of the budget,
+    ahead of downloads, and only free ones beyond it.
   - Connections open slightly staggered. If a server refuses one while others of grab's get
     data, grab lowers that server's budget and remembers it (in `limits.json` next to
     gui.json, shared with the `grab` command). Each download from that server that ends
@@ -607,7 +609,8 @@ Add one `[section]` per server and choose with `-r NAME`.
 
 **grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
 `engine = grab` in a server's section to try it: files and folders then download through it, and
-searches, file lists and Browse go through it too (Play and checks still go through rclone; previews use grab's client on every server).
+searches, file lists and Browse go through it too (previews, Play and Verify use grab's client on
+every server, whatever its engine).
 A search or a list uses the server's GNU find when it has one and the `find` setting allows it,
 else it lists folders over SFTP, several at a time; links are followed. It logs in once and
 keeps the connections open between files, asks the server for exactly the bytes it needs, and
@@ -616,7 +619,9 @@ and more follow "At once" and spread over the connections; smaller ones go besid
 free connection, many at a time. It also downloads names that aren't UTF-8, and a subfolder the
 server won't list is reported instead of failing the whole folder. Of `common_flags` it takes
 `--bind`, `--contimeout` and `--timeout` (`-v` names the ones it leaves out). Test in Settings
-logs in through it and says whether searches use find or list folders. `GRAB_ENGINE=grab` or
+logs in through it and says whether searches use find or list folders; it asks rclone nothing
+there (on an engine = rclone server it checks rclone's login for the downloads, and a failure of
+grab's own login is a warning: previews, Play and Verify can't run). `GRAB_ENGINE=grab` or
 `rclone` in the environment overrides every server.
 
 ## Usage
@@ -816,7 +821,7 @@ Defaults (override per remote in grab.conf):
 | `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
 All three are for `--rclone`, the plain rclone copy, which gets them as they are. grab's own
-rclone calls (its downloads, listings, searches and Play) take only
+rclone calls (downloads, listings and searches of engine = rclone servers) take only
 their connection flags: `--sftp-*`, `--bind`, `--contimeout`, `--timeout`,
 `--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and
 `--password-command`. Those calls depend on rclone's exact output, so a progress, logging,
@@ -854,7 +859,9 @@ src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
 src/verify.*    checking downloads: the server's md5sum and grab's MD5, by path; what proves a mismatch
-src/gui/play_server.* Play's warm start: the player's local stream (start and end from memory)
+src/play_stream.* Play: the player's local stream over grab's connections (warm start, cache, seeks)
+src/gui/play_server.* the player, started without rclone's variables
+src/ssh_read.*  one file read over pooled connections (previews); src/preview_jobs.* the viewer's fetches and cache
 src/local_name.* server names as safe Windows names (rclone's encoding, device names)
 src/rclone_encoding.* rclone's own name encoding; local paths as rclone must be told them
 src/existing.*  a different file already there: replace, keep both ("name (2).ext") or skip

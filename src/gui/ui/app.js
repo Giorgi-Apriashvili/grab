@@ -2819,22 +2819,23 @@ function closeSettings() {
 function testLine(t) {
   if (!t) return '';
   if (t.pending) return '<span class="muted"><span class="spinner"></span>Testing the connection…</span>';
-  // grab's own client verifies on every server; on engine = grab it also downloads and searches,
-  // and rclone previews.
+  if (t.error) return `<span><span class="bad">✗ Test failed:</span> <span class="detail">${esc(t.error)}</span></span>`;
+  // grab's own client previews, plays and verifies on every server; on engine = grab it also
+  // downloads and searches, and rclone isn't asked (rcloneOk null).
   const grab = t.grabEngine === true;
   const how = (t.grabOk && grab ? ` · searches ${esc(t.grabSearch)}` : '') + (t.grabOk && t.checksums ? ` · ${esc(t.checksums)}` : '');
   if (t.ok) {
-    // On engine = rclone grab's login only verifies: a failure there is a warning, not a failed test.
+    // On engine = rclone grab's login only previews, plays and verifies: a failure there is a
+    // warning, not a failed test (its downloads go through rclone).
     const trust = /host key/.test(t.grabError || '') ? ' Use Trust… to pin the host key.' : '';
     const verify = !grab && t.grabOk === false
-      ? ` · <span class="warn">Verify (grab) can't run: ${esc(t.grabError || 'failed')}.${trust}</span>` : '';
+      ? ` · <span class="warn">Previews, Play and Verify (grab) can't run: ${esc(t.grabError || 'failed')}.${trust}</span>` : '';
     return `<span class="good">✓ Connection OK</span>${how ? `<span class="muted">${how}</span>` : ''}${verify}`;
   }
   const parts = [];
-  const rclone = grab ? 'Previews (rclone)' : 'Downloads (rclone)';
-  const mine = grab ? 'Downloads, searches and verify (grab)' : 'Verify (grab)';
-  if (t.rcloneOk) parts.push(`<span class="good">✓ ${rclone}</span>`);
-  else parts.push(`<span class="bad">✗ ${rclone}:</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
+  const mine = grab ? 'Downloads, searches, previews, Play and Verify (grab)' : 'Previews, Play and Verify (grab)';
+  if (t.rcloneOk === true) parts.push('<span class="good">✓ Downloads (rclone)</span>');
+  else if (t.rcloneOk === false) parts.push(`<span class="bad">✗ Downloads (rclone):</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
   if (t.grabOk === true) parts.push(`<span class="good">✓ ${mine}</span><span class="muted">${how}</span>`);
   else if (t.grabOk === false) parts.push(`<span class="bad">✗ ${mine}:</span> <span class="detail">${esc(t.grabError || 'failed')}</span>`);
   if (t.sshOk === true) parts.push('<span class="good">✓ Searches (ssh)</span>');

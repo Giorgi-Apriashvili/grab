@@ -155,6 +155,8 @@ GuiState gui_state_from(const json::Value* doc) {
     }
     if (const auto* t = doc->find("timings"); t != nullptr && t->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < t->keys.size(); ++i) {
+            // rclone serve's start, which previews and Play no longer wait for (phase 6).
+            if (t->keys[i].starts_with("serve:")) continue;
             if (auto n = number(&t->items[i]); n && *n >= activity::min_ms && *n <= activity::max_ms) {
                 s.timings[t->keys[i]] = *n;
             }

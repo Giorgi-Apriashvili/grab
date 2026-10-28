@@ -668,15 +668,21 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
     if (!remote) return util::fail(remote.error());
 
     TestResult result;
-    auto probe = proc::run_capture(servers::probe_argv(env.rclone, env.rclone_conf, s->rclone_remote), quiet(stop));
-    if (stop.stop_requested()) return util::fail("cancelled");
-    result.rclone_ok = ok(probe);
-    if (!result.rclone_ok) {
-        result.rclone_error = probe ? clean_rclone_error(probe->err) : probe.error();
-        if (!env.secrets_error.empty()) result.rclone_error += " (" + env.secrets_error + ")";
+    const Engine server_engine = effective_engine(*s);
+    // rclone only where it still downloads: on engine = grab nothing a test can show goes through it
+    // (previews and Play don't either since phase 6), and its listing costs a login (1-3.5 s on a
+    // Storage Box).
+    if (server_engine != Engine::grab) {
+        auto probe = proc::run_capture(servers::probe_argv(env.rclone, env.rclone_conf, s->rclone_remote), quiet(stop));
+        if (stop.stop_requested()) return util::fail("cancelled");
+        result.rclone_ok = ok(probe);
+        if (!*result.rclone_ok) {
+            result.rclone_error = probe ? clean_rclone_error(probe->err) : probe.error();
+            if (!env.secrets_error.empty()) result.rclone_error += " (" + env.secrets_error + ")";
+        }
     }
 
-    if (effective_engine(*s) != Engine::grab && resolve_find_method(*s, *remote) == FindMethod::ssh) {
+    if (server_engine != Engine::grab && resolve_find_method(*s, *remote) == FindMethod::ssh) {
         std::vector<std::string> options{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"};
         options.insert(options.end(), s->ssh_options.begin(), s->ssh_options.end());
         auto ssh = proc::run_capture(build_ssh_argv(env.cfg.ssh, *remote, options, "echo grab-ok"), quiet(stop));
@@ -685,13 +691,13 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
         if (!*result.ssh_ok) result.ssh_error = ssh ? first_line(ssh->err) : ssh.error();
     }
     // Every server: grab's own login, which downloads and searches use on engine = grab, and
-    // verification on any.
+    // previews, Play and verification on any.
     const engine::Context ctx{.config = env.cfg,
                               .settings = *s,
                               .remote = *remote,
                               .method = resolve_find_method(*s, *remote),
                               .imported = {},
-                              .engine = effective_engine(*s),
+                              .engine = server_engine,
                               .grab_method = resolve_grab_method(*s, *remote)};
     test_grab(ctx, learned_limits_path(env.grab_conf), stop, result);
     if (stop.stop_requested()) return util::fail("cancelled");

@@ -68,6 +68,9 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
           std::map<std::string, int>{{"a", 3}});
     CHECK(parse_gui_state(R"({"timings":{"a":1500,"b":0,"c":"x","d":99999999}})").timings ==
           std::map<std::string, int>{{"a", 1500}});
+    // rclone serve's start timings (before phase 6) go; Play's warm part stays.
+    CHECK(parse_gui_state(R"({"timings":{"serve:Main":2100,"warm:Main":3000,"lsjson:serve":900}})").timings ==
+          std::map<std::string, int>{{"lsjson:serve", 900}, {"warm:Main", 3000}});
 
     // The speed schedule keeps its valid rules; a broken change of the limit is dropped.
     CHECK(parse_gui_state(R"({"speedSchedule":[{"days":["sat"],"from":"10:00","to":"12:00","mibps":8},{"days":[]}]})")

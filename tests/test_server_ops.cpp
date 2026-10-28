@@ -667,3 +667,50 @@ TEST_CASE("server ops: a test fails on grab's login only where grab downloads (e
     t.rclone_ok = false;
     CHECK_FALSE(t.ok());
 }
+TEST_CASE("server ops: on engine = grab a test asks rclone nothing and stands on grab's login") {
+    // rclone downloads nothing there (previews and Play go through grab's client since phase 6), so
+    // test_connection leaves rclone_ok unset.
+    server_ops::TestResult t;
+    t.grab_engine = true;
+    CHECK_FALSE(t.ok()); // nothing tested yet
+    t.grab_ok = true;
+    CHECK(t.ok());
+    t.grab_ok = false;
+    CHECK_FALSE(t.ok());
+    // engine = rclone without its listing's answer is no failure either (a grab warning at most).
+    server_ops::TestResult r;
+    r.grab_ok = false;
+    CHECK(r.ok());
+    r.rclone_ok = false;
+    CHECK_FALSE(r.ok());
+}
+TEST_CASE("server ops: Test runs rclone's listing on engine = rclone only") {
+    if (util::getenv_utf8("GRAB_ENGINE")) {
+        MESSAGE("GRAB_ENGINE is set; skipped");
+        return;
+    }
+    // Both servers fail without the network: grab's login binds to TEST-NET's 192.0.2.1, which
+    // this PC hasn't got, and the rclone asked is a program that isn't there.
+    Scratch s;
+    s.write("rclone.conf", "[h]\ntype = sftp\nhost = 127.0.0.1\nport = 1\nuser = me\nkey_use_agent = true\n");
+    s.write("grab.conf", "[grab]\nrclone = " + util::path_to_utf8(s.dir / "no-rclone.exe") +
+                             "\nrclone_config = " + util::path_to_utf8(s.dir / "rclone.conf") +
+                             "\n\n[g]\nrclone_remote = h\nengine = grab\ncommon_flags = --bind 192.0.2.1\n"
+                             "\n[r]\nrclone_remote = h\nengine = rclone\nfind = rclone\ncommon_flags = --bind 192.0.2.1\n");
+    auto env = server_ops::load_env(s.dir / "grab.conf", s.dir);
+    REQUIRE(env.has_value());
+    const auto g = server_ops::test_connection(*env, "g");
+    REQUIRE(g.has_value());
+    CHECK(g->grab_engine);
+    CHECK_FALSE(g->rclone_ok.has_value()); // not asked
+    CHECK(g->grab_ok == false);
+    CHECK(g->grab_error.find("--bind") != std::string::npos);
+    CHECK_FALSE(g->ok());
+    const auto r = server_ops::test_connection(*env, "r");
+    REQUIRE(r.has_value());
+    CHECK_FALSE(r->grab_engine);
+    CHECK(r->rclone_ok == false); // asked, and it isn't there
+    CHECK_FALSE(r->rclone_error.empty());
+    CHECK(r->grab_ok == false); // previews, Play and Verify can't run: a warning
+    CHECK_FALSE(r->ok());
+}

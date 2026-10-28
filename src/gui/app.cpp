@@ -1987,10 +1987,11 @@ void App::test_server(const std::string& name, std::stop_token stop) {
     }
     if (!result) {
         v.set("ok", Value::make_bool(false));
-        v.set("rcloneError", str(result.error()));
+        v.set("error", str(result.error()));
     } else {
         v.set("ok", Value::make_bool(result->ok()));
-        v.set("rcloneOk", Value::make_bool(result->rclone_ok));
+        // rclone's listing: engine = rclone only (its downloads); engine = grab doesn't ask it.
+        v.set("rcloneOk", result->rclone_ok ? Value::make_bool(*result->rclone_ok) : Value{});
         v.set("rcloneError", str(result->rclone_error));
         v.set("sshOk", result->ssh_ok ? Value::make_bool(*result->ssh_ok) : Value{});
         v.set("sshError", str(result->ssh_error));

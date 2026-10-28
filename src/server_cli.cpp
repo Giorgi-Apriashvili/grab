@@ -239,16 +239,18 @@ int server_add(const Env& env, const std::string& prefill) {
         error(test.error());
         return exit_config;
     }
-    // grab's own client verifies on every server; on engine = grab it also downloads and searches,
-    // and rclone previews.
-    std::println(stderr, "  rclone ({}): {}", test->grab_engine ? "previews" : "downloads",
-                 test->rclone_ok ? "OK" : "FAILED: " + test->rclone_error);
+    // grab's own client previews, plays and verifies on every server; on engine = grab it also
+    // downloads and searches, and rclone isn't asked.
+    if (test->rclone_ok) {
+        std::println(stderr, "  rclone (downloads): {}", *test->rclone_ok ? "OK" : "FAILED: " + test->rclone_error);
+    }
     if (test->grab_ok) {
         std::string how = test->grab_engine ? "OK, searches " + test->grab_search : std::string("OK");
         if (!test->checksums.empty()) how += ", " + test->checksums;
-        // On engine = rclone grab's login only verifies: a failure there is a warning.
+        // On engine = rclone grab's login only previews, plays and verifies: a failure there is a warning.
         const std::string failed = (test->grab_engine ? "FAILED: " : "can't run: ") + test->grab_error;
-        std::println(stderr, "  grab ({}): {}", test->grab_engine ? "downloads, searches, verify" : "verify",
+        std::println(stderr, "  grab ({}): {}",
+                     test->grab_engine ? "downloads, searches, previews, Play, verify" : "previews, Play, verify",
                      *test->grab_ok ? how : failed);
     }
     if (test->ssh_ok) {

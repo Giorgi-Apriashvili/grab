@@ -20,6 +20,7 @@ TEST_CASE("remembered step times") {
     CHECK(activity::guess("search:Box") == 5000);
     CHECK(activity::guess("update") == 2000);
     CHECK(activity::guess("other") == 3000);
+    CHECK(activity::guess("warm:Main") == 3000); // Play's warm part shows real progress
     // grab's own SSH client, by the way chosen.
     CHECK(activity::guess("readdir:Main") == 1000);
     CHECK(activity::guess("find:Main") == 3000);
