@@ -40,13 +40,38 @@
 // And one on this PC: GRAB_TEST_MD5_FILE, a big local file hashed by util::md5_file, by Windows
 // CNG and by OpenSSL's EVP, timed (phase 5 step 3: which local hasher; util::md5_file took EVP).
 //
-// At most 4 logins at once. Lines start with "hook: ".
+// The reads behind phase 6's previews and Play (phase 6 step 1; phase6\box.ps1 runs them on a
+// Storage Box) are a case of their own as well, read only, each run reading bytes no earlier run
+// of it read (so a server's cache speeds none up):
+//
+//   GRAB_TEST_PLAY_FILE     a video (grab's form), or a folder: its first video by name
+//   GRAB_TEST_PLAY_PARTS    "all" (the default), or some of previews,mkv,depth,idle,seek,heads,logins
+//   GRAB_TEST_PLAY_ROUNDS   rounds of the depth and seek checks (default 1)
+//   GRAB_TEST_PLAY_SECONDS  each depth run's time (default 20) and GRAB_TEST_PLAY_MIB its bytes
+//                           (default 64), whichever comes first
+//   GRAB_TEST_PLAY_K        connections reading a head together (default 1,2,4; above 4 only on a
+//                           Storage Box), each count with logins and again on the open connections
+//   GRAB_TEST_PLAY_HEAD     the head's size in MiB (default 32), or "warm": the size of the parts
+//                           Play fetches before the player starts
+//   GRAB_TEST_PLAY_LOGINS   logins at once for the check of 8 logins (default 4,8; only on a
+//                           Storage Box, the one check above 4), 3 rounds of each;
+//                           GRAB_TEST_PLAY_LOGIN_COUNT logins instead of 8 (4 at most elsewhere)
+//   GRAB_TEST_PLAY_MKVS     folders ('|' between them) whose MKVs (at most GRAB_TEST_PLAY_MKV_MAX,
+//                           default 16) show where their first cluster starts (default: the
+//                           file's folder)
+//   GRAB_TEST_PLAY_PREVIEWS folders ('|' between them) walked 3 deep for an image, a PDF and a text
+//                           file the window then previews (phase6\window.ps1)
+//
+// At most 4 logins at once, except the checks above 4 on a Storage Box. Lines start with "hook: ".
 
 #include "browse.hpp"
 #include "config.hpp"
+#include "conn_budget.hpp"
 #include "engine.hpp"
 #include "fake_command.hpp"
+#include "fake_sftp.hpp"
 #include "ini.hpp"
+#include "preview.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
@@ -61,15 +86,19 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1203,6 +1232,788 @@ TEST_CASE("live server: md5sum through grab's own client, printed only (GRAB_TES
     say(std::format("{} login(s) in all", logins.load()));
 }
 
+// ---- Play's reads ------------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::uint64_t mib = std::uint64_t{1} << 20;
+constexpr std::uint64_t ebml_header_id = 0x1A45DFA3;
+constexpr std::uint64_t segment_id = 0x18538067;
+constexpr std::uint64_t info_id = 0x1549A966;
+constexpr std::uint64_t cluster_id = 0x1F43B675;
+
+// Part of a file: [first, end).
+struct Piece {
+    std::uint64_t first = 0;
+    std::uint64_t end = 0;
+    bool operator==(const Piece&) const = default;
+};
+using NextPiece = std::function<std::optional<Piece>()>;
+
+// [first, first + total) in pieces of at most `size`, in order, to any number of threads.
+class Pieces {
+public:
+    Pieces(std::uint64_t first, std::uint64_t total, std::uint64_t size) : at_(first), end_(first + total), size_(size) {}
+    std::optional<Piece> next() {
+        std::scoped_lock lock(m_);
+        if (at_ >= end_) return std::nullopt;
+        const Piece p{.first = at_, .end = std::min(end_, at_ + size_)};
+        at_ = p.end;
+        return p;
+    }
+    NextPiece supplier() {
+        return [this] { return next(); };
+    }
+
+private:
+    std::mutex m_;
+    std::uint64_t at_;
+    std::uint64_t end_;
+    std::uint64_t size_;
+};
+
+// The `i`th of `k` connections' share of [first, first + total) in pieces of `size`: pieces i,
+// i + k, i + 2k... Dealt out, not taken by whoever has room: one connection 64 x 255 KiB deep has
+// room for 8 pieces of 2 MiB at once, so on a 32 MiB head the first two would take them all.
+NextPiece dealt(std::uint64_t first, std::uint64_t total, std::uint64_t size, std::uint64_t k, std::uint64_t i) {
+    return [=, next = i]() mutable -> std::optional<Piece> {
+        const std::uint64_t at = next * size;
+        if (at >= total) return std::nullopt;
+        next += k;
+        return Piece{.first = first + at, .end = first + std::min(total, at + size)};
+    };
+}
+
+// Where each run reads: one region after the other from `from` on, so that no run reads bytes an
+// earlier one read (the server's cache would speed it up), starting over at `from` when the next
+// one wouldn't fit before `end`.
+class Regions {
+public:
+    Regions(std::uint64_t from, std::uint64_t end) : from_(from), end_(end), at_(from) {}
+    // Where a run of at most `most` bytes starts.
+    std::uint64_t start(std::uint64_t most) {
+        if (at_ + most > end_) at_ = from_;
+        return at_;
+    }
+    // The run from `first` read `bytes`: the next one starts after them, on a MiB.
+    void used(std::uint64_t first, std::uint64_t bytes) { at_ = (first + bytes + mib - 1) / mib * mib; }
+
+private:
+    std::uint64_t from_;
+    std::uint64_t end_;
+    std::uint64_t at_;
+};
+
+// What one connection's pipelined READs gave (pump_reads); times in seconds from the moment given.
+struct Pumped {
+    std::uint64_t bytes = 0;
+    std::uint32_t reads = 0;
+    double first = -1; // the first DATA; -1: none came
+    double last = 0;   // the last reply
+    std::optional<sftp::Status> failed;
+};
+
+// READs of at most `chunk` bytes kept `depth` deep on `handle` over the pieces `next` hands out, in
+// order, until it has no more or `until` has passed: then, the READs in flight topped up once more,
+// `at_until` (if any) runs with their number, no new one goes out and the replies on their way are
+// waited for. A short DATA is asked again for the rest, as read_range does; a failed READ (EOF too)
+// stops new ones. Times are from `from`. Throws sftp::Broken.
+Pumped pump_reads(sftp::Client& s, std::string_view handle, int depth, std::uint32_t chunk, const NextPiece& next,
+                  Clock::time_point from, std::optional<Clock::time_point> until = std::nullopt,
+                  const std::function<void(int in_flight)>& at_until = {}) {
+    Pumped p;
+    Piece piece;
+    std::deque<Piece> rest; // what short DATA left out
+    int in_flight = 0;
+    bool asking = true;
+    const auto ask = [&](std::uint64_t offset, std::uint32_t length) {
+        ++in_flight;
+        ++p.reads;
+        s.read(handle, offset, length,
+               [&p, &rest, &in_flight, from, offset, length](std::expected<std::string_view, sftp::Status> r) {
+                   --in_flight;
+                   if (!r) {
+                       if (!p.failed) p.failed = r.error();
+                       return;
+                   }
+                   const double t = seconds(Clock::now() - from);
+                   if (p.first < 0) p.first = t;
+                   p.last = t;
+                   const std::uint64_t got = std::min<std::uint64_t>(r->size(), length);
+                   p.bytes += got;
+                   if (got < length) rest.push_back({.first = offset + got, .end = offset + length});
+               });
+    };
+    for (;;) {
+        while (in_flight < depth && !p.failed) {
+            if (!rest.empty()) {
+                const Piece left = rest.front();
+                rest.pop_front();
+                ask(left.first, static_cast<std::uint32_t>(left.end - left.first));
+                continue;
+            }
+            if (!asking) break;
+            if (piece.first >= piece.end) {
+                const auto n = next();
+                if (!n) {
+                    asking = false;
+                    break;
+                }
+                piece = *n;
+                continue;
+            }
+            const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(chunk, piece.end - piece.first));
+            ask(piece.first, n);
+            piece.first += n;
+        }
+        if (asking && until && Clock::now() >= *until) {
+            asking = false;
+            if (at_until) at_until(in_flight);
+        }
+        if (in_flight == 0) break;
+        s.pump();
+    }
+    return p;
+}
+
+// One READ of `length` bytes at `offset` (and what a short DATA leaves, asked again), timed.
+Pumped one_read(sftp::Client& s, std::string_view handle, std::uint64_t offset, std::uint32_t length) {
+    Pieces one(offset, length, length);
+    return pump_reads(s, handle, 1, length, one.supplier(), Clock::now());
+}
+
+// "24.3 MiB in 20.01 s = 1.21 MiB/s, first byte after 0.21 s".
+std::string read_line(const Pumped& p) {
+    return std::format("{:.1f} MiB in {:.2f} s = {:.2f} MiB/s, first byte after {:.2f} s{}",
+                       static_cast<double>(p.bytes) / static_cast<double>(mib), p.last, mib_per_s(p.bytes, p.last), p.first,
+                       p.failed ? "; FAILED: " + sftp::describe(*p.failed) : "");
+}
+
+// [offset, offset + length) of `raw` (less at its end), opened and closed here; nullopt when it
+// can't be read.
+std::optional<std::string> read_part(sftp::Client& s, const std::string& raw, std::uint64_t offset, std::uint64_t length) {
+    auto handle = sftp::open_file(s, raw);
+    if (!handle) return std::nullopt;
+    std::string bytes(static_cast<std::size_t>(length), '\0');
+    std::uint64_t end = offset;
+    const auto got = sftp::read_range(s, *handle, offset, length, [&](std::uint64_t at, std::string_view piece) {
+        std::memcpy(bytes.data() + (at - offset), piece.data(), piece.size());
+        end = std::max(end, at + piece.size());
+    });
+    const auto closed = sftp::close_file(s, *handle);
+    if (!closed || (!got && got.error().code != sftp::Code::eof)) return std::nullopt;
+    bytes.resize(static_cast<std::size_t>(end - offset));
+    return bytes;
+}
+
+// An EBML element of `b` at `at`: its id (length marker kept), its size, whether that is unknown
+// and where its body starts; nullopt when its header isn't all in `b`.
+struct Ebml {
+    std::uint64_t id = 0;
+    std::uint64_t size = 0;
+    bool unknown = false;
+    std::uint64_t body = 0;
+};
+std::optional<Ebml> ebml_at(std::string_view b, std::uint64_t at) {
+    const auto vint = [&](std::uint64_t pos, bool id) -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
+        if (pos >= b.size()) return std::nullopt;
+        const auto first = static_cast<unsigned char>(b[static_cast<std::size_t>(pos)]);
+        const auto length = static_cast<std::uint64_t>(std::countl_zero(first)) + 1;
+        if (length > 8 || pos + length > b.size()) return std::nullopt;
+        std::uint64_t value = id ? first : first & (0xFFU >> length);
+        for (std::uint64_t i = 1; i < length; ++i) value = (value << 8) | static_cast<unsigned char>(b[static_cast<std::size_t>(pos + i)]);
+        return std::pair{value, length};
+    };
+    const auto id = vint(at, true);
+    if (!id) return std::nullopt;
+    const auto size = vint(at + id->second, false);
+    if (!size) return std::nullopt;
+    return Ebml{.id = id->first,
+                .size = size->first,
+                .unknown = size->first == (std::uint64_t{1} << (7 * size->second)) - 1,
+                .body = at + id->second + size->second};
+}
+
+// An MKV's duration from its first bytes (the Segment's Info: Duration x TimestampScale), in
+// seconds; nullopt for anything else, or an Info `head` doesn't hold whole.
+std::optional<double> mkv_duration(std::string_view head) {
+    const auto header = ebml_at(head, 0);
+    if (!header || header->id != ebml_header_id || header->unknown) return std::nullopt;
+    const auto segment = ebml_at(head, header->body + header->size);
+    if (!segment || segment->id != segment_id) return std::nullopt;
+    for (std::uint64_t at = segment->body;;) {
+        const auto e = ebml_at(head, at);
+        if (!e || e->unknown || e->id == cluster_id) return std::nullopt;
+        if (e->id != info_id) {
+            at = e->body + e->size;
+            continue;
+        }
+        const std::uint64_t end = e->body + e->size;
+        if (end > head.size()) return std::nullopt;
+        std::uint64_t scale = 1'000'000; // ns per tick, Matroska's default
+        std::optional<double> duration;
+        for (std::uint64_t c = e->body; c < end;) {
+            const auto child = ebml_at(head, c);
+            if (!child || child->unknown || child->body + child->size > end) return std::nullopt;
+            std::uint64_t value = 0;
+            if (child->size <= 8) {
+                for (const char ch : head.substr(static_cast<std::size_t>(child->body), static_cast<std::size_t>(child->size)))
+                    value = (value << 8) | static_cast<unsigned char>(ch);
+            }
+            if (child->id == 0x2AD7B1 && child->size >= 1 && child->size <= 8) scale = value; // TimestampScale
+            if (child->id == 0x4489 && child->size == 8) duration = std::bit_cast<double>(value);
+            if (child->id == 0x4489 && child->size == 4) duration = std::bit_cast<float>(static_cast<std::uint32_t>(value));
+            c = child->body + child->size;
+        }
+        if (!duration) return std::nullopt;
+        return *duration * static_cast<double>(scale) / 1e9;
+    }
+}
+
+// What Play fetches today before the player starts (PlayServer::play's warm parts): the start
+// (preview::warm_start of the first bytes) and the last warm_tail bytes.
+std::uint64_t warm_bytes(std::string_view head, std::uint64_t size) {
+    const std::uint64_t tail_at = size > preview::warm_first + preview::warm_tail ? size - preview::warm_tail : size;
+    return std::min(preview::warm_start(head, size), tail_at) + (size - tail_at);
+}
+
+// "1:23:45".
+std::string clock_of(double seconds_in_all) {
+    const auto s = static_cast<std::uint64_t>(std::llround(seconds_in_all));
+    return std::format("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60);
+}
+
+const char* kind_name(preview::Kind kind) {
+    return kind == preview::Kind::image ? "image" : kind == preview::Kind::pdf ? "pdf" : kind == preview::Kind::text ? "text" : "other";
+}
+
+// The first video of `files` by its path.
+std::optional<ssh::Walked> first_video(const std::vector<ssh::Walked>& files) {
+    std::optional<ssh::Walked> best;
+    for (const auto& f : files) {
+        if (!f.dir && preview::kind_of(f.path) == preview::Kind::video && (!best || f.path < best->path)) best = f;
+    }
+    return best;
+}
+
+// What the window's check previews from `files`: the biggest image and PDF of at most `most`
+// bytes and the biggest text file the viewer shows whole (an .nfo before others), those there are.
+std::vector<std::pair<preview::Kind, ssh::Walked>> previewable(const std::vector<ssh::Walked>& files, std::uint64_t most) {
+    std::optional<ssh::Walked> image;
+    std::optional<ssh::Walked> pdf;
+    std::optional<ssh::Walked> text;
+    const auto nfo = [](const ssh::Walked& f) { return util::to_lower(f.path).ends_with(".nfo"); };
+    for (const auto& f : files) {
+        if (f.dir || f.size == 0) continue;
+        const auto kind = preview::kind_of(f.path);
+        if (kind == preview::Kind::image && f.size <= most && (!image || f.size > image->size)) image = f;
+        if (kind == preview::Kind::pdf && f.size <= most && (!pdf || f.size > pdf->size)) pdf = f;
+        if (kind == preview::Kind::text && f.size <= preview::max_text &&
+            (!text || nfo(f) > nfo(*text) || (nfo(f) == nfo(*text) && f.size > text->size)))
+            text = f;
+    }
+    std::vector<std::pair<preview::Kind, ssh::Walked>> out;
+    if (image) out.emplace_back(preview::Kind::image, *image);
+    if (pdf) out.emplace_back(preview::Kind::pdf, *pdf);
+    if (text) out.emplace_back(preview::Kind::text, *text);
+    return out;
+}
+
+// A comma-separated list of numbers from `name`, else `fallback`.
+std::vector<int> numbers_from_env(const char* name, std::vector<int> fallback) {
+    const auto v = util::getenv_utf8(name);
+    if (!v) return fallback;
+    std::vector<int> out;
+    for (const auto& part : util::split(*v, ',')) {
+        if (const auto n = util::trim(part); !n.empty()) out.push_back(std::stoi(std::string(n)));
+    }
+    return out;
+}
+
+std::string seconds_list(const std::vector<double>& times) {
+    std::string out;
+    for (const double t : times) out += std::format("{}{:.3f}", out.empty() ? "" : ", ", t);
+    return out;
+}
+
+} // namespace
+
+// What phase 6's reader and Play need to know of a server before they are built on it: one
+// stream's speed by READs in flight and their size; how long a READ takes on an idle connection;
+// how long a seek waits behind a full queue, and on a second, idle connection instead; how fast K
+// connections read a player's head together; whether 8 logins at once are taken (Storage Boxes
+// only); and where MKVs' first video starts. Read only: nothing is written on the server, and
+// nothing here but the log.
+TEST_CASE("live server: Play's reads through grab's own client, printed only (GRAB_TEST_PLAY_FILE)") {
+    const auto name = util::getenv_utf8("GRAB_TEST_SERVER");
+    const auto appdata = util::getenv_utf8("GRAB_TEST_APPDATA");
+    const auto file = util::getenv_utf8("GRAB_TEST_PLAY_FILE");
+    if (!name || !appdata || !file) {
+        MESSAGE("skipped: GRAB_TEST_SERVER / GRAB_TEST_APPDATA / GRAB_TEST_PLAY_FILE not set");
+        return;
+    }
+#ifdef _WIN32
+    const AppData settings(util::path_from_utf8(*appdata));
+#endif
+    const std::string parts = util::getenv_utf8("GRAB_TEST_PLAY_PARTS").value_or("all");
+    const auto wanted = [&](std::string_view part) {
+        if (parts == "all") return true;
+        const auto list = util::split(parts, ',');
+        return std::ranges::find(list, part) != list.end();
+    };
+    auto ctx = read_context(*name);
+    REQUIRE_MESSAGE(ctx, ctx.error_or(""));
+    auto target = engine::ssh_target(*ctx);
+    REQUIRE_MESSAGE(target, target.error_or(""));
+    const auto& t = *target;
+    const bool box = budget::is_storage_box(t.host);
+    say(std::format("Play's reads on {} = {}@{}:{} ({}; {})", *name, t.user, t.host, t.port,
+                    box ? "a Storage Box" : "not a Storage Box", parts));
+
+    std::atomic<int> logins = 0;
+    const auto pool_of = [&](int limit, int at_once) {
+        ssh::Pool::Options o;
+        o.limit = limit;
+        o.logins_at_once = at_once;
+        o.idle_timer = false;
+        return std::make_shared<ssh::Pool>([&] {
+            ++logins;
+            return ssh::open_session(t);
+        }, o);
+    };
+    auto pool = pool_of(4, 4);
+
+    // The file, or a folder's first video.
+    std::string path = *file;
+    std::uint64_t size = 0;
+    {
+        auto lease = pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        const auto attrs = sftp::stat((*lease)->sftp(), rclone_enc::raw_path(path));
+        REQUIRE_MESSAGE(attrs, path << ": " << sftp::describe(attrs.error_or(sftp::Status{})));
+        size = attrs->size.value_or(0);
+        lease->release();
+        if (attrs->is_dir()) {
+            const auto video = first_video(files_under(*pool, path, 1));
+            REQUIRE_MESSAGE(video, "no video in " << path);
+            path = video->path;
+            size = video->size;
+        }
+    }
+    const std::string raw = rclone_enc::raw_path(path);
+    // box.ps1 reads this line: the size in bytes, then the path.
+    say(std::format("play file: {} bytes ({}): {}", size, util::format_size(size), path));
+    // Runs need room: 64 MiB in from the start (the head Play and the window's check read), 8 MiB
+    // short of the end.
+    const bool big = size >= 256 * mib;
+    if (!big) say("the file is under 256 MiB: the depth, idle, seek and head checks are left out");
+    Regions regions(64 * mib, big ? size - 8 * mib : size);
+
+    // The files the window's check previews (phase6\window.ps1 reads these lines).
+    if (wanted("previews")) {
+        if (const auto folders = util::getenv_utf8("GRAB_TEST_PLAY_PREVIEWS")) {
+            std::vector<ssh::Walked> files;
+            for (const auto& folder : util::split(*folders, '|')) {
+                if (folder.empty()) continue;
+                auto under = files_under(*pool, folder, 3);
+                files.insert(files.end(), std::make_move_iterator(under.begin()), std::make_move_iterator(under.end()));
+            }
+            const auto picked = previewable(files, std::uint64_t{32} << 20);
+            for (const auto& [kind, f] : picked) say(std::format("preview {} {} {}", kind_name(kind), f.size, f.path));
+            if (picked.empty()) say("previews: no image, PDF or text file of at most 32 MiB under " + *folders);
+        }
+    }
+
+    // Where MKVs' first video starts: what a player reads before it, and Play fetches first.
+    if (wanted("mkv")) {
+        const auto slash = path.rfind('/');
+        const std::string folders =
+            util::getenv_utf8("GRAB_TEST_PLAY_MKVS").value_or(slash == std::string::npos ? "" : path.substr(0, slash));
+        const auto most = static_cast<std::size_t>(std::stoul(util::getenv_utf8("GRAB_TEST_PLAY_MKV_MAX").value_or("16")));
+        auto roots = util::split(folders, '|');
+        if (roots.empty()) roots.emplace_back(); // the login folder
+        std::vector<ssh::Walked> mkvs;
+        for (const auto& folder : roots) {
+            for (auto& f : files_under(*pool, folder, 1)) {
+                if (!f.dir && util::to_lower(f.path).ends_with(".mkv")) mkvs.push_back(std::move(f));
+            }
+        }
+        std::ranges::sort(mkvs, {}, &ssh::Walked::path);
+        if (mkvs.size() > most) mkvs.resize(most);
+        auto lease = pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        try {
+            auto& s = (*lease)->sftp();
+            for (const auto& f : mkvs) {
+                const auto mkv = rclone_enc::raw_path(f.path);
+                const auto head = read_part(s, mkv, 0, std::uint64_t{64} * 1024);
+                if (!head) {
+                    say(std::format("mkv {}: can't be read", visible(f.path, 200)));
+                    continue;
+                }
+                // grab reads 64 KiB and skips elements by their sizes; past the head it takes the
+                // next element's start for the cluster's. Followed here to the real one.
+                const auto said = preview::mkv_first_cluster(*head);
+                std::string found = "not an MKV grab reads";
+                std::optional<std::uint64_t> cluster;
+                for (std::uint64_t at = said.value_or(f.size), steps = 0; said && steps < 16; ++steps) {
+                    const auto bytes = at < f.size ? read_part(s, mkv, at, 16) : std::nullopt;
+                    const auto e = bytes ? ebml_at(*bytes, 0) : std::nullopt;
+                    if (!e) {
+                        found = std::format("nothing readable at {}", at);
+                        break;
+                    }
+                    if (e->id == cluster_id) {
+                        cluster = at;
+                        found = at == *said ? "where grab says"
+                                            : std::format("{} bytes after where grab's 64 KiB say", at - *said);
+                        break;
+                    }
+                    if (e->unknown) {
+                        found = std::format("element 0x{:X} of unknown size at {}", e->id, at);
+                        break;
+                    }
+                    at += e->body + e->size;
+                }
+                const auto duration = mkv_duration(*head);
+                say(std::format("mkv {} ({}): first cluster {}; {}; Play's warm parts today {:.1f} MiB",
+                                visible(f.path, 200), util::format_size(f.size),
+                                cluster ? std::format("at {:.1f} MiB ({})", static_cast<double>(*cluster) / mib, found)
+                                        : "not found: " + found,
+                                duration ? std::format("{}, {:.1f} Mbit/s on average", clock_of(*duration),
+                                                       static_cast<double>(f.size) * 8 / *duration / 1e6)
+                                         : "no duration in the first 64 KiB",
+                                static_cast<double>(warm_bytes(*head, f.size)) / mib));
+            }
+        } catch (const sftp::Broken& e) {
+            lease->broken();
+            say(std::format("mkv: lost the connection: {}", e.what()));
+        }
+    }
+
+    const int rounds = std::stoi(util::getenv_utf8("GRAB_TEST_PLAY_ROUNDS").value_or("1"));
+
+    // One stream's speed by READs in flight and their size: what a single connection gives Play.
+    if (wanted("depth") && big) {
+        const auto limit = std::chrono::seconds(std::stoi(util::getenv_utf8("GRAB_TEST_PLAY_SECONDS").value_or("20")));
+        const std::uint64_t most = std::stoull(util::getenv_utf8("GRAB_TEST_PLAY_MIB").value_or("64")) * mib;
+        struct Run {
+            int depth;
+            std::uint32_t chunk;
+        };
+        std::vector<Run> runs;
+        for (const int d : {4, 8, 16, 32, 64}) runs.push_back({.depth = d, .chunk = sftp::max_read});
+        for (const std::uint32_t c : {32U * 1024, 64U * 1024}) {
+            for (const int d : {16, 32, 64}) runs.push_back({.depth = d, .chunk = c});
+        }
+        std::vector<std::vector<double>> speeds(runs.size());
+        auto lease = pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        try {
+            auto& s = (*lease)->sftp();
+            const auto handle = sftp::open_file(s, raw);
+            REQUIRE_MESSAGE(handle, sftp::describe(handle.error_or(sftp::Status{})));
+            for (int round = 1; round <= rounds; ++round) {
+                // Every other round backwards, so a server slowing down over the runs shows.
+                for (std::size_t k = 0; k < runs.size(); ++k) {
+                    const std::size_t i = round % 2 == 1 ? k : runs.size() - 1 - k;
+                    const Run& r = runs[i];
+                    const auto first = regions.start(most);
+                    Pieces pieces(first, most, 4 * mib);
+                    const auto from = Clock::now();
+                    const Pumped p = pump_reads(s, *handle, r.depth, r.chunk, pieces.supplier(), from, from + limit);
+                    regions.used(first, p.bytes);
+                    speeds[i].push_back(mib_per_s(p.bytes, p.last));
+                    say(std::format("one stream, {} x {} KiB in flight, round {}: {}", r.depth, r.chunk / 1024, round,
+                                    read_line(p)));
+                }
+            }
+            if (!sftp::close_file(s, *handle)) say("the handle didn't close");
+        } catch (const sftp::Broken& e) {
+            lease->broken();
+            say(std::format("one stream: lost the connection: {}", e.what()));
+        }
+        for (std::size_t i = 0; i < runs.size(); ++i) {
+            std::string each;
+            for (const double v : speeds[i]) each += std::format("{}{:.2f}", each.empty() ? "" : ", ", v);
+            say(std::format("one stream, {:2} x {:3} KiB in flight ({:5.1f} MiB): {} MiB/s", runs[i].depth,
+                            runs[i].chunk / 1024, static_cast<double>(runs[i].depth) * runs[i].chunk / static_cast<double>(mib),
+                            each));
+        }
+    }
+
+    // A READ on a connection with nothing in flight: the least a seek costs.
+    if (wanted("idle") && big) {
+        auto lease = pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        try {
+            auto& s = (*lease)->sftp();
+            const auto handle = sftp::open_file(s, raw);
+            REQUIRE_MESSAGE(handle, sftp::describe(handle.error_or(sftp::Status{})));
+            for (const std::uint32_t length : {sftp::max_read, 32U * 1024}) {
+                std::vector<double> idle;
+                std::vector<double> after;
+                for (int i = 0; i < 3; ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    const auto at = regions.start(mib);
+                    idle.push_back(one_read(s, *handle, at, length).last);
+                    after.push_back(one_read(s, *handle, at + length, length).last);
+                    regions.used(at, std::uint64_t{2} * length);
+                }
+                say(std::format("one READ of {} KiB on a connection idle for 3 s: {} s; right after another: {} s",
+                                length / 1024, seconds_list(idle), seconds_list(after)));
+            }
+            if (!sftp::close_file(s, *handle)) say("the handle didn't close");
+        } catch (const sftp::Broken& e) {
+            lease->broken();
+            say(std::format("idle READs: lost the connection: {}", e.what()));
+        }
+    }
+
+    // A seek on a connection reading ahead 64 x 255 KiB deep: its READ waits behind those in
+    // flight (SFTP READs can't be taken back); on a second, idle connection it doesn't.
+    if (wanted("seek") && big) {
+        auto a = pool->acquire({}, ssh::interactive_retry);
+        auto b = pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(a);
+        REQUIRE(b);
+        try {
+            auto& sa = (*a)->sftp();
+            auto& sb = (*b)->sftp();
+            const auto ha = sftp::open_file(sa, raw);
+            const auto hb = sftp::open_file(sb, raw);
+            REQUIRE(ha);
+            REQUIRE(hb);
+            // After the spare connection fails, its client may still hold the handlers of that
+            // round's READs (pointing into a finished frame), so later rounds leave it alone.
+            bool spare_lost = false;
+            for (int round = 1; round <= rounds; ++round) {
+                const auto seek_a = regions.start(mib);
+                regions.used(seek_a, mib);
+                const auto seek_b = regions.start(mib);
+                regions.used(seek_b, mib);
+                const auto stream_at = regions.start(256 * mib);
+                std::atomic<bool> go = false;
+                bool measured = false;
+                Clock::time_point seek_moment;
+                std::optional<Pumped> spare;
+                std::string spare_failed;
+                std::jthread other([&] {
+                    go.wait(false);
+                    if (!measured || spare_lost) return;
+                    try {
+                        Pieces one(seek_b, mib, mib);
+                        spare = pump_reads(sb, *hb, 8, sftp::max_read, one.supplier(), seek_moment);
+                    } catch (const sftp::Broken& e) {
+                        spare_failed = e.what();
+                    }
+                });
+                // Destroyed before `other` joins: a Broken on `a` before the seek would otherwise
+                // leave `other` waiting for good.
+                struct Wake {
+                    std::atomic<bool>& go;
+                    ~Wake() {
+                        go = true;
+                        go.notify_one();
+                    }
+                } wake{go};
+                // 2 s of reading ahead 64 deep, then the seek's READ goes out behind those in flight.
+                Pieces stream(stream_at, 256 * mib, 4 * mib);
+                int backlog = 0;
+                double seek_first = -1;
+                const auto from = Clock::now();
+                const Pumped p = pump_reads(sa, *ha, 64, sftp::max_read, stream.supplier(), from,
+                                            from + std::chrono::seconds(2), [&](int in_flight) {
+                                                backlog = in_flight;
+                                                seek_moment = Clock::now();
+                                                sa.read(*ha, seek_a, sftp::max_read,
+                                                        [&](const std::expected<std::string_view, sftp::Status>&) {
+                                                            seek_first = seconds(Clock::now() - seek_moment);
+                                                        });
+                                                sa.flush();
+                                                measured = true;
+                                                go = true;
+                                                go.notify_one();
+                                            });
+                if (!measured) {
+                    go = true;
+                    go.notify_one();
+                    say(std::format("seek, round {}: not measured (the stream ended within 2 s)", round));
+                    continue;
+                }
+                while (seek_first < 0) sa.pump();
+                other.join();
+                regions.used(stream_at, p.bytes);
+                const double drained = p.last - seconds(seek_moment - from);
+                std::string on_spare = "lost: " + spare_failed;
+                if (spare)
+                    on_spare = std::format("after {:.2f} s, its first MiB (8 x 255 KiB deep) after {:.2f} s",
+                                           spare->first, spare->last);
+                else if (spare_lost)
+                    on_spare = "not measured (lost in an earlier round)";
+                say(std::format("seek, round {}: behind {} x 255 KiB in flight the first byte came after {:.2f} s (the "
+                                "last of them after {:.2f} s; {:.2f} MiB/s before the seek); on a second, idle connection "
+                                "{}",
+                                round, backlog, seek_first, drained, mib_per_s(p.bytes, p.last), on_spare));
+                if (!spare_failed.empty()) {
+                    b->broken();
+                    spare_lost = true;
+                }
+            }
+        } catch (const sftp::Broken& e) {
+            a->broken();
+            b->broken();
+            say(std::format("seek: lost a connection: {}", e.what()));
+        }
+    }
+
+    // K connections reading a player's head together, its 2 MiB pieces dealt out among them (each
+    // up to 64 x 255 KiB deep): first with their logins (a new pool), then again on the
+    // connections already open.
+    if (wanted("heads") && big) {
+        std::uint64_t head_bytes = 32 * mib;
+        if (const auto spec = util::getenv_utf8("GRAB_TEST_PLAY_HEAD"); spec == "warm") {
+            auto lease = pool->acquire({}, ssh::interactive_retry);
+            REQUIRE(lease);
+            const auto head = read_part((*lease)->sftp(), raw, 0, std::uint64_t{64} * 1024);
+            REQUIRE(head);
+            head_bytes = warm_bytes(*head, size);
+        } else if (spec) {
+            head_bytes = std::stoull(*spec) * mib;
+        }
+        // Only the heads' connections from here.
+        pool->close_idle(Clock::now() + std::chrono::hours(1));
+        for (const int k : numbers_from_env("GRAB_TEST_PLAY_K", {1, 2, 4})) {
+            if (k < 1 || (k > 4 && !box)) {
+                say(std::format("head over K = {}: not checked (above 4 only on a Storage Box)", k));
+                continue;
+            }
+            auto heads = pool_of(k, 4);
+            for (const bool cold : {true, false}) {
+                const auto first = regions.start(head_bytes);
+                regions.used(first, head_bytes);
+                std::vector<Pumped> got(static_cast<std::size_t>(k));
+                std::vector<double> ready(static_cast<std::size_t>(k), -1);
+                std::vector<std::string> failed(static_cast<std::size_t>(k));
+                const auto started = Clock::now();
+                {
+                    std::vector<std::jthread> readers;
+                    for (std::size_t i = 0; std::cmp_less(i, k); ++i) {
+                        readers.emplace_back([&, i] {
+                            try {
+                                auto lease = heads->acquire({}, ssh::interactive_retry);
+                                if (!lease) return;
+                                try {
+                                    auto& s = (*lease)->sftp();
+                                    const auto handle = sftp::open_file(s, raw);
+                                    if (!handle) {
+                                        failed[i] = sftp::describe(handle.error());
+                                        return;
+                                    }
+                                    ready[i] = seconds(Clock::now() - started);
+                                    got[i] = pump_reads(s, *handle, 64, sftp::max_read,
+                                                        dealt(first, head_bytes, 2 * mib, static_cast<std::uint64_t>(k), i),
+                                                        started);
+                                    if (!sftp::close_file(s, *handle)) failed[i] = "the handle didn't close";
+                                } catch (const sftp::Broken& e) {
+                                    lease->broken();
+                                    failed[i] = e.what();
+                                }
+                            } catch (const ssh::Error& e) {
+                                failed[i] = "no login: "s + e.what();
+                            }
+                        });
+                    }
+                }
+                std::uint64_t bytes = 0;
+                double last = 0;
+                double opened = 0;
+                std::string each;
+                std::string problems;
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    bytes += got[i].bytes;
+                    last = std::max(last, got[i].last);
+                    opened = std::max(opened, ready[i]);
+                    each += std::format("{}{:.2f}-{:.2f} s", each.empty() ? "" : ", ", ready[i], got[i].last);
+                    if (!failed[i].empty()) problems += "; " + failed[i];
+                    if (got[i].failed) problems += "; " + sftp::describe(*got[i].failed);
+                }
+                say(std::format("head of {:.1f} MiB over K = {} {}: {:.2f} s (all {} ready after {:.2f} s), {:.2f} MiB/s "
+                                "from then; each connection from ready to its last byte: {}{}{}",
+                                static_cast<double>(head_bytes) / static_cast<double>(mib), k,
+                                cold ? "with their logins" : "already open", last, k, opened,
+                                mib_per_s(bytes, last - opened), each,
+                                bytes == head_bytes ? "" : std::format("; only {} of {} bytes", bytes, head_bytes), problems));
+            }
+        }
+    }
+
+    // 8 logins at once on a Storage Box (the product logs in at most 4 at once): taken, refused or
+    // dropped once in? Phase 0's 14 connections logged in 4 at a time; 8 at once was never tried.
+    if (wanted("logins")) {
+        // GRAB_TEST_PLAY_LOGIN_COUNT: fewer, for a check of this check elsewhere (4 at most there).
+        const int n = std::stoi(util::getenv_utf8("GRAB_TEST_PLAY_LOGIN_COUNT").value_or("8"));
+        const auto counts = numbers_from_env("GRAB_TEST_PLAY_LOGINS", {4, 8});
+        if (n < 1 || (!box && (n > 4 || std::ranges::any_of(counts, [](int c) { return c > 4; })))) {
+            say(std::format("{} logins: not checked (more than 4 only on a Storage Box)", n));
+        } else {
+            pool->close_idle(Clock::now() + std::chrono::hours(1));
+            for (const int at_once : counts) {
+                for (int round = 1; round <= 3; ++round) {
+                    auto many = pool_of(n, at_once);
+                    const auto count = static_cast<std::size_t>(n);
+                    std::latch all_in(n);
+                    std::vector<double> ready(count, -1);
+                    std::vector<std::string> failed(count);
+                    std::vector<std::string> dropped(count);
+                    const auto started = Clock::now();
+                    {
+                        std::vector<std::jthread> threads;
+                        for (std::size_t i = 0; i < count; ++i) {
+                            threads.emplace_back([&, i] {
+                                std::optional<ssh::Pool::Lease> lease;
+                                try {
+                                    // No pause and try again: a refusal is what this counts.
+                                    lease = many->acquire({}, ssh::Retry(std::span<const std::chrono::milliseconds>{}));
+                                    if (lease && sftp::realpath((*lease)->sftp(), ".")) ready[i] = seconds(Clock::now() - started);
+                                    else failed[i] = "REALPATH . failed";
+                                } catch (const ssh::Error& e) {
+                                    failed[i] = std::format("{}: {}", e.kind == budget::Failure::refused ? "refused" : "failed",
+                                                            e.what());
+                                } catch (const sftp::Broken& e) {
+                                    if (lease) lease->broken();
+                                    failed[i] = "SFTP: "s + e.what();
+                                }
+                                all_in.arrive_and_wait();
+                                if (!lease || ready[i] < 0) return;
+                                try {
+                                    if (!sftp::stat((*lease)->sftp(), raw)) dropped[i] = "STAT failed";
+                                } catch (const sftp::Broken& e) {
+                                    lease->broken();
+                                    dropped[i] = e.what();
+                                }
+                            });
+                        }
+                    }
+                    std::vector<double> in;
+                    std::string problems;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        if (ready[i] >= 0) in.push_back(ready[i]);
+                        if (!failed[i].empty()) problems += "; " + failed[i];
+                        if (!dropped[i].empty()) problems += "; dropped once all were in: " + dropped[i];
+                    }
+                    std::ranges::sort(in);
+                    say(std::format("{} logins, at most {} at once, round {}: {} in{}{}", n, at_once, round, in.size(),
+                                    in.empty() ? "" : std::format(" (the first after {:.2f} s, all after {:.2f} s)", in.front(), in.back()),
+                                    problems.empty() ? "; none refused or dropped" : problems));
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                }
+            }
+        }
+    }
+    say(std::format("{} login(s) in all", logins.load()));
+}
+
 #ifdef _WIN32
 namespace {
 
@@ -1484,4 +2295,213 @@ TEST_CASE("hook helpers: a run keeps the start of stdout, judged by its one reco
     REQUIRE(r.lost);
     CHECK(r.lost.value_or("").find("stopped answering") != std::string::npos);
     CHECK(judged(r, true, "/big", std::nullopt).starts_with("LOST"));
+}
+
+TEST_CASE("hook helpers: READs kept deep over pieces in order, short DATA asked again for the rest") {
+    test::FakeServer srv;
+    srv.files["/f"] = test::pattern(3 * 1024 * 1024 + 123);
+    srv.max_data = 100 * 1024; // each 128 KiB READ comes back short
+    sftp::Client c(srv);
+    c.start();
+    const auto h = sftp::open_file(c, "/f");
+    REQUIRE(h);
+    Pieces pieces(1000, 2 * mib, std::uint64_t{300} * 1024);
+    const Pumped p = pump_reads(c, *h, 4, 128 * 1024, pieces.supplier(), Clock::now());
+    CHECK(p.bytes == 2 * mib);
+    CHECK_FALSE(p.failed);
+    CHECK(p.first >= 0);
+    CHECK(p.last >= p.first);
+    CHECK(srv.most_waiting <= 4);
+    CHECK(srv.most_waiting >= 2);
+    // What came back covers the range exactly once: no byte asked twice, none left out.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> got;
+    for (const auto& [offset, length] : srv.reads) {
+        CHECK(length <= 128 * 1024);
+        got.emplace_back(offset, offset + std::min<std::uint64_t>(length, srv.max_data));
+    }
+    std::ranges::sort(got);
+    std::uint64_t at = 1000;
+    for (const auto& [from, to] : got) {
+        CHECK(from == at);
+        at = to;
+    }
+    CHECK(at == 1000 + 2 * mib);
+    CHECK(p.reads == srv.reads.size());
+
+    // Past the file's end: what is there, then EOF stops it.
+    srv.reads.clear();
+    Pieces past(srv.files["/f"].size() - 10, mib, mib);
+    const Pumped q = pump_reads(c, *h, 4, 64 * 1024, past.supplier(), Clock::now());
+    CHECK(q.bytes == 10);
+    REQUIRE(q.failed);
+    CHECK(q.failed->code == sftp::Code::eof);
+}
+
+TEST_CASE("hook helpers: a time limit tops the READs in flight up once, then asks nothing new") {
+    test::FakeServer srv;
+    srv.files["/f"] = test::pattern(std::size_t{4} << 20);
+    sftp::Client c(srv);
+    c.start();
+    const auto h = sftp::open_file(c, "/f");
+    REQUIRE(h);
+    Pieces pieces(0, 4 * mib, mib);
+    int at_until = -1;
+    bool extra = false;
+    const auto now = Clock::now();
+    const Pumped p = pump_reads(c, *h, 4, 64 * 1024, pieces.supplier(), now, now, [&](int in_flight) {
+        at_until = in_flight;
+        // A request of the caller's own goes out behind them, as the seek check's does.
+        c.read(*h, 3 * mib, 1000,
+               [&](const std::expected<std::string_view, sftp::Status>& r) { extra = r && r->size() == 1000; });
+    });
+    CHECK(at_until == 4);
+    CHECK(p.reads == 4);
+    CHECK(p.bytes == 4 * 64 * 1024);
+    while (!extra && c.pending() > 0) c.pump();
+    CHECK(extra);
+    // No time limit: the pieces end it.
+    constexpr std::uint64_t kib64 = std::uint64_t{64} * 1024;
+    Pieces few(0, 3 * kib64 + 5, kib64);
+    CHECK(pump_reads(c, *h, 8, 64 * 1024, few.supplier(), Clock::now()).bytes == 3 * kib64 + 5);
+    // one_read: one READ, timed.
+    srv.reads.clear();
+    const Pumped one = one_read(c, *h, 77, 5000);
+    CHECK(one.bytes == 5000);
+    CHECK(srv.reads.size() == 1);
+}
+
+TEST_CASE("hook helpers: pieces hand a range out once, regions don't overlap until they start over") {
+    Pieces p(5, 10, 4);
+    CHECK(p.next() == Piece{5, 9});
+    CHECK(p.next() == Piece{9, 13});
+    CHECK(p.next() == Piece{13, 15});
+    CHECK_FALSE(p.next());
+
+    // Dealt out among 3: every byte to exactly one, in turns.
+    std::vector<Piece> all;
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        auto next = dealt(100, 23, 4, 3, i);
+        while (const auto piece = next()) all.push_back(*piece);
+    }
+    REQUIRE(all.size() == 6);
+    CHECK(all[0] == Piece{100, 104}); // the first one's: pieces 0 and 3
+    CHECK(all[1] == Piece{112, 116});
+    CHECK(all[5] == Piece{120, 123}); // the third one's last, cut at the end
+    std::ranges::sort(all, {}, &Piece::first);
+    for (std::size_t i = 1; i < all.size(); ++i) CHECK(all[i].first == all[i - 1].end);
+    CHECK(all.back().end == 123);
+
+    Regions r(64 * mib, 200 * mib);
+    CHECK(r.start(64 * mib) == 64 * mib);
+    r.used(64 * mib, 10 * mib + 5); // on to the next MiB
+    CHECK(r.start(64 * mib) == 75 * mib);
+    r.used(75 * mib, 64 * mib);
+    CHECK(r.start(64 * mib) == 64 * mib); // 139 + 64 MiB wouldn't fit: from the start again
+    CHECK(r.start(10 * mib) == 64 * mib);
+}
+
+namespace {
+
+// An EBML element: its id, an 8-byte size, its body.
+std::string ebml_element(std::uint32_t id, std::string_view body) {
+    std::string out;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (const auto byte = (id >> shift) & 0xFF; byte != 0 || !out.empty()) out += static_cast<char>(byte);
+    }
+    out += '\x01';
+    for (int shift = 48; shift >= 0; shift -= 8) out += static_cast<char>((body.size() >> shift) & 0xFF);
+    out += body;
+    return out;
+}
+
+// `v` in its `n` lowest bytes, big-endian.
+std::string big_endian(std::uint64_t v, int n) {
+    std::string out;
+    for (int i = n - 1; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("hook helpers: an MKV's duration, its elements, and the warm parts Play fetches today") {
+    const std::string header = ebml_element(0x1A45DFA3, "abcd");
+    const std::string seek = ebml_element(0x114D9B74, std::string(10, 's'));
+    // 23:40.5 in ms ticks (TimestampScale 1,000,000 ns), as a double and as a float.
+    const std::string info8 =
+        ebml_element(0x1549A966, ebml_element(0x2AD7B1, big_endian(1'000'000, 3)) +
+                                     ebml_element(0x4489, big_endian(std::bit_cast<std::uint64_t>(1'420'500.0), 8)));
+    const std::string info4 = ebml_element(
+        0x1549A966, ebml_element(0x4489, big_endian(std::bit_cast<std::uint32_t>(1'420'500.0F), 4)) + ebml_element(0x7BA9, "title"));
+    const std::string cluster = ebml_element(0x1F43B675, "frames");
+    const std::string fonts = ebml_element(0x1941A469, std::string(1000, 'f'));
+    const auto mkv = [&](const std::string& children) { return header + ebml_element(0x18538067, children); };
+
+    const auto d8 = mkv_duration(mkv(seek + info8 + fonts + cluster));
+    REQUIRE(d8);
+    CHECK(*d8 == doctest::Approx(1420.5));
+    const auto d4 = mkv_duration(mkv(info4 + cluster));
+    REQUIRE(d4);
+    CHECK(*d4 == doctest::Approx(1420.5));
+    CHECK(clock_of(*d8) == "0:23:41");
+    CHECK_FALSE(mkv_duration(mkv(seek + cluster + info8))); // none before the first cluster
+    const std::string cut = mkv(seek + info8);
+    CHECK_FALSE(mkv_duration(cut.substr(0, cut.size() - 3))); // Info not all in the head
+    CHECK_FALSE(mkv_duration("RIFF....AVI LIST"));
+
+    // The element at a cluster's start, with an id and a size of every length.
+    const auto e = ebml_at(cluster, 0);
+    REQUIRE(e);
+    CHECK(e->id == cluster_id);
+    CHECK(e->size == 6);
+    CHECK(e->body == 12);
+    CHECK_FALSE(e->unknown);
+    const std::string unknown = "\x1F\x43\xB6\x75\xFF"s;
+    const auto u = ebml_at(unknown, 0);
+    REQUIRE(u);
+    CHECK(u->unknown);
+    CHECK(u->body == 5);
+    CHECK_FALSE(ebml_at("\x1F\x43"s, 0)); // cut
+    CHECK_FALSE(ebml_at("\x00\x81"s, 0)); // no length marker in 8 bytes
+
+    // Play's warm parts: up to the first cluster and 8 MiB more, and the last 4 MiB.
+    const std::string head = mkv(seek + info8 + fonts + cluster);
+    const auto first_cluster = preview::mkv_first_cluster(head);
+    REQUIRE(first_cluster);
+    CHECK(warm_bytes(head, 1'500'000'000) == *first_cluster + 12 * mib);
+    CHECK(warm_bytes(head, 21 * mib) == *first_cluster + 12 * mib);
+    CHECK(warm_bytes(head, 10 * mib) == *first_cluster + 8 * mib); // no tail read under 20 MiB
+    CHECK(warm_bytes(head, 5 * mib) == 5 * mib);                   // never more than the file
+}
+
+TEST_CASE("hook helpers: the play file and the previews picked from a folder") {
+    const auto file = [](std::string path, std::uint64_t size, bool dir = false) {
+        ssh::Walked w;
+        w.path = std::move(path);
+        w.size = size;
+        w.dir = dir;
+        return w;
+    };
+    const std::vector<ssh::Walked> files{
+        file("s04/ep02.mkv", 1500),        file("s04/ep01.mkv", 1400),       file("s04/aaa.mkv", 0, true),
+        file("s04/cover.jpg", 5'000'000),  file("s04/poster.jpg", 40'000'000), file("s04/x.png", 8'000'000),
+        file("s04/b.pdf", 10'000'000),     file("s04/notes.txt", 2000),       file("s04/info.nfo", 1000),
+        file("s04/huge.log", 3'000'000),   file("s04/empty.jpg", 0)};
+    const auto video = first_video(files);
+    REQUIRE(video);
+    CHECK(video->path == "s04/ep01.mkv");
+    CHECK_FALSE(first_video({file("a.txt", 5)}));
+
+    const auto picked = previewable(files, std::uint64_t{32} << 20);
+    REQUIRE(picked.size() == 3);
+    CHECK(picked[0].first == preview::Kind::image);
+    CHECK(picked[0].second.path == "s04/x.png"); // the biggest under 32 MiB
+    CHECK(picked[1].first == preview::Kind::pdf);
+    CHECK(picked[1].second.path == "s04/b.pdf");
+    CHECK(picked[2].first == preview::Kind::text);
+    CHECK(picked[2].second.path == "s04/info.nfo"); // an .nfo before a bigger .txt
+    CHECK(previewable({file("a/n.txt", 10), file("a/m.txt", 20)}, 100).front().second.path == "a/m.txt");
+    CHECK(previewable({file("a.mkv", 10)}, 100).empty());
+
+    CHECK(numbers_from_env("GRAB_TEST_NO_SUCH_VARIABLE", {1, 2, 4}) == std::vector<int>{1, 2, 4});
+    CHECK(seconds_list({0.5, 1.25}) == "0.500, 1.250");
 }
