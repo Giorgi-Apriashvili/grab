@@ -11,6 +11,7 @@
 #include "ini.hpp"
 #include "listing.hpp"
 #include "local_name.hpp"
+#include "play_server.hpp"
 #include "preview.hpp"
 #include "process.hpp"
 #include "quote.hpp"
@@ -33,7 +34,6 @@
 #include <cstring>
 #include <format>
 #include <fstream>
-#include <future>
 #include <iterator>
 #include <memory>
 #include <set>
@@ -174,6 +174,13 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
 App::~App() {
     // Previews and Play first (review G42): nothing queued starts any more, and the running ones
     // stop at their next READs; their workers are joined before the members they use.
+    {
+        std::scoped_lock lock(play_mutex_);
+        play_next_.reset();
+        play_current_.request_stop(); // its wait for the warm part ends, and no player starts
+    }
+    play_thread_.request_stop();
+    play_wake_.notify_all();
     preview_jobs_.stop_all();
     {
         std::scoped_lock lock(preview_mutex_);
@@ -341,6 +348,17 @@ constexpr auto preview_seat_idle = std::chrono::seconds(60);
 // Storage Box connection gives 0.7-2.5 MiB/s, one of Main's reaches its link.
 constexpr int preview_extra_box = 4;
 constexpr int preview_extra_other = 2;
+
+// Play's connections, for the whole film (decision 2, "burst all the time"): 8 on a Storage Box,
+// whose connections give 0.7-2.5 MiB/s each, 2 elsewhere (one of Main's reaches its link, the
+// other stays idle for a seek); fewer beside downloads from that server, as Play's High share
+// allows. Its logins 8 at once on a Storage Box (box part 1: accepted, 0.7 s sooner than 4), the
+// pool's 4 elsewhere (Main's fail2ban). Read-ahead in front of each of the player's requests.
+constexpr int play_burst_box = 8;
+constexpr int play_burst_other = 2;
+constexpr int play_logins_box = 8;
+constexpr std::uint64_t play_ahead_box = std::uint64_t{32} << 20;
+constexpr std::uint64_t play_ahead_other = std::uint64_t{16} << 20;
 
 } // namespace
 
@@ -529,87 +547,92 @@ preview::Fetched App::preview_answer(const preview::Previews::Job& job, PreviewH
     return fetched;
 }
 
-std::expected<std::string, std::string> App::stream_url(const engine::Context& ctx, const std::string& remote,
-                                                         const std::string& path, bool announce, bool bg,
-                                                         const std::function<void()>& on_ready) {
-    auto at = preview::where(path, engine::search_roots(ctx));
-    const auto folder = preview::in_folder(path);
-    while (true) {
-        std::optional<Activity> starting;
-        if (announce && !previews_.running(remote, at.root)) {
-            starting.emplace(*this, std::format("Starting a stream from {} (rclone serve http)…", remote), "serve:" + remote, bg);
-        }
-        auto base = previews_.base(ctx, remote, at.root);
-        if (!base) {
-            if (starting) starting->failed();
-            return util::fail(base.error());
-        }
-        starting.reset();
-        if (on_ready) on_ready();
-        auto url = *base + preview::url_path(at.path);
-        const auto status = http_status(url);
-        if (!status) return util::fail(status.error());
-        if (*status == 200 || *status == 206) return url;
-        if (*status == 404) return util::failf("Not found on {}.", remote);
-        if (*status == 500 && at != folder) {
-            at = folder;
-            continue;
-        }
-        return util::fail(previews_.failure(remote, at.root, at.path).value_or(std::format("{} answered {}.", remote, *status)));
-    }
-}
-
 void App::play(const Value& msg) {
     const std::string remote = msg.string_of("remote").value_or("");
     const std::string path = msg.string_of("path").value_or("");
     if (remote.empty() || path.empty()) return;
-    std::optional<std::uint64_t> size; // the row's: no need to ask the server
-    if (const Value* n = msg.find("size"); n != nullptr && n->kind == Value::Kind::number && n->number >= 0) {
-        size = static_cast<std::uint64_t>(n->number);
-    }
-    queue_preview([this, remote, path, size] {
-        Value v = Value::make_object();
-        auto fail = [&](const std::string& message) {
-            v.set("type", str("error"));
-            v.set("message", str(message));
-            post(v);
-        };
-        auto ctx = engine::load_context(config_path_, remote);
-        if (!ctx) return fail(ctx.error());
-        const auto name = remote_basename(path);
-        const auto dot = name.rfind('.');
-        // The player gets grab's own stream: what it reads while opening, fetched over several
-        // connections first; the rest from rclone serve, which starts meanwhile. If grab's
-        // stream can't start, rclone serve's.
-        std::shared_future<std::expected<std::string, std::string>> upstream =
-            std::async(std::launch::async, [this, ctx = *ctx, remote, path] {
-                return stream_url(ctx, remote, path, false, true);
-            }).share();
-        connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
-        PlayServer::File file{fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, path,
-                                            rclone_flags::connection(ctx->settings.common_flags)},
-                              remote, upstream, name, size};
-        auto preparing = std::make_shared<Activity>(*this, std::format("Preparing {}…", name), "warm:" + remote);
-        auto address = play_server_.play(std::move(file), [preparing, name](std::uint64_t done, std::uint64_t total) {
-            preparing->progress(done, total, std::format("Preparing {}: {} of {}", name, util::format_size(done),
-                                                         util::format_size(total)));
-        });
-        if (!address) { // rclone serve's own stream, as before
-            const auto& direct = upstream.get();
-            if (!direct) {
-                preparing->failed();
-                return fail(std::format("Can't play {}: {}", name, direct.error()));
-            }
-            address = *direct;
+    {
+        std::scoped_lock lock(play_mutex_);
+        play_next_ = PlayJob{.remote = remote, .path = path};
+        play_current_.request_stop(); // one still preparing gives way: no player opens for it
+        if (!play_thread_.joinable()) {
+            play_thread_ = std::jthread([this](const std::stop_token& stop) { run_plays(stop); });
         }
-        preparing.reset(); // it ends once the start is in, with the warm start's own copy
-        auto program = open_with_player(dot == std::string::npos ? "" : util::to_lower(name.substr(dot + 1)), *address);
-        if (!program) return fail(program.error());
-        v.set("type", str("played"));
-        v.set("name", str(name));
-        v.set("program", str(*program));
+    }
+    play_wake_.notify_all();
+}
+
+void App::run_plays(const std::stop_token& stop) {
+    while (true) {
+        PlayJob job;
+        std::stop_source current;
+        {
+            std::unique_lock lock(play_mutex_);
+            if (!play_wake_.wait(lock, stop, [this] { return play_next_.has_value(); })) return;
+            job = std::move(*play_next_);
+            play_next_.reset();
+            play_current_ = current;
+        }
+        // The window closing stops it as well (review G42).
+        const std::stop_callback closing(stop, [&current] { current.request_stop(); });
+        run_play(job, current.get_token());
+    }
+}
+
+void App::run_play(const PlayJob& job, const std::stop_token& stop) {
+    const auto& remote = job.remote;
+    const auto name = remote_basename(job.path);
+    Value v = Value::make_object();
+    auto fail = [&](const std::string& message) {
+        v.set("type", str("error"));
+        v.set("message", str(message));
         post(v);
-    });
+    };
+    // Only videos and audio go to a player (review G127).
+    if (const auto kind = preview::kind_of(name); kind != preview::Kind::video && kind != preview::Kind::audio) {
+        return fail(std::format("Can't play {}: only videos and audio play.", name));
+    }
+    auto ctx = engine::load_context(config_path_, remote);
+    if (!ctx) return fail(ctx.error());
+    auto target = engine::ssh_target(*ctx);
+    if (!target) return fail(std::format("Can't play {}: {}", name, target.error()));
+    connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
+    const bool box = budget::is_storage_box(ctx->remote.host);
+    play::Server::File file{.server = remote,
+                            .pool = pools_.get(remote, *target, connections_.budget(remote)),
+                            .path = rclone_enc::raw_path(job.path),
+                            .name = name,
+                            .connections = box ? play_burst_box : play_burst_other,
+                            .logins_at_once = box ? play_logins_box : 0,
+                            .ahead = box ? play_ahead_box : play_ahead_other,
+                            .close_on_release = ctx->engine != Engine::grab};
+    std::string address;
+    {
+        // The player starts once the warm part is in (decision 3): the status bar shows it coming.
+        Activity preparing(*this, std::format("Preparing {}…", name), "warm:" + remote);
+        auto got = play_server_.play(
+            std::move(file),
+            [&preparing, &name](std::uint64_t done, std::uint64_t total) {
+                preparing.progress(done, total, std::format("Preparing {}: {} of {}", name, util::format_size(done),
+                                                            util::format_size(total)));
+            },
+            stop);
+        if (!got) {
+            preparing.failed(); // a stopped run's time isn't a warm part's
+            if (stop.stop_requested()) return; // another Play, or the window closing
+            return fail(std::format("Can't play {}: {}.", name, got.error()));
+        }
+        address = std::move(*got);
+    }
+    // Nothing stopped it meanwhile: only then the player (review G42).
+    if (stop.stop_requested()) return;
+    const auto dot = name.rfind('.');
+    auto program = open_with_player(dot == std::string::npos ? "" : util::to_lower(name.substr(dot + 1)), address);
+    if (!program) return fail(program.error());
+    v.set("type", str("played"));
+    v.set("name", str(name));
+    v.set("program", str(*program));
+    post(v);
 }
 
 void App::post(const Value& message) const { host_.post(json::stringify(message)); }

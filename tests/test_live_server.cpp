@@ -1470,7 +1470,7 @@ std::optional<double> mkv_duration(std::string_view head) {
     }
 }
 
-// What Play fetches today before the player starts (PlayServer::play's warm parts): the start
+// What Play fetches before the player starts (play::Server::play's warm part): the start
 // (preview::warm_start of the first bytes) and the last warm_tail bytes.
 std::uint64_t warm_bytes(std::string_view head, std::uint64_t size) {
     const std::uint64_t tail_at = size > preview::warm_first + preview::warm_tail ? size - preview::warm_tail : size;

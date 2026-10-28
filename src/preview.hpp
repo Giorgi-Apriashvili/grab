@@ -1,19 +1,15 @@
 #pragma once
 
 // Previews in grab's window: videos and audio play in the program Windows uses for them,
-// streamed from a local `rclone serve http` (on 127.0.0.1 only, behind a random path); images,
-// text files and PDFs show in the window's viewer. The parts here are the ones without Windows:
-// what kind of file a name is, the server's command line, its address from its log, and text
-// decoding.
-
-#include "engine.hpp"
+// streamed through a local HTTP server (play_stream.hpp); images, text files and PDFs show in the
+// window's viewer (preview_jobs.hpp). The parts here are the ones without Windows: what kind of
+// file a name is, addresses, text decoding and what a player reads first.
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace grab::preview {
 
@@ -31,36 +27,6 @@ inline constexpr std::size_t max_image = std::size_t{64} << 20;
 inline constexpr std::size_t max_pdf = std::size_t{128} << 20;
 [[nodiscard]] std::size_t max_bytes(Kind kind);
 
-// `rclone serve http <remote:root>` on a free port of 127.0.0.1, read-only, under `/<token>/`.
-// Measured 2026-10-19 on a seek far into a film: one connection per file (rclone's parallel chunk
-// reads took 15-27 s to start on a Storage Box), and few SFTP reads in flight, since with the
-// configured 255Ki chunks rclone's default 64 made a seek wait 18-26 s on a Storage Box (2.5 MB/s
-// per connection); 4 there start in about 3 s, and 8 elsewhere keep Main's 17 MiB/s.
-[[nodiscard]] std::vector<std::string> serve_argv(const engine::Context& ctx, std::string_view root,
-                                                  std::string_view token);
-// The port from rclone's "HTTP Server started on [http://127.0.0.1:PORT/...]" log line.
-[[nodiscard]] std::optional<int> served_port(std::string_view log);
-
-// The folder a server serves a remote path from, and the path under it. rclone serve lists every
-// folder from its root down to a file and answers 500 at one it may not list (a Storage Box's
-// "/", found 2026-10-20 with "/home" as a search root), so: the search root the path is under
-// (`roots` as engine::search_roots; grab lists those; the shortest, so one server serves them
-// all), else the login home for a path in it (one server for them all, ~2 s each to start), else
-// the file's own folder.
-struct Where {
-    std::string root; // "" the login home, "media" under it, "/srv", "/"
-    std::string path;
-    bool operator==(const Where&) const = default;
-};
-[[nodiscard]] Where where(std::string_view remote_path, const std::vector<std::string>& roots);
-// From the file's own folder: for when a folder on the way from its search root can't be listed.
-[[nodiscard]] Where in_folder(std::string_view remote_path);
-// Why a server serving from `root` answered 500 for `path`, from its log (its last
-// "ERROR : <path>: ..." line), in words for the window: "Box.Guest doesn't let you list /home." for
-// a folder it may not list, else "Box.Guest: <rclone's words>."; nullopt when the log says nothing.
-[[nodiscard]] std::optional<std::string> serve_failure(std::string_view log, std::string_view remote,
-                                                       std::string_view root, std::string_view path);
-
 // `path` for a URL: each segment percent-encoded, the slashes kept.
 [[nodiscard]] std::string url_path(std::string_view path);
 // The other way, for the window's requests; nullopt for a broken escape.
@@ -71,7 +37,7 @@ struct Where {
 // Windows-1252.
 [[nodiscard]] std::string text_utf8(std::string_view bytes, bool nfo);
 
-// ---- Play's warm start (src/gui/play_server.*) ----
+// ---- Play's warm start (play_stream.hpp) ----
 // What a player reads while it opens a file (its start, up to the first video, and its end) is
 // fetched over several connections before the player starts: one stream from a Storage Box gives
 // ~2.3 MiB/s with 2.5-5 s per seek, and an MKV can hold tens of MB of fonts before its first

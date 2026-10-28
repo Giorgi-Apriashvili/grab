@@ -1,15 +1,11 @@
 #include "preview.hpp"
 
-#include "conn_budget.hpp"
-#include "rclone.hpp"
-#include "rclone_flags.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstdint>
-#include <format>
 #include <initializer_list>
 #include <optional>
 #include <system_error>
@@ -163,87 +159,6 @@ std::size_t max_bytes(Kind kind) {
     default:
         return 0;
     }
-}
-
-std::vector<std::string> serve_argv(const engine::Context& ctx, std::string_view root, std::string_view token) {
-    std::vector<std::string> argv{ctx.config.rclone,     "serve",   "http", remote_spec(ctx.settings.rclone_remote, root),
-                                  "--addr",              "127.0.0.1:0",
-                                  "--baseurl",           "/" + std::string(token),
-                                  "--read-only",         "--log-level", "NOTICE"};
-    if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
-    // Only connection flags (rclone_flags.hpp): a -v next to grab's --log-level ended every
-    // preview's server at once (G185), a --log-file hid the port line it waits for (G187).
-    const auto flags = rclone_flags::connection(ctx.settings.common_flags);
-    argv.insert(argv.end(), flags.begin(), flags.end());
-    // Its connections are not in the pool (it answers the viewer and the player at any time): at
-    // most two, as more in parallel added no speed through one server (review G146).
-    argv.insert(argv.end(), {"--sftp-connections", "2"});
-    argv.insert(argv.end(), {"--sftp-concurrency", budget::is_storage_box(ctx.remote.host) ? "4" : "8"});
-    return argv;
-}
-
-std::optional<int> served_port(std::string_view log) {
-    constexpr std::string_view at = "http://127.0.0.1:";
-    const auto p = log.find(at);
-    if (p == std::string_view::npos) return std::nullopt;
-    const auto digits = log.substr(p + at.size());
-    int port = 0;
-    const auto [end, err] = std::from_chars(digits.data(), digits.data() + digits.size(), port);
-    if (err != std::errc{} || end == digits.data() || port <= 0 || port > 65535) return std::nullopt;
-    return port;
-}
-
-Where where(std::string_view remote_path, const std::vector<std::string>& roots) {
-    const bool absolute = remote_path.starts_with('/');
-    const std::string* best = nullptr;
-    for (const auto& root : roots) {
-        const bool under = root.empty()  ? !absolute
-                           : root == "/" ? absolute
-                                         : remote_path.size() > root.size() + 1 && remote_path.starts_with(root) &&
-                                               remote_path[root.size()] == '/';
-        if (under && (best == nullptr || root.size() < best->size())) best = &root;
-    }
-    if (best == nullptr) return absolute ? in_folder(remote_path) : Where{"", std::string(remote_path)};
-    auto rest = remote_path.substr(best->size());
-    while (rest.starts_with('/')) rest.remove_prefix(1);
-    return {*best, std::string(rest)};
-}
-
-Where in_folder(std::string_view remote_path) {
-    const auto slash = remote_path.rfind('/');
-    if (slash == std::string_view::npos) return {"", std::string(remote_path)};
-    auto folder = remote_path.substr(0, slash);
-    while (folder.ends_with('/')) folder.remove_suffix(1);
-    return {folder.empty() ? "/" : std::string(folder), std::string(remote_path.substr(slash + 1))};
-}
-
-std::optional<std::string> serve_failure(std::string_view log, std::string_view remote, std::string_view root,
-                                         std::string_view path) {
-    const std::string mark = std::format("ERROR : {}: ", path);
-    std::optional<std::string_view> said;
-    while (!log.empty()) {
-        const auto eol = log.find('\n');
-        auto line = log.substr(0, eol);
-        log.remove_prefix(eol == std::string_view::npos ? log.size() : eol + 1);
-        if (line.ends_with('\r')) line.remove_suffix(1);
-        if (const auto at = line.find(mark); at != std::string_view::npos) said = line.substr(at + mark.size());
-    }
-    if (!said) return std::nullopt;
-    // "Failed to find file: error listing "tmp/locked": permission denied", the folder under root.
-    constexpr std::string_view listing = "error listing \"";
-    constexpr std::string_view denied = "\": permission denied";
-    if (const auto a = said->find(listing); a != std::string_view::npos) {
-        const auto from = a + listing.size();
-        if (const auto b = said->find(denied, from); b != std::string_view::npos) {
-            const auto folder = said->substr(from, b - from);
-            const std::string full = folder.empty() ? (root.empty() ? std::string("~") : std::string(root))
-                                     : root.empty() ? std::string(folder)
-                                     : root == "/"  ? std::format("/{}", folder)
-                                                    : std::format("{}/{}", root, folder);
-            return std::format("{} doesn't let you list {}.", remote, full);
-        }
-    }
-    return std::format("{}: {}.", remote, *said);
 }
 
 std::string url_path(std::string_view path) {

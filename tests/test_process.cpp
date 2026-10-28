@@ -254,3 +254,27 @@ TEST_CASE("a missing executable is reported, not crashed on") {
     CHECK(r.error().find("grab-definitely-not-installed-xyz") != std::string::npos);
     CHECK_FALSE(proc::run_inherit(argv).has_value());
 }
+
+#ifdef _WIN32
+TEST_CASE("the player's environment: no RCLONE_* variable at all, the rest kept (review G7, partly)") {
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_MAIN_PASS", L"secret");
+    SetEnvironmentVariableW(L"rclone_progress", L"1");
+    SetEnvironmentVariableW(L"GRAB_PLAYER_TEST_KEPT", L"yes");
+    const std::wstring block = proc::environment_without_rclone();
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_MAIN_PASS", nullptr);
+    SetEnvironmentVariableW(L"rclone_progress", nullptr);
+    SetEnvironmentVariableW(L"GRAB_PLAYER_TEST_KEPT", nullptr);
+    std::vector<std::wstring> entries;
+    for (std::size_t at = 0; at < block.size() && block[at] != L'\0';) {
+        const auto end = block.find(L'\0', at);
+        entries.push_back(block.substr(at, end - at));
+        at = end + 1;
+    }
+    REQUIRE(block.ends_with(std::wstring(2, L'\0')));
+    CHECK(std::ranges::find(entries, L"GRAB_PLAYER_TEST_KEPT=yes") != entries.end());
+    CHECK(std::ranges::none_of(entries, [](const std::wstring& e) {
+        return util::to_lower(util::to_utf8(e.substr(0, 7))) == "rclone_";
+    }));
+    CHECK(std::ranges::any_of(entries, [](const std::wstring& e) { return e.starts_with(L"PATH=") || e.starts_with(L"Path="); }));
+}
+#endif

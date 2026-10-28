@@ -1,10 +1,10 @@
 #include <doctest/doctest.h>
 
 #include "conn_budget.hpp"
+#include "fake_pool.hpp"
 #include "fake_sftp.hpp"
 #include "fetch.hpp"
 #include "sftp.hpp"
-#include "ssh.hpp"
 #include "ssh_pool.hpp"
 #include "ssh_read.hpp"
 
@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <stop_token>
@@ -28,81 +27,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Pooled sessions on in-memory SFTP servers sharing one set of files; what each was asked for is
-// collected as it closes.
-struct Fake {
-    std::map<std::string, std::string> files;
-    std::set<std::string> fifos, no_size, dirs, denied;
-    std::map<std::string, std::uint64_t> claimed; // sizes STAT claims instead
-    bool break_on_close = false;
-    std::uint32_t max_data = sftp::max_read;
-    bool reverse = false;
-    std::size_t slice = 0;
-    std::map<int, std::chrono::milliseconds> slow; // login -> a pause before each of its reads
-    std::map<int, int> breaks;                     // login -> the read on which its stream breaks
-    std::optional<budget::Failure> login_fails;    // every login fails so
-    std::atomic<int> closed{0};                    // logins up to this one the server has closed
-    std::mutex mutex;
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
-    std::map<int, std::uint64_t> asked_by; // login -> bytes its READs asked for
-    std::vector<std::string> opened;
-    std::atomic<int> logins{0};
-
-    struct Session : ssh::Session {
-        Session(Fake& f, int n) : fake(f), login(n), client(server) {
-            {
-                std::scoped_lock lock(f.mutex);
-                server.files = f.files;
-                for (const auto& d : f.dirs) server.dirs[d] = {".", ".."};
-                server.fifos = f.fifos;
-                server.no_size = f.no_size;
-                server.denied = f.denied;
-                server.listed_size = f.claimed;
-                server.break_on_close = f.break_on_close;
-                if (const auto it = f.slow.find(n); it != f.slow.end()) server.delay = it->second;
-                if (const auto it = f.breaks.find(n); it != f.breaks.end()) server.broken_after = it->second;
-            }
-            server.max_data = f.max_data;
-            server.reverse = f.reverse;
-            server.slice = f.slice;
-            client.start();
-        }
-        ~Session() override {
-            std::scoped_lock lock(fake.mutex);
-            fake.reads.insert(fake.reads.end(), server.reads.begin(), server.reads.end());
-            for (const auto& [off, len] : server.reads) fake.asked_by[login] += len;
-            fake.opened.insert(fake.opened.end(), server.opened.begin(), server.opened.end());
-        }
-        Session(const Session&) = delete;
-        Session& operator=(const Session&) = delete;
-        sftp::Client& sftp() override {
-            if (login <= fake.closed) server.dropped = true; // found out at the next read
-            return client;
-        }
-        bool reusable() override { return client.pending() == 0; }
-        Fake& fake;
-        int login;
-        test::FakeServer server;
-        sftp::Client client;
-    };
-
-    std::shared_ptr<ssh::Pool> pool(int limit = 8, std::chrono::milliseconds failure_holds = 30s) {
-        auto o = ssh::Pools::download_options(limit);
-        o.idle_timer = false;
-        o.login_failure_holds = failure_holds;
-        return std::make_shared<ssh::Pool>([this]() -> std::unique_ptr<ssh::Session> {
-            const int login = ++logins;
-            if (login_fails) throw ssh::Error(*login_fails, "Fake refused the login: the key was refused");
-            return std::make_unique<Session>(*this, login);
-        }, o);
-    }
-    std::uint64_t asked() {
-        std::scoped_lock lock(mutex);
-        std::uint64_t n = 0;
-        for (const auto& [off, len] : reads) n += len;
-        return n;
-    }
-};
+using Fake = test::FakePool;
 
 // Extra connections' seats, counted.
 struct Seats {

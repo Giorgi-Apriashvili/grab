@@ -77,6 +77,7 @@ add_library(grab_core STATIC
     src/ssh_find.cpp
     src/ssh_hash.cpp
     src/ssh_read.cpp
+    src/play_stream.cpp
     src/ssh_target.cpp
     src/ssh_walk.cpp
     src/body_stream.cpp)
@@ -85,8 +86,9 @@ target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
 # crypt32: DPAPI, which encrypts the saved file lists for the current user.
 # normaliz: NormalizeString, for names rclone takes for one (folder_job.cpp).
+# ws2_32: Play's local HTTP server (play_stream.cpp).
 target_link_libraries(grab_core PUBLIC $<$<PLATFORM_ID:Windows>:bcrypt> $<$<PLATFORM_ID:Windows>:crypt32>
-                                       $<$<PLATFORM_ID:Windows>:normaliz>)
+                                       $<$<PLATFORM_ID:Windows>:normaliz> $<$<PLATFORM_ID:Windows>:ws2_32>)
 target_compile_features(grab_core PUBLIC cxx_std_23)
 target_compile_definitions(grab_core PUBLIC
     GRAB_VERSION="${PROJECT_VERSION}"
@@ -213,7 +215,6 @@ if(WIN32 AND GRAB_BUILD_GUI)
         src/gui/app.cpp
         src/gui/tray.cpp
         src/gui/webview.cpp
-        src/gui/preview_host.cpp
         src/gui/play_server.cpp
         src/gui/resources.cpp
         src/gui/grab-gui.rc)
@@ -226,7 +227,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
     target_link_libraries(grab-gui PRIVATE
         grab_core
         ${webview2_SOURCE_DIR}/build/native/${GRAB_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib
-        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32 winhttp ws2_32)
+        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32)
     install(TARGETS grab-gui RUNTIME DESTINATION bin)
 endif()
 install(FILES grab.conf.example DESTINATION .)

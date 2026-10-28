@@ -199,7 +199,10 @@ public:
     // A session: an idle one, else a new login once there is room under the limit and among the
     // logins at once, else waiting for one to come back. nullopt once `stop` is requested. Throws
     // Error: a fatal one at once, a refusal after the retries (`retry_refused`, else the pool's).
-    [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {}, Retry retry_refused = std::nullopt);
+    // `logins_at_once`: this caller's own cap on the pool's logins in progress (Play's burst on a
+    // Storage Box, which accepted 8 at once); 0: Options::logins_at_once. Other callers keep theirs.
+    [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {}, Retry retry_refused = std::nullopt,
+                                               int logins_at_once = 0);
     // A new login, never an idle connection, for a command the server refused beside the SFTP
     // session of a reused one (MaxSessions 1): nothing else runs on it. When the pool is full, its
     // oldest idle connection is closed to make room (idle ones count toward the limit); else as
@@ -212,9 +215,9 @@ public:
     // host key not trusted, a login refused) until forget_login_failure, another for
     // Options::login_failure_holds. An idle connection is still handed out, and any caller's login
     // that works (downloads, Browse) clears it. Until a login worked, these log in one at a time,
-    // the others waiting for its outcome.
+    // the others waiting for its outcome. `logins_at_once` as acquire's.
     [[nodiscard]] std::optional<Lease> acquire_remembered(std::stop_token stop = {},
-                                                          Retry retry_refused = std::nullopt);
+                                                          Retry retry_refused = std::nullopt, int logins_at_once = 0);
     // The next acquire_remembered logs in again: a Test that worked, Trust, a server saved.
     void forget_login_failure();
 

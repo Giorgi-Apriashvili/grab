@@ -48,6 +48,9 @@ struct RunOptions {
 // run_streaming and run_piped give their children this one; run_inherit (the user's own --rclone
 // copy, an editor, an installer) and start_independent everything.
 [[nodiscard]] std::wstring internal_environment();
+// The same without any RCLONE_* variable at all, the RCLONE_CONFIG_* secrets grab exports too: for
+// a long-lived program of someone else's (the media player Play starts; review G7, partly).
+[[nodiscard]] std::wstring environment_without_rclone();
 #endif
 
 struct CaptureResult {

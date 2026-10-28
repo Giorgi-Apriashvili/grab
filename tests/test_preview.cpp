@@ -1,14 +1,11 @@
-#include "engine.hpp"
 #include "preview.hpp"
 
 #include <doctest/doctest.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <vector>
 
 using namespace grab;
 using preview::Kind;
@@ -32,71 +29,6 @@ TEST_CASE("what kind of file a name is") {
     CHECK(preview::content_type("a.pdf") == "application/pdf");
     CHECK(preview::max_bytes(Kind::text) == 1 << 20);
     CHECK(preview::max_bytes(Kind::video) == 0);
-}
-
-TEST_CASE("the local stream server's command line and address") {
-    engine::Context ctx;
-    ctx.config.rclone = "rclone.exe";
-    ctx.settings.rclone_remote = "Box.Guest";
-    ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki"};
-    ctx.remote.host = "u443987-sub1.your-storagebox.de";
-    const auto argv = preview::serve_argv(ctx, "", "abc123");
-    CHECK(std::vector<std::string>(argv.begin(), argv.begin() + 4) ==
-          std::vector<std::string>{"rclone.exe", "serve", "http", "Box.Guest:"});
-    auto has = [&](std::string a, std::string b) {
-        const auto it = std::ranges::find(argv, a);
-        return it != argv.end() && it + 1 != argv.end() && *(it + 1) == b;
-    };
-    CHECK(has("--addr", "127.0.0.1:0")); // this PC only, a free port
-    CHECK(has("--baseurl", "/abc123"));
-    CHECK(std::ranges::find(argv, "--read-only") != argv.end());
-    CHECK(std::ranges::find(argv, "-P") == argv.end()); // no console progress
-    CHECK(has("--sftp-chunk-size", "255Ki"));
-    CHECK(has("--sftp-concurrency", "4")); // few reads in flight: a seek starts in seconds
-    CHECK(has("--sftp-connections", "2")); // outside the pool, so few (G146)
-    CHECK(argv.back() == "4");             // after the configured flags, so it wins
-    CHECK(std::ranges::find(argv, "--vfs-read-chunk-streams") == argv.end()); // slow to start on a Storage Box
-    CHECK(preview::serve_argv(ctx, "/", "t")[3] == "Box.Guest:/");
-    ctx.remote.host = "65.21.224.123";
-    CHECK(preview::serve_argv(ctx, "", "t").back() == "8");
-    CHECK(preview::served_port(
-              "2026/10/19 16:23:03 NOTICE: sftp://x/y: HTTP Server started on [http://127.0.0.1:53954/abc123/]") == 53954);
-    CHECK_FALSE(preview::served_port("NOTICE: starting").has_value());
-    CHECK_FALSE(preview::served_port("http://127.0.0.1:/").has_value());
-}
-
-TEST_CASE("the folder a stream serves a file from") {
-    using preview::Where;
-    const std::vector<std::string> home{""};
-    CHECK(preview::where("movies/a.mkv", home) == Where{"", "movies/a.mkv"});
-    // Not from "/", which a Storage Box doesn't let you list: from the file's folder.
-    CHECK(preview::where("/home/tv/a.jpg", home) == Where{"/home/tv", "a.jpg"});
-    CHECK(preview::where("/a.jpg", home) == Where{"/", "a.jpg"});
-    // From the search root it is under (the shortest of several), which grab lists anyway.
-    const std::vector<std::string> roots{"/home/tv", "/home", "media", "/srv/x"};
-    CHECK(preview::where("/home/tv/s01/a.jpg", roots) == Where{"/home", "tv/s01/a.jpg"});
-    CHECK(preview::where("/srv/x/a.jpg", roots) == Where{"/srv/x", "a.jpg"});
-    CHECK(preview::where("/srv/xy/a.jpg", roots) == Where{"/srv/xy", "a.jpg"}); // not under /srv/x
-    CHECK(preview::where("media/b/a.jpg", roots) == Where{"media", "b/a.jpg"});
-    CHECK(preview::where("other/a.jpg", roots) == Where{"", "other/a.jpg"}); // the login home's one server
-    CHECK(preview::where("a.jpg", roots) == Where{"", "a.jpg"});
-    CHECK(preview::where("/etc/x.nfo", std::vector<std::string>{"/"}) == Where{"/", "etc/x.nfo"});
-    CHECK(preview::in_folder("/home/tv/a.jpg") == Where{"/home/tv", "a.jpg"});
-    CHECK(preview::in_folder("tv/a.jpg") == Where{"tv", "a.jpg"});
-
-    // Why rclone serve answered 500, from its log (rclone 1.75.1's words, 2026-10-20).
-    const std::string log = "2026/10/20 19:05:32 NOTICE: sftp://u@h:23//: HTTP Server started on [http://127.0.0.1:63027/t/]\r\n"
-                            "2026/10/20 19:05:34 ERROR : home/tv/: Dir.Stat error: error listing \"\": permission denied\r\n"
-                            "2026/10/20 19:05:34 ERROR : home/tv/a.jpg: Failed to find file: error listing \"\": permission "
-                            "denied\r\n"
-                            "2026/10/20 19:05:40 ERROR : home/tv/b.jpg: Failed to open file: connection lost\n";
-    CHECK(preview::serve_failure(log, "Box.Guest", "/", "home/tv/a.jpg") == "Box.Guest doesn't let you list /.");
-    CHECK(preview::serve_failure(log, "Box.Guest", "/", "home/tv/b.jpg") == "Box.Guest: Failed to open file: connection lost.");
-    CHECK_FALSE(preview::serve_failure(log, "Box.Guest", "/", "home/tv/c.jpg").has_value());
-    const std::string deeper = "ERROR : x/pics/a.png: Failed to find file: error listing \"x\": permission denied\n";
-    CHECK(preview::serve_failure(deeper, "Main", "/srv", "x/pics/a.png") == "Main doesn't let you list /srv/x.");
-    CHECK(preview::serve_failure(deeper, "Main", "", "x/pics/a.png") == "Main doesn't let you list x.");
-    CHECK(preview::serve_failure(deeper, "Main", "/", "x/pics/a.png") == "Main doesn't let you list /x.");
 }
 
 TEST_CASE("paths in the stream's addresses") {
@@ -182,7 +114,11 @@ TEST_CASE("Play's warm start: an MKV up to its first video and 8 MiB more, other
     // Not an MKV.
     CHECK_FALSE(preview::mkv_first_cluster("RIFF....AVI LIST").has_value());
     CHECK_FALSE(preview::mkv_first_cluster("").has_value());
-    CHECK(preview::warm_start("\x00\x00\x00\x20" "ftypisom", 700 * MiB) == 8 * MiB);
+    // An MP4's first bytes, its leading NULs included (review G126: a plain literal stopped at the first).
+    const std::string mp4("\x00\x00\x00\x20" "ftypisom", 12);
+    REQUIRE(mp4.size() == 12);
+    CHECK_FALSE(preview::mkv_first_cluster(mp4).has_value());
+    CHECK(preview::warm_start(mp4, 700 * MiB) == 8 * MiB);
     CHECK(preview::warm_start("", 100) == 100);
 }
 

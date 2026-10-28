@@ -95,10 +95,11 @@ Pool::~Pool() {
     if (timer_.joinable()) timer_.join();
 }
 
-std::optional<Pool::Lease> Pool::acquire(std::stop_token stop, Retry retry_refused) {
+std::optional<Pool::Lease> Pool::acquire(std::stop_token stop, Retry retry_refused, int logins_at_once) {
     const std::span<const std::chrono::milliseconds> pauses = retry_refused.value_or(options_.retry_refused);
+    const int at_once = logins_at_once > 0 ? logins_at_once : options_.logins_at_once;
     std::unique_lock lock(mutex_);
-    auto room = [this] { return open_locked() < options_.limit && logging_in_ < options_.logins_at_once; };
+    auto room = [this, at_once] { return open_locked() < options_.limit && logging_in_ < at_once; };
     for (;;) {
         if (stop.stop_requested()) return std::nullopt;
         if (!idle_.empty()) {
@@ -137,7 +138,7 @@ std::optional<Pool::Lease> Pool::acquire_new(std::stop_token stop, Retry retry_r
     return log_in(lock, stop, pauses);
 }
 
-std::optional<Pool::Lease> Pool::acquire_remembered(std::stop_token stop, Retry retry_refused) {
+std::optional<Pool::Lease> Pool::acquire_remembered(std::stop_token stop, Retry retry_refused, int logins_at_once) {
     bool trying = false; // this caller logs in while none of these logins has worked yet
     {
         std::unique_lock lock(mutex_);
@@ -178,7 +179,7 @@ std::optional<Pool::Lease> Pool::acquire_remembered(std::stop_token stop, Retry 
     };
     std::optional<Lease> lease;
     try {
-        lease = acquire(std::move(stop), retry_refused);
+        lease = acquire(std::move(stop), retry_refused, logins_at_once);
     } catch (const Error& e) {
         outcome(LoginFailure{.kind = e.kind, .what = e.what(), .since = Clock::now()}, false);
         throw;

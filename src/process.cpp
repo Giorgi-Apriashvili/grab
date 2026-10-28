@@ -123,6 +123,22 @@ std::wstring internal_environment() {
     return block;
 }
 
+std::wstring environment_without_rclone() {
+    std::wstring block;
+    LPWCH all = GetEnvironmentStringsW();
+    if (all == nullptr) return std::wstring(2, L'\0');
+    for (const wchar_t* p = all; *p != L'\0'; p += std::wcslen(p) + 1) {
+        const std::wstring_view entry(p);
+        if (util::to_lower(util::to_utf8(entry.substr(0, 7))) == "rclone_") continue;
+        block.append(entry);
+        block.push_back(L'\0');
+    }
+    FreeEnvironmentStringsW(all);
+    if (block.empty()) block.push_back(L'\0');
+    block.push_back(L'\0');
+    return block;
+}
+
 namespace {
 
 BOOL WINAPI ignore_ctrl(DWORD type) {

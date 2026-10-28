@@ -8,8 +8,7 @@
 #include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
-#include "play_server.hpp"
-#include "preview_host.hpp"
+#include "play_stream.hpp"
 #include "preview_jobs.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
@@ -122,8 +121,17 @@ public:
     };
 
 private:
-    // A video or audio file, in the program Windows plays it with: {remote, path}.
+    // A video or audio file, in the program Windows plays it with: {remote, path}. On the Play
+    // thread, where a new Play stops one still preparing (review G50).
     void play(const json::Value& msg);
+    struct PlayJob {
+        std::string remote;
+        std::string path;
+    };
+    void run_plays(const std::stop_token& stop);
+    // Through grab's own connections on every server (RCLONE-REPLACEMENT.md, phase 6): the warm
+    // part first (the status bar shows it coming in), then the player.
+    void run_play(const PlayJob& job, const std::stop_token& stop);
 
     // What a preview fetch holds while it runs and gives back once its answer went out: the reader
     // (its connections) and the viewer's seat on the server.
@@ -150,13 +158,6 @@ private:
     // A server saved, trusted or removed: its previews kept go (review G36) and the login the
     // previews remembered as failed is tried again (Pool::acquire_remembered).
     void forget_server_previews(const std::string& server);
-    // The address of `path` on `remote`'s rclone serve (preview::where), once it says it has the
-    // file; when it answers 500 (a folder on the way the server doesn't let you list, as a
-    // Storage Box's "/"), from the file's own folder. `on_ready`: called when a server runs, before it is asked. announce: the
-    // status bar says when one starts (bg: as background work).
-    [[nodiscard]] std::expected<std::string, std::string> stream_url(const engine::Context& ctx, const std::string& remote,
-                                                                     const std::string& path, bool announce, bool bg,
-                                                                     const std::function<void()>& on_ready = {});
     // `first`: ahead of the jobs queued already (the preview shown now).
     void queue_preview(std::function<void()> job, bool first = false);
     void run_preview_jobs(const std::stop_token& stop);
@@ -515,11 +516,13 @@ private:
     std::mutex timings_mutex_;
     std::map<std::string, int> timings_;
 
-    // Play's servers' local streams (rclone serve), and two workers for the page's previews and Play.
-    PreviewServers previews_;
-    // Play's warm starts and the player's stream; after previews_ and connections_ (it uses
-    // both), before the workers that call it.
-    PlayServer play_server_{connections_};
+    // Play's local stream server; after connections_ and pools_, which its streams use.
+    play::Server play_server_{connections_};
+    std::mutex play_mutex_; // guards play_next_, play_current_
+    std::condition_variable_any play_wake_;
+    std::optional<PlayJob> play_next_;
+    std::stop_source play_current_; // the Play preparing now
+    std::jthread play_thread_;      // after play_server_: joined before it goes
     // The previews being fetched, by file, and the ones kept in memory (thread-safe).
     preview::Previews preview_jobs_;
     // Guards preview_queue_, viewer_seats_, preview_workers_.
@@ -535,7 +538,7 @@ private:
         std::shared_ptr<ssh::Pool> rclone_pool; // engine = rclone: idle connections close with the seat
     };
     std::map<std::string, ViewerSeat> viewer_seats_; // by server
-    std::vector<std::jthread> preview_workers_; // after previews_: they stop before the servers end
+    std::vector<std::jthread> preview_workers_; // after the members their jobs use
 
     std::vector<std::jthread> workers_; // last member: stopped and joined first
 };
