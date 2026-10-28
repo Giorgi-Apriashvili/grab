@@ -1,20 +1,13 @@
 #include "secrets.hpp"
 
 #include "config.hpp"
+#include "rclone_encoding.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <format>
-#include <mutex>
-#include <set>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
-#else
-#include <cstdlib>
-#endif
-
 namespace grab::secrets {
 
 namespace fs = std::filesystem;
@@ -130,41 +123,16 @@ std::expected<void, std::string> save(const fs::path& file, const Store& store) 
     return util::write_file_atomic(file, std::string(sealed_header) + *sealed);
 }
 
-std::string env_name(std::string_view remote, std::string_view key) {
-    // As rclone's fs.ConfigToEnv: '-' becomes '_' in the key only; the remote keeps its '-' and
-    // '.', or rclone never finds the password of a server called "my-box" (review G6).
-    const auto upper = [](char c) { return static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c); };
-    std::string name = "RCLONE_CONFIG_";
-    for (const char c : remote) name += upper(c);
-    name += '_';
-    for (const char c : key) name += c == '-' ? '_' : upper(c);
-    return name;
+std::string env_prefix(std::string_view remote) {
+    // As rclone's fs.ConfigToEnv: the remote keeps its '-' and '.', or rclone never finds the
+    // password of a server called "my-box" (review G6), and is upper-cased as Go does it.
+    return "RCLONE_CONFIG_" + rclone_enc::go_upper(remote) + "_";
 }
 
-void export_to_env(const Store& store) {
-    static std::mutex m;
-    static std::set<std::string> exported; // names this process set, to drop the stale ones
-    std::lock_guard lock(m);
-    std::set<std::string> now;
-    auto set = [](const std::string& name, const std::string* value) {
-#ifdef _WIN32
-        SetEnvironmentVariableW(util::to_wide(name).c_str(), value != nullptr ? util::to_wide(*value).c_str() : nullptr);
-#else
-        if (value != nullptr) setenv(name.c_str(), value->c_str(), 1);
-        else unsetenv(name.c_str());
-#endif
-    };
-    for (const auto& [remote, values] : store) {
-        for (const auto& [key, value] : values) {
-            const auto name = env_name(remote, key);
-            set(name, &value);
-            now.insert(name);
-        }
-    }
-    for (const auto& name : exported) {
-        if (!now.contains(name)) set(name, nullptr);
-    }
-    exported = std::move(now);
+std::string env_name(std::string_view remote, std::string_view key) {
+    std::string k(key); // its '-' become '_'
+    std::ranges::replace(k, '-', '_');
+    return env_prefix(remote) + rclone_enc::go_upper(k);
 }
 
 Taken take_secrets(std::string_view rclone_text) {
@@ -219,7 +187,6 @@ std::expected<void, std::string> prepare(const fs::path& rclone_conf) {
         }
     }
     if (!store) return util::fail(store.error());
-    export_to_env(*store);
     return {};
 }
 

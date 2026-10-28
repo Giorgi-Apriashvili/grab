@@ -537,9 +537,10 @@ the file can reverse.
 - grab keeps them in `%APPDATA%\grab\secrets`, encrypted for your Windows account (DPAPI). Other
   accounts, backups and copies of the file can't read them; programs running as you can, as
   grab does, without asking you for anything.
-- When grab runs rclone, it hands them over as environment variables
-  (`RCLONE_CONFIG_<SERVER>_PASS`, which rclone reads like its config; a server called `my-box`
-  keeps its dash: `RCLONE_CONFIG_MY-BOX_PASS`), never on disk unencrypted or on a command line.
+- When grab runs rclone, it hands a server's password to that rclone run alone, in its own
+  environment (`RCLONE_CONFIG_<SERVER>_PASS`, which rclone reads like its config; a server called
+  `my-box` keeps its dash: `RCLONE_CONFIG_MY-BOX_PASS`), never on disk unencrypted, on a command
+  line, or in grab's own environment, where every program grab starts would see it.
 - A grab.conf `rclone_config =` that points at your own rclone.conf is used as it is: its
   passwords stay there.
 - If the store can't be read (another Windows account, a damaged file, or a Windows password an
@@ -832,9 +833,16 @@ their connection flags: `--sftp-*`, `--bind`, `--contimeout`, `--timeout`,
 `--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and
 `--password-command`. Those calls depend on rclone's exact output, so a progress, logging,
 filter or comparison flag there would break them (`-vP` failed every download, `--size-only`
-made verification compare sizes only). Likewise they see no `RCLONE_*` environment variable but
-`RCLONE_CONFIG*`, `RCLONE_PASSWORD_COMMAND` and `RCLONE_SFTP_*`: an `RCLONE_PROGRESS=true` meant
-for interactive rclone would put progress text into the bytes grab reads. A folder's small-file
+made verification compare sizes only). The `--sftp-*` flags that would replace the server
+itself (`--sftp-host`, `-port`, `-user`, `-pass`, `-ask-password`, `-key-pem`, `-key-file`,
+`-key-file-pass`, `-pubkey`, `-pubkey-file`, `-key-use-agent`, `-known-hosts-file`, `-ssh`) are
+refused there, in `common_flags` and after `--`; `--rclone` takes them. Likewise they see no
+`RCLONE_*` environment variable but `RCLONE_PASSWORD_COMMAND` and the `RCLONE_SFTP_*` ones that
+don't set the server's address, login or host keys: an `RCLONE_PROGRESS=true` meant for
+interactive rclone would put progress text into the bytes grab reads. Each rclone run gets its
+one server's details from grab alone, in its own environment, with rclone's config in memory
+(`--config NUL`); `--rclone` gets the whole environment, that server's variables replacing any
+`RCLONE_CONFIG_<SERVER>_*` of yours. A folder's small-file
 batch gets its `--transfers` from grab (the connections it may use), and grab's own engine
 fetches a file in byte ranges over `max_connections` (blank = automatic: 14 on Storage Boxes,
 12 elsewhere, lowered when a server refuses connections and raised again by clean downloads),
@@ -911,7 +919,8 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
   (81 MB, which is why the installer is about 22 MB), and grab uses it rather than any rclone
   on PATH (only when it is missing does grab look on PATH). Set `rclone = <path>` in `[grab]`
   to use another copy. Another copy must be 1.67 or newer (folder downloads use
-  `--sftp-connections`); grab checks once and says so when it's older. For dates in listings it
+  `--sftp-connections`); grab checks once, where it runs rclone (engine = rclone servers,
+  `--rclone`), and says so when it's older. For dates in listings it
   must also understand `--time-format unix` (1.72 and newer; older ones show rows without dates).
   - **Pin:** the build downloads the official Windows zip and checks it against the pinned
     SHA-256, which is rclone's own published `SHA256SUMS` value.

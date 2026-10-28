@@ -47,10 +47,7 @@ std::expected<std::vector<std::string>, std::string> build_rclone_argv(const Rcl
     std::vector<std::string> argv{req.rclone_exe, req.mode == Mode::folder ? "copy" : "copyto",
                                   remote_spec(req.rclone_remote, req.remote_path), std::move(*local)};
 
-    if (req.rclone_config) {
-        argv.push_back("--config");
-        argv.push_back(util::path_to_utf8(*req.rclone_config));
-    }
+    argv.insert(argv.end(), {"--config", std::string(config_in_memory)});
     argv.insert(argv.end(), req.common_flags.begin(), req.common_flags.end());
     argv.insert(argv.end(), req.mode_flags.begin(), req.mode_flags.end());
     argv.insert(argv.end(), req.extra.begin(), req.extra.end());

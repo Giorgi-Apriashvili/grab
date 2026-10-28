@@ -291,6 +291,13 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     // grab's engine uses only connection flags (rclone_flags.hpp): anything else after `--` would
     // be ignored, or worse ("-- --dry-run" still downloaded the big files, G186).
     if (!result.opts.rclone) {
+        // Nor one that would replace the server grab gives rclone (its address, login, host keys).
+        if (const auto bad = rclone_flags::first_refused(result.opts.extra)) {
+            return util::failf("{} after -- would replace the server's {}, which grab gives rclone itself; change "
+                               "the server with Edit in grab's Settings, or add --rclone for a plain rclone copy that "
+                               "takes it",
+                               bad->flag, bad->what);
+        }
         if (const auto bad = rclone_flags::first_unusable(result.opts.extra)) {
             return util::failf("{} after -- isn't used by grab's downloads, which take only connection flags "
                                "(--sftp-*, --bind, --timeout...): {}",

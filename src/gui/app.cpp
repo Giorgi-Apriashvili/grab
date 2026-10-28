@@ -2778,8 +2778,11 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                            connection_budget(item->remote, ctx->remote.host, ctx->settings.max_connections));
 
     fetch::Download d;
-    d.source = fetch::Source{ctx->config.rclone, ctx->config.rclone_config, ctx->settings.rclone_remote, item->path,
-                             rclone_flags::connection(ctx->settings.common_flags)};
+    d.source = fetch::Source{.rclone = ctx->config.rclone,
+                             .environment = {}, // engine = rclone: below
+                             .rclone_remote = ctx->settings.rclone_remote,
+                             .path = item->path,
+                             .flags = rclone_flags::connection(ctx->settings.common_flags)};
     d.server = item->remote;
     d.id = item->id;
     existing::Choice choice{};
@@ -2796,6 +2799,10 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         auto target = engine::ssh_target(*ctx);
         if (!target) return set(Status::failed, target.error());
         d.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
+    } else if (auto env = engine::rclone_env(*ctx); env) {
+        d.source.environment = std::move(*env);
+    } else {
+        return set(Status::failed, env.error());
     }
     auto fetch_once = [&] {
         return fetch::run(d, connections_, [&](const fetch::Progress& p) {

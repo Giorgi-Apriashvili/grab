@@ -191,10 +191,10 @@ void apply_auth(secrets::Store& store, const std::string& remote, servers::Auth 
 
 namespace {
 
-// Changes the encrypted store of grab's own rclone.conf and hands the result to rclone. A store
-// that can't be decrypted starts over, the old file set aside (secrets::load_for_change); the
-// note returned then says so, and which other servers (but `leaving`, one being removed) need
-// their password again (review G211). Empty otherwise.
+// Changes the encrypted store of grab's own rclone.conf, which each rclone run reads its server's
+// secrets from (engine::rclone_env). A store that can't be decrypted starts over, the old file set
+// aside (secrets::load_for_change); the note returned then says so, and which other servers (but
+// `leaving`, one being removed) need their password again (review G211). Empty otherwise.
 std::expected<std::string, std::string> change_secrets(const Env& env, const std::function<void(secrets::Store&)>& change,
                                                        std::string_view leaving = {}) {
     auto lock = lock_settings();
@@ -204,7 +204,6 @@ std::expected<std::string, std::string> change_secrets(const Env& env, const std
     if (!loaded) return util::fail(loaded.error());
     change(loaded->store);
     if (auto saved = secrets::save(file, loaded->store); !saved) return util::fail(saved.error());
-    secrets::export_to_env(loaded->store);
     if (!loaded->set_aside) return std::string{};
     std::vector<std::string> again;
     for (const auto& s : list_servers(env)) {
@@ -669,11 +668,24 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
 
     TestResult result;
     const Engine server_engine = effective_engine(*s);
+    engine::Context ctx{.config = env.cfg,
+                        .settings = *s,
+                        .remote = *remote,
+                        .method = resolve_find_method(*s, *remote),
+                        .imported = {},
+                        .engine = server_engine,
+                        .grab_method = resolve_grab_method(*s, *remote)};
+    ctx.config.rclone = env.rclone;
+    ctx.config.rclone_config = env.rclone_conf; // as load_context resolves them
     // rclone only where it still downloads: on engine = grab nothing a test can show goes through it
     // (previews and Play don't either since phase 6), and its listing costs a login (1-3.5 s on a
     // Storage Box).
     if (server_engine != Engine::grab) {
-        auto probe = proc::run_capture(servers::probe_argv(env.rclone, env.rclone_conf, s->rclone_remote), quiet(stop));
+        auto probe = engine::rclone_env(ctx).and_then([&](proc::Environment server) {
+            auto run = quiet(stop);
+            run.environment = std::move(server);
+            return proc::run_capture(servers::probe_argv(env.rclone, s->rclone_remote), run);
+        });
         if (stop.stop_requested()) return util::fail("cancelled");
         result.rclone_ok = ok(probe);
         if (!*result.rclone_ok) {
@@ -692,13 +704,6 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
     }
     // Every server: grab's own login, which downloads and searches use on engine = grab, and
     // previews, Play and verification on any.
-    const engine::Context ctx{.config = env.cfg,
-                              .settings = *s,
-                              .remote = *remote,
-                              .method = resolve_find_method(*s, *remote),
-                              .imported = {},
-                              .engine = server_engine,
-                              .grab_method = resolve_grab_method(*s, *remote)};
     test_grab(ctx, learned_limits_path(env.grab_conf), stop, result);
     if (stop.stop_requested()) return util::fail("cancelled");
     return result;

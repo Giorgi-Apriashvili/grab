@@ -185,7 +185,7 @@ namespace {
 std::vector<std::string> base_argv(const Source& src, std::initializer_list<std::string> head) {
     std::vector<std::string> argv{src.rclone};
     argv.insert(argv.end(), head);
-    if (src.config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*src.config)});
+    argv.insert(argv.end(), {"--config", std::string(config_in_memory)});
     argv.insert(argv.end(), src.flags.begin(), src.flags.end());
     // A dead connection is noticed in a minute; grab retries the chunk from where it stopped.
     argv.insert(argv.end(), {"--contimeout", "15s", "--timeout", "60s", "--low-level-retries", "1"});
@@ -736,6 +736,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
     proc::RunOptions quiet;
     quiet.detached = true;
     quiet.stop = stop;
+    quiet.environment = src.environment;
     // The size check is a connection like the others: taken from the pool, and when the server
     // is full, asked again 1, 2, 4, 8, then 15 s apart rather than failing the file (review G193).
     std::optional<RemoteStat> remote;
@@ -946,6 +947,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         proc::RunOptions opts;
         opts.detached = true;
         opts.stop = token;
+        opts.environment = src.environment;
         const auto cat = cat_argv(src, offset, count, limited);
         if (d.on_command) d.on_command(cat);
         auto run = proc::run_piped(cat, [&](std::string_view chunk) {

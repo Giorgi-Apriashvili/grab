@@ -93,10 +93,9 @@ struct Fingerprint {
                                                    const std::filesystem::path& config,
                                                    const std::string& name);
 
-// A quick connection test: list the login home's folders once, with short timeouts.
-[[nodiscard]] std::vector<std::string> probe_argv(const std::string& rclone,
-                                                  const std::filesystem::path& config,
-                                                  const std::string& name);
+// A quick connection test: list the login home's folders once, with short timeouts. The server
+// comes in the run's environment (engine::rclone_env), its config in memory.
+[[nodiscard]] std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name);
 
 // ---- grab.conf text edits (everything else, comments included, is kept) -------------------
 

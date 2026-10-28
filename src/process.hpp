@@ -10,12 +10,25 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace grab::proc {
 
 // Exit code reported for a child that was stopped through RunOptions::stop (and, on Windows,
 // for STATUS_CONTROL_C_EXIT), mirroring the POSIX 128 + SIGINT convention.
 inline constexpr int exit_stopped = 130;
+
+// What a child's environment gets beyond the one it inherits: a server's variables for the rclone
+// process that works on it, and for no other program (engine::rclone_env; review G7). Names are
+// compared as the system compares them: ignoring case on Windows (CompareStringOrdinal), exactly
+// elsewhere.
+struct Environment {
+    // UTF-8 names and values, each replacing an inherited variable of the same name.
+    std::vector<std::pair<std::string, std::string>> set;
+    // Inherited variables whose names start with one of these are left out (a remote's
+    // RCLONE_CONFIG_<NAME>_ that the user's own environment has: `set` defines that remote alone).
+    std::vector<std::string> without_prefix;
+};
 
 struct RunOptions {
     // request_stop() terminates the child and everything it started (a Job object on
@@ -30,6 +43,9 @@ struct RunOptions {
     // run_capture only: each chunk of the child's stdout as it arrives (it is captured too), e.g.
     // to count a listing's entries while it runs, for a progress bar. On the reading thread.
     std::function<void(std::string_view)> on_output;
+    // Added to the child's environment (internal_environment's), for run_capture, run_streaming
+    // and run_piped alike.
+    Environment environment;
 };
 
 // The program argv[0] names, as every run_* and start_independent start it (review G3). A name
@@ -44,13 +60,20 @@ struct RunOptions {
 
 #ifdef _WIN32
 // This process's environment as a CreateProcess block (UTF-16), without the RCLONE_* variables
-// grab's internal rclone calls must not see (rclone_flags::kept_variable; review G8). run_capture,
-// run_streaming and run_piped give their children this one; run_inherit (the user's own --rclone
-// copy, an editor, an installer) and start_independent everything.
+// grab's internal rclone calls must not see (rclone_flags::kept_variable; review G8): no inherited
+// RCLONE_CONFIG_* at all, since each run gets its own server's in RunOptions::environment.
+// run_capture, run_streaming and run_piped give their children this one with that environment
+// added; run_inherit (the user's own --rclone copy, an editor, an installer) and start_independent
+// everything.
 [[nodiscard]] std::wstring internal_environment();
-// The same without any RCLONE_* variable at all, the RCLONE_CONFIG_* secrets grab exports too: for
-// a long-lived program of someone else's (the media player Play starts; review G7, partly).
+// The same without any RCLONE_* variable at all: for a long-lived program of someone else's (the
+// media player Play starts; review G7).
 [[nodiscard]] std::wstring environment_without_rclone();
+// Remove every RCLONE_CONFIG_* (any case) from this process's own environment; RCLONE_CONFIG
+// itself stays. grab-gui calls it first thing: a 0.19 grab-gui kept every server's secrets in its
+// environment, and an in-app update hands that environment to the next window, whose editors,
+// Explorer, browser and installer would pass them on in turn (review G7).
+void drop_inherited_server_variables();
 #endif
 
 struct CaptureResult {
@@ -87,6 +110,11 @@ run_piped(std::span<const std::string> argv, const std::function<bool(std::strin
 // starts. `contain_descendants` false lets the child's own children leave the job, so they
 // outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
 [[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
+                                                          bool contain_descendants = true);
+// The same with `environment` added to the whole environment: the user's own --rclone copy, given
+// its server (engine::rclone_env).
+[[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
+                                                          const Environment& environment,
                                                           bool contain_descendants = true);
 
 // A program started by start_independent. Dropping this object leaves it running.

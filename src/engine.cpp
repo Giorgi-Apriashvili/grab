@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -93,6 +94,21 @@ std::expected<void, std::string> check_rclone(const std::string& rclone, const s
     return util::fail(why);
 }
 
+std::expected<void, std::string> check_rclone(const Context& ctx) {
+    return check_rclone(ctx.config.rclone, util::self_exe_path().parent_path(), ctx.config.rclone != "rclone");
+}
+
+namespace {
+
+// Why the saved passwords can't be used, with what to do about it.
+std::string password_again(std::string_view why, std::string_view server) {
+    return std::format("{}. Enter the password of {} again: Settings → Edit in grab's window, or `grab server remove "
+                       "{}` and `grab server add {}`",
+                       why, server, server, server);
+}
+
+} // namespace
+
 std::expected<Context, std::string> load_context(const std::filesystem::path& config_path,
                                                  const std::optional<std::string>& remote_name) {
     auto cfg = load_grab_config(config_path);
@@ -111,10 +127,15 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
 
     const auto exe_dir = util::self_exe_path().parent_path();
     cfg->rclone = resolve_rclone_exe(*cfg, exe_dir);
-    if (auto usable = check_rclone(cfg->rclone, exe_dir, !util::trim(cfg->rclone).empty()); !usable) {
-        return util::fail(usable.error());
+    const Engine engine = effective_engine(settings);
+    // Asked only where rclone runs: an engine = grab server loads with a missing or too old one
+    // (--rclone asks for itself).
+    if (engine == Engine::rclone) {
+        if (auto usable = check_rclone(cfg->rclone, exe_dir, cfg->rclone != "rclone"); !usable) {
+            return util::fail(usable.error());
+        }
     }
-    cfg->rclone_config = effective_rclone_config(*cfg); // always passed as --config
+    cfg->rclone_config = effective_rclone_config(*cfg); // where rclone_env reads the server
     auto remote = load_rclone_remote(*cfg->rclone_config, settings.rclone_remote);
     if (!remote) {
         std::string msg = remote.error();
@@ -124,12 +145,9 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
     }
 
     if (!secrets_error.empty() && !remote->key_use_agent && !remote->key_file) {
-        return util::failf("{}. Enter the password of {} again: Settings → Edit in grab's window, or `grab server "
-                           "remove {}` and `grab server add {}`",
-                           secrets_error, settings.name, settings.name, settings.name);
+        return util::fail(password_again(secrets_error, settings.name));
     }
     const FindMethod method = resolve_find_method(settings, *remote);
-    const Engine engine = effective_engine(settings);
     const GrabMethod grab_method = resolve_grab_method(settings, *remote);
     return Context{.config = std::move(*cfg),
                    .settings = std::move(settings),
@@ -171,6 +189,136 @@ std::vector<std::string> unused_flags(const Context& ctx) {
 
 namespace {
 
+// A value as rclone's config reader (goconfig) takes it from a line: from a leading """ or ` to the
+// last one after it, anything else as it is (RCLONE-REPLACEMENT.md, progress log 2026-10-29).
+std::string_view unquoted(std::string_view value) {
+    for (const std::string_view quote : {std::string_view(R"(""")"), std::string_view("`")}) {
+        if (!value.starts_with(quote) || (quote.size() == 3 && value.size() < 6)) continue;
+        const auto end = value.substr(quote.size()).rfind(quote);
+        return end == std::string_view::npos ? value : value.substr(quote.size(), end);
+    }
+    return value;
+}
+
+// A key rclone can read: its options are named in lower case with '_'. A key it would skip in the
+// file ("Host", "key-file") must not reach it as RCLONE_CONFIG_<NAME>_HOST or _KEY_FILE either.
+bool option_name(std::string_view key) {
+    return !key.empty() &&
+           std::ranges::all_of(key, [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; });
+}
+
+// The variable that holds the folder of the rclone.conf a server came from, for its own run.
+constexpr std::string_view config_dir_variable = "GRAB_RCLONE_CONFIG_DIR";
+
+// `value` (a key_file, pubkey_file or known_hosts_file) with ${RCLONE_CONFIG_DIR} and
+// $RCLONE_CONFIG_DIR as ${GRAB_RCLONE_CONFIG_DIR}, where rclone's os.ExpandEnv would find them:
+// with its config in memory rclone sets RCLONE_CONFIG_DIR to ".". The folder itself isn't pasted
+// in, since rclone expands the whole value and would expand a '$' in the folder's name again;
+// Go doesn't rescan what it substituted. The rest (other variables, a leading ~) rclone expands
+// as it would have.
+std::string with_config_dir(std::string_view value) {
+    constexpr std::string_view name = "RCLONE_CONFIG_DIR";
+    const auto special = [](char c) { return std::string_view("*#$@!?-0123456789").contains(c); };
+    const auto alnum = [](char c) {
+        return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    };
+    std::string out;
+    std::size_t i = 0;
+    while (i < value.size()) {
+        if (value[i] != '$' || i + 1 == value.size()) {
+            out += value[i++];
+            continue;
+        }
+        // Go's getShellName: the name after '$' and how many characters it takes.
+        const auto s = value.substr(i + 1);
+        std::string_view var;
+        std::size_t width = 0;
+        if (s.front() == '{') {
+            const auto close = s.find('}');
+            if (s.size() > 2 && special(s[1]) && s[2] == '}') {
+                var = s.substr(1, 1);
+                width = 3;
+            } else if (close == std::string_view::npos) {
+                width = 1;
+            } else {
+                var = s.substr(1, close - 1);
+                width = close + 1;
+            }
+        } else if (special(s.front())) {
+            var = s.substr(0, 1);
+            width = 1;
+        } else {
+            while (width < s.size() && alnum(s[width])) ++width;
+            var = s.substr(0, width);
+        }
+        // Windows finds a variable ignoring case.
+        const bool ours = std::ranges::equal(var, name, [](char a, char b) {
+            return std::toupper(static_cast<unsigned char>(a)) == std::toupper(static_cast<unsigned char>(b));
+        });
+        if (ours) {
+            out += "${";
+            out += config_dir_variable;
+            out += '}';
+        } else {
+            out += value.substr(i, 1 + width);
+        }
+        i += 1 + width;
+    }
+    return out;
+}
+
+} // namespace
+
+std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, bool user_copy) {
+    if (!user_copy) {
+        if (const auto bad = rclone_flags::first_refused(ctx.settings.common_flags)) {
+            return util::failf("[{}] common_flags: {} would replace the server's {}, which grab gives rclone itself; "
+                               "take it out and change the server with Edit in grab's Settings (only --rclone copies "
+                               "take such a flag)",
+                               ctx.settings.name, bad->flag, bad->what);
+        }
+    }
+    const auto conf = ctx.config.rclone_config ? *ctx.config.rclone_config : grab_rclone_config_path();
+    const std::string& remote = ctx.settings.rclone_remote;
+    auto doc = ini::parse_file(conf);
+    if (!doc) return util::fail(doc.error());
+    const auto* section = doc->find(remote);
+    if (section == nullptr) return util::failf("{}: rclone remote '{}' not found", util::path_to_utf8(conf), remote);
+
+    std::map<std::string, std::string> values; // rclone's key -> value
+    if (auto stored = secrets::load(secrets::path_beside(conf)); !stored) {
+        if (!ctx.remote.key_use_agent && !ctx.remote.key_file) {
+            return util::fail(password_again(stored.error(), ctx.settings.name));
+        }
+    } else if (const auto it = stored->find(remote); it != stored->end()) {
+        values = it->second;
+    }
+    // Then the section's own lines, its own secrets too (an rclone.conf that isn't grab's keeps
+    // them inside), as ssh_target reads them.
+    bool config_dir = false; // some path names the file's folder
+    for (const auto& [key, raw] : section->values) {
+        const auto value = unquoted(util::trim(raw));
+        if (value.empty()) continue;
+        const bool path = key == "key_file" || key == "pubkey_file" || key == "known_hosts_file";
+        values[key] = path ? with_config_dir(value) : std::string(value);
+        config_dir = config_dir || (path && values[key] != value);
+    }
+
+    proc::Environment env;
+    env.without_prefix.push_back(secrets::env_prefix(remote));
+    for (auto& [key, value] : values) {
+        if (option_name(key)) env.set.emplace_back(secrets::env_name(remote, key), std::move(value));
+    }
+    if (config_dir) {
+        std::string dir = util::path_to_utf8(conf.parent_path());
+        if (dir.empty()) dir = "."; // Go's filepath.Dir of a bare file name
+        env.set.emplace_back(config_dir_variable, std::move(dir));
+    }
+    return env;
+}
+
+namespace {
+
 std::int64_t unix_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -208,6 +356,9 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, std::span<const 
     // A path target is checked with a single listing of its parent, whatever the roots.
     const std::vector<std::string> bases =
         is_path_target(req.target) ? std::vector<std::string>{""} : roots;
+    auto with_server = run;
+    if (auto env = rclone_env(ctx); env) with_server.environment = std::move(*env);
+    else return util::fail(env.error());
 
     std::vector<std::vector<RemoteEntry>> found(kinds.size());
     for (const auto& root : bases) {
@@ -220,12 +371,11 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, std::span<const 
         list.max_depth = max_depth;
         list.skip_hidden = ctx.settings.skip_hidden;
         list.rclone_exe = ctx.config.rclone;
-        list.rclone_config = ctx.config.rclone_config;
         list.rclone_remote = ctx.settings.rclone_remote;
         list.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches searches too (G189)
         list.flags.insert(list.flags.end(), req.walk_flags.begin(), req.walk_flags.end());
 
-        auto out = run_listing(build_lsf_argv(list), run, on_command);
+        auto out = run_listing(build_lsf_argv(list), with_server, on_command);
         if (!out) return util::fail(out.error());
         for (std::size_t k = 0; k < kinds.size(); ++k) {
             list.mode = kinds[k];
@@ -605,7 +755,6 @@ download_argv(const Context& ctx, Mode mode, const std::string& remote_path, con
     RcloneRequest rq;
     rq.mode = mode;
     rq.rclone_exe = ctx.config.rclone;
-    rq.rclone_config = ctx.config.rclone_config;
     rq.rclone_remote = ctx.settings.rclone_remote;
     rq.remote_path = remote_path;
     rq.dest_dir = dest_dir;
@@ -682,7 +831,6 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
     RcloneRequest rq;
     rq.mode = mode;
     rq.rclone_exe = ctx.config.rclone;
-    rq.rclone_config = ctx.config.rclone_config;
     rq.rclone_remote = ctx.settings.rclone_remote;
     rq.remote_path = remote_path;
     rq.dest_dir = dest_dir;
@@ -693,6 +841,9 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
     const auto built = build_rclone_argv(rq);
     if (!built) return util::fail(built.error());
     const auto& argv = *built;
+    auto with_server = run;
+    if (auto env = rclone_env(ctx); env) with_server.environment = std::move(*env);
+    else return util::fail(env.error());
     if (on_command) on_command(argv);
 
     DownloadResult result;
@@ -707,7 +858,7 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
                 if (auto name = folder::parse_copied_line(line)) on_copied(*name);
             }
         },
-        run);
+        with_server);
     if (!code) return util::fail(code.error());
     result.exit_code = *code;
     return result;

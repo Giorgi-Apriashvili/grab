@@ -292,6 +292,8 @@ struct Session {
     bool several = false; // more than one pick: the question offers "the same for the rest"
     // engine = grab: files and folders through grab's own SSH client.
     std::shared_ptr<ssh::Pool> pool = nullptr;
+    // engine = rclone: the server in rclone's environment (engine::rclone_env).
+    proc::Environment rclone_env = {};
     // With `verify`: grab's own connections to the server, which every server verifies through
     // (`pool` on engine = grab), or why there are none.
     std::shared_ptr<ssh::Pool> verify_pool = nullptr;
@@ -385,7 +387,11 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
     if (auto p = fetch::saved_progress(target, path, {}, rclone_remote)) before = p->first;
 
     fetch::Download d;
-    d.source = fetch::Source{s.ctx.config.rclone, s.ctx.config.rclone_config, s.ctx.settings.rclone_remote, path, s.flags};
+    d.source = fetch::Source{.rclone = s.ctx.config.rclone,
+                             .environment = s.rclone_env,
+                             .rclone_remote = s.ctx.settings.rclone_remote,
+                             .path = path,
+                             .flags = s.flags};
     d.server = s.ctx.settings.name;
     d.id = id;
     d.limiter = &s.limiter;
@@ -823,6 +829,13 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         }
         s.pool = pools.get(server, *target, budget);
         if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client (engine = grab)", server);
+    } else if (auto env = engine::rclone_env(ctx); env) {
+        s.rclone_env = std::move(*env);
+    } else {
+        std::println(stderr, "grab: {}", env.error());
+        tally.code = exit_download_failed;
+        tally.failed = paths;
+        return tally;
     }
     // Every server verifies through grab's own client (RCLONE-REPLACEMENT.md, phase 5); on engine =
     // rclone it logs in only to verify. Without a login the downloads go on, "not verified".

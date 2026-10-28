@@ -213,9 +213,13 @@ TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's l
         << "@echo off\r\n"
            ">> \"%~dp0calls.log\" echo %*\r\n"
            "echo [{\"Path\":\"a.txt\",\"Name\":\"a.txt\",\"Size\":3,\"ModTime\":\"2026-10-21T10:00:00Z\",\"IsDir\":false}]\r\n";
+    std::ofstream(dir / "rclone.conf", std::ios::binary) << "[Main]\ntype = sftp\nhost = main.example\nuser = u\n";
     engine::Context ctx;
     ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+    ctx.config.rclone_config = dir / "rclone.conf"; // the server rclone_env gives rclone
     ctx.settings.rclone_remote = "Main";
+    // --rclone's check before its copy takes the flags the copy does (rclone_flags::first_refused).
+    ctx.settings.common_flags = {"--sftp-port", "2222"};
     folder::Job job;
     job.ctx = &ctx; // no job.connections
     job.remote_path = "/tmp/f";
@@ -227,6 +231,7 @@ TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's l
     CHECK(tree.files[0].path == "a.txt");
     const auto calls = util::read_file(dir / "calls.log").value_or("");
     CHECK(calls.find("--checkers") == std::string::npos); // rclone's own walk
+    CHECK(calls.find("--config NUL --sftp-port 2222") != std::string::npos);
     std::filesystem::remove_all(dir);
 }
 #endif

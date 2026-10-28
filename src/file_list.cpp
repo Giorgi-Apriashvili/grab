@@ -264,18 +264,20 @@ std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t 
         list.entries = parse_find(*out);
         return list;
     }
+    auto with_server = run;
+    if (auto env = engine::rclone_env(ctx); env) with_server.environment = std::move(*env);
+    else return util::fail(env.error());
     for (const auto& root : roots) {
         ListRequest req;
         req.root = root;
         req.max_depth = ctx.settings.max_depth;
         req.skip_hidden = ctx.settings.skip_hidden;
         req.rclone_exe = ctx.config.rclone;
-        req.rclone_config = ctx.config.rclone_config;
         req.rclone_remote = ctx.settings.rclone_remote;
         req.all_entries = true;
         req.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches the list too (G189)
         req.flags.insert(req.flags.end(), walk_flags.begin(), walk_flags.end());
-        auto out = engine::run_listing(build_lsf_argv(req), run, on_command);
+        auto out = engine::run_listing(build_lsf_argv(req), with_server, on_command);
         if (!out) return util::fail(out.error());
         auto entries = parse_lsf(*out, root);
         list.entries.insert(list.entries.end(), std::make_move_iterator(entries.begin()),

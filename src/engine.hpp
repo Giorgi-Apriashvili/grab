@@ -45,7 +45,8 @@ struct Context {
 };
 
 // grab.conf + the selected remote section + its rclone.conf entry. Errors are ready to show.
-// Also performs the one-time import of referenced remotes into grab's own rclone.conf.
+// Also performs the one-time import of referenced remotes into grab's own rclone.conf. rclone is
+// checked (check_rclone) only for an engine = rclone server.
 [[nodiscard]] std::expected<Context, std::string>
 load_context(const std::filesystem::path& config_path, const std::optional<std::string>& remote_name);
 
@@ -59,6 +60,18 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 // The connection flags of the context's common_flags that grab's own client doesn't use (all but
 // --bind, --contimeout and --timeout), with their values, for a -v line.
 [[nodiscard]] std::vector<std::string> unused_flags(const Context& ctx);
+
+// What an rclone run on the context's server gets in its environment, its config in memory
+// (`--config NUL`, config_in_memory; RCLONE-REPLACEMENT.md phase 7, decision 1): each key of the
+// server's section in the rclone.conf in use, read now as rclone reads that file (backticks and
+// """ taken off, ${RCLONE_CONFIG_DIR} as that file's folder), and the secrets of the store beside
+// it as rclone keeps them (obscured), as RCLONE_CONFIG_<NAME>_<KEY> (secrets::env_name). Only that
+// run sees them, never grab itself nor another program it starts (review G7), nor another
+// server's run (G84); rclone sees no parent section's keys (G86), as grab doesn't. A password
+// server whose store can't be read is an error, as in load_context. grab's own runs refuse a flag
+// in common_flags that would replace these (rclone_flags::first_refused); `user_copy`, for the
+// --rclone copy and its checks, lets it through.
+[[nodiscard]] std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, bool user_copy = false);
 
 // rclone's version from `rclone version`'s output ("rclone v1.75.1").
 struct RcloneVersion {
@@ -75,6 +88,9 @@ inline constexpr RcloneVersion min_rclone{1, 67, 0};
 // per process and refused below min_rclone (review G190).
 [[nodiscard]] std::expected<void, std::string> check_rclone(const std::string& rclone,
                                                             const std::filesystem::path& exe_dir, bool configured);
+// The same for the context's rclone, which resolve_rclone_exe left "rclone" only when it falls back
+// to PATH's. Asked only where rclone runs: load_context on engine = rclone, --rclone itself.
+[[nodiscard]] std::expected<void, std::string> check_rclone(const Context& ctx);
 
 // A search, list or Browse through grab's own SSH client (engine = grab): find over an exec
 // channel where the server's check says it works, else the SFTP walk (RCLONE-REPLACEMENT.md,

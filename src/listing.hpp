@@ -5,7 +5,6 @@
 #include "remote.hpp"
 
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,8 +23,7 @@ struct ListRequest {
     int max_depth = 4;
     bool skip_hidden = true;
     std::string rclone_exe;
-    std::optional<std::filesystem::path> rclone_config;
-    std::string rclone_remote;
+    std::string rclone_remote; // in the run's environment (engine::rclone_env), not a file
     // Files and folders together (a server's whole file list), instead of `mode`'s kind only.
     bool all_entries = false;
     std::vector<std::string> flags; // the server's connection flags (rclone_flags.hpp)

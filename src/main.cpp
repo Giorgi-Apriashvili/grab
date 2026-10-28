@@ -221,6 +221,18 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
 
     DownloadTally tally;
     const std::size_t total = paths.size();
+    // The server in rclone's environment (its config in memory), for the copies and grab's checks
+    // before them alike: they take the flags the copy does. On engine = grab nothing has asked
+    // whether this rclone can be used yet.
+    auto env = ctx.engine == Engine::grab
+                   ? engine::check_rclone(ctx).and_then([&] { return engine::rclone_env(ctx, true); })
+                   : engine::rclone_env(ctx, true);
+    if (!env) {
+        error(env.error());
+        tally.code = exit_config;
+        tally.failed = paths;
+        return tally;
+    }
     // Picks of the same name get numbered ones (review G103).
     const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
     // Different files already where rclone would write (another size, or a time off): asked first,
@@ -260,11 +272,16 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
             const auto& path = paths[i];
             const auto& target = targets[i];
             if (opts.mode == Mode::file) {
-                const fetch::Source src{ctx.config.rclone, ctx.config.rclone_config, ctx.settings.rclone_remote, path, flags};
+                const fetch::Source src{.rclone = ctx.config.rclone,
+                                        .environment = *env,
+                                        .rclone_remote = ctx.settings.rclone_remote,
+                                        .path = path,
+                                        .flags = flags};
                 const auto stat = fetch::stat_argv(src);
                 if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(stat));
                 proc::RunOptions quiet;
                 quiet.detached = true;
+                quiet.environment = *env;
                 const auto ran = proc::run_capture(stat, quiet);
                 if (!ran) {
                     uncompared(path, target, ran.error());
@@ -363,7 +380,7 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
         std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
                      remote_spec(ctx.settings.rclone_remote, path),
                      util::path_to_utf8(local_name ? dest / *local_name : dest / local::relative(remote_basename(path))));
-        auto code = proc::run_inherit(rclone_argv);
+        auto code = proc::run_inherit(rclone_argv, *env);
         if (!code) {
             error(code.error());
             tally.code = exit_config;

@@ -36,9 +36,9 @@ TEST_CASE("folder mode recreates the folder inside DEST, flags in common, mode, 
     CHECK(local_target(rq) == rq.dest_dir / "releases");
     const auto argv = build_rclone_argv(rq).value();
     CHECK(argv == std::vector<std::string>{"rclone", "copy", "hetzner:/home/alice/releases",
-                                           util::path_to_utf8(rq.dest_dir / "releases"), "-P",
-                                           "--sftp-chunk-size", "255Ki", "--transfers", "4",
-                                           "--bwlimit", "10M"});
+                                           util::path_to_utf8(rq.dest_dir / "releases"), "--config",
+                                           std::string(config_in_memory), "-P", "--sftp-chunk-size", "255Ki",
+                                           "--transfers", "4", "--bwlimit", "10M"});
 }
 
 TEST_CASE("folder names with spaces and punctuation survive as one path") {
@@ -50,12 +50,12 @@ TEST_CASE("folder names with spaces and punctuation survive as one path") {
     rq.dest_dir = util::path_from_utf8("C:\\Users\\alice\\Desktop");
 
     const auto argv = build_rclone_argv(rq).value();
-    REQUIRE(argv.size() == 4);
+    REQUIRE(argv.size() == 6); // and --config NUL
     CHECK(argv[3] == util::path_to_utf8(
                          rq.dest_dir / "Course - Learn to Program with C++ by Jane Doe"));
 }
 
-TEST_CASE("file mode builds rclone copyto DEST\\name and passes --config when set") {
+TEST_CASE("file mode builds rclone copyto DEST\\name, its config in memory") {
     // Same DEST\<name> rule as folder mode, but with copyto so rclone treats it as a file path.
     const std::vector<std::string> common{"-P"};
     const std::vector<std::string> file{"--multi-thread-streams", "8"};
@@ -63,7 +63,6 @@ TEST_CASE("file mode builds rclone copyto DEST\\name and passes --config when se
     RcloneRequest rq;
     rq.mode = Mode::file;
     rq.rclone_exe = "C:\\Tools\\rclone.exe";
-    rq.rclone_config = util::path_from_utf8("C:\\cfg\\rclone.conf");
     rq.rclone_remote = "hetzner";
     rq.remote_path = "/home/alice/releases/Some.Movie.2013/Some.Movie.2013.mkv";
     rq.dest_dir = util::path_from_utf8("E:\\Backup");
@@ -75,8 +74,11 @@ TEST_CASE("file mode builds rclone copyto DEST\\name and passes --config when se
     CHECK(argv == std::vector<std::string>{
                       "C:\\Tools\\rclone.exe", "copyto",
                       "hetzner:/home/alice/releases/Some.Movie.2013/Some.Movie.2013.mkv",
-                      expected_dest, "--config", util::path_to_utf8(*rq.rclone_config), "-P",
+                      expected_dest, "--config", std::string(config_in_memory), "-P",
                       "--multi-thread-streams", "8"});
+#ifdef _WIN32
+    CHECK(config_in_memory == "NUL"); // Go's os.DevNull exactly: rclone refuses "nul" (phase 7, chunk A)
+#endif
 }
 
 #ifdef _WIN32
@@ -102,7 +104,7 @@ TEST_CASE("rclone is told the local side so that it lands in grab's folder (G80)
 }
 #endif
 
-TEST_CASE("empty flag lists produce a bare command") {
+TEST_CASE("empty flag lists produce a bare command, its config in memory") {
     RcloneRequest rq;
     rq.mode = Mode::folder;
     rq.rclone_exe = "rclone";
@@ -110,8 +112,8 @@ TEST_CASE("empty flag lists produce a bare command") {
     rq.remote_path = "/p";
     rq.dest_dir = util::path_from_utf8("D:\\out");
     const auto argv = build_rclone_argv(rq).value();
-    CHECK(argv == std::vector<std::string>{"rclone", "copy", "r:/p",
-                                           util::path_to_utf8(rq.dest_dir / "p")});
+    CHECK(argv == std::vector<std::string>{"rclone", "copy", "r:/p", util::path_to_utf8(rq.dest_dir / "p"), "--config",
+                                           std::string(config_in_memory)});
 }
 
 TEST_CASE("a remote path with no name to save it under (G15)") {

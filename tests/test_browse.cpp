@@ -1,6 +1,7 @@
 #include "browse.hpp"
 #include "engine.hpp"
 #include "file_list.hpp"
+#include "rclone.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -210,7 +211,8 @@ TEST_CASE("a folder listed live") {
     ctx.config.rclone_config = util::path_from_utf8("C:\\grab\\rclone.conf");
     ctx.settings.rclone_remote = "Box";
     ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki"};
+    // The server comes in rclone's environment (engine::rclone_env), never a file.
     CHECK(browse::listing_argv(ctx, "tv/show") ==
           std::vector<std::string>{"rclone", "lsjson", "Box:tv/show", "--no-mimetype", "--config",
-                                   util::path_to_utf8(*ctx.config.rclone_config), "--sftp-chunk-size", "255Ki"});
+                                   std::string(config_in_memory), "--sftp-chunk-size", "255Ki"});
 }

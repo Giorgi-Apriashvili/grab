@@ -2,9 +2,10 @@
 
 // Server secrets kept out of grab's rclone.conf. rclone stores passwords there only "obscured",
 // which anyone who can read the file can reverse. grab keeps them instead in a file encrypted for
-// the current Windows user (DPAPI, util::protect_for_user) and hands them to rclone through
-// environment variables (RCLONE_CONFIG_<REMOTE>_<KEY>, which rclone reads like config values), so
-// they are never on disk unencrypted nor on a command line.
+// the current Windows user (DPAPI, util::protect_for_user) and hands a server's to the rclone
+// process for that server alone, in that process's environment (RCLONE_CONFIG_<REMOTE>_<KEY>,
+// which rclone reads like config values; engine::rclone_env), so they are never on disk
+// unencrypted, on a command line or in grab's own environment.
 
 #include <expected>
 #include <filesystem>
@@ -46,13 +47,12 @@ struct ForChange {
 [[nodiscard]] std::expected<void, std::string> save(const std::filesystem::path& file, const Store& store);
 
 // The environment variable rclone reads for `key` of `remote`, as rclone's ConfigToEnv names it:
-// RCLONE_CONFIG_<REMOTE>_<KEY>, upper case, '-' as '_' in the key only (my-box's password is
-// RCLONE_CONFIG_MY-BOX_PASS).
+// RCLONE_CONFIG_<REMOTE>_<KEY> in upper case as Go makes it (rclone_enc::go_upper: Georgian too),
+// '-' as '_' in the key only (my-box's password is RCLONE_CONFIG_MY-BOX_PASS). Only the rclone
+// process for that remote gets it (engine::rclone_env), never grab's own environment (review G7).
 [[nodiscard]] std::string env_name(std::string_view remote, std::string_view key);
-
-// Puts every secret of `store` into this process's environment, so the rclone processes grab
-// starts inherit them, and removes the ones it put there before that `store` no longer has.
-void export_to_env(const Store& store);
+// What every one of `remote`'s variables starts with: RCLONE_CONFIG_<REMOTE>_.
+[[nodiscard]] std::string env_prefix(std::string_view remote);
 
 // A value as rclone obscures it, made plain again, for grab's own SSH client (which takes
 // secrets in memory, never through the environment). rclone's lib/obscure: URL-safe base64
@@ -69,8 +69,8 @@ struct Taken {
 [[nodiscard]] Taken take_secrets(std::string_view rclone_text);
 
 // For grab's own rclone.conf, before running rclone: moves any secrets still in it into the store
-// (saved and read back before the file loses them), then exports the store. Returns why the
-// store could not be read, if it couldn't; servers with passwords then can't log in.
+// (saved and read back before the file loses them). Returns why the store could not be read, if
+// it couldn't; servers with passwords then can't log in.
 [[nodiscard]] std::expected<void, std::string> prepare(const std::filesystem::path& rclone_conf);
 
 } // namespace grab::secrets

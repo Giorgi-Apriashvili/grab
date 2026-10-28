@@ -332,13 +332,13 @@ TEST_CASE("grab's own rclone.conf loses its passwords to the encrypted store on 
     const auto store = secrets::load(secrets::path_beside(own));
     REQUIRE(store.has_value());
     CHECK(store->at("box").at("pass") == "OBSCURED");
-    CHECK(util::getenv_utf8("RCLONE_CONFIG_BOX_PASS") == "OBSCURED");
+    // Only box's rclone runs get it (engine::rclone_env), never grab's own environment (G7).
+    CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG_BOX_PASS").has_value());
     // The rest of the server is still read from rclone.conf.
     const auto list = server_ops::list_servers(*env);
     REQUIRE(list.size() == 2);
     CHECK(list[0].host == "box.example.com");
     CHECK(list[0].auth == Auth::password);
-    secrets::export_to_env({});
     std::filesystem::remove(own);
     std::filesystem::remove(secrets::path_beside(own));
 }
@@ -650,7 +650,7 @@ TEST_CASE("a change sets aside a password store it can't decrypt, and names who 
     env = server_ops::load_env(s.dir / "grab.conf", s.dir);
     REQUIRE(env.has_value());
     CHECK(server_ops::update_server(*env, server(Auth::password), std::nullopt, std::nullopt) == std::string());
-    secrets::export_to_env({});
+    CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG_BOX_PASS").has_value()); // never grab's own environment (G7)
     std::filesystem::remove(own);
     std::filesystem::remove(store);
 }

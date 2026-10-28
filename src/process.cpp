@@ -4,7 +4,9 @@
 #include "rclone_flags.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <format>
+#include <iterator>
 #include <utility>
 #include <thread>
 #include <vector>
@@ -104,24 +106,66 @@ std::expected<std::filesystem::path, std::string> find_program(std::string_view 
     return util::failf("cannot find {}{} in System32 or PATH", argv0, given.has_extension() ? "" : ".exe");
 }
 
-std::wstring internal_environment() {
+namespace {
+
+// An entry's name: up to its '=', after the first character ("=C:=C:\x" entries, each drive's
+// current folder, start with '=').
+std::wstring_view name_of(std::wstring_view entry) {
+    const auto eq = entry.find(L'=', 1);
+    return entry.substr(0, eq == std::wstring_view::npos ? entry.size() : eq);
+}
+
+// As Windows compares variable names: ordinally, ignoring case by its own table.
+int compare_names(std::wstring_view a, std::wstring_view b) {
+    return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE);
+}
+
+// This process's environment (all of it, or without what internal rclone calls must not see), less
+// what `extra` leaves out or replaces, plus extra.set, as a CreateProcess block sorted by name
+// ignoring case, as Windows keeps one.
+std::wstring environment_block(bool whole, const Environment& extra) {
+    std::vector<std::wstring> added;
+    added.reserve(extra.set.size());
+    for (const auto& [name, value] : extra.set) added.push_back(util::to_wide(name + "=" + value));
+    std::vector<std::wstring> prefixes;
+    prefixes.reserve(extra.without_prefix.size());
+    for (const auto& p : extra.without_prefix) prefixes.push_back(util::to_wide(p));
+
+    std::vector<std::wstring> entries;
+    if (LPWCH all = GetEnvironmentStringsW(); all != nullptr) {
+        for (const wchar_t* p = all; *p != L'\0'; p += std::wcslen(p) + 1) {
+            const std::wstring_view entry(p);
+            const auto name = name_of(entry);
+            if (!whole && !rclone_flags::kept_variable(util::to_utf8(name))) continue;
+            const bool replaced = std::ranges::any_of(added, [&](const std::wstring& a) {
+                return compare_names(name, name_of(a)) == CSTR_EQUAL;
+            });
+            const bool left_out = std::ranges::any_of(prefixes, [&](const std::wstring& prefix) {
+                return name.size() >= prefix.size() &&
+                       compare_names(name.substr(0, prefix.size()), prefix) == CSTR_EQUAL;
+            });
+            if (!replaced && !left_out) entries.emplace_back(entry);
+        }
+        FreeEnvironmentStringsW(all);
+    }
+    entries.insert(entries.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
+    std::ranges::stable_sort(entries, [](const std::wstring& a, const std::wstring& b) {
+        return compare_names(name_of(a), name_of(b)) == CSTR_LESS_THAN;
+    });
+
     std::wstring block;
-    LPWCH all = GetEnvironmentStringsW();
-    if (all == nullptr) return std::wstring(2, L'\0');
-    for (const wchar_t* p = all; *p != L'\0'; p += std::wcslen(p) + 1) {
-        const std::wstring_view entry(p);
-        // "=C:=C:\x" entries (each drive's current folder) start with '=' and are kept.
-        const auto eq = entry.find(L'=', 1);
-        const auto name = util::to_utf8(entry.substr(0, eq == std::wstring_view::npos ? entry.size() : eq));
-        if (!rclone_flags::kept_variable(name)) continue;
-        block.append(entry);
+    for (const auto& e : entries) {
+        block.append(e);
         block.push_back(L'\0');
     }
-    FreeEnvironmentStringsW(all);
     if (block.empty()) block.push_back(L'\0');
     block.push_back(L'\0');
     return block;
 }
+
+} // namespace
+
+std::wstring internal_environment() { return environment_block(false, {}); }
 
 std::wstring environment_without_rclone() {
     std::wstring block;
@@ -137,6 +181,21 @@ std::wstring environment_without_rclone() {
     if (block.empty()) block.push_back(L'\0');
     block.push_back(L'\0');
     return block;
+}
+
+void drop_inherited_server_variables() {
+    constexpr std::wstring_view prefix = L"RCLONE_CONFIG_";
+    std::vector<std::wstring> names;
+    if (LPWCH all = GetEnvironmentStringsW(); all != nullptr) {
+        for (const wchar_t* p = all; *p != L'\0'; p += std::wcslen(p) + 1) {
+            const auto name = name_of(p);
+            if (name.size() > prefix.size() && compare_names(name.substr(0, prefix.size()), prefix) == CSTR_EQUAL) {
+                names.emplace_back(name);
+            }
+        }
+        FreeEnvironmentStringsW(all);
+    }
+    for (const auto& name : names) SetEnvironmentVariableW(name.c_str(), nullptr);
 }
 
 namespace {
@@ -223,10 +282,11 @@ struct StdHandles {
 // `contain_descendants` false: only the child itself is in the job; programs it starts are
 // not, so they outlive it (see RunOptions for run_inherit). `whole_environment`: the child sees
 // every variable (run_inherit: the user's own rclone copy, an editor, an installer); otherwise the
-// RCLONE_* ones grab's internal calls must not see are left out (internal_environment).
+// RCLONE_* ones grab's internal calls must not see are left out (internal_environment). `extra` is
+// added either way.
 std::expected<void, std::string> launch(std::span<const std::string> argv, const StdHandles& std_h,
-                                        bool no_window, Child& child, bool contain_descendants = true,
-                                        bool whole_environment = false) {
+                                        bool no_window, Child& child, const Environment& extra,
+                                        bool contain_descendants = true, bool whole_environment = false) {
     if (argv.empty()) return util::fail("empty command");
 
     child.job.h = CreateJobObjectW(nullptr, nullptr);
@@ -278,11 +338,13 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
         return util::fail(program.error());
     }
     std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
-    std::wstring environment = whole_environment ? std::wstring() : internal_environment();
+    // The whole environment as it is needs no block of its own.
+    const bool inherited = whole_environment && extra.set.empty() && extra.without_prefix.empty();
+    std::wstring environment = inherited ? std::wstring() : environment_block(whole_environment, extra);
     PROCESS_INFORMATION pi{};
     // The program by its full path: Windows itself would look in the current folder first.
     const BOOL ok = CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE, flags,
-                                   whole_environment ? nullptr : environment.data(), nullptr, &si.StartupInfo, &pi);
+                                   inherited ? nullptr : environment.data(), nullptr, &si.StartupInfo, &pi);
     const DWORD create_error = GetLastError();
     if (si.lpAttributeList != nullptr) DeleteProcThreadAttributeList(si.lpAttributeList);
     if (!ok) {
@@ -341,7 +403,7 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
 
     CtrlGuard guard(!opts.detached);
     Child child;
-    if (auto r = launch(argv, std_h, opts.detached, child); !r) return util::fail(r.error());
+    if (auto r = launch(argv, std_h, opts.detached, child, opts.environment); !r) return util::fail(r.error());
     out.write.close(); // only the child holds the write ends now
     err.write.close();
     in.read.close();
@@ -385,7 +447,7 @@ std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
 
     StdHandles std_h{null_io.h, null_io.h, err.write.h, true};
     Child child;
-    if (auto r = launch(argv, std_h, opts.detached, child); !r) return util::fail(r.error());
+    if (auto r = launch(argv, std_h, opts.detached, child, opts.environment); !r) return util::fail(r.error());
     err.write.close();
     std::stop_callback on_stop(opts.stop, [&] { TerminateJobObject(child.job.h, exit_stopped); });
 
@@ -408,7 +470,7 @@ std::expected<PipedResult, std::string> run_piped(std::span<const std::string> a
 
     StdHandles std_h{null_in.h, out.write.h, err.write.h, true};
     Child child;
-    if (auto r = launch(argv, std_h, true, child); !r) return util::fail(r.error());
+    if (auto r = launch(argv, std_h, true, child, opts.environment); !r) return util::fail(r.error());
     out.write.close();
     err.write.close();
     std::stop_callback on_stop(opts.stop, [&] { TerminateJobObject(child.job.h, exit_stopped); });
@@ -430,11 +492,18 @@ std::expected<PipedResult, std::string> run_piped(std::span<const std::string> a
 }
 
 std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool contain_descendants) {
+    return run_inherit(argv, Environment{}, contain_descendants);
+}
+
+std::expected<int, std::string> run_inherit(std::span<const std::string> argv, const Environment& environment,
+                                            bool contain_descendants) {
     const StdHandles std_h{GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE),
                            GetStdHandle(STD_ERROR_HANDLE), false};
     CtrlGuard guard;
     Child child;
-    if (auto r = launch(argv, std_h, false, child, contain_descendants, true); !r) return util::fail(r.error());
+    if (auto r = launch(argv, std_h, false, child, environment, contain_descendants, true); !r) {
+        return util::fail(r.error());
+    }
     return wait_exit(child);
 }
 
@@ -544,20 +613,31 @@ int decode_status(int status) {
 
 // Spawns in a new process group so a stop can signal the child and its descendants.
 // `whole_environment`: as launch() on Windows (run_inherit); otherwise without the RCLONE_*
-// variables grab's internal calls must not see.
+// variables grab's internal calls must not see. `extra` is added either way (names compared
+// exactly, as POSIX does).
 std::expected<pid_t, std::string> spawn(std::span<const std::string> argv,
                                         posix_spawn_file_actions_t* actions, bool own_group,
-                                        bool whole_environment = false) {
+                                        const Environment& extra, bool whole_environment = false) {
     if (argv.empty()) return util::fail("empty command");
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
     for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
     cargv.push_back(nullptr);
+    std::vector<std::string> added;
+    added.reserve(extra.set.size());
+    for (const auto& [name, value] : extra.set) added.push_back(name + "=" + value);
     std::vector<char*> env;
     for (char** e = environ; *e != nullptr; ++e) {
         const std::string_view entry(*e);
-        if (whole_environment || rclone_flags::kept_variable(entry.substr(0, entry.find('=')))) env.push_back(*e);
+        const auto name = entry.substr(0, entry.find('='));
+        if (!whole_environment && !rclone_flags::kept_variable(name)) continue;
+        if (std::ranges::any_of(extra.set, [&](const auto& v) { return v.first == name; })) continue;
+        if (std::ranges::any_of(extra.without_prefix, [&](const std::string& p) { return name.starts_with(p); })) {
+            continue;
+        }
+        env.push_back(*e);
     }
+    for (auto& a : added) env.push_back(a.data());
     env.push_back(nullptr);
 
     posix_spawnattr_t attr;
@@ -636,7 +716,7 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     }
 
     SigintGuard guard(!opts.detached);
-    auto pid = spawn(argv, &actions, true);
+    auto pid = spawn(argv, &actions, true, opts.environment);
     posix_spawn_file_actions_destroy(&actions);
     close(out[1]);
     if (opts.detached) close(err[1]);
@@ -698,7 +778,7 @@ std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
     posix_spawn_file_actions_addclose(&actions, err[0]);
     posix_spawn_file_actions_addclose(&actions, err[1]);
 
-    auto pid = spawn(argv, &actions, true);
+    auto pid = spawn(argv, &actions, true, opts.environment);
     posix_spawn_file_actions_destroy(&actions);
     close(err[1]);
     if (!pid) {
@@ -733,7 +813,7 @@ std::expected<PipedResult, std::string> run_piped(std::span<const std::string> a
     posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
     for (int fd : {out[0], out[1], err[0], err[1]}) posix_spawn_file_actions_addclose(&actions, fd);
 
-    auto pid = spawn(argv, &actions, true);
+    auto pid = spawn(argv, &actions, true, opts.environment);
     posix_spawn_file_actions_destroy(&actions);
     close(out[1]);
     close(err[1]);
@@ -768,9 +848,14 @@ std::expected<PipedResult, std::string> run_piped(std::span<const std::string> a
     return result;
 }
 
-std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool /*contain_descendants*/) {
+std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool contain_descendants) {
+    return run_inherit(argv, Environment{}, contain_descendants);
+}
+
+std::expected<int, std::string> run_inherit(std::span<const std::string> argv, const Environment& environment,
+                                            bool /*contain_descendants*/) {
     SigintGuard guard;
-    auto pid = spawn(argv, nullptr, false, true);
+    auto pid = spawn(argv, nullptr, false, environment, true);
     if (!pid) return util::fail(pid.error());
     return wait_pid(*pid);
 }

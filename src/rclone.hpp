@@ -12,11 +12,20 @@
 
 namespace grab {
 
+// rclone's config kept in memory: `--config` with Go's os.DevNull ("NUL" exactly on Windows; "nul"
+// is refused as a reserved file name). Every rclone run grab starts passes it and gets its server in
+// its environment instead (engine::rclone_env; RCLONE-REPLACEMENT.md phase 7, decision 1), so rclone
+// reads and writes no rclone.conf.
+#ifdef _WIN32
+inline constexpr std::string_view config_in_memory = "NUL";
+#else
+inline constexpr std::string_view config_in_memory = "/dev/null";
+#endif
+
 struct RcloneRequest {
     Mode mode = Mode::folder;
     std::string rclone_exe;
-    std::optional<std::filesystem::path> rclone_config;
-    std::string rclone_remote;          // remote name in rclone.conf
+    std::string rclone_remote;          // the remote's name, as rclone_env gives it to rclone
     std::string remote_path;            // absolute path on the server
     std::filesystem::path dest_dir;     // absolute local directory
     std::span<const std::string> common_flags;

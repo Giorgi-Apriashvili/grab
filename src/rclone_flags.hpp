@@ -36,11 +36,26 @@ struct Unusable {
 };
 [[nodiscard]] std::optional<Unusable> first_unusable(std::span<const std::string> extra);
 
+// The first --sftp-* flag of `flags` that would replace what grab gives each of its rclone runs
+// about the server (engine::rclone_env, RCLONE-REPLACEMENT.md phase 7): its address, port, user,
+// password, key, key file, passphrase, certificate, ssh-agent use, trusted host keys or ssh
+// command (--sftp-host, --sftp-port, --sftp-user, --sftp-pass, --sftp-ask-password,
+// --sftp-key-pem, --sftp-key-file, --sftp-key-file-pass, --sftp-pubkey, --sftp-pubkey-file,
+// --sftp-key-use-agent, --sftp-known-hosts-file, --sftp-ssh), with what it is in words
+// ("address"). grab's own runs refuse them in common_flags and after `--`; --rclone, the user's
+// own copy, takes them.
+struct Refused {
+    std::string flag; // its name, without a value
+    std::string what;
+};
+[[nodiscard]] std::optional<Refused> first_refused(std::span<const std::string> flags);
+
 // Whether an inherited environment variable reaches grab's internal rclone calls: anything but
-// RCLONE_*, and of those RCLONE_CONFIG* (rclone.conf's path and password, the passwords grab hands
-// over), RCLONE_PASSWORD_COMMAND and RCLONE_SFTP_*. RCLONE_PROGRESS=true, say, would put
-// rclone's progress text into the bytes `rclone cat` hands grab (G8). Names ignore case, as
-// Windows' do.
+// RCLONE_*, and of those RCLONE_PASSWORD_COMMAND and the RCLONE_SFTP_* that aren't about the
+// server first_refused guards (RCLONE_SFTP_HOST, say, would beat the server's own address). No
+// RCLONE_CONFIG*: each run gets its server's RCLONE_CONFIG_<NAME>_* from grab alone, with its
+// config in memory (`--config NUL`). RCLONE_PROGRESS=true, say, would put rclone's progress text
+// into the bytes `rclone cat` hands grab (G8). Names ignore case, as Windows' do.
 [[nodiscard]] bool kept_variable(std::string_view name);
 
 } // namespace grab::rclone_flags

@@ -69,6 +69,19 @@ TEST_CASE("grab's own downloads take only connection flags after -- (G186)") {
     CHECK(filter.error().find("--rclone") != std::string::npos);
 }
 
+TEST_CASE("after --, a flag that would replace the server grab gives rclone is refused; --rclone takes it (phase 7)") {
+    auto host = parse_args(args({"x", "d", "--", "--sftp-chunk-size", "1Mi", "--sftp-host=elsewhere.example"}));
+    REQUIRE_FALSE(host.has_value());
+    CHECK(host.error().starts_with("--sftp-host after -- would replace the server's address"));
+    CHECK(host.error().find("--rclone") != std::string::npos);
+    auto keys = parse_args(args({"x", "d", "--", "--sftp-known-hosts-file", "C:\\other"}));
+    REQUIRE_FALSE(keys.has_value());
+    CHECK(keys.error().find("trusted host keys") != std::string::npos);
+    auto copy = parse_args(args({"x", "d", "--rclone", "--", "--sftp-host", "elsewhere.example"}));
+    REQUIRE(copy.has_value());
+    CHECK(copy->opts.extra == std::vector<std::string>{"--sftp-host", "elsewhere.example"});
+}
+
 TEST_CASE("mode defaults to file and the two mode flags are exclusive") {
     auto bare = parse_args(args({"lioness"}));
     REQUIRE(bare.has_value());

@@ -12,6 +12,7 @@
 // "<name>.2.grabpart" and so on.
 
 #include "conn_budget.hpp"
+#include "process.hpp"
 #include "rate.hpp"
 
 #include <atomic>
@@ -122,7 +123,9 @@ struct RemoteStat {
 // Where a file comes from and how rclone reaches it.
 struct Source {
     std::string rclone; // executable
-    std::optional<std::filesystem::path> config;
+    // The server in rclone's environment, its config in memory (engine::rclone_env); unused when
+    // grab's own pool fetches (Download::pool).
+    proc::Environment environment;
     std::string rclone_remote;
     std::string path;
     std::vector<std::string> flags; // the remote's common flags, without console progress

@@ -1,16 +1,26 @@
 #include "engine.hpp"
 #include "listing.hpp"
+#include "rclone.hpp"
 #include "remote.hpp"
+#include "secrets.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW, GetEnvironmentStringsW)
+#endif
+
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace grab;
@@ -101,13 +111,13 @@ TEST_CASE("download_argv uses the remote's flags and DEST\\<name>") {
 
     CHECK(engine::download_argv(ctx, Mode::file, "/srv/tv/Lioness.S03E08.mkv", dest).value() ==
           std::vector<std::string>{"rclone", "copyto", "hetzner:/srv/tv/Lioness.S03E08.mkv",
-                                   util::path_to_utf8(dest / "Lioness.S03E08.mkv"), "-P",
-                                   "--multi-thread-streams", "8"});
+                                   util::path_to_utf8(dest / "Lioness.S03E08.mkv"), "--config",
+                                   std::string(config_in_memory), "-P", "--multi-thread-streams", "8"});
     const std::vector<std::string> extra{"--bwlimit", "10M"};
     CHECK(engine::download_argv(ctx, Mode::folder, "/srv/tv/show", dest, extra).value() ==
-          std::vector<std::string>{"rclone", "copy", "hetzner:/srv/tv/show",
-                                   util::path_to_utf8(dest / "show"), "-P", "--transfers", "8",
-                                   "--bwlimit", "10M"});
+          std::vector<std::string>{"rclone", "copy", "hetzner:/srv/tv/show", util::path_to_utf8(dest / "show"),
+                                   "--config", std::string(config_in_memory), "-P", "--transfers", "8", "--bwlimit",
+                                   "10M"});
 }
 
 TEST_CASE("rclone's temp files: only those of the run's files, made by the run") {
@@ -233,8 +243,10 @@ TEST_CASE("a search for folders and files walks the server once over rclone (G19
            ">> \"%~dp0calls.log\" echo %*\r\n" // (redirect first: "...connections 3>>" would be handle 3)
            "echo 1697000000,-1,tv/Lioness/\r\n"
            "echo 1697354554,300,tv/Lioness/Lioness.S03E08.mkv\r\n";
+    std::ofstream(dir / "rclone.conf", std::ios::binary) << "[Box]\ntype = sftp\nhost = box.example\nuser = u\n";
     engine::Context ctx;
     ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+    ctx.config.rclone_config = dir / "rclone.conf"; // the server rclone_env gives rclone
     ctx.method = FindMethod::rclone;
     ctx.settings.rclone_remote = "Box";
     engine::SearchRequest req;
@@ -280,3 +292,222 @@ TEST_CASE("grab's own target: common_flags, then the command's flags after --, w
     CHECK(engine::ssh_target(ctx, bad).error_or("").starts_with("the flags after --: --timeout soon"));
     std::filesystem::remove_all(dir);
 }
+
+namespace {
+
+// Servers of a made-up rclone.conf, as engine::rclone_env reads them; made-up secrets only.
+constexpr std::string_view env_conf = "[Main]\n"
+                                      "type = sftp\n"
+                                      "host = main.example\n"
+                                      "port = 2222\n"
+                                      "user = me\n"
+                                      "key_use_agent = true\n"
+                                      "key_file = `${RCLONE_CONFIG_DIR}/id_main`\n"
+                                      "known_hosts_file = $rclone_config_dir/kh\n"
+                                      "shell_type = unix\n"
+                                      "md5sum_command = md5sum\n"
+                                      "sha1sum_command = none\n"
+                                      "Host = not-read.example\n"
+                                      "key-file = not-read\n"
+                                      "blank =\n"
+                                      "\n"
+                                      "[Main.eu]\n"
+                                      "type = sftp\n"
+                                      "host = eu.example\n"
+                                      "user = me\n"
+                                      "\n"
+                                      "[pw]\n"
+                                      "type = sftp\n"
+                                      "host = pw.example\n"
+                                      "user = u\n"
+                                      "\n"
+                                      "[inline]\n"
+                                      "type = sftp\n"
+                                      "host = in.example\n"
+                                      "user = u\n"
+                                      "pass = INLINE-FAKE-OBSCURED\n"
+                                      "\n"
+                                      "[\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8]\n"
+                                      "type = sftp\n"
+                                      "host = ge.example\n"
+                                      "user = u\n"
+                                      "shell_type = unix\n";
+
+engine::Context env_context(const std::filesystem::path& conf, const std::string& name, bool agent) {
+    engine::Context ctx;
+    ctx.config.rclone_config = conf;
+    ctx.settings.name = name;
+    ctx.settings.rclone_remote = name;
+    ctx.remote.name = name;
+    ctx.remote.key_use_agent = agent;
+    return ctx;
+}
+
+using Vars = std::vector<std::pair<std::string, std::string>>;
+
+} // namespace
+
+TEST_CASE("rclone_env: a server's section and its secrets as its own run's RCLONE_CONFIG_<NAME>_* (phase 7)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-rclone-env-block";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto conf = dir / "rclone.conf";
+    std::ofstream(conf, std::ios::binary) << env_conf;
+    REQUIRE(secrets::save(secrets::path_beside(conf), {{"pw", {{"pass", "STORED-FAKE-OBSCURED"}}},
+                                                       {"inline", {{"pass", "OLDER-FAKE-OBSCURED"}}}}));
+    const std::string d = util::path_to_utf8(dir);
+
+    // Every key rclone reads in the file, as it reads it: backticks off, ${RCLONE_CONFIG_DIR} the
+    // file's folder through GRAB_RCLONE_CONFIG_DIR (rclone's own is "." with its config in memory),
+    // "none" kept. Not "Host" or "key-file", which rclone skips in a file but would take from the
+    // environment; not a blank.
+    auto ctx = env_context(conf, "Main", true);
+    const auto main = engine::rclone_env(ctx);
+    REQUIRE_MESSAGE(main, main.error_or(""));
+    CHECK(main->set == Vars{{"RCLONE_CONFIG_MAIN_HOST", "main.example"},
+                            {"RCLONE_CONFIG_MAIN_KEY_FILE", "${GRAB_RCLONE_CONFIG_DIR}/id_main"},
+                            {"RCLONE_CONFIG_MAIN_KEY_USE_AGENT", "true"},
+                            {"RCLONE_CONFIG_MAIN_KNOWN_HOSTS_FILE", "${GRAB_RCLONE_CONFIG_DIR}/kh"},
+                            {"RCLONE_CONFIG_MAIN_MD5SUM_COMMAND", "md5sum"},
+                            {"RCLONE_CONFIG_MAIN_PORT", "2222"},
+                            {"RCLONE_CONFIG_MAIN_SHA1SUM_COMMAND", "none"},
+                            {"RCLONE_CONFIG_MAIN_SHELL_TYPE", "unix"},
+                            {"RCLONE_CONFIG_MAIN_TYPE", "sftp"},
+                            {"RCLONE_CONFIG_MAIN_USER", "me"},
+                            {"GRAB_RCLONE_CONFIG_DIR", d}});
+    // The user's own RCLONE_CONFIG_MAIN_* can't add to it (--rclone, whose environment is whole).
+    CHECK(main->without_prefix == std::vector<std::string>{"RCLONE_CONFIG_MAIN_"});
+
+    // A dotted name gets its own keys only, as grab reads it: nothing from [Main] (G86).
+    const auto eu = engine::rclone_env(env_context(conf, "Main.eu", false));
+    REQUIRE(eu);
+    CHECK(eu->set == Vars{{"RCLONE_CONFIG_MAIN.EU_HOST", "eu.example"},
+                          {"RCLONE_CONFIG_MAIN.EU_TYPE", "sftp"},
+                          {"RCLONE_CONFIG_MAIN.EU_USER", "me"}});
+    // A password from the store beside the file, as rclone keeps it; one in the section wins, as
+    // for grab's own client (ssh_target).
+    using Var = std::pair<std::string, std::string>;
+    const auto pw = engine::rclone_env(env_context(conf, "pw", false));
+    REQUIRE(pw);
+    CHECK(std::ranges::find(pw->set, Var{"RCLONE_CONFIG_PW_PASS", "STORED-FAKE-OBSCURED"}) != pw->set.end());
+    const auto in = engine::rclone_env(env_context(conf, "inline", false));
+    REQUIRE(in);
+    CHECK(std::ranges::find(in->set, Var{"RCLONE_CONFIG_INLINE_PASS", "INLINE-FAKE-OBSCURED"}) != in->set.end());
+    // A Georgian name, upper-cased as Go does it (Mtavruli), which rclone looks for.
+    const auto ge = engine::rclone_env(env_context(conf, "\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8", false));
+    REQUIRE(ge);
+    CHECK(ge->set.front().first == "RCLONE_CONFIG_\u1CA1\u1C94\u1CA0\u1C95\u1C94\u1CA0\u1C98_HOST");
+    CHECK(ge->without_prefix == std::vector<std::string>{"RCLONE_CONFIG_\u1CA1\u1C94\u1CA0\u1C95\u1C94\u1CA0\u1C98_"});
+
+    // A flag that would replace the server is refused for grab's own runs, not for --rclone's.
+    ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki", "--sftp-known-hosts-file", "C:\\other"};
+    const auto refused = engine::rclone_env(ctx);
+    REQUIRE_FALSE(refused);
+    CHECK(refused.error().starts_with(
+        "[Main] common_flags: --sftp-known-hosts-file would replace the server's trusted host keys"));
+    CHECK(engine::rclone_env(ctx, true).has_value());
+
+    CHECK(engine::rclone_env(env_context(conf, "gone", true)).error_or("").find("rclone remote 'gone' not found") !=
+          std::string::npos);
+
+    // A '$' in the folder's own name isn't expanded a second time: rclone expands the value once,
+    // and the folder only arrives through GRAB_RCLONE_CONFIG_DIR.
+    const auto dollar = dir / "$sync";
+    std::filesystem::create_directories(dollar);
+    std::ofstream(dollar / "rclone.conf", std::ios::binary)
+        << "[d]\ntype = sftp\nhost = d.example\nkey_file = ${RCLONE_CONFIG_DIR}/id\n";
+    const auto in_dollar = engine::rclone_env(env_context(dollar / "rclone.conf", "d", true));
+    REQUIRE(in_dollar);
+    CHECK(std::ranges::find(in_dollar->set, Var{"RCLONE_CONFIG_D_KEY_FILE", "${GRAB_RCLONE_CONFIG_DIR}/id"}) !=
+          in_dollar->set.end());
+    CHECK(in_dollar->set.back() == Var{"GRAB_RCLONE_CONFIG_DIR", util::path_to_utf8(dollar)});
+    // No path naming the folder, no variable.
+    CHECK(std::ranges::none_of(eu->set, [](const Var& v) { return v.first == "GRAB_RCLONE_CONFIG_DIR"; }));
+#ifdef _WIN32
+    // A store that can't be read: a password server can't log in; the others still can.
+    std::ofstream(secrets::path_beside(conf), std::ios::binary) << "grab-secrets-sealed 1\nanother account's";
+    CHECK(engine::rclone_env(env_context(conf, "pw", false)).error_or("").find("Enter the password of pw again") !=
+          std::string::npos);
+    CHECK(engine::rclone_env(env_context(conf, "Main", true)).has_value());
+#endif
+    std::filesystem::remove_all(dir);
+}
+
+#ifdef _WIN32
+TEST_CASE("each rclone run gets its own server's variables and no other's; grab keeps none (G7, G84)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-rclone-env-runs";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto conf = dir / "rclone.conf";
+    std::ofstream(conf, std::ios::binary) << env_conf;
+    REQUIRE(secrets::save(secrets::path_beside(conf), {{"pw", {{"pass", "STORED-FAKE-OBSCURED"}}}}));
+    // A stand-in rclone: logs its arguments and the RCLONE_* variables it gets (names and made-up
+    // values; cmd /u writes them in UTF-16), lists one file.
+    std::ofstream(dir / "rclone.cmd", std::ios::binary)
+        << "@echo off\r\n"
+           ">> \"%~dp0calls.log\" echo %*\r\n"
+           "cmd /d /u /c set RCLONE_ > \"%~dp0env.log\"\r\n"
+           "echo 1697354554,300,tv/x.mkv\r\n";
+    // What the user's own environment may hold: another server's password, an address that would
+    // beat the server's own, a tuning variable that stays.
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_PW_PASS", L"INHERITED-FAKE");
+    SetEnvironmentVariableW(L"rclone_config_main_host", L"inherited.example");
+    SetEnvironmentVariableW(L"RCLONE_SFTP_HOST", L"inherited.example");
+    SetEnvironmentVariableW(L"RCLONE_SFTP_CHUNK_SIZE", L"64Ki");
+    auto env_of = [&](const std::string& name, bool agent) {
+        std::filesystem::remove(dir / "env.log");
+        auto ctx = env_context(conf, name, agent);
+        ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+        ctx.method = FindMethod::rclone;
+        engine::SearchRequest req;
+        req.target = "x";
+        const auto found = engine::search(ctx, req);
+        CHECK_MESSAGE(found.has_value(), found.error_or(""));
+        const auto raw = util::read_file(dir / "env.log").value_or("");
+        std::wstring wide(raw.size() / 2, L'\0');
+        std::memcpy(wide.data(), raw.data(), wide.size() * sizeof(wchar_t));
+        std::vector<std::string> lines;
+        for (const auto& line : util::split(util::to_utf8(wide), '\n')) {
+            if (const auto t = util::trim(line); !t.empty()) lines.emplace_back(t);
+        }
+        return lines;
+    };
+    const auto main = env_of("Main", true);
+    const auto pw = env_of("pw", false);
+    const auto ge = env_of("\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8", false);
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_PW_PASS", nullptr);
+    SetEnvironmentVariableW(L"rclone_config_main_host", nullptr);
+    SetEnvironmentVariableW(L"RCLONE_SFTP_HOST", nullptr);
+    SetEnvironmentVariableW(L"RCLONE_SFTP_CHUNK_SIZE", nullptr);
+
+    CHECK(main == std::vector<std::string>{"RCLONE_CONFIG_MAIN_HOST=main.example",
+                                           "RCLONE_CONFIG_MAIN_KEY_FILE=${GRAB_RCLONE_CONFIG_DIR}/id_main",
+                                           "RCLONE_CONFIG_MAIN_KEY_USE_AGENT=true",
+                                           "RCLONE_CONFIG_MAIN_KNOWN_HOSTS_FILE=${GRAB_RCLONE_CONFIG_DIR}/kh",
+                                           "RCLONE_CONFIG_MAIN_MD5SUM_COMMAND=md5sum",
+                                           "RCLONE_CONFIG_MAIN_PORT=2222",
+                                           "RCLONE_CONFIG_MAIN_SHA1SUM_COMMAND=none",
+                                           "RCLONE_CONFIG_MAIN_SHELL_TYPE=unix",
+                                           "RCLONE_CONFIG_MAIN_TYPE=sftp",
+                                           "RCLONE_CONFIG_MAIN_USER=me",
+                                           "RCLONE_SFTP_CHUNK_SIZE=64Ki"});
+    CHECK(pw == std::vector<std::string>{"RCLONE_CONFIG_PW_HOST=pw.example",
+                                         "RCLONE_CONFIG_PW_PASS=STORED-FAKE-OBSCURED", "RCLONE_CONFIG_PW_TYPE=sftp",
+                                         "RCLONE_CONFIG_PW_USER=u", "RCLONE_SFTP_CHUNK_SIZE=64Ki"});
+    const std::string g = "RCLONE_CONFIG_\u1CA1\u1C94\u1CA0\u1C95\u1C94\u1CA0\u1C98_";
+    CHECK(ge == std::vector<std::string>{g + "HOST=ge.example", g + "SHELL_TYPE=unix", g + "TYPE=sftp", g + "USER=u",
+                                         "RCLONE_SFTP_CHUNK_SIZE=64Ki"});
+    // Its config in memory, on every run.
+    for (const auto& call : util::split(util::read_file(dir / "calls.log").value_or(""), '\n')) {
+        if (!util::trim(call).empty()) CHECK(call.find("--config NUL") != std::string_view::npos);
+    }
+    // grab's own environment holds no server's variables, for any program it starts (G7).
+    LPWCH all = GetEnvironmentStringsW();
+    REQUIRE(all != nullptr);
+    for (const wchar_t* p = all; *p != L'\0'; p += std::wcslen(p) + 1) {
+        CHECK_FALSE(util::to_lower(util::to_utf8(p)).starts_with("rclone_config"));
+    }
+    FreeEnvironmentStringsW(all);
+    std::filesystem::remove_all(dir);
+}
+#endif

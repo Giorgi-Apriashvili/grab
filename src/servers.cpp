@@ -1,5 +1,6 @@
 #include "servers.hpp"
 
+#include "rclone.hpp"
 #include "util.hpp"
 
 #include <openssl/evp.h>
@@ -186,11 +187,10 @@ std::vector<std::string> delete_argv(const std::string& rclone, const std::files
     return {rclone, "config", "delete", name, "--config", util::path_to_utf8(config)};
 }
 
-std::vector<std::string> probe_argv(const std::string& rclone, const std::filesystem::path& config,
-                                    const std::string& name) {
+std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name) {
     return {rclone, "lsf", name + ":", "--dirs-only", "--max-depth", "1", "--contimeout", "15s",
             "--timeout", "30s", "--low-level-retries", "1", "--retries", "1", "--config",
-            util::path_to_utf8(config)};
+            std::string(config_in_memory)};
 }
 
 // ---- grab.conf text edits --------------------------------------------------------------------

@@ -40,6 +40,14 @@ inline constexpr Mask windows = slash | dot | colon | question | double_quote | 
 // Whether `s` is UTF-8 throughout (as Go's utf8 package sees it).
 [[nodiscard]] bool valid_utf8(std::string_view s);
 
+// `s` in upper case as Go's strings.ToUpper makes it, which is how rclone names a remote's
+// environment variables (RCLONE_CONFIG_<NAME>_<KEY>, secrets::env_name): every letter by its simple
+// upper-case mapping in the tables of the Go that rclone 1.75.1 is built with (Go 1.26, Unicode
+// 15.0.0: 'ß' stays, 'ǅ' becomes 'Ǆ', Georgian Mkhedruli becomes Mtavruli), a byte that isn't UTF-8
+// U+FFFD. Windows matches variable names ignoring case by an older table of its own, without
+// Georgian, 'ſ', 'ı', 'µ', 'ς' and others (RCLONE-REPLACEMENT.md, phase 7).
+[[nodiscard]] std::string go_upper(std::string_view s);
+
 // rclone's MultiEncoder.Encode and .Decode for `mask`.
 [[nodiscard]] std::string encode(std::string_view in, Mask mask);
 [[nodiscard]] std::string decode(std::string_view in, Mask mask);

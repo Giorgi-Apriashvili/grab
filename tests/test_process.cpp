@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -276,5 +278,94 @@ TEST_CASE("the player's environment: no RCLONE_* variable at all, the rest kept 
         return util::to_lower(util::to_utf8(e.substr(0, 7))) == "rclone_";
     }));
     CHECK(std::ranges::any_of(entries, [](const std::wstring& e) { return e.starts_with(L"PATH=") || e.starts_with(L"Path="); }));
+}
+#endif
+
+#ifdef _WIN32
+TEST_CASE("a run's own environment: added, replacing inherited names ignoring case, prefixes left out (phase 7)") {
+    SetEnvironmentVariableW(L"grab_test_env_replaced", L"inherited");
+    SetEnvironmentVariableW(L"GRAB_TEST_ENV_KEPT", L"inherited");
+    SetEnvironmentVariableW(L"GRAB_TEST_ENV_DROP_ONE", L"inherited");
+    proc::RunOptions quiet;
+    quiet.detached = true;
+    // A Georgian name, which Windows' ignoring of case doesn't upper-case: kept as given.
+    quiet.environment.set = {{"GRAB_TEST_ENV_REPLACED", "mine"},
+                             {"GRAB_TEST_ENV_\u10E1\u10D4\u10E0", "\u10D2\u10D0\u10E0\u10D4 = x"}};
+    quiet.environment.without_prefix = {"grab_test_env_drop_"};
+    const auto ran = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/u", "/c", "set GRAB_TEST_ENV_"}, quiet);
+    // run_inherit's: the whole environment, the same rules (its output goes to the console, so the
+    // child writes it to a file).
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-run-env";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = util::path_to_utf8(dir / "set.txt");
+    const auto inherited = proc::run_inherit(
+        std::vector<std::string>{"cmd", "/d", "/u", "/c", "set", "GRAB_TEST_ENV_", ">", file}, quiet.environment);
+    SetEnvironmentVariableW(L"grab_test_env_replaced", nullptr);
+    SetEnvironmentVariableW(L"GRAB_TEST_ENV_KEPT", nullptr);
+    SetEnvironmentVariableW(L"GRAB_TEST_ENV_DROP_ONE", nullptr);
+    // cmd /u writes UTF-16.
+    auto lines = [](std::string_view raw) {
+        std::wstring wide(raw.size() / 2, L'\0');
+        std::memcpy(wide.data(), raw.data(), wide.size() * sizeof(wchar_t));
+        std::vector<std::string> out;
+        for (const auto& line : util::split(util::to_utf8(wide), '\n')) {
+            if (const auto t = util::trim(line); !t.empty()) out.emplace_back(t);
+        }
+        std::ranges::sort(out);
+        return out;
+    };
+    const std::vector<std::string> expected{"GRAB_TEST_ENV_KEPT=inherited", "GRAB_TEST_ENV_REPLACED=mine",
+                                            "GRAB_TEST_ENV_\u10E1\u10D4\u10E0=\u10D2\u10D0\u10E0\u10D4 = x"};
+    REQUIRE_MESSAGE(ran.has_value(), ran.error_or(""));
+    CHECK(lines(ran->out) == expected);
+    REQUIRE_MESSAGE(inherited.has_value(), inherited.error_or(""));
+    CHECK(lines(util::read_file(dir / "set.txt").value_or("")) == expected);
+    std::filesystem::remove_all(dir);
+    // A run with nothing of its own still leaves out what internal runs must not see.
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", L"x");
+    proc::RunOptions bare;
+    bare.detached = true;
+    const auto plain = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/c", "set RCLONE_CONFIG"}, bare);
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", nullptr);
+    REQUIRE(plain.has_value());
+    CHECK(plain->out.find("GRABTEST") == std::string::npos);
+}
+#endif
+
+#ifdef _WIN32
+TEST_CASE("grab-gui drops server variables a 0.19 window left in its environment, not RCLONE_CONFIG (review G7)") {
+    // What the test process had, to put back.
+    auto saved = [](const wchar_t* name) -> std::optional<std::wstring> {
+        const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+        if (size == 0) return std::nullopt;
+        std::wstring value(size, L'\0');
+        value.resize(GetEnvironmentVariableW(name, value.data(), size));
+        return value;
+    };
+    const auto config = saved(L"RCLONE_CONFIG");
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_FAKE-BOX_PASS", L"FAKE-OBSCURED");
+    SetEnvironmentVariableW(L"rclone_config_x_key_pem", L"FAKE-PEM");
+    SetEnvironmentVariableW(L"RCLONE_CONFIG", L"C:\fake\rclone.conf");
+    proc::drop_inherited_server_variables();
+    CHECK(saved(L"RCLONE_CONFIG_FAKE-BOX_PASS") == std::nullopt);
+    CHECK(saved(L"RCLONE_CONFIG_X_KEY_PEM") == std::nullopt);
+    CHECK(saved(L"RCLONE_CONFIG") == std::wstring(L"C:\fake\rclone.conf"));
+    // A child given the whole environment (an editor, the installer) sees none of them either.
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-drop-server-vars";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = util::path_to_utf8(dir / "set.txt");
+    const auto ran = proc::run_inherit(std::vector<std::string>{"cmd", "/d", "/c", "set", ">", file});
+    if (config) {
+        SetEnvironmentVariableW(L"RCLONE_CONFIG", config->c_str());
+    } else {
+        SetEnvironmentVariableW(L"RCLONE_CONFIG", nullptr);
+    }
+    REQUIRE_MESSAGE(ran.has_value(), ran.error_or(""));
+    const auto text = util::to_lower(util::read_file(dir / "set.txt").value_or(""));
+    CHECK(text.find("rclone_config=c:\fake\rclone.conf") != std::string::npos);
+    CHECK(text.find("rclone_config_") == std::string::npos);
+    std::filesystem::remove_all(dir);
 }
 #endif

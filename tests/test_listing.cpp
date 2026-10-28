@@ -1,5 +1,5 @@
 #include "listing.hpp"
-#include "util.hpp"
+#include "rclone.hpp"
 
 #include <doctest/doctest.h>
 
@@ -43,19 +43,19 @@ ListRequest base_request() {
 TEST_CASE("lsf argv for a name search under the home root prunes dot-dirs") {
     CHECK(build_lsf_argv(base_request()) ==
           std::vector<std::string>{"rclone", "lsf", "arch_guest:", "--format", "tsp", "--time-format", "unix",
-                                   "--csv", "--dirs-only", "-R", "--max-depth", "3", "--exclude", ".*/**", "--exclude", ".*"});
+                                   "--csv", "--dirs-only", "-R", "--max-depth", "3", "--exclude", ".*/**", "--exclude",
+                                   ".*", "--config", std::string(config_in_memory)});
 }
 
-TEST_CASE("lsf argv for a file search with hidden allowed and --config") {
+TEST_CASE("lsf argv for a file search with hidden allowed, its config in memory") {
     auto r = base_request();
     r.mode = Mode::file;
     r.root = "/home";
     r.skip_hidden = false;
-    r.rclone_config = util::path_from_utf8("C:\\cfg\\rclone.conf");
     CHECK(build_lsf_argv(r) ==
           std::vector<std::string>{"rclone", "lsf", "arch_guest:/home", "--format", "tsp", "--time-format", "unix",
                                    "--csv", "--files-only", "-R", "--max-depth", "3", "--config",
-                                   util::path_to_utf8(*r.rclone_config)});
+                                   std::string(config_in_memory)});
 }
 
 TEST_CASE("lsf argv for a path target lists only the parent, one level") {
@@ -63,7 +63,7 @@ TEST_CASE("lsf argv for a path target lists only the parent, one level") {
     r.target = "learning/Course - Intro to Testing - Jane Doe";
     CHECK(build_lsf_argv(r) ==
           std::vector<std::string>{"rclone", "lsf", "arch_guest:learning", "--format", "tsp", "--time-format",
-                                   "unix", "--csv", "--dirs-only"});
+                                   "unix", "--csv", "--dirs-only", "--config", std::string(config_in_memory)});
     r.target = "/x";
     CHECK(build_lsf_argv(r)[2] == "arch_guest:/");
 }

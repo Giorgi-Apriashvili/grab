@@ -568,6 +568,9 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
     auto flags = rclone_flags::connection(job.ctx->settings.common_flags);
     const auto extra = rclone_flags::connection(job.extra);
     flags.insert(flags.end(), extra.begin(), extra.end());
+    // rclone's environment for the server, unless grab's own pool fetches them; without it each
+    // file fails with why.
+    const auto env = job.pool ? std::expected<proc::Environment, std::string>{} : engine::rclone_env(*job.ctx);
     // Its big files downloading now: they split the folder's connections evenly, so one that
     // starts later gets its part instead of waiting for the first ones to end.
     std::atomic<int> files_running{0};
@@ -611,8 +614,11 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             notify(job, Event::changed);
             std::stop_callback forward(stop, [&file_stop] { file_stop.request_stop(); });
             fetch::Download d;
-            d.source = fetch::Source{job.ctx->config.rclone, job.ctx->config.rclone_config,
-                                     job.ctx->settings.rclone_remote, child_remote_path(job.remote_path, path), flags};
+            d.source = fetch::Source{.rclone = job.ctx->config.rclone,
+                                     .environment = env.value_or(proc::Environment{}),
+                                     .rclone_remote = job.ctx->settings.rclone_remote,
+                                     .path = child_remote_path(job.remote_path, path),
+                                     .flags = flags};
             d.server = job.server;
             d.id = job.id;
             d.target = target;
@@ -626,7 +632,7 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
             d.pool = job.pool;
             std::error_code ec;
             fs::create_directories(d.target.parent_path(), ec);
-            const auto result = fetch::run(d, *job.connections, [&](const fetch::Progress& p) {
+            const auto on_progress = [&](const fetch::Progress& p) {
                 {
                     std::lock_guard lock(m);
                     auto& f = tree.files[i];
@@ -636,7 +642,10 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                     tree.connections = p.connections;
                 }
                 notify(job, Event::progress);
-            }, file_stop.get_token());
+            };
+            const auto result =
+                env ? fetch::run(d, *job.connections, on_progress, file_stop.get_token())
+                    : fetch::Result{.outcome = fetch::Outcome::failed, .error = env.error(), .note = {}};
 
             bool discard = false;
             {
@@ -928,8 +937,12 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     if (job.pool) return list_grab(job, tree, m, stop);
     const auto& ctx = *job.ctx;
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", "-R", "--files-only",
-                                  remote_spec(ctx.settings.rclone_remote, job.remote_path)};
-    if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
+                                  remote_spec(ctx.settings.rclone_remote, job.remote_path), "--config",
+                                  std::string(config_in_memory)};
+    // Without a pool's connections it is --rclone's check before its copy, which takes the flags
+    // the copy does.
+    auto env = engine::rclone_env(ctx, job.connections == nullptr);
+    if (!env) return util::fail(env.error());
     const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
     const auto extra = rclone_flags::connection(job.extra);
@@ -947,6 +960,7 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     proc::RunOptions quiet;
     quiet.detached = true;
     quiet.stop = stop;
+    quiet.environment = std::move(*env);
     auto run = proc::run_capture(argv, quiet);
     if (stop.stop_requested()) return {};
     if (!run) return util::fail(run.error());

@@ -212,8 +212,7 @@ std::vector<Crumb> crumbs(const std::vector<std::string>& roots, std::string_vie
 
 std::vector<std::string> listing_argv(const engine::Context& ctx, std::string_view path) {
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", remote_spec(ctx.settings.rclone_remote, path),
-                                  "--no-mimetype"};
-    if (ctx.config.rclone_config) argv.insert(argv.end(), {"--config", util::path_to_utf8(*ctx.config.rclone_config)});
+                                  "--no-mimetype", "--config", std::string(config_in_memory)};
     const auto flags = rclone_flags::connection(ctx.settings.common_flags); // rclone_flags.hpp
     argv.insert(argv.end(), flags.begin(), flags.end());
     return argv;
@@ -395,8 +394,11 @@ std::expected<std::vector<Item>, ListError> list_live(const engine::Context& ctx
                                                      const engine::GrabSide& grab) {
     if (ctx.engine == Engine::grab) return list_grab(ctx, path, run.stop, on_command, grab);
     const auto argv = listing_argv(ctx, path);
+    auto with_server = run;
+    if (auto env = engine::rclone_env(ctx); env) with_server.environment = std::move(*env);
+    else return std::unexpected(list_error(ListError::Kind::other, env.error()));
     if (on_command) on_command(argv);
-    auto ran = proc::run_capture(argv, run);
+    auto ran = proc::run_capture(argv, with_server);
     if (!ran) return std::unexpected(list_error(ListError::Kind::other, ran.error()));
     if (run.stop.stop_requested()) return std::unexpected(list_error(ListError::Kind::other, "stopped"));
     if (ran->exit_code != 0) {

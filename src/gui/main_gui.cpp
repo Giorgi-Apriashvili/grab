@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "gui_state.hpp"
 #include "preview_jobs.hpp"
+#include "process.hpp"
 #include "tray.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -319,6 +320,8 @@ void place_window(HWND hwnd, const GuiState& state, int& show) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show) {
+    // Before any thread starts: server secrets a 0.19 window left in the environment it handed on.
+    proc::drop_inherited_server_variables();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     // One window per configuration (%APPDATA%\grab, or GRAB_CONFIG's folder): a second launch

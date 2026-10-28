@@ -44,36 +44,71 @@ TEST_CASE("a flag after -- that grab's engine doesn't use, with what to use inst
     CHECK(rclone_flags::first_unusable(V{"--size-only"})->hint.find("--rclone") != std::string::npos);
 }
 
-TEST_CASE("which RCLONE_* variables grab's own rclone calls see (G8)") {
+TEST_CASE("which RCLONE_* variables grab's own rclone calls see (G8; phase 7)") {
     CHECK(rclone_flags::kept_variable("PATH"));
-    CHECK(rclone_flags::kept_variable("RCLONE_CONFIG"));
-    CHECK(rclone_flags::kept_variable("RCLONE_CONFIG_PASS"));
-    CHECK(rclone_flags::kept_variable("RCLONE_CONFIG_MY-BOX_PASS"));
     CHECK(rclone_flags::kept_variable("RCLONE_SFTP_CHUNK_SIZE"));
+    CHECK(rclone_flags::kept_variable("RCLONE_SFTP_KEY_EXCHANGE"));
+    CHECK(rclone_flags::kept_variable("RCLONE_SFTP_HOSTS")); // not RCLONE_SFTP_HOST
     CHECK(rclone_flags::kept_variable("RCLONE_PASSWORD_COMMAND"));
-    CHECK(rclone_flags::kept_variable("rclone_config_box_pass")); // Windows ignores case
     CHECK_FALSE(rclone_flags::kept_variable("RCLONE_PROGRESS"));
     CHECK_FALSE(rclone_flags::kept_variable("rclone_progress"));
     CHECK_FALSE(rclone_flags::kept_variable("RCLONE_LOG_FILE"));
     CHECK_FALSE(rclone_flags::kept_variable("RCLONE_DRY_RUN"));
     CHECK_FALSE(rclone_flags::kept_variable("RCLONE_PASSWORD_COMMANDX"));
+    // Each run gets its own server from grab, its config in memory: no inherited rclone.conf path,
+    // its password, or a server's variables (another grab's, the user's own).
+    CHECK_FALSE(rclone_flags::kept_variable("RCLONE_CONFIG"));
+    CHECK_FALSE(rclone_flags::kept_variable("RCLONE_CONFIG_PASS"));
+    CHECK_FALSE(rclone_flags::kept_variable("RCLONE_CONFIG_MY-BOX_PASS"));
+    CHECK_FALSE(rclone_flags::kept_variable("rclone_config_box_host")); // Windows ignores case
+    // Nor what would beat the server's own address, login or host keys (each RCLONE_SFTP_* beats
+    // RCLONE_CONFIG_<NAME>_*).
+    for (const char* key : {"HOST", "USER", "PORT", "PASS", "KEY_PEM", "KEY_FILE", "KEY_FILE_PASS", "PUBKEY",
+                            "PUBKEY_FILE", "KEY_USE_AGENT", "KNOWN_HOSTS_FILE", "ASK_PASSWORD", "SSH"}) {
+        CHECK_FALSE_MESSAGE(rclone_flags::kept_variable(std::string("RCLONE_SFTP_") + key), key);
+    }
+    CHECK_FALSE(rclone_flags::kept_variable("rclone_sftp_known_hosts_file"));
+}
+
+TEST_CASE("--sftp-* flags that would replace the server grab gives rclone are refused (phase 7)") {
+    using V = std::vector<std::string>;
+    CHECK_FALSE(rclone_flags::first_refused(V{"-P", "--sftp-chunk-size", "255Ki", "--sftp-disable-hashcheck",
+                                              "--sftp-key-exchange", "x", "--bind", "10.0.0.2"})
+                    .has_value());
+    const auto host =
+        rclone_flags::first_refused(V{"--sftp-chunk-size", "1Mi", "--sftp-host=other.example", "--sftp-user", "x"})
+            .value_or(rclone_flags::Refused{});
+    CHECK(host.flag == "--sftp-host");
+    CHECK(host.what == "address");
+    for (const char* flag : {"--sftp-host", "--sftp-user", "--sftp-port", "--sftp-pass", "--sftp-key-pem",
+                             "--sftp-key-file", "--sftp-key-file-pass", "--sftp-pubkey", "--sftp-pubkey-file",
+                             "--sftp-key-use-agent", "--sftp-known-hosts-file", "--sftp-ask-password", "--sftp-ssh"}) {
+        CHECK_MESSAGE(rclone_flags::first_refused(V{flag, "x"}).has_value(), flag);
+    }
+    CHECK(rclone_flags::first_refused(V{"--sftp-key-use-agent=false"}).value_or(rclone_flags::Refused{}).what ==
+          "login method (ssh-agent)");
+    // rclone's flag names are exact (no '_' for '-', no other case): these it refuses itself.
+    CHECK_FALSE(rclone_flags::first_refused(V{"--sftp_host", "x", "--SFTP-HOST", "y"}).has_value());
 }
 
 #ifdef _WIN32
-TEST_CASE("children grab runs itself don't see RCLONE_PROGRESS and the like; run_inherit's do (G8)") {
+TEST_CASE("children grab runs itself don't see RCLONE_PROGRESS, RCLONE_CONFIG_* and the like; run_inherit's do (G8)") {
     SetEnvironmentVariableW(L"RCLONE_PROGRESS", L"true");
     SetEnvironmentVariableW(L"RCLONE_SFTP_GRABTEST", L"kept");
-    SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", L"kept too");
+    SetEnvironmentVariableW(L"RCLONE_SFTP_HOST", L"elsewhere.example");
+    SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", L"not kept");
     proc::RunOptions quiet;
     quiet.detached = true;
     const auto ran = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/c", "set RCLONE_"}, quiet);
     SetEnvironmentVariableW(L"RCLONE_PROGRESS", nullptr);
     SetEnvironmentVariableW(L"RCLONE_SFTP_GRABTEST", nullptr);
+    SetEnvironmentVariableW(L"RCLONE_SFTP_HOST", nullptr);
     SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", nullptr);
     REQUIRE(ran.has_value());
     CHECK(ran->out.find("RCLONE_PROGRESS") == std::string::npos);
     CHECK(ran->out.find("RCLONE_SFTP_GRABTEST=kept") != std::string::npos);
-    CHECK(ran->out.find("RCLONE_CONFIG_GRABTEST_PASS=kept too") != std::string::npos);
+    CHECK(ran->out.find("RCLONE_SFTP_HOST") == std::string::npos);
+    CHECK(ran->out.find("RCLONE_CONFIG_GRABTEST_PASS") == std::string::npos);
     // The rest of the environment is there (cmd needs SystemRoot, for one).
     const auto path = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/c", "echo %SystemRoot%"}, quiet);
     REQUIRE(path.has_value());

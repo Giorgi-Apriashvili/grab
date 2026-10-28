@@ -1,5 +1,6 @@
 #include "conn_budget.hpp"
 #include "fetch.hpp"
+#include "rclone.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -76,7 +77,7 @@ TEST_CASE("a download whose logins are refused for good stops with the reason, a
     fetch::Connections connections([&](const std::string&, int b) { learned.push_back(b); });
     connections.configure("Main", 12);
     fetch::Download d;
-    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .config = std::nullopt,
+    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .environment = {},
                              .rclone_remote = "Main", .path = "f.bin", .flags = {}};
     d.server = "Main";
     d.id = 1;
@@ -319,8 +320,8 @@ TEST_CASE("rclone lsjson --stat") {
 }
 
 TEST_CASE("rclone command lines for ranges") {
-    fetch::Source src{"rclone.exe", util::path_from_utf8("C:\\g\\rclone.conf"), "box", "/home/a b.mkv",
-                      {"--sftp-chunk-size", "255Ki"}};
+    fetch::Source src{.rclone = "rclone.exe", .environment = {}, .rclone_remote = "box", .path = "/home/a b.mkv",
+                      .flags = {"--sftp-chunk-size", "255Ki"}};
     const auto cat = fetch::cat_argv(src, 1000, 2000);
     CHECK(cat[0] == "rclone.exe");
     CHECK(cat[1] == "cat");
@@ -333,7 +334,7 @@ TEST_CASE("rclone command lines for ranges") {
     };
     CHECK(has_pair(cat, "--offset", "1000"));
     CHECK(has_pair(cat, "--count", "2000"));
-    CHECK(has_pair(cat, "--config", "C:\\g\\rclone.conf"));
+    CHECK(has_pair(cat, "--config", config_in_memory));
     CHECK(has_pair(cat, "--sftp-chunk-size", "255Ki"));
     CHECK_FALSE(has_pair(cat, "--buffer-size", "0"));
     const auto limited = fetch::cat_argv(src, 1000, 2000, true); // under a speed limit: no read-ahead
@@ -535,7 +536,7 @@ TEST_CASE("a size check refused by a full server is asked again, not failed (G19
     fetch::Connections connections;
     connections.configure("Main", 12);
     fetch::Download d;
-    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .config = std::nullopt,
+    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .environment = {},
                              .rclone_remote = "Main", .path = "f.bin", .flags = {}};
     d.server = "Main";
     d.id = 1;
@@ -623,7 +624,7 @@ TEST_CASE("a file that already is the server's wins over a partial download of i
     fetch::Connections connections;
     connections.configure("Main", 12);
     fetch::Download d;
-    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .config = std::nullopt,
+    d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .environment = {},
                              .rclone_remote = "Main", .path = "/f.bin", .flags = {}};
     d.server = "Main";
     d.id = 1;

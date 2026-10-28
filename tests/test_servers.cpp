@@ -1,4 +1,5 @@
 #include "servers.hpp"
+#include "rclone.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -151,9 +152,10 @@ TEST_CASE("rclone config create argv per auth type; no plaintext secret, pre-obs
           std::vector<std::string>{"rclone", "config", "delete", "box", "--config", util::path_to_utf8(conf)});
     const auto update = servers::update_argv("rclone", conf, "box", "known_hosts_file", "C:\\kh");
     CHECK(std::ranges::find(update, "known_hosts_file=C:\\kh") != update.end());
-    const auto probe = servers::probe_argv("rclone", conf, "box");
+    const auto probe = servers::probe_argv("rclone", "box");
     CHECK(probe[2] == "box:");
     CHECK(std::ranges::find(probe, "--contimeout") != probe.end());
+    CHECK(probe.back() == config_in_memory); // the server comes in its environment (engine::rclone_env)
 }
 
 TEST_CASE("to_remote carries auth and pinned host keys") {
