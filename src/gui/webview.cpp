@@ -1,5 +1,6 @@
 #include "webview.hpp"
 
+#include "body_stream.hpp"
 #include "resources.hpp"
 #include "ui_origin.hpp"
 #include "util.hpp"
@@ -23,6 +24,7 @@ std::wstring reason(int status) {
     case 404: return L"Not Found";
     case 413: return L"Too Large";
     case 415: return L"Unsupported";
+    case 503: return L"Unavailable";
     default: return status >= 500 ? L"Error" : L"Bad Request";
     }
 }
@@ -204,27 +206,15 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
                     if (FAILED(args->get_Request(&request))) return S_OK;
                     CoString uri;
                     request->get_Uri(&uri.p);
-                    // A preview: answered later, from a worker thread, through the deferral.
+                    // A preview: answered later, from a worker thread, by its id; the deferral and
+                    // the arguments wait here until the answer is back on the UI thread.
                     if (ui_origin::is_preview(uri.view()) && options_.on_preview && options_.defer) {
                         ComPtr<ICoreWebView2Deferral> deferral;
                         if (FAILED(args->GetDeferral(&deferral))) return S_OK;
-                        ComPtr<ICoreWebView2WebResourceRequestedEventArgs> held(args);
-                        ComPtr<ICoreWebView2Environment> env = env_;
-                        auto defer = options_.defer;
-                        options_.on_preview(util::to_utf8(uri.view()), [defer, deferral, held, env](WebResource r) {
-                            defer([deferral, held, env, r = std::move(r)] {
-                                ComPtr<IStream> stream;
-                                stream.Attach(SHCreateMemStream(reinterpret_cast<const BYTE*>(r.body.data()),
-                                                                static_cast<UINT>(r.body.size())));
-                                std::wstring headers = L"Content-Type: " + util::to_wide(r.content_type) +
-                                                       L"\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff";
-                                if (!r.headers.empty()) headers += L"\r\n" + util::to_wide(r.headers);
-                                ComPtr<ICoreWebView2WebResourceResponse> response;
-                                env->CreateWebResourceResponse(stream.Get(), r.status, reason(r.status).c_str(),
-                                                               headers.c_str(), &response);
-                                held->put_Response(response.Get());
-                                deferral->Complete();
-                            });
+                        const std::uint64_t id = ++next_request_;
+                        deferred_.emplace(id, Deferred{.deferral = deferral, .args = args});
+                        options_.on_preview(util::to_utf8(uri.view()), [this, id, defer = options_.defer](WebResource r) {
+                            defer([this, id, r = std::move(r)] { complete(id, r); });
                         });
                         return S_OK;
                     }
@@ -262,6 +252,24 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
     return S_OK;
 }
 
+void WebViewHost::complete(std::uint64_t id, const WebResource& r) {
+    auto request = deferred_.extract(id);
+    if (request.empty()) return; // closed meanwhile, or answered before
+    if (env_) {
+        ComPtr<IStream> stream;
+        stream.Attach(new_body_stream(r.body));
+        std::wstring headers = L"Content-Type: " + util::to_wide(r.content_type) +
+                               L"\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff";
+        if (!r.headers.empty()) headers += L"\r\n" + util::to_wide(r.headers);
+        ComPtr<ICoreWebView2WebResourceResponse> response;
+        if (SUCCEEDED(env_->CreateWebResourceResponse(stream.Get(), r.status, reason(r.status).c_str(), headers.c_str(),
+                                                      &response))) {
+            request.mapped().args->put_Response(response.Get());
+        }
+    }
+    request.mapped().deferral->Complete();
+}
+
 void WebViewHost::resize(const RECT& bounds) {
     if (controller_) controller_->put_Bounds(bounds);
 }
@@ -287,6 +295,7 @@ void WebViewHost::set_background(COLORREF color) {
 }
 
 void WebViewHost::close() {
+    deferred_.clear(); // requests still waiting: released here, on the UI thread
     if (controller_) controller_->Close();
     webview_.Reset();
     controller_.Reset();

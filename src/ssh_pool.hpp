@@ -11,6 +11,7 @@
 //
 // libssh2 sessions aren't thread-safe; a Lease gives one thread a session until it's returned.
 
+#include "conn_budget.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 
@@ -157,6 +158,9 @@ public:
         std::chrono::milliseconds find_check_expiry{ssh::find_check_fresh};
         std::chrono::milliseconds find_check_trust{ssh::find_check_trust};
         int hashes_at_once = 1; // hash commands on this server at once (hash_turn)
+        // How long acquire_remembered keeps a login failure that may pass by itself (no answer in
+        // time, the server turned it away after the retries).
+        std::chrono::milliseconds login_failure_holds{30'000};
     };
 
     Pool(Connect connect, Options options);
@@ -201,6 +205,18 @@ public:
     // oldest idle connection is closed to make room (idle ones count toward the limit); else as
     // acquire.
     [[nodiscard]] std::optional<Lease> acquire_new(std::stop_token stop = {}, Retry retry_refused = std::nullopt);
+    // As acquire, for the window's previews and Play (ssh_read.hpp), which must not log in again
+    // and again where logins fail: flipping through 10 images would make 20-30 failed logins in
+    // seconds, a fail2ban ban on Main that stops rclone and the downloads too. A login that failed
+    // here is thrown again without logging in: one that can't pass by itself (Failure::fatal: a
+    // host key not trusted, a login refused) until forget_login_failure, another for
+    // Options::login_failure_holds. An idle connection is still handed out, and any caller's login
+    // that works (downloads, Browse) clears it. Until a login worked, these log in one at a time,
+    // the others waiting for its outcome.
+    [[nodiscard]] std::optional<Lease> acquire_remembered(std::stop_token stop = {},
+                                                          Retry retry_refused = std::nullopt);
+    // The next acquire_remembered logs in again: a Test that worked, Trust, a server saved.
+    void forget_login_failure();
 
     // A turn to run a hash command (ssh_hash.hpp), held while it runs: at most
     // Options::hashes_at_once of them at once on this server, however many verifications share the
@@ -231,6 +247,10 @@ public:
     // Closes connections idle longer than idle_close at `now` (the most recently used one: longer
     // than keep_newest, when that is longer).
     void close_idle(Clock::time_point now);
+    // Closes idle connections but the `keep` most recently used, however long they sat: for an
+    // engine = rclone server, whose rclone can't see them, once the seats that counted them went
+    // back (the window's viewer).
+    void trim_idle(int keep);
 
     // The find check of this pool's server, asked once: `check` runs on the first call (one at a
     // time: a second caller waits for the first one's answer, or until its `stop`, then nullopt)
@@ -290,6 +310,16 @@ private:
     int hashing_ = 0; // hash turns out
     Asked<FindCheck> find_asked_;
     Asked<HashCheck> hash_asked_;
+    // acquire_remembered's: the login that failed, whether one of its logins worked since, and
+    // whether one is logging in while none has.
+    struct LoginFailure {
+        budget::Failure kind = budget::Failure::other;
+        std::string what;
+        Clock::time_point since;
+    };
+    std::optional<LoginFailure> login_failure_;
+    bool login_works_ = false;
+    bool login_trying_ = false;
     std::jthread timer_;
 };
 
@@ -320,6 +350,9 @@ public:
     // again: a login that failed for good (a host key not trusted yet, an agent without the key)
     // may work after Trust or a server Test.
     void forget_hash_check(const std::string& server);
+    // The server's pool (if any) forgets the login that failed for previews and Play
+    // (Pool::acquire_remembered): after a Test that logged in, Trust, or the server saved.
+    void forget_login_failure(const std::string& server);
 
 private:
     struct Entry {

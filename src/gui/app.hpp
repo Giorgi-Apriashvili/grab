@@ -10,11 +10,13 @@
 #include "json.hpp"
 #include "play_server.hpp"
 #include "preview_host.hpp"
+#include "preview_jobs.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "ssh_pool.hpp"
+#include "ssh_read.hpp"
 #include "update.hpp"
 #include "webview.hpp"
 
@@ -28,11 +30,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
-#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -77,9 +79,11 @@ public:
     void save_state() const;
     // UI thread, every second: follows the speed schedule.
     void tick();
-    // The page's https://grab.ui/preview/<remote>/<path> requests (the viewer's images, text and
-    // PDFs; each part percent-encoded): read from the server's local stream on a preview worker,
-    // or from the recent ones kept in memory. `reply` answers, from any thread.
+    // The page's https://grab.ui/preview/<remote>/<path>[?size=N&modified=T][&ahead] requests (the
+    // viewer's images, text and PDFs; each part percent-encoded; the row's size and time, for the
+    // cache; ahead: a neighbour fetched before it's shown): read through grab's own connections to
+    // the server on a preview worker, or from the recent ones kept in memory. A request for a file
+    // already being fetched joins that fetch. `reply` answers, from any thread.
     void preview_request(const std::string& url, std::function<void(WebResource)> reply);
 
     // Something the window may be waiting on, shown in the status bar while it runs: what grab is
@@ -120,7 +124,32 @@ public:
 private:
     // A video or audio file, in the program Windows plays it with: {remote, path}.
     void play(const json::Value& msg);
-    [[nodiscard]] WebResource preview_answer(const std::string& remote, const std::string& path, bool ahead);
+
+    // What a preview fetch holds while it runs and gives back once its answer went out: the reader
+    // (its connections) and the viewer's seat on the server.
+    struct PreviewHold {
+        std::optional<ssh::Reader> reader;
+        std::shared_ptr<ssh::Pool> pool;
+        bool seated = false;
+        bool rclone = false; // engine = rclone: the pool's idle connections close when the seats go
+    };
+    // A job from the queue, on a preview worker (preview::Previews: the cache again, the fetch,
+    // every request that joined it answered), then its connections and seat given back.
+    void run_preview(const std::shared_ptr<preview::Previews::Job>& job);
+    // The fetch on grab's own connections, every server (RCLONE-REPLACEMENT.md, phase 6).
+    [[nodiscard]] preview::Fetched preview_answer(const preview::Previews::Job& job, PreviewHold& hold);
+    // The viewer's seat on `server`, which it keeps up to preview_seat_idle after a preview, so
+    // flipping through images makes downloads step aside once, not for each image. A preview shown
+    // takes it, else a free one, else waits for one as a download does (they step aside); a
+    // neighbour fetched ahead takes it, else only a free one, waiting for either. False: stopped.
+    bool take_viewer_seat(const std::string& server, const preview::Previews::Job& job, const std::stop_token& stop);
+    void return_viewer_seat(const std::string& server, const PreviewHold& hold);
+    // Gives back the viewer's seats idle longer than preview_seat_idle; on engine = rclone a
+    // preview worker then closes the idle connections they counted. UI thread (tick).
+    void release_viewer_seats();
+    // A server saved, trusted or removed: its previews kept go (review G36) and the login the
+    // previews remembered as failed is tried again (Pool::acquire_remembered).
+    void forget_server_previews(const std::string& server);
     // The address of `path` on `remote`'s rclone serve (preview::where), once it says it has the
     // file; when it answers 500 (a folder on the way the server doesn't let you list, as a
     // Storage Box's "/"), from the file's own folder. `on_ready`: called when a server runs, before it is asked. announce: the
@@ -128,7 +157,8 @@ private:
     [[nodiscard]] std::expected<std::string, std::string> stream_url(const engine::Context& ctx, const std::string& remote,
                                                                      const std::string& path, bool announce, bool bg,
                                                                      const std::function<void()>& on_ready = {});
-    void queue_preview(std::function<void()> job);
+    // `first`: ahead of the jobs queued already (the preview shown now).
+    void queue_preview(std::function<void()> job, bool first = false);
     void run_preview_jobs(const std::stop_token& stop);
     // A plaintext password or passphrase, overwritten when it is dropped.
     class Secret {
@@ -485,19 +515,26 @@ private:
     std::mutex timings_mutex_;
     std::map<std::string, int> timings_;
 
-    // Previews: the servers' local streams, and two workers for the page's requests and Play.
+    // Play's servers' local streams (rclone serve), and two workers for the page's previews and Play.
     PreviewServers previews_;
     // Play's warm starts and the player's stream; after previews_ and connections_ (it uses
     // both), before the workers that call it.
     PlayServer play_server_{connections_};
-    std::mutex preview_mutex_; // guards preview_jobs_, preview_cache_, preview_workers_
-    std::condition_variable_any preview_wake_;
-    std::deque<std::function<void()>> preview_jobs_;
-    struct CachedPreview {
-        std::string key; // remote, a line break, path
-        WebResource answer;
+    // The previews being fetched, by file, and the ones kept in memory (thread-safe).
+    preview::Previews preview_jobs_;
+    // Guards preview_queue_, viewer_seats_, preview_workers_.
+    std::mutex preview_mutex_;
+    std::condition_variable_any preview_wake_; // a job queued, a viewer seat back
+    std::deque<std::function<void()>> preview_queue_;
+    struct ViewerSeat {
+        int id = 0;    // the viewer's own in connections_, joined at High priority while it has seats
+        int held = 0;  // seats it has: in use, or kept
+        int in_use = 0;
+        int taking = 0; // in take_viewer_seat, waiting for a seat
+        std::chrono::steady_clock::time_point idle_since;
+        std::shared_ptr<ssh::Pool> rclone_pool; // engine = rclone: idle connections close with the seat
     };
-    std::list<CachedPreview> preview_cache_; // the most recent first, up to preview_cache_bytes
+    std::map<std::string, ViewerSeat> viewer_seats_; // by server
     std::vector<std::jthread> preview_workers_; // after previews_: they stop before the servers end
 
     std::vector<std::jthread> workers_; // last member: stopped and joined first

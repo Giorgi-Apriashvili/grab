@@ -3,6 +3,7 @@
 #include "activity.hpp"
 #include "browse.hpp"
 #include "config.hpp"
+#include "conn_budget.hpp"
 #include "engine.hpp"
 #include "file_list.hpp"
 #include "folder.hpp"
@@ -14,8 +15,10 @@
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
+#include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
 #include "space.hpp"
+#include "ssh_read.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -169,6 +172,15 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
 }
 
 App::~App() {
+    // Previews and Play first (review G42): nothing queued starts any more, and the running ones
+    // stop at their next READs; their workers are joined before the members they use.
+    preview_jobs_.stop_all();
+    {
+        std::scoped_lock lock(preview_mutex_);
+        preview_queue_.clear();
+        for (auto& worker : preview_workers_) worker.request_stop();
+    }
+    preview_wake_.notify_all();
     if (search_thread_.joinable()) search_thread_.request_stop();
     if (settings_thread_.joinable()) settings_thread_.request_stop();
     cancel_pending();
@@ -323,23 +335,25 @@ void App::Activity::send(bool force) {
 
 namespace {
 
-constexpr std::size_t preview_cache_bytes = std::size_t{256} << 20;
-
-WebResource preview_failed(int status, std::string message) {
-    return WebResource{status, "text/plain; charset=utf-8", {}, std::move(message)};
-}
+// How long the viewer keeps its seat on a server after its last preview.
+constexpr auto preview_seat_idle = std::chrono::seconds(60);
+// Extra connections for a big image or PDF (ssh::ReadOptions::extra_from), on free seats only: a
+// Storage Box connection gives 0.7-2.5 MiB/s, one of Main's reaches its link.
+constexpr int preview_extra_box = 4;
+constexpr int preview_extra_other = 2;
 
 } // namespace
 
-void App::queue_preview(std::function<void()> job) {
+void App::queue_preview(std::function<void()> job, bool first) {
     {
-        std::lock_guard lock(preview_mutex_);
-        preview_jobs_.push_back(std::move(job));
+        std::scoped_lock lock(preview_mutex_);
+        if (first) preview_queue_.push_front(std::move(job));
+        else preview_queue_.push_back(std::move(job));
         while (preview_workers_.size() < 2) {
             preview_workers_.emplace_back([this](const std::stop_token& stop) { run_preview_jobs(stop); });
         }
     }
-    preview_wake_.notify_one();
+    preview_wake_.notify_all();
 }
 
 void App::run_preview_jobs(const std::stop_token& stop) {
@@ -347,92 +361,172 @@ void App::run_preview_jobs(const std::stop_token& stop) {
         std::function<void()> job;
         {
             std::unique_lock lock(preview_mutex_);
-            if (!preview_wake_.wait(lock, stop, [this] { return !preview_jobs_.empty(); })) return;
-            job = std::move(preview_jobs_.front());
-            preview_jobs_.pop_front();
+            if (!preview_wake_.wait(lock, stop, [this] { return !preview_queue_.empty(); })) return;
+            if (stop.stop_requested()) return; // the window is closing: nothing more is taken (review G42)
+            job = std::move(preview_queue_.front());
+            preview_queue_.pop_front();
         }
         job();
     }
 }
 
 void App::preview_request(const std::string& url, std::function<void(WebResource)> reply) {
-    constexpr std::string_view prefix = "https://grab.ui/preview/";
-    std::string_view rest = url;
-    if (!rest.starts_with(prefix)) return reply(preview_failed(400, "not a preview"));
-    rest.remove_prefix(prefix.size());
-    rest = rest.substr(0, rest.find_first_of("?#"));
-    const auto slash = rest.find('/');
-    const auto remote = preview::url_decode(rest.substr(0, slash));
-    const auto path = slash == std::string_view::npos ? std::nullopt : preview::url_decode(rest.substr(slash + 1));
-    if (!remote || !path || remote->empty() || path->empty()) return reply(preview_failed(400, "not a preview"));
-
-    std::string key = *remote + '\n' + *path;
-    {
-        std::lock_guard lock(preview_mutex_);
-        const auto it = std::ranges::find(preview_cache_, key, &CachedPreview::key);
-        if (it != preview_cache_.end()) {
-            preview_cache_.splice(preview_cache_.begin(), preview_cache_, it);
-            return reply(it->answer);
-        }
+    auto request = preview::parse_url(url);
+    if (!request) return reply(preview::failed(400, "not a preview"));
+    const bool shown = !request->ahead;
+    // Kept, or joining the fetch of the same file (review G50), or a new one: the one shown goes
+    // first, neighbours fetched ahead wait their turn.
+    if (auto job = preview_jobs_.ask(std::move(*request), std::move(reply))) {
+        queue_preview([this, job] { run_preview(job); }, shown);
     }
-    const bool ahead = url.find("?ahead") != std::string::npos; // the viewer fetching the next one
-    queue_preview([this, remote = *remote, path = *path, key = std::move(key), reply = std::move(reply), ahead] {
-        auto answer = preview_answer(remote, path, ahead);
-        {
-            // Kept for ←/→ and the neighbours fetched ahead; failures too, briefly (they come
-            // back after the others push them out).
-            std::lock_guard lock(preview_mutex_);
-            preview_cache_.push_front(CachedPreview{key, answer});
-            std::size_t total = 0;
-            for (auto it = preview_cache_.begin(); it != preview_cache_.end();) {
-                total += it->answer.body.size();
-                it = total > preview_cache_bytes && it != preview_cache_.begin() ? preview_cache_.erase(it) : std::next(it);
-            }
-        }
-        reply(std::move(answer));
-    });
 }
 
-WebResource App::preview_answer(const std::string& remote, const std::string& path, bool ahead) {
+void App::run_preview(const std::shared_ptr<preview::Previews::Job>& job) {
+    if (!preview_jobs_.begin(job)) return;
+    PreviewHold hold;
+    const auto fetched = preview_answer(*job, hold);
+    preview_jobs_.end(job, fetched);
+    // After the answer: the connections go back to the pool (the extra ones' seats with them),
+    // then the viewer's seat.
+    hold.reader.reset();
+    if (hold.seated) return_viewer_seat(job->server, hold);
+}
+
+bool App::take_viewer_seat(const std::string& server, const preview::Previews::Job& job, const std::stop_token& stop) {
+    std::unique_lock lock(preview_mutex_);
+    ViewerSeat& seat = viewer_seats_[server];
+    if (seat.id == 0) {
+        seat.id = connections_.new_id();
+        seat.idle_since = std::chrono::steady_clock::now();
+    }
+    connections_.join(server, seat.id, 4); // High; nothing when it has joined already
+    // Counted for the whole wait, so release_viewer_seats leaves the seat's id alone meanwhile.
+    ++seat.taking;
+    const bool got = [&] {
+        for (;;) {
+            if (stop.stop_requested()) return false;
+            if (seat.held > seat.in_use) return true; // the one it kept
+            if (connections_.try_acquire(server, seat.id)) {
+                ++seat.held;
+                return true;
+            }
+            if (!preview_jobs_.ahead(job)) {
+                // Shown now: it waits as a download does, and downloads above their share step aside.
+                const int id = seat.id;
+                lock.unlock();
+                const bool acquired = connections_.acquire(server, id, stop, false);
+                lock.lock();
+                if (!acquired) return false;
+                ++seat.held;
+                return true;
+            }
+            // Fetched ahead: the kept seat once it's back, or one that comes free.
+            preview_wake_.wait_for(lock, stop, std::chrono::milliseconds(250), [] { return false; });
+        }
+    }();
+    --seat.taking;
+    if (got) ++seat.in_use;
+    return got;
+}
+
+void App::return_viewer_seat(const std::string& server, const PreviewHold& hold) {
+    int idle = 0;
+    {
+        std::scoped_lock lock(preview_mutex_);
+        auto& seat = viewer_seats_[server];
+        seat.in_use = std::max(seat.in_use - 1, 0);
+        // One is kept while the viewer is idle; any more go back now.
+        if (const int keep = std::max(seat.in_use, 1); seat.held > keep) {
+            connections_.release(server, seat.id, seat.held - keep);
+            seat.held = keep;
+        }
+        seat.idle_since = std::chrono::steady_clock::now();
+        seat.rclone_pool = hold.rclone ? hold.pool : nullptr;
+        idle = seat.held - seat.in_use;
+    }
+    preview_wake_.notify_all();
+    // engine = rclone: rclone's own connections can't see the pool's idle ones, only the seats
+    // that count them, so no more stay open than the viewer keeps seats for.
+    if (hold.rclone && hold.pool) hold.pool->trim_idle(idle);
+}
+
+void App::release_viewer_seats() {
+    std::vector<std::shared_ptr<ssh::Pool>> close;
+    {
+        std::scoped_lock lock(preview_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& [server, seat] : viewer_seats_) {
+            if (seat.id == 0 || seat.in_use > 0 || seat.taking > 0) continue;
+            if (now - seat.idle_since < preview_seat_idle) continue;
+            if (seat.held > 0) connections_.release(server, seat.id, seat.held);
+            connections_.leave(server, seat.id);
+            seat.held = 0;
+            seat.id = 0;
+            if (seat.rclone_pool) close.push_back(std::move(seat.rclone_pool));
+        }
+    }
+    // Closing waits for the server (up to the session timeout on a dead path): a preview worker
+    // does it, not the UI thread.
+    if (!close.empty()) {
+        queue_preview(
+            [close = std::move(close)] {
+                for (const auto& pool : close) pool->trim_idle(0);
+            },
+            false);
+    }
+}
+
+void App::forget_server_previews(const std::string& server) {
+    preview_jobs_.forget_server(server);
+    pools_.forget_login_failure(server);
+}
+
+preview::Fetched App::preview_answer(const preview::Previews::Job& job, PreviewHold& hold) {
+    auto fail = [](preview::Answer answer) {
+        return preview::Fetched{.answer = std::move(answer), .stamp = {}, .keep = false};
+    };
+    const auto& remote = job.server;
+    const auto& path = job.path;
+    const auto stop = job.stop.get_token();
     const auto kind = preview::kind_of(path);
-    const auto max = preview::max_bytes(kind);
-    if (max == 0) return preview_failed(415, "This kind of file has no preview.");
+    if (preview::max_bytes(kind) == 0) return fail(preview::failed(415, "This kind of file has no preview."));
     auto ctx = engine::load_context(config_path_, remote);
-    if (!ctx) return preview_failed(500, ctx.error());
+    if (!ctx) return fail(preview::failed(500, ctx.error()));
+    // Every server through grab's own connections, engine = rclone too (RCLONE-REPLACEMENT.md,
+    // phase 6): its pool, shared with the downloads, Browse and verification, logs in once.
+    auto target = engine::ssh_target(*ctx);
+    if (!target) return fail(preview::failed(502, std::format("Can't preview from {}: {}", remote, target.error())));
+    connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
+    hold.pool = pools_.get(remote, *target, connections_.budget(remote));
+    hold.rclone = ctx->engine != Engine::grab;
     const auto name = remote_basename(path);
-    // Until the first bytes, rclone opens the file (the first one in a folder reads the folder).
-    std::optional<Activity> loading;
-    const auto url = stream_url(*ctx, remote, path, true, ahead, [&] {
-        if (!loading) loading.emplace(*this, std::format("Opening {} on {}…", name, remote), std::string(), ahead);
-    });
-    if (!url) {
-        if (loading) loading->failed();
-        return preview_failed(502, url.error());
+    Activity loading(*this, std::format("Opening {} on {}…", name, remote), std::string(), preview_jobs_.ahead(job));
+    if (!take_viewer_seat(remote, job, stop)) return fail(preview::cancelled());
+    hold.seated = true;
+    int seat_id = 0;
+    {
+        std::scoped_lock lock(preview_mutex_);
+        seat_id = viewer_seats_[remote].id;
     }
-    auto got = http_get(*url, max, [&](std::uint64_t done, std::uint64_t total) {
-        loading->progress(done, total,
-                          std::format("Loading {}: {} of {}", name, util::format_size(done), util::format_size(total)));
-    });
-    if (!got) return preview_failed(502, got.error());
-    if (got->status == 404) return preview_failed(404, std::format("Not found on {}.", remote));
-    if (got->status != 200 && got->status != 206) {
-        return preview_failed(502, std::format("{} answered {}.", remote, got->status));
-    }
-    const bool cut = got->total && *got->total > got->body.size();
-    if (cut && kind != preview::Kind::text) {
-        return preview_failed(413, std::format("Too big to preview ({}); download it instead.", util::format_size(*got->total)));
-    }
-    WebResource answer{200, preview::content_type(path), {}, {}};
-    if (kind == preview::Kind::text) {
-        answer.body = preview::text_utf8(got->body, util::to_lower(path).ends_with(".nfo"));
-        if (cut) answer.headers = std::format("X-Grab-Total: {}", *got->total);
-    } else {
-        answer.body = std::move(got->body);
-    }
-    // An SVG is shown as an image, where its scripts never run; if it were opened as a page
-    // anyway, it gets no rights at all.
-    if (util::to_lower(path).ends_with(".svg")) answer.headers = "Content-Security-Policy: sandbox";
-    return answer;
+
+    ssh::ReadOptions o;
+    o.stop = stop;
+    // A big image or PDF also over free seats; text reads its first MiB only.
+    o.extra = kind == preview::Kind::text ? 0
+              : budget::is_storage_box(ctx->remote.host) ? preview_extra_box
+                                                         : preview_extra_other;
+    o.seat = [this, remote, seat_id] { return connections_.try_acquire(remote, seat_id); };
+    o.seat_back = [this, remote, seat_id] { connections_.release(remote, seat_id); };
+    o.yield = [this, remote, seat_id] { return connections_.yield_if_over_share(remote, seat_id); };
+    // Never called once read() has returned, so `loading` may go first.
+    o.progress = [&loading, &name](std::uint64_t done, std::uint64_t total) {
+        loading.progress(done, total,
+                         std::format("Loading {}: {} of {}", name, util::format_size(done), util::format_size(total)));
+    };
+    hold.reader.emplace(hold.pool, rclone_enc::raw_path(path), std::move(o));
+    auto fetched = preview::fetch(*hold.reader, remote, path);
+    if (fetched.answer.status != 200 && !stop.stop_requested()) loading.failed();
+    return fetched;
 }
 
 std::expected<std::string, std::string> App::stream_url(const engine::Context& ctx, const std::string& remote,
@@ -579,6 +673,17 @@ void App::on_message(const std::string& text) {
         save_state();
     } else if (type == "search") {
         start_search(*msg);
+    } else if (type == "previewCancel") {
+        // The viewer moved or closed: {keep: [the preview URLs it still wants]}.
+        std::set<std::string> keep;
+        if (const Value* urls = msg->find("keep"); urls != nullptr && urls->kind == Value::Kind::array) {
+            for (const Value& url : urls->items) {
+                if (url.kind != Value::Kind::string) continue;
+                if (auto at = preview::parse_url(url.str)) keep.insert(preview::key_of(at->server, at->path));
+            }
+        }
+        preview_jobs_.cancel(keep); // they stop at their next READs (review G50)
+        preview_wake_.notify_all(); // one waiting for a seat
     } else if (type == "play") {
         play(*msg);
     } else if (type == "browse") {
@@ -712,6 +817,7 @@ void App::on_message(const std::string& text) {
                 auto note = server_ops::remove_server(*env, name);
                 if (!note) return settings_error(note.error());
                 if (!note->empty()) settings_error(*note);
+                forget_server_previews(name);
             } else if (auto done = server_ops::set_default(*env, name); !done) {
                 return settings_error(done.error());
             }
@@ -1820,6 +1926,8 @@ void App::apply_pending(Pending p, std::stop_token stop) {
     }
     if (!done) return settings_error(done.error());
     if (!done->empty()) settings_error(*done);
+    // Its previews kept may be another server's files now, and a login that failed may work.
+    forget_server_previews(p.server.name);
     // An explicit connection limit replaces whatever grab learned for this server.
     if (p.server.max_connections) {
         {
@@ -1852,6 +1960,7 @@ void App::test_server(const std::string& name, std::stop_token stop) {
     if (result && result->grab_ok.value_or(false)) {
         pools_.forget_find_check(name);
         pools_.forget_hash_check(name);
+        pools_.forget_login_failure(name);
     }
     if (!result) {
         v.set("ok", Value::make_bool(false));
@@ -2317,7 +2426,10 @@ void App::set_schedule(const Value& rules) {
     update_limit();
 }
 
-void App::tick() { update_limit(); }
+void App::tick() {
+    update_limit();
+    release_viewer_seats();
+}
 
 schedule::Applied App::current_limit(const schedule::Now& now) const {
     return schedule::apply({state_.limit_on, state_.limit_mibps}, schedule::limit_at(state_.speed_schedule, now.minute),

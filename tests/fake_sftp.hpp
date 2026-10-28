@@ -41,9 +41,13 @@ public:
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
     int broken_after = 0;                                   // the stream breaks on this read (0: never)
     bool dropped = false;                                   // the server closed the connection: every read breaks
+    bool break_on_close = false;                            // the connection breaks at a CLOSE, before its reply
     bool never_eof = false;                                 // past the last name, READDIR gets empty NAMEs, not EOF
+    std::set<std::string> fifos;                            // named pipes: STAT says so (an OPEN would block a real server)
+    std::set<std::string> no_size;                          // files whose ATTRS carry no size
 
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
+    std::vector<std::string> opened;                            // the paths of each OPEN
     std::size_t most_waiting = 0;                               // most requests answered in one batch
 
     void write(std::string_view bytes) override {
@@ -138,6 +142,21 @@ private:
         u32(b, 1700000000);
     }
     void attrs(std::string& b, const std::string& path, bool in_listing = false) {
+        if (fifos.contains(path)) {
+            u32(b, 0x1 | 0x4 | 0x8);
+            u64(b, 0);
+            u32(b, 0010644);
+            u32(b, 0);
+            u32(b, 1700000000);
+            return;
+        }
+        if (no_size.contains(path)) {
+            u32(b, 0x4 | 0x8);
+            u32(b, 0100644);
+            u32(b, 0);
+            u32(b, 1700000000);
+            return;
+        }
         if (dirs.contains(path)) {
             u32(b, 0x4 | 0x8);
             u32(b, 040755);
@@ -152,7 +171,9 @@ private:
         u32(b, shared_mtimes != nullptr && shared_mtimes->contains(path) ? shared_mtimes->at(path) : 1700000000);
     }
     const std::map<std::string, std::string>& all_files() const { return shared_files ? *shared_files : files; }
-    bool known(const std::string& path) const { return all_files().contains(path) || dirs.contains(path); }
+    [[nodiscard]] bool known(const std::string& path) const {
+        return all_files().contains(path) || dirs.contains(path) || fifos.contains(path);
+    }
     std::string new_handle(std::string path) {
         std::string h = "h" + std::to_string(next_handle_++);
         handles_[h] = {std::move(path), 0};
@@ -179,6 +200,7 @@ private:
         case 3: // OPEN
         case 11: { // OPENDIR
             std::string path = resolve(in.str());
+            if (type == 3) opened.push_back(path);
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (type == 3 ? !all_files().contains(path) : !dirs.contains(path)) return status(id, 2, "No such file");
             std::string b;
@@ -198,6 +220,10 @@ private:
         }
         case 4: // CLOSE
             handles_.erase(in.str());
+            if (break_on_close) {
+                dropped = true;
+                return;
+            }
             return status(id, 0);
         case 12: { // READDIR
             auto& h = handles_.at(in.str());

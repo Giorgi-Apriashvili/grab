@@ -137,6 +137,67 @@ std::optional<Pool::Lease> Pool::acquire_new(std::stop_token stop, Retry retry_r
     return log_in(lock, stop, pauses);
 }
 
+std::optional<Pool::Lease> Pool::acquire_remembered(std::stop_token stop, Retry retry_refused) {
+    bool trying = false; // this caller logs in while none of these logins has worked yet
+    {
+        std::unique_lock lock(mutex_);
+        // The failure that still holds, if any.
+        auto failed = [this]() -> const LoginFailure* {
+            if (!login_failure_) return nullptr;
+            const LoginFailure& f = *login_failure_;
+            const bool holds = f.kind == budget::Failure::fatal || Clock::now() - f.since < options_.login_failure_holds;
+            return holds ? &f : nullptr;
+        };
+        if (!changed_.wait(lock, stop, [&] { return !idle_.empty() || failed() != nullptr || !login_trying_; })) {
+            return std::nullopt;
+        }
+        // An idle connection costs no login, whatever failed before (another caller's login worked).
+        if (!idle_.empty()) {
+            std::unique_ptr<Session> session = std::move(idle_.back().session);
+            idle_.pop_back();
+            ++leased_;
+            return Lease(this, std::move(session), true);
+        }
+        if (const LoginFailure* f = failed()) throw Error(f->kind, f->what);
+        if (!login_works_) trying = login_trying_ = true;
+    }
+    // Its outcome, for the next ones.
+    auto outcome = [&](std::optional<LoginFailure> failure, bool worked) {
+        {
+            std::scoped_lock lock(mutex_);
+            if (trying) login_trying_ = false;
+            if (failure) {
+                login_failure_ = std::move(failure);
+                login_works_ = false;
+            } else if (worked) {
+                login_failure_.reset();
+                login_works_ = true;
+            }
+        }
+        changed_.notify_all();
+    };
+    std::optional<Lease> lease;
+    try {
+        lease = acquire(std::move(stop), retry_refused);
+    } catch (const Error& e) {
+        outcome(LoginFailure{.kind = e.kind, .what = e.what(), .since = Clock::now()}, false);
+        throw;
+    } catch (...) {
+        outcome(std::nullopt, false);
+        throw;
+    }
+    outcome(std::nullopt, lease.has_value());
+    return lease;
+}
+
+void Pool::forget_login_failure() {
+    {
+        std::scoped_lock lock(mutex_);
+        login_failure_.reset();
+    }
+    changed_.notify_all();
+}
+
 std::optional<Pool::Lease> Pool::log_in(std::unique_lock<std::mutex>& lock, const std::stop_token& stop,
                                         std::span<const std::chrono::milliseconds> pauses) {
     // A new login, outside the lock: it takes a second or more.
@@ -163,7 +224,13 @@ std::optional<Pool::Lease> Pool::log_in(std::unique_lock<std::mutex>& lock, cons
     }
     lock.lock();
     --logging_in_;
-    if (session) ++leased_;
+    if (session) {
+        ++leased_;
+        // Any caller's login that works (a download's, Browse's) is acquire_remembered's too: same
+        // pool, same target.
+        login_failure_.reset();
+        login_works_ = true;
+    }
     changed_.notify_all();
     if (failed) std::rethrow_exception(failed);
     if (!session) return std::nullopt;
@@ -217,6 +284,18 @@ void Pool::close_idle(Clock::time_point now) {
             // The oldest first; the last one left is the most recently used.
             const auto after = idle_.size() == 1 ? std::max(options_.idle_close, options_.keep_newest) : options_.idle_close;
             if (now - idle_.front().since < after) break;
+            drop.push_back(std::move(idle_.front().session));
+            idle_.pop_front();
+        }
+    }
+    if (!drop.empty()) changed_.notify_all();
+}
+
+void Pool::trim_idle(int keep) {
+    std::vector<std::unique_ptr<Session>> drop;
+    {
+        std::scoped_lock lock(mutex_);
+        while (std::cmp_greater(idle_.size(), std::max(keep, 0))) {
             drop.push_back(std::move(idle_.front().session));
             idle_.pop_front();
         }
@@ -373,6 +452,11 @@ void Pools::forget_find_check(const std::string& server) {
 void Pools::forget_hash_check(const std::string& server) {
     std::lock_guard lock(mutex_);
     if (const auto it = pools_.find(server); it != pools_.end() && it->second.pool) it->second.pool->set_hash_check(std::nullopt);
+}
+
+void Pools::forget_login_failure(const std::string& server) {
+    std::scoped_lock lock(mutex_);
+    if (const auto it = pools_.find(server); it != pools_.end() && it->second.pool) it->second.pool->forget_login_failure();
 }
 
 } // namespace grab::ssh

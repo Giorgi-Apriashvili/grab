@@ -119,6 +119,11 @@ bool ServerPool::may_start(int id, Clock::time_point now, bool staggered) const 
     return u->active < share(id) || !other_starved(id);
 }
 
+bool ServerPool::free_for(int id) const {
+    if (find(id) == nullptr || total_active() >= budget_) return false;
+    return std::ranges::none_of(users_, [&](const User& u) { return u.id != id && u.waiting > 0; });
+}
+
 void ServerPool::waiting(int id, int delta) {
     auto it = std::ranges::find(users_, id, &User::id);
     if (it != users_.end()) it->waiting = std::max(0, it->waiting + delta);

@@ -261,7 +261,12 @@ too and goes on without them.
       in your browser only after grab asks, showing the site it really goes to; nothing from a
       preview can replace grab's window.
     - Nothing is written to disk: previews go from the stream to the window in memory.
-  - The streams come from `rclone serve http`, which reads every folder on the way to a file, so
+    - They come over grab's own SSH connections on every server (whatever its engine): one
+      connection of the server's budget, kept a minute after the last preview, plus free ones
+      for a big image or PDF. Moving on cancels the one still loading. A login that fails is
+      tried again only after Test, Trust or a save in Settings (or 30 s, when it may pass by
+      itself), so flipping through images never hammers a server that refuses you.
+  - Play's streams come from `rclone serve http`, which reads every folder on the way to a file, so
     grab serves a file from the search root it is under (or the login home, or else its own
     folder), never from a `/` the server may not let you list (a Storage Box's). When a folder on
     the way can't be listed all the same, it serves the file from its own folder; when that
@@ -429,8 +434,9 @@ too and goes on without them.
   - The budget is a hard limit: with more downloads queued for a server than it has
     connections, the window starts only that many, and the rest wait their turn. Each file's
     first look at the server (its size and date) takes one of them too.
-  - Previews and Play's player use their own `rclone serve`, outside the budget, with at most
-    two connections.
+  - Play's player uses its own `rclone serve`, outside the budget, with at most two
+    connections. Previews take one connection of the budget, ahead of downloads, and only free
+    ones beyond it.
   - Connections open slightly staggered. If a server refuses one while others of grab's get
     data, grab lowers that server's budget and remembers it (in `limits.json` next to
     gui.json, shared with the `grab` command). Each download from that server that ends
@@ -601,7 +607,7 @@ Add one `[section]` per server and choose with `-r NAME`.
 
 **grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
 `engine = grab` in a server's section to try it: files and folders then download through it, and
-searches, file lists and Browse go through it too (previews and checks still go through rclone).
+searches, file lists and Browse go through it too (Play and checks still go through rclone; previews use grab's client on every server).
 A search or a list uses the server's GNU find when it has one and the `find` setting allows it,
 else it lists folders over SFTP, several at a time; links are followed. It logs in once and
 keeps the connections open between files, asks the server for exactly the bytes it needs, and
@@ -810,7 +816,7 @@ Defaults (override per remote in grab.conf):
 | `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
 
 All three are for `--rclone`, the plain rclone copy, which gets them as they are. grab's own
-rclone calls (its downloads, listings, searches, previews and Play) take only
+rclone calls (its downloads, listings, searches and Play) take only
 their connection flags: `--sftp-*`, `--bind`, `--contimeout`, `--timeout`,
 `--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and
 `--password-command`. Those calls depend on rclone's exact output, so a progress, logging,

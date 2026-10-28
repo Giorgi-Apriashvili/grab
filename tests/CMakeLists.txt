@@ -53,6 +53,9 @@ add_executable(grab_tests
     test_ssh_pool.cpp
     test_ssh_find.cpp
     test_ssh_hash.cpp
+    test_ssh_read.cpp
+    test_preview_jobs.cpp
+    test_body_stream.cpp
     test_fetch_grab.cpp
     test_folder_grab.cpp
     test_lookup_grab.cpp

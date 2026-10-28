@@ -3,6 +3,7 @@
 #include "app.hpp"
 #include "config.hpp"
 #include "gui_state.hpp"
+#include "preview_jobs.hpp"
 #include "tray.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -432,7 +433,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     // The viewer's previews come from the app, which answers on a worker thread.
     options.on_preview = [](const std::string& url, std::function<void(gui::WebResource)> reply) {
         if (g.app) g.app->preview_request(url, std::move(reply));
-        else reply(gui::WebResource{503, "text/plain; charset=utf-8", {}, "not ready"});
+        else reply(preview::failed(503, "not ready"));
     };
     options.defer = [](std::function<void()> fn) {
         auto* payload = new std::function<void()>(std::move(fn));

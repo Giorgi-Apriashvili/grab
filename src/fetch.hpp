@@ -181,6 +181,11 @@ public:
     // `staggered`: kept ServerPool::stagger after the last start (a login: rclone's); grab's
     // engine passes false, its pool pacing its own logins.
     bool acquire(const std::string& server, int id, std::stop_token stop, bool staggered = true);
+    // One more connection for `id` (joined) only if one is free now: within the budget, and no
+    // other user waiting for one. It never waits and never counts as waiting, so no download hands
+    // a connection back for it: a preview's extra connections, the viewer's neighbours fetched
+    // ahead. Released as acquire's.
+    [[nodiscard]] bool try_acquire(const std::string& server, int id);
     // Takes up to `id`'s whole share at once (for an rclone copy or listing that manages its own
     // connections), at most `at_most`; at least 1 unless stopped (0). With `settle`, it waits that
     // long for downloads above their shares to hand connections back first.

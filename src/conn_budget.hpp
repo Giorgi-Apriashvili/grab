@@ -69,6 +69,9 @@ public:
     // `staggered`: this start may be a login (rclone's are); grab's engine logs in through its
     // pool, which paces logins itself, so its starts aren't kept `stagger` apart.
     [[nodiscard]] bool may_start(int id, Clock::time_point now, bool staggered = true) const;
+    // Whether `id` (a user) may take a connection that is free now without anyone handing one
+    // back or waiting longer for it: below the budget, and no other user waiting for one.
+    [[nodiscard]] bool free_for(int id) const;
     // Downloads waiting for a connection, so borrowed ones are handed back.
     void waiting(int id, int delta);
     // Whether `id` should hand a connection back: it holds more than its share while another

@@ -352,6 +352,14 @@ bool Connections::acquire(const std::string& server, int id, std::stop_token sto
     }
 }
 
+bool Connections::try_acquire(const std::string& server, int id) {
+    std::scoped_lock lock(mutex_);
+    auto& p = pool(server);
+    if (!p.free_for(id)) return false;
+    p.started(id, budget::ServerPool::Clock::now());
+    return true;
+}
+
 int Connections::reserve(const std::string& server, int id, std::stop_token stop, int at_most,
                          std::chrono::milliseconds settle) {
     if (!acquire(server, id, stop)) return 0;

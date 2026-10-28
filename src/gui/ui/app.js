@@ -3,7 +3,7 @@
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, suggest, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
-//                 pauseChild, resumeChild, skipChild, resolveExisting,
+//                 pauseChild, resumeChild, skipChild, resolveExisting, play, previewCancel,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
@@ -730,12 +730,35 @@ function flash(text, ms = 6000) {
   setTimeout(renderBrowseBar, ms + 50);
 }
 
-function previewUrl(h) {
-  return `https://grab.ui/preview/${encodeURIComponent(h.remote || state.remote)}/${encodeURIComponent(h.path)}`;
+// The row's size and time go along, so the backend knows whether a preview it kept still holds;
+// `ahead`: a neighbour fetched before it is shown (it waits for a free connection).
+function previewUrl(h, ahead = false) {
+  const q = [];
+  if (Number.isFinite(h.size)) q.push(`size=${h.size}`);
+  if (Number.isFinite(h.modified)) q.push(`modified=${h.modified}`);
+  if (ahead) q.push('ahead');
+  const base = `https://grab.ui/preview/${encodeURIComponent(h.remote || state.remote)}/${encodeURIComponent(h.path)}`;
+  return q.length ? `${base}?${q.join('&')}` : base;
 }
 
 // The viewer goes through the list's images, text files and PDFs, as they were when it opened.
-const viewer = { open: false, list: [], index: -1, token: 0, returnTo: null };
+// `blob`: the image shown, as a blob: URL, let go when it goes.
+const viewer = { open: false, list: [], index: -1, token: 0, returnTo: null, blob: null };
+
+function dropViewerBlob() {
+  if (viewer.blob) URL.revokeObjectURL(viewer.blob);
+  viewer.blob = null;
+}
+
+// The backend stops fetching what the viewer no longer wants: all but the one shown and its
+// neighbours, or everything once it closes.
+function cancelPreviews() {
+  const keep = viewer.open
+    ? [viewer.list[viewer.index], viewer.list[viewer.index + 1], viewer.list[viewer.index - 1]]
+      .filter((n) => views(kindOf(n))).map((n) => previewUrl(n))
+    : [];
+  send({ type: 'previewCancel', keep });
+}
 
 function openViewer(h) {
   viewer.list = state.hits.filter((x) => views(kindOf(x)));
@@ -751,8 +774,10 @@ function closeViewer() {
   if (!viewer.open) return;
   viewer.open = false;
   viewer.token += 1;
+  cancelPreviews();
   $('#viewer').hidden = true;
   $('#viewer-body').replaceChildren();
+  dropViewerBlob();
   // The list's cursor goes to the last one viewed, as in Explorer.
   const last = viewer.list[viewer.index];
   const i = last ? state.hits.indexOf(last) : -1;
@@ -782,6 +807,8 @@ function showViewerItem() {
   const body = $('#viewer-body');
   body.className = `viewer-body ${kind}`;
   body.innerHTML = '<span class="spinner"></span>';
+  dropViewerBlob();
+  cancelPreviews();
   const failed = (text) => {
     if (token !== viewer.token) return;
     const p = document.createElement('div');
@@ -789,8 +816,6 @@ function showViewerItem() {
     p.textContent = bidiVisible(text || 'Couldn’t load the preview.');
     body.replaceChildren(p);
   };
-  // An error's reason, from the backend's answer.
-  const reason = () => fetch(url).then((r) => r.text()).then(failed, () => failed(''));
   if (kind === 'image') {
     const img = new Image();
     img.className = 'fit';
@@ -801,7 +826,8 @@ function showViewerItem() {
       $('#viewer-info').textContent = [`${img.naturalWidth} × ${img.naturalHeight}`, ...info].join(' · ');
       fetchAhead();
     };
-    img.onerror = reason;
+    // Bytes that aren't a picture the browser can show: a fixed message, never the bytes (G38).
+    img.onerror = () => failed('This image can’t be shown.');
     img.draggable = false; // a drag moves the view (below), never the picture itself
     // A click: the full size (scroll or drag to see the rest), the spot clicked staying under
     // the pointer. A click on it at full size goes back (the panning handlers below).
@@ -816,7 +842,16 @@ function showViewerItem() {
       body.scrollLeft += now.left + fx * now.width - ev.clientX;
       body.scrollTop += now.top + fy * now.height - ev.clientY;
     });
-    img.src = url;
+    // One request gives the picture or, failing, why: a failed or cancelled one isn't fetched
+    // again for its reason (G38).
+    fetch(url).then(async (r) => {
+      if (token !== viewer.token) return;
+      if (!r.ok) return failed(await r.text());
+      const blob = await r.blob();
+      if (token !== viewer.token) return;
+      viewer.blob = URL.createObjectURL(blob);
+      img.src = viewer.blob;
+    }).catch(() => failed(''));
   } else if (kind === 'text') {
     fetch(url).then(async (r) => {
       const text = await r.text();
@@ -849,8 +884,7 @@ function showViewerItem() {
     if (token !== viewer.token) return;
     for (const n of [viewer.list[viewer.index + 1], viewer.list[viewer.index - 1]]) {
       const k = kindOf(n);
-      if (k === 'image') new Image().src = `${previewUrl(n)}?ahead`;
-      else if (k === 'text') fetch(`${previewUrl(n)}?ahead`).catch(() => {});
+      if (k === 'image' || k === 'text') fetch(previewUrl(n, true)).catch(() => {});
     }
   }
 }
