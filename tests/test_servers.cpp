@@ -1,6 +1,5 @@
 #include "servers.hpp"
 #include "rclone.hpp"
-#include "util.hpp"
 
 #include <doctest/doctest.h>
 
@@ -10,8 +9,6 @@
 #include <vector>
 
 using namespace grab;
-using servers::Auth;
-using servers::NewServer;
 
 TEST_CASE("server names") {
     CHECK_FALSE(servers::validate_name("hetzner").has_value());
@@ -117,65 +114,12 @@ TEST_CASE("merge_known_hosts appends only new lines") {
           "other key\n[h]:23 ssh-ed25519 AAAA\n");
 }
 
-TEST_CASE("rclone config create argv per auth type; no plaintext secret, pre-obscured only") {
-    NewServer s;
-    s.name = "box";
-    s.host = "box.example.com";
-    s.port = 23;
-    s.user = "u1";
-    const auto conf = util::path_from_utf8("C:\\grab\\rclone.conf");
-    const auto kh = util::path_from_utf8("C:\\grab\\known_hosts");
-    const auto tail = std::vector<std::string>{"known_hosts_file=" + util::path_to_utf8(kh), "--no-obscure",
-                                               "--non-interactive", "--config", util::path_to_utf8(conf)};
-    auto expect = [&](std::vector<std::string> middle) {
-        std::vector<std::string> v{"rclone", "config", "create", "box", "sftp", "host=box.example.com",
-                                   "port=23", "user=u1"};
-        v.insert(v.end(), middle.begin(), middle.end());
-        v.insert(v.end(), tail.begin(), tail.end());
-        return v;
-    };
-
-    s.auth = Auth::password;
-    CHECK(servers::create_argv("rclone", conf, s, std::string("OBSCURED"), kh) == expect({"pass=OBSCURED"}));
-
-    s.auth = Auth::key_file;
-    s.key_file = "E:\\keys\\server.pem";
-    CHECK(servers::create_argv("rclone", conf, s, std::nullopt, kh) == expect({"key_file=E:\\keys\\server.pem"}));
-    CHECK(servers::create_argv("rclone", conf, s, std::string("OBS2"), kh) ==
-          expect({"key_file=E:\\keys\\server.pem", "key_file_pass=OBS2"}));
-
-    s.auth = Auth::agent;
-    CHECK(servers::create_argv("rclone", conf, s, std::nullopt, kh) == expect({"key_use_agent=true"}));
-
-    CHECK(servers::obscure_argv("rclone") == std::vector<std::string>{"rclone", "obscure", "-"});
-    CHECK(servers::delete_argv("rclone", conf, "box") ==
-          std::vector<std::string>{"rclone", "config", "delete", "box", "--config", util::path_to_utf8(conf)});
-    const auto update = servers::update_argv("rclone", conf, "box", "known_hosts_file", "C:\\kh");
-    CHECK(std::ranges::find(update, "known_hosts_file=C:\\kh") != update.end());
+TEST_CASE("rclone's probe: the server in its environment, its config in memory; nothing else builds rclone config") {
     const auto probe = servers::probe_argv("rclone", "box");
     CHECK(probe[2] == "box:");
     CHECK(std::ranges::find(probe, "--contimeout") != probe.end());
     CHECK(probe.back() == config_in_memory); // the server comes in its environment (engine::rclone_env)
-}
-
-TEST_CASE("to_remote carries auth and pinned host keys") {
-    NewServer s;
-    s.name = "n";
-    s.host = "h";
-    s.user = "u";
-    s.port = 2222;
-    s.auth = Auth::key_file;
-    s.key_file = "E:\\k.pem";
-    auto r = servers::to_remote(s, util::path_from_utf8("C:\\kh"));
-    CHECK(r.key_file == "E:\\k.pem");
-    CHECK_FALSE(r.key_use_agent);
-    CHECK(r.known_hosts_file == "C:\\kh");
-    CHECK(r.port == 2222);
-    s.auth = Auth::agent;
-    r = servers::to_remote(s, {});
-    CHECK(r.key_use_agent);
-    CHECK_FALSE(r.key_file.has_value());
-    CHECK_FALSE(r.known_hosts_file.has_value());
+    CHECK(std::ranges::find(probe, "config") == probe.end());
 }
 
 namespace {
@@ -232,8 +176,9 @@ TEST_CASE("append_section and set_value") {
     CHECK(servers::append_section("", "[x]\na = 1\n") == "[x]\na = 1\n");
     CHECK(servers::append_section("[grab]", "[x]\n") == "[grab]\n\n[x]\n");
 
+
     // Replaces the existing line in the right section only.
-    const auto changed = servers::set_value(grab_conf, "grab", "default_remote", "box");
+    const auto changed = servers::set_value(grab_conf, "grab", "default_remote", "box").value();
     CHECK(changed.find("default_remote = box\n") != std::string::npos);
     CHECK(changed.find("default_remote = hetzner") == std::string::npos);
     CHECK(changed.size() == std::string(grab_conf).size() - std::string("hetzner").size() + 3);
@@ -249,4 +194,50 @@ TEST_CASE("append_section and set_value") {
     // A commented-out key is not mistaken for the real one.
     CHECK(servers::set_value("[grab]\n# default_remote = old\n", "grab", "default_remote", "new") ==
           "[grab]\ndefault_remote = new\n# default_remote = old\n");
+}
+
+TEST_CASE("set_value refuses line breaks and control characters, which would start lines of their own (G28)") {
+    const std::string text = "[box]\nhost = h\n";
+    for (const std::string_view bad : {std::string_view("h\nauth = agent"), std::string_view("h\rx"),
+                                       std::string_view("h\0x", 3), std::string_view("h\tx"),
+                                       std::string_view("h\x7Fx"), std::string_view("h\xC2\x85x")}) {
+        const auto set = servers::set_value(text, "box", "host", bad);
+        REQUIRE_FALSE(set.has_value());
+        CHECK(set.error().find("control characters or line breaks") != std::string::npos);
+    }
+    CHECK_FALSE(servers::set_value(text, "box\n[evil]", "host", "h").has_value());
+    CHECK_FALSE(servers::set_value(text, "box", "host\nauth", "h").has_value());
+    // Georgian and other letters are fine.
+    CHECK(servers::set_value(text, "box", "user", "\u10D2\u10D8\u10DD").value() ==
+          "[box]\nuser = \u10D2\u10D8\u10DD\nhost = h\n");
+}
+
+TEST_CASE("set_value puts a new key after the keys it follows, else after the header") {
+    const std::vector<std::string_view> before{"host", "port", "user", "auth"};
+    CHECK(servers::set_value("[s]\nhost = h\nauth = agent\nx = 1\n", "s", "key_file", "k", before).value() ==
+          "[s]\nhost = h\nauth = agent\nkey_file = k\nx = 1\n");
+    CHECK(servers::set_value("[s]\nx = 1\n", "s", "key_file", "k", before).value() == "[s]\nkey_file = k\nx = 1\n");
+    // A key there already stays where it is.
+    CHECK(servers::set_value("[s]\nkey_file = old\nhost = h\n", "s", "key_file", "k", before).value() ==
+          "[s]\nkey_file = k\nhost = h\n");
+}
+
+TEST_CASE("a repeated key or section is written where ini::parse reads it: the last one wins") {
+    // A host set twice: the last line takes the value, the earlier one goes.
+    CHECK(servers::set_value("[Box]\nhost = old.example\nuser = u\nhost = old.example\n", "Box", "host", "new.example")
+              .value() == "[Box]\nuser = u\nhost = new.example\n");
+    // [Box] split in two blocks, host in the second.
+    const std::string split = "[Box]\nuser = u\n\n[grab]\nx = 1\n\n[Box]\nhost = old.example\n";
+    CHECK(servers::set_value(split, "Box", "host", "new.example").value() ==
+          "[Box]\nuser = u\n\n[grab]\nx = 1\n\n[Box]\nhost = new.example\n");
+    // In both: the first goes, the second takes the value.
+    CHECK(servers::set_value("[Box]\nhost = a\n\n[Box]\nhost = b\n", "Box", "host", "c").value() ==
+          "[Box]\n\n[Box]\nhost = c\n");
+    // A new key goes in the last block.
+    CHECK(servers::set_value(split, "Box", "port", "23").value() ==
+          "[Box]\nuser = u\n\n[grab]\nx = 1\n\n[Box]\nport = 23\nhost = old.example\n");
+    // A removal takes every block of that name.
+    CHECK(servers::remove_section(split, "Box") == "[grab]\nx = 1\n");
+    CHECK(servers::remove_section("[a]\n1 = 1\n\n# rclone remote [Box]: x\n[Box]\nhost = h\n\n[b]\n2 = 2\n\n[Box]\nuser = u\n",
+                                  "Box") == "[a]\n1 = 1\n\n[b]\n2 = 2\n");
 }

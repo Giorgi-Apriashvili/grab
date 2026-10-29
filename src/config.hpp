@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace grab {
@@ -58,7 +59,8 @@ struct GrabConfig {
     select(const std::optional<std::string>& name) const;
 };
 
-// Connection details read from an sftp remote in rclone.conf.
+// A server's connection details: from its grab.conf section (server_conf::to_remote), or an sftp
+// remote of rclone.conf for `grab --init`. Renamed in phase 9.
 struct RcloneRemote {
     std::string name;
     std::string host;
@@ -115,16 +117,14 @@ extern const std::string_view example_config;
 // digits of config_key>". nullopt for the default configuration (<config>/grab), whose files
 // stay where they always were.
 [[nodiscard]] std::optional<std::string> config_folder_name(const std::filesystem::path& grab_conf);
-// grab's own rclone config, holding the remotes grab manages: <config>/grab/rclone.conf.
+// The rclone config where grab 0.19 and before kept its servers: <config>/grab/rclone.conf. Only
+// the import (rclone_import.hpp) reads it now; grab never writes it again.
 [[nodiscard]] std::filesystem::path grab_rclone_config_path();
 // Host keys pinned by `grab server add|trust`: <config>/grab/known_hosts.
 [[nodiscard]] std::filesystem::path grab_known_hosts_path();
 // The rclone.conf other tools use ($RCLONE_CONFIG, else <config>/rclone/rclone.conf); grab
 // only reads it, to import remotes.
 [[nodiscard]] std::filesystem::path standard_rclone_config_path();
-
-// The rclone.conf grab passes to rclone: [grab] rclone_config if set, else grab's own file.
-[[nodiscard]] std::filesystem::path effective_rclone_config(const GrabConfig& cfg);
 
 // Held while grab changes grab.conf, an rclone.conf, the password store or known_hosts, so that
 // grab.exe and grab-gui (and the window's threads) change them one at a time, each change
@@ -151,34 +151,13 @@ private:
 // PATH. Anything else is used as given.
 [[nodiscard]] std::string resolve_rclone_exe(const GrabConfig& cfg, const std::filesystem::path& exe_dir);
 
-// ---- importing remotes into grab's own rclone.conf ----------------------------------------
-
-// A section as rclone.conf text: "[name]\nkey = value\n...". Values are copied verbatim, so
-// obscured passwords stay obscured.
-[[nodiscard]] std::string section_text(const ini::Section& section);
-
-struct ImportResult {
-    std::vector<std::string> imported;  // copied into the target file
-    std::vector<std::string> not_found; // referenced but in neither file
-    std::string error;                  // non-empty when a file could not be read or written
-};
-
-// Copies each remote in `names` that `to` lacks and `from` has, from `from` into `to`
-// (created if missing). `from` is never modified.
-ImportResult import_rclone_remotes(const std::vector<std::string>& names,
-                                   const std::filesystem::path& from, const std::filesystem::path& to);
-
-// The one-time move to grab's own rclone.conf: when grab.conf has no explicit rclone_config,
-// imports the remotes it references from the standard rclone.conf. Idempotent.
-ImportResult migrate_rclone_remotes(const GrabConfig& cfg);
-
 [[nodiscard]] std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& doc);
 [[nodiscard]] std::expected<GrabConfig, std::string> load_grab_config(const std::filesystem::path& p);
 
+// An sftp remote of rclone.conf, for `grab --init`'s list of remotes (grab's servers are read
+// from grab.conf; the import, rclone_import.hpp, reads rclone.conf as rclone does).
 [[nodiscard]] std::expected<RcloneRemote, std::string> parse_rclone_remote(const ini::Document& doc,
                                                                             std::string_view name);
-[[nodiscard]] std::expected<RcloneRemote, std::string>
-load_rclone_remote(const std::filesystem::path& p, std::string_view name);
 
 // ---- generating grab.conf from rclone.conf (grab --init) ------------------------------------
 
@@ -205,10 +184,13 @@ load_rclone_remote(const std::filesystem::path& p, std::string_view name);
 
 // A commented grab.conf section for one rclone remote. search_roots is left blank (the login
 // home, correct for both lookup methods) and the rclone flag keys are written commented out,
-// so later changes to the built-in defaults still apply.
+// so later changes to the built-in defaults still apply. With `connection` (server_conf::lines),
+// those lines go after the header instead of `rclone_remote`, which a new server leaves to its
+// name.
 [[nodiscard]] std::string remote_section(const RcloneRemote& remote,
                                          const std::vector<std::string>& search_roots = {},
-                                         int max_depth = 4);
+                                         int max_depth = 4,
+                                         const std::vector<std::pair<std::string, std::string>>& connection = {});
 
 // A complete grab.conf: the [grab] block plus one section per usable sftp remote, with
 // default_remote set to the first. With a null `rclone` or no usable sftp remote it is the

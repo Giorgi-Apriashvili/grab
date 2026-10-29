@@ -6,10 +6,11 @@
 #include "json.hpp"
 #include "listing.hpp"
 #include "match.hpp"
+#include "passwords.hpp"
 #include "rclone.hpp"
-#include "rclone_conf.hpp"
 #include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
+#include "rclone_import.hpp"
 #include "remote.hpp"
 #include "ini.hpp"
 #include "secrets.hpp"
@@ -110,69 +111,102 @@ std::string password_again(std::string_view why, std::string_view server) {
 
 } // namespace
 
+Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Connection connection,
+                     const std::filesystem::path& grab_conf) {
+    Context ctx;
+    ctx.remote = server_conf::to_remote(settings.rclone_remote, connection, grab_known_hosts_path());
+    ctx.method = resolve_find_method(settings, ctx.remote);
+    ctx.grab_method = resolve_grab_method(settings, ctx.remote);
+    ctx.engine = effective_engine(settings);
+    ctx.config = std::move(config);
+    ctx.settings = std::move(settings);
+    ctx.connection = std::move(connection);
+    ctx.passwords = passwords::path_in(state_dir(grab_conf));
+    return ctx;
+}
+
 std::expected<Context, std::string> load_context(const std::filesystem::path& config_path,
-                                                 const std::optional<std::string>& remote_name) {
-    auto cfg = load_grab_config(config_path);
-    if (!cfg) return util::fail(cfg.error());
+                                                 const std::optional<std::string>& remote_name, bool import) {
+    // grab 0.19's servers move from rclone.conf into grab.conf once.
+    std::optional<std::expected<rclone_import::Result, std::string>> applied;
+    if (import) applied = rclone_import::apply(rclone_import::files_for(config_path));
+
+    auto doc = ini::parse_file(config_path);
+    if (!doc) return util::fail(doc.error());
+    auto cfg = parse_grab_config(*doc);
+    if (!cfg) return util::failf("{}: {}", util::path_to_utf8(config_path), cfg.error());
     auto selected = cfg->select(remote_name);
     if (!selected) return util::fail(selected.error());
     RemoteSettings settings = **selected;
-
-    // Move referenced remotes into grab's own rclone.conf the first time (idempotent).
-    auto imported = migrate_rclone_remotes(*cfg);
-    // grab's own rclone.conf keeps no secrets: they come from the encrypted store (secrets.hpp).
-    std::string secrets_error;
-    if (!cfg->rclone_config) {
-        if (auto ready = secrets::prepare(grab_rclone_config_path()); !ready) secrets_error = ready.error();
+    std::expected<std::optional<server_conf::Connection>, std::string> connection;
+    if (const auto* section = doc->find(settings.name)) connection = server_conf::parse(*section);
+    if (!connection) return util::failf("{}: {}", util::path_to_utf8(config_path), connection.error());
+    if (!*connection) {
+        // A section without details: what the import said about it, if it tried.
+        std::string why;
+        if (applied && !*applied) why = applied->error();
+        if (applied && *applied) {
+            for (const auto& note : (*applied)->notes) {
+                if (note.server == settings.name && note.text.starts_with("not imported")) why = note.text;
+            }
+        }
+        return util::failf("[{}] has no connection details (host, port, user, auth) in grab.conf{}. Add them with Edit "
+                           "in grab's Settings, or `grab server remove {}` and `grab server add {}`",
+                           settings.name, why.empty() ? std::string() : " (" + why + ")", settings.name, settings.name);
     }
 
     const auto exe_dir = util::self_exe_path().parent_path();
     cfg->rclone = resolve_rclone_exe(*cfg, exe_dir);
-    const Engine engine = effective_engine(settings);
     // Asked only where rclone runs: an engine = grab server loads with a missing or too old one
     // (--rclone asks for itself).
-    if (engine == Engine::rclone) {
+    if (effective_engine(settings) == Engine::rclone) {
         if (auto usable = check_rclone(cfg->rclone, exe_dir, cfg->rclone != "rclone"); !usable) {
             return util::fail(usable.error());
         }
     }
-    cfg->rclone_config = effective_rclone_config(*cfg); // where rclone_env reads the server
-    auto remote = load_rclone_remote(*cfg->rclone_config, settings.rclone_remote);
-    if (!remote) {
-        std::string msg = remote.error();
-        if (!imported.error.empty()) msg += std::format(" (import from rclone.conf failed: {})", imported.error);
-        msg += std::format(". Add the server with `grab server add`.");
-        return util::fail(msg);
+    Context ctx = make_context(std::move(*cfg), std::move(settings), std::move(**connection), config_path);
+    if (applied && !*applied) ctx.import_notes.push_back(applied->error());
+    if (applied && *applied) {
+        for (const auto& server : (*applied)->imported) ctx.imported.push_back(server.name);
+        for (const auto& note : (*applied)->notes) ctx.import_notes.push_back(std::format("[{}] {}", note.server, note.text));
     }
-
-    if (!secrets_error.empty() && !remote->key_use_agent && !remote->key_file) {
-        return util::fail(password_again(secrets_error, settings.name));
-    }
-    const FindMethod method = resolve_find_method(settings, *remote);
-    const GrabMethod grab_method = resolve_grab_method(settings, *remote);
-    return Context{.config = std::move(*cfg),
-                   .settings = std::move(settings),
-                   .remote = std::move(*remote),
-                   .method = method,
-                   .imported = std::move(imported.imported),
-                   .engine = engine,
-                   .grab_method = grab_method};
+    return ctx;
 }
 
-std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span<const std::string> extra) {
-    const auto& conf = ctx.config.rclone_config ? *ctx.config.rclone_config : grab_rclone_config_path();
-    secrets::Store store;
-    if (auto stored = secrets::load(secrets::path_beside(conf)); stored) store = std::move(*stored);
-    else return util::fail(stored.error());
-    // An rclone.conf that isn't grab's own keeps its secrets inside, as rclone writes them.
-    if (auto doc = ini::parse_file(conf); doc) {
-        if (const auto* section = doc->find(ctx.remote.name)) {
-            for (const auto& [key, value] : section->values) {
-                if (secrets::is_secret_key(key) && !util::trim(value).empty()) store[ctx.remote.name][key] = value;
-            }
-        }
+std::expected<void, std::string> check_pinned(const Context& ctx) {
+    const auto file = ctx.remote.known_hosts_file ? util::path_from_utf8(*ctx.remote.known_hosts_file)
+                                                  : grab_known_hosts_path();
+    auto text = util::read_file_if_exists(file);
+    if (!text) return util::failf("grab's known_hosts can't be read: {}", text.error());
+    if (server_conf::pinned(text->value_or(""), ctx.remote.host, ctx.remote.port)) return {};
+    return util::failf("{}: host key not trusted: use Trust (Settings → Trust in grab's window, or `grab server trust "
+                       "{}`), which shows the key's fingerprints to compare",
+                       ctx.settings.name, ctx.settings.name);
+}
+
+namespace {
+
+// grab's store of the context's server, when it has one that can be read; an error only for a
+// server that can't log in without it.
+std::expected<passwords::Store, std::string> server_secrets(const Context& ctx) {
+    if (ctx.passwords.empty()) return passwords::Store{};
+    auto store = passwords::load(ctx.passwords);
+    if (store) return store;
+    if (ctx.connection.auth == server_conf::Auth::password || ctx.connection.auth == server_conf::Auth::stored_key) {
+        return util::fail(password_again(store.error(), ctx.settings.name));
     }
-    auto target = ssh::target_for(ctx.remote, store, grab_known_hosts_path());
+    return passwords::Store{};
+}
+
+} // namespace
+
+std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span<const std::string> extra) {
+    if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
+    auto store = server_secrets(ctx);
+    if (!store) return util::fail(store.error());
+    const auto known_hosts = ctx.remote.known_hosts_file ? util::path_from_utf8(*ctx.remote.known_hosts_file)
+                                                         : grab_known_hosts_path();
+    auto target = ssh::target_for(ctx.settings.name, ctx.connection, *store, known_hosts);
     if (!target) return target;
     // --bind, --contimeout and --timeout reach grab's connections as they reached rclone's (G189).
     if (auto flags = ssh::apply_flags(*target, rclone_flags::connection(ctx.settings.common_flags)); !flags) {
@@ -197,64 +231,13 @@ bool option_name(std::string_view key) {
            std::ranges::all_of(key, [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; });
 }
 
-// The variable that holds the folder of the rclone.conf a server came from, for its own run.
-constexpr std::string_view config_dir_variable = "GRAB_RCLONE_CONFIG_DIR";
-
-// `value` (a key_file, pubkey_file or known_hosts_file) with ${RCLONE_CONFIG_DIR} and
-// $RCLONE_CONFIG_DIR as ${GRAB_RCLONE_CONFIG_DIR}, where rclone's os.ExpandEnv would find them:
-// with its config in memory rclone sets RCLONE_CONFIG_DIR to ".". The folder itself isn't pasted
-// in, since rclone expands the whole value and would expand a '$' in the folder's name again;
-// Go doesn't rescan what it substituted. The rest (other variables, a leading ~) rclone expands
-// as it would have.
-std::string with_config_dir(std::string_view value) {
-    constexpr std::string_view name = "RCLONE_CONFIG_DIR";
-    const auto special = [](char c) { return std::string_view("*#$@!?-0123456789").contains(c); };
-    const auto alnum = [](char c) {
-        return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    };
-    std::string out;
-    std::size_t i = 0;
-    while (i < value.size()) {
-        if (value[i] != '$' || i + 1 == value.size()) {
-            out += value[i++];
-            continue;
-        }
-        // Go's getShellName: the name after '$' and how many characters it takes.
-        const auto s = value.substr(i + 1);
-        std::string_view var;
-        std::size_t width = 0;
-        if (s.front() == '{') {
-            const auto close = s.find('}');
-            if (s.size() > 2 && special(s[1]) && s[2] == '}') {
-                var = s.substr(1, 1);
-                width = 3;
-            } else if (close == std::string_view::npos) {
-                width = 1;
-            } else {
-                var = s.substr(1, close - 1);
-                width = close + 1;
-            }
-        } else if (special(s.front())) {
-            var = s.substr(0, 1);
-            width = 1;
-        } else {
-            while (width < s.size() && alnum(s[width])) ++width;
-            var = s.substr(0, width);
-        }
-        // Windows finds a variable ignoring case.
-        const bool ours = std::ranges::equal(var, name, [](char a, char b) {
-            return std::toupper(static_cast<unsigned char>(a)) == std::toupper(static_cast<unsigned char>(b));
-        });
-        if (ours) {
-            out += "${";
-            out += config_dir_variable;
-            out += '}';
-        } else {
-            out += value.substr(i, 1 + width);
-        }
-        i += 1 + width;
-    }
-    return out;
+// The settings whose value rclone expands again (env.ShellExpand: a leading ~, then
+// os.ExpandEnv), and the variable a path with a '$' goes in for it.
+constexpr auto expanded_paths = std::to_array<std::string_view>({"key_file", "pubkey_file", "known_hosts_file"});
+std::string path_variable(std::string_view key) {
+    std::string name = "GRAB_RCLONE_";
+    for (const char c : key) name += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return name;
 }
 
 } // namespace
@@ -268,50 +251,90 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
                                ctx.settings.name, bad->flag, bad->what);
         }
     }
-    const auto conf = ctx.config.rclone_config ? *ctx.config.rclone_config : grab_rclone_config_path();
-    const std::string& remote = ctx.settings.rclone_remote;
-    // As rclone reads the file (rclone_conf.hpp): quotes off keys and values, %(key)s.
-    const auto text = util::read_file(conf);
-    if (!text) return util::fail(text.error());
-    if (is_encrypted_rclone_config(*text)) {
-        return util::failf("{} is encrypted, and grab can't read an encrypted rclone.conf", util::path_to_utf8(conf));
-    }
-    const auto doc = rclone_conf::parse(*text);
-    if (!doc) return util::failf("{}: {}", util::path_to_utf8(conf), doc.error());
-    const auto* section = doc->find(remote);
-    if (section == nullptr) return util::failf("{}: rclone remote '{}' not found", util::path_to_utf8(conf), remote);
+    if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
+    const auto& c = ctx.connection;
+    const std::string& name = ctx.settings.name;
+    auto store = server_secrets(ctx);
+    if (!store) return util::fail(store.error());
+    const passwords::Binding login{.user = c.user, .host = c.host, .port = c.port};
+    const auto saved = [&](std::string_view key) { return passwords::value_for(*store, name, key, login); };
+    // rclone takes a password and a passphrase only obscured.
+    const auto obscured = [&](std::string_view plain) -> std::expected<std::string, std::string> {
+        auto text = secrets::obscure(plain);
+        if (!text) return util::failf("{}: its password couldn't be prepared for rclone (no random numbers)", name);
+        return std::move(*text);
+    };
 
     std::map<std::string, std::string> values; // rclone's key -> value
-    if (auto stored = secrets::load(secrets::path_beside(conf)); !stored) {
-        if (!ctx.remote.key_use_agent && !ctx.remote.key_file) {
-            return util::fail(password_again(stored.error(), ctx.settings.name));
+    // The store's rclone extras and the section's rclone.<key> lines first: a key grab sets below
+    // wins over them.
+    if (const auto it = store->find(name); it != store->end()) {
+        for (const auto& [key, secret] : it->second) {
+            if (key.starts_with(passwords::rclone_prefix) && secret.binding == login) {
+                values[key.substr(passwords::rclone_prefix.size())] = secret.value;
+            }
         }
-    } else if (const auto it = stored->find(remote); it != stored->end()) {
-        values = it->second;
     }
-    // Then the section's own lines, its own secrets too (an rclone.conf that isn't grab's keeps
-    // them inside), as ssh_target reads them.
-    bool config_dir = false; // some path names the file's folder
-    for (const auto& key : section->keys) {
-        // Its own keys only: a dotted name's parent's aren't this server's (G86).
-        auto found = rclone_conf::get(*doc, remote, key, false);
-        if (!found) return util::failf("{}: {}", util::path_to_utf8(conf), found.error());
-        if (!*found) continue; // blank: rclone takes it as not set
-        const std::string& value = (*found)->text;
-        const bool path = key == "key_file" || key == "pubkey_file" || key == "known_hosts_file";
-        values[key] = path ? with_config_dir(value) : value;
-        config_dir = config_dir || (path && values[key] != value);
+    for (const auto& [key, value] : c.rclone) values[key] = value;
+    values["type"] = "sftp";
+    values["host"] = c.host;
+    values["port"] = std::to_string(c.port);
+    values["user"] = c.user;
+    switch (c.auth) {
+    case server_conf::Auth::agent:
+        values["key_use_agent"] = "true";
+        if (c.key_file) values["key_file"] = *c.key_file; // rclone then asks the agent for that key alone
+        break;
+    case server_conf::Auth::key:
+        if (c.key_file) values["key_file"] = *c.key_file;
+        if (const auto pass = saved(passwords::passphrase)) {
+            auto text = obscured(*pass);
+            if (!text) return util::fail(text.error());
+            values["key_file_pass"] = std::move(*text);
+        }
+        break;
+    case server_conf::Auth::password:
+        if (!saved(passwords::password)) {
+            return util::failf("{}: {}", name, passwords::why_none(*store, name, passwords::password, login));
+        }
+        break;
+    case server_conf::Auth::stored_key: {
+        const auto pem = saved(passwords::key_pem);
+        if (!pem) return util::failf("{}: {}", name, passwords::why_none(*store, name, passwords::key_pem, login));
+        values["key_pem"] = *pem;
+        break;
     }
+    }
+    // A password, also one saved beside a key, which rclone tries after it.
+    if (const auto password = saved(passwords::password)) {
+        auto text = obscured(*password);
+        if (!text) return util::fail(text.error());
+        values["pass"] = std::move(*text);
+    }
+    values["known_hosts_file"] = ctx.remote.known_hosts_file.value_or(util::path_to_utf8(grab_known_hosts_path()));
+    // What rclone would otherwise ask the server on every run (RCLONE-REPLACEMENT.md, phase 7
+    // chunk A: 0.1 s for the shell, 0.6 s for the sum commands on Main). The --rclone copy leaves
+    // what grab.conf doesn't know to rclone: its --verify turns rclone's hash check on, and with
+    // "none" rclone would compare sizes only and say nothing (most imported servers never had the
+    // sum commands saved, since grab's flags kept the hash check off). With the check off rclone
+    // asks nothing anyway.
+    for (const auto& [key, known] : {std::pair{"shell_type", &c.shell_type}, std::pair{"md5sum_command", &c.md5sum_command},
+                                     std::pair{"sha1sum_command", &c.sha1sum_command}}) {
+        if (known->has_value()) values[key] = **known;
+        else if (!user_copy) values[key] = "none";
+    }
+    if (c.path_override) values["path_override"] = *c.path_override;
 
     proc::Environment env;
-    env.without_prefix.push_back(secrets::env_prefix(remote));
+    env.without_prefix.push_back(secrets::env_prefix(ctx.settings.rclone_remote));
     for (auto& [key, value] : values) {
-        if (option_name(key)) env.set.emplace_back(secrets::env_name(remote, key), std::move(value));
-    }
-    if (config_dir) {
-        std::string dir = util::path_to_utf8(conf.parent_path());
-        if (dir.empty()) dir = "."; // Go's filepath.Dir of a bare file name
-        env.set.emplace_back(config_dir_variable, std::move(dir));
+        if (!option_name(key)) continue;
+        if (std::ranges::find(expanded_paths, key) != expanded_paths.end() && value.contains('$')) {
+            const auto variable = path_variable(key);
+            env.set.emplace_back(variable, std::move(value));
+            value = "${" + variable + "}";
+        }
+        env.set.emplace_back(secrets::env_name(ctx.settings.rclone_remote, key), std::move(value));
     }
     return env;
 }
@@ -623,6 +646,7 @@ std::vector<std::string> search_roots(const Context& ctx) {
 
 std::expected<std::string, std::string> run_over_ssh(const Context& ctx, const std::string& command, bool batch_ssh,
                                                      const proc::RunOptions& run, const CommandHook& on_command) {
+    if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
     std::vector<std::string> ssh_options = ctx.settings.ssh_options;
     if (batch_ssh) ssh_options.insert(ssh_options.end(), {"-o", "BatchMode=yes"});
     const auto argv = build_ssh_argv(ctx.config.ssh, ctx.remote, ssh_options, command);

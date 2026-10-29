@@ -1,25 +1,22 @@
 #pragma once
 
 // Building blocks for `grab server add | list | trust | remove` (and the GUI's settings):
-// rclone command lines, host-key handling, and in-place edits of grab.conf text. Pure
-// functions; the dialogue lives in main.cpp.
+// rclone's probe command line, host-key handling, and in-place edits of grab.conf text. Pure
+// functions; the dialogue lives in server_cli.cpp.
 
-#include "config.hpp"
+#include "server_conf.hpp"
 
-#include <filesystem>
+#include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace grab::servers {
 
-enum class Auth {
-    password, // rclone `pass`; searched with rclone lsf
-    key_file, // rclone `key_file` (+ optional `key_file_pass`); searched with ssh + find
-    agent     // rclone `key_use_agent`; searched with ssh + find
-};
+// How a server logs in, as its grab.conf section says (`auth`).
+using Auth = server_conf::Auth;
 
 struct NewServer {
     std::string name;
@@ -27,7 +24,7 @@ struct NewServer {
     int port = 22;
     std::string user;
     Auth auth = Auth::password;
-    std::string key_file;                  // Auth::key_file
+    std::string key_file;                  // Auth::key
     std::vector<std::string> search_roots; // blank = login home
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
@@ -35,9 +32,6 @@ struct NewServer {
 
 // nullopt when usable as both a grab.conf section and an rclone remote name, else why not.
 [[nodiscard]] std::optional<std::string> validate_name(std::string_view name);
-
-// The RcloneRemote the new server will be, for describe_remote/remote_section.
-[[nodiscard]] RcloneRemote to_remote(const NewServer& s, const std::filesystem::path& known_hosts);
 
 // ---- host keys ---------------------------------------------------------------------------
 // Scanned by ssh::scan_host_keys (grab's own client, for every server); grab's known_hosts holds
@@ -66,32 +60,8 @@ struct Fingerprint {
 [[nodiscard]] std::string merge_known_hosts(std::string_view existing, const std::vector<std::string>& lines);
 
 // ---- rclone command lines ----------------------------------------------------------------
-
-// `rclone obscure -`: reads the secret from stdin, prints the obscured form.
-[[nodiscard]] std::vector<std::string> obscure_argv(const std::string& rclone);
-
-// `rclone config create NAME sftp ... --no-obscure --non-interactive --config FILE`.
-// `obscured_secret` is the password (Auth::password) or key passphrase (Auth::key_file),
-// already obscured, so no plaintext secret is ever on a command line.
-[[nodiscard]] std::vector<std::string> create_argv(const std::string& rclone,
-                                                   const std::filesystem::path& config,
-                                                   const NewServer& s,
-                                                   const std::optional<std::string>& obscured_secret,
-                                                   const std::filesystem::path& known_hosts);
-
-[[nodiscard]] std::vector<std::string> update_argv(const std::string& rclone,
-                                                   const std::filesystem::path& config,
-                                                   const std::string& name, const std::string& key,
-                                                   const std::string& value);
-// Several keys in one run; an empty value blanks the key.
-[[nodiscard]] std::vector<std::string> update_argv(const std::string& rclone,
-                                                   const std::filesystem::path& config,
-                                                   const std::string& name,
-                                                   const std::vector<std::pair<std::string, std::string>>& values);
-
-[[nodiscard]] std::vector<std::string> delete_argv(const std::string& rclone,
-                                                   const std::filesystem::path& config,
-                                                   const std::string& name);
+// grab writes no rclone.conf (RCLONE-REPLACEMENT.md, phase 7): servers are added, changed and
+// removed in grab.conf and grab's store, never with `rclone config` or `rclone obscure` (G12, G27).
 
 // A quick connection test: list the login home's folders once, with short timeouts. The server
 // comes in the run's environment (engine::rclone_env), its config in memory.
@@ -99,14 +69,21 @@ struct Fingerprint {
 
 // ---- grab.conf text edits (everything else, comments included, is kept) -------------------
 
-// Removes [section] and its lines, plus grab's generated comment line right above it.
+// Removes [section] and its lines, plus grab's generated comment line right above it; every block
+// of that name, as ini::parse merges them.
 [[nodiscard]] std::string remove_section(std::string_view text, std::string_view section);
 // Appends `section_text` after one blank line.
 [[nodiscard]] std::string append_section(std::string_view text, std::string_view section_text);
-// Sets key = value in [section], replacing an existing line or adding one after the header;
-// adds the section at the top when missing.
-[[nodiscard]] std::string set_value(std::string_view text, std::string_view section,
-                                    std::string_view key, std::string_view value);
+// Sets key = value in [section], replacing an existing line or adding one after the header (or
+// after the last line of a key in `after` the section has, to keep keys in order); adds the
+// section at the top when missing. As ini::parse reads repeats (the last wins), a key set twice,
+// or a section in more than one block, has its last line replaced and the earlier ones removed,
+// and a new key goes in the last block. Refused when the section, key or value holds a line break or
+// another control character (server_conf::check_value, review G28): it would start a line of its
+// own.
+[[nodiscard]] std::expected<std::string, std::string> set_value(std::string_view text, std::string_view section,
+                                                                std::string_view key, std::string_view value,
+                                                                std::span<const std::string_view> after = {});
 // Replaces grab's generated comment line right above [section] ("# rclone remote [...]: ...")
 // with `comment`; text without that line is returned unchanged.
 [[nodiscard]] std::string replace_lead_in(std::string_view text, std::string_view section,

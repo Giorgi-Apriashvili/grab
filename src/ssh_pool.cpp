@@ -460,4 +460,20 @@ void Pools::forget_login_failure(const std::string& server) {
     if (const auto it = pools_.find(server); it != pools_.end() && it->second.pool) it->second.pool->forget_login_failure();
 }
 
+void Pools::forget(const std::string& server) {
+    std::shared_ptr<Pool> pool;
+    {
+        std::scoped_lock lock(mutex_);
+        const auto it = pools_.find(server);
+        if (it == pools_.end()) return;
+        pool = std::move(it->second.pool);
+        pools_.erase(it);
+    }
+    if (!pool) return;
+    pool->trim_idle(0);
+    pool->forget_find_check();
+    pool->set_hash_check(std::nullopt);
+    pool->forget_login_failure();
+}
+
 } // namespace grab::ssh

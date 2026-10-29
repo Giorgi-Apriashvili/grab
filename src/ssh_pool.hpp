@@ -359,6 +359,11 @@ public:
     // The server's pool (if any) forgets the login that failed for previews and Play
     // (Pool::acquire_remembered): after a Test that logged in, Trust, or the server saved.
     void forget_login_failure(const std::string& server);
+    // A server removed (or changed to another address): its pool's idle connections close, its
+    // find and hash answers and a failed login go, and it leaves the program's pools, so that a
+    // server added under the name later gets a pool of its own. Downloads still on it keep it
+    // until they end.
+    void forget(const std::string& server);
 
 private:
     struct Entry {

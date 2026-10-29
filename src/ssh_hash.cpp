@@ -19,6 +19,7 @@ namespace grab::ssh {
 namespace {
 
 constexpr std::string_view md5_of_nothing = "d41d8cd98f00b204e9800998ecf8427e";
+constexpr std::string_view sha1_of_nothing = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
 constexpr std::size_t md5_digits = 32;
 
 // A probe on `session`, its stdout in `out` (a few records' worth at most).
@@ -239,22 +240,79 @@ std::optional<HashFailed> hash_blocked(const RcloneRemote& remote) {
         const std::string shell = util::to_lower(*remote.shell_type);
         if (shell == "cmd" || shell == "powershell" || shell == "none") {
             return HashFailed{.kind = HashFailure::no_checksums,
-                              .why = std::format("the server can't compute checksums (shell_type = {} in rclone.conf)", shell)};
+                              .why = std::format("the server can't compute checksums (shell_type = {} in grab.conf)", shell)};
         }
     }
     if (remote.md5sum_command && util::to_lower(*remote.md5sum_command) == "none") {
         return HashFailed{.kind = HashFailure::no_checksums,
-                          .why = "the server can't compute checksums (md5sum_command = none in rclone.conf)"};
+                          .why = "the server can't compute checksums (md5sum_command = none in grab.conf)"};
     }
     if (remote.md5sum_command && *remote.md5sum_command != "md5sum") {
         return HashFailed{.kind = HashFailure::unsupported,
-                          .why = "md5sum_command in rclone.conf isn't supported by grab's check yet"};
+                          .why = "md5sum_command in grab.conf isn't supported by grab's check yet"};
     }
     if (remote.path_override) {
         return HashFailed{.kind = HashFailure::unsupported,
-                          .why = "path_override in rclone.conf isn't supported by grab's check yet"};
+                          .why = "path_override in grab.conf isn't supported by grab's check yet"};
     }
     return std::nullopt;
+}
+
+std::optional<std::string> read_shell_answer(const std::expected<ExecResult, ExecError>& ran, std::string_view out) {
+    if (!ran || !ran->signal.empty() || ran->status < 0 || ran->status >= 128) return std::nullopt;
+    if (ran->status != 0) return "none"; // a shell that runs no such command
+    const std::string said = util::to_lower(util::trim(out));
+    if (said.starts_with("microsoft.powershell")) return "powershell";
+    // cmd: "${ShellId}C:\Windows\system32\cmd.exe". Only with the program in it, as rclone checks,
+    // so an unforeseen POSIX shell's answer isn't taken for cmd.
+    if (!said.ends_with("%comspec%") && (said.contains(".exe") || said.contains(".com"))) return "cmd";
+    return "unix";
+}
+
+std::optional<bool> read_sum_answer(const std::expected<ExecResult, ExecError>& ran, std::string_view out,
+                                    std::string_view empty_sum) {
+    if (!ran || !ran->signal.empty() || ran->status < 0 || ran->status >= 128) return std::nullopt;
+    if (ran->status != 0) return false;
+    std::string_view said = util::trim(out);
+    while (said.starts_with('\\')) said.remove_prefix(1);
+    return util::to_lower(said.substr(0, said.find(' '))) == empty_sum;
+}
+
+ServerCommands learn_commands(Pool& pool, const ServerCommands& known, std::stop_token stop, Retry retry) {
+    ServerCommands out = known;
+    const auto done = [&] { return out.shell_type && (*out.shell_type == "none" || (out.md5sum_command && out.sha1sum_command)); };
+    if (done()) return out;
+    std::optional<Pool::Lease> lease;
+    try {
+        lease = pool.acquire(stop, retry);
+    } catch (const Error&) {
+        return out; // the login's failure is the caller's to tell
+    }
+    if (!lease) return out;
+    std::string said;
+    try {
+        if (!out.shell_type) {
+            const auto ran = run_probe(**lease, shell_probe, stop, said); // before `said` is read
+            out.shell_type = read_shell_answer(ran, said);
+            if (!out.shell_type) return out;
+        }
+        if (done()) return out;
+        const auto first_working = [&](std::span<const std::string_view> commands,
+                                       std::string_view empty_sum) -> std::optional<std::string> {
+            for (const auto command : commands) {
+                const auto ran = run_probe(**lease, command, stop, said);
+                const auto works = read_sum_answer(ran, said, empty_sum);
+                if (!works) return std::nullopt;
+                if (*works) return std::string(command);
+            }
+            return "none";
+        };
+        if (!out.md5sum_command) out.md5sum_command = first_working(md5_commands, md5_of_nothing);
+        if (!out.sha1sum_command) out.sha1sum_command = first_working(sha1_commands, sha1_of_nothing);
+    } catch (const Error&) {
+        lease->broken();
+    }
+    return out;
 }
 
 std::string absolute_path(std::string_view home, std::string_view raw) {

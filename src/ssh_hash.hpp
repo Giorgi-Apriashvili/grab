@@ -24,6 +24,7 @@
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -70,11 +71,49 @@ using HashResult = std::expected<std::string, HashFailed>;
 // checksums (its answer to ... was ...)"), as run_hashes gives it for each.
 [[nodiscard]] HashFailed hash_check_failed(const HashCheck& check);
 
-// Whether the keys rclone saved for the server in rclone.conf keep grab's check from it, without
-// running anything: shell_type cmd, powershell or none, or md5sum_command none (rclone found no
-// way to hash there); another md5sum_command or any path_override (not supported by grab's check
-// yet). nullopt when the check may run.
+// Whether the keys grab.conf holds for the server (what rclone or grab found there, below) keep
+// grab's check from it, without running anything: shell_type cmd, powershell or none, or
+// md5sum_command none (no way to hash there); another md5sum_command or any path_override (not
+// supported by grab's check yet). nullopt when the check may run.
 [[nodiscard]] std::optional<HashFailed> hash_blocked(const RcloneRemote& remote);
+
+// ---- what rclone asks a server once ------------------------------------------------------------
+// rclone finds out an SFTP server's shell and its MD5 and SHA-1 commands on its first run and
+// saves them in rclone.conf; with a server given in its environment it can't save them, and asks
+// on every run (0.1 s and 0.6 s on Main; RCLONE-REPLACEMENT.md, phase 7 chunk A). grab asks them
+// the same way over its own client when a server is tested (and so added), keeps them in
+// grab.conf, and gives them to rclone (engine::rclone_env).
+
+struct ServerCommands {
+    std::optional<std::string> shell_type; // "unix", "cmd", "powershell", "none"
+    std::optional<std::string> md5sum_command; // "md5sum", "md5 -r", "rclone md5sum" or "none"
+    std::optional<std::string> sha1sum_command;
+    bool operator==(const ServerCommands&) const = default;
+};
+
+// rclone's shell probe: a POSIX shell expands ${ShellId} to nothing and keeps %ComSpec%, cmd
+// expands %ComSpec% to its program, PowerShell $ShellId to "Microsoft.PowerShell".
+inline constexpr std::string_view shell_probe = "echo ${ShellId}%ComSpec%";
+// rclone's commands for each sum, tried in order with empty stdin.
+inline constexpr std::array<std::string_view, 3> md5_commands = {"md5sum", "md5 -r", "rclone md5sum"};
+inline constexpr std::array<std::string_view, 3> sha1_commands = {"sha1sum", "sha1 -r", "rclone sha1sum"};
+
+// The shell, from the probe's run (`out`: its stdout), as rclone reads it: "powershell", "cmd"
+// (an answer naming a .exe or .com program), else "unix"; "none" where the command ran and failed
+// (exit 1-127), as rclone says. nullopt where nothing lasting was learned: refused (perhaps only
+// beside SFTP), stopped, no answer in time, ended by a signal.
+[[nodiscard]] std::optional<std::string> read_shell_answer(const std::expected<ExecResult, ExecError>& ran,
+                                                           std::string_view out);
+// Whether a sum command's run gave `empty_sum`, the sum of nothing, as rclone reads it (a leading
+// '\' off, the first word, lower case); false when it ran and failed; nullopt as above.
+[[nodiscard]] std::optional<bool> read_sum_answer(const std::expected<ExecResult, ExecError>& ran, std::string_view out,
+                                                  std::string_view empty_sum);
+// What `known` doesn't say, asked on one of the pool's connections: the shell, then (unless it is
+// "none", where rclone runs nothing) each sum's commands until one works ("none" when none does).
+// What can't be learned now (a failed login, a lost connection, an unclear answer) stays unknown;
+// grab never guesses. The caller holds none of the pool's leases.
+[[nodiscard]] ServerCommands learn_commands(Pool& pool, const ServerCommands& known, std::stop_token stop,
+                                            Retry retry = std::nullopt);
 
 // A raw path (from the login folder, or absolute) as md5sum gets it: absolute, after `home`.
 [[nodiscard]] std::string absolute_path(std::string_view home, std::string_view raw);

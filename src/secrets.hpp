@@ -1,11 +1,11 @@
 #pragma once
 
-// Server secrets kept out of grab's rclone.conf. rclone stores passwords there only "obscured",
-// which anyone who can read the file can reverse. grab keeps them instead in a file encrypted for
-// the current Windows user (DPAPI, util::protect_for_user) and hands a server's to the rclone
-// process for that server alone, in that process's environment (RCLONE_CONFIG_<REMOTE>_<KEY>,
-// which rclone reads like config values; engine::rclone_env), so they are never on disk
-// unencrypted, on a command line or in grab's own environment.
+// The 'secrets' store of grab 0.19 and before: server secrets kept out of grab's rclone.conf, in
+// rclone's obscured form (which anyone who can read it can reverse) inside a file encrypted for
+// the current Windows user (DPAPI, util::protect_for_user). Since phase 7 (RCLONE-REPLACEMENT.md)
+// grab only reads it, to import its servers (rclone_import.hpp) into grab's own store
+// (passwords.hpp); 0.19 still uses it. Also rclone's naming of a remote's variables and its
+// obscuring, for each rclone run's environment (engine::rclone_env).
 
 #include <expected>
 #include <filesystem>
@@ -33,17 +33,8 @@ using Store = std::map<std::string, std::map<std::string, std::string>>;
 // error, and the store on disk is then left alone.
 [[nodiscard]] std::expected<Store, std::string> load(const std::filesystem::path& file);
 
-// The store about to be changed. One that was read but can't be decrypted or parsed (another
-// Windows user's, damaged, or DPAPI failing for now, as after a domain password reset) is moved
-// aside to "<file>.unreadable-<time>" and the change starts from an empty store, its passwords
-// kept should they become readable again; `set_aside` then names that file (review G211). A file
-// that can't be read at all is an error: the change has to wait rather than replace it.
-struct ForChange {
-    Store store;
-    std::optional<std::filesystem::path> set_aside;
-};
-[[nodiscard]] std::expected<ForChange, std::string> load_for_change(const std::filesystem::path& file);
-// Encrypted, and replaced in one step (util::write_file_atomic).
+// Encrypted, and replaced in one step (util::write_file_atomic). grab itself never writes the
+// store any more (RCLONE-REPLACEMENT.md, phase 7): its passwords are in passwords.hpp's.
 [[nodiscard]] std::expected<void, std::string> save(const std::filesystem::path& file, const Store& store);
 
 // The environment variable rclone reads for `key` of `remote`, as rclone's ConfigToEnv names it:
@@ -73,10 +64,5 @@ struct Taken {
     Store found;
 };
 [[nodiscard]] Taken take_secrets(std::string_view rclone_text);
-
-// For grab's own rclone.conf, before running rclone: moves any secrets still in it into the store
-// (saved and read back before the file loses them). Returns why the store could not be read, if
-// it couldn't; servers with passwords then can't log in.
-[[nodiscard]] std::expected<void, std::string> prepare(const std::filesystem::path& rclone_conf);
 
 } // namespace grab::secrets

@@ -2,6 +2,8 @@
 #include "file_list.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
+#include "passwords.hpp"
+#include "rclone_import.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -370,41 +372,32 @@ TEST_CASE("resolve_rclone_exe: bundled next to grab, else PATH, explicit path wi
     fs::remove_all(dir);
 }
 
-TEST_CASE("import_rclone_remotes copies referenced sections verbatim, once, never touching the source") {
-    namespace fs = std::filesystem;
-    const auto dir = fs::temp_directory_path() / "grab_test_import";
-    fs::remove_all(dir);
-    fs::create_directories(dir);
-    const auto from = dir / "standard.conf";
-    const auto to = dir / "grab" / "rclone.conf";
-    const std::string standard = "[hetzner]\ntype = sftp\nhost = 203.0.113.10\nuser = alice\n"
-                                 "key_file_pass = OBSCURED+/==\n\n[other]\ntype = drive\n";
-    std::ofstream(from, std::ios::binary) << standard;
-
-    auto r = import_rclone_remotes({"hetzner", "missing"}, from, to);
-    CHECK(r.error.empty());
-    CHECK(r.imported == std::vector<std::string>{"hetzner"});
-    CHECK(r.not_found == std::vector<std::string>{"missing"});
-    auto copied = ini::parse(*util::read_file(to));
-    REQUIRE(copied.has_value());
-    REQUIRE(copied->find("hetzner") != nullptr);
-    CHECK(copied->find("hetzner")->get("key_file_pass") == "OBSCURED+/=="); // verbatim
-    CHECK(copied->find("other") == nullptr);                               // not referenced
-    CHECK(*util::read_file(from) == standard);                             // source untouched
-
-    // Idempotent: nothing more to copy, file unchanged.
-    const auto before = *util::read_file(to);
-    auto again = import_rclone_remotes({"hetzner"}, from, to);
-    CHECK(again.imported.empty());
-    CHECK(*util::read_file(to) == before);
-
-    // A later, second remote is appended without disturbing the first.
-    std::ofstream(from, std::ios::app | std::ios::binary) << "[box]\ntype = sftp\nhost = h\nuser = u\n";
-    auto more = import_rclone_remotes({"hetzner", "box"}, from, to);
-    CHECK(more.imported == std::vector<std::string>{"box"});
-    auto both = ini::parse(*util::read_file(to));
-    CHECK(both->section_names() == std::vector<std::string>{"hetzner", "box"});
-    fs::remove_all(dir);
+TEST_CASE("the tests' settings are a scratch folder's: grab's files never resolve to the real ones") {
+    // test_main.cpp points APPDATA, LOCALAPPDATA, HOME and USERPROFILE at a folder of this run
+    // and clears RCLONE_CONFIG and GRAB_CONFIG before any test: every default path grab writes to
+    // lands there (phase 7: the import writes grab.conf, the store, known_hosts, imported.json).
+    const auto scratch = std::filesystem::temp_directory_path().lexically_normal();
+    const auto inside = [&](const std::filesystem::path& p) {
+        const auto text = util::to_lower(util::path_to_utf8(p.lexically_normal()));
+        return text.starts_with(util::to_lower(util::path_to_utf8(scratch))) && text.find("grab-tests-home-") != std::string::npos;
+    };
+    CHECK(inside(util::config_home()));
+    CHECK(inside(util::local_data_home()));
+    CHECK(inside(default_grab_config_path()));
+    CHECK(inside(grab_rclone_config_path()));
+    CHECK(inside(grab_known_hosts_path()));
+    CHECK(inside(standard_rclone_config_path()));
+    CHECK(inside(state_dir(default_grab_config_path())));
+    CHECK(inside(passwords::path_in(state_dir(default_grab_config_path()))));
+    CHECK(inside(rclone_import::record_path(state_dir(default_grab_config_path()))));
+    CHECK(inside(file_list::default_dir()));
+    for (const char* name : {"HOME", "USERPROFILE"}) {
+        const auto value = util::getenv_utf8(name);
+        REQUIRE(value.has_value());
+        CHECK(inside(util::path_from_utf8(*value)));
+    }
+    CHECK_FALSE(util::getenv_utf8("RCLONE_CONFIG").has_value());
+    CHECK_FALSE(util::getenv_utf8("GRAB_CONFIG").has_value());
 }
 
 TEST_CASE("agent remotes are searched over ssh") {

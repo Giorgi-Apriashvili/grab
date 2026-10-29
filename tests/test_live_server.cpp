@@ -8,7 +8,7 @@
 //
 //   GRAB_TEST_SERVER   the server's name in grab.conf
 //   GRAB_TEST_APPDATA  the %APPDATA% the programs use (the runner points APPDATA at a scratch
-//                      folder, test_main.cpp); grab.conf there, or where GRAB_CONFIG says
+//                      folder, test_main.cpp); grab.conf there, or where GRAB_TEST_CONFIG says
 //   GRAB_TEST_FOLDER   a folder to walk, twice: 32 and 64 folders in flight per connection
 //                      (optional; GRAB_TEST_DEPTH its depth, 0 or unset: all)
 //   GRAB_TEST_SILENT   a command that says nothing for several seconds, for the keepalive check;
@@ -71,13 +71,18 @@
 #include "fake_command.hpp"
 #include "fake_sftp.hpp"
 #include "ini.hpp"
+#include "passwords.hpp"
 #include "preview.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
+#include "rclone_flags.hpp"
+#include "rclone_import.hpp"
+#include "server_conf.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_find.hpp"
 #include "ssh_pool.hpp"
+#include "ssh_target.hpp"
 #include "ssh_walk.hpp"
 #include "util.hpp"
 
@@ -182,24 +187,53 @@ private:
 };
 #endif
 
-// The server as the programs load it, read only: engine::load_context would also import remotes
-// into grab's rclone.conf and move secrets into the store when there are any, and needs rclone.exe.
+// The import's store for a server read through its pure function (read_context), else none.
+std::optional<passwords::Store> planned_store;
+
+// The server as the programs load it, read only: engine::load_context would also run the import
+// from rclone.conf (writing grab.conf, the store and known_hosts) and needs rclone.exe. A section
+// without connection details is read as the import would fill it in (rclone_import's pure
+// function over the files as they are; nothing written). grab.conf: GRAB_TEST_CONFIG, else the
+// one in GRAB_TEST_APPDATA (the runner clears GRAB_CONFIG, test_main.cpp).
 std::expected<engine::Context, std::string> read_context(const std::string& name) {
-    auto cfg = load_grab_config(default_grab_config_path());
+    const auto conf = util::getenv_utf8("GRAB_TEST_CONFIG") ? util::path_from_utf8(*util::getenv_utf8("GRAB_TEST_CONFIG"))
+                                                            : default_grab_config_path();
+    auto doc = ini::parse_file(conf);
+    if (!doc) return std::unexpected(doc.error());
+    auto cfg = parse_grab_config(*doc);
     if (!cfg) return std::unexpected(cfg.error());
     auto selected = cfg->select(name);
     if (!selected) return std::unexpected(selected.error());
-    engine::Context ctx;
-    ctx.settings = **selected;
-    ctx.config = std::move(*cfg);
-    ctx.config.rclone_config = effective_rclone_config(ctx.config);
-    auto remote = load_rclone_remote(*ctx.config.rclone_config, ctx.settings.rclone_remote);
-    if (!remote) return std::unexpected(remote.error());
-    ctx.remote = std::move(*remote);
-    ctx.method = resolve_find_method(ctx.settings, ctx.remote);
+    const RemoteSettings settings = **selected;
+    auto connection = server_conf::parse(*doc->find(settings.name));
+    if (!connection) return std::unexpected(connection.error());
+    planned_store.reset();
+    if (!*connection) {
+        auto in = rclone_import::read_inputs(rclone_import::files_for(conf));
+        if (!in) return std::unexpected(in.error());
+        auto plan = rclone_import::plan(*in);
+        if (!plan) return std::unexpected(plan.error());
+        const auto found = std::ranges::find(plan->imported, settings.name, &rclone_import::Imported::name);
+        if (found == plan->imported.end()) return std::unexpected(std::string("the import wouldn't fill it in"));
+        *connection = found->connection;
+        planned_store = std::move(plan->store);
+    }
+    auto ctx = engine::make_context(std::move(*cfg), settings, std::move(**connection), conf);
     ctx.engine = Engine::grab;
-    ctx.grab_method = resolve_grab_method(ctx.settings, ctx.remote);
     return ctx;
+}
+
+// grab's target for the server read_context read: engine::ssh_target's, or with the store the
+// import's pure function planned for it.
+std::expected<ssh::Target, std::string> live_target(const engine::Context& ctx) {
+    if (!planned_store) return engine::ssh_target(ctx);
+    auto target = ssh::target_for(ctx.settings.name, ctx.connection, *planned_store,
+                                  util::path_from_utf8(ctx.remote.known_hosts_file.value_or("")));
+    if (!target) return target;
+    if (auto flags = ssh::apply_flags(*target, rclone_flags::connection(ctx.settings.common_flags)); !flags) {
+        return std::unexpected(flags.error());
+    }
+    return target;
 }
 
 // A command's run, for the log: what exec gave, the start of stdout, how long it took, or how the
@@ -615,7 +649,7 @@ TEST_CASE("live server: what it answers grab's own client, printed only (GRAB_TE
 #endif
     auto ctx = read_context(*name);
     REQUIRE_MESSAGE(ctx, ctx.error_or(""));
-    auto target = engine::ssh_target(*ctx);
+    auto target = live_target(*ctx);
     REQUIRE_MESSAGE(target, target.error_or(""));
     const auto& t = *target;
     const char* method = ctx->grab_method == GrabMethod::walk   ? "walk"
@@ -795,7 +829,7 @@ TEST_CASE("live server: md5sum through grab's own client, printed only (GRAB_TES
     };
     auto ctx = read_context(*name);
     REQUIRE_MESSAGE(ctx, ctx.error_or(""));
-    auto target = engine::ssh_target(*ctx);
+    auto target = live_target(*ctx);
     REQUIRE_MESSAGE(target, target.error_or(""));
     const auto& t = *target;
     say(std::format("md5sum checks on {} = {}@{}:{} ({})", *name, t.user, t.host, t.port, *parts));
@@ -836,17 +870,14 @@ TEST_CASE("live server: md5sum through grab's own client, printed only (GRAB_TES
     const std::string md5sum = z ? "md5sum -z " : "md5sum ";
 
     if (wanted("probe")) {
-        // The rclone.conf keys rclone saves for an SFTP remote's commands.
-        if (ctx->config.rclone_config) {
-            const auto doc = ini::parse_file(*ctx->config.rclone_config);
-            const ini::Section* section = doc ? doc->find(ctx->settings.rclone_remote) : nullptr;
-            const auto key = [&](std::string_view k) {
-                const auto v = section ? section->get(k) : std::nullopt;
-                return std::format("{} = {}", k, v ? "\"" + *v + "\"" : "(not set)");
-            };
-            say(std::format("rclone.conf [{}]: {}, {}, {}, {}", ctx->settings.rclone_remote, key("shell_type"),
-                            key("md5sum_command"), key("sha1sum_command"), key("path_override")));
-        }
+        // The keys rclone saved for an SFTP remote's commands, as grab.conf (or the import) has them.
+        const auto key = [](std::string_view k, const std::optional<std::string>& v) {
+            return std::format("{} = {}", k, v ? "\"" + *v + "\"" : "(not set)");
+        };
+        const auto& c = ctx->connection;
+        say(std::format("grab.conf [{}]: {}, {}, {}, {}", ctx->settings.name, key("shell_type", c.shell_type),
+                        key("md5sum_command", c.md5sum_command), key("sha1sum_command", c.sha1sum_command),
+                        key("path_override", c.path_override)));
         say("raw answers (stdin empty):");
         for (const std::string_view command :
              {"help", "md5sum --version", "sha256sum --version", "md5sum -z ''\\-", "md5sum ''\\-", "md5sum -z \\-",
@@ -1563,7 +1594,7 @@ TEST_CASE("live server: Play's reads through grab's own client, printed only (GR
     };
     auto ctx = read_context(*name);
     REQUIRE_MESSAGE(ctx, ctx.error_or(""));
-    auto target = engine::ssh_target(*ctx);
+    auto target = live_target(*ctx);
     REQUIRE_MESSAGE(target, target.error_or(""));
     const auto& t = *target;
     const bool box = budget::is_storage_box(t.host);

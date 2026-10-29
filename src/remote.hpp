@@ -47,10 +47,16 @@ struct FindRequest {
 // is %T@, Unix seconds with a fraction.
 [[nodiscard]] std::string build_find_command(const FindRequest& req);
 
+// A file for an ssh -o option such as UserKnownHostsFile, as ssh reads it back (review G1): in
+// double quotes (a space would end it), '\' as '/' on Windows (ssh takes a backslash for an
+// escape) and '%' doubled (ssh expands %d, %u and the like there).
+[[nodiscard]] std::string ssh_file_value(std::string_view path);
+
 // ssh argv: options first, then user@host, then the remote command as one argument. With a
 // known_hosts_file the host key must be in it (StrictHostKeyChecking=yes), only it is read
 // (GlobalKnownHostsFile=NUL) and ssh never adds keys to it (UpdateHostKeys=no, whatever
-// ~/.ssh/config says), before `ssh_options` so these come first (review G4).
+// ~/.ssh/config says), before `ssh_options` so these come first (review G4). The file goes in as
+// ssh_file_value writes it.
 [[nodiscard]] std::vector<std::string> build_ssh_argv(const std::string& ssh_exe,
                                                       const RcloneRemote& remote,
                                                       std::span<const std::string> ssh_options,

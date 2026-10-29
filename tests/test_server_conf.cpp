@@ -50,11 +50,11 @@ TEST_CASE("server_conf: a section's connection details, and the lines grab write
     std::string text = "[s]\nrclone_remote = s\n";
     const auto lines = server_conf::lines(c);
     CHECK(lines.front() == std::pair<std::string, std::string>{"host", "box.example"});
-    for (auto it = lines.rbegin(); it != lines.rend(); ++it) text = servers::set_value(text, "s", it->first, it->second);
+    for (auto it = lines.rbegin(); it != lines.rend(); ++it) text = servers::set_value(text, "s", it->first, it->second).value();
     CHECK(text.starts_with("[s]\nhost = box.example\nport = 23\nuser = u1\nauth = key\nkey_file = C:\\keys\\id\n"));
     CHECK(parse_section(text) == full);
 
-    // No host: an old-style section, its server still in rclone.conf.
+    // No host: an old-style section, waiting for the import from rclone.conf.
     CHECK(parse_section("[s]\nrclone_remote = s\nuser = u\n").value() == std::nullopt);
     CHECK(parse_section("[s]\nhost =\n").value() == std::nullopt);
     // Blank port: 22.

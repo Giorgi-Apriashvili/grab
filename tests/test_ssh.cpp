@@ -3,7 +3,9 @@
 #include "config.hpp"
 #include "conn_budget.hpp"
 #include "fake_command.hpp"
-#include "secrets.hpp"
+#include "live_import.hpp"
+#include "passwords.hpp"
+#include "server_conf.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
@@ -308,53 +310,65 @@ TEST_CASE("ssh: the offered algorithms leave out the weak ones") {
     }
 }
 
-TEST_CASE("ssh: a server's target from its rclone.conf section and its stored secrets") {
-    RcloneRemote r;
-    r.name = "Box";
-    r.host = "box.example";
-    r.user = "u1";
-    r.port = 23;
-    secrets::Store store;
+TEST_CASE("ssh: a server's target from its grab.conf section and the secrets saved for its login") {
+    server_conf::Connection c;
+    c.host = "box.example";
+    c.user = "u1";
+    c.port = 23;
+    c.auth = server_conf::Auth::password;
+    const passwords::Binding login{.user = "u1", .host = "box.example", .port = 23};
+    passwords::Store store;
     const std::filesystem::path grab_known = "C:/grab/known_hosts";
+    const auto save = [&](std::string_view key, std::string value, passwords::Binding at) {
+        store["Box"][std::string(key)] = passwords::Secret{.binding = std::move(at), .value = std::move(value)};
+    };
 
-    SUBCASE("a password: revealed, grab's known_hosts by default") {
-        store["Box"]["pass"] = "gLZBxgITy_HxlUNmOsLeEByAksnrlA"; // "potato", obscured by rclone
-        auto t = ssh::target_for(r, store, grab_known);
+    SUBCASE("a password: plain from the store, grab's known_hosts") {
+        save(passwords::password, "fake-potato", login);
+        auto t = ssh::target_for("Box", c, store, grab_known);
         REQUIRE(t);
         CHECK(t->host == "box.example");
         CHECK(t->port == 23);
         CHECK(t->user == "u1");
-        CHECK(t->password == "potato");
+        CHECK(t->password == "fake-potato");
         CHECK_FALSE(t->agent);
         CHECK(t->known_hosts == grab_known);
     }
-    SUBCASE("ssh-agent, the remote's own known_hosts") {
-        r.key_use_agent = true;
-        r.known_hosts_file = "D:/keys/known_hosts";
-        auto t = ssh::target_for(r, store, grab_known);
+    SUBCASE("a password saved for another login is refused, never sent (G40)") {
+        save(passwords::password, "fake-potato", passwords::Binding{.user = "u1", .host = "other.example", .port = 23});
+        const auto t = ssh::target_for("Box", c, store, grab_known);
+        REQUIRE_FALSE(t);
+        CHECK(t.error().find("the saved password is for u1@other.example:23") != std::string::npos);
+        CHECK(t.error().find("fake-potato") == std::string::npos);
+        store.clear();
+        CHECK(ssh::target_for("Box", c, store, grab_known).error_or("").find("no password is saved") != std::string::npos);
+    }
+    SUBCASE("ssh-agent") {
+        c.auth = server_conf::Auth::agent;
+        auto t = ssh::target_for("Box", c, store, grab_known);
         REQUIRE(t);
         CHECK(t->agent);
         CHECK(t->password.empty());
-        CHECK(t->known_hosts == std::filesystem::path("D:/keys/known_hosts"));
     }
-    SUBCASE("a key file and its passphrase") {
-        r.key_file = "C:/keys/id_ed25519";
-        store["Box"]["key_file_pass"] = "gLZBxgITy_HxlUNmOsLeEByAksnrlA";
-        auto t = ssh::target_for(r, store, grab_known);
+    SUBCASE("a key file, its passphrase, and a password beside it that rclone tries too") {
+        c.auth = server_conf::Auth::key;
+        c.key_file = "C:/keys/id_ed25519";
+        save(passwords::passphrase, "fake-phrase", login);
+        save(passwords::password, "fake-pw", login);
+        auto t = ssh::target_for("Box", c, store, grab_known);
         REQUIRE(t);
         CHECK(t->key_file == std::filesystem::path("C:/keys/id_ed25519"));
-        CHECK(t->key_passphrase == "potato");
+        CHECK(t->key_passphrase == "fake-phrase");
+        CHECK(t->password == "fake-pw");
     }
     SUBCASE("what it can't use is said, not guessed") {
-        CHECK_FALSE(ssh::target_for(r, store, grab_known)); // no way to log in
-        store["Box"]["key_pem"] = "x";
-        CHECK_FALSE(ssh::target_for(r, store, grab_known)); // an inline key: not yet
-        store["Box"].erase("key_pem");
-        store["Box"]["pass"] = "not obscured!";
-        CHECK_FALSE(ssh::target_for(r, store, grab_known));
-        r.user.clear();
-        store["Box"]["pass"] = "gLZBxgITy_HxlUNmOsLeEByAksnrlA";
-        CHECK_FALSE(ssh::target_for(r, store, grab_known));
+        c.auth = server_conf::Auth::stored_key;
+        save(passwords::key_pem, "-----BEGIN fake-----", login);
+        CHECK(ssh::target_for("Box", c, store, grab_known).error_or("").find("engine = rclone only") != std::string::npos);
+        c.auth = server_conf::Auth::password;
+        save(passwords::password, "fake", login);
+        c.user.clear();
+        CHECK_FALSE(ssh::target_for("Box", c, store, grab_known));
     }
 }
 
@@ -786,7 +800,8 @@ TEST_CASE("ssh: live pool, 4 threads twice over, 4 logins (GRAB_TEST_SSH)") {
 
 // From a server's rclone.conf section to a login through the pool, as the engine will do it:
 // GRAB_TEST_RCLONE_CONF names an rclone.conf (no passwords needed for an agent server) and
-// GRAB_TEST_REMOTE its section.
+// GRAB_TEST_REMOTE its section, read as the import reads it (live_import.hpp, nothing written);
+// GRAB_TEST_KNOWN_HOSTS, when set, the known_hosts it is checked against.
 TEST_CASE("ssh: live, a server from its rclone.conf section through the pool (GRAB_TEST_REMOTE)") {
     auto conf = util::getenv_utf8("GRAB_TEST_RCLONE_CONF");
     auto name = util::getenv_utf8("GRAB_TEST_REMOTE");
@@ -794,9 +809,11 @@ TEST_CASE("ssh: live, a server from its rclone.conf section through the pool (GR
         MESSAGE("skipped: GRAB_TEST_RCLONE_CONF / GRAB_TEST_REMOTE not set");
         return;
     }
-    auto remote = load_rclone_remote(util::path_from_utf8(*conf), *name);
-    REQUIRE_MESSAGE(remote, remote.error_or(""));
-    auto target = ssh::target_for(*remote, secrets::Store{}, grab_known_hosts_path());
+    const auto known = util::getenv_utf8("GRAB_TEST_KNOWN_HOSTS");
+    const auto known_hosts = known ? util::path_from_utf8(*known) : grab_known_hosts_path();
+    auto server = test::live_server(util::path_from_utf8(*conf), *name, known_hosts);
+    REQUIRE_MESSAGE(server, server.error_or(""));
+    auto target = ssh::target_for(*name, server->server.connection, server->store, known_hosts);
     REQUIRE_MESSAGE(target, target.error_or(""));
     ssh::Pool::Options o;
     o.limit = 2;

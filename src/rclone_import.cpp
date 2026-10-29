@@ -1,5 +1,6 @@
 #include "rclone_import.hpp"
 
+#include "gui_state.hpp"
 #include "ini.hpp"
 #include "json.hpp"
 #include "servers.hpp"
@@ -600,12 +601,34 @@ std::expected<Plan, std::string> plan(const Inputs& in) {
         }
         // Each key set after the header in turn, so they end up in the order of `lines`.
         const auto lines = server_conf::lines(outcome->server.connection);
-        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
-            p.grab_text = servers::set_value(p.grab_text, s.name, it->first, it->second);
+        std::expected<std::string, std::string> text = p.grab_text;
+        for (auto it = lines.rbegin(); it != lines.rend() && text; ++it) {
+            text = servers::set_value(*text, s.name, it->first, it->second);
         }
+        if (!text) {
+            p.failed.push_back(s.name);
+            p.record.failed[s.name] = Failure{.remote = remote, .stamps = in.stamps};
+            p.notes.push_back(Note{.server = s.name, .text = "not imported: " + text.error()});
+            continue;
+        }
+        p.grab_text = std::move(*text);
+        // What grab's store already holds for this very login stays: it was saved in grab (an
+        // Edit, an earlier import) and is newer than rclone.conf and the old 'secrets' store,
+        // which grab no longer updates (decision 3). A `grab --init` after grab.conf was deleted
+        // must not log in with an old password again. Values for another login are replaced.
+        const auto& c = outcome->server.connection;
+        const passwords::Binding login{.user = c.user, .host = c.host, .port = c.port};
         auto& stored = p.store[s.name];
-        stored.clear();
-        for (auto& [key, secret] : outcome->secrets) stored[key] = std::move(secret);
+        std::erase_if(stored, [&](const auto& kv) { return kv.second.binding != login; });
+        bool kept = false;
+        for (auto& [key, secret] : outcome->secrets) {
+            if (const auto it = stored.find(key); it != stored.end()) {
+                kept = kept || it->second.value != secret.value;
+                continue;
+            }
+            stored[key] = std::move(secret);
+        }
+        if (kept) outcome->notes.emplace_back("kept the password saved in grab, not rclone.conf's; change it with Edit");
         if (stored.empty()) p.store.erase(s.name);
         for (auto& line : outcome->host_key_lines) {
             pinned_text += "\n" + line;
@@ -619,6 +642,174 @@ std::expected<Plan, std::string> plan(const Inputs& in) {
         p.imported.push_back(std::move(outcome->server));
     }
     return p;
+}
+
+// ---- the apply step ---------------------------------------------------------------------------
+
+Files files_for(const fs::path& grab_conf) {
+    return Files{.grab_conf = grab_conf, .state_dir = state_dir(grab_conf), .known_hosts = grab_known_hosts_path()};
+}
+
+Stamp stamp_of(const fs::path& file) {
+    Stamp s{.file = util::path_to_utf8(file), .size = -1, .time = 0};
+    std::error_code ec;
+    const auto size = fs::file_size(file, ec);
+    if (ec) return s;
+    const auto time = fs::last_write_time(file, ec);
+    s.size = static_cast<std::int64_t>(size);
+    if (!ec) s.time = static_cast<std::int64_t>(time.time_since_epoch().count());
+    return s;
+}
+
+Source read_source(const fs::path& file) {
+    Source s{.file = file, .text = std::nullopt, .error = {}, .store = secrets::Store{}};
+    auto text = util::read_file_if_exists(file);
+    if (!text) {
+        s.error = text.error();
+        return s;
+    }
+    s.text = std::move(*text);
+    if (s.text) s.store = secrets::load(secrets::path_beside(file));
+    return s;
+}
+
+namespace {
+
+// imported.json as it is: nullopt when there is none.
+std::expected<std::optional<Record>, std::string> read_record(const fs::path& state) {
+    const auto file = record_path(state);
+    auto text = util::read_file_if_exists(file);
+    if (!text) return util::fail(text.error());
+    if (!*text) return std::nullopt;
+    auto record = from_json(**text);
+    if (!record) return util::failf("{} isn't grab's record of the import from rclone.conf", util::path_to_utf8(file));
+    return record;
+}
+
+// The stamps of the sources and of the old stores beside them, as `plan` compares them.
+std::vector<Stamp> stamps_of(const std::vector<fs::path>& sources) {
+    std::vector<Stamp> out;
+    for (const auto& file : sources) {
+        out.push_back(stamp_of(file));
+        out.push_back(stamp_of(secrets::path_beside(file)));
+    }
+    return out;
+}
+
+// Whether a section of grab.conf waits for the import, as `plan` picks them, from the stamps and
+// the record alone (no rclone.conf or store read); false when there is no grab.conf.
+std::expected<bool, std::string> waiting(const Files& files) {
+    auto text = util::read_file_if_exists(files.grab_conf);
+    if (!text) return util::fail(text.error());
+    if (!*text) return false;
+    const auto doc = ini::parse(**text);
+    if (!doc) return util::failf("{}: {}", util::path_to_utf8(files.grab_conf), doc.error());
+    std::vector<const ini::Section*> bare;
+    for (const auto& s : doc->sections) {
+        if (!s.name.empty() && s.name != "grab" && !nonblank(s, "host")) bare.push_back(&s);
+    }
+    if (bare.empty()) return false;
+    auto record = read_record(files.state_dir);
+    if (!record) return true; // read_inputs says why
+    const auto cfg = parse_grab_config(*doc);
+    if (!cfg) return util::failf("{}: {}", util::path_to_utf8(files.grab_conf), cfg.error());
+    const Record r = record->value_or(Record{});
+    const auto stamps = stamps_of(source_files(*cfg));
+    return std::ranges::any_of(bare, [&](const ini::Section* s) {
+        if (r.imported.contains(s->name)) return false;
+        const auto f = r.failed.find(s->name);
+        return f == r.failed.end() || f->second.remote != nonblank(*s, "rclone_remote").value_or(s->name) ||
+               f->second.stamps != stamps;
+    });
+}
+
+} // namespace
+
+std::expected<Inputs, std::string> read_inputs(const Files& files) {
+    Inputs in;
+    auto text = util::read_file_if_exists(files.grab_conf);
+    if (!text) return util::fail(text.error());
+    in.grab_text = text->value_or("");
+    const auto doc = ini::parse(in.grab_text);
+    if (!doc) return util::failf("{}: {}", util::path_to_utf8(files.grab_conf), doc.error());
+    const auto cfg = parse_grab_config(*doc);
+    if (!cfg) return util::failf("{}: {}", util::path_to_utf8(files.grab_conf), cfg.error());
+    const auto sources = source_files(*cfg);
+    for (const auto& file : sources) in.sources.push_back(read_source(file));
+    in.stamps = stamps_of(sources);
+
+    in.known_hosts = files.known_hosts;
+    auto known = util::read_file_if_exists(files.known_hosts);
+    if (!known) return util::failf("grab's known_hosts can't be read: {}", known.error());
+    in.known_hosts_text = known->value_or("");
+    const auto store_file = passwords::path_in(files.state_dir);
+    auto store = passwords::load(store_file);
+    if (!store) {
+        return util::failf("grab's saved passwords ({}) can't be read: {}", util::path_to_utf8(store_file), store.error());
+    }
+    in.store = std::move(*store);
+    auto record = read_record(files.state_dir);
+    if (!record) return util::fail(record.error());
+    in.record = record->value_or(Record{});
+
+    in.getenv = [](std::string_view name) { return util::getenv_utf8(std::string(name).c_str()); };
+    in.exists = [](const fs::path& p) {
+        std::error_code ec;
+        return fs::is_regular_file(p, ec);
+    };
+    in.read_host_keys = [](const fs::path& p) {
+        std::error_code ec;
+        if (const auto size = fs::file_size(p, ec); !ec && size > max_host_keys_file) {
+            return HostKeysFile{.text = std::nullopt, .error = "it is over 1 MiB"};
+        }
+        auto read = util::read_file(p);
+        if (!read) return HostKeysFile{.text = std::nullopt, .error = read.error()};
+        if (read->size() > max_host_keys_file) return HostKeysFile{.text = std::nullopt, .error = "it is over 1 MiB"};
+        return HostKeysFile{.text = std::move(*read), .error = {}};
+    };
+    return in;
+}
+
+std::expected<Result, std::string> apply(const Files& files) {
+    auto wait = waiting(files);
+    if (!wait) return util::fail(wait.error());
+    if (!*wait) return Result{};
+    // From the files as they are under the lock: another grab may have imported them meanwhile.
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
+    auto in = read_inputs(files);
+    if (!in) return util::fail(in.error());
+    auto p = plan(*in);
+    if (!p) return util::fail(p.error());
+    Result result{.imported = std::move(p->imported), .failed = std::move(p->failed), .notes = std::move(p->notes)};
+    const auto stopped = [](std::string_view what, const std::string& why) {
+        return util::failf("moving servers from rclone.conf into grab.conf stopped ({}: {}); grab tries again next time",
+                           what, why);
+    };
+    if (p->store != in->store) {
+        if (auto saved = passwords::save(passwords::path_in(files.state_dir), p->store); !saved) {
+            return stopped("the saved passwords", saved.error());
+        }
+    }
+    if (!p->host_key_lines.empty()) {
+        const auto merged = servers::merge_known_hosts(in->known_hosts_text, p->host_key_lines);
+        if (merged != in->known_hosts_text) {
+            if (auto written = util::write_file_atomic(files.known_hosts, merged); !written) {
+                return stopped("known_hosts", written.error());
+            }
+        }
+    }
+    if (p->grab_text != in->grab_text) {
+        if (auto written = util::write_file_atomic(files.grab_conf, p->grab_text); !written) {
+            return stopped("grab.conf", written.error());
+        }
+    }
+    if (p->record != in->record) {
+        if (auto written = util::write_file_atomic(record_path(files.state_dir), to_json(p->record)); !written) {
+            return stopped("imported.json", written.error());
+        }
+    }
+    return result;
 }
 
 } // namespace grab::rclone_import

@@ -39,9 +39,9 @@ Commands:
                        $EDITOR, else notepad. The file is created from the example if missing.
   server list          the configured servers: login, auth, lookup method, host key
   server add [NAME]    set up a server step by step (host, login, host key, search roots);
-                       writes grab.conf and grab's rclone.conf, then tests the connection
+                       writes grab.conf (a password to grab's encrypted store), then tests it
   server trust NAME    fetch, confirm and pin a server's host key
-  server remove NAME   delete a server from grab.conf and grab's rclone.conf
+  server remove NAME   delete a server from grab.conf, its saved password and host keys
   update               install the latest GitHub release over this copy (Windows), after
                        verifying its SHA-256; --check only reports whether one is available.
 

@@ -21,7 +21,9 @@
 // key_pem -> stored_key, else key_file -> key (key_file_pass its passphrase), else pass ->
 // password, else agent, unless ask_password or a parent's own `pass` line (password, none saved).
 // A parent's secret rclone read from the file gets a note to enter it with Edit. A password
-// beside a key is kept. key_file and known_hosts_file expanded as rclone does (~, $VAR,
+// beside a key is kept. A value grab's store already holds for that server and the same login
+// stays (it is newer: a `grab --init` after grab.conf was deleted imports again), with a note
+// when it differs; one bound to another login is replaced. key_file and known_hosts_file expanded as rclone does (~, $VAR,
 // ${RCLONE_CONFIG_DIR} as the file's folder) and made absolute. Host keys: the remote's own
 // known_hosts lines for its [host]:port are copied when grab's known_hosts has none for it; a
 // network or device path, a file over 1 MiB, @cert-authority and wildcard lines and lines with a
@@ -158,5 +160,43 @@ struct HostKeyLines {
     std::vector<std::string> skipped; // "a @cert-authority line", "a wildcard line (*.example)"
 };
 [[nodiscard]] HostKeyLines host_key_lines(std::string_view text, std::string_view host, int port);
+
+// ---- the apply step ---------------------------------------------------------------------------
+
+// What the import of one configuration reads and writes: its grab.conf, its state_dir
+// (gui_state.hpp: the 'passwords' store and imported.json) and grab's known_hosts.
+struct Files {
+    std::filesystem::path grab_conf;
+    std::filesystem::path state_dir;
+    std::filesystem::path known_hosts;
+};
+[[nodiscard]] Files files_for(const std::filesystem::path& grab_conf);
+
+// A file's Stamp now.
+[[nodiscard]] Stamp stamp_of(const std::filesystem::path& file);
+// An rclone.conf as the import reads it, with the old store beside it (read only when the file is
+// there).
+[[nodiscard]] Source read_source(const std::filesystem::path& file);
+
+// `files` as `plan` takes them, read now; nothing is written. An error when grab.conf, grab's
+// known_hosts, the 'passwords' store or imported.json is there but can't be read: the import then
+// waits (a store taken as empty would be replaced).
+[[nodiscard]] std::expected<Inputs, std::string> read_inputs(const Files& files);
+
+struct Result {
+    std::vector<Imported> imported;
+    std::vector<std::string> failed;
+    std::vector<Note> notes;
+};
+
+// The apply step, run by load_context, load_env, --init and the window's settings thread. First,
+// without the lock, whether any section waits for the import (no `host`, not imported before,
+// not failed with the same remote and source files): when none does, as on almost every run, it
+// returns at once. Else under the settings lock: read_inputs, plan, then the writes in the order
+// the header gives (store, known_hosts, grab.conf, imported.json), each only when it changes. A
+// write that fails stops it with an error; what was written before is what the next run plans
+// from, and it finishes then (the store and known_hosts lines come out the same again, and a
+// section is done once grab.conf has its `host`). No grab.conf: nothing to do.
+[[nodiscard]] std::expected<Result, std::string> apply(const Files& files);
 
 } // namespace grab::rclone_import

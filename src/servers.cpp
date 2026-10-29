@@ -29,18 +29,6 @@ std::optional<std::string> validate_name(std::string_view name) {
     return std::nullopt;
 }
 
-RcloneRemote to_remote(const NewServer& s, const std::filesystem::path& known_hosts) {
-    RcloneRemote r;
-    r.name = s.name;
-    r.host = s.host;
-    r.user = s.user;
-    r.port = s.port;
-    if (s.auth == Auth::key_file && !s.key_file.empty()) r.key_file = s.key_file;
-    r.key_use_agent = s.auth == Auth::agent;
-    if (!known_hosts.empty()) r.known_hosts_file = util::path_to_utf8(known_hosts);
-    return r;
-}
-
 // ---- host keys -------------------------------------------------------------------------------
 
 std::string key_label(std::string_view type) {
@@ -142,51 +130,6 @@ std::string merge_known_hosts(std::string_view existing, const std::vector<std::
 
 // ---- rclone command lines --------------------------------------------------------------------
 
-std::vector<std::string> obscure_argv(const std::string& rclone) { return {rclone, "obscure", "-"}; }
-
-std::vector<std::string> create_argv(const std::string& rclone, const std::filesystem::path& config,
-                                     const NewServer& s, const std::optional<std::string>& obscured_secret,
-                                     const std::filesystem::path& known_hosts) {
-    std::vector<std::string> argv{rclone, "config", "create", s.name, "sftp",
-                                  "host=" + s.host, std::format("port={}", s.port), "user=" + s.user};
-    switch (s.auth) {
-    case Auth::password:
-        if (obscured_secret) argv.push_back("pass=" + *obscured_secret);
-        break;
-    case Auth::key_file:
-        argv.push_back("key_file=" + s.key_file);
-        if (obscured_secret) argv.push_back("key_file_pass=" + *obscured_secret);
-        break;
-    case Auth::agent:
-        argv.emplace_back("key_use_agent=true");
-        break;
-    }
-    if (!known_hosts.empty()) argv.push_back("known_hosts_file=" + util::path_to_utf8(known_hosts));
-    argv.insert(argv.end(), {"--no-obscure", "--non-interactive", "--config", util::path_to_utf8(config)});
-    return argv;
-}
-
-std::vector<std::string> update_argv(const std::string& rclone, const std::filesystem::path& config,
-                                     const std::string& name, const std::string& key,
-                                     const std::string& value) {
-    return {rclone, "config", "update", name, key + "=" + value, "--no-obscure", "--non-interactive",
-            "--config", util::path_to_utf8(config)};
-}
-
-std::vector<std::string> update_argv(const std::string& rclone, const std::filesystem::path& config,
-                                     const std::string& name,
-                                     const std::vector<std::pair<std::string, std::string>>& values) {
-    std::vector<std::string> argv{rclone, "config", "update", name};
-    for (const auto& [key, value] : values) argv.push_back(key + "=" + value);
-    argv.insert(argv.end(), {"--no-obscure", "--non-interactive", "--config", util::path_to_utf8(config)});
-    return argv;
-}
-
-std::vector<std::string> delete_argv(const std::string& rclone, const std::filesystem::path& config,
-                                     const std::string& name) {
-    return {rclone, "config", "delete", name, "--config", util::path_to_utf8(config)};
-}
-
 std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name) {
     return {rclone, "lsf", name + ":", "--dirs-only", "--max-depth", "1", "--contimeout", "15s",
             "--timeout", "30s", "--low-level-retries", "1", "--retries", "1", "--config",
@@ -240,14 +183,24 @@ bool is_header_of(std::string_view line, std::string_view name) {
 
 bool blank(std::string_view line) { return util::trim(line).empty(); }
 
-// [begin, end) of a section's lines, header included; nullopt when absent.
+// The key a "key = value" line sets; nullopt for a comment, a blank or another line.
+std::optional<std::string_view> key_of(std::string_view line) {
+    const auto t = util::trim(line);
+    if (t.empty() || t.starts_with('#') || t.starts_with(';')) return std::nullopt;
+    const auto eq = t.find('=');
+    if (eq == std::string_view::npos) return std::nullopt;
+    return util::trim(t.substr(0, eq));
+}
+
+// [begin, end) of a section's first block at or after line `from`, header included; nullopt when
+// there is none.
 std::optional<std::pair<std::size_t, std::size_t>> find_section(const std::vector<std::string>& lines,
-                                                                std::string_view name) {
+                                                                std::string_view name, std::size_t from = 0) {
     auto comment = [](std::string_view line) {
         const auto t = util::trim(line);
         return t.starts_with('#') || t.starts_with(';');
     };
-    for (std::size_t i = 0; i < lines.size(); ++i) {
+    for (std::size_t i = from; i < lines.size(); ++i) {
         if (!is_header_of(lines[i], name)) continue;
         std::size_t end = i + 1;
         while (end < lines.size() && !is_header(lines[end])) ++end;
@@ -264,13 +217,9 @@ std::optional<std::pair<std::size_t, std::size_t>> find_section(const std::vecto
     return std::nullopt;
 }
 
-} // namespace
-
-std::string remove_section(std::string_view text, std::string_view section) {
-    Lines l = split_lines(text);
-    auto range = find_section(l.lines, section);
-    if (!range) return std::string(text);
-    auto [begin, end] = *range;
+// Removes the block [begin, end) of `section`, with grab's lead-in comment right above it.
+void remove_block(Lines& l, std::string_view section, std::pair<std::size_t, std::size_t> range) {
+    auto [begin, end] = range;
     // grab's generated lead-in comment ("# rclone remote [name]: ...").
     if (begin > 0) {
         const auto prev = util::trim(l.lines[begin - 1]);
@@ -288,6 +237,18 @@ std::string remove_section(std::string_view text, std::string_view section) {
     }
     // Nor a blank first line when the removed section opened the file.
     while (begin == 0 && !l.lines.empty() && blank(l.lines.front())) l.lines.erase(l.lines.begin());
+}
+
+} // namespace
+
+std::string remove_section(std::string_view text, std::string_view section) {
+    Lines l = split_lines(text);
+    if (!find_section(l.lines, section)) return std::string(text);
+    // Every block of that name: ini::parse merges them into one section (review: a second [Box]
+    // lower down would otherwise keep the server listed).
+    while (auto range = find_section(l.lines, section)) {
+        remove_block(l, section, *range);
+    }
     while (!l.lines.empty() && blank(l.lines.back())) l.lines.pop_back();
     l.final_newline = true;
     return join_lines(l);
@@ -303,8 +264,13 @@ std::string append_section(std::string_view text, std::string_view section_text)
     return join_lines(l);
 }
 
-std::string set_value(std::string_view text, std::string_view section, std::string_view key,
-                      std::string_view value) {
+std::expected<std::string, std::string> set_value(std::string_view text, std::string_view section,
+                                                  std::string_view key, std::string_view value,
+                                                  std::span<const std::string_view> after) {
+    for (const auto& [what, part] : {std::pair{"section name", section}, std::pair{"key", key}}) {
+        if (auto bad = server_conf::check_value(part)) return util::failf("a grab.conf {}: {}", what, *bad);
+    }
+    if (auto bad = server_conf::check_value(value)) return util::failf("[{}] {}: {}", section, key, *bad);
     Lines l = split_lines(text);
     const std::string assignment = value.empty() ? std::format("{} =", key) : std::format("{} = {}", key, value);
     auto range = find_section(l.lines, section);
@@ -315,17 +281,32 @@ std::string set_value(std::string_view text, std::string_view section, std::stri
         l.final_newline = true;
         return join_lines(l);
     }
-    const auto [begin, end] = *range;
-    for (std::size_t i = begin + 1; i < end; ++i) {
-        const auto t = util::trim(l.lines[i]);
-        if (t.empty() || t.starts_with('#') || t.starts_with(';')) continue;
-        const auto eq = t.find('=');
-        if (eq != std::string_view::npos && util::trim(t.substr(0, eq)) == key) {
-            l.lines[i] = assignment;
-            return join_lines(l);
+    // As ini::parse reads it, the last line of the key across every block of that name wins: that
+    // one is replaced and the earlier ones go, so the value written is the one read back.
+    std::vector<std::size_t> lines_of_key;
+    std::pair<std::size_t, std::size_t> last = *range;
+    for (auto block = range; block; block = find_section(l.lines, section, block->second)) {
+        last = *block;
+        for (std::size_t i = block->first + 1; i < block->second; ++i) {
+            if (key_of(l.lines[i]) == key) lines_of_key.push_back(i);
         }
     }
-    l.lines.insert(l.lines.begin() + static_cast<std::ptrdiff_t>(begin + 1), assignment);
+    if (!lines_of_key.empty()) {
+        l.lines[lines_of_key.back()] = assignment;
+        for (auto i = lines_of_key.size() - 1; i-- > 0;) {
+            l.lines.erase(l.lines.begin() + static_cast<std::ptrdiff_t>(lines_of_key[i]));
+        }
+        return join_lines(l);
+    }
+    // A new key goes in the last block, after `after`'s last one found there.
+    const auto [begin, end] = last;
+    std::size_t at = begin + 1;
+    for (std::size_t i = begin + 1; i < end; ++i) {
+        if (const auto name = key_of(l.lines[i]); name && std::ranges::find(after, *name) != after.end()) {
+            at = std::max(at, i + 1);
+        }
+    }
+    l.lines.insert(l.lines.begin() + static_cast<std::ptrdiff_t>(at), assignment);
     return join_lines(l);
 }
 

@@ -19,6 +19,7 @@
 #include "rate.hpp"
 #include "rclone.hpp"
 #include "rclone_flags.hpp"
+#include "rclone_import.hpp"
 #include "remote.hpp"
 #include "schedule.hpp"
 #include "server_cli.hpp"
@@ -142,13 +143,18 @@ int do_init(const std::filesystem::path& path) {
         std::println("add one with:  grab server add");
         return exit_ok;
     }
-    // Copy them into grab's own rclone.conf; the standard one is never modified.
-    std::vector<std::string> names;
-    for (const auto& r : remotes) names.push_back(r.name);
-    const auto imported = import_rclone_remotes(names, rclone_path, grab_rclone_config_path());
-    if (!imported.error.empty()) error(imported.error);
+    // Their connection details into the new sections, their passwords into grab's store: the
+    // import (rclone.conf is never modified). What an earlier grab.conf at this path imported
+    // doesn't count for this new one.
+    const auto files = rclone_import::files_for(path);
+    std::filesystem::remove(rclone_import::record_path(files.state_dir), ec);
+    const auto applied = rclone_import::apply(files);
+    if (!applied) error(applied.error());
     std::println("wrote {} with {} server(s) imported from rclone.conf:", shown, remotes.size());
     for (const auto& r : remotes) std::println("  [{}]  {}", r.name, describe_remote(r));
+    if (applied) {
+        for (const auto& note : applied->notes) std::println("  note: [{}] {}", note.server, note.text);
+    }
     std::println("ready: grab NAME [DEST]   (search_roots is blank = login home; narrow it with "
                  "`grab config`)");
     return exit_ok;
@@ -502,9 +508,11 @@ int run(const Options& opts) {
         return exit_config;
     }
     if (!ctx->imported.empty()) {
-        std::println(stderr, "grab: imported {} from rclone.conf into {} (one time)",
-                     util::join(ctx->imported, ", "), util::path_to_utf8(grab_rclone_config_path()));
+        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time; rclone.conf "
+                             "unchanged)",
+                     util::join(ctx->imported, ", "), util::path_to_utf8(cfg_path));
     }
+    for (const auto& note : ctx->import_notes) std::println(stderr, "grab: note: {}", note);
     // grab's own client takes --bind, --contimeout and --timeout of them (review G189).
     if (opts.verbose && ctx->engine == Engine::grab) {
         if (const auto unused = engine::unused_flags(*ctx); !unused.empty()) {

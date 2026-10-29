@@ -9,9 +9,11 @@
 #include "conn_budget.hpp"
 #include "fake_command.hpp"
 #include "fake_md5sum.hpp"
+#include "live_import.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
+#include "server_conf.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_hash.hpp"
@@ -110,7 +112,7 @@ TEST_CASE("ssh hash: the probe counts only md5sum's exact record for empty stdin
     CHECK(ssh::read_hash_probe(ended("", 2), "bad\x01\xFF\n", true).answer == "\"bad␁‛FF\", exit 2");
 }
 
-TEST_CASE("ssh hash: rclone.conf's keys keep grab's check from servers it can't hash the same way") {
+TEST_CASE("ssh hash: grab.conf's keys keep grab's check from servers it can't hash the same way") {
     RcloneRemote r;
     CHECK_FALSE(ssh::hash_blocked(r));
     r.shell_type = "unix";
@@ -125,14 +127,89 @@ TEST_CASE("ssh hash: rclone.conf's keys keep grab's check from servers it can't 
     r.shell_type = "unix";
     r.md5sum_command = "none";
     CHECK(ssh::hash_blocked(r) == ssh::HashFailed{.kind = ssh::HashFailure::no_checksums,
-                                                  .why = "the server can't compute checksums (md5sum_command = none in rclone.conf)"});
+                                                  .why = "the server can't compute checksums (md5sum_command = none in grab.conf)"});
     r.md5sum_command = "md5 -r";
     CHECK(ssh::hash_blocked(r) == ssh::HashFailed{.kind = ssh::HashFailure::unsupported,
-                                                  .why = "md5sum_command in rclone.conf isn't supported by grab's check yet"});
+                                                  .why = "md5sum_command in grab.conf isn't supported by grab's check yet"});
     r.md5sum_command.reset();
     r.path_override = "@/volume1";
     CHECK(ssh::hash_blocked(r) == ssh::HashFailed{.kind = ssh::HashFailure::unsupported,
-                                                  .why = "path_override in rclone.conf isn't supported by grab's check yet"});
+                                                  .why = "path_override in grab.conf isn't supported by grab's check yet"});
+}
+
+TEST_CASE("ssh hash: rclone's shell probe and sum commands, read as rclone reads them (phase 7)") {
+    CHECK(ssh::read_shell_answer(ended("", 0), "%ComSpec%\n") == "unix");
+    CHECK(ssh::read_shell_answer(ended("", 0), "${ShellId}C:\\WINDOWS\\system32\\cmd.exe\r\n") == "cmd");
+    CHECK(ssh::read_shell_answer(ended("", 0), "Microsoft.PowerShell%ComSpec%\r\n") == "powershell");
+    CHECK(ssh::read_shell_answer(ended("", 0), "an unforeseen answer\n") == "unix"); // as rclone takes it
+    // It ran and failed: a shell without echo, as rclone says.
+    CHECK(ssh::read_shell_answer(ended("Command not found.\n", 8), "") == "none");
+    // Nothing lasting learned: grab never guesses.
+    CHECK_FALSE(ssh::read_shell_answer(failed(ssh::ExecFailure::refused, "refused"), "").has_value());
+    CHECK_FALSE(ssh::read_shell_answer(failed(ssh::ExecFailure::deadline, "late"), "").has_value());
+    CHECK_FALSE(ssh::read_shell_answer(failed(ssh::ExecFailure::stopped, "stopped"), "").has_value());
+    CHECK_FALSE(ssh::read_shell_answer(ended("", -1, "TERM"), "").has_value());
+
+    const std::string md5 = "d41d8cd98f00b204e9800998ecf8427e";
+    CHECK(ssh::read_sum_answer(ended("", 0), md5 + "  -\n", md5) == true);
+    CHECK(ssh::read_sum_answer(ended("", 0), md5 + "\n", md5) == true);                          // BSD md5 -r
+    CHECK(ssh::read_sum_answer(ended("", 0), "\\D41D8CD98F00B204E9800998ECF8427E  -\n", md5) == true); // GNU's '\', case
+    CHECK(ssh::read_sum_answer(ended("", 0), "Welcome\n" + md5 + "  -\n", md5) == false);
+    CHECK(ssh::read_sum_answer(ended("not found", 127), "", md5) == false);
+    CHECK_FALSE(ssh::read_sum_answer(failed(ssh::ExecFailure::refused, "refused"), "", md5).has_value());
+}
+
+TEST_CASE("ssh hash: what grab.conf doesn't say is asked once, over grab's own connection (phase 7)") {
+    const std::string md5 = "d41d8cd98f00b204e9800998ecf8427e";
+    const std::string sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+    Box b;
+    // A POSIX shell without md5sum but with BSD's md5, and GNU's sha1sum.
+    b.also = [&](test::FakeCommand& c, std::string_view command) {
+        c.err.clear();
+        c.out.clear();
+        c.status = 0;
+        if (command == ssh::shell_probe) c.out = {"%ComSpec%\n"};
+        else if (command == "md5 -r") c.out = {md5 + "\n"};
+        else if (command == "sha1sum") c.out = {sha1 + "  -\n"};
+        else c.status = 127;
+    };
+    auto pool = b.pool(1);
+    const auto learned = ssh::learn_commands(*pool, {}, {});
+    CHECK(learned == ssh::ServerCommands{.shell_type = "unix", .md5sum_command = "md5 -r", .sha1sum_command = "sha1sum"});
+    CHECK(b.commands == std::vector<std::string>{std::string(ssh::shell_probe), "md5sum", "md5 -r", "sha1sum"});
+
+    // What is known is not asked again.
+    b.commands.clear();
+    CHECK(ssh::learn_commands(*pool, learned, {}) == learned);
+    CHECK(b.commands.empty());
+    const ssh::ServerCommands shell_only{.shell_type = "unix", .md5sum_command = std::nullopt, .sha1sum_command = std::nullopt};
+    CHECK(ssh::learn_commands(*pool, shell_only, {}) == learned);
+    CHECK(b.commands == std::vector<std::string>{"md5sum", "md5 -r", "sha1sum"});
+    // Where no shell runs, rclone asks no sums either.
+    b.commands.clear();
+    const ssh::ServerCommands none{.shell_type = "none", .md5sum_command = std::nullopt, .sha1sum_command = std::nullopt};
+    CHECK(ssh::learn_commands(*pool, none, {}) == none);
+    CHECK(b.commands.empty());
+
+    // No sum command works: "none", as rclone saves it.
+    Box bare;
+    bare.also = [&](test::FakeCommand& c, std::string_view command) {
+        c.err.clear();
+        c.out.clear();
+        c.status = command == ssh::shell_probe ? 0 : 127;
+        if (command == ssh::shell_probe) c.out = {"%ComSpec%\n"};
+    };
+    CHECK(ssh::learn_commands(*bare.pool(1), {}, {}) ==
+          ssh::ServerCommands{.shell_type = "unix", .md5sum_command = "none", .sha1sum_command = "none"});
+
+    // Refused (an SFTP-only account, or one channel only): nothing learned, nothing guessed.
+    Box refused;
+    refused.refuse = true;
+    CHECK(ssh::learn_commands(*refused.pool(1), {}, {}) == ssh::ServerCommands{});
+    // A login that fails: the same.
+    Box no_login;
+    no_login.no_login = ssh::Error(budget::Failure::fatal, "the host key isn't trusted");
+    CHECK(ssh::learn_commands(*no_login.pool(1), {}, {}) == ssh::ServerCommands{});
 }
 
 TEST_CASE("ssh hash: absolute paths, the command, its output cap and deadline") {
@@ -802,9 +879,10 @@ TEST_CASE("ssh hash: live, odd names hashed on the server equal local MD5 and rc
     const auto conf = util::getenv_utf8("GRAB_TEST_RCLONE_CONF");
     const auto name = util::getenv_utf8("GRAB_TEST_REMOTE");
     if (conf && name) {
-        auto remote = load_rclone_remote(util::path_from_utf8(*conf), *name);
-        REQUIRE_MESSAGE(remote, remote.error_or(""));
-        o.server = *remote; // its keys as rclone saved them (shell_type, md5sum_command)
+        auto server = test::live_server(util::path_from_utf8(*conf), *name, grab_known_hosts_path());
+        REQUIRE_MESSAGE(server, server.error_or(""));
+        // Its keys as rclone saved them (shell_type, md5sum_command), as the import takes them.
+        o.server = server_conf::to_remote(*name, server->server.connection, grab_known_hosts_path());
     }
     o.batches.files = 16; // several commands
     const auto started = std::chrono::steady_clock::now();

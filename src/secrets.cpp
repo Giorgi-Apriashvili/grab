@@ -1,6 +1,5 @@
 #include "secrets.hpp"
 
-#include "config.hpp"
 #include "rclone_encoding.hpp"
 #include "util.hpp"
 
@@ -107,16 +106,6 @@ std::expected<Store, std::string> load(const fs::path& file) {
     return std::move(*store);
 }
 
-std::expected<ForChange, std::string> load_for_change(const fs::path& file) {
-    auto data = util::read_file_if_exists(file);
-    if (!data) return util::fail(data.error());
-    if (!*data) return ForChange{};
-    if (auto store = unseal(**data)) return ForChange{.store = std::move(*store), .set_aside = std::nullopt};
-    auto moved = util::move_aside(file, "unreadable");
-    if (!moved) return util::fail(moved.error());
-    return ForChange{.store = {}, .set_aside = std::move(*moved)};
-}
-
 std::expected<void, std::string> save(const fs::path& file, const Store& store) {
     const auto sealed = util::protect_for_user(to_text(store), purpose);
     if (!sealed) return util::failf("cannot write {}: the passwords could not be encrypted", util::path_to_utf8(file));
@@ -155,39 +144,6 @@ Taken take_secrets(std::string_view rclone_text) {
         t.text += raw;
     });
     return t;
-}
-
-std::expected<void, std::string> prepare(const fs::path& rclone_conf) {
-    const auto file = path_beside(rclone_conf);
-    auto store = load(file);
-    auto text = util::read_file(rclone_conf);
-    if (text && !take_secrets(*text).found.empty()) {
-        // Moved under the settings lock, from both files as they are then: another grab may be
-        // moving them at the same time (review G175). Without the lock they stay for now.
-        if (auto lock = lock_settings()) {
-            text = util::read_file(rclone_conf);
-            auto taken = text ? take_secrets(*text) : Taken{};
-            // A store that can't be decrypted is set aside first, as for any change (G211); the
-            // secrets just found start a new one.
-            auto base = taken.found.empty() ? util::fail("nothing to move") : load_for_change(file);
-            if (base) {
-                Store merged = std::move(base->store);
-                for (auto& [remote, values] : taken.found) {
-                    for (auto& [key, value] : values) merged[remote][key] = std::move(value);
-                }
-                // The file keeps its secrets until the store holds them for sure. If anything
-                // fails, they stay where rclone reads them anyway, and the next run tries again.
-                if (save(file, merged) && load(file) == merged) {
-                    if (!util::write_file_atomic(rclone_conf, taken.text)) {
-                        // They stay in the file as well, where rclone reads them anyway.
-                    }
-                }
-            }
-            store = load(file);
-        }
-    }
-    if (!store) return util::fail(store.error());
-    return {};
 }
 
 } // namespace grab::secrets

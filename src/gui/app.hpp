@@ -158,6 +158,10 @@ private:
     // A server saved, trusted or removed: its previews kept go (review G36) and the login the
     // previews remembered as failed is tried again (Pool::acquire_remembered).
     void forget_server_previews(const std::string& server);
+    // A server removed, or moved to another user, host or port: also its pool (Pools::forget) and
+    // what the window learned for it, its connection limit and timings (G122; server_ops drops
+    // the saved ones).
+    void forget_server(const std::string& server);
     // `first`: ahead of the jobs queued already (the preview shown now).
     void queue_preview(std::function<void()> job, bool first = false);
     void run_preview_jobs(const std::stop_token& stop);
@@ -195,6 +199,7 @@ private:
         servers::NewServer server;
         Secret secret;
         server_ops::HostKeys keys;
+        bool moved = false; // an edit to another user, host or port
     };
     enum class Status { queued, running, paused, done, failed, cancelled, skipped };
     // Why a running download is being stopped.
@@ -455,6 +460,7 @@ private:
     std::filesystem::path limits_path_; // learned connection limits, shared with the command
     GuiState state_;
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
+    bool page_ready_ = false;          // UI thread: the page has sent "init"
     fetch::Connections connections_;
     ssh::Pools pools_;          // grab's own SSH connections: engine = grab servers, every server's verification
     rate::RateLimiter limiter_; // shared by every download's streams

@@ -58,6 +58,16 @@ using Store = std::map<std::string, std::map<std::string, Secret, std::less<>>, 
 
 // A missing file is an empty store; one that can't be decrypted or read is an error.
 [[nodiscard]] std::expected<Store, std::string> load(const std::filesystem::path& file);
+// The store about to be changed. One that was read but can't be decrypted or parsed (another
+// Windows user's, damaged, or DPAPI failing for now, as after a domain password reset) is moved
+// aside to "<file>.unreadable-<time>" and the change starts from an empty store, its passwords
+// kept should they become readable again; `set_aside` then names that file (review G211). A file
+// that can't be read at all is an error: the change has to wait rather than replace it.
+struct ForChange {
+    Store store;
+    std::optional<std::filesystem::path> set_aside;
+};
+[[nodiscard]] std::expected<ForChange, std::string> load_for_change(const std::filesystem::path& file);
 // Encrypted, replaced in one step (util::write_file_atomic), then read back: an error unless the
 // file then holds `store`.
 [[nodiscard]] std::expected<void, std::string> save(const std::filesystem::path& file, const Store& store);
@@ -68,5 +78,10 @@ using Store = std::map<std::string, std::map<std::string, Secret, std::less<>>, 
                                                    const Binding& login);
 // `key` of `server` whatever login it was saved for, or nullptr.
 [[nodiscard]] const Secret* find(const Store& store, std::string_view server, std::string_view key);
+// Why value_for finds no `key` (a password, a passphrase) of `server` for `login`, for a message:
+// "the saved password is for u@h:22, not u@h:23: enter it again with Edit", or "no password is
+// saved: enter it with Edit".
+[[nodiscard]] std::string why_none(const Store& store, std::string_view server, std::string_view key,
+                                   const Binding& login);
 
 } // namespace grab::passwords

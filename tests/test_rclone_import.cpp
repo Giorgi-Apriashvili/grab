@@ -5,16 +5,24 @@
 // made up.
 
 #include "config.hpp"
+#include "engine.hpp"
 #include "ini.hpp"
 #include "passwords.hpp"
 #include "rclone_import.hpp"
 #include "secrets.hpp"
 #include "server_conf.hpp"
+#include "server_ops.hpp"
+#include "servers.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (SetFileAttributesW)
+#endif
+
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -201,6 +209,32 @@ TEST_CASE("import: grab's own rclone.conf and its store become grab.conf section
         CHECK(x.find == y.find);
         CHECK(x.common_flags == y.common_flags);
     }
+}
+
+TEST_CASE("import: a value grab's store holds for the same login stays; one for another login is replaced") {
+    // grab.conf deleted and `grab --init` run: Box is imported again from the 0.19 files, whose
+    // password is older than the one saved with Edit in grab.
+    World world;
+    const std::string rclone = "[Box]\ntype = sftp\nhost = u1.example\nport = 23\nuser = u1\npass = " +
+                               obscured("fake-old-password") + "\n\n[Moved]\ntype = sftp\nhost = new.example\nuser = u\n"
+                               "pass = " + obscured("fake-moved-password") + "\n";
+    auto in = inputs(world, std::string(grab_head) + "[Box]\n[Moved]\n", {source("grab/rclone.conf", rclone)});
+    const passwords::Binding box{.user = "u1", .host = "u1.example", .port = 23};
+    const passwords::Binding old_moved{.user = "u", .host = "old.example", .port = 22};
+    in.store = {{"Box", {{"password", {.binding = box, .value = "fake-new-password"}}}},
+                {"Moved", {{"password", {.binding = old_moved, .value = "fake-elsewhere"}},
+                           {"rclone.set_env", {.binding = old_moved, .value = "FAKE=1"}}}}};
+    const auto p = run(in);
+    REQUIRE(p.failed.empty());
+    CHECK(passwords::value_for(p.store, "Box", passwords::password, box) == "fake-new-password");
+    CHECK(has_note(p, "Box", "kept the password saved in grab"));
+    const passwords::Binding moved{.user = "u", .host = "new.example", .port = 22};
+    CHECK(p.store.at("Moved") == std::map<std::string, passwords::Secret, std::less<>>{
+                                     {"password", {.binding = moved, .value = "fake-moved-password"}}});
+    CHECK_FALSE(has_note(p, "Moved", "kept the password"));
+    // The same value saved in both says nothing.
+    in.store["Box"]["password"].value = "fake-old-password";
+    CHECK_FALSE(has_note(run(in), "Box", "kept the password"));
 }
 
 TEST_CASE("import: an explicit rclone.conf's inline secrets win over the store beside it; a standard one is read too") {
@@ -541,4 +575,276 @@ TEST_CASE("imported.json keeps what the import did") {
           std::vector<fs::path>{grab_rclone_config_path(), standard_rclone_config_path()});
     cfg.rclone_config = root() / "mine.conf";
     CHECK(rclone_import::source_files(cfg) == std::vector<fs::path>{root() / "mine.conf"});
+}
+
+// ---- the apply step, on disk ---------------------------------------------------------------------
+// Made-up files only: grab's old rclone.conf and 'secrets', rclone's standard rclone.conf and
+// grab's known_hosts all live in the test runner's scratch APPDATA (test_main.cpp), grab.conf in
+// a temp folder, its state_dir (store, imported.json) under the scratch APPDATA too.
+
+namespace {
+
+// A configuration of grab 0.19: grab's rclone.conf with an agent server whose own known_hosts
+// pins it, a password server (its password in the old store), a dotted name under it and a
+// Georgian one; rclone's standard rclone.conf with another agent server.
+struct Old {
+    fs::path dir = fs::temp_directory_path() / "grab-test-import-apply";
+    fs::path conf = dir / "grab.conf";
+    fs::path own = grab_rclone_config_path();
+    fs::path standard = standard_rclone_config_path();
+    fs::path old_store = secrets::path_beside(grab_rclone_config_path());
+    rclone_import::Files files = rclone_import::files_for(conf);
+    std::string grab_text;
+    std::string own_text;
+    std::string standard_text;
+    std::string old_store_bytes;
+
+    Old() {
+        REQUIRE(util::path_to_utf8(own).find("grab-tests-home") != std::string::npos);
+        REQUIRE(util::path_to_utf8(standard).find("grab-tests-home") != std::string::npos);
+        clean();
+        fs::create_directories(dir);
+        fs::create_directories(own.parent_path());
+        fs::create_directories(standard.parent_path());
+        const std::string georgian = "\xE1\x83\xA1\xE1\x83\x94\xE1\x83\xA0\xE1\x83\x95\xE1\x83\x94\xE1\x83\xA0\xE1\x83\x98";
+        grab_text = "[grab]\ndefault_remote = Main\n\n# rclone remote [Main]: me@main.example:2222\n[Main]\n"
+                    "rclone_remote = Main\nsearch_roots = /srv\n\n[Box]\nmax_depth = 3\n\n[Box.eu]\n\n[" +
+                    georgian + "]\n\n[Std]\nengine = grab\n";
+        write(conf, grab_text);
+        write(dir / "main_known_hosts", "[main.example]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMAIN\n");
+        own_text = "[Main]\ntype = sftp\nhost = main.example\nport = 2222\nuser = me\nkey_use_agent = true\n"
+                   "known_hosts_file = " + util::path_to_utf8(dir / "main_known_hosts") + "\nshell_type = unix\n"
+                   "md5sum_command = md5sum\nsha1sum_command = sha1sum\n\n"
+                   "[Box]\ntype = sftp\nhost = box.example\nport = 23\nuser = u1\n\n"
+                   "[Box.eu]\nport = 24\n\n[" + georgian + "]\ntype = sftp\nhost = ge.example\nuser = g\nkey_use_agent = true\n";
+        write(own, own_text);
+        standard_text = "[Std]\ntype = sftp\nhost = std.example\nuser = s\nkey_use_agent = true\n";
+        write(standard, standard_text);
+        REQUIRE(secrets::save(old_store, {{"Box", {{"pass", obscured("fake-box-password")}}}}));
+        old_store_bytes = util::read_file(old_store).value_or("");
+    }
+    ~Old() {
+        try {
+            clean();
+        } catch (...) { // only std::bad_alloc, which a destructor must not throw
+            std::fputs("grab_tests: a temp folder was left behind\n", stderr);
+        }
+    }
+    Old(const Old&) = delete;
+    Old& operator=(const Old&) = delete;
+    void clean() const {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::remove_all(files.state_dir, ec);
+        for (const auto& f : {own, standard, old_store, grab_known_hosts_path()}) fs::remove(f, ec);
+    }
+    static void write(const fs::path& p, const std::string& text) { REQUIRE(util::write_file_atomic(p, text)); }
+    [[nodiscard]] std::string grab() const { return util::read_file(conf).value_or(""); }
+    [[nodiscard]] passwords::Store store() const { return passwords::load(passwords::path_in(files.state_dir)).value_or(passwords::Store{}); }
+    [[nodiscard]] static std::string pins() { return util::read_file(grab_known_hosts_path()).value_or(""); }
+    [[nodiscard]] std::optional<rclone_import::Record> record() const {
+        auto text = util::read_file(rclone_import::record_path(files.state_dir));
+        if (!text) return std::nullopt;
+        return rclone_import::from_json(*text);
+    }
+    // What grab never writes, as it was.
+    void untouched() const {
+        CHECK(util::read_file(own).value_or("") == own_text);
+        CHECK(util::read_file(standard).value_or("") == standard_text);
+        CHECK(util::read_file(old_store).value_or("") == old_store_bytes);
+    }
+};
+
+struct Done {
+    std::string grab;
+    passwords::Store store;
+    std::string pins;
+    std::optional<rclone_import::Record> record;
+    bool operator==(const Done&) const = default;
+};
+Done done_of(const Old& old) { return Done{.grab = old.grab(), .store = old.store(), .pins = Old::pins(), .record = old.record()}; }
+
+} // namespace
+
+TEST_CASE("apply: grab 0.19's servers into grab.conf, the store and known_hosts; rclone.conf and the old store untouched") {
+    Old old;
+    const auto applied = rclone_import::apply(old.files);
+    REQUIRE_MESSAGE(applied.has_value(), applied.error_or(""));
+    std::vector<std::string> names;
+    for (const auto& s : applied->imported) names.push_back(s.name);
+    const std::string georgian = "\xE1\x83\xA1\xE1\x83\x94\xE1\x83\xA0\xE1\x83\x95\xE1\x83\x94\xE1\x83\xA0\xE1\x83\x98";
+    CHECK(names == std::vector<std::string>{"Main", "Box", "Box.eu", georgian, "Std"});
+    const auto text = old.grab();
+    CHECK(text.find("[Main]\nhost = main.example\nport = 2222\nuser = me\nauth = agent\nshell_type = unix\n"
+                    "md5sum_command = md5sum\nsha1sum_command = sha1sum\nrclone_remote = Main\nsearch_roots = /srv\n") !=
+          std::string::npos);
+    CHECK(text.find("# rclone remote [Main]: me@main.example:2222\n") != std::string::npos); // comments kept
+    CHECK(text.find("[Box]\nhost = box.example\nport = 23\nuser = u1\nauth = password\nmax_depth = 3\n") != std::string::npos);
+    // The dotted name: its parent's host and user, its own port; the parent's password isn't its.
+    CHECK(text.find("[Box.eu]\nhost = box.example\nport = 24\nuser = u1\nauth = agent\n") != std::string::npos);
+    CHECK(text.find("[Std]\nhost = std.example\nport = 22\nuser = s\nauth = agent\nengine = grab\n") != std::string::npos);
+    CHECK(text.find("fake-box-password") == std::string::npos);
+    CHECK(old.store() == passwords::Store{{"Box", {{"password", passwords::Secret{.binding = {.user = "u1", .host = "box.example", .port = 23},
+                                                                                  .value = "fake-box-password"}}}}});
+    CHECK(Old::pins() == "[main.example]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMAIN\n");
+    const auto record = old.record();
+    REQUIRE(record.has_value());
+    CHECK(record.value_or(rclone_import::Record{}).imported.size() == 5);
+    CHECK(record.value_or(rclone_import::Record{}).banner == names);
+    old.untouched();
+    // Every section now loads as a server.
+    auto doc = ini::parse(text);
+    REQUIRE(doc);
+    for (const auto& s : doc->sections) {
+        if (s.name.empty() || s.name == "grab") continue;
+        CAPTURE(s.name);
+        const auto c = server_conf::parse(s);
+        REQUIRE_MESSAGE(c.has_value(), c.error_or(""));
+        CHECK(c->has_value());
+    }
+
+    // A second run changes nothing, and doesn't even look further than grab.conf and the stamps.
+    const auto before = done_of(old);
+    const auto store_bytes = util::read_file(passwords::path_in(old.files.state_dir)).value_or("");
+    const auto again = rclone_import::apply(old.files);
+    REQUIRE(again.has_value());
+    CHECK(again->imported.empty());
+    CHECK(again->notes.empty());
+    CHECK(done_of(old) == before);
+    CHECK(util::read_file(passwords::path_in(old.files.state_dir)).value_or("") == store_bytes);
+    old.untouched();
+}
+
+TEST_CASE("apply: a removed server doesn't come back; a failed one is tried again when its source changes") {
+    Old old;
+    REQUIRE(rclone_import::apply(old.files));
+    // [Box] removed by hand, then a section of that name without details: never imported again.
+    auto text = old.grab();
+    text = servers::remove_section(text, "Box");
+    text += "\n[Box]\n\n[Late]\n";
+    Old::write(old.conf, text);
+    auto applied = rclone_import::apply(old.files);
+    REQUIRE(applied.has_value());
+    CHECK(applied->imported.empty());
+    CHECK(applied->failed == std::vector<std::string>{"Late"}); // no such remote yet
+    const auto failed_once = old.grab();
+    // Nothing changed: not tried again.
+    applied = rclone_import::apply(old.files);
+    REQUIRE(applied.has_value());
+    CHECK(applied->failed.empty());
+    // 0.19 adds [Late] to its rclone.conf: imported on the next run.
+    Old::write(old.own, util::read_file(old.own).value_or("") + "\n[Late]\ntype = sftp\nhost = late.example\nuser = l\n"
+                                                                 "key_use_agent = true\n");
+    applied = rclone_import::apply(old.files);
+    REQUIRE(applied.has_value());
+    REQUIRE(applied->imported.size() == 1);
+    CHECK(applied->imported[0].name == "Late");
+    CHECK(old.grab().find("[Box]\n\n") != std::string::npos); // still without details
+    CHECK(old.grab() != failed_once);
+}
+
+TEST_CASE("apply: a 'passwords' store that can't be loaded stops the import, nothing written") {
+    Old old;
+    fs::create_directories(old.files.state_dir);
+    const auto store = passwords::path_in(old.files.state_dir);
+    Old::write(store, "grab-passwords-sealed 1\nanother account's");
+    const auto applied = rclone_import::apply(old.files);
+    REQUIRE_FALSE(applied.has_value());
+    CHECK(applied.error().find("saved passwords") != std::string::npos);
+    CHECK(applied.error().find("can't be read") != std::string::npos);
+    CHECK(old.grab() == old.grab_text);
+    CHECK(util::read_file(store).value_or("") == "grab-passwords-sealed 1\nanother account's");
+    CHECK_FALSE(fs::exists(grab_known_hosts_path()));
+    CHECK_FALSE(old.record().has_value());
+    old.untouched();
+}
+
+TEST_CASE("apply: no grab.conf, or nothing waiting, is nothing to do") {
+    Old old;
+    fs::remove(old.conf);
+    const auto none = rclone_import::apply(old.files);
+    REQUIRE(none.has_value());
+    CHECK(none->imported.empty());
+    CHECK_FALSE(fs::exists(old.conf));
+    Old::write(old.conf, "[grab]\n\n[x]\nhost = x.example\nuser = x\nauth = agent\n");
+    CHECK(rclone_import::apply(old.files).has_value());
+    CHECK_FALSE(old.record().has_value()); // not even the record
+}
+
+#ifdef _WIN32
+TEST_CASE("apply: each write failing in turn leaves a state the next run finishes") {
+    // The reference: one run that goes through.
+    Done reference;
+    {
+        Old old;
+        REQUIRE(rclone_import::apply(old.files));
+        reference = done_of(old);
+    }
+    const auto readonly = [](const fs::path& p, bool on) {
+        SetFileAttributesW(p.c_str(), on ? FILE_ATTRIBUTE_READONLY : FILE_ATTRIBUTE_NORMAL);
+    };
+    for (const std::string_view which : {"store", "known_hosts", "grab.conf", "imported.json"}) {
+        CAPTURE(which);
+        Old old;
+        fs::create_directories(old.files.state_dir);
+        fs::path target;
+        if (which == "store") {
+            target = passwords::path_in(old.files.state_dir);
+            REQUIRE(passwords::save(target, {}));
+        } else if (which == "known_hosts") {
+            target = grab_known_hosts_path();
+            Old::write(target, "");
+        } else if (which == "grab.conf") {
+            target = old.conf;
+        } else {
+            target = rclone_import::record_path(old.files.state_dir);
+            Old::write(target, rclone_import::to_json({}));
+        }
+        readonly(target, true);
+        const auto failed = rclone_import::apply(old.files);
+        readonly(target, false);
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error().find("stopped") != std::string::npos);
+        CHECK(failed.error().find("fake-box-password") == std::string::npos);
+        old.untouched();
+        // The next run finishes it.
+        const auto next = rclone_import::apply(old.files);
+        REQUIRE_MESSAGE(next.has_value(), next.error_or(""));
+        const auto now = done_of(old);
+        CHECK(now.grab == reference.grab);
+        CHECK(now.store == reference.store);
+        CHECK(now.pins == reference.pins);
+        if (which == "imported.json") {
+            // grab.conf was written: every server is done, and the next run has nothing left to
+            // import; only the record of it (the window's banner) is missing.
+            REQUIRE(now.record.has_value());
+            CHECK(now.record.value_or(rclone_import::Record{}).imported.empty());
+        } else {
+            CHECK(now.record == reference.record);
+        }
+        old.untouched();
+    }
+}
+#endif
+
+TEST_CASE("the programs run the import: load_context and load_env fill a section in from rclone.conf") {
+    Old old;
+    // load_context imports, then loads the server from grab.conf.
+    auto ctx = engine::load_context(old.conf, std::string("Std"));
+    REQUIRE_MESSAGE(ctx.has_value(), ctx.error_or(""));
+    CHECK(ctx->connection.host == "std.example");
+    CHECK(ctx->remote.known_hosts_file == util::path_to_utf8(grab_known_hosts_path()));
+    CHECK(ctx->imported.size() == 5);
+    // The window's UI thread doesn't: a section still without details is said to be so.
+    Old::write(old.conf, old.grab() + "\n[Late]\n");
+    auto bare = engine::load_context(old.conf, std::string("Late"), false);
+    REQUIRE_FALSE(bare.has_value());
+    CHECK(bare.error().find("no connection details") != std::string::npos);
+    // load_env does too, and says why it couldn't.
+    auto env = server_ops::load_env(old.conf, old.dir);
+    REQUIRE(env.has_value());
+    CHECK(env->imported.empty());
+    REQUIRE(env->import_notes.size() == 1);
+    CHECK(env->import_notes[0].starts_with("[Late] not imported: there is no rclone remote [Late]"));
+    old.untouched();
 }

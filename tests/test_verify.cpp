@@ -245,7 +245,7 @@ TEST_CASE("verify: a server that can't check keeps every copy, not verified") {
          .says = "h refused the login: it accepted none of ssh-agent's keys"},
         {.name = "rclone.conf's shell_type",
          .make = [](Check& c) { c.ctx.remote.shell_type = "powershell"; },
-         .says = "the server can't compute checksums (shell_type = powershell in rclone.conf)"},
+         .says = "the server can't compute checksums (shell_type = powershell in grab.conf)"},
         {.name = "a server that takes too long",
          .make = [](Check& c) {
              c.box.also = [](test::FakeCommand& cmd, std::string_view command) {
@@ -456,10 +456,10 @@ TEST_CASE("verify: what the row and the command say") {
           "10 files verified (MD5); 3 could not be checked (your copy changed since the download, and other reasons)");
 
     verify::Report none;
-    none.files.assign(2, R{Verdict::unchecked, "the server can't compute checksums (shell_type = cmd in rclone.conf)"});
-    CHECK(verify::summary(none, true) == "not verified: the server can't compute checksums (shell_type = cmd in rclone.conf)");
+    none.files.assign(2, R{Verdict::unchecked, "the server can't compute checksums (shell_type = cmd in grab.conf)"});
+    CHECK(verify::summary(none, true) == "not verified: the server can't compute checksums (shell_type = cmd in grab.conf)");
     none.files.resize(1);
-    CHECK(verify::summary(none) == "not verified: the server can't compute checksums (shell_type = cmd in rclone.conf)");
+    CHECK(verify::summary(none) == "not verified: the server can't compute checksums (shell_type = cmd in grab.conf)");
 }
 
 TEST_CASE("verify: a folder whose files failed still says what was verified: the row after the failure, the command before") {

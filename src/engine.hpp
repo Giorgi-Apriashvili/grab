@@ -7,6 +7,7 @@
 #include "config.hpp"
 #include "process.hpp"
 #include "remote.hpp"
+#include "server_conf.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
 
@@ -35,26 +36,43 @@ namespace grab::engine {
 
 // Everything needed to talk to one remote.
 struct Context {
-    GrabConfig config;    // rclone and rclone_config resolved (bundled exe, grab's own file)
+    GrabConfig config;    // rclone resolved (the bundled exe)
     RemoteSettings settings;
-    RcloneRemote remote;  // connection details from rclone.conf
+    RcloneRemote remote;  // connection details from grab.conf (server_conf::to_remote)
     FindMethod method;    // resolved: ssh or rclone (engine = rclone)
-    std::vector<std::string> imported; // remotes imported into grab's rclone.conf just now
+    std::vector<std::string> imported; // servers the import moved from rclone.conf into grab.conf just now
     Engine engine = Engine::rclone;    // effective_engine(settings)
     GrabMethod grab_method = GrabMethod::probe; // how searches and lists run on engine = grab
+    server_conf::Connection connection; // the server's grab.conf section
+    std::filesystem::path passwords;    // grab's store of this configuration (passwords::path_in)
+    std::vector<std::string> import_notes; // that import's notes, "[server] ..."
 };
 
-// grab.conf + the selected remote section + its rclone.conf entry. Errors are ready to show.
-// Also performs the one-time import of referenced remotes into grab's own rclone.conf. rclone is
+// The Context of `settings`, a server of `config` (rclone resolved) whose grab.conf section holds
+// `connection`, in the configuration at `grab_conf` (whose state_dir keeps its passwords).
+[[nodiscard]] Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Connection connection,
+                                   const std::filesystem::path& grab_conf);
+
+// grab.conf + the selected server's section. Errors are ready to show. With `import`, first the
+// one-time move of servers from rclone.conf into grab.conf (rclone_import::apply), which takes
+// the settings lock when a section waits for it; the window's UI thread passes false. rclone is
 // checked (check_rclone) only for an engine = rclone server.
 [[nodiscard]] std::expected<Context, std::string>
-load_context(const std::filesystem::path& config_path, const std::optional<std::string>& remote_name);
+load_context(const std::filesystem::path& config_path, const std::optional<std::string>& remote_name,
+             bool import = true);
 
-// How grab's own SSH client logs in to the context's server (engine = grab): its rclone.conf
-// section, with the secrets of grab's encrypted store, and any the rclone.conf in use keeps
-// itself (obscured, as rclone writes them when it isn't grab's own file). --bind, --contimeout and
-// --timeout in its common_flags apply (ssh::apply_flags; an error when one can't be read), then
-// those of `extra`, the command's connection flags after `--`, so they win as they did for rclone.
+// Whether grab may reach the context's server: grab's known_hosts has a key for its [host]:port
+// (server_conf::pinned, read now). Else "host key not trusted: use Trust", before any rclone
+// process starts or grab's client or ssh dials (RCLONE-REPLACEMENT.md, phase 7: rclone dials 10
+// times per failed handshake, which Main's fail2ban counts). rclone_env, ssh_target and
+// run_over_ssh ask it.
+[[nodiscard]] std::expected<void, std::string> check_pinned(const Context& ctx);
+
+// How grab's own SSH client logs in to the context's server: its grab.conf section, with the
+// secrets grab's store keeps for exactly that login (ssh::target_for), once check_pinned passes.
+// --bind, --contimeout and --timeout in its common_flags apply (ssh::apply_flags; an error when
+// one can't be read), then those of `extra`, the command's connection flags after `--`, so they
+// win as they did for rclone.
 [[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx,
                                                                  std::span<const std::string> extra = {});
 // The connection flags of the context's common_flags that grab's own client doesn't use (all but
@@ -62,16 +80,22 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 [[nodiscard]] std::vector<std::string> unused_flags(const Context& ctx);
 
 // What an rclone run on the context's server gets in its environment, its config in memory
-// (`--config NUL`, config_in_memory; RCLONE-REPLACEMENT.md phase 7, decision 1): each key of the
-// server's section in the rclone.conf in use, read now as rclone reads that file (rclone_conf.hpp:
-// quotes taken off keys and values, %(key)s; ${RCLONE_CONFIG_DIR} as that file's folder, through
-// GRAB_RCLONE_CONFIG_DIR, so rclone expands the value once), and the secrets of the store beside
-// it as rclone keeps them (obscured), as RCLONE_CONFIG_<NAME>_<KEY> (secrets::env_name). Only that
-// run sees them, never grab itself nor another program it starts (review G7), nor another
-// server's run (G84); rclone sees no parent section's keys (G86), as grab doesn't. A password
-// server whose store can't be read is an error, as in load_context. grab's own runs refuse a flag
-// in common_flags that would replace these (rclone_flags::first_refused); `user_copy`, for the
-// --rclone copy and its checks, lets it through.
+// (`--config NUL`, config_in_memory; RCLONE-REPLACEMENT.md phase 7, decision 1), as
+// RCLONE_CONFIG_<NAME>_<KEY> (secrets::env_name): TYPE sftp, HOST, PORT, USER, the login (agent:
+// KEY_USE_AGENT and its KEY_FILE; key: KEY_FILE and KEY_FILE_PASS; password: PASS; stored_key:
+// KEY_PEM as stored; a password saved beside a key too, which rclone tries after it), grab's
+// known_hosts as KNOWN_HOSTS_FILE, SHELL_TYPE, MD5SUM_COMMAND and SHA1SUM_COMMAND ("none" when
+// grab.conf doesn't know them, so rclone doesn't ask the server on every run; unset for
+// `user_copy`, so that a --rclone --verify lets rclone find the sum commands), PATH_OVERRIDE,
+// the section's rclone.<key> lines and the store's rclone extras. Secrets come from grab's store
+// for exactly that login, PASS and KEY_FILE_PASS obscured as rclone takes them (secrets::obscure).
+// A path holding '$' (rclone expands its key_file, pubkey_file and known_hosts_file again) goes
+// in its own GRAB_RCLONE_<KEY> variable, which the value names, since Go doesn't expand what it
+// substituted. Only that run sees them, never grab itself nor another program it starts (review
+// G7), nor another server's run (G84). An unpinned server (check_pinned), or one whose password
+// isn't saved for its login, is an error. grab's own runs refuse a flag in common_flags that
+// would replace these (rclone_flags::first_refused); `user_copy`, for the --rclone copy and its
+// checks, lets it through.
 [[nodiscard]] std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, bool user_copy = false);
 
 // rclone's version from `rclone version`'s output ("rclone v1.75.1").

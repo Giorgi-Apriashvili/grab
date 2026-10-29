@@ -2754,7 +2754,7 @@ const settings = {
   status: '',
 };
 
-const AUTH_TEXT = { password: 'password', key: 'key file', agent: 'ssh-agent' };
+const AUTH_TEXT = { password: 'password', key: 'key file', agent: 'ssh-agent', stored_key: 'key in grab\'s store' };
 // How a server is searched (the backend's search_method): ssh + find or rclone's listing on
 // engine = rclone; on engine = grab find, the folders listed by grab, or find where grab's check
 // finds it.

@@ -1,7 +1,9 @@
+#include "config.hpp"
 #include "engine.hpp"
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "gui_state.hpp"
+#include "server_conf.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -213,13 +215,20 @@ TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's l
         << "@echo off\r\n"
            ">> \"%~dp0calls.log\" echo %*\r\n"
            "echo [{\"Path\":\"a.txt\",\"Name\":\"a.txt\",\"Size\":3,\"ModTime\":\"2026-10-21T10:00:00Z\",\"IsDir\":false}]\r\n";
-    std::ofstream(dir / "rclone.conf", std::ios::binary) << "[Main]\ntype = sftp\nhost = main.example\nuser = u\n";
-    engine::Context ctx;
-    ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
-    ctx.config.rclone_config = dir / "rclone.conf"; // the server rclone_env gives rclone
-    ctx.settings.rclone_remote = "Main";
+    // The server as grab.conf has it, pinned in grab's known_hosts (the runner's scratch APPDATA).
+    server_conf::Connection c;
+    c.host = "main.example";
+    c.user = "u";
+    c.auth = server_conf::Auth::agent;
+    RemoteSettings settings;
+    settings.name = "Main";
+    settings.rclone_remote = "Main";
     // --rclone's check before its copy takes the flags the copy does (rclone_flags::first_refused).
-    ctx.settings.common_flags = {"--sftp-port", "2222"};
+    settings.common_flags = {"--sftp-port", "2222"};
+    auto ctx = engine::make_context(GrabConfig{}, settings, c, dir / "grab.conf");
+    ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+    std::filesystem::create_directories(grab_known_hosts_path().parent_path());
+    std::ofstream(grab_known_hosts_path(), std::ios::binary) << "main.example ssh-ed25519 FAKEKEY\n";
     folder::Job job;
     job.ctx = &ctx; // no job.connections
     job.remote_path = "/tmp/f";
@@ -233,6 +242,7 @@ TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's l
     CHECK(calls.find("--checkers") == std::string::npos); // rclone's own walk
     CHECK(calls.find("--config NUL --sftp-port 2222") != std::string::npos);
     std::filesystem::remove_all(dir);
+    std::filesystem::remove(grab_known_hosts_path());
 }
 #endif
 

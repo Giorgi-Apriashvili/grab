@@ -1,10 +1,12 @@
 #include "server_cli.hpp"
 
 #include "config.hpp"
+#include "server_conf.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
@@ -67,19 +69,19 @@ int server_list(const Env& env) {
         std::println("No servers yet. Add one with:  grab server add");
         return exit_ok;
     }
-    std::println("Servers in {}  (connections: {})", util::path_to_utf8(env.grab_conf),
-                 util::path_to_utf8(env.rclone_conf));
+    std::println("Servers in {}", util::path_to_utf8(env.grab_conf));
     for (const auto& s : server_ops::list_servers(env)) {
         const std::string mark = s.is_default ? "*" : " ";
         if (!s.error.empty()) {
             std::println("{} {:<14} not usable: {}", mark, s.name, s.error);
             continue;
         }
-        const char* auth = s.auth == servers::Auth::agent      ? "ssh-agent"
-                           : s.auth == servers::Auth::key_file ? "key file"
-                                                               : "password";
+        const char* auth = s.auth == servers::Auth::agent        ? "ssh-agent"
+                           : s.auth == servers::Auth::key        ? "key file"
+                           : s.auth == servers::Auth::stored_key ? "key in grab's store"
+                                                                 : "password";
         const std::string hostkey =
-            s.host_key_pinned ? "host key pinned" : "host key NOT checked (grab server trust " + s.name + ")";
+            s.host_key_pinned ? "host key pinned" : "host key not trusted (grab server trust " + s.name + ")";
         // engine = grab: grab's own client, with find or by listing folders.
         const char* search = s.search == "ssh"    ? "search via ssh"
                              : s.search == "rclone" ? "search via rclone"
@@ -117,20 +119,7 @@ std::optional<std::string> ask_until(std::string_view prompt, std::string_view d
 // Answers come from the console, or from piped stdin one per line (scriptable); running out
 // of input aborts without writing anything.
 int server_add(const Env& env, const std::string& prefill) {
-    // Checked before the questions: an rclone.conf that can't be read could hide a remote of the
-    // name about to be chosen.
-    auto rclone_doc = server_ops::read_rclone_conf(env);
-    if (!rclone_doc) {
-        error(rclone_doc.error());
-        return exit_config;
-    }
-    auto taken = [&](const std::string& name) -> std::optional<std::string> {
-        if (auto why = servers::validate_name(name)) return why;
-        return server_ops::name_taken(env, *rclone_doc, name);
-    };
-    auto required = [](const std::string& v) -> std::optional<std::string> {
-        return v.empty() ? std::optional<std::string>("required") : std::nullopt;
-    };
+    auto taken = [&](const std::string& name) { return server_ops::name_taken(env, name); };
 
     std::println(stderr, "Add a server (Enter keeps the value in brackets, Ctrl+C cancels).\n");
     auto aborted = [] {
@@ -141,7 +130,7 @@ int server_add(const Env& env, const std::string& prefill) {
     auto name = ask_until("Name (used with -r)", prefill, taken);
     if (!name) return aborted();
     s.name = *name;
-    auto host = ask_until("Host name or IP", "", required);
+    auto host = ask_until("Host name or IP", "", [](const std::string& v) { return server_conf::check_host(v); });
     if (!host) return aborted();
     s.host = *host;
     auto port = ask_until("SSH port", "22", [](const std::string& v) -> std::optional<std::string> {
@@ -149,7 +138,7 @@ int server_add(const Env& env, const std::string& prefill) {
     });
     if (!port) return aborted();
     s.port = *parse_int(*port, 1, 65535);
-    auto user = ask_until("User name", "", required);
+    auto user = ask_until("User name", "", [](const std::string& v) { return server_conf::check_user(v); });
     if (!user) return aborted();
     s.user = *user;
 
@@ -174,12 +163,10 @@ int server_add(const Env& env, const std::string& prefill) {
             std::println(stderr, "  required");
         }
     } else if (*auth == "2") {
-        s.auth = servers::Auth::key_file;
-        auto key = ask_until("Private key file", "", [](const std::string& v) -> std::optional<std::string> {
+        s.auth = servers::Auth::key;
+        auto key = ask_until("Private key file", "", [](const std::string& v) {
             std::error_code ec;
-            return std::filesystem::is_regular_file(util::path_from_utf8(v), ec)
-                       ? std::nullopt
-                       : std::optional<std::string>("no such file");
+            return server_conf::check_key_file(v, std::filesystem::is_regular_file(util::path_from_utf8(v), ec));
         });
         if (!key) return aborted();
         s.key_file = *key;
@@ -192,7 +179,8 @@ int server_add(const Env& env, const std::string& prefill) {
         s.auth = servers::Auth::agent;
     }
 
-    auto roots = ask("Folders to search, comma-separated (Enter = the login home)", "");
+    auto roots = ask_until("Folders to search, comma-separated (Enter = the login home)", "",
+                           [](const std::string& v) { return server_conf::check_value(v); });
     if (!roots) return aborted();
     for (const auto& r : util::split(*roots, ',')) s.search_roots.push_back(normalize_root(r));
     auto depth = ask_until("Search depth", "4", [](const std::string& v) -> std::optional<std::string> {
@@ -208,23 +196,13 @@ int server_add(const Env& env, const std::string& prefill) {
         return exit_config;
     }
 
-    std::optional<std::string> obscured;
-    if (secret) {
-        auto ob = server_ops::obscure(env, *secret);
-        if (!ob) {
-            error(ob.error());
-            return exit_config;
-        }
-        obscured = std::move(*ob);
-    }
-    auto added = server_ops::add_server(env, s, obscured, *keys);
+    auto added = server_ops::add_server(env, s, secret, *keys);
     if (!added) {
         error(added.error());
         return exit_config;
     }
     if (!added->empty()) std::println(stderr, "note: {}", *added);
-    std::println(stderr, "\nSaved {} to {} and {}.", s.name, util::path_to_utf8(env.grab_conf),
-                 util::path_to_utf8(env.rclone_conf));
+    std::println(stderr, "\nSaved {} to {}.", s.name, util::path_to_utf8(env.grab_conf));
 
     // Connection test: the same paths searches and downloads will use. The env is reloaded so
     // it sees the server just written.
@@ -255,7 +233,7 @@ int server_add(const Env& env, const std::string& prefill) {
     }
     if (test->ssh_ok) {
         std::string why = test->ssh_error;
-        if (s.auth == servers::Auth::key_file && secret) {
+        if (s.auth == servers::Auth::key && secret) {
             why += " (a passphrase-protected key needs ssh-agent: ssh-add <key file>)";
         }
         std::println(stderr, "  ssh (searches):     {}", *test->ssh_ok ? "OK" : "FAILED: " + why);
@@ -271,17 +249,17 @@ int server_add(const Env& env, const std::string& prefill) {
 // ---- trust / remove --------------------------------------------------------------------------
 
 int server_trust(const Env& env, const std::string& name) {
-    const auto* s = server_ops::find_server(env.cfg, name);
-    if (s == nullptr) {
+    const auto list = server_ops::list_servers(env);
+    const auto s = std::ranges::find(list, name, &server_ops::ServerInfo::name);
+    if (s == list.end()) {
         error(std::format("no server called {} in grab.conf", name));
         return exit_not_found;
     }
-    auto remote = load_rclone_remote(env.rclone_conf, s->rclone_remote);
-    if (!remote) {
-        error(remote.error());
+    if (!s->error.empty()) {
+        error(s->error);
         return exit_config;
     }
-    auto keys = fetch_host_key(remote->host, remote->port);
+    auto keys = fetch_host_key(s->host, s->port);
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -304,7 +282,7 @@ int server_remove(const Env& env, const std::string& name) {
     }
     // Confirmation comes from the console or piped stdin (`echo y | grab server remove NAME`);
     // no answer at all means no.
-    if (!confirm(std::format("Remove {} from grab.conf and grab's rclone.conf?", name))) {
+    if (!confirm(std::format("Remove {} from grab.conf, with its saved password and host keys?", name))) {
         std::println(stderr, "Nothing removed.");
         return exit_ok;
     }
@@ -328,9 +306,10 @@ int run_server_command(const Options& opts) {
         return exit_config;
     }
     if (!env->imported.empty()) {
-        std::println(stderr, "grab: imported {} from rclone.conf into {}", util::join(env->imported, ", "),
-                     util::path_to_utf8(grab_rclone_config_path()));
+        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (rclone.conf unchanged)",
+                     util::join(env->imported, ", "), util::path_to_utf8(env->grab_conf));
     }
+    for (const auto& note : env->import_notes) std::println(stderr, "grab: note: {}", note);
     const std::string& sub = opts.server_args.at(0);
     const std::string arg = opts.server_args.size() > 1 ? opts.server_args[1] : std::string{};
     if (sub == "list") return server_list(*env);

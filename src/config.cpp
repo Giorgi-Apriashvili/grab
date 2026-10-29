@@ -188,10 +188,6 @@ std::filesystem::path standard_rclone_config_path() {
     return util::config_home() / "rclone" / "rclone.conf";
 }
 
-std::filesystem::path effective_rclone_config(const GrabConfig& cfg) {
-    return cfg.rclone_config.value_or(grab_rclone_config_path());
-}
-
 namespace {
 // This thread's hold on the settings lock: how many SettingsLocks, and the file lock they share.
 thread_local int settings_depth = 0;
@@ -228,98 +224,6 @@ std::string resolve_rclone_exe(const GrabConfig& cfg, const std::filesystem::pat
     std::error_code ec;
     if (!exe_dir.empty() && std::filesystem::is_regular_file(bundled, ec)) return util::path_to_utf8(bundled);
     return "rclone";
-}
-
-std::string section_text(const ini::Section& section) {
-    std::string out = std::format("[{}]\n", section.name);
-    for (const auto& [key, value] : section.values) out += std::format("{} = {}\n", key, value);
-    return out;
-}
-
-namespace {
-
-// What an import would do: `text` is `to` with the sections it lacks appended (empty when
-// nothing is to be written).
-struct ImportPlan {
-    std::string text;
-    std::vector<std::string> imported;
-    std::vector<std::string> not_found;
-};
-
-std::expected<ImportPlan, std::string> plan_import(const std::vector<std::string>& names,
-                                                   const std::filesystem::path& from,
-                                                   const std::filesystem::path& to) {
-    auto read = util::read_file_if_exists(to);
-    if (!read) return util::fail(read.error());
-    std::string target_text = read->value_or("");
-    auto target = ini::parse(target_text);
-    if (!target) return util::failf("{}: {}", util::path_to_utf8(to), target.error());
-
-    std::vector<std::string> wanted;
-    for (const auto& name : names) {
-        if (target->find(name) == nullptr && std::ranges::find(wanted, name) == wanted.end()) {
-            wanted.push_back(name);
-        }
-    }
-    ImportPlan plan;
-    if (wanted.empty()) return plan;
-
-    std::optional<ini::Document> source;
-    if (auto text = util::read_file(from); text && !is_encrypted_rclone_config(*text)) {
-        if (auto doc = ini::parse(*text)) source = std::move(*doc);
-    }
-    std::string appended;
-    for (const auto& name : wanted) {
-        const ini::Section* s = source ? source->find(name) : nullptr;
-        if (s == nullptr) {
-            plan.not_found.push_back(name);
-            continue;
-        }
-        appended += (target_text.empty() && appended.empty() ? "" : "\n") + section_text(*s);
-        plan.imported.push_back(name);
-    }
-    if (appended.empty()) return plan;
-    if (!target_text.empty() && !target_text.ends_with('\n')) target_text += '\n';
-    plan.text = target_text + appended;
-    return plan;
-}
-
-} // namespace
-
-ImportResult import_rclone_remotes(const std::vector<std::string>& names,
-                                   const std::filesystem::path& from, const std::filesystem::path& to) {
-    ImportResult result;
-    auto plan = plan_import(names, from, to);
-    if (plan && !plan->text.empty()) {
-        // Something to write: again under the settings lock, from the file as it is then, since
-        // another grab may be importing or changing it at the same time (review G173).
-        auto lock = lock_settings();
-        if (!lock) {
-            result.error = lock.error();
-            return result;
-        }
-        plan = plan_import(names, from, to);
-        if (plan && !plan->text.empty()) {
-            if (auto written = util::write_file_atomic(to, plan->text); !written) {
-                result.error = written.error();
-                return result;
-            }
-            result.imported = std::move(plan->imported);
-        }
-    }
-    if (!plan) {
-        result.error = plan.error();
-        return result;
-    }
-    result.not_found = std::move(plan->not_found);
-    return result;
-}
-
-ImportResult migrate_rclone_remotes(const GrabConfig& cfg) {
-    if (cfg.rclone_config) return {}; // an explicit rclone.conf is used as is
-    std::vector<std::string> names;
-    for (const auto& r : cfg.remotes) names.push_back(r.rclone_remote);
-    return import_rclone_remotes(names, standard_rclone_config_path(), grab_rclone_config_path());
 }
 
 std::expected<const RemoteSettings*, std::string>
@@ -484,26 +388,6 @@ std::vector<std::string> editor_command(const std::vector<std::string>& candidat
     return argv;
 }
 
-std::expected<RcloneRemote, std::string> load_rclone_remote(const std::filesystem::path& p,
-                                                            std::string_view name) {
-    auto text = util::read_file(p);
-    if (!text) {
-        return util::failf("{} (set rclone_config in grab.conf if rclone.conf lives elsewhere)",
-                           text.error());
-    }
-    if (is_encrypted_rclone_config(*text)) {
-        return util::failf("{} is encrypted and grab cannot decrypt it to read the remote's host, "
-                           "user and port; point rclone_config in grab.conf at an unencrypted "
-                           "rclone.conf",
-                           util::path_to_utf8(p));
-    }
-    auto doc = ini::parse(*text);
-    if (!doc) return util::failf("{}: {}", util::path_to_utf8(p), doc.error());
-    auto r = parse_rclone_remote(*doc, name);
-    if (!r) return util::failf("{}: {}", util::path_to_utf8(p), r.error());
-    return r;
-}
-
 // ---- generating grab.conf from rclone.conf ---------------------------------------------------
 
 namespace {
@@ -578,11 +462,12 @@ std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& se
 }
 
 std::string remote_section(const RcloneRemote& remote, const std::vector<std::string>& search_roots,
-                           int max_depth) {
+                           int max_depth, const std::vector<std::pair<std::string, std::string>>& connection) {
     std::string s;
     s += std::format("# rclone remote [{}]: {}\n", remote.name, describe_remote(remote));
     s += std::format("[{}]\n", section_name_for(remote.name));
-    s += std::format("rclone_remote = {}\n", remote.name);
+    if (connection.empty()) s += std::format("rclone_remote = {}\n", remote.name);
+    for (const auto& [key, value] : connection) s += std::format("{} = {}\n", key, value);
     s += "# auto = ssh + find when the server uses a key file or ssh-agent, otherwise rclone lsf.\n";
     s += "# With engine = grab: auto = find where grab's check finds GNU find on the server, else by\n";
     s += "# listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.\n";
@@ -613,8 +498,9 @@ std::string generate_grab_config(const ini::Document* rclone, std::string_view r
     } else {
         out += "# Generated by `grab --init`. No servers yet: add one with `grab server add`.\n";
     }
-    out += "# Connection details (host, user, port, key, password) live in grab's own rclone.conf\n"
-           "# next to this file; manage servers with `grab server add | list | trust | remove`.\n"
+    out += "# Each server's section holds its connection details (host, port, user, auth); passwords\n"
+           "# are kept in grab's own encrypted store, never here. Manage servers with\n"
+           "# `grab server add | list | trust | remove`.\n"
            "# grab.conf.example explains every key.\n"
            "# Comments must be on their own line; a ; or # after a value is part of the value.\n";
     if (!skipped.empty()) {
@@ -624,7 +510,8 @@ std::string generate_grab_config(const ini::Document* rclone, std::string_view r
     out += "\n[grab]\n";
     out += "# rclone executable. Blank = the rclone.exe bundled with grab (else rclone on PATH).\n";
     out += "rclone =\n";
-    out += "# rclone.conf with the server connections. Blank = grab's own (%APPDATA%\\grab\\rclone.conf).\n";
+    out += "# The rclone.conf whose servers a section without `host` is imported from, once. Blank = grab's\n"
+           "# own (%APPDATA%\\grab\\rclone.conf), then rclone's.\n";
     out += "rclone_config =\n";
     out += "ssh = ssh\n";
     out += "# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.\n";

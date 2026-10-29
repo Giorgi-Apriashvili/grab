@@ -91,16 +91,33 @@ std::optional<Store> from_text(std::string_view text) {
     return store;
 }
 
+namespace {
+
+// The store a file's bytes hold; nullopt when they can't be decrypted or parsed.
+std::optional<Store> unseal(std::string_view sealed) {
+    if (!sealed.starts_with(sealed_header)) return std::nullopt;
+    const auto text = util::unprotect_for_user(sealed.substr(sealed_header.size()), purpose);
+    if (!text) return std::nullopt;
+    return from_text(*text);
+}
+
+} // namespace
+
+std::expected<ForChange, std::string> load_for_change(const fs::path& file) {
+    auto data = util::read_file_if_exists(file);
+    if (!data) return util::fail(data.error());
+    if (!*data) return ForChange{};
+    if (auto store = unseal(**data)) return ForChange{.store = std::move(*store), .set_aside = std::nullopt};
+    auto moved = util::move_aside(file, "unreadable");
+    if (!moved) return util::fail(moved.error());
+    return ForChange{.store = {}, .set_aside = std::move(*moved)};
+}
+
 std::expected<Store, std::string> load(const fs::path& file) {
     auto data = util::read_file_if_exists(file);
     if (!data) return util::fail(data.error());
     if (!*data) return Store{};
-    std::optional<Store> store;
-    if (const std::string_view sealed = **data; sealed.starts_with(sealed_header)) {
-        if (const auto text = util::unprotect_for_user(sealed.substr(sealed_header.size()), purpose)) {
-            store = from_text(*text);
-        }
-    }
+    auto store = unseal(**data);
     if (!store) {
         return util::failf("the saved passwords in {} can't be read (they belong to another Windows account, or the "
                            "file is damaged)",
@@ -132,6 +149,15 @@ std::optional<std::string> value_for(const Store& store, std::string_view server
     const auto* secret = find(store, server, key);
     if (secret == nullptr || secret->binding != login) return std::nullopt;
     return secret->value;
+}
+
+std::string why_none(const Store& store, std::string_view server, std::string_view key, const Binding& login) {
+    const std::string_view what = key == password ? "password" : key == passphrase ? "key passphrase" : key;
+    if (const auto* secret = find(store, server, key); secret != nullptr && secret->binding != login) {
+        return std::format("the saved {} is for {}, not {}: enter it again with Edit", what, secret->binding.text(),
+                           login.text());
+    }
+    return std::format("no {} is saved: enter it with Edit", what);
 }
 
 } // namespace grab::passwords

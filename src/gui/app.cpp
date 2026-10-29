@@ -18,6 +18,7 @@
 #include "rclone.hpp"
 #include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
+#include "rclone_import.hpp"
 #include "space.hpp"
 #include "ssh_read.hpp"
 #include "util.hpp"
@@ -83,15 +84,6 @@ int int_of(const Value& msg, std::string_view key, int fallback = 0) {
 bool bool_of(const Value& msg, std::string_view key) {
     const Value* v = msg.find(key);
     return v != nullptr && v->kind == Value::Kind::boolean && v->boolean;
-}
-
-const char* auth_name(servers::Auth a) {
-    switch (a) {
-    case servers::Auth::key_file: return "key";
-    case servers::Auth::agent: return "agent";
-    case servers::Auth::password: break;
-    }
-    return "password";
 }
 
 // Bandwidth priority names and weights (4:2:1).
@@ -165,6 +157,24 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     restore_queue();
     lists_dir_ = file_list::dir_for(config_path_);
     prune_lists();
+    // grab 0.19's servers move from rclone.conf into grab.conf once (rclone_import.hpp), here on
+    // the settings thread before its first server list, so the page's list (send_init, UI thread)
+    // never waits on the settings lock for it; the list is sent again once it's done.
+    settings_task([this](std::stop_token) {
+        auto applied = rclone_import::apply(rclone_import::files_for(config_path_));
+        if (applied && applied->imported.empty() && applied->failed.empty()) return;
+        host_.defer([this, why = applied ? std::string() : applied.error()] {
+            if (!why.empty()) notices_.push_back(why);
+            if (!page_ready_) return; // its init takes the list and the notices
+            send_init();
+            if (!notices_.empty()) {
+                Value v = Value::make_object();
+                v.set("type", str("error"));
+                v.set("message", str(util::join(std::exchange(notices_, {}), " ")));
+                post(v);
+            }
+        });
+    });
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {
         workers_.emplace_back([this](std::stop_token stop) { worker_loop(std::move(stop)); });
@@ -505,6 +515,27 @@ void App::forget_server_previews(const std::string& server) {
     pools_.forget_login_failure(server);
 }
 
+void App::forget_server(const std::string& server) {
+    forget_server_previews(server);
+    pools_.forget(server);
+    {
+        std::lock_guard lock(mutex_);
+        learned_.erase(server);
+    }
+    // "<step>:<server>"; a copy of the name, for the UI thread's turn below.
+    const auto of_server = [server](const auto& kv) {
+        const auto colon = kv.first.find(':');
+        return colon != std::string::npos && std::string_view(kv.first).substr(colon + 1) == server;
+    };
+    {
+        std::lock_guard lock(timings_mutex_);
+        std::erase_if(timings_, of_server);
+    }
+    host_.defer([this, of_server] {
+        if (std::erase_if(state_.timings, of_server) > 0) save_state();
+    });
+}
+
 preview::Fetched App::preview_answer(const preview::Previews::Job& job, PreviewHold& hold) {
     auto fail = [](preview::Answer answer) {
         return preview::Fetched{.answer = std::move(answer), .stamp = {}, .keep = false};
@@ -674,6 +705,7 @@ void App::on_message(const std::string& text) {
     const std::string type = msg->string_of("type").value_or("");
 
     if (type == "init") {
+        page_ready_ = true;
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
@@ -848,7 +880,7 @@ void App::on_message(const std::string& text) {
                 auto note = server_ops::remove_server(*env, name);
                 if (!note) return settings_error(note.error());
                 if (!note->empty()) settings_error(*note);
-                forget_server_previews(name);
+                forget_server(name);
             } else if (auto done = server_ops::set_default(*env, name); !done) {
                 return settings_error(done.error());
             }
@@ -878,7 +910,8 @@ void App::send_init() {
         for (const auto& r : cfg->remotes) {
             Value entry = Value::make_object();
             entry.set("name", str(r.name));
-            auto ctx = engine::load_context(config_path_, r.name);
+            // Without the import, which the settings thread runs: this is the UI thread.
+            auto ctx = engine::load_context(config_path_, r.name, false);
             if (ctx) {
                 entry.set("host", str(ctx->remote.host));
                 entry.set("user", str(ctx->remote.user));
@@ -1613,7 +1646,9 @@ void App::suggest(const std::string& remote, const std::string& path) {
     v.set("remote", str(remote));
     v.set("path", str(path));
     Value names = Value::make_array();
-    if (auto ctx = engine::load_context(config_path_, remote)) {
+    // On the UI thread, so without the import (the settings thread does it at start-up): it
+    // would take the settings lock and decrypt the stores on every key typed.
+    if (auto ctx = engine::load_context(config_path_, remote, false)) {
         const std::string folder = browse::address_path(path);
         const auto view = list_view(remote, *ctx);
         if (!view.list) {
@@ -1807,7 +1842,8 @@ void App::post_servers(const server_ops::Env& env) const {
         v.set("host", str(s.host));
         v.set("user", str(s.user));
         v.set("port", num(s.port));
-        v.set("auth", str(auth_name(s.auth)));
+        // "password", "key", "agent", or "stored_key" (an imported key_pem, kept as it is on Edit).
+        v.set("auth", str(std::string(server_conf::auth_name(s.auth))));
         v.set("keyFile", str(s.key_file));
         v.set("search", str(s.search)); // search_method(): ssh, rclone; find, walk, probe on grab
         v.set("engine", str(s.engine == Engine::grab ? "grab" : "rclone"));
@@ -1861,8 +1897,8 @@ void App::save_server(const Value& msg) {
     s.port = int_of(msg, "port");
     s.max_depth = int_of(msg, "depth");
     const std::string auth = msg.string_of("auth").value_or("password");
-    s.auth = auth == "key" ? servers::Auth::key_file : auth == "agent" ? servers::Auth::agent : servers::Auth::password;
-    if (s.auth == servers::Auth::key_file) s.key_file = std::string(util::trim(msg.string_of("keyFile").value_or("")));
+    s.auth = server_conf::parse_auth(auth).value_or(servers::Auth::password);
+    if (s.auth == servers::Auth::key) s.key_file = std::string(util::trim(msg.string_of("keyFile").value_or("")));
     if (const Value* roots = msg.find("roots"); roots != nullptr && roots->kind == Value::Kind::array) {
         for (const auto& r : roots->items) {
             if (r.kind == Value::Kind::string && !util::trim(r.str).empty()) {
@@ -1883,13 +1919,8 @@ void App::save_server(const Value& msg) {
     if (!editing) {
         if (auto why = servers::validate_name(s.name)) return invalid("name", *why);
     }
-    if (s.host.empty()) return invalid("host", "required");
-    if (s.port < 1 || s.port > 65535) return invalid("port", "a number from 1 to 65535");
-    if (s.user.empty()) return invalid("user", "required");
-    std::error_code ec;
-    if (s.auth == servers::Auth::key_file && !std::filesystem::is_regular_file(util::path_from_utf8(s.key_file), ec)) {
-        return invalid("keyFile", "no such file");
-    }
+    // The checks grab.conf's details get everywhere (G5, G28).
+    if (auto problem = server_ops::check_server(s)) return invalid(problem->field.c_str(), problem->why);
     if (s.max_depth < 1 || s.max_depth > 64) return invalid("depth", "a number from 1 to 64");
     if (const int conns = int_of(msg, "connections"); conns != 0) { // 0 or missing: automatic
         if (conns < 1 || conns > 64) return invalid("connections", "a number from 1 to 64, or blank for automatic");
@@ -1909,15 +1940,15 @@ void App::save_server(const Value& msg) {
             auto it = std::ranges::find(list, s.name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + s.name);
             if (p.secret.empty() && server_ops::edit_needs_password(*it, s)) {
-                return invalid("secret", it->auth == servers::Auth::password ? "enter the password again for the new host or user"
-                                                                              : "enter the password");
+                return invalid("secret", it->auth == servers::Auth::password
+                                             ? "enter the password again for the new user, host or port"
+                                             : "enter the password");
             }
             need_keys = it->error.empty() ? server_ops::edit_needs_host_key(*it, s) : true;
+            p.moved = it->host != s.host || it->port != s.port || it->user != s.user;
         } else {
             p.kind = Pending::Kind::add;
-            auto rclone_doc = server_ops::read_rclone_conf(*env);
-            if (!rclone_doc) return settings_error(rclone_doc.error());
-            if (auto why = server_ops::name_taken(*env, *rclone_doc, s.name)) return invalid("name", *why);
+            if (auto why = server_ops::name_taken(*env, s.name)) return invalid("name", *why);
             if (s.auth == servers::Auth::password && p.secret.empty()) return invalid("secret", "enter the password");
         }
         if (!need_keys) return apply_pending(std::move(p), stop);
@@ -1935,30 +1966,30 @@ void App::save_server(const Value& msg) {
 void App::apply_pending(Pending p, std::stop_token stop) {
     auto env = load_env();
     if (!env) return settings_error(env.error());
-    std::optional<std::string> obscured;
-    if (!p.secret.empty()) {
-        auto ob = server_ops::obscure(*env, p.secret.value());
-        p.secret.wipe();
-        if (!ob) return settings_error(ob.error());
-        obscured = std::move(*ob);
-    }
+    // Plain into grab's store (encrypted there), and wiped here once handed over.
+    std::optional<std::string> secret;
+    if (!p.secret.empty()) secret = p.secret.value();
+    p.secret.wipe();
     std::expected<std::string, std::string> done; // a note to show, when it worked
     switch (p.kind) {
     case Pending::Kind::add:
-        done = server_ops::add_server(*env, p.server, obscured, p.keys);
+        done = server_ops::add_server(*env, p.server, secret, p.keys);
         break;
     case Pending::Kind::edit:
-        done = server_ops::update_server(*env, p.server, obscured,
+        done = server_ops::update_server(*env, p.server, secret,
                                          p.keys.lines.empty() ? std::nullopt : std::optional(p.keys));
         break;
     case Pending::Kind::trust:
         done = server_ops::trust_server(*env, p.server.name, p.keys).transform([] { return std::string{}; });
         break;
     }
+    if (secret) std::fill(secret->begin(), secret->end(), '\0');
     if (!done) return settings_error(done.error());
     if (!done->empty()) settings_error(*done);
-    // Its previews kept may be another server's files now, and a login that failed may work.
-    forget_server_previews(p.server.name);
+    // Its previews kept may be another server's files now, and a login that failed may work; a
+    // server at another login also loses what grab learned for the old one (G122).
+    if (p.moved) forget_server(p.server.name);
+    else forget_server_previews(p.server.name);
     // An explicit connection limit replaces whatever grab learned for this server.
     if (p.server.max_connections) {
         {
@@ -2158,7 +2189,7 @@ App::Needed App::needed_for(const Value& groups, const std::filesystem::path& de
                 continue;
             }
             if (!view) {
-                auto ctx = engine::load_context(config_path_, remote);
+                auto ctx = engine::load_context(config_path_, remote, false);
                 view = ctx ? list_view(remote, *ctx) : ListView{};
             }
             if (!view->index) {
@@ -2243,7 +2274,7 @@ std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::files
             std::error_code ec;
             if (!std::filesystem::is_directory(folder_dir, ec)) continue;
             if (!view) {
-                auto ctx = engine::load_context(config_path_, remote);
+                auto ctx = engine::load_context(config_path_, remote, false);
                 view = ctx ? list_view(remote, *ctx) : ListView{};
             }
             if (!view->index) continue;

@@ -67,12 +67,29 @@ std::string build_find_command(const FindRequest& req) {
     return cmd;
 }
 
+std::string ssh_file_value(std::string_view path) {
+    std::string out = "\"";
+    for (const char c : path) {
+#ifdef _WIN32
+        if (c == '\\') {
+            out += '/';
+            continue;
+        }
+#endif
+        if (c == '%') out += '%';
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
 std::vector<std::string> build_ssh_argv(const std::string& ssh_exe, const RcloneRemote& remote,
                                         std::span<const std::string> ssh_options,
                                         const std::string& remote_command) {
     std::vector<std::string> argv{ssh_exe, "-T", "-p", std::to_string(remote.port)};
     if (remote.key_file) {
-        argv.insert(argv.end(), {"-i", *remote.key_file, "-o", "IdentitiesOnly=yes"});
+        // Not -i: ssh expands '%' tokens in it too, so a key in "D:\keys@%" would be another file.
+        argv.insert(argv.end(), {"-o", "IdentityFile=" + ssh_file_value(*remote.key_file), "-o", "IdentitiesOnly=yes"});
     }
     if (remote.known_hosts_file) {
 #ifdef _WIN32
@@ -81,7 +98,7 @@ std::vector<std::string> build_ssh_argv(const std::string& ssh_exe, const Rclone
         const char* no_file = "/dev/null";
 #endif
         // Only grab's pins count, and ssh adds none behind grab's back (review G4, G87).
-        argv.insert(argv.end(), {"-o", "UserKnownHostsFile=" + *remote.known_hosts_file, "-o",
+        argv.insert(argv.end(), {"-o", "UserKnownHostsFile=" + ssh_file_value(*remote.known_hosts_file), "-o",
                                  "StrictHostKeyChecking=yes", "-o", std::string("GlobalKnownHostsFile=") + no_file,
                                  "-o", "UpdateHostKeys=no"});
     }
