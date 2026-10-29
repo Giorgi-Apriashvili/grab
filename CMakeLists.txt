@@ -58,6 +58,10 @@ add_library(grab_core STATIC
     src/file_list.cpp
     src/secrets.cpp
     src/secrets_reveal.cpp
+    src/passwords.cpp
+    src/rclone_conf.cpp
+    src/rclone_import.cpp
+    src/server_conf.cpp
     src/progress_line.cpp
     src/rate.cpp
     src/schedule.cpp

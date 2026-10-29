@@ -59,6 +59,12 @@ struct ForChange {
 // without padding of a 16-byte IV and the text encrypted with AES-256-CTR under a key rclone
 // publishes (obscuring hides a value from a glance, nothing more). nullopt when it isn't one.
 [[nodiscard]] std::optional<std::string> reveal(std::string_view obscured);
+// The reverse, as rclone's `obscure` makes it: a new random IV each time, so the same text is
+// obscured differently each time and `reveal` (grab's or rclone's) gives it back. Only for a
+// secret that goes into one rclone run's environment (engine::rclone_env), which takes passwords
+// and passphrases in this form alone; never through another program's stdin or command line.
+// nullopt when no random IV can be had.
+[[nodiscard]] std::optional<std::string> obscure(std::string_view plain);
 
 // rclone.conf text without its secret lines, and the secrets taken from it. Comments, other
 // keys, order and line endings stay as they were.

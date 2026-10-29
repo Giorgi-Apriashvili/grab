@@ -433,6 +433,37 @@ TEST_CASE("rclone_env: a server's section and its secrets as its own run's RCLON
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("rclone_env reads the section as rclone does: quoted keys, %(key)s, refused files (phase 7)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-rclone-env-reader";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto conf = dir / "rclone.conf";
+    std::ofstream(conf, std::ios::binary) << "dir = /srv/keys\n"
+                                             "[q]\n"
+                                             "type = sftp\n"
+                                             "\"host\" = q.example\n"
+                                             "`user` : me\n"
+                                             "key_file = %(dir)s/id_q\n"
+                                             "shell_type = %(shell)s\n"
+                                             "shell = unix\n"
+                                             "md5sum_command = %(nothing)s\n";
+    using Var = std::pair<std::string, std::string>;
+    const auto env = engine::rclone_env(env_context(conf, "q", true));
+    REQUIRE_MESSAGE(env, env.error_or(""));
+    CHECK(env->set == std::vector<Var>{{"RCLONE_CONFIG_Q_HOST", "q.example"},
+                                       {"RCLONE_CONFIG_Q_KEY_FILE", "/srv/keys/id_q"},
+                                       {"RCLONE_CONFIG_Q_SHELL", "unix"},
+                                       {"RCLONE_CONFIG_Q_SHELL_TYPE", "unix"},
+                                       {"RCLONE_CONFIG_Q_TYPE", "sftp"},
+                                       {"RCLONE_CONFIG_Q_USER", "me"}});
+    // A file rclone refuses as a whole, or an encrypted one, gives rclone nothing.
+    std::ofstream(conf, std::ios::binary | std::ios::trunc) << "[q] # c\ntype = sftp\n";
+    CHECK(engine::rclone_env(env_context(conf, "q", true)).error_or("").find("line 1") != std::string::npos);
+    std::ofstream(conf, std::ios::binary | std::ios::trunc) << "# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nFAKE\n";
+    CHECK(engine::rclone_env(env_context(conf, "q", true)).error_or("").find("is encrypted") != std::string::npos);
+    std::filesystem::remove_all(dir);
+}
+
 #ifdef _WIN32
 TEST_CASE("each rclone run gets its own server's variables and no other's; grab keeps none (G7, G84)") {
     const auto dir = std::filesystem::temp_directory_path() / "grab-test-rclone-env-runs";

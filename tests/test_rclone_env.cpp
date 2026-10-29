@@ -14,6 +14,7 @@
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone.hpp"
+#include "rclone_conf.hpp"
 #include "secrets.hpp"
 #include "util.hpp"
 
@@ -22,11 +23,8 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
-#include <openssl/rand.h>
 
-#include <array>
 #include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <filesystem>
@@ -160,38 +158,11 @@ int closed_port() {
     return port;
 }
 
-// What secrets::obscure will do (chunk C moves it into src/secrets_reveal.cpp): rclone's
-// lib/obscure, a random 16-byte IV and the text under AES-256-CTR with rclone's published key,
-// both in URL-safe base64 without padding.
-std::string obscure_like_rclone(std::string_view plain) {
-    static constexpr std::array<unsigned char, 32> key = {
-        0x9c, 0x93, 0x5b, 0x48, 0x73, 0x0a, 0x55, 0x4d, 0x6b, 0xfd, 0x7c, 0x63, 0xc8, 0x86, 0xa9, 0x2b,
-        0xd3, 0x90, 0x19, 0x8e, 0xb8, 0x12, 0x8a, 0xfb, 0xf4, 0xde, 0x16, 0x2b, 0x8b, 0x95, 0xf6, 0x38};
-    std::string raw(16 + plain.size(), '\0');
-    auto* bytes = reinterpret_cast<unsigned char*>(raw.data());
-    REQUIRE(RAND_bytes(bytes, 16) == 1);
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    int n = 0;
-    const bool ok = ctx != nullptr && EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), nullptr, key.data(), bytes) == 1 &&
-                    EVP_EncryptUpdate(ctx, bytes + 16, &n, reinterpret_cast<const unsigned char*>(plain.data()),
-                                      static_cast<int>(plain.size())) == 1;
-    EVP_CIPHER_CTX_free(ctx);
-    REQUIRE(ok);
-    REQUIRE(static_cast<std::size_t>(n) == plain.size());
-    static constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string text;
-    std::uint32_t acc = 0;
-    int bits = 0;
-    for (const unsigned char c : raw) {
-        acc = (acc << 8) | c;
-        bits += 8;
-        while (bits >= 6) {
-            bits -= 6;
-            text.push_back(alphabet[(acc >> bits) & 0x3F]);
-        }
-    }
-    if (bits > 0) text.push_back(alphabet[(acc << (6 - bits)) & 0x3F]);
-    return text;
+// secrets::obscure, which has to work for these cases to mean anything.
+std::string obscured(std::string_view plain) {
+    auto text = secrets::obscure(plain);
+    REQUIRE(text.has_value());
+    return *text;
 }
 
 // A made-up private key in PEM, as OpenSSL writes it; `pass`: encrypted the old way (DEK-Info),
@@ -511,12 +482,12 @@ TEST_CASE("key_pem, a key's passphrase and a password reach rclone through the e
     CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", ed25519}}).find("pem key not formatted properly") != std::string::npos);
     const auto ec = made_up_key("EC", "P-256", "fake-passphrase");
     CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ec)},
-                   {"RCLONE_CONFIG_EK_KEY_FILE_PASS", obscure_like_rclone("fake-passphrase")}}) == "dialled");
+                   {"RCLONE_CONFIG_EK_KEY_FILE_PASS", obscured("fake-passphrase")}}) == "dialled");
     CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ec)}}).find("passphrase") != std::string::npos);
     CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ec)}, {"RCLONE_CONFIG_EK_KEY_FILE_PASS", "fake-passphrase"}})
               .find("is it obscured?") != std::string::npos);
     // A password: only in rclone's obscured form.
-    CHECK(attempt({{"RCLONE_CONFIG_EK_PASS", obscure_like_rclone("fake-password")}}) == "dialled");
+    CHECK(attempt({{"RCLONE_CONFIG_EK_PASS", obscured("fake-password")}}) == "dialled");
     CHECK(attempt({{"RCLONE_CONFIG_EK_PASS", "fake-password"}}).find("is it obscured?") != std::string::npos);
 }
 
@@ -535,7 +506,7 @@ TEST_CASE("an inherited RCLONE_SFTP_* or a --sftp-* flag beats RCLONE_CONFIG_<NA
                       {"RCLONE_CONFIG_WN_HOST", "127.0.0.1"},
                       {"RCLONE_CONFIG_WN_PORT", std::to_string(p1)},
                       {"RCLONE_CONFIG_WN_USER", "t"},
-                      {"RCLONE_CONFIG_WN_PASS", obscure_like_rclone("fake-password")},
+                      {"RCLONE_CONFIG_WN_PASS", obscured("fake-password")},
                       {"RCLONE_CONFIG_WN_KNOWN_HOSTS_FILE", util::path_to_utf8(scratch.dir() / "known_hosts")}};
     // The port rclone dialled, from Go's refused dial (its syscall name is never translated).
     const auto dialled = [&](const Vars& more, const std::vector<std::string>& flags = {}) {
@@ -579,20 +550,21 @@ TEST_CASE("rclone reveals what grab obscures, and grab reveals what rclone obscu
     for (const auto& plain : std::vector<std::string>{"fake-password", "", "x", "fake pass with spaces \"' and = and \\",
                                                       "fake-\u10DE\u10D0\u10E0\u10DD\u10DA\u10D8-\u00E9",
                                                       std::string(300, 'p')}) {
-        const auto obscured = obscure_like_rclone(plain);
-        CHECK(obscured != obscure_like_rclone(plain)); // a new IV each time
-        CHECK(secrets::reveal(obscured) == plain);
+        const auto text = obscured(plain);
+        CHECK(text != obscured(plain)); // a new IV each time
+        CHECK(secrets::reveal(text) == plain);
         // "--": an obscured value can start with '-'.
-        const auto ran = run_rclone(*rclone, scratch, {"reveal", "--", obscured});
+        const auto ran = run_rclone(*rclone, scratch, {"reveal", "--", text});
         CHECK_MESSAGE(ran.exit_code == 0, ran.err);
         CHECK(ran.out == plain + "\n");
     }
     const auto ran = run_rclone(*rclone, scratch, {"obscure", "fake-password-2"});
     REQUIRE(ran.exit_code == 0);
-    std::string obscured = ran.out;
-    while (!obscured.empty() && (obscured.back() == '\n' || obscured.back() == '\r')) obscured.pop_back();
-    CHECK(secrets::reveal(obscured) == "fake-password-2");
+    std::string by_rclone = ran.out;
+    while (!by_rclone.empty() && (by_rclone.back() == '\n' || by_rclone.back() == '\r')) by_rclone.pop_back();
+    CHECK(secrets::reveal(by_rclone) == "fake-password-2");
 }
+
 TEST_CASE("grab's own path: rclone_env and --config NUL reach the bundled rclone, under the user's names (phase 7)") {
     const auto rclone = bundled_rclone();
     if (!rclone) {
@@ -677,6 +649,218 @@ TEST_CASE("${RCLONE_CONFIG_DIR} in a key_file reaches rclone as the file's folde
     // rclone reads the missing key before it dials, and names the path it tried: in "$sync".
     CHECK_MESSAGE(ran->err.find("failed to read private key file") != std::string::npos, ran->err);
     CHECK_MESSAGE(ran->err.find(util::path_to_utf8(dir) + "/id_none") != std::string::npos, ran->err);
+}
+
+namespace {
+
+// What grab's reader (rclone_conf.hpp) makes of `text`, in `dump`'s shape: every section's own
+// keys, each as rclone would get it (a blank one as "").
+std::expected<Sections, std::string> read_like_dump(std::string_view text) {
+    const auto doc = rclone_conf::parse(text);
+    if (!doc) return std::unexpected(doc.error());
+    Sections sections;
+    for (const auto& s : doc->sections) {
+        auto& out = sections[s.name];
+        for (const auto& key : s.keys) {
+            const auto v = rclone_conf::get(*doc, s.name, key, false);
+            REQUIRE_MESSAGE(v.has_value(), v.error());
+            out[key] = *v ? (*v)->text : std::string();
+        }
+    }
+    return sections;
+}
+
+} // namespace
+
+TEST_CASE("grab's rclone.conf reader reads every shape as `rclone config dump` does (phase 7)") {
+    const auto rclone = bundled_rclone();
+    if (!rclone) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    const Scratch scratch("grab-test-rclone-conf-dump");
+    const std::vector<std::string> texts = {
+        // Keys: quoted in ", """ or ` (not trimmed inside), cut at '=' or ':', "-" numbered.
+        "[k]\n"
+        "type = alias\n"
+        "\"quoted key\" = v1\n"
+        "\"\"\"triple key\"\"\" = v2\n"
+        "`tick key` = v3\n"
+        "\" spaced \" = v4\n"
+        "\"a=b\" : v5\n"
+        "\"x\"junk = v6\n"
+        "- = auto1\n"
+        "- = auto2\n"
+        "key:colon = x\n"
+        "nb = \u00A0padded\u00A0\n"
+        "\u00A0# a comment after a no-break space\n"
+        "bq = `e f` trailing\n"
+        "tq = \"\"\"g\"\"\" \"\"\"h\"\"\"\n"
+        "short = `\n"
+        "tick2 = ``\n"
+        "dq = \"a b\"\n"
+        "sq = 'c d'\n"
+        "hash = v # not a comment\n"
+        "back = C:\\keys\\id_rsa\n",
+        // %(key)s: DEFAULT first (and through DEFAULT's own references), else the section's raw
+        // value, substituted again on the next pass; cutsets; 200 passes; nothing else is a name.
+        "spaced = from-default\n"
+        "e =\n"
+        "chain = %(e2)s!\n"
+        "e2 = E2\n"
+        "[r]\n"
+        "type = alias\n"
+        "spaced = from-section\n"
+        "e = sec\n"
+        "sub = %(spaced)s/x\n"
+        "blank = %(e)s|\n"
+        "ps = %(pass)s|%(hosts)s\n"
+        "a = x%(a)s\n"
+        "viadef = %(chain)s\n"
+        "two = %(own)s+%(own)s\n"
+        "own = O\n"
+        "nested = %(inner)s\n"
+        "inner = %(own)s-in\n"
+        "noclose = %(abc\n"
+        "emptyname = %()s\n"
+        "weird = %((own)s\n"
+        "[box]\n"
+        "dir = C:\\k\n"
+        "[box.eu]\n"
+        "own = %(dir)s\\id\n",
+        // Layout: a BOM, CRLF, comments, DEFAULT's keys before any section and under [DEFAULT],
+        // a key again, a section again, case-sensitive names, [ x ], no final line break.
+        "\xEF\xBB\xBFtop = x\r\n"
+        "# a comment\r\n"
+        "[d]\r\n"
+        "  ; an indented comment\r\n"
+        "type = alias\r\n"
+        "remote = first\r\n"
+        "remote = second\r\n"
+        "Remote = upper\r\n"
+        "[D]\r\n"
+        "type = alias\r\n"
+        "[ d ]\r\n"
+        "extra = again\r\n"
+        "[DEFAULT]\r\n"
+        "late = y\r\n"
+        "[last]\r\n"
+        "type = alias\r\n"
+        "nofinal = end"};
+    for (const auto& text : texts) {
+        const auto ours = read_like_dump(text);
+        const auto theirs = dump(*rclone, scratch, text);
+        REQUIRE_MESSAGE(theirs.has_value(), theirs.error());
+        REQUIRE_MESSAGE(ours.has_value(), ours.error());
+        CHECK(*ours == *theirs);
+        for (const auto& [section, keys] : *theirs) {
+            for (const auto& [key, value] : keys) {
+                const auto mine = ours->find(section);
+                CHECK_MESSAGE((mine != ours->end() && mine->second.contains(key) && mine->second.at(key) == value),
+                              "[", section, "] ", key, " = ", value);
+            }
+        }
+    }
+    // What rclone refuses as a whole, grab's reader refuses too.
+    for (const std::string_view broken :
+         {"[s] # c\ntype = alias\n", "[]\ntype = alias\n", "[n]\njustakey\n", "[m]\nremote = \"\"\"line1\nline2\"\"\"\n",
+          "[m]\nremote = `open\n", "[k]\n\"open = v\n", "[k]\n\"k\" v\n", "[k]\n= v\n", "[k]\n: v\n"}) {
+        CHECK_MESSAGE(!rclone_conf::parse(broken).has_value(), broken);
+        CHECK_MESSAGE(!dump(*rclone, scratch, broken).has_value(), broken);
+    }
+}
+
+TEST_CASE("grab's reader follows a dotted name's parents as rclone does") {
+    const auto rclone = bundled_rclone();
+    if (!rclone) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    const Scratch scratch("grab-test-rclone-conf-parents");
+    for (const auto* folder : {"a", "b", "m"}) {
+        fs::create_directories(scratch.dir() / folder);
+        scratch.write(std::string(folder) + "/in-" + folder + ".txt", "x");
+    }
+    const auto a = util::path_to_utf8(scratch.dir() / "a");
+    const auto b = util::path_to_utf8(scratch.dir() / "b");
+    const auto m = util::path_to_utf8(scratch.dir() / "m");
+    const std::string text = "remote = " + b + "\n"
+                             "[p]\ntype = alias\nremote = " + a + "\n"
+                             "[p.c]\ndescription = no type, no remote\n"
+                             "[p.c.d]\n"
+                             "[p.e]\nremote =\n"
+                             "[p.f]\nremote = " + b + "\n"
+                             "[P.g]\n"
+                             "[q.c]\ntype = alias\n"
+                             "[p.x.y]\ndescription = no [p.x]\n"
+                             "[rr]\ntype = alias\n"
+                             // %(key)s in a parent's value reads the parent's own keys.
+                             "[mm]\ntype = alias\nmdir = " + m + "\nremote = %(mdir)s\n"
+                             "[mm.c]\ndescription = the remote of [mm]\n"
+                             "[mm.d]\nremote = %(mdir)s\n";
+    scratch.write("parent.conf", text);
+    const auto doc = rclone_conf::parse(text);
+    REQUIRE(doc.has_value());
+    const auto conf = util::path_to_utf8(scratch.file("parent.conf"));
+    // Not "p" itself, which rclone takes for drive P:.
+    for (const std::string name : {"p.c", "p.c.d", "p.e", "p.f", "P.g", "q.c", "p.x.y", "rr", "mm", "mm.c", "mm.d"}) {
+        // What grab says rclone lists: the alias's folder's one file, or nothing.
+        std::optional<std::string> expected;
+        const auto type = rclone_conf::get(*doc, name, "type");
+        const auto remote = rclone_conf::get(*doc, name, "remote");
+        REQUIRE((type.has_value() && remote.has_value()));
+        if (*type && (*type)->text == "alias" && *remote) {
+            expected = "in-" + util::path_to_utf8(util::path_from_utf8((*remote)->text).filename()) + ".txt";
+        }
+        const auto listed = listing(run_rclone(*rclone, scratch, {"lsf", name + ":", "--config", conf}));
+        CHECK_MESSAGE(listed == expected, name);
+    }
+    // Which section a value came from, for the import's notes.
+    const auto from = rclone_conf::get(*doc, "p.c.d", "remote");
+    REQUIRE((from.has_value() && from->has_value()));
+    CHECK((*from)->section == "p");
+    const auto own = rclone_conf::get(*doc, "p.c.d", "remote", false);
+    REQUIRE(own.has_value());
+    CHECK_FALSE(own->has_value());
+}
+
+TEST_CASE("~, $VAR and ${RCLONE_CONFIG_DIR} in a key_file expand as rclone expands them") {
+    const auto rclone = bundled_rclone();
+    if (!rclone) {
+        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        return;
+    }
+    const Scratch scratch("grab-test-rclone-conf-paths");
+    const auto dir = scratch.dir() / "$sync";
+    fs::create_directories(dir);
+    // Outside "$sync": rclone would expand the '$' in a path written out (with_config_dir).
+    scratch.write("known_hosts", "");
+    const int port = closed_port();
+    const std::string var = "GRAB_TEST_P7C_FOLDER";
+    const std::string var_value = util::path_to_utf8(scratch.dir() / "v$x");
+    const rclone_conf::Getenv getenv = [&](std::string_view name) -> std::optional<std::string> {
+        if (util::to_lower(name) == util::to_lower(var)) return var_value;
+        return util::getenv_utf8(std::string(name).c_str());
+    };
+    for (const std::string key_file :
+         {"${RCLONE_CONFIG_DIR}/id_a", "$RCLONE_CONFIG_DIR\\id_b", "$rclone_config_dir/id_c", "~/grab-test-no-key",
+          "~\\grab-test-no-key-2", "${GRAB_TEST_P7C_FOLDER}/id_d", "$GRAB_TEST_P7C_FOLDER\\id_e",
+          "x$/id_f", "${}id_g", "~user/id_h", "C:\\keys\\$GRAB_TEST_P7C_FOLDER-id"}) {
+        // Not a one-letter name, which rclone takes for a drive letter.
+        scratch.write("$sync/rclone.conf", "[kf]\ntype = sftp\nhost = 127.0.0.1\nport = " + std::to_string(port) +
+                                               "\nuser = t\nknown_hosts_file = " +
+                                               util::path_to_utf8(scratch.file("known_hosts")) + "\nkey_file = " +
+                                               key_file + "\n");
+        const auto ran =
+            run_rclone(*rclone, scratch,
+                       {"lsf", "kf:", "--config", util::path_to_utf8(dir / "rclone.conf"), "--low-level-retries", "1",
+                        "--retries", "1"},
+                       {{var, var_value}});
+        const auto expected = rclone_conf::expand_path(key_file, dir, getenv);
+        // Go's "open <path>: ..." names the path it tried.
+        CHECK_MESSAGE(ran.err.find("open " + expected + ":") != std::string::npos, key_file, " -> ", expected, "\n",
+                      ran.err);
+    }
 }
 
 #endif

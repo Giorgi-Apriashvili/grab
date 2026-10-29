@@ -7,6 +7,7 @@
 #include "listing.hpp"
 #include "match.hpp"
 #include "rclone.hpp"
+#include "rclone_conf.hpp"
 #include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
 #include "remote.hpp"
@@ -189,17 +190,6 @@ std::vector<std::string> unused_flags(const Context& ctx) {
 
 namespace {
 
-// A value as rclone's config reader (goconfig) takes it from a line: from a leading """ or ` to the
-// last one after it, anything else as it is (RCLONE-REPLACEMENT.md, progress log 2026-10-29).
-std::string_view unquoted(std::string_view value) {
-    for (const std::string_view quote : {std::string_view(R"(""")"), std::string_view("`")}) {
-        if (!value.starts_with(quote) || (quote.size() == 3 && value.size() < 6)) continue;
-        const auto end = value.substr(quote.size()).rfind(quote);
-        return end == std::string_view::npos ? value : value.substr(quote.size(), end);
-    }
-    return value;
-}
-
 // A key rclone can read: its options are named in lower case with '_'. A key it would skip in the
 // file ("Host", "key-file") must not reach it as RCLONE_CONFIG_<NAME>_HOST or _KEY_FILE either.
 bool option_name(std::string_view key) {
@@ -280,8 +270,14 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
     }
     const auto conf = ctx.config.rclone_config ? *ctx.config.rclone_config : grab_rclone_config_path();
     const std::string& remote = ctx.settings.rclone_remote;
-    auto doc = ini::parse_file(conf);
-    if (!doc) return util::fail(doc.error());
+    // As rclone reads the file (rclone_conf.hpp): quotes off keys and values, %(key)s.
+    const auto text = util::read_file(conf);
+    if (!text) return util::fail(text.error());
+    if (is_encrypted_rclone_config(*text)) {
+        return util::failf("{} is encrypted, and grab can't read an encrypted rclone.conf", util::path_to_utf8(conf));
+    }
+    const auto doc = rclone_conf::parse(*text);
+    if (!doc) return util::failf("{}: {}", util::path_to_utf8(conf), doc.error());
     const auto* section = doc->find(remote);
     if (section == nullptr) return util::failf("{}: rclone remote '{}' not found", util::path_to_utf8(conf), remote);
 
@@ -296,11 +292,14 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
     // Then the section's own lines, its own secrets too (an rclone.conf that isn't grab's keeps
     // them inside), as ssh_target reads them.
     bool config_dir = false; // some path names the file's folder
-    for (const auto& [key, raw] : section->values) {
-        const auto value = unquoted(util::trim(raw));
-        if (value.empty()) continue;
+    for (const auto& key : section->keys) {
+        // Its own keys only: a dotted name's parent's aren't this server's (G86).
+        auto found = rclone_conf::get(*doc, remote, key, false);
+        if (!found) return util::failf("{}: {}", util::path_to_utf8(conf), found.error());
+        if (!*found) continue; // blank: rclone takes it as not set
+        const std::string& value = (*found)->text;
         const bool path = key == "key_file" || key == "pubkey_file" || key == "known_hosts_file";
-        values[key] = path ? with_config_dir(value) : std::string(value);
+        values[key] = path ? with_config_dir(value) : value;
         config_dir = config_dir || (path && values[key] != value);
     }
 

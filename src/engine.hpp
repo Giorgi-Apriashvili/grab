@@ -63,8 +63,9 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 
 // What an rclone run on the context's server gets in its environment, its config in memory
 // (`--config NUL`, config_in_memory; RCLONE-REPLACEMENT.md phase 7, decision 1): each key of the
-// server's section in the rclone.conf in use, read now as rclone reads that file (backticks and
-// """ taken off, ${RCLONE_CONFIG_DIR} as that file's folder), and the secrets of the store beside
+// server's section in the rclone.conf in use, read now as rclone reads that file (rclone_conf.hpp:
+// quotes taken off keys and values, %(key)s; ${RCLONE_CONFIG_DIR} as that file's folder, through
+// GRAB_RCLONE_CONFIG_DIR, so rclone expands the value once), and the secrets of the store beside
 // it as rclone keeps them (obscured), as RCLONE_CONFIG_<NAME>_<KEY> (secrets::env_name). Only that
 // run sees them, never grab itself nor another program it starts (review G7), nor another
 // server's run (G84); rclone sees no parent section's keys (G86), as grab doesn't. A password
