@@ -150,9 +150,9 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
                 if (note.server == settings.name && note.text.starts_with("not imported")) why = note.text;
             }
         }
-        return util::failf("[{}] has no connection details (host, port, user, auth) in grab.conf{}. Add them with Edit "
-                           "in grab's Settings, or `grab server remove {}` and `grab server add {}`",
-                           settings.name, why.empty() ? std::string() : " (" + why + ")", settings.name, settings.name);
+        return util::failf("[{}] has no connection details (host, port, user, auth) in grab.conf{}. Add them with "
+                           "`grab server edit {}` or Edit in grab's Settings",
+                           settings.name, why.empty() ? std::string() : " (" + why + ")", settings.name);
     }
 
     const auto exe_dir = util::self_exe_path().parent_path();
@@ -246,9 +246,9 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
     if (!user_copy) {
         if (const auto bad = rclone_flags::first_refused(ctx.settings.common_flags)) {
             return util::failf("[{}] common_flags: {} would replace the server's {}, which grab gives rclone itself; "
-                               "take it out and change the server with Edit in grab's Settings (only --rclone copies "
-                               "take such a flag)",
-                               ctx.settings.name, bad->flag, bad->what);
+                               "take it out ({} instead; only --rclone copies take such a flag)",
+                               ctx.settings.name, bad->flag, bad->what,
+                               rclone_flags::change_instead(*bad, ctx.settings.name));
         }
     }
     if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());

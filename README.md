@@ -19,8 +19,8 @@ remote name.
 ```
 grab -f releases E:\Backup
   ├─ 1. parse args      mode=folder, target="releases", dest="E:\Backup"
-  ├─ 2. load config     grab.conf  ->  which rclone remote, where to search, which flags
-  │                     rclone.conf -> host / user / port / key for the ssh step
+  ├─ 2. load config     grab.conf  ->  the server (host, port, user, login), where to search,
+  │                     which flags; its password from grab's encrypted store
   ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -printf '%T@\t%p\0'"
   │                     (or `rclone lsf -R` for remotes without a key / shell, see Lookup methods)
   │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick, several allowed
@@ -479,9 +479,10 @@ too and goes on without them.
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
   test, trust, make default and remove. Each server's search folders and depth are edited
   there too. Adding a server, or changing its address, shows the host key fingerprints
-  and writes nothing until you trust them. A saved password stays with the host and user it
-  was typed for: changing either asks for it again. "Open grab.conf" covers the rarer settings
-  (rclone flags, ssh options, find method).
+  and writes nothing until you trust them. A saved password stays with the user, host and port
+  it was typed for: changing any of them asks for it again. A server without connection details
+  (one grab couldn't import, see [Servers](#servers)) opens with Edit to fill them in. "Open
+  grab.conf" covers the rarer settings (rclone flags, ssh options, find method).
 - **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
   only that page's messages reach grab, and files dragged in from outside are ignored.
 - **Tray:** closing the window while downloads run keeps them going in the notification
@@ -507,10 +508,30 @@ The GUI is built with the rest (`GRAB_BUILD_GUI=ON` by default); in a source bui
 
 ```powershell
 grab server add              # step by step: host, port, user, login, folders to search
-grab server list             # what is configured, and whether each host key is pinned
+grab server list             # each server's login, saved password, host key
+grab server edit NAME        # the same questions, with the current answers as defaults
+grab server test NAME        # log in as downloads, searches and verification do
 grab server trust NAME       # pin a server's host key (for servers imported without one)
 grab server remove NAME
 ```
+
+Each server is a section of grab.conf with its connection details:
+
+```ini
+[box]
+host = u123456.your-storagebox.de
+port = 23
+user = u123456
+auth = password
+```
+
+- `auth = agent`: the keys loaded in the Windows ssh-agent (`ssh-add`); with `key_file`, only
+  that key.
+- `auth = key`: `key_file`, with its passphrase, if it has one, in grab's password store.
+- `auth = password`: the password in grab's password store.
+- `auth = stored_key`: a key an rclone.conf held inline (`key_pem`), imported into grab's store.
+  Only rclone can log in with it, so the server works on `engine = rclone` only (Test says so);
+  Edit can switch it to a key file or ssh-agent.
 
 `grab server add` asks for:
 - the server's host, port and user
@@ -521,39 +542,59 @@ Then it:
 - **pins the host key:** shows the server's fingerprints (ED25519, ECDSA and RSA, whichever
   it has; grab reads them itself, without logging in) and saves them to
   `%APPDATA%\grab\known_hosts` once you confirm, in place of any it held for that address. From
-  then on grab, ssh and rclone refuse a server that presents a different key. Changing a
-  server's host or port, or removing it, takes its keys out again unless another server uses the
-  same host and port. A server that offers only old key types (SHA-1 `ssh-rsa`, DSA) or old key
-  exchanges can't be added.
-- **writes both config files:** the connection goes into grab's own
-  `%APPDATA%\grab\rclone.conf`, the search settings into grab.conf.
-- **tests the connection:** one check through rclone and, for key or agent logins, one
-  through ssh; with `engine = grab`, a login through grab's own client instead of ssh, which
-  also says whether searches will use find or list folders.
+  then on grab, ssh and rclone refuse a server that presents a different key, and a server
+  without a pinned key isn't contacted at all until you trust it. Changing a server's host or
+  port, or removing it, takes its keys out again unless another server uses the same host and
+  port. A server that offers only old key types (SHA-1 `ssh-rsa`, DSA) or old key exchanges
+  can't be added.
+- **saves the server:** its section goes into grab.conf, its password or passphrase into grab's
+  password store.
+- **tests the connection:** grab's own client logs in and lists the home folder (previews, Play
+  and Verify use it on every server); on `engine = rclone` also one check through rclone (its
+  downloads) and, for key or agent logins, one through ssh (its searches); on `engine = grab`
+  whether searches will use find or list folders. What rclone would otherwise ask the server on
+  each of its runs (its shell and checksum commands) is noted in the section as `shell_type`,
+  `md5sum_command` and `sha1sum_command`.
 
-Passwords and passphrases are never shown and never put on a command line. They are not kept
-in rclone.conf either, where rclone would store them only "obscured", which anyone who can read
-the file can reverse.
-- grab keeps them in `%APPDATA%\grab\secrets`, encrypted for your Windows account (DPAPI). Other
+`grab server edit NAME` asks the same questions with the current answers in brackets; Enter
+keeps one. The name stays, since partial downloads, file lists, limits and the saved password
+go by it. Enter keeps the saved password only while user, host and port stay the same: for
+another login it asks again, so a password never goes to a machine or account it wasn't typed
+for. A new host or port shows the host key to trust first; a new user, host or port also drops
+what grab learned about the old one (its connection limit, the window's timings, the shell and
+checksum commands). A section without connection details is filled in the same way.
+
+`grab server list` shows each server's login (`password saved` or `no password saved`, a key
+file's `passphrase saved`) and `host key pinned` or `host key not trusted (grab server trust
+NAME)`. `grab server test NAME` prints what Test in Settings shows:
+
+```
+Testing box (u123456@u123456.your-storagebox.de:23) ...
+  rclone (downloads): OK
+  grab (previews, Play, verify): OK, home folder listed, checksums: md5sum
+```
+
+Passwords and passphrases are never shown and never put on a command line.
+- grab keeps them in its own store, `passwords` in `%APPDATA%\grab` (a configuration elsewhere
+  keeps its own, see [grab.conf](#grabconf)), encrypted for your Windows account (DPAPI). Other
   accounts, backups and copies of the file can't read them; programs running as you can, as
-  grab does, without asking you for anything.
-- When grab runs rclone, it hands a server's password to that rclone run alone, in its own
-  environment (`RCLONE_CONFIG_<SERVER>_PASS`, which rclone reads like its config; a server called
-  `my-box` keeps its dash: `RCLONE_CONFIG_MY-BOX_PASS`), never on disk unencrypted, on a command
-  line, or in grab's own environment, where every program grab starts would see it.
-- A grab.conf `rclone_config =` that points at your own rclone.conf is used as it is: its
-  passwords stay there.
+  grab does, without asking you for anything. grab.conf never holds one: it is plain text that
+  editors and sync tools open.
+- Each one is kept with the user@host:port it was typed for, and grab sends it nowhere else: a
+  hand edit of `host` in grab.conf, or a grab.conf copied from somewhere else, gets "the saved
+  password is for ...: enter it again with Edit" instead.
+- When grab runs rclone, it hands that rclone run alone the server's details and password (in
+  rclone's obscured form, which rclone reads like its config), in its own environment, with
+  rclone's config kept in memory (`--config NUL`): never on disk, on a command line, or in
+  grab's own environment, where every program grab starts would see it.
 - If the store can't be read (another Windows account, a damaged file, or a Windows password an
-  admin reset), servers with passwords say so: enter the password again in Settings → Edit, or
-  remove and add the server again. Servers without passwords keep working.
-  - That first change keeps the old store as `secrets.unreadable-<date>-<time>` (it may become
+  admin reset), servers with passwords say so: enter the password again in Settings → Edit (or
+  `grab server edit NAME`). Servers without passwords keep working.
+  - That first change keeps the old store as `passwords.unreadable-<date>-<time>` (it may become
     readable again, e.g. once a domain controller is reachable after a reset) and names the
     other servers whose passwords need entering again.
-
-**Upgrading from 0.7.0 or earlier:** the first run moves the passwords out of grab's rclone.conf
-into the encrypted store by itself. They leave the file only after the store holds them. The
-standard `%APPDATA%\rclone\rclone.conf`, which grab only reads, is never changed, so remotes you
-keep there still hold obscured passwords.
+- Elsewhere than Windows the store is a plain file only you can read (mode 0600), not
+  encrypted.
 
 The commands also take answers from piped input, one per line, so they can be scripted. When
 the input runs out, the command stops without changing anything.
@@ -564,10 +605,55 @@ find, which is faster; with a passphrase-protected key that needs the key in ssh
 GNU find (grab checks once a week and remembers the answer in `limits.json`; Test checks again),
 else by listing its folders.
 
-**Coming from an earlier grab:** grab.conf used to point at remotes in the standard
-rclone.conf. The first run of this version copies the remotes grab.conf uses into grab's own
-file, once, and never modifies the original. `grab server list` then shows which host keys
-still need `grab server trust`.
+#### Coming from an earlier grab
+
+Up to 0.19, a grab.conf section named a remote in an rclone.conf (grab's own
+`%APPDATA%\grab\rclone.conf`, or the one `rclone_config =` names) that held the server's
+address and login, and grab kept the passwords in `%APPDATA%\grab\secrets`. The first run of
+0.20, the command or the window, moves each such server into grab.conf, once:
+- Its section gets `host`, `port`, `user`, `auth` and `key_file` from its rclone remote (as
+  rclone reads it: a dotted name like `box.eu` takes what it lacks from `[box]`), and
+  `shell_type`, `md5sum_command` and `sha1sum_command` as rclone saved them. `rclone_remote`,
+  your comments and every other setting stay.
+- Its password or passphrase goes from the old store (or the rclone.conf) into the new
+  `passwords` store, taken out of rclone's obscured form and encrypted for your account.
+- When its remote named its own known_hosts file, the host keys there for that host and port are
+  copied into grab's known_hosts (unless grab's has some already), so it stays as trusted as it
+  was. Keys it can't copy (a network path, a file over 1 MiB, wildcard or `@cert-authority`
+  lines) are left out with a note to use Trust.
+- Other rclone settings stay with the server: harmless ones as `rclone.<key>` lines in
+  grab.conf, any that could hold a secret in the password store, both only for its rclone runs.
+- `imported.json` beside the store records what was moved, so each server is moved once: one
+  you remove later doesn't come back from the old files.
+- The command prints one line naming the servers moved, and a note for each one that needs
+  something (Trust, its password, its details); the window says the same once, in a notice
+  above the search.
+
+rclone.conf, the old `secrets` store and `%APPDATA%\rclone\rclone.conf` are only read, never
+changed, and grab doesn't write any rclone.conf again. A section it can't move (no such remote,
+not sftp, an encrypted rclone.conf, an old store it can't read for a password server) keeps no
+details: Settings and `grab server list` say why, Edit fills it in, and the next run tries
+again once that rclone.conf changes.
+
+#### Going back to 0.19
+
+0.19.0 reads the same grab.conf: it ignores the new keys and finds each moved server through
+`rclone_remote` in the rclone.conf and `secrets` that 0.20 left as they were. So it sees the
+servers as they were when you upgraded:
+- a password changed in 0.20 isn't seen: 0.19 keeps logging in with the old one, which can lock
+  a Storage Box account or set off a server's fail2ban (change it in 0.19 too);
+- servers added in 0.20 show as not usable (0.19 looks for them in rclone.conf). With a blank
+  `rclone_config =`, if `%APPDATA%\rclone\rclone.conf` has a remote of the same name, 0.19
+  copies it into its rclone.conf and logs in with it, which may be another address or account;
+- a server removed and added again in 0.20 under the same name is the old remote to 0.19 (old
+  address, old password);
+- on the way forward again, addresses and passwords changed in 0.19 aren't seen by 0.20:
+  grab.conf's details win;
+- 0.19's rclone still notes in that rclone.conf what it finds out about a server (its shell,
+  for one), as it always did.
+
+If `rclone_config =` points at an rclone.conf you also use with rclone on its own, servers you
+add or change in grab no longer show up there.
 
 ### grab.conf
 
@@ -577,15 +663,17 @@ grab config          # opens it in your editor, creating it first if needed
 ```
 
 `--init` writes the `[grab]` block. If you already have sftp remotes in the standard
-rclone.conf (`$RCLONE_CONFIG`, else `%APPDATA%\rclone\rclone.conf`), it imports them into grab's
-own rclone.conf, one grab.conf section each:
+rclone.conf (`$RCLONE_CONFIG`, else `%APPDATA%\rclone\rclone.conf`), it adds one grab.conf section
+for each, with its connection details and its password moved as described in
+[Coming from an earlier grab](#coming-from-an-earlier-grab) (rclone.conf is only read):
 - `search_roots` is blank, meaning the login home.
 - `default_remote` is the first one.
 - The rclone flag keys are written commented out, so later changes to the built-in defaults
   still reach you. Uncomment one to override it.
 
 Run `--init` again later: it never rewrites an existing file, but prints ready-to-paste
-sections for sftp remotes added to the standard rclone.conf since.
+sections for sftp remotes added to the standard rclone.conf since; the next grab run moves
+their details in as above.
 
 `grab config` uses the `editor` key in `[grab]` (for example `editor = code --wait`),
 otherwise `$VISUAL`, then `$EDITOR`, and finally Notepad. It reads only that key, so a
@@ -598,7 +686,9 @@ Minimal `grab.conf`:
 default_remote = hetzner
 
 [hetzner]
-rclone_remote = hetzner
+host          = files.example.com
+user          = alice
+auth          = agent
 search_roots  = /home/alice
 max_depth     = 4
 ```
@@ -610,8 +700,10 @@ The config path can be overridden with `--config PATH` or the `GRAB_CONFIG` env 
 grab-gui then runs one window per configuration folder, and each configuration other than the
 default keeps its own window settings, queue and recent searches in
 `%APPDATA%\grab\configs\<folder>-<id>` and its file lists in
-`%LOCALAPPDATA%\grab\lists\<folder>-<id>` (the command reads the same). grab's rclone.conf,
-saved passwords and known_hosts are shared by all of them.
+`%LOCALAPPDATA%\grab\lists\<folder>-<id>` (the command reads the same), and its saved passwords
+there too, since two configurations can have servers of the same name. Moving such a
+configuration's folder leaves its passwords behind (`grab server list` then says "no password
+saved"), as it leaves its lists. grab's known_hosts is shared by all of them.
 Add one `[section]` per server and choose with `-r NAME`.
 
 **grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
@@ -630,6 +722,16 @@ logs in through it and says whether searches use find or list folders; it asks r
 there (on an engine = rclone server it checks rclone's login for the downloads, and a failure of
 grab's own login is a warning: previews, Play and Verify can't run). `GRAB_ENGINE=grab` or
 `rclone` in the environment overrides every server.
+
+#### Environment
+
+- `GRAB_CONFIG`: grab.conf's path, as `--config`.
+- `GRAB_ENGINE=grab` or `rclone`: every server's engine, whatever grab.conf says.
+- `RCLONE_CONFIG`: the standard rclone.conf that `--init` and the import read.
+- rclone runs grab starts get one server's `RCLONE_CONFIG_<SERVER>_*` variables from grab alone
+  (see [Tuning](#tuning)); `RCLONE_CONFIG_*` variables of your own are left out of them, and
+  grab-gui drops any it inherited when it starts. Players, editors, ssh and the installer get no
+  server's details at all.
 
 ## Usage
 
@@ -766,7 +868,7 @@ Per remote, `find =` in grab.conf picks how `TARGET` is located:
 
 | method   | how                                                          | auto picks it when |
 |----------|--------------------------------------------------------------|--------------------|
-| `ssh`    | one `ssh user@host "find ROOTS -maxdepth N -iname '*WORD*' ..."` | the rclone remote has a `key_file` |
+| `ssh`    | one `ssh user@host "find ROOTS -maxdepth N -iname '*WORD*' ..."` | the server logs in with a key file or ssh-agent |
 | `rclone` | `rclone lsf REMOTE:ROOT -R --max-depth N`, filtered locally   | otherwise (password remotes, storage boxes) |
 
 `ssh` is a single round trip but needs a shell on the server and prompts for the key
@@ -776,8 +878,8 @@ does not run arbitrary commands. On a Storage Box use `search_roots = /home` or 
 blank for the home directory; `/` itself is not listable there.
 
 `search_roots` entries may be absolute (`/srv`) or relative to the login home
-(`learning`); blank or `.` means the home directory. `known_hosts_file = none` in
-rclone.conf is honoured as "no known_hosts file" and never passed to ssh.
+(`learning`); blank or `.` means the home directory. ssh gets grab's known_hosts and the
+server's key file from grab.conf, never from your own ssh config's host keys.
 
 ## File lists
 
@@ -860,11 +962,16 @@ copy end to end, turn on Verify downloads (or `--verify`), whatever `common_flag
 ```
 src/cli.*       argument parsing            src/remote.*   find command, ssh argv, match picking
 src/ini.*       INI reader (grab + rclone)  src/listing.*  rclone lsf lookup, glob matching
-src/config.*    grab.conf / rclone.conf     src/rclone.*   rclone argv for both modes
+src/config.*    grab.conf                   src/rclone.*   rclone argv for both modes
 src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix_spawn wrappers
 src/util.*      strings, paths, environment src/main.cpp   the five steps
 src/engine.*    search + download for both  src/servers.*  server argv, host keys, conf edits
 src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`, the window's check
+src/server_cli.cpp `grab server ...`: the questions, list and test lines
+src/server_conf.* a server's grab.conf keys (host, port, user, auth...) and the checks they pass
+src/passwords.* grab's password store: DPAPI, each value bound to its user@host:port
+src/rclone_conf.* rclone.conf read as rclone reads it (for the import only)
+src/rclone_import.* the one-time move of 0.19's servers from rclone.conf into grab.conf
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    folder listing, rclone batch lines, which files the tree shows
 src/folder_job.*    a folder download, shared by the window and the command
@@ -882,12 +989,12 @@ src/existing.*  a different file already there: replace, keep both ("name (2).ex
 src/file_type.* file kinds by extension (as the window's icons and filters), --type/--min-size
 src/browse.*    browse mode: a server's folders from its file list, deeper ones live
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
-src/secrets.*   passwords kept out of rclone.conf: encrypted store, handed to rclone
+src/secrets.*   0.19's 'secrets' store, read by the import; rclone's obscured form
 src/ui_origin.* what the window may show and whose messages count (exact addresses)
 src/ssh.*       grab's own SSH connections (libssh2): host keys, login, SFTP channels, commands
 src/sftp.*      grab's own SFTP client: pipelined reads with exact bounds, listings, stat
 src/ssh_pool.*  a server's connections kept open and lent to downloads, searches and Browse
-src/ssh_target.* a server's rclone.conf section and stored secrets as an SSH login
+src/ssh_target.* a server's grab.conf section and saved password as an SSH login
 src/ssh_walk.*  a server's folder tree over SFTP: several folders in flight per connection
 src/ssh_find.*  searches and lists with the server's GNU find over a command; the find check
 src/ssh_hash.*  the server's MD5 for verification: md5sum over a command, batched; the hash check

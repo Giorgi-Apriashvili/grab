@@ -159,14 +159,35 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     prune_lists();
     // grab 0.19's servers move from rclone.conf into grab.conf once (rclone_import.hpp), here on
     // the settings thread before its first server list, so the page's list (send_init, UI thread)
-    // never waits on the settings lock for it; the list is sent again once it's done.
+    // never waits on the settings lock for it; the list is sent again once it's done. Then the
+    // one-time notice naming the servers moved (by this window or by a command before it), with
+    // what each still needs (server_ops::import_banner); imported.json forgets them as it's made.
     settings_task([this](std::stop_token) {
-        auto applied = rclone_import::apply(rclone_import::files_for(config_path_));
-        if (applied && applied->imported.empty() && applied->failed.empty()) return;
-        host_.defer([this, why = applied ? std::string() : applied.error()] {
+        const auto files = rclone_import::files_for(config_path_);
+        auto applied = rclone_import::apply(files);
+        std::vector<std::string> notes;
+        if (applied) {
+            for (const auto& note : applied->notes) notes.push_back(std::format("[{}] {}", note.server, note.text));
+        }
+        // The names leave imported.json only once the notice can be made (a grab.conf load_env
+        // refuses keeps them for a later window).
+        std::string banner;
+        if (!notes.empty() || rclone_import::banner_waiting(files.state_dir)) {
+            if (auto env = load_env()) {
+                const auto names = rclone_import::take_banner(files.state_dir).value_or(std::vector<std::string>{});
+                if (!names.empty() || !notes.empty()) {
+                    banner = server_ops::import_banner(names, server_ops::list_servers(*env), notes);
+                }
+            }
+        }
+        const bool changed = !applied || !applied->imported.empty() || !applied->failed.empty();
+        if (!changed && banner.empty()) return;
+        host_.defer([this, changed, banner = std::move(banner), why = applied ? std::string() : applied.error()] {
             if (!why.empty()) notices_.push_back(why);
-            if (!page_ready_) return; // its init takes the list and the notices
-            send_init();
+            if (!banner.empty()) import_banner_ = banner;
+            if (!page_ready_) return; // its init takes the list, the notices and the banner
+            if (changed) send_init();
+            post_import_banner();
             if (!notices_.empty()) {
                 Value v = Value::make_object();
                 v.set("type", str("error"));
@@ -215,6 +236,15 @@ App::~App() {
 }
 
 void App::save_state() const { report_save("the window's settings", save_gui_state(state_path_, state_), state_unsaved_); }
+
+// The one-time notice after an import, once: a reloaded page doesn't get it again.
+void App::post_import_banner() {
+    if (import_banner_.empty()) return;
+    Value v = Value::make_object();
+    v.set("type", str("importBanner"));
+    v.set("text", str(std::exchange(import_banner_, {})));
+    post(v);
+}
 
 // A saved file that exists but can't be read: moved aside, so nothing this run saves replaces
 // it, with a notice for the page once it's open (reviews G212, G213).
@@ -709,6 +739,7 @@ void App::on_message(const std::string& text) {
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
+        post_import_banner();
         if (!notices_.empty()) {
             Value v = Value::make_object();
             v.set("type", str("error"));
@@ -1848,6 +1879,9 @@ void App::post_servers(const server_ops::Env& env) const {
         v.set("search", str(s.search)); // search_method(): ssh, rclone; find, walk, probe on grab
         v.set("engine", str(s.engine == Engine::grab ? "grab" : "rclone"));
         v.set("pinned", Value::make_bool(s.host_key_pinned));
+        // Whether its password (passphrase, stored key) is saved for this login; null for ssh-agent
+        // or a store that can't be read. Never the value.
+        v.set("secretSaved", s.secret_saved ? Value::make_bool(*s.secret_saved) : Value{});
         items.push(std::move(v));
     }
     Value msg = Value::make_object();
@@ -1940,11 +1974,11 @@ void App::save_server(const Value& msg) {
             auto it = std::ranges::find(list, s.name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + s.name);
             if (p.secret.empty() && server_ops::edit_needs_password(*it, s)) {
-                return invalid("secret", it->auth == servers::Auth::password
-                                             ? "enter the password again for the new user, host or port"
-                                             : "enter the password");
+                const bool saved = it->error.empty() && it->auth == servers::Auth::password && it->secret_saved == true;
+                return invalid("secret", saved ? "enter the password again for the new user, host or port"
+                                               : "enter the password");
             }
-            need_keys = it->error.empty() ? server_ops::edit_needs_host_key(*it, s) : true;
+            need_keys = server_ops::edit_needs_host_key(*it, s);
             p.moved = it->host != s.host || it->port != s.port || it->user != s.user;
         } else {
             p.kind = Pending::Kind::add;

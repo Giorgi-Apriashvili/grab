@@ -145,8 +145,17 @@ TEST_CASE("a saved password stays with the user, host and port it was typed for 
     cur.user = "u1";
     cur.port = 23;
     cur.auth = Auth::password;
+    cur.secret_saved = true;
     auto wanted = server(Auth::password);
     CHECK_FALSE(server_ops::edit_needs_password(cur, wanted));
+    // Nothing to keep: none saved for this login, a store that can't be read, no details at all.
+    for (auto nothing : {+[](server_ops::ServerInfo& c) { c.secret_saved = false; },
+                         +[](server_ops::ServerInfo& c) { c.secret_saved.reset(); },
+                         +[](server_ops::ServerInfo& c) { c.error = "[box] has no connection details"; }}) {
+        auto none = cur;
+        nothing(none);
+        CHECK(server_ops::edit_needs_password(none, wanted));
+    }
     for (auto change : {+[](NewServer& s) { s.port = 22; }, +[](NewServer& s) { s.host = "evil.example"; },
                         +[](NewServer& s) { s.host = "BOX.example.com"; }, +[](NewServer& s) { s.user = "u2"; }}) {
         wanted = server(Auth::password);
@@ -191,6 +200,22 @@ TEST_CASE("search_roots values and lead-in comments") {
     CHECK(servers::replace_lead_in(text, "box", "# rclone remote [box]: new") ==
           "# rclone remote [box]: new\n[box]\nx = 1\n\n# my note\n[other]\ny = 2\n");
     CHECK(servers::replace_lead_in(text, "other", "# x") == text); // not grab's comment: untouched
+
+    // grab's own lead-in since phase 7, and 0.19's (whose remote may have another name), are both grab's.
+    CHECK(lead_in("box", "u@h:23, password, lookup via rclone lsf") ==
+          "# server [box]: u@h:23, password, lookup via rclone lsf");
+    const std::string mixed = "[grab]\n\n# server [box]: old\n[box]\nx = 1\n\n# rclone remote [hz3]: old\n[hetzner]\n"
+                              "y = 2\n\n# server [box] is mine, not grab's\n[other]\nz = 3\n";
+    const auto renewed = servers::replace_lead_in(mixed, "hetzner", lead_in("hetzner", "new"));
+    CHECK(renewed.find("# server [hetzner]: new\n[hetzner]\n") != std::string::npos);
+    CHECK(servers::replace_lead_in(mixed, "box", lead_in("box", "new")).find("# server [box]: new\n[box]\n") !=
+          std::string::npos);
+    // A comment naming another section isn't this one's lead-in.
+    CHECK(servers::replace_lead_in(mixed, "other", lead_in("other", "new")) == mixed);
+    CHECK(servers::remove_section(mixed, "box") ==
+          "[grab]\n\n# rclone remote [hz3]: old\n[hetzner]\ny = 2\n\n# server [box] is mine, not grab's\n[other]\nz = 3\n");
+    CHECK(servers::remove_section(mixed, "hetzner") ==
+          "[grab]\n\n# server [box]: old\n[box]\nx = 1\n\n# server [box] is mine, not grab's\n[other]\nz = 3\n");
 }
 
 TEST_CASE("server list from grab.conf: details, pins read now (G209), sections without details") {
@@ -243,7 +268,9 @@ TEST_CASE("an edit of search folders keeps comments, refreshes grab's line and l
     CHECK(text.find("search_roots = ~, /srv/tv\n") != std::string::npos);
     CHECK(text.find("max_depth = 7\n") != std::string::npos);
     CHECK(text.find("# my own note about roots\n") != std::string::npos);
-    CHECK(text.find("# rclone remote [box]: u1@box.example.com:23, password, lookup via rclone lsf\n") != std::string::npos);
+    // grab 0.19's lead-in becomes grab's own.
+    CHECK(text.find("# server [box]: u1@box.example.com:23, password, lookup via rclone lsf\n[box]\n") != std::string::npos);
+    CHECK(text.find("# rclone remote [box]") == std::string::npos);
     // The connection lines and what rclone found are as they were.
     CHECK(text.find("host = box.example.com\nport = 23\nuser = u1\nauth = password\nshell_type = unix\n"
                     "md5sum_command = md5sum\nrclone.ciphers = aes256-ctr\n") != std::string::npos);
@@ -409,7 +436,7 @@ TEST_CASE("Georgian, dotted and case-only names through add, edit and remove") {
     CHECK(Scratch::pins().empty()); // the last server there: its keys go
 }
 
-TEST_CASE("an edit changes the store only with the login method or the secret, and moves what belongs to the server (G85)") {
+TEST_CASE("an edit changes the store only with the login method, the key file or the secret, and moves what belongs to the server (G85)") {
     Scratch s;
     s.write("grab.conf", grab_conf);
     Scratch::pins("[box.example.com]:23 ssh-ed25519 BOX\n");
@@ -446,9 +473,25 @@ TEST_CASE("an edit changes the store only with the login method or the secret, a
     CHECK(text.find("rclone.ciphers = aes256-ctr\n") != std::string::npos); // a setting of the user's: kept
     CHECK(Scratch::pins() == "[box.example.com]:2223 ssh-ed25519 NEW\n");
 
+    // The same key file: its passphrase stays.
+    REQUIRE(server_ops::update_server(s.env(), keyed, std::nullopt, std::nullopt));
+    CHECK(s.secrets().at("box").at("passphrase") == fake("fake-phrase", "u1", "box.example.com", 2223));
+    // Another key file with a passphrase typed: it replaces the old one.
+    const auto other = std::filesystem::temp_directory_path() / "grab-test-server-ops-key2";
+    std::ofstream(other, std::ios::binary) << "not a real key either";
+    keyed.key_file = util::path_to_utf8(other);
+    REQUIRE(server_ops::update_server(s.env(), keyed, std::string("fake-phrase2"), std::nullopt));
+    CHECK(s.secrets().at("box").at("passphrase") == fake("fake-phrase2", "u1", "box.example.com", 2223));
+    // Another key file and nothing typed: the old key's passphrase goes (rclone refuses an
+    // unencrypted key given one); the extra stays.
+    keyed.key_file = util::path_to_utf8(key);
+    REQUIRE(server_ops::update_server(s.env(), keyed, std::nullopt, std::nullopt));
+    CHECK(s.secrets() == passwords::Store{{"box", {{"rclone.set_env", fake("FAKE=1", "u1", "box.example.com", 2223)}}}});
+
     // A stored key stays only where it was.
     CHECK_FALSE(server_ops::update_server(s.env(), server(Auth::stored_key), std::nullopt, std::nullopt).has_value());
     std::filesystem::remove(key);
+    std::filesystem::remove(other);
 }
 
 TEST_CASE("a section without connection details is filled in by Edit") {
@@ -784,4 +827,148 @@ TEST_CASE("server ops: Test runs rclone's listing on engine = rclone only, and r
     // A section without details can't be tested.
     s.write("grab.conf", "[grab]\n\n[bare]\nmax_depth = 2\n");
     CHECK_FALSE(server_ops::test_connection(s.env(), "bare").has_value());
+}
+
+TEST_CASE("server list says whether each login's secret is saved for that very login, never the value (phase 7)") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "\n[keyed]\nhost = k.example\nuser = k\nauth = key\nkey_file = C:\\k\\id\n"
+                                     "\n[pem]\nhost = p.example\nuser = p\nauth = stored_key\n"
+                                     "\n[moved]\nhost = m.example\nport = 2222\nuser = m\nauth = password\n");
+    REQUIRE(passwords::save(s.store(), {{"box", {{"password", fake("fake-pw")}}},
+                                        {"keyed", {{"passphrase", fake("fake-pass", "k", "k.example", 22)}}},
+                                        {"moved", {{"password", fake("fake-old", "m", "m.example", 22)}}}}));
+    auto env = s.env();
+    auto list = server_ops::list_servers(env);
+    REQUIRE(list.size() == 5);
+    CHECK(list[0].secret_saved == true);           // box: its password, for u1@box.example.com:23
+    CHECK_FALSE(list[1].secret_saved.has_value()); // agent: nothing to save
+    CHECK(list[2].secret_saved == true);           // keyed: its passphrase
+    CHECK(list[3].secret_saved == false);          // pem: no key in the store
+    CHECK(list[4].secret_saved == false);          // moved: saved for port 22, not 2222
+    CHECK(server_ops::login_text(list[0]) == "password saved");
+    CHECK(server_ops::login_text(list[1]) == "ssh-agent");
+    CHECK(server_ops::login_text(list[2]) == "key file, passphrase saved");
+    CHECK(server_ops::login_text(list[3]) == "no key in grab's store (grab server edit pem)");
+    CHECK(server_ops::login_text(list[4]) == "no password saved (grab server edit moved)");
+    CHECK(server_ops::host_key_text(list[0]) == "host key not trusted (grab server trust box)");
+    Scratch::pins("[box.example.com]:23 ssh-ed25519 BOX\n");
+    CHECK(server_ops::host_key_text(server_ops::list_servers(env)[0]) == "host key pinned");
+    for (const auto& info : list) {
+        CHECK(server_ops::login_text(info).find("fake-") == std::string::npos);
+        CHECK(info.store_error.empty());
+    }
+#ifdef _WIN32
+    // A store that can't be read: unknown, and why, for the servers that need one.
+    std::ofstream(s.store(), std::ios::binary) << "grab-passwords-sealed 1\nanother account's";
+    list = server_ops::list_servers(env);
+    CHECK_FALSE(list[0].secret_saved.has_value());
+    CHECK_FALSE(list[0].store_error.empty());
+    CHECK(server_ops::login_text(list[0]).starts_with("password (grab's saved passwords can't be read: "));
+    CHECK(list[1].store_error.empty()); // ssh-agent needs none
+    // So an edit can't keep "the saved one".
+    CHECK(server_ops::edit_needs_password(list[0], server(Auth::password)));
+#endif
+}
+
+TEST_CASE("an edit starts from the server's answers; a section without details from blank ones") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "max_connections = 6\n\n[bare]\nsearch_roots = ~, /srv\nmax_depth = 2\n");
+    const auto list = server_ops::list_servers(s.env());
+    REQUIRE(list.size() == 3);
+    const auto box = server_ops::edit_defaults(list[0]);
+    CHECK(box.name == "box");
+    CHECK(box.host == "box.example.com");
+    CHECK(box.port == 23);
+    CHECK(box.user == "u1");
+    CHECK(box.auth == Auth::password);
+    CHECK(box.search_roots == std::vector<std::string>{"/home/movies"});
+    CHECK(box.max_depth == 4);
+    const auto agent = server_ops::edit_defaults(list[1]);
+    CHECK(agent.auth == Auth::agent);
+    CHECK(agent.max_depth == 6);
+    CHECK(agent.max_connections == 6);
+    const auto bare = server_ops::edit_defaults(list[2]);
+    CHECK(bare.name == "bare");
+    CHECK(bare.host.empty());
+    CHECK(bare.user.empty());
+    CHECK(bare.port == 22);
+    CHECK(bare.search_roots == std::vector<std::string>{"", "/srv"}); // "~" is the login home
+    CHECK(bare.max_depth == 2);
+    // Its edit asks for the host key and a password, whatever is typed.
+    auto wanted = bare;
+    wanted.host = "box.example.com";
+    wanted.user = "u1";
+    CHECK(server_ops::edit_needs_host_key(list[2], wanted));
+    CHECK(server_ops::edit_needs_password(list[2], wanted));
+}
+
+TEST_CASE("a test's lines as the command prints them") {
+    server_ops::TestResult t;
+    t.rclone_ok = true;
+    t.grab_ok = true;
+    t.checksums = "checksums: md5sum";
+    CHECK(server_ops::test_lines(t) == std::vector<std::string>{
+                                           "rclone (downloads): OK",
+                                           "grab (previews, Play, verify): OK, home folder listed, checksums: md5sum"});
+    t.grab_ok = false;
+    t.grab_error = "Box: host key not trusted: use Trust";
+    t.ssh_ok = false;
+    t.ssh_error = "Permission denied (publickey).";
+    CHECK(server_ops::test_lines(t, " (hint)") ==
+          std::vector<std::string>{"rclone (downloads): OK",
+                                   "grab (previews, Play, verify): can't run: Box: host key not trusted: use Trust",
+                                   "ssh (searches):     FAILED: Permission denied (publickey). (hint)"});
+    server_ops::TestResult g;
+    g.grab_engine = true;
+    g.grab_ok = true;
+    g.grab_search = "with find (GNU find)";
+    g.checksums = "verify can't run: no md5sum";
+    CHECK(server_ops::test_lines(g) ==
+          std::vector<std::string>{"grab (downloads, searches, previews, Play, verify): OK, home folder listed, searches "
+                                   "with find (GNU find), verify can't run: no md5sum"});
+    g.grab_ok = false;
+    g.grab_error = "login refused";
+    CHECK(server_ops::test_lines(g).at(0) == "grab (downloads, searches, previews, Play, verify): FAILED: login refused");
+}
+
+TEST_CASE("the window's notice after an import names the servers moved and what each still needs") {
+    auto info = [](std::string name, bool pinned, Auth auth, std::optional<bool> saved, std::string error = {}) {
+        server_ops::ServerInfo s;
+        s.name = std::move(name);
+        s.host_key_pinned = pinned;
+        s.auth = auth;
+        s.secret_saved = saved;
+        s.error = std::move(error);
+        return s;
+    };
+    const std::string georgian = "\xE1\x83\x91\xE1\x83\x9D\xE1\x83\xA5\xE1\x83\xA1\xE1\x83\x98"; // ბოქსი
+    const std::vector<server_ops::ServerInfo> servers{
+        info("Main", true, Auth::agent, std::nullopt), info("Box", false, Auth::password, true),
+        info(georgian, true, Auth::password, false), info("old", false, Auth::password, std::nullopt, "[old] has no details")};
+    const auto text = server_ops::import_banner(
+        {"Main", "Box", georgian, "gone"}, servers,
+        {"[Box] its host key isn't trusted yet: use Trust (grab server trust Box)",
+         "[" + georgian + "] rclone asked for its password each time (ask_password), which grab can't do in the "
+                          "background: enter it with Edit",
+         "[Main] key_file came from [main], as rclone reads [main.x]", "[Late] not imported: there is no rclone remote [Late]"});
+    const auto lines = util::split(text, '\n');
+    REQUIRE(lines.size() == 5);
+    CHECK(lines[0] == "Servers are kept in grab.conf now: the connection details of Main, Box, " + georgian +
+                          " moved there from rclone.conf, which stays as it was (grab no longer writes it). Their "
+                          "passwords are in grab's own encrypted store.");
+    CHECK(lines[1] == "Box: its host key isn't trusted yet: use Trust in Settings, which shows its fingerprints to compare.");
+    CHECK(lines[2] == georgian + ": no password is saved for it: enter it with Edit.");
+    // The import's notes the lines above don't already say ("gone" was removed since).
+    CHECK(lines[3] == "[Main] key_file came from [main], as rclone reads [main.x]");
+    CHECK(lines[4] == "[Late] not imported: there is no rclone remote [Late]");
+    CHECK(text.find("gone") == std::string::npos);
+    // Nothing moved that is still there, and no notes: nothing to say.
+    CHECK(server_ops::import_banner({"gone"}, servers, {}).empty());
+    CHECK(server_ops::import_banner({}, servers, {}).empty());
+    // A section without details says so.
+    CHECK(server_ops::import_banner({"old"}, servers, {}).find("\n[old] has no details") != std::string::npos);
+    // Only ssh-agent servers moved: no password to speak of.
+    CHECK(server_ops::import_banner({"Main"}, servers, {}) ==
+          "Servers are kept in grab.conf now: the connection details of Main moved there from rclone.conf, which stays "
+          "as it was (grab no longer writes it).");
 }

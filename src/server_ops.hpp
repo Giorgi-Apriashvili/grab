@@ -61,6 +61,12 @@ struct ServerInfo {
     Engine engine = Engine::rclone; // effective_engine(): what downloads and searches it
     std::string search;             // search_method(): "ssh", "rclone"; on grab "find", "walk", "probe"
     bool host_key_pinned = false;   // grab's known_hosts has a key for [host]:port, read now (G209)
+    // Whether grab's store has the secret this login uses, saved for this very user@host:port
+    // (passwords::value_for): the password (auth = password), the key's passphrase (key, where
+    // none is fine too), the imported key (stored_key). nullopt for ssh-agent, and when the store
+    // can't be read (store_error says why).
+    std::optional<bool> secret_saved;
+    std::string store_error;
 };
 
 [[nodiscard]] bool is_default_server(const GrabConfig& cfg, std::string_view name);
@@ -120,13 +126,18 @@ struct Problem {
                                                                  const std::optional<std::string>& secret,
                                                                  const HostKeys& keys);
 
+// The answers an edit of `current` starts from (`grab server edit`'s defaults): its details as
+// they are, its search folders, depth and connection limit. A section without details (or with
+// details grab can't read) starts from a blank host and user, port 22 and a password.
+[[nodiscard]] servers::NewServer edit_defaults(const ServerInfo& current);
 // Whether an edit from `current` to `wanted` must fetch and confirm the host key again: the
-// address changed, or no key is pinned yet.
+// address changed, no key is pinned yet, or the section had no details to compare with.
 [[nodiscard]] bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wanted);
-// Whether an edit to password login must be given the password: the server didn't use one, or
-// its user, host or port changed, so the saved password never goes to another server or account
-// without being typed (G40: a page that took over the window could otherwise send it anywhere;
-// the store's binding enforces it below the window too).
+// Whether an edit to password login must be given the password: the server didn't use one, has
+// none saved for its login (or no details), or its user, host or port changed, so the saved
+// password never goes to another server or account without being typed (G40: a page that took
+// over the window could otherwise send it anywhere; the store's binding enforces it below the
+// window too).
 [[nodiscard]] bool edit_needs_password(const ServerInfo& current, const servers::NewServer& wanted);
 
 // Applies an edit of server `wanted.name` (the name itself cannot change): the section's keys
@@ -176,6 +187,24 @@ struct TestResult {
     }
 };
 
+// ---- texts the command and the window show -----------------------------------------------
+
+// How `s` logs in, for `grab server list`: "ssh-agent", "key file", "key file, passphrase
+// saved", "password saved", "no password saved (grab server edit NAME)", "key in grab's store",
+// "no key in grab's store (grab server edit NAME)", or why grab's store can't be read.
+[[nodiscard]] std::string login_text(const ServerInfo& s);
+// "host key pinned", or "host key not trusted (grab server trust NAME)".
+[[nodiscard]] std::string host_key_text(const ServerInfo& s);
+
+// The window's one-time notice after an import (the names rclone_import::take_banner gives):
+// whose connection details moved from rclone.conf into grab.conf, then what each of them still
+// needs as `servers` (list_servers, read now) has it: details, Trust, its password. `notes` are
+// that import's own ("[server] ..."), when this run made it; they follow, but not those a line
+// above already says. One line each, joined by line breaks; "" when it has nothing to say (none
+// of the names is a server any more, and no notes).
+[[nodiscard]] std::string import_banner(const std::vector<std::string>& names, const std::vector<ServerInfo>& servers,
+                                        const std::vector<std::string>& notes);
+
 // The paths searches, downloads, previews, Play and verification use. An unpinned server
 // (engine::check_pinned) fails each part at once, nothing dialled. On engine = rclone an rclone
 // listing (`--config NUL`, the server in its environment), plus an ssh login (BatchMode) for
@@ -186,5 +215,13 @@ struct TestResult {
 // the find check, which says how its searches go.
 [[nodiscard]] std::expected<TestResult, std::string> test_connection(const Env& env, std::string_view name,
                                                                      std::stop_token stop = {});
+
+// A test's result as `grab server add | edit | test` print it, one line per part:
+//   rclone (downloads): OK                        engine = rclone
+//   grab (previews, Play, verify): OK, home folder listed, checksums: md5sum
+//   ssh (searches):     FAILED: ...               engine = rclone with ssh + find
+// grab's part names what it does there (downloads and searches too on engine = grab) and says
+// "can't run" where it is only a warning. `ssh_hint` follows a failed ssh login.
+[[nodiscard]] std::vector<std::string> test_lines(const TestResult& t, std::string_view ssh_hint = {});
 
 } // namespace grab::server_ops

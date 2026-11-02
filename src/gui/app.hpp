@@ -76,6 +76,7 @@ public:
     [[nodiscard]] QueueSummary summary() const;
     [[nodiscard]] GuiState& state() { return state_; }
     void save_state() const;
+    void post_import_banner();
     // UI thread, every second: follows the speed schedule.
     void tick();
     // The page's https://grab.ui/preview/<remote>/<path>[?size=N&modified=T][&ahead] requests (the
@@ -460,6 +461,7 @@ private:
     std::filesystem::path limits_path_; // learned connection limits, shared with the command
     GuiState state_;
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
+    std::string import_banner_;        // UI thread: the one-time notice after an import, until the page shows it
     bool page_ready_ = false;          // UI thread: the page has sent "init"
     fetch::Connections connections_;
     ssh::Pools pools_;          // grab's own SSH connections: engine = grab servers, every server's verification

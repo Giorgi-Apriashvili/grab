@@ -86,8 +86,8 @@ std::expected<std::optional<Connection>, std::string> parse(const ini::Section& 
     const auto auth = nonblank(section, "auth");
     if (!auth) {
         return util::failf("[{}] has a host but no login method: add auth = agent, key, password or stored_key (or "
-                           "change the server with Edit in grab's Settings)",
-                           name);
+                           "choose one with `grab server edit {}` or Edit in grab's Settings)",
+                           name, name);
     }
     const auto method = parse_auth(*auth);
     if (!method) return util::failf("[{}] auth must be agent, key, password or stored_key, got '{}'", name, *auth);
@@ -106,8 +106,8 @@ std::expected<std::optional<Connection>, std::string> parse(const ini::Section& 
         const auto option = std::string_view(key).substr(rclone_prefix.size());
         if (!rclone_key_allowed(option)) {
             return util::failf("[{}] {} can't be set in grab.conf (grab gives rclone only the settings that hold no "
-                               "password; change the server with Edit in grab's Settings)",
-                               name, key);
+                               "password; change the server with `grab server edit {}` or Edit in grab's Settings)",
+                               name, key, name);
         }
         const auto v = util::trim(value);
         if (!v.empty()) c.rclone.emplace_back(option, v);

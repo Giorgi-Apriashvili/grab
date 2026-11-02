@@ -47,8 +47,15 @@ struct Unusable {
 struct Refused {
     std::string flag; // its name, without a value
     std::string what;
+    // Where grab keeps it instead: grab.conf's key ("host", "key_file", "auth",
+    // "rclone.pubkey_file"), "" for a secret in grab's store, "trust" for grab's known_hosts,
+    // "ssh" for nothing (grab's runs use rclone's own SSH client).
+    std::string in_grab;
 };
 [[nodiscard]] std::optional<Refused> first_refused(std::span<const std::string> flags);
+// What to do instead, for the refusal's message: "change grab.conf's `host` with `grab server
+// edit Main` or Edit in grab's Settings"; `server` is the server's name (or a placeholder).
+[[nodiscard]] std::string change_instead(const Refused& refused, std::string_view server);
 
 // Whether an inherited environment variable reaches grab's internal rclone calls: anything but
 // RCLONE_*, and of those RCLONE_PASSWORD_COMMAND and the RCLONE_SFTP_* that aren't about the

@@ -11,7 +11,7 @@
 //                 spaceShort, existing,
 //                 updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
-//                 serverError, filePicked
+//                 serverError, filePicked, importBanner
 
 const $ = (sel) => document.querySelector(sel);
 const ROW = 32; // keep in sync with --row in app.css
@@ -2582,6 +2582,25 @@ $('#update-banner').addEventListener('click', (ev) => {
   else if (act === 'dismiss') { state.update = { state: '' }; renderUpdate(); }
 });
 
+// ---- the one-time notice after grab moved servers from rclone.conf into grab.conf -----------
+
+function showImportBanner(text) {
+  const b = $('#import-banner');
+  b.hidden = !text;
+  if (!text) return;
+  b.innerHTML = '<span class="text"></span>' +
+    '<button type="button" data-act="settings">Settings</button>' +
+    '<button type="button" class="subtle" data-act="ok">OK</button>';
+  b.querySelector('.text').textContent = bidiVisible(text);
+}
+
+$('#import-banner').addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-act]');
+  if (!el) return;
+  showImportBanner('');
+  if (el.dataset.act === 'settings' && !settings.open) openSettings();
+});
+
 $('#update-auto').addEventListener('change', (ev) => send({ type: 'setUpdateCheck', on: ev.target.checked }));
 $('#verify-on').addEventListener('change', (ev) => send({ type: 'setVerify', on: ev.target.checked }));
 
@@ -2823,7 +2842,9 @@ function testLine(t) {
   // grab's own client previews, plays and verifies on every server; on engine = grab it also
   // downloads and searches, and rclone isn't asked (rcloneOk null).
   const grab = t.grabEngine === true;
-  const how = (t.grabOk && grab ? ` · searches ${esc(t.grabSearch)}` : '') + (t.grabOk && t.checksums ? ` · ${esc(t.checksums)}` : '');
+  // As `grab server test` says it: grab's login listed the home folder.
+  const how = (t.grabOk ? ' · home folder listed' : '') + (t.grabOk && grab ? ` · searches ${esc(t.grabSearch)}` : '') +
+    (t.grabOk && t.checksums ? ` · ${esc(t.checksums)}` : '');
   if (t.ok) {
     // On engine = rclone grab's login only previews, plays and verifies: a failure there is a
     // warning, not a failed test (its downloads go through rclone).
@@ -2843,6 +2864,17 @@ function testLine(t) {
   return parts.map((p) => `<span>${p}</span>`).join('');
 }
 
+// How a server logs in, and whether what it needs is saved (never the value): "password
+// (saved)", "password (none saved: enter it with Edit)".
+function loginText(s) {
+  const how = AUTH_TEXT[s.auth];
+  if (s.auth === 'password' && s.secretSaved === true) return `${how} (saved)`;
+  if (s.auth === 'password' && s.secretSaved === false) return `${how} <span class="warn">(none saved: enter it with Edit)</span>`;
+  if (s.auth === 'key' && s.secretSaved === true) return `${how} (passphrase saved)`;
+  if (s.auth === 'stored_key' && s.secretSaved === false) return `${how} <span class="warn">(not in the store: choose another login with Edit)</span>`;
+  return how;
+}
+
 function serverCard(s) {
   const btn = (act, label, cls = '') =>
     `<button type="button" class="${cls}" data-act="${act}" data-name="${esc(s.name)}"${settings.busy ? ' disabled' : ''}>${label}</button>`;
@@ -2850,21 +2882,22 @@ function serverCard(s) {
   if (!s.error) {
     actions.push(btn('test', 'Test'));
     if (!s.pinned) actions.push(btn('trust', 'Trust…'));
-    actions.push(btn('edit', 'Edit'));
-    if (!s.isDefault) actions.push(btn('default', 'Make default'));
   }
+  // A section without connection details (or with ones grab can't read) is filled in with Edit.
+  actions.push(btn('edit', 'Edit'));
+  if (!s.error && !s.isDefault) actions.push(btn('default', 'Make default'));
   actions.push(btn('remove', 'Remove', 'danger'));
 
   const where = s.roots.length ? s.roots.join(', ') : '~';
   const meta = s.error
     ? `<span class="bad">${esc(s.error)}</span>`
-    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${AUTH_TEXT[s.auth]}${s.engine === 'grab' ? ' · grab\'s engine' : ''}` +
+    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}${s.engine === 'grab' ? ' · grab\'s engine' : ''}` +
       ` · searched ${SEARCHED_TEXT[s.search] || 'with rclone listing'} in ${esc(where)}, depth ${s.depth}` +
       ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}`;
   const status = [];
   if (!s.error) {
     status.push(s.pinned ? '<span class="good">✓ Host key pinned</span>'
-      : '<span class="warn">⚠ Host key not checked: any server answering at this address is accepted. Use Trust… to pin it.</span>');
+      : '<span class="warn">⚠ Host key not trusted yet: grab won\'t connect to this server until you pin its key with Trust….</span>');
   }
   const test = testLine(settings.tests[s.name]);
   return `<div class="server">` +
@@ -2890,12 +2923,15 @@ function renderServers() {
       '<button type="button" class="primary" data-act="add">Add a server</button></div>';
 }
 
-// A saved password stays only with the host and user it was typed for (the backend checks too).
+// A saved password stays only with the user, host and port it was typed for, compared exactly
+// as the backend's binding does (G40); a key's passphrase moves with the server but stays only
+// with its key file.
 function keepsSecret(auth) {
   const f = settings.form;
-  if (!f || !f.editing || f.origAuth !== auth) return false;
-  return auth !== 'password' || ($('#f-host').value.trim().toLowerCase() === f.origHost.toLowerCase() &&
-    $('#f-user').value.trim() === f.origUser);
+  if (!f || !f.editing || f.origAuth !== auth || !f.secretSaved) return false;
+  if (auth === 'key') return $('#f-key').value.trim() === f.origKey;
+  return auth !== 'password' || ($('#f-host').value.trim() === f.origHost &&
+    $('#f-user').value.trim() === f.origUser && intOf('#f-port') === f.origPort);
 }
 
 function setSecretPlaceholder() {
@@ -2904,7 +2940,7 @@ function setSecretPlaceholder() {
   $('#f-secret').placeholder = keepsSecret(auth)
     ? (auth === 'key' ? 'Leave blank to keep the saved passphrase' : 'Leave blank to keep the saved password')
     : auth === 'key' ? 'Only if the key has one'
-    : f && f.editing && f.origAuth === 'password' ? 'Enter it again for the new host or user' : '';
+    : f && f.editing && f.origAuth === 'password' && f.secretSaved ? 'Enter it again for the new user, host or port' : '';
 }
 
 function setAuth(auth) {
@@ -2918,7 +2954,7 @@ function setAuth(auth) {
   const grab = (settings.form ? settings.form.engine : settings.engine) === 'grab';
   $('#secret-hint').textContent = auth === 'key' && !grab
     ? 'Searches use ssh, which cannot ask for a passphrase here: load such a key into ssh-agent (ssh-add) and choose ssh-agent instead.'
-    : 'Stored obscured in grab\'s rclone.conf, never in plain text on a command line.';
+    : 'Kept in grab\'s own password store, encrypted for your Windows account; never in grab.conf or on a command line.';
   const searches = 'searches use find where the server has it, else grab lists its folders.';
   $('#auth-hint').textContent = (grab ? {
     password: `Works without a shell (e.g. storage boxes); ${searches}`,
@@ -2937,22 +2973,25 @@ function clearFieldErrors() {
 
 function openForm(name) {
   const s = name ? settings.servers.find((x) => x.name === name) : null;
-  settings.form = { editing: !!s, name: s ? s.name : '', origAuth: s ? s.auth : null,
-    origHost: s ? s.host : '', origUser: s ? s.user : '', engine: s ? s.engine : settings.engine };
-  $('#form-title').textContent = s ? `Edit ${s.name}` : 'Add a server';
+  // A section without connection details (s.error) starts from a blank host and user.
+  const known = s && !s.error;
+  settings.form = { editing: !!s, name: s ? s.name : '', origAuth: known ? s.auth : null,
+    origHost: known ? s.host : '', origUser: known ? s.user : '', origPort: known ? s.port : 22,
+    origKey: known ? (s.keyFile || '') : '', secretSaved: !!known && s.secretSaved === true, engine: s ? s.engine : settings.engine };
+  $('#form-title').textContent = s ? (known ? `Edit ${s.name}` : `Fill in ${s.name}'s connection details`) : 'Add a server';
   $('#f-name').value = s ? s.name : '';
   $('#f-name').disabled = !!s;
-  $('#f-host').value = s ? s.host : '';
-  $('#f-port').value = s ? s.port : 22;
-  $('#f-user').value = s ? s.user : '';
-  $('#f-key').value = s ? s.keyFile : '';
+  $('#f-host').value = known ? s.host : '';
+  $('#f-port').value = known ? s.port : 22;
+  $('#f-user').value = known ? s.user : '';
+  $('#f-key').value = known ? s.keyFile : '';
   $('#f-secret').value = '';
   $('#f-roots').value = s ? s.roots.join('\n') : '';
   $('#f-depth').value = s ? s.depth : 4;
   $('#f-conns').value = s && s.maxConnections ? s.maxConnections : '';
   $('#f-conns').placeholder = s ? String(s.autoConnections) : '';
   $('#conns-hint').textContent = s ? `blank = automatic (now ${s.autoConnections})` : 'blank = automatic';
-  setAuth(s ? s.auth : 'password');
+  setAuth(known ? s.auth : 'password');
   clearFieldErrors();
   showSettingsBanner('');
   renderServers();
@@ -3088,8 +3127,9 @@ function onSettingsAction(act, name) {
   if (act === 'remove') {
     showModal({
       title: `Remove ${name}?`,
-      html: '<p>grab forgets this server: its section in grab.conf and its connection in grab\'s ' +
-        'rclone.conf are deleted. Files you already downloaded stay where they are.</p>',
+      html: '<p>grab forgets this server: its section in grab.conf, its saved password, its file list and ' +
+        'what grab learned about it are deleted, and its host keys too unless another server uses that address. ' +
+        'Files you already downloaded stay where they are, and rclone.conf isn\'t changed.</p>',
       ok: 'Remove',
       danger: true,
       onOk: () => { delete settings.tests[name]; send({ type: 'serverRemove', name }); },
@@ -3142,7 +3182,8 @@ if (webview) {
       case 'serverSaved': onServerSaved(msg); break;
       case 'serverTested': settings.tests[msg.name] = msg; renderServers(); break;
       case 'serverError': onServerError(msg); break;
-      case 'filePicked': $('#f-key').value = msg.path; break;
+      case 'filePicked': $('#f-key').value = msg.path; setSecretPlaceholder(); break;
+      case 'importBanner': showImportBanner(msg.text); break;
     }
   });
 }
@@ -3547,6 +3588,8 @@ $('#f-auth').addEventListener('click', (ev) => {
 });
 $('#f-host').addEventListener('input', setSecretPlaceholder);
 $('#f-user').addEventListener('input', setSecretPlaceholder);
+$('#f-port').addEventListener('input', setSecretPlaceholder);
+$('#f-key').addEventListener('input', setSecretPlaceholder);
 $('#f-key-browse').addEventListener('click', () => send({ type: 'pickFile', current: $('#f-key').value.trim() }));
 $('#modal-ok').addEventListener('click', () => closeModal(true));
 $('#modal-cancel').addEventListener('click', () => closeModal(false));

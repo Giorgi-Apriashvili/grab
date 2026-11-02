@@ -91,6 +91,29 @@ TEST_CASE("--sftp-* flags that would replace the server grab gives rclone are re
     CHECK_FALSE(rclone_flags::first_refused(V{"--sftp_host", "x", "--SFTP-HOST", "y"}).has_value());
 }
 
+TEST_CASE("a refused --sftp-* flag names where grab keeps that setting instead (phase 7)") {
+    using V = std::vector<std::string>;
+    auto change = [](const char* flag) {
+        const auto refused = rclone_flags::first_refused(V{flag, "x"});
+        REQUIRE(refused.has_value());
+        return rclone_flags::change_instead(refused.value_or(rclone_flags::Refused{}), "Main");
+    };
+    CHECK(change("--sftp-host") == "change grab.conf's `host` with `grab server edit Main` or Edit in grab's Settings");
+    CHECK(change("--sftp-port").find("grab.conf's `port`") != std::string::npos);
+    CHECK(change("--sftp-user").find("grab.conf's `user`") != std::string::npos);
+    CHECK(change("--sftp-key-file").find("grab.conf's `key_file`") != std::string::npos);
+    CHECK(change("--sftp-key-use-agent").find("grab.conf's `auth`") != std::string::npos);
+    CHECK(change("--sftp-pubkey-file").find("grab.conf's `rclone.pubkey_file`") != std::string::npos);
+    for (const char* secret : {"--sftp-pass", "--sftp-ask-password", "--sftp-key-file-pass"}) {
+        CHECK_MESSAGE(change(secret) == "change it with `grab server edit Main` or Edit in grab's Settings (grab keeps it "
+                                        "in its password store)",
+                      secret);
+    }
+    CHECK(change("--sftp-known-hosts-file") ==
+          "pin its host keys with `grab server trust Main` or Trust in grab's Settings");
+    CHECK(change("--sftp-ssh").find("rclone's own SSH client") != std::string::npos);
+}
+
 #ifdef _WIN32
 TEST_CASE("children grab runs itself don't see RCLONE_PROGRESS, RCLONE_CONFIG_* and the like; run_inherit's do (G8)") {
     SetEnvironmentVariableW(L"RCLONE_PROGRESS", L"true");

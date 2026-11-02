@@ -715,6 +715,43 @@ TEST_CASE("apply: grab 0.19's servers into grab.conf, the store and known_hosts;
     old.untouched();
 }
 
+TEST_CASE("the window names the servers an import moved once: take_banner empties the record's list") {
+    Old old;
+    // Nothing imported yet, no imported.json: nothing to name, nothing written.
+    const auto none = rclone_import::take_banner(old.files.state_dir);
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+    CHECK_FALSE(rclone_import::banner_waiting(old.files.state_dir));
+    CHECK_FALSE(old.record().has_value());
+
+    REQUIRE(rclone_import::apply(old.files));
+    const auto before = old.record().value_or(rclone_import::Record{});
+    REQUIRE(before.banner.size() == 5);
+    CHECK(rclone_import::banner_waiting(old.files.state_dir)); // a peek: the names stay
+    CHECK(old.record().value_or(rclone_import::Record{}) == before);
+    const auto names = rclone_import::take_banner(old.files.state_dir);
+    REQUIRE_MESSAGE(names.has_value(), names.error_or(""));
+    CHECK(*names == before.banner);
+    // Only the list goes: what was imported stays, so nothing is imported or named again.
+    auto after = old.record().value_or(rclone_import::Record{});
+    CHECK(after.banner.empty());
+    after.banner = before.banner;
+    CHECK(after == before);
+    const auto again = rclone_import::take_banner(old.files.state_dir);
+    REQUIRE(again.has_value());
+    CHECK(again->empty());
+    CHECK_FALSE(rclone_import::banner_waiting(old.files.state_dir));
+    REQUIRE(rclone_import::apply(old.files));
+    CHECK(rclone_import::take_banner(old.files.state_dir).value_or(std::vector<std::string>{"x"}).empty());
+    old.untouched();
+
+    // An imported.json grab can't read is an error, never replaced.
+    Old::write(rclone_import::record_path(old.files.state_dir), "not a record");
+    CHECK_FALSE(rclone_import::take_banner(old.files.state_dir).has_value());
+    CHECK_FALSE(rclone_import::banner_waiting(old.files.state_dir));
+    CHECK(util::read_file(rclone_import::record_path(old.files.state_dir)).value_or("") == "not a record");
+}
+
 TEST_CASE("apply: a removed server doesn't come back; a failed one is tried again when its source changes") {
     Old old;
     REQUIRE(rclone_import::apply(old.files));

@@ -102,8 +102,7 @@ inline constexpr std::string_view default_folder_flags = "--transfers 8 --checke
 inline constexpr std::string_view default_file_flags =
     "--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi";
 
-// Commented example with a placeholder server; `grab --init` falls back to it when rclone.conf
-// is missing, encrypted or has no usable sftp remote.
+// Commented example with a placeholder server, as grab.conf.example has it.
 extern const std::string_view example_config;
 
 [[nodiscard]] std::filesystem::path default_grab_config_path(); // $GRAB_CONFIG or <config>/grab/grab.conf
@@ -179,8 +178,15 @@ private:
                                              Engine engine);
 
 // "alice@host:22, key file, lookup via ssh + find": the lookup as `settings` (its engine as
-// grab.conf says it, and its find setting) has it.
-[[nodiscard]] std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings = {});
+// grab.conf says it, and its find setting) has it; `login`, when given, says how it logs in
+// ("key in grab's store") instead of what `remote` says.
+[[nodiscard]] std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings = {},
+                                          std::string_view login = {});
+
+// grab's comment line right above a server's section: "# server [NAME]: DESCRIPTION". grab 0.19
+// and before wrote "# rclone remote [NAME]: ...", which servers::remove_section and
+// replace_lead_in still take for grab's.
+[[nodiscard]] std::string lead_in(std::string_view name, std::string_view description);
 
 // A commented grab.conf section for one rclone remote. search_roots is left blank (the login
 // home, correct for both lookup methods) and the rclone flag keys are written commented out,

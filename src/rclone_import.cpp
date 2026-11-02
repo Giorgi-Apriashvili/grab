@@ -812,4 +812,26 @@ std::expected<Result, std::string> apply(const Files& files) {
     return result;
 }
 
+bool banner_waiting(const fs::path& state_dir) {
+    const auto record = read_record(state_dir);
+    return record && *record && !(*record)->banner.empty();
+}
+
+std::expected<std::vector<std::string>, std::string> take_banner(const fs::path& state_dir) {
+    // Without the lock first, as on almost every start: nothing to name.
+    auto record = read_record(state_dir);
+    if (!record) return util::fail(record.error());
+    if (!*record || (*record)->banner.empty()) return std::vector<std::string>{};
+    auto lock = lock_settings();
+    if (!lock) return util::fail(lock.error());
+    record = read_record(state_dir); // as it is now: another grab may have changed it
+    if (!record) return util::fail(record.error());
+    if (!*record || (*record)->banner.empty()) return std::vector<std::string>{};
+    auto names = std::exchange((*record)->banner, {});
+    if (auto written = util::write_file_atomic(record_path(state_dir), to_json(**record)); !written) {
+        return util::fail(written.error());
+    }
+    return names;
+}
+
 } // namespace grab::rclone_import

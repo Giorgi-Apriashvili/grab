@@ -206,7 +206,7 @@ std::optional<std::pair<std::size_t, std::size_t>> find_section(const std::vecto
         while (end < lines.size() && !is_header(lines[end])) ++end;
         if (end < lines.size()) {
             // A comment block directly above the next header, set off from this section by a
-            // blank line, is that section's lead-in ("# rclone remote [next]: ..."), not ours.
+            // blank line, is that section's lead-in ("# server [next]: ..."), not ours.
             std::size_t j = end;
             while (j > i + 1 && comment(lines[j - 1])) --j;
             if (j < end && j > i + 1 && blank(lines[j - 1])) end = j;
@@ -217,17 +217,19 @@ std::optional<std::pair<std::size_t, std::size_t>> find_section(const std::vecto
     return std::nullopt;
 }
 
+// Whether line `at` of `l` is grab's generated lead-in comment of [section]: "# server
+// [section]: ..." (lead_in), or grab 0.19's "# rclone remote [its remote]: ..." (an imported
+// section's remote may have another name) and its older "# rclone.conf [section]".
+bool is_lead_in(const Lines& l, std::size_t at, std::string_view section) {
+    const auto t = util::trim(l.lines[at]);
+    return t.starts_with(std::format("# server [{}]", section)) || t.starts_with("# rclone remote [") ||
+           t.starts_with(std::format("# rclone.conf [{}]", section));
+}
+
 // Removes the block [begin, end) of `section`, with grab's lead-in comment right above it.
 void remove_block(Lines& l, std::string_view section, std::pair<std::size_t, std::size_t> range) {
     auto [begin, end] = range;
-    // grab's generated lead-in comment ("# rclone remote [name]: ...").
-    if (begin > 0) {
-        const auto prev = util::trim(l.lines[begin - 1]);
-        if (prev.starts_with(std::format("# rclone remote [{}]", section)) ||
-            prev.starts_with(std::format("# rclone.conf [{}]", section))) {
-            --begin;
-        }
-    }
+    if (begin > 0 && is_lead_in(l, begin - 1, section)) --begin;
     l.lines.erase(l.lines.begin() + static_cast<std::ptrdiff_t>(begin),
                   l.lines.begin() + static_cast<std::ptrdiff_t>(end));
     // Don't leave two blank lines where the section was.
@@ -314,9 +316,8 @@ std::string replace_lead_in(std::string_view text, std::string_view section, std
     Lines l = split_lines(text);
     auto range = find_section(l.lines, section);
     if (!range || range->first == 0) return std::string(text);
-    auto& prev = l.lines[range->first - 1];
-    if (!util::trim(prev).starts_with("# rclone remote [")) return std::string(text);
-    prev = comment;
+    if (!is_lead_in(l, range->first - 1, section)) return std::string(text);
+    l.lines[range->first - 1] = comment;
     return join_lines(l);
 }
 

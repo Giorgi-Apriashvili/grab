@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <format>
 #include <utility>
 
 namespace grab::rclone_flags {
@@ -20,25 +21,26 @@ constexpr std::array connection_names{
 // The sftp settings that say where and as whom rclone logs in, and which host keys it trusts: grab
 // gives each rclone run the server's own (engine::rclone_env), so neither a --sftp-* flag nor an
 // inherited RCLONE_SFTP_* variable may replace them (each beats RCLONE_CONFIG_<NAME>_*, checked
-// with rclone 1.75.1). With what each is in the server's settings.
+// with rclone 1.75.1). With what each is in the server's settings, and where grab keeps it.
 struct ServerSetting {
     std::string_view key; // rclone's option name
     std::string_view what;
+    std::string_view in_grab; // "host": grab.conf's key; "": no key of its own; "trust": known_hosts
 };
 constexpr std::array server_settings{
-    ServerSetting{.key = "host", .what = "address"},
-    ServerSetting{.key = "port", .what = "port"},
-    ServerSetting{.key = "user", .what = "user"},
-    ServerSetting{.key = "pass", .what = "password"},
-    ServerSetting{.key = "ask_password", .what = "password"},
-    ServerSetting{.key = "key_pem", .what = "key"},
-    ServerSetting{.key = "key_file", .what = "key file"},
-    ServerSetting{.key = "key_file_pass", .what = "key file's passphrase"},
-    ServerSetting{.key = "pubkey", .what = "certificate"},
-    ServerSetting{.key = "pubkey_file", .what = "certificate"},
-    ServerSetting{.key = "key_use_agent", .what = "login method (ssh-agent)"},
-    ServerSetting{.key = "known_hosts_file", .what = "trusted host keys"},
-    ServerSetting{.key = "ssh", .what = "connection (an ssh command instead of rclone's own)"},
+    ServerSetting{.key = "host", .what = "address", .in_grab = "host"},
+    ServerSetting{.key = "port", .what = "port", .in_grab = "port"},
+    ServerSetting{.key = "user", .what = "user", .in_grab = "user"},
+    ServerSetting{.key = "pass", .what = "password", .in_grab = ""},
+    ServerSetting{.key = "ask_password", .what = "password", .in_grab = ""},
+    ServerSetting{.key = "key_pem", .what = "key", .in_grab = "auth"},
+    ServerSetting{.key = "key_file", .what = "key file", .in_grab = "key_file"},
+    ServerSetting{.key = "key_file_pass", .what = "key file's passphrase", .in_grab = ""},
+    ServerSetting{.key = "pubkey", .what = "certificate", .in_grab = "rclone.pubkey_file"},
+    ServerSetting{.key = "pubkey_file", .what = "certificate", .in_grab = "rclone.pubkey_file"},
+    ServerSetting{.key = "key_use_agent", .what = "login method (ssh-agent)", .in_grab = "auth"},
+    ServerSetting{.key = "known_hosts_file", .what = "trusted host keys", .in_grab = "trust"},
+    ServerSetting{.key = "ssh", .what = "connection (an ssh command instead of rclone's own)", .in_grab = "ssh"},
 };
 
 std::string_view name_of(std::string_view flag) { return flag.substr(0, flag.find('=')); }
@@ -100,10 +102,24 @@ std::optional<Refused> first_refused(std::span<const std::string> flags) {
         const auto name = name_of(f);
         if (!name.starts_with(sftp)) continue;
         if (const auto* s = server_setting(name.substr(sftp.size()), true)) {
-            return Refused{.flag = std::string(name), .what = std::string(s->what)};
+            return Refused{.flag = std::string(name), .what = std::string(s->what), .in_grab = std::string(s->in_grab)};
         }
     }
     return std::nullopt;
+}
+
+std::string change_instead(const Refused& refused, std::string_view server) {
+    if (refused.in_grab == "trust") {
+        return std::format("pin its host keys with `grab server trust {}` or Trust in grab's Settings", server);
+    }
+    if (refused.in_grab == "ssh") return "grab's runs use rclone's own SSH client, which takes no ssh command";
+    if (refused.in_grab.empty()) {
+        return std::format("change it with `grab server edit {}` or Edit in grab's Settings (grab keeps it in its "
+                           "password store)",
+                           server);
+    }
+    return std::format("change grab.conf's `{}` with `grab server edit {}` or Edit in grab's Settings", refused.in_grab,
+                       server);
 }
 
 bool kept_variable(std::string_view name) {

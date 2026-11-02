@@ -62,6 +62,17 @@ std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::strin
     return keys;
 }
 
+// The server called `name` as `grab server list` shows it, or nullopt with the error printed.
+std::optional<server_ops::ServerInfo> server_named(const Env& env, std::string_view name) {
+    auto list = server_ops::list_servers(env);
+    const auto s = std::ranges::find(list, name, &server_ops::ServerInfo::name);
+    if (s == list.end()) {
+        error(std::format("no server called {} in grab.conf", name));
+        return std::nullopt;
+    }
+    return std::move(*s);
+}
+
 // ---- list ------------------------------------------------------------------------------------
 
 int server_list(const Env& env) {
@@ -76,24 +87,19 @@ int server_list(const Env& env) {
             std::println("{} {:<14} not usable: {}", mark, s.name, s.error);
             continue;
         }
-        const char* auth = s.auth == servers::Auth::agent        ? "ssh-agent"
-                           : s.auth == servers::Auth::key        ? "key file"
-                           : s.auth == servers::Auth::stored_key ? "key in grab's store"
-                                                                 : "password";
-        const std::string hostkey =
-            s.host_key_pinned ? "host key pinned" : "host key not trusted (grab server trust " + s.name + ")";
         // engine = grab: grab's own client, with find or by listing folders.
         const char* search = s.search == "ssh"    ? "search via ssh"
                              : s.search == "rclone" ? "search via rclone"
                              : s.search == "find"   ? "engine grab, search with find"
                              : s.search == "walk"   ? "engine grab, search by listing folders"
                                                     : "engine grab, search with find or by listing folders";
-        std::println("{} {:<14} {}@{}:{}  {}, {}, {}", mark, s.name, s.user, s.host, s.port, auth, search, hostkey);
+        std::println("{} {:<14} {}@{}:{}  {}, {}, {}", mark, s.name, s.user, s.host, s.port, server_ops::login_text(s),
+                     search, server_ops::host_key_text(s));
     }
     return exit_ok;
 }
 
-// ---- add -------------------------------------------------------------------------------------
+// ---- add / edit / test -----------------------------------------------------------------------
 
 std::optional<int> parse_int(std::string_view s, int lo, int hi) {
     int v = 0;
@@ -116,6 +122,132 @@ std::optional<std::string> ask_until(std::string_view prompt, std::string_view d
     }
 }
 
+// A secret typed without echo; Enter is an empty answer. nullopt at end of input.
+std::optional<std::string> ask_secret(std::string_view prompt) {
+    std::print(stderr, "{}: ", prompt);
+    std::fflush(stderr);
+    return util::read_secret_line();
+}
+
+// The questions `grab server add` and `edit` share, from the host to the search depth, with `s`
+// as the defaults; the answers go into `s`, a password or passphrase typed into `secret`.
+// `current` is the server being edited (nullptr for a new one): Enter keeps its saved password
+// only while user, host and port stay the same (server_ops::edit_needs_password), and its saved
+// passphrase while it logs in with a key file. False when the input ran out.
+bool ask_details(servers::NewServer& s, std::optional<std::string>& secret, const server_ops::ServerInfo* current) {
+    using servers::Auth;
+    auto host = ask_until("Host name or IP", s.host, [](const std::string& v) { return server_conf::check_host(v); });
+    if (!host) return false;
+    s.host = *host;
+    auto port = ask_until("SSH port", std::to_string(s.port), [](const std::string& v) -> std::optional<std::string> {
+        return parse_int(v, 1, 65535) ? std::nullopt : std::optional<std::string>("a number from 1 to 65535");
+    });
+    if (!port) return false;
+    s.port = *parse_int(*port, 1, 65535);
+    auto user = ask_until("User name", s.user, [](const std::string& v) { return server_conf::check_user(v); });
+    if (!user) return false;
+    s.user = *user;
+
+    // An imported key kept in grab's store can only be kept, never chosen.
+    const bool stored = current != nullptr && s.auth == Auth::stored_key;
+    const std::string choices = stored ? "1) password  2) key file  3) ssh-agent  4) the key kept in grab's store"
+                                       : "1) password  2) key file  3) ssh-agent";
+    const std::string_view was = s.auth == Auth::key          ? "2"
+                                 : s.auth == Auth::agent      ? "3"
+                                 : s.auth == Auth::stored_key ? "4"
+                                                              : "1";
+    auto auth = ask_until("Log in with  " + choices, was, [&](const std::string& v) -> std::optional<std::string> {
+        if (v == "1" || v == "2" || v == "3" || (stored && v == "4")) return std::nullopt;
+        return stored ? "1, 2, 3 or 4" : "1, 2 or 3";
+    });
+    if (!auth) return false;
+    const Auth before = s.auth;
+    const std::string before_key = s.key_file;
+    s.auth = *auth == "1" ? Auth::password : *auth == "2" ? Auth::key : *auth == "3" ? Auth::agent : Auth::stored_key;
+    // Beside ssh-agent an edit keeps the key file the section names (which agent key to use).
+    s.key_file.clear();
+    if (s.auth == Auth::password) {
+        const bool keeps = current != nullptr && !server_ops::edit_needs_password(*current, s);
+        for (;;) {
+            auto pw = ask_secret(keeps ? "Password (not shown; Enter keeps the saved one)" : "Password (not shown)");
+            if (!pw) return false;
+            if (!pw->empty()) {
+                secret = std::move(*pw);
+                break;
+            }
+            if (keeps) break;
+            std::println(stderr, "  required");
+        }
+    } else if (s.auth == Auth::key) {
+        auto key = ask_until("Private key file", before == Auth::key || before == Auth::agent ? before_key : "",
+                             [](const std::string& v) {
+                                 std::error_code ec;
+                                 return server_conf::check_key_file(
+                                     v, std::filesystem::is_regular_file(util::path_from_utf8(v), ec));
+                             });
+        if (!key) return false;
+        s.key_file = *key;
+        // Another key file drops the old one's passphrase (server_ops::update_server).
+        const bool keeps = current != nullptr && before == Auth::key && *key == before_key &&
+                           current->secret_saved.value_or(false);
+        auto pass = ask_secret(keeps ? "Key passphrase (not shown; Enter keeps the saved one)"
+                                     : "Key passphrase (not shown; Enter if none)");
+        if (!pass) return false;
+        if (!pass->empty()) secret = std::move(*pass);
+    }
+
+    auto roots = ask_until(current != nullptr ? "Folders to search, comma-separated (~ = the login home)"
+                                              : "Folders to search, comma-separated (Enter = the login home)",
+                           search_roots_value(s.search_roots),
+                           [](const std::string& v) { return server_conf::check_value(v); });
+    if (!roots) return false;
+    s.search_roots.clear();
+    for (const auto& r : util::split(*roots, ',')) s.search_roots.push_back(normalize_root(r));
+    auto depth = ask_until("Search depth", std::to_string(s.max_depth), [](const std::string& v) -> std::optional<std::string> {
+        return parse_int(v, 1, 64) ? std::nullopt : std::optional<std::string>("a number from 1 to 64");
+    });
+    if (!depth) return false;
+    s.max_depth = *parse_int(*depth, 1, 64);
+    return true;
+}
+
+// The connection test, printed: the same paths searches, downloads, previews, Play and
+// verification use. A failed ssh login gets `ssh_hint`. exit_ok when it passed.
+int print_test(const Env& env, const std::string& name, std::string_view ssh_hint) {
+    auto test = server_ops::test_connection(env, name);
+    if (!test) {
+        error(test.error());
+        return exit_config;
+    }
+    for (const auto& line : server_ops::test_lines(*test, ssh_hint)) std::println(stderr, "  {}", line);
+    return test->ok() ? exit_ok : exit_config;
+}
+
+// After a change: the test, with the configuration read again so that it sees what was written.
+int test_saved(const Env& env, const std::string& name, std::string_view ssh_hint) {
+    std::println(stderr, "Testing the connection ...");
+    auto fresh = server_ops::load_env(env.grab_conf, util::self_exe_path().parent_path());
+    if (!fresh) {
+        error(fresh.error());
+        return exit_config;
+    }
+    if (print_test(*fresh, name, ssh_hint) == exit_ok) {
+        std::println(stderr, "\nReady:  grab -r {} WORDS [DEST]", name);
+        return exit_ok;
+    }
+    std::println(stderr,
+                 "\nThe server is saved; fix the problem above with `grab server edit {}`, or remove it with: grab "
+                 "server remove {}",
+                 name, name);
+    return exit_config;
+}
+
+// What a passphrase-protected key means for ssh + find, after its failed login.
+std::string_view ssh_hint(servers::Auth auth, bool passphrase) {
+    return auth == servers::Auth::key && passphrase ? " (a passphrase-protected key needs ssh-agent: ssh-add <key file>)"
+                                                    : "";
+}
+
 // Answers come from the console, or from piped stdin one per line (scriptable); running out
 // of input aborts without writing anything.
 int server_add(const Env& env, const std::string& prefill) {
@@ -130,64 +262,8 @@ int server_add(const Env& env, const std::string& prefill) {
     auto name = ask_until("Name (used with -r)", prefill, taken);
     if (!name) return aborted();
     s.name = *name;
-    auto host = ask_until("Host name or IP", "", [](const std::string& v) { return server_conf::check_host(v); });
-    if (!host) return aborted();
-    s.host = *host;
-    auto port = ask_until("SSH port", "22", [](const std::string& v) -> std::optional<std::string> {
-        return parse_int(v, 1, 65535) ? std::nullopt : std::optional<std::string>("a number from 1 to 65535");
-    });
-    if (!port) return aborted();
-    s.port = *parse_int(*port, 1, 65535);
-    auto user = ask_until("User name", "", [](const std::string& v) { return server_conf::check_user(v); });
-    if (!user) return aborted();
-    s.user = *user;
-
-    auto auth = ask_until("Log in with  1) password  2) key file  3) ssh-agent", "1",
-                          [](const std::string& v) -> std::optional<std::string> {
-                              return v == "1" || v == "2" || v == "3" ? std::nullopt
-                                                                      : std::optional<std::string>("1, 2 or 3");
-                          });
-    if (!auth) return aborted();
     std::optional<std::string> secret;
-    if (*auth == "1") {
-        s.auth = servers::Auth::password;
-        for (;;) {
-            std::print(stderr, "Password (not shown): ");
-            std::fflush(stderr);
-            auto pw = util::read_secret_line();
-            if (!pw) return aborted();
-            if (!pw->empty()) {
-                secret = std::move(*pw);
-                break;
-            }
-            std::println(stderr, "  required");
-        }
-    } else if (*auth == "2") {
-        s.auth = servers::Auth::key;
-        auto key = ask_until("Private key file", "", [](const std::string& v) {
-            std::error_code ec;
-            return server_conf::check_key_file(v, std::filesystem::is_regular_file(util::path_from_utf8(v), ec));
-        });
-        if (!key) return aborted();
-        s.key_file = *key;
-        std::print(stderr, "Key passphrase (not shown; Enter if none): ");
-        std::fflush(stderr);
-        auto pass = util::read_secret_line();
-        if (!pass) return aborted();
-        if (!pass->empty()) secret = std::move(*pass);
-    } else {
-        s.auth = servers::Auth::agent;
-    }
-
-    auto roots = ask_until("Folders to search, comma-separated (Enter = the login home)", "",
-                           [](const std::string& v) { return server_conf::check_value(v); });
-    if (!roots) return aborted();
-    for (const auto& r : util::split(*roots, ',')) s.search_roots.push_back(normalize_root(r));
-    auto depth = ask_until("Search depth", "4", [](const std::string& v) -> std::optional<std::string> {
-        return parse_int(v, 1, 64) ? std::nullopt : std::optional<std::string>("a number from 1 to 64");
-    });
-    if (!depth) return aborted();
-    s.max_depth = *parse_int(*depth, 1, 64);
+    if (!ask_details(s, secret, nullptr)) return aborted();
 
     // Host key first: nothing is written unless the user trusts the server.
     auto keys = fetch_host_key(s.host, s.port);
@@ -203,58 +279,65 @@ int server_add(const Env& env, const std::string& prefill) {
     }
     if (!added->empty()) std::println(stderr, "note: {}", *added);
     std::println(stderr, "\nSaved {} to {}.", s.name, util::path_to_utf8(env.grab_conf));
+    return test_saved(env, s.name, ssh_hint(s.auth, secret.has_value()));
+}
 
-    // Connection test: the same paths searches and downloads will use. The env is reloaded so
-    // it sees the server just written.
-    std::println(stderr, "Testing the connection ...");
-    auto fresh = server_ops::load_env(env.grab_conf, util::self_exe_path().parent_path());
-    if (!fresh) {
-        error(fresh.error());
-        return exit_config;
+// The add questions with the server's answers as defaults; its name stays (it keys partial
+// downloads, lists, limits and the store). A section without connection details is filled in
+// this way. Nothing is written when the input runs out or the host key isn't trusted.
+int server_edit(const Env& env, const std::string& name) {
+    const auto current = server_named(env, name);
+    if (!current) return exit_not_found;
+    std::println(stderr, "Edit {} (Enter keeps the value in brackets, Ctrl+C cancels).\n", name);
+    if (!current->error.empty()) std::println(stderr, "{}\n", current->error);
+    servers::NewServer s = server_ops::edit_defaults(*current);
+    std::optional<std::string> secret;
+    if (!ask_details(s, secret, &*current)) {
+        std::println(stderr, "\nno more input; nothing was changed");
+        return exit_usage;
     }
-    auto test = server_ops::test_connection(*fresh, s.name);
-    if (!test) {
-        error(test.error());
-        return exit_config;
-    }
-    // grab's own client previews, plays and verifies on every server; on engine = grab it also
-    // downloads and searches, and rclone isn't asked.
-    if (test->rclone_ok) {
-        std::println(stderr, "  rclone (downloads): {}", *test->rclone_ok ? "OK" : "FAILED: " + test->rclone_error);
-    }
-    if (test->grab_ok) {
-        std::string how = test->grab_engine ? "OK, searches " + test->grab_search : std::string("OK");
-        if (!test->checksums.empty()) how += ", " + test->checksums;
-        // On engine = rclone grab's login only previews, plays and verifies: a failure there is a warning.
-        const std::string failed = (test->grab_engine ? "FAILED: " : "can't run: ") + test->grab_error;
-        std::println(stderr, "  grab ({}): {}",
-                     test->grab_engine ? "downloads, searches, previews, Play, verify" : "previews, Play, verify",
-                     *test->grab_ok ? how : failed);
-    }
-    if (test->ssh_ok) {
-        std::string why = test->ssh_error;
-        if (s.auth == servers::Auth::key && secret) {
-            why += " (a passphrase-protected key needs ssh-agent: ssh-add <key file>)";
+
+    // A new address, or one never pinned: its host key first, as for add.
+    std::optional<server_ops::HostKeys> keys;
+    if (server_ops::edit_needs_host_key(*current, s)) {
+        auto fetched = fetch_host_key(s.host, s.port);
+        if (!fetched) {
+            error(fetched.error());
+            return exit_config;
         }
-        std::println(stderr, "  ssh (searches):     {}", *test->ssh_ok ? "OK" : "FAILED: " + why);
+        keys = std::move(*fetched);
     }
-    if (test->ok()) {
-        std::println(stderr, "\nReady:  grab -r {} WORDS [DEST]", s.name);
-        return exit_ok;
+    auto done = server_ops::update_server(env, s, secret, keys);
+    if (!done) {
+        error(done.error());
+        return exit_config;
     }
-    std::println(stderr, "\nThe server is saved; fix the problem above, or remove it with: grab server remove {}", s.name);
-    return exit_config;
+    if (!done->empty()) std::println(stderr, "note: {}", *done);
+    std::println(stderr, "\nSaved {} in {}.", name, util::path_to_utf8(env.grab_conf));
+    const bool passphrase = secret.has_value() || (current->auth == servers::Auth::key && s.key_file == current->key_file &&
+                                                   current->secret_saved == true);
+    return test_saved(env, name, ssh_hint(s.auth, passphrase));
+}
+
+int server_test(const Env& env, const std::string& name) {
+    const auto s = server_named(env, name);
+    if (!s) return exit_not_found;
+    if (!s->error.empty()) {
+        error(s->error);
+        return exit_config;
+    }
+    std::println(stderr, "Testing {} ({}@{}:{}) ...", name, s->user, s->host, s->port);
+    const int rc = print_test(env, name, ssh_hint(s->auth, s->secret_saved == true));
+    if (rc == exit_ok) std::println(stderr, "\n{} works.", name);
+    else std::println(stderr, "\n{} has a problem: see above (grab server edit {} changes it).", name, name);
+    return rc;
 }
 
 // ---- trust / remove --------------------------------------------------------------------------
 
 int server_trust(const Env& env, const std::string& name) {
-    const auto list = server_ops::list_servers(env);
-    const auto s = std::ranges::find(list, name, &server_ops::ServerInfo::name);
-    if (s == list.end()) {
-        error(std::format("no server called {} in grab.conf", name));
-        return exit_not_found;
-    }
+    const auto s = server_named(env, name);
+    if (!s) return exit_not_found;
     if (!s->error.empty()) {
         error(s->error);
         return exit_config;
@@ -282,7 +365,7 @@ int server_remove(const Env& env, const std::string& name) {
     }
     // Confirmation comes from the console or piped stdin (`echo y | grab server remove NAME`);
     // no answer at all means no.
-    if (!confirm(std::format("Remove {} from grab.conf, with its saved password and host keys?", name))) {
+    if (!confirm(std::format("Remove {} from grab.conf, with its saved password, host keys and file list?", name))) {
         std::println(stderr, "Nothing removed.");
         return exit_ok;
     }
@@ -306,7 +389,8 @@ int run_server_command(const Options& opts) {
         return exit_config;
     }
     if (!env->imported.empty()) {
-        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (rclone.conf unchanged)",
+        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time; rclone.conf "
+                             "unchanged)",
                      util::join(env->imported, ", "), util::path_to_utf8(env->grab_conf));
     }
     for (const auto& note : env->import_notes) std::println(stderr, "grab: note: {}", note);
@@ -314,6 +398,8 @@ int run_server_command(const Options& opts) {
     const std::string arg = opts.server_args.size() > 1 ? opts.server_args[1] : std::string{};
     if (sub == "list") return server_list(*env);
     if (sub == "add") return server_add(*env, arg);
+    if (sub == "edit") return server_edit(*env, arg);
+    if (sub == "test") return server_test(*env, arg);
     if (sub == "trust") return server_trust(*env, arg);
     if (sub == "remove") return server_remove(*env, arg);
     error(std::format("unknown `grab server` command '{}'", sub));

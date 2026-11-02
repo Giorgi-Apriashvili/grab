@@ -621,6 +621,8 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
   background: color-mix(in srgb, var(--danger) 8%, var(--panel));
 }
 .update-banner.failed .text { color: var(--danger); white-space: normal; user-select: text; }
+.import-banner { align-items: flex-start; }
+.import-banner .text { white-space: pre-wrap; overflow: visible; user-select: text; max-height: 40vh; overflow-y: auto; }
 
 /* settings ------------------------------------------------------------------------------ */
 .in-settings .remote, .in-settings #remote-info { visibility: hidden; } /* search-only controls */

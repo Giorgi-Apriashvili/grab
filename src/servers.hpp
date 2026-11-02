@@ -69,8 +69,9 @@ struct Fingerprint {
 
 // ---- grab.conf text edits (everything else, comments included, is kept) -------------------
 
-// Removes [section] and its lines, plus grab's generated comment line right above it; every block
-// of that name, as ini::parse merges them.
+// Removes [section] and its lines, plus grab's generated comment line right above it ("# server
+// [section]: ...", or 0.19's "# rclone remote [...]: ..."); every block of that name, as
+// ini::parse merges them.
 [[nodiscard]] std::string remove_section(std::string_view text, std::string_view section);
 // Appends `section_text` after one blank line.
 [[nodiscard]] std::string append_section(std::string_view text, std::string_view section_text);
@@ -84,8 +85,8 @@ struct Fingerprint {
 [[nodiscard]] std::expected<std::string, std::string> set_value(std::string_view text, std::string_view section,
                                                                 std::string_view key, std::string_view value,
                                                                 std::span<const std::string_view> after = {});
-// Replaces grab's generated comment line right above [section] ("# rclone remote [...]: ...")
-// with `comment`; text without that line is returned unchanged.
+// Replaces grab's generated comment line right above [section] ("# server [section]: ...", or
+// 0.19's "# rclone remote [...]: ...") with `comment`; text without that line is returned unchanged.
 [[nodiscard]] std::string replace_lead_in(std::string_view text, std::string_view section,
                                           std::string_view comment);
 

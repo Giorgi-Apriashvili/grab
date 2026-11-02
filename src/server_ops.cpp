@@ -310,6 +310,7 @@ std::vector<ServerInfo> list_servers(const Env& env) {
     std::vector<ServerInfo> out;
     // Read when asked (G209): pinned is what the file holds now.
     const std::string known = util::read_file_if_exists(env.known_hosts).value_or(std::nullopt).value_or("");
+    const auto store = passwords::load(env.passwords); // only what is saved is said, never a value
     for (const auto& s : env.cfg.remotes) {
         ServerInfo info;
         info.name = s.name;
@@ -323,8 +324,8 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             info.error = c.error();
         } else if (!*c) {
             info.error = std::format("[{}] has no connection details (host, port, user, auth) in grab.conf: fill them in "
-                                     "with Edit",
-                                     s.name);
+                                     "with Edit (grab server edit {})",
+                                     s.name, s.name);
             // Why the import couldn't fill them in, when this load tried.
             const std::string tag = std::format("[{}] ", s.name);
             for (const auto& note : env.import_notes) {
@@ -342,6 +343,16 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             info.search = std::string(search_method(s, remote, info.engine));
             info.host_key_pinned = server_conf::pinned(known, conn.host, conn.port);
             info.default_connections = budget::default_budget(conn.host);
+            const std::string_view key = conn.auth == servers::Auth::password ? passwords::password
+                                         : conn.auth == servers::Auth::key    ? passwords::passphrase
+                                         : conn.auth == servers::Auth::stored_key ? passwords::key_pem
+                                                                                  : std::string_view{};
+            if (!key.empty() && store) {
+                const passwords::Binding login{.user = conn.user, .host = conn.host, .port = conn.port};
+                info.secret_saved = passwords::value_for(*store, s.name, key, login).has_value();
+            } else if (!key.empty()) {
+                info.store_error = store.error();
+            }
         }
         out.push_back(std::move(info));
     }
@@ -474,15 +485,32 @@ std::expected<std::string, std::string> add_server(const Env& loaded, const serv
     return note;
 }
 
+servers::NewServer edit_defaults(const ServerInfo& current) {
+    servers::NewServer s;
+    s.name = current.name;
+    if (current.error.empty()) {
+        s.host = current.host;
+        s.port = current.port;
+        s.user = current.user;
+        s.auth = current.auth;
+        s.key_file = current.key_file;
+    }
+    for (const auto& root : current.search_roots) s.search_roots.push_back(normalize_root(root));
+    s.max_depth = current.max_depth;
+    s.max_connections = current.max_connections;
+    return s;
+}
+
 bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wanted) {
-    return !current.host_key_pinned || current.host != wanted.host || current.port != wanted.port;
+    return !current.error.empty() || !current.host_key_pinned || current.host != wanted.host ||
+           current.port != wanted.port;
 }
 
 bool edit_needs_password(const ServerInfo& current, const servers::NewServer& wanted) {
     if (wanted.auth != servers::Auth::password) return false;
     // As the store's binding compares them: exactly.
-    return current.auth != servers::Auth::password || current.host != wanted.host || current.port != wanted.port ||
-           current.user != wanted.user;
+    return !current.error.empty() || current.auth != servers::Auth::password || !current.secret_saved.value_or(false) ||
+           current.host != wanted.host || current.port != wanted.port || current.user != wanted.user;
 }
 
 std::expected<std::string, std::string> update_server(const Env& loaded, const servers::NewServer& wanted,
@@ -513,6 +541,10 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     if (!agent_kept) next.key_file = connection_of(wanted).key_file;
     const bool moved = !current || current->host != next.host || current->port != next.port || current->user != next.user;
     const bool method = !current || current->auth != next.auth;
+    // Another key file: the old one's passphrase goes unless a new one is typed (rclone refuses an
+    // unencrypted key given a passphrase).
+    const bool key_changed = current && current->auth == servers::Auth::key && next.auth == servers::Auth::key &&
+                             current->key_file != next.key_file;
     if (moved) {
         // What the old server answered (ssh::learn_commands): the next Test asks the new one.
         next.shell_type.reset();
@@ -535,7 +567,7 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     passwords::Store store;
     std::string store_note;
     const bool secret_kind = wanted.auth == servers::Auth::password || wanted.auth == servers::Auth::key;
-    if (method || moved || (typed && secret_kind)) {
+    if (method || moved || key_changed || (typed && secret_kind)) {
         auto loaded_store = load_store(env, wanted.name);
         if (!loaded_store) return util::fail(loaded_store.error());
         store_note = std::move(loaded_store->note);
@@ -555,6 +587,7 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
             // A password goes only to the login it was typed for (G40); the key's passphrase, an
             // imported key and rclone extras belong to this server wherever it moved.
             if (moved) values.erase(std::string(passwords::password));
+            if (key_changed && !typed) values.erase(std::string(passwords::passphrase));
             for (auto& [key, saved] : values) saved.binding = login;
             if (values.empty()) store.erase(it);
         }
@@ -587,7 +620,9 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     if (!text) return undo(text.error());
     const RcloneRemote remote = server_conf::to_remote(settings->rclone_remote, next, env.known_hosts);
     const std::string described = servers::replace_lead_in(
-        *text, wanted.name, std::format("# rclone remote [{}]: {}", remote.name, describe_remote(remote, *settings)));
+        *text, wanted.name,
+        lead_in(wanted.name, describe_remote(remote, *settings,
+                                             next.auth == servers::Auth::stored_key ? "key in grab's store" : "")));
     if (auto written = write_grab_conf(env, described); !written) return undo(written.error());
 
     std::vector<std::string> notes;
@@ -612,7 +647,10 @@ std::expected<void, std::string> trust_server(const Env& loaded, std::string_vie
     if (find_server(env.cfg, name) == nullptr) return util::failf("no server called {} in grab.conf", name);
     auto c = connection_in(env.grab_text, name);
     if (!c) return util::fail(c.error());
-    if (!*c) return util::failf("[{}] has no connection details in grab.conf: fill them in with Edit", name);
+    if (!*c) {
+        return util::failf("[{}] has no connection details in grab.conf: fill them in with Edit (grab server edit {})",
+                           name, name);
+    }
     return pin_host_keys(env.known_hosts, (*c)->host, (*c)->port, keys.lines);
 }
 
@@ -671,6 +709,77 @@ std::expected<void, std::string> set_default(const Env& loaded, std::string_view
     auto text = servers::set_value(env.grab_text, "grab", "default_remote", name);
     if (!text) return util::fail(text.error());
     return write_grab_conf(env, *text);
+}
+
+// ---- texts ---------------------------------------------------------------------------------
+
+std::string login_text(const ServerInfo& s) {
+    using servers::Auth;
+    if (s.auth == Auth::agent) return "ssh-agent";
+    if (!s.secret_saved) {
+        const char* how = s.auth == Auth::key ? "key file" : s.auth == Auth::stored_key ? "key in grab's store" : "password";
+        return std::format("{} (grab's saved passwords can't be read: {})", how, s.store_error);
+    }
+    switch (s.auth) {
+    case Auth::key: return *s.secret_saved ? "key file, passphrase saved" : "key file";
+    case Auth::stored_key:
+        return *s.secret_saved ? std::string("key in grab's store")
+                               : std::format("no key in grab's store (grab server edit {})", s.name);
+    default: break;
+    }
+    return *s.secret_saved ? std::string("password saved") : std::format("no password saved (grab server edit {})", s.name);
+}
+
+std::string host_key_text(const ServerInfo& s) {
+    return s.host_key_pinned ? std::string("host key pinned")
+                             : std::format("host key not trusted (grab server trust {})", s.name);
+}
+
+std::string import_banner(const std::vector<std::string>& names, const std::vector<ServerInfo>& servers,
+                          const std::vector<std::string>& notes) {
+    std::vector<std::string> moved;
+    std::vector<std::string> lines;
+    std::vector<std::string> trust; // servers a line already tells to Trust
+    std::vector<std::string> typed; // and to enter their password
+    bool secrets = false;           // one of them has a password, passphrase or key in grab's store
+    for (const auto& name : names) {
+        const auto s = std::ranges::find(servers, name, &ServerInfo::name);
+        if (s == servers.end()) continue; // removed since
+        moved.push_back(name);
+        secrets = secrets || s->secret_saved == true;
+        if (!s->error.empty()) {
+            lines.push_back(s->error);
+            continue;
+        }
+        if (!s->host_key_pinned) {
+            trust.push_back(name);
+            lines.push_back(std::format("{}: its host key isn't trusted yet: use Trust in Settings, which shows its "
+                                        "fingerprints to compare.",
+                                        name));
+        }
+        if (s->auth == servers::Auth::password && s->secret_saved == false) {
+            typed.push_back(name);
+            lines.push_back(std::format("{}: no password is saved for it: enter it with Edit.", name));
+        }
+    }
+    for (const auto& note : notes) {
+        // "[server] text"
+        const auto close = note.find("] ");
+        const std::string server = note.starts_with('[') && close != std::string::npos ? note.substr(1, close - 1) : "";
+        const bool told_trust = std::ranges::contains(trust, server) && note.find("Trust") != std::string::npos;
+        const bool told_password = std::ranges::contains(typed, server) && note.find("password") != std::string::npos;
+        if (!told_trust && !told_password) lines.push_back(note);
+    }
+    if (moved.empty() && lines.empty()) return {};
+    std::vector<std::string> out;
+    if (!moved.empty()) {
+        out.push_back(std::format("Servers are kept in grab.conf now: the connection details of {} moved there from "
+                                  "rclone.conf, which stays as it was (grab no longer writes it).{}",
+                                  util::join(moved, ", "),
+                                  secrets ? " Their passwords are in grab's own encrypted store." : ""));
+    }
+    out.insert(out.end(), lines.begin(), lines.end());
+    return util::join(out, "\n");
 }
 
 namespace {
@@ -786,7 +895,10 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
     if (s == nullptr) return util::failf("no server called {} in grab.conf", name);
     auto c = connection_in(env.grab_text, name);
     if (!c) return util::fail(c.error());
-    if (!*c) return util::failf("[{}] has no connection details in grab.conf: fill them in with Edit", name);
+    if (!*c) {
+        return util::failf("[{}] has no connection details in grab.conf: fill them in with Edit (grab server edit {})",
+                           name, name);
+    }
 
     GrabConfig cfg = env.cfg;
     cfg.rclone = env.rclone; // as load_context resolves it
@@ -838,6 +950,28 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
     test_grab(env, ctx, learned_limits_path(env.grab_conf), stop, result);
     if (stop.stop_requested()) return util::fail("cancelled");
     return result;
+}
+
+std::vector<std::string> test_lines(const TestResult& t, std::string_view ssh_hint) {
+    std::vector<std::string> out;
+    // grab's own client previews, plays and verifies on every server; on engine = grab it also
+    // downloads and searches, and rclone isn't asked.
+    if (t.rclone_ok) out.push_back("rclone (downloads): " + (*t.rclone_ok ? "OK" : "FAILED: " + t.rclone_error));
+    if (t.grab_ok) {
+        std::string how = "OK, home folder listed";
+        if (t.grab_engine) how += ", searches " + t.grab_search;
+        if (!t.checksums.empty()) how += ", " + t.checksums;
+        // On engine = rclone grab's login only previews, plays and verifies: a failure there is a warning.
+        const std::string failed = (t.grab_engine ? "FAILED: " : "can't run: ") + t.grab_error;
+        out.push_back(std::format("grab ({}): {}",
+                                  t.grab_engine ? "downloads, searches, previews, Play, verify" : "previews, Play, verify",
+                                  *t.grab_ok ? how : failed));
+    }
+    if (t.ssh_ok) {
+        out.push_back("ssh (searches):     " +
+                      (*t.ssh_ok ? std::string("OK") : "FAILED: " + t.ssh_error + std::string(ssh_hint)));
+    }
+    return out;
 }
 
 } // namespace grab::server_ops

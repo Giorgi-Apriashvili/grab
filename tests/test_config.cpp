@@ -4,6 +4,8 @@
 #include "ini.hpp"
 #include "passwords.hpp"
 #include "rclone_import.hpp"
+#include "server_conf.hpp"
+#include "servers.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -13,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -312,7 +315,10 @@ TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp 
     CHECK(text.find("broken (sftp, incomplete") != std::string::npos);
     CHECK(text.find("[gdrive]") == std::string::npos);
     CHECK(text.find("[broken]") == std::string::npos);
-    CHECK(text.find("alice@203.0.113.10:2222, key file, lookup via ssh + find") != std::string::npos);
+    CHECK(text.find("# server [hetzner]: alice@203.0.113.10:2222, key file, lookup via ssh + find\n[hetzner]\n") !=
+          std::string::npos);
+    CHECK(text.find("# rclone remote [") == std::string::npos);
+    CHECK(text.find("grab server add | list | edit | test | trust | remove") != std::string::npos);
     CHECK(text.find("u1-sub1@box.example.com:23, password, lookup via rclone lsf") !=
           std::string::npos);
 
@@ -332,6 +338,20 @@ TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp 
         CHECK(r.file_flags == util::split_args(default_file_flags));
         CHECK(r.ssh_options.empty());
     }
+}
+
+TEST_CASE("generate_grab_config names a remote called grab's section in its lead-in, so edits and removal find it") {
+    auto rclone = ini::parse("[grab]\ntype = sftp\nhost = 203.0.113.10\nuser = alice\n");
+    REQUIRE(rclone.has_value());
+    const auto text = generate_grab_config(&*rclone, "x");
+    CHECK(text.find("# server [grab_remote]: alice@203.0.113.10:22") != std::string::npos);
+    CHECK(text.find("# server [grab]:") == std::string::npos);
+    const auto replaced = servers::replace_lead_in(text, "grab_remote", "# server [grab_remote]: replaced");
+    CHECK(replaced.find("# server [grab_remote]: replaced\n[grab_remote]\n") != std::string::npos);
+    CHECK(replaced.find("alice@203.0.113.10") == std::string::npos);
+    const auto removed = servers::remove_section(text, "grab_remote");
+    CHECK(removed.find("[grab_remote]") == std::string::npos); // the section and its lead-in
+    CHECK(removed.find("alice@") == std::string::npos);
 }
 
 TEST_CASE("generate_grab_config without usable remotes is a [grab] block ready for `grab server add`") {
@@ -435,6 +455,7 @@ TEST_CASE("a server's search method as lists and comments name it, per engine") 
     CHECK(describe_remote(box, grab) == "u1@u1.your-storagebox.de:23, password, lookup by listing folders");
     grab.find = FindMethod::ssh;
     CHECK(describe_remote(key, grab) == "u@h:22, key file, lookup with find");
+    CHECK(describe_remote(key, grab, "key in grab's store") == "u@h:22, key in grab's store, lookup with find");
 }
 
 TEST_CASE("a remote named grab gets a non-colliding section name") {
@@ -506,6 +527,18 @@ TEST_CASE("example config parses and matches the defaults") {
     CHECK(cfg.remotes[0].common_flags == util::split_args(default_common_flags));
     CHECK(cfg.remotes[0].folder_flags == util::split_args(default_folder_flags));
     CHECK(cfg.remotes[0].file_flags == util::split_args(default_file_flags));
+    // Its server's connection details are grab.conf's own (phase 7), not an rclone remote's.
+    auto doc = ini::parse(example_config);
+    REQUIRE(doc);
+    const auto* section = doc->find("hetzner");
+    REQUIRE(section != nullptr);
+    const auto c = server_conf::parse(*section);
+    REQUIRE_MESSAGE(c.has_value(), c.error_or(""));
+    REQUIRE(c->has_value());
+    const auto& conn = c->value();
+    CHECK(conn.host == "files.example.com");
+    CHECK(conn.auth == server_conf::Auth::key);
+    CHECK(std::string_view(example_config).find("grab's own rclone.conf") == std::string_view::npos);
 }
 
 TEST_CASE("the settings lock has one holder at a time, and a thread may take it again") {

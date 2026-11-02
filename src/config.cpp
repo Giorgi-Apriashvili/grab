@@ -18,16 +18,18 @@ const std::string_view example_config = R"(# grab.conf - settings for the `grab`
 # Same INI dialect as rclone.conf: [section], key = value, comment lines start with ; or #.
 # Comments must be on their own line; a ; or # after a value is part of the value.
 #
-# Server connection details (host, user, port, key, password) are NOT stored here: they live
-# in grab's own rclone.conf (%APPDATA%\grab\rclone.conf), in the rclone remote named by
-# `rclone_remote`. Add servers with `grab server add`; it writes both files.
+# Each server's section holds its connection details (host, port, user, how it logs in).
+# Passwords and key passphrases are NOT stored here: grab keeps them in its own encrypted
+# store (%APPDATA%\grab\passwords), and host keys in %APPDATA%\grab\known_hosts. Add servers
+# with `grab server add`, change them with `grab server edit NAME` (or grab's Settings).
 
 [grab]
 # rclone executable. Blank = the rclone.exe bundled with grab (else rclone on PATH);
 # a full path uses that one instead.
 rclone =
-# rclone.conf with the server connections. Blank = grab's own (%APPDATA%\grab\rclone.conf).
-# It is always passed to rclone as --config.
+# The rclone.conf grab 0.19 and before kept servers in: a section without `host` takes its
+# details from the remote there once (grab only reads it, never writes it). Blank = grab's
+# own (%APPDATA%\grab\rclone.conf), then rclone's standard one.
 rclone_config =
 # ssh executable used for the remote `find`. Blank = `ssh` on PATH (Windows OpenSSH).
 ssh = ssh
@@ -38,10 +40,28 @@ default_remote = hetzner
 
 # One section per server. The section name is what you pass to -r/--remote.
 [hetzner]
-# Name of the remote in rclone.conf (defaults to this section's name).
-rclone_remote = hetzner
-# How TARGET is located: auto = ssh + find when the rclone remote has a key_file, otherwise
-# an rclone listing (password remotes and storage boxes have no shell). Force with ssh | rclone.
+# The server's address, SSH port (blank = 22) and login.
+host = files.example.com
+port = 22
+user = alice
+# How to log in: agent (the keys in Windows' ssh-agent; with key_file, only that one), key
+# (key_file; its passphrase, if any, in grab's store), password (in grab's store: enter it
+# with `grab server edit hetzner`) or stored_key (a key imported from rclone.conf, kept in
+# grab's store; only rclone can use it).
+auth = key
+key_file = C:\Users\alice\.ssh\id_ed25519
+# What the server told grab's Test, so rclone needn't ask it again on every run: its shell
+# (unix, cmd, powershell, none) and its checksum commands. Left out = not known yet.
+# shell_type = unix
+# md5sum_command = md5sum
+# A non-secret rclone sftp setting for this server's rclone runs (engine = rclone), e.g.
+# rclone.ciphers = aes256-ctr
+# The rclone remote grab 0.19 and before used for this server (default: this section's name).
+# Kept in sections imported from rclone.conf: their partial downloads and 0.19 go by it.
+# rclone_remote = hetzner
+# How TARGET is located: auto = ssh + find when the server logs in with a key file or
+# ssh-agent, otherwise an rclone listing (password servers and storage boxes have no shell).
+# Force with ssh | rclone.
 # With engine = grab: auto = find where grab's check finds GNU find on the server, else by
 # listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.
 find = auto
@@ -450,21 +470,28 @@ std::string_view search_method(const RemoteSettings& settings, const RcloneRemot
     return "probe";
 }
 
-std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings) {
+std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings, std::string_view login) {
     const auto method = search_method(settings, remote, settings.engine);
     const char* lookup = method == "ssh"    ? "via ssh + find"
                          : method == "rclone" ? "via rclone lsf"
                          : method == "find"   ? "with find"
                          : method == "walk"   ? "by listing folders"
                                               : "with find, else by listing folders";
-    const char* auth = remote.key_use_agent ? "ssh-agent" : remote.key_file ? "key file" : "password";
+    const std::string_view auth = !login.empty()          ? login
+                                  : remote.key_use_agent ? "ssh-agent"
+                                  : remote.key_file      ? "key file"
+                                                         : "password";
     return std::format("{}@{}:{}, {}, lookup {}", remote.user, remote.host, remote.port, auth, lookup);
+}
+
+std::string lead_in(std::string_view name, std::string_view description) {
+    return std::format("# server [{}]: {}", name, description);
 }
 
 std::string remote_section(const RcloneRemote& remote, const std::vector<std::string>& search_roots,
                            int max_depth, const std::vector<std::pair<std::string, std::string>>& connection) {
     std::string s;
-    s += std::format("# rclone remote [{}]: {}\n", remote.name, describe_remote(remote));
+    s += lead_in(section_name_for(remote.name), describe_remote(remote)) + "\n";
     s += std::format("[{}]\n", section_name_for(remote.name));
     if (connection.empty()) s += std::format("rclone_remote = {}\n", remote.name);
     for (const auto& [key, value] : connection) s += std::format("{} = {}\n", key, value);
@@ -500,7 +527,7 @@ std::string generate_grab_config(const ini::Document* rclone, std::string_view r
     }
     out += "# Each server's section holds its connection details (host, port, user, auth); passwords\n"
            "# are kept in grab's own encrypted store, never here. Manage servers with\n"
-           "# `grab server add | list | trust | remove`.\n"
+           "# `grab server add | list | edit | test | trust | remove` or grab's Settings.\n"
            "# grab.conf.example explains every key.\n"
            "# Comments must be on their own line; a ; or # after a value is part of the value.\n";
     if (!skipped.empty()) {
@@ -510,8 +537,8 @@ std::string generate_grab_config(const ini::Document* rclone, std::string_view r
     out += "\n[grab]\n";
     out += "# rclone executable. Blank = the rclone.exe bundled with grab (else rclone on PATH).\n";
     out += "rclone =\n";
-    out += "# The rclone.conf whose servers a section without `host` is imported from, once. Blank = grab's\n"
-           "# own (%APPDATA%\\grab\\rclone.conf), then rclone's.\n";
+    out += "# The rclone.conf whose remote a section without `host` takes its details from, once (grab\n"
+           "# only reads it). Blank = grab's own (%APPDATA%\\grab\\rclone.conf), then rclone's.\n";
     out += "rclone_config =\n";
     out += "ssh = ssh\n";
     out += "# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.\n";

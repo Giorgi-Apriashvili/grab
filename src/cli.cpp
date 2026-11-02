@@ -20,7 +20,7 @@ std::string usage() {
 Usage:
   grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- extra rclone args]
   grab config [-c PATH]
-  grab server [list | add [NAME] | trust NAME | remove NAME]
+  grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]
   grab update [--check]
   grab --init | --help | --version
 
@@ -37,9 +37,13 @@ Without DEST, grab asks for one after you have picked (Enter = the current direc
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
                        $EDITOR, else notepad. The file is created from the example if missing.
-  server list          the configured servers: login, auth, lookup method, host key
+  server list          the configured servers: login, how it logs in, whether a password is
+                       saved, lookup method, whether its host key is pinned
   server add [NAME]    set up a server step by step (host, login, host key, search roots);
                        writes grab.conf (a password to grab's encrypted store), then tests it
+  server edit NAME     the same questions, the current answers as defaults; Enter keeps the
+                       saved password while user, host and port stay the same
+  server test NAME     log in as downloads, searches and verification do, and list its home
   server trust NAME    fetch, confirm and pin a server's host key
   server remove NAME   delete a server from grab.conf, its saved password and host keys
   update               install the latest GitHub release over this copy (Windows), after
@@ -69,11 +73,14 @@ Options:
                        stops when there is no console to ask on
       --rclone         download with plain rclone copyto / copy and rclone's own progress
                        instead of grab's resumable download over several connections
-  -- FLAGS             rclone flags: connection ones (--sftp-*, --bind, --timeout...) for
-                       grab's downloads; with --rclone, any rclone flags for its copy
+  -- FLAGS             rclone flags: connection ones (--sftp-chunk-size, --bind, --timeout...)
+                       for grab's downloads, but not the server's address, login or host
+                       keys (grab.conf's host, port, user, auth, key_file: grab server edit
+                       NAME); with --rclone, any rclone flags for its copy
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
   -v, --verbose        echo the ssh and rclone command lines before running them
-      --init           write a commented example grab.conf to the config path if absent
+      --init           write grab.conf to the config path if absent, with the sftp remotes of
+                       the standard rclone.conf as servers (rclone.conf is only read)
   -h, --help           show this help
       --version        show version
 
@@ -245,9 +252,9 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     if (result.action == CliAction::server) {
         if (mode) return util::fail("`grab server` takes no -s/-f");
         const std::string sub = positionals.empty() ? "list" : positionals[0];
-        const bool needs_name = sub == "trust" || sub == "remove";
+        const bool needs_name = sub == "edit" || sub == "test" || sub == "trust" || sub == "remove";
         if (sub != "list" && sub != "add" && !needs_name) {
-            return util::failf("unknown `grab server` command '{}' (list, add, trust, remove)", sub);
+            return util::failf("unknown `grab server` command '{}' (list, add, edit, test, trust, remove)", sub);
         }
         if (needs_name && positionals.size() != 2) return util::failf("usage: grab server {} NAME", sub);
         if (positionals.size() > 2 || (sub == "list" && positionals.size() > 1)) {
@@ -293,10 +300,10 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     if (!result.opts.rclone) {
         // Nor one that would replace the server grab gives rclone (its address, login, host keys).
         if (const auto bad = rclone_flags::first_refused(result.opts.extra)) {
-            return util::failf("{} after -- would replace the server's {}, which grab gives rclone itself; change "
-                               "the server with Edit in grab's Settings, or add --rclone for a plain rclone copy that "
-                               "takes it",
-                               bad->flag, bad->what);
+            return util::failf("{} after -- would replace the server's {}, which grab gives rclone itself; {}, or add "
+                               "--rclone for a plain rclone copy that takes it",
+                               bad->flag, bad->what,
+                               rclone_flags::change_instead(*bad, result.opts.remote.value_or("NAME")));
         }
         if (const auto bad = rclone_flags::first_unusable(result.opts.extra)) {
             return util::failf("{} after -- isn't used by grab's downloads, which take only connection flags "

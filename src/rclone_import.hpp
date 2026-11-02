@@ -199,4 +199,12 @@ struct Result {
 // section is done once grab.conf has its `host`). No grab.conf: nothing to do.
 [[nodiscard]] std::expected<Result, std::string> apply(const Files& files);
 
+// The servers the window still has to name in its one-time notice about the import (Record's
+// banner; server_ops::import_banner), taken out of imported.json under the settings lock, so the
+// next window doesn't name them again. Empty when there are none or no imported.json.
+[[nodiscard]] std::expected<std::vector<std::string>, std::string> take_banner(const std::filesystem::path& state_dir);
+// Whether imported.json has names for that notice, read without the lock (a peek: take_banner
+// decides). False when it can't be read.
+[[nodiscard]] bool banner_waiting(const std::filesystem::path& state_dir);
+
 } // namespace grab::rclone_import

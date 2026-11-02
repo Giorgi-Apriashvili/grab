@@ -69,14 +69,45 @@ TEST_CASE("grab's own downloads take only connection flags after -- (G186)") {
     CHECK(filter.error().find("--rclone") != std::string::npos);
 }
 
+TEST_CASE("grab server: list, add [NAME], and edit, test, trust and remove with a NAME (phase 7)") {
+    auto bare = parse_args(args({"server"}));
+    REQUIRE(bare.has_value());
+    CHECK(bare->action == CliAction::server);
+    CHECK(bare->opts.server_args == std::vector<std::string>{"list"});
+    for (const char* sub : {"edit", "test", "trust", "remove"}) {
+        CAPTURE(sub);
+        auto named = parse_args(args({"server", sub, "Box.Guest"}));
+        REQUIRE(named.has_value());
+        CHECK(named->opts.server_args == std::vector<std::string>{sub, "Box.Guest"});
+        auto unnamed = parse_args(args({"server", sub}));
+        REQUIRE_FALSE(unnamed.has_value());
+        CHECK(unnamed.error() == std::string("usage: grab server ") + sub + " NAME");
+    }
+    auto add = parse_args(args({"server", "add"}));
+    REQUIRE(add.has_value());
+    CHECK(add->opts.server_args == std::vector<std::string>{"add"});
+    auto unknown = parse_args(args({"server", "rename", "a"}));
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().find("(list, add, edit, test, trust, remove)") != std::string::npos);
+    CHECK(usage().find("grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]") !=
+          std::string::npos);
+    CHECK(usage().find("rclone.conf with") == std::string::npos);
+}
+
 TEST_CASE("after --, a flag that would replace the server grab gives rclone is refused; --rclone takes it (phase 7)") {
     auto host = parse_args(args({"x", "d", "--", "--sftp-chunk-size", "1Mi", "--sftp-host=elsewhere.example"}));
     REQUIRE_FALSE(host.has_value());
     CHECK(host.error().starts_with("--sftp-host after -- would replace the server's address"));
     CHECK(host.error().find("--rclone") != std::string::npos);
+    // It says where grab keeps that setting, for the server named, else a placeholder.
+    CHECK(host.error().find("change grab.conf's `host` with `grab server edit NAME`") != std::string::npos);
+    auto named = parse_args(args({"-r", "Box", "x", "d", "--", "--sftp-user", "u"}));
+    REQUIRE_FALSE(named.has_value());
+    CHECK(named.error().find("`grab server edit Box`") != std::string::npos);
     auto keys = parse_args(args({"x", "d", "--", "--sftp-known-hosts-file", "C:\\other"}));
     REQUIRE_FALSE(keys.has_value());
     CHECK(keys.error().find("trusted host keys") != std::string::npos);
+    CHECK(keys.error().find("`grab server trust NAME`") != std::string::npos);
     auto copy = parse_args(args({"x", "d", "--rclone", "--", "--sftp-host", "elsewhere.example"}));
     REQUIRE(copy.has_value());
     CHECK(copy->opts.extra == std::vector<std::string>{"--sftp-host", "elsewhere.example"});
