@@ -46,6 +46,9 @@ Source: "@GRAB_STAGE_DIR_NATIVE@\grab-gui.exe"; DestDir: "{app}\bin"; Flags: ign
 ; Bundled rclone (MIT, notice in licenses\rclone.txt); grab prefers it over any on PATH.
 Source: "@GRAB_STAGE_DIR_NATIVE@\rclone.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\rclone.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+; libssh2 (BSD-3-Clause) and OpenSSL (Apache-2.0), built into grab.exe and grab-gui.exe.
+Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\libssh2.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\openssl.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab.conf.example"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\LICENSE"; DestDir: "{app}"; Flags: ignoreversion

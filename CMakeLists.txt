@@ -182,6 +182,9 @@ if(WIN32 AND GRAB_BUNDLE_RCLONE)
     install(PROGRAMS "${GRAB_RCLONE_EXE}" DESTINATION bin)
     install(FILES licenses/rclone.txt DESTINATION licenses)
 endif()
+# libssh2 (BSD-3-Clause) and OpenSSL (Apache-2.0) are linked into grab statically; both licenses
+# ask for their text to ship with the programs.
+install(FILES licenses/libssh2.txt licenses/openssl.txt DESTINATION licenses)
 
 # ---------------------------------------------------------------------------
 # Install: <prefix>/bin/grab.exe plus the commented example config. On Windows the user
@@ -296,22 +299,28 @@ if(WIN32)
         "${GRAB_STAGE_DIR}/grab-gui.exe"
         "${GRAB_STAGE_DIR}/rclone.exe"
         "${GRAB_STAGE_DIR}/licenses/rclone.txt"
+        "${GRAB_STAGE_DIR}/licenses/libssh2.txt"
+        "${GRAB_STAGE_DIR}/licenses/openssl.txt"
         "${GRAB_STAGE_DIR}/grab.conf.example"
         "${GRAB_STAGE_DIR}/README.md"
         "${GRAB_STAGE_DIR}/LICENSE")
+    set(GRAB_LICENSES
+        "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/licenses/libssh2.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/licenses/openssl.txt")
     add_custom_command(OUTPUT ${GRAB_STAGED}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}/licenses"
         COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "$<TARGET_FILE:grab-gui>" "${GRAB_RCLONE_EXE}"
                 ${GRAB_EXTRA_FILES} "${GRAB_STAGE_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
-                "${GRAB_STAGE_DIR}/licenses/rclone.txt"
-        DEPENDS grab grab-gui "${GRAB_RCLONE_EXE}" "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy ${GRAB_LICENSES} "${GRAB_STAGE_DIR}/licenses"
+        DEPENDS grab grab-gui "${GRAB_RCLONE_EXE}" ${GRAB_LICENSES}
                 ${GRAB_EXTRA_FILES}
         COMMENT "Staging release files"
         VERBATIM)
     add_custom_command(OUTPUT "${GRAB_ZIP}"
         COMMAND ${CMAKE_COMMAND} -E tar cf "${GRAB_ZIP}" --format=zip --
-                grab.exe grab-gui.exe rclone.exe licenses/rclone.txt grab.conf.example README.md LICENSE
+                grab.exe grab-gui.exe rclone.exe licenses/rclone.txt licenses/libssh2.txt
+                licenses/openssl.txt grab.conf.example README.md LICENSE
         WORKING_DIRECTORY "${GRAB_STAGE_DIR}"
         DEPENDS ${GRAB_STAGED}
         COMMENT "Packing ${GRAB_ZIP}"
