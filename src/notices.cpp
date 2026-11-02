@@ -5,6 +5,7 @@
 #include "json.hpp"
 #include "passwords.hpp"
 #include "rclone_flags.hpp"
+#include "rclone_import.hpp"
 #include "server_conf.hpp"
 #include "ssh_target.hpp"
 #include "util.hpp"
@@ -345,33 +346,61 @@ void rclone_notices(const Builder& b, const std::string& s, const std::vector<st
 } // namespace
 
 std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig& cfg, const Extras& extras,
-                                     const Environment& environment, bool store_unreadable) {
+                                     const Environment& environment, const Moved& moved, bool store_unreadable) {
     std::vector<Notice> out;
+    std::vector<std::string> switched; // N0: on grab's own client by the default
     for (const auto& r : cfg.remotes) {
         const Builder b{.out = out, .server = r.name};
-        const Engine engine = effective_engine(r);
+        // Its connection details, when it has them, and what keeps grab's client off it: the
+        // guard leaves a server without an `engine` line on rclone (effective_engine).
+        std::optional<server_conf::Connection> details;
+        if (const auto* section = doc.find(r.name)) {
+            if (auto parsed = server_conf::parse(*section); parsed && *parsed) details = std::move(**parsed);
+        }
+        static const std::vector<std::pair<std::string, std::string>> none;
+        const auto found = extras.find(r.name);
+        const auto& kept = found != extras.end() ? found->second : none; // a reference, never a copy
+        std::vector<guard::Reason> reasons;
+        if (details) {
+            auto sources = guard::sources(r, *details, kept);
+            sources.environment = environment;
+            auto guarded = guard::evaluate(sources);
+            // Its copy of the extras (a proxy can hold a password), wiped as make_context does.
+            for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
+            if (store_unreadable) guard::add_unreadable_store(guarded);
+            reasons = guard::reasons(guarded);
+        }
+        const Engine engine = effective_engine(r, !reasons.empty());
         const bool on_grab = engine == Engine::grab;
+        // (GRAB_ENGINE=grab puts a guarded one there too, where grab's client refuses it.)
+        if (on_grab && details && !r.engine && reasons.empty() && moved.contains(r.name)) switched.push_back(r.name);
         flag_notices(b, r, on_grab);
         if (on_grab) ssh_notices(b, r);
-        const auto* section = doc.find(r.name);
-        if (section == nullptr) continue;
-        const auto connection = server_conf::parse(*section);
-        if (!connection || !*connection) continue; // no details yet: nothing to guard
-        const auto& c = **connection;
-        const auto found = extras.find(r.name);
-        const auto& kept = found != extras.end() ? found->second : std::vector<std::pair<std::string, std::string>>{};
+        if (!details) continue; // no details yet: nothing to guard
         if (on_grab) {
             rclone_notices(b, r.name, kept);
-            rclone_notices(b, r.name, c.rclone);
+            rclone_notices(b, r.name, details->rclone);
         }
-        auto sources = guard::sources(r, c, kept);
-        sources.environment = environment;
-        auto guarded = guard::evaluate(sources);
-        if (store_unreadable) guard::add_unreadable_store(guarded);
         // Keyed on the text (kind, where, engine), never the value: a proxy can hold a password.
-        for (const auto& reason : guard::reasons(guarded)) {
+        for (const auto& reason : reasons) {
             b.add_keyed_on_text("guard", reason.where, guard::text(r.name, std::span(&reason, 1), engine));
         }
+    }
+    // N0 first, once per configuration whichever servers it names then (keyed on the default
+    // itself): an imported server without an `engine` line changed engine with the switch (phase 8
+    // step 8), and a list fetched by rclone doesn't match grab's (file_list::fingerprint).
+    if (!switched.empty()) {
+        out.insert(out.begin(),
+                   Notice{.server = "grab",
+                          .key = "engine",
+                          .flag = "default",
+                          .digest = util::sha256_hex("grab"),
+                          .text = std::format("Downloads, searches and lists now use grab's own SSH client, no longer "
+                                              "rclone ({}); their saved file lists are fetched again once. To go back "
+                                              "to rclone for a server until a later grab removes it, set engine = "
+                                              "rclone in its section (grab config, or Open grab.conf in grab's "
+                                              "Settings).",
+                                              util::join(switched, ", "))});
     }
     // N7, wherever the key is.
     for (const auto& [section, key] : cfg.unknown_keys) {
@@ -403,8 +432,13 @@ std::expected<std::vector<Notice>, std::string> for_config(const std::filesystem
             if (auto kept = guard::store_extras(*store, r.name, login); !kept.empty()) extras[r.name] = std::move(kept);
         }
     }
+    // The servers that used rclone before the switch: those the import moved.
+    Moved moved;
+    if (const auto text = util::read_file_if_exists(rclone_import::record_path(state_dir(grab_conf))); text && *text) {
+        if (auto record = rclone_import::from_json(**text)) moved = std::move(record->imported);
+    }
     auto out = settings_notices(
-        *doc, *cfg, extras, [](const std::string& name) { return util::getenv_utf8(name.c_str()); }, !store);
+        *doc, *cfg, extras, [](const std::string& name) { return util::getenv_utf8(name.c_str()); }, moved, !store);
     for (auto& [server, kept] : extras) {
         for (auto& [key, value] : kept) std::ranges::fill(value, '\0');
     }
@@ -418,6 +452,12 @@ namespace {
 using Id = std::tuple<std::string, std::string, std::string, std::string>; // server, key, flag, digest
 
 Id id_of(const Notice& n) { return {n.server, n.key, n.flag, n.digest}; }
+
+// N0 is about the switch itself: once shown it stays shown, also while no server is on grab's
+// client for a time (an `engine = rclone` tried and taken out again has nothing new to say).
+bool sticky(const Id& id) {
+    return std::get<0>(id) == "grab" && std::get<1>(id) == "engine" && std::get<2>(id) == "default";
+}
 
 std::set<Id> read_shown(const std::filesystem::path& file) {
     std::set<Id> shown;
@@ -446,6 +486,9 @@ std::expected<std::vector<Notice>, std::string> take_new(const std::filesystem::
     for (const auto& n : current) {
         if (!shown.contains(id_of(n))) fresh.push_back(n);
         now.insert(id_of(n));
+    }
+    for (const auto& id : shown) {
+        if (sticky(id)) now.insert(id);
     }
     if (now == shown) return fresh;
     auto list = json::Value::make_array();

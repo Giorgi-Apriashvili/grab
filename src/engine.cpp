@@ -128,7 +128,6 @@ Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Co
     ctx.remote = server_conf::to_remote(settings.rclone_remote, connection, grab_known_hosts_path());
     ctx.method = resolve_find_method(settings, ctx.remote);
     ctx.grab_method = resolve_grab_method(settings, ctx.remote);
-    ctx.engine = effective_engine(settings);
     ctx.config = std::move(config);
     ctx.settings = std::move(settings);
     ctx.connection = std::move(connection);
@@ -147,6 +146,9 @@ Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Co
     ctx.guard = guard::evaluate(sources);
     if (!store) guard::add_unreadable_store(ctx.guard);
     for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
+    // The default is grab's own client (phase 8 step 8), except for a server it can't serve as
+    // configured: that one stays on rclone by itself, and its texts say why (guard::text).
+    ctx.engine = effective_engine(ctx.settings, !guard::reasons(ctx.guard).empty());
     // ssh.exe find would connect past a route rclone takes.
     if (ctx.engine == Engine::rclone && guard::routed(guard::reasons(ctx.guard))) ctx.method = FindMethod::rclone;
     return ctx;
@@ -184,13 +186,14 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
 
     const auto exe_dir = util::self_exe_path().parent_path();
     cfg->rclone = resolve_rclone_exe(*cfg, exe_dir);
-    // Asked only where rclone runs: an engine = grab server loads with a missing or too old one.
-    if (effective_engine(settings) == Engine::rclone) {
-        if (auto usable = check_rclone(cfg->rclone, exe_dir, cfg->rclone != "rclone"); !usable) {
+    Context ctx = make_context(std::move(*cfg), std::move(settings), std::move(**connection), config_path);
+    // Asked only where rclone runs (the engine as resolved, the guard's included): an engine = grab
+    // server loads with a missing or too old one.
+    if (ctx.engine == Engine::rclone) {
+        if (auto usable = check_rclone(ctx.config.rclone, exe_dir, ctx.config.rclone != "rclone"); !usable) {
             return util::fail(usable.error());
         }
     }
-    Context ctx = make_context(std::move(*cfg), std::move(settings), std::move(**connection), config_path);
     if (applied && !*applied) ctx.import_notes.push_back(applied->error());
     if (applied && *applied) {
         for (const auto& server : (*applied)->imported) ctx.imported.push_back(server.name);
@@ -386,6 +389,16 @@ std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span
                                reach->io_from);
         }
         target->timeout = *reach->io_timeout;
+    }
+    // A failure only rclone might get past says how to fall back to it (decision 3: grab.conf only),
+    // on the servers grab's client downloads from; elsewhere it only previews, plays and verifies.
+    // One Target serves every caller (Pools::get compares all of it), so the text says what the
+    // setting changes: previews, Play and verify stay on grab's client either way.
+    if (ctx.engine == Engine::grab) {
+        target->fallback = std::format("; for {}'s downloads, searches and lists to go through rclone until a later "
+                                       "grab removes it, set engine = rclone in [{}] (grab config, or Open grab.conf "
+                                       "in grab's Settings)",
+                                       ctx.settings.name, ctx.settings.name);
     }
     return target;
 }

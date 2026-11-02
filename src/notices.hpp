@@ -1,7 +1,8 @@
 #pragma once
 
-// One-time notices about the settings grab's own SSH client reads differently from rclone, or not
-// at all (RCLONE-REPLACEMENT.md, phase 8 step 5): common_flags' --bind, --contimeout and --timeout
+// One-time notices about the switch of the default engine to grab's own SSH client, naming the
+// fallback (N0, phase 8 step 8), and about the settings that client reads differently from rclone,
+// or not at all (RCLONE-REPLACEMENT.md, phase 8 step 5): common_flags' --bind, --contimeout and --timeout
 // read as the new keys (N1), rclone's other connection flags (N2, N3), ssh_options (N4), connection
 // flags in folder_flags and file_flags (N5), rclone settings that change what grab does (N6), keys
 // grab doesn't know (N7), flags only the --rclone copies used (N8), and what keeps grab's client off a
@@ -23,6 +24,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,24 +45,34 @@ struct Notice {
 using Extras = std::map<std::string, std::vector<std::pair<std::string, std::string>>, std::less<>>;
 // An inherited environment variable, or nullopt.
 using Environment = std::function<std::optional<std::string>(const std::string&)>;
+// The servers the import from rclone.conf moved into grab.conf (imported.json's names): every
+// server from before the switch reaches grab.conf that way, so these are the ones it can move.
+using Moved = std::set<std::string, std::less<>>;
 
-// Every notice the configuration `doc` (parsed as `cfg`) has, server by server in file order:
-// on engine = grab servers (effective_engine) N1-N6, on any N5 for file_flags, N7, N8 and the
-// guard's reasons (with `extras` and `environment`; `store_unreadable`: grab's store exists but
-// can't be read, so every server with connection details counts as routed).
+// Every notice the configuration `doc` (parsed as `cfg`) has: first N0 (server "grab", key
+// "engine", flag "default", keyed on the default itself so it shows once whatever it names) when
+// a server of `moved` with connection details and no `engine` line is on grab's own client (one
+// added since never used rclone); then server by
+// server in file order on engine = grab servers (effective_engine, with the guard) N1-N6, on any
+// N5 for file_flags, N7, N8 and the guard's reasons (with `extras` and `environment`;
+// `store_unreadable`: grab's store exists but can't be read, so every server with connection
+// details counts as routed and stays on rclone).
 [[nodiscard]] std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig& cfg, const Extras& extras,
-                                                   const Environment& environment, bool store_unreadable = false);
+                                                   const Environment& environment, const Moved& moved,
+                                                   bool store_unreadable = false);
 
 // The notices of the configuration at `grab_conf`, read now: grab.conf, grab's store (one
-// decryption, for the extras) and this process's environment.
+// decryption, for the extras), imported.json (no N0 when it can't be read) and this process's
+// environment.
 [[nodiscard]] std::expected<std::vector<Notice>, std::string> for_config(const std::filesystem::path& grab_conf);
 
 // The file that keeps which were shown: "notices.json" in `state_dir`.
 [[nodiscard]] std::filesystem::path path_in(const std::filesystem::path& state_dir);
 
 // Those of `current` (a configuration's every notice) not shown yet. notices.json then holds
-// `current`, so one that goes and comes back shows again; written under the settings lock in one
-// step, only when it changes. One that can't be read counts as empty.
+// `current`, so one that goes and comes back shows again, except N0, which stays once shown;
+// written under the settings lock in one step, only when it changes. One that can't be read
+// counts as empty.
 [[nodiscard]] std::expected<std::vector<Notice>, std::string> take_new(const std::filesystem::path& file,
                                                                       const std::vector<Notice>& current);
 

@@ -18,6 +18,7 @@
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "server_cli.hpp"
+#include "server_ops.hpp"
 #include "ssh_pool.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -144,8 +145,20 @@ int do_init(const std::filesystem::path& path) {
     std::filesystem::remove(rclone_import::record_path(files.state_dir), ec);
     const auto applied = rclone_import::apply(files);
     if (!applied) error(applied.error());
+    // The lookups as runs resolve them now that the details and the store are in, the guard's
+    // included (a server rclone.conf routes stays on rclone): in the comments and below.
+    std::map<std::string, std::string, std::less<>> searches;
+    if (applied) {
+        if (auto env = server_ops::load_env(path, util::self_exe_path().parent_path())) {
+            if (auto described = server_ops::describe_servers(*env); !described) error(described.error());
+            for (auto& info : server_ops::list_servers(*env)) searches[info.name] = std::move(info.search);
+        }
+    }
     std::println("wrote {} with {} server(s) imported from rclone.conf:", shown, remotes.size());
-    for (const auto& r : remotes) std::println("  [{}]  {}", r.name, describe_remote(r));
+    for (const auto& r : remotes) {
+        const auto found = searches.find(section_name_for(r.name));
+        std::println("  [{}]  {}", r.name, describe_remote(r, found != searches.end() ? found->second : ""));
+    }
     if (applied) {
         for (const auto& note : applied->notes) std::println("  note: [{}] {}", note.server, note.text);
     }

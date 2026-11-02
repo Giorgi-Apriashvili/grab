@@ -58,6 +58,13 @@ struct Target {
     std::string bind_from = "--bind";
     std::chrono::milliseconds connect_timeout{30'000};
     std::chrono::milliseconds timeout{30'000};
+    // Added to the failures rclone might get past where grab's client can't (RCLONE-REPLACEMENT.md,
+    // phase 8 step 9): a handshake the two sides couldn't agree on, a host key type grab can't
+    // check, an SFTP server that breaks the protocol (sftp::ProtocolError). engine::ssh_target sets
+    // it on engine = grab servers ("; for Main's downloads, searches and lists to go through rclone
+    // ..., set engine = rclone in [Main]": previews, Play and verify stay on grab's client); a
+    // refused login, a timeout or a dropped connection fails rclone the same way and gets none.
+    std::string fallback;
     bool operator==(const Target&) const = default;
 };
 
@@ -156,7 +163,8 @@ public:
 private:
     void open(const Target& target);
     void close();
-    [[noreturn]] void fail(budget::Failure kind, std::string_view what) const;
+    // Throws Error: `what`, libssh2's last error, then `then` (Target::fallback, or nothing).
+    [[noreturn]] void fail(budget::Failure kind, std::string_view what, std::string_view then = {}) const;
     void check_host_key(const Target& target, std::string_view known_hosts_text);
     void log_in(const Target& target);
 
@@ -166,6 +174,9 @@ private:
     std::atomic<std::uint64_t> received_{0};
     std::chrono::milliseconds login_time_{0};
     bool dropped_ = false;
+    bool link_lost_ = false; // a socket read saw the server close, or a send or read failed
+    // The socket call that just failed: -EAGAIN when it only has to wait, else the link is lost.
+    long long socket_failed();
     friend struct SessionAccess;
 };
 

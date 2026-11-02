@@ -43,7 +43,7 @@ struct Context {
     RcloneRemote remote;  // connection details from grab.conf (server_conf::to_remote)
     FindMethod method;    // resolved: ssh or rclone (engine = rclone)
     std::vector<std::string> imported; // servers the import moved from rclone.conf into grab.conf just now
-    Engine engine = Engine::rclone;    // effective_engine(settings)
+    Engine engine = Engine::grab;      // effective_engine(settings, guarded): the guard keeps a server on rclone
     GrabMethod grab_method = GrabMethod::probe; // how searches and lists run on engine = grab
     server_conf::Connection connection; // the server's grab.conf section
     std::filesystem::path passwords;    // grab's store of this configuration (passwords::path_in)
@@ -55,9 +55,10 @@ struct Context {
 
 // The Context of `settings`, a server of `config` (rclone resolved) whose grab.conf section holds
 // `connection`, in the configuration at `grab_conf` (whose state_dir keeps its passwords). The
-// guard reads grab's store (one decryption) for the server's rclone extras; a route rclone takes
-// (guard::routed) makes an engine = rclone server search with rclone's listing, since ssh.exe
-// find would connect past it.
+// guard reads grab's store (one decryption) for the server's rclone extras. Its engine: GRAB_ENGINE,
+// else its `engine` line, else grab's own client unless the guard has a reason to keep it off,
+// which leaves it on rclone (effective_engine). A route rclone takes (guard::routed) makes an
+// engine = rclone server search with rclone's listing, since ssh.exe find would connect past it.
 [[nodiscard]] Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Connection connection,
                                    const std::filesystem::path& grab_conf);
 
@@ -109,7 +110,8 @@ struct ConnectSettings {
 // and nothing keeps grab's client off it (grab_blockers, with `extra`; the error says why and what
 // that means on its engine). Its connection settings as connect_settings has them with `extra`,
 // the command's connection flags after `--`; an I/O time outside 1 s to 24 h is refused (with no
-// limit a stalled read couldn't be cancelled).
+// limit a stalled read couldn't be cancelled). On engine = grab its failures that rclone might get
+// past name the fallback, engine = rclone in its section (ssh::Target::fallback).
 [[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx,
                                                                  std::span<const std::string> extra = {});
 

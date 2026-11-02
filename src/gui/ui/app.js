@@ -2765,7 +2765,7 @@ $('#limit-hint').addEventListener('click', () => {
 const settings = {
   open: false,
   servers: [],
-  engine: 'rclone', // a new server's engine (GRAB_ENGINE can make it grab)
+  engine: 'grab', // a new server's engine (GRAB_ENGINE=rclone can make it rclone)
   form: null,     // null, or { editing, name, origAuth, engine } while the add/edit form is shown
   auth: 'password',
   tests: {},      // server name -> serverTested message, or { pending: true }
@@ -2891,7 +2891,7 @@ function serverCard(s) {
   const where = s.roots.length ? s.roots.join(', ') : '~';
   const meta = s.error
     ? `<span class="bad">${esc(s.error)}</span>`
-    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}${s.engine === 'grab' ? ' · grab\'s engine' : ''}` +
+    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}${s.engine === 'rclone' ? ' · rclone (fallback)' : ''}` +
       ` · searched ${SEARCHED_TEXT[s.search] || 'with rclone listing'} in ${esc(where)}, depth ${s.depth}` +
       ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}` +
       (s.connectionKeys ? ` · ${esc(s.connectionKeys)}` : '');
@@ -3194,7 +3194,7 @@ if (webview) {
       case 'played': flash(`Playing ${msg.name} in ${msg.program}`); break;
       case 'servers':
         settings.servers = msg.items;
-        settings.engine = msg.engine || 'rclone';
+        settings.engine = msg.engine || 'grab';
         renderServers();
         break;
       case 'settingsBusy':

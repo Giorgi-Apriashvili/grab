@@ -241,8 +241,15 @@ TEST_CASE("a list's fingerprint follows what it covers") {
     changed.remote.host = "u2.your-storagebox.de";
     CHECK(file_list::fingerprint(changed) != fp);
     changed = ctx;
-    changed.method = FindMethod::ssh;
+    changed.grab_method = GrabMethod::walk;
     CHECK(file_list::fingerprint(changed) != fp);
+    // A list rclone fetched isn't grab's (the default since phase 8): fetched again once (N0).
+    changed = ctx;
+    changed.engine = Engine::rclone;
+    const auto by_rclone = file_list::fingerprint(changed);
+    CHECK(by_rclone != fp);
+    changed.method = FindMethod::ssh;
+    CHECK(file_list::fingerprint(changed) != by_rclone);
 }
 
 TEST_CASE("hits of several servers rank together") {

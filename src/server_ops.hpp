@@ -60,7 +60,7 @@ struct ServerInfo {
     int port = 22;
     servers::Auth auth = servers::Auth::password;
     std::string key_file;
-    Engine engine = Engine::rclone; // effective_engine(): what downloads and searches it
+    Engine engine = Engine::grab;   // effective_engine() with the guard: what downloads and searches it
     std::string search;             // search_method(): "ssh", "rclone"; on grab "find", "walk", "probe"
     bool host_key_pinned = false;   // grab's known_hosts has a key for [host]:port, read now (G209)
     // Whether grab's store has the secret this login uses, saved for this very user@host:port
@@ -79,6 +79,10 @@ struct ServerInfo {
 
 [[nodiscard]] bool is_default_server(const GrabConfig& cfg, std::string_view name);
 [[nodiscard]] std::vector<ServerInfo> list_servers(const Env& env);
+// grab's comment above each section with connection details (lead_in) says the lookup as
+// list_servers resolves it, the guard's included; grab.conf is written only when one changes.
+// `grab --init` writes them before the import fills in the details and grab's store.
+[[nodiscard]] std::expected<void, std::string> describe_servers(const Env& env);
 [[nodiscard]] const RemoteSettings* find_server(const GrabConfig& cfg, std::string_view name);
 
 // ---- host keys ----------------------------------------------------------------------------

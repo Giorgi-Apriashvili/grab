@@ -317,12 +317,23 @@ TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp 
     CHECK(text.find("broken (sftp, incomplete") != std::string::npos);
     CHECK(text.find("[gdrive]") == std::string::npos);
     CHECK(text.find("[broken]") == std::string::npos);
-    CHECK(text.find("# server [hetzner]: alice@203.0.113.10:2222, key file, lookup via ssh + find\n[hetzner]\n") !=
-          std::string::npos);
+    // Lead-ins as grab's own client (the default) searches.
+    CHECK(text.find("# server [hetzner]: alice@203.0.113.10:2222, key file, lookup with find, else by listing "
+                    "folders\n[hetzner]\n") != std::string::npos);
     CHECK(text.find("# rclone remote [") == std::string::npos);
     CHECK(text.find("grab server add | list | edit | test | trust | remove") != std::string::npos);
-    CHECK(text.find("u1-sub1@box.example.com:23, password, lookup via rclone lsf") !=
+    CHECK(text.find("u1-sub1@box.example.com:23, password, lookup with find, else by listing folders") !=
           std::string::npos);
+    // No rclone flag lines; the connection keys and the fallback commented out (grab's defaults
+    // apply), and `find = auto`, never walk (0.19 refuses it).
+    CHECK(text.find("common_flags") == std::string::npos);
+    CHECK(text.find("folder_flags") == std::string::npos);
+    CHECK(text.find("# bind = ") != std::string::npos);
+    CHECK(text.find("# connect_timeout = 30s\n") != std::string::npos);
+    CHECK(text.find("# io_timeout = 30s\n") != std::string::npos);
+    CHECK(text.find("# engine = rclone\n") != std::string::npos);
+    CHECK(text.find("\nengine") == std::string::npos);
+    CHECK(text.find("\nfind = walk") == std::string::npos);
 
     const auto cfg = parse_ok(text);
     CHECK(cfg.default_remote == "hetzner");
@@ -449,15 +460,21 @@ TEST_CASE("a server's search method as lists and comments name it, per engine") 
     s.find = FindMethod::rclone;
     CHECK(search_method(s, key, Engine::grab) == "walk");
 
-    // grab.conf's comment follows the section's own engine and find setting.
-    CHECK(describe_remote(key) == "u@h:22, key file, lookup via ssh + find");
+    // grab.conf's comment says the lookup as the caller resolved it (engine, guard and find
+    // setting); without one, grab's own client's with the default find setting.
+    CHECK(describe_remote(key) == "u@h:22, key file, lookup with find, else by listing folders");
+    CHECK(describe_remote(box) == "u1@u1.your-storagebox.de:23, password, lookup by listing folders");
+    RemoteSettings on_rclone;
+    on_rclone.engine = Engine::rclone;
+    CHECK(describe_remote(key, search_method(on_rclone, key, Engine::rclone)) ==
+          "u@h:22, key file, lookup via ssh + find");
+    CHECK(describe_remote(box, search_method(on_rclone, box, Engine::rclone)) ==
+          "u1@u1.your-storagebox.de:23, password, lookup via rclone lsf");
+    CHECK(describe_remote(key, "rclone") == "u@h:22, key file, lookup via rclone lsf"); // a route rclone takes
     RemoteSettings grab;
-    grab.engine = Engine::grab;
-    CHECK(describe_remote(key, grab) == "u@h:22, key file, lookup with find, else by listing folders");
-    CHECK(describe_remote(box, grab) == "u1@u1.your-storagebox.de:23, password, lookup by listing folders");
     grab.find = FindMethod::ssh;
-    CHECK(describe_remote(key, grab) == "u@h:22, key file, lookup with find");
-    CHECK(describe_remote(key, grab, "key in grab's store") == "u@h:22, key in grab's store, lookup with find");
+    CHECK(describe_remote(key, search_method(grab, key, Engine::grab)) == "u@h:22, key file, lookup with find");
+    CHECK(describe_remote(key, "find", "key in grab's store") == "u@h:22, key in grab's store, lookup with find");
 }
 
 TEST_CASE("a remote named grab gets a non-colliding section name") {
@@ -501,7 +518,7 @@ TEST_CASE("RCLONE_CONFIG overrides the default rclone.conf path") {
     set_env("RCLONE_CONFIG", previous ? previous->c_str() : nullptr);
 }
 
-TEST_CASE("engine: rclone by default, grab when asked, GRAB_ENGINE over every server") {
+TEST_CASE("engine: grab's own client by default, rclone when asked or guarded, GRAB_ENGINE over every server") {
     const auto cfg = parse_ok("[a]\n[b]\nengine = grab\n[c]\nengine = RClone\n");
     REQUIRE(cfg.remotes.size() == 3);
     CHECK_FALSE(cfg.remotes[0].engine.has_value()); // absent: the default, resolved by effective_engine
@@ -511,14 +528,23 @@ TEST_CASE("engine: rclone by default, grab when asked, GRAB_ENGINE over every se
 
     const auto previous = util::getenv_utf8("GRAB_ENGINE");
     set_env("GRAB_ENGINE", nullptr);
-    CHECK(effective_engine(cfg.remotes[0]) == Engine::rclone);
+    CHECK(effective_engine(cfg.remotes[0]) == Engine::grab); // the default since phase 8 (0.20)
     CHECK(effective_engine(cfg.remotes[1]) == Engine::grab);
+    CHECK(effective_engine(cfg.remotes[2]) == Engine::rclone); // the fallback
+    // A server grab's client can't serve as configured stays on rclone by itself; one that asks
+    // for grab is refused where it's used (engine::ssh_target), never moved.
+    CHECK(effective_engine(cfg.remotes[0], true) == Engine::rclone);
+    CHECK(effective_engine(cfg.remotes[1], true) == Engine::grab);
+    CHECK(effective_engine(cfg.remotes[2], true) == Engine::rclone);
     set_env("GRAB_ENGINE", "grab");
-    CHECK(effective_engine(cfg.remotes[0]) == Engine::grab);
+    CHECK(effective_engine(cfg.remotes[2]) == Engine::grab);
+    CHECK(effective_engine(cfg.remotes[0], true) == Engine::grab);
     set_env("GRAB_ENGINE", "rclone");
+    CHECK(effective_engine(cfg.remotes[0]) == Engine::rclone);
     CHECK(effective_engine(cfg.remotes[1]) == Engine::rclone);
     set_env("GRAB_ENGINE", "something else"); // ignored
-    CHECK(effective_engine(cfg.remotes[1]) == Engine::grab);
+    CHECK(effective_engine(cfg.remotes[0]) == Engine::grab);
+    CHECK(effective_engine(cfg.remotes[2]) == Engine::rclone);
     set_env("GRAB_ENGINE", previous ? previous->c_str() : nullptr);
 }
 
@@ -591,6 +617,28 @@ TEST_CASE("example config parses and matches the defaults") {
     CHECK(conn.host == "files.example.com");
     CHECK(conn.auth == server_conf::Auth::key);
     CHECK(std::string_view(example_config).find("grab's own rclone.conf") == std::string_view::npos);
+    // grab's own client by default: the engine line and the connection keys commented out, no
+    // rclone flag keys, `find = auto` (0.19 refuses walk).
+    CHECK_FALSE(cfg.remotes[0].engine.has_value());
+    CHECK_FALSE(cfg.remotes[0].bind.has_value());
+    CHECK_FALSE(cfg.remotes[0].io_timeout.has_value());
+    CHECK(cfg.remotes[0].find == FindMethod::auto_detect);
+    CHECK(cfg.unknown_keys.empty());
+    const std::string_view text = example_config;
+    for (const char* line : {"\n# engine = rclone\n", "\n# bind = ", "\n# connect_timeout = 30s\n", "\n# io_timeout = 30s\n",
+                             "\nfind = auto\n"}) {
+        CHECK_MESSAGE(text.find(line) != std::string_view::npos, line);
+    }
+    for (const char* key : {"\ncommon_flags", "\nfolder_flags", "\nfile_flags", "\nssh_options", "\nengine"}) {
+        CHECK_MESSAGE(text.find(key) == std::string_view::npos, key);
+    }
+}
+
+TEST_CASE("grab.conf.example is the example built into grab, as shipped") {
+    auto shipped = util::read_file(util::path_from_utf8(GRAB_SOURCE_DIR) / "grab.conf.example");
+    REQUIRE_MESSAGE(shipped, shipped.error_or(""));
+    std::erase(*shipped, '\r'); // a checkout may have made it CRLF
+    CHECK(*shipped == example_config);
 }
 
 TEST_CASE("the settings lock has one holder at a time, and a thread may take it again") {

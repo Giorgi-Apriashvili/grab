@@ -39,7 +39,7 @@ Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
                        $EDITOR, else notepad. The file is created from the example if missing.
   server list          the configured servers: login, how it logs in, whether a password is
-                       saved, lookup method, whether its host key is pinned
+                       saved, engine and lookup method, whether its host key is pinned
   server add [NAME]    set up a server step by step (host, login, host key, search roots);
                        writes grab.conf (a password to grab's encrypted store), then tests it
   server edit NAME     the same questions, the current answers as defaults; Enter keeps the
@@ -78,7 +78,8 @@ Options:
                        takes rclone's other connection flags (--sftp-*...), but not its
                        address, login or host keys (grab server edit NAME)
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
-  -v, --verbose        echo the ssh and rclone command lines before running them
+  -v, --verbose        say how grab connects and searches, the settings' notes again, and the
+                       command lines of servers on rclone (engine = rclone) before they run
       --init           write grab.conf to the config path if absent, with the sftp remotes of
                        the standard rclone.conf as servers (rclone.conf is only read)
   -h, --help           show this help
@@ -90,8 +91,13 @@ Downloads run over several connections at once and survive interruptions: Ctrl+C
 what is on disk, and the same command later continues from there. A file or folder file
 already on disk (same size, not older than the server's) is not fetched again.
 
+grab downloads, searches and lists with its own SSH client. `engine = rclone` in a server's
+section (or GRAB_ENGINE=rclone for a run) uses rclone for it instead, until a later grab
+removes it; a server whose rclone settings grab's client can't serve (a proxy, an ssh
+command) stays on rclone by itself, and `grab server list` says why.
+
 Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
-(ssh or rclone listing) failed, 5 update failed, 6 download failed, 130 stopped by Ctrl+C.
+(search or file list) failed, 5 update failed, 6 download failed, 130 stopped by Ctrl+C.
 )";
 }
 

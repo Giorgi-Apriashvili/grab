@@ -34,6 +34,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <winsock2.h> // IWYU pragma: keep (the socket API)
+#endif
+
 using namespace grab;
 
 TEST_CASE("libssh2 is built in, on OpenSSL") {
@@ -301,6 +305,129 @@ TEST_CASE("ssh: --bind connects from that address, and one this machine can't us
     CHECK(v6.first == budget::Failure::fatal);
     CHECK(v6.second.find("no address of the same kind") != std::string::npos);
 }
+
+#ifdef _WIN32
+namespace {
+
+// One SSH server on 127.0.0.1 for one connection: it sends its banner and `kexinit` (or, with
+// `hang_up`, closes the connection at once), then reads until grab hangs up (5 s at most).
+// What a OneShotServer does with its one connection: sends its banner and `kexinit`, hangs up at
+// once, or reads the client's banner, sends its own and closes cleanly (a FIN, not a reset).
+enum class Shot { talk, hang_up, banner_then_close };
+
+class OneShotServer {
+public:
+    explicit OneShotServer(std::string kexinit, Shot shot = Shot::talk) {
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        listening_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in at{};
+        at.sin_family = AF_INET;
+        at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int length = sizeof(at);
+        REQUIRE(::bind(listening_, reinterpret_cast<const sockaddr*>(&at), sizeof(at)) == 0);
+        REQUIRE(::listen(listening_, 1) == 0);
+        REQUIRE(::getsockname(listening_, reinterpret_cast<sockaddr*>(&at), &length) == 0);
+        port = ntohs(at.sin_port);
+        thread_ = std::jthread([this, kexinit = std::move(kexinit), shot] {
+            const SOCKET c = ::accept(listening_, nullptr, nullptr);
+            if (c == ~SOCKET{0}) return; // INVALID_SOCKET: the listening socket was closed
+            if (shot != Shot::hang_up) {
+                const DWORD wait = 5'000;
+                ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&wait), sizeof(wait));
+                if (shot == Shot::banner_then_close) {
+                    char ch = 0;
+                    while (::recv(c, &ch, 1, 0) == 1 && ch != '\n') {}
+                }
+                const std::string out = "SSH-2.0-FakeServer\r\n" + kexinit;
+                ::send(c, out.data(), static_cast<int>(out.size()), 0);
+                if (shot == Shot::banner_then_close) ::shutdown(c, SD_SEND);
+                std::array<char, 4096> in{};
+                while (::recv(c, in.data(), static_cast<int>(in.size()), 0) > 0) {}
+            }
+            closesocket(c);
+        });
+    }
+    ~OneShotServer() { closesocket(listening_); } // accept() returns, then the thread is joined
+    OneShotServer(const OneShotServer&) = delete;
+    OneShotServer& operator=(const OneShotServer&) = delete;
+    int port = 0;
+
+private:
+    SOCKET listening_ = INVALID_SOCKET;
+    std::jthread thread_;
+};
+
+// An SSH binary packet holding a KEXINIT that offers only these algorithms.
+std::string kexinit_packet(std::string_view kex, std::string_view host_key, std::string_view cipher, std::string_view mac) {
+    auto u32 = [](std::string& out, std::uint32_t v) {
+        for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<char>((v >> shift) & 0xFF));
+    };
+    std::string payload(1, '\x14'); // SSH_MSG_KEXINIT
+    payload.append(16, 'c');        // cookie
+    for (const std::string_view list : {kex, host_key, cipher, cipher, mac, mac, std::string_view("none"),
+                                        std::string_view("none"), std::string_view(), std::string_view()}) {
+        u32(payload, static_cast<std::uint32_t>(list.size()));
+        payload += list;
+    }
+    payload.push_back('\0'); // first_kex_packet_follows
+    u32(payload, 0);         // reserved
+    std::size_t padding = 8 - (5 + payload.size()) % 8;
+    if (padding < 4) padding += 8;
+    std::string packet;
+    u32(packet, static_cast<std::uint32_t>(1 + payload.size() + padding));
+    packet.push_back(static_cast<char>(padding));
+    return packet + payload + std::string(padding, '\0');
+}
+
+} // namespace
+
+TEST_CASE("ssh: a handshake the two sides can't agree on names the fallback; a dropped connection doesn't (phase 8)") {
+    const auto known_hosts = std::filesystem::temp_directory_path() / "grab-test-fallback-known_hosts";
+    const std::string fallback = "; to use rclone for Old until a later grab removes it, set engine = rclone in [Old]";
+    auto failure = [&](OneShotServer& server) {
+        ssh::Target t;
+        t.host = "127.0.0.1";
+        t.port = server.port;
+        t.user = "u";
+        t.agent = true;
+        t.known_hosts = known_hosts;
+        t.connect_timeout = std::chrono::seconds(5);
+        t.timeout = std::chrono::seconds(5);
+        t.fallback = fallback;
+        std::ofstream(known_hosts, std::ios::binary | std::ios::trunc)
+            << ssh::known_host_line("127.0.0.1", server.port, key_of(ed25519_key)) << "\n";
+        try {
+            ssh::Connection c(t);
+        } catch (const ssh::Error& e) {
+            const std::string said = e.what();
+            MESSAGE(said);
+            return std::pair{e.kind, said};
+        }
+        return std::pair{budget::Failure::other, std::string("connected")};
+    };
+    // A server that offers only an old key exchange (SHA-1 group 1), which grab doesn't: rclone,
+    // with engine = rclone, might still agree with it.
+    OneShotServer old(kexinit_packet("diffie-hellman-group1-sha1", "ssh-ed25519", "aes128-ctr", "hmac-sha2-256"));
+    const auto disagreed = failure(old);
+    CHECK(disagreed.first == budget::Failure::fatal);
+    CHECK(disagreed.second.starts_with("SSH handshake with 127.0.0.1 failed: "));
+    CHECK(disagreed.second.ends_with(fallback));
+    // One that hangs up at once (MaxStartups, fail2ban): rclone would fare no better.
+    OneShotServer dropping("", Shot::hang_up);
+    const auto dropped = failure(dropping);
+    CHECK(dropped.first == budget::Failure::refused);
+    CHECK(dropped.second.find("engine = rclone") == std::string::npos);
+    // One that hangs up after its banner: libssh2 calls that a failed key exchange, but the link
+    // was dropped, so it's the server turning grab away, not a disagreement.
+    OneShotServer closing("", Shot::banner_then_close);
+    const auto closed = failure(closing);
+    CHECK(closed.first == budget::Failure::refused);
+    CHECK(closed.second.starts_with("SSH handshake with 127.0.0.1 failed"));
+    CHECK(closed.second.find("engine = rclone") == std::string::npos);
+    std::filesystem::remove(known_hosts);
+}
+#endif
 
 TEST_CASE("ssh: the offered algorithms leave out the weak ones") {
     for (std::string_view weak : {"sha1", "cbc", "arcfour", "md5", "3des", "blowfish", "group1-"}) {

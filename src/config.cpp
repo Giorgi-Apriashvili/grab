@@ -27,14 +27,15 @@ const std::string_view example_config = R"(# grab.conf - settings for the `grab`
 # with `grab server add`, change them with `grab server edit NAME` (or grab's Settings).
 
 [grab]
-# rclone executable. Blank = the rclone.exe bundled with grab (else rclone on PATH);
-# a full path uses that one instead.
+# rclone executable, for servers with engine = rclone. Blank = the rclone.exe bundled with
+# grab (else rclone on PATH); a full path uses that one instead.
 rclone =
 # The rclone.conf grab 0.19 and before kept servers in: a section without `host` takes its
 # details from the remote there once (grab only reads it, never writes it). Blank = grab's
 # own (%APPDATA%\grab\rclone.conf), then rclone's standard one.
 rclone_config =
-# ssh executable used for the remote `find`. Blank = `ssh` on PATH (Windows OpenSSH).
+# ssh executable for the searches of servers with engine = rclone (ssh + find). Blank = `ssh`
+# on PATH (Windows OpenSSH).
 ssh = ssh
 # Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.
 editor =
@@ -53,8 +54,9 @@ user = alice
 # grab's store with its passphrase).
 auth = key
 key_file = C:\Users\alice\.ssh\id_ed25519
-# What the server told grab's Test, so rclone needn't ask it again on every run: its shell
-# (unix, cmd, powershell, none) and its checksum commands. Left out = not known yet.
+# What the server told grab's Test, which Verify (and rclone, on engine = rclone) go by instead
+# of asking again: its shell (unix, cmd, powershell, none) and its checksum commands. Left out =
+# not known yet.
 # shell_type = unix
 # md5sum_command = md5sum
 # A non-secret rclone sftp setting for this server's rclone runs (engine = rclone), e.g.
@@ -62,37 +64,36 @@ key_file = C:\Users\alice\.ssh\id_ed25519
 # The rclone remote grab 0.19 and before used for this server (default: this section's name).
 # Kept in sections imported from rclone.conf: their partial downloads and 0.19 go by it.
 # rclone_remote = hetzner
-# How TARGET is located: auto = ssh + find when the server logs in with a key file or
-# ssh-agent, otherwise an rclone listing (password servers and storage boxes have no shell).
-# Force with ssh | rclone.
-# With engine = grab: auto = find where grab's check finds GNU find on the server, else by
-# listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.
+# How TARGET is located: auto = find where grab's check finds GNU find on the server, else by
+# listing folders (Storage Boxes always); ssh = find only; walk = by listing folders (grab 0.19
+# and before refuse walk: write rclone, which means the same, while one of them reads this file).
+# With engine = rclone: auto = ssh + find when the server logs in with a key file or ssh-agent,
+# else rclone's listing; ssh = ssh + find; walk or rclone = rclone's listing.
 find = auto
 # Comma-separated directories to search: absolute (/srv) or relative to the login home
 # (learning). Blank or . = the home directory itself.
 search_roots = /home/alice
 # How deep below each root `find` may look (find -maxdepth).
 max_depth = 4
-# Connections grab-gui's downloads may open to this server at once. Blank = automatic
-# (14 on Hetzner Storage Boxes, 12 elsewhere, lowered when the server refuses connections).
+# Connections downloads may open to this server at once, shared by all downloads from it.
+# Blank = automatic: 14 on Hetzner Storage Boxes, 12 elsewhere, lowered when the server
+# refuses connections.
 max_connections =
 # Skip dot-directories such as .cache and .config while searching.
 skip_hidden = true
-# Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
-ssh_options =
-# rclone flags for this server's rclone runs (engine = rclone), which use only the connection
-# ones (--sftp-*, --bind, --timeout...). 255Ki is the largest SFTP packet OpenSSH accepts and
-# cuts round trips roughly 8x compared with the 32Ki default. --sftp-disable-hashcheck skips
-# the md5sum rclone would otherwise run on the server after each of its own copies (minutes
-# for a 30 GB file); SSH already guarantees integrity in flight. To check downloads against
-# the server's copy, turn on Verify downloads (or grab --verify): grab's own check, which no
-# rclone flag changes.
-common_flags = -P --sftp-chunk-size 255Ki --sftp-disable-hashcheck
-# rclone flags for -f/--folder: their connection ones reach rclone's batch of small files on
-# engine = rclone; the rest were for --rclone copies, which are gone.
-folder_flags = --transfers 8 --checkers 8
-# rclone flags for -s/--file: they were for --rclone copies, which are gone; nothing uses them.
-file_flags = --multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi
+# How every connection to this server is made: the local address to connect from (blank =
+# any), the time to reach the server (blank = 30s; off = as long as TCP tries) and the longest
+# wait for it after that (blank = 30s; 1s to 24h). A run's -- --bind, --contimeout and
+# --timeout win over them.
+# bind = 192.0.2.10
+# connect_timeout = 30s
+# io_timeout = 30s
+# What downloads from, searches and lists this server: grab's own SSH client (the default), or
+# rclone, the fallback until a later grab removes it. A server whose rclone settings grab's
+# client can't serve (a proxy, an ssh command) stays on rclone by itself and says why. A server
+# on rclone also takes rclone's flags in common_flags and folder_flags, and ssh.exe's in
+# ssh_options (README: Configure).
+# engine = rclone
 )";
 
 namespace {
@@ -195,13 +196,14 @@ GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemot
     return budget::is_storage_box(remote.host) ? GrabMethod::walk : GrabMethod::probe;
 }
 
-Engine effective_engine(const RemoteSettings& settings) {
+Engine effective_engine(const RemoteSettings& settings, bool guarded) {
     if (auto env = util::getenv_utf8("GRAB_ENGINE")) {
         const std::string e = util::to_lower(util::trim(*env));
         if (e == "grab") return Engine::grab;
         if (e == "rclone") return Engine::rclone;
     }
-    return settings.engine.value_or(Engine::rclone);
+    if (settings.engine) return *settings.engine;
+    return guarded ? Engine::rclone : Engine::grab;
 }
 
 std::filesystem::path default_grab_config_path() {
@@ -461,12 +463,11 @@ std::vector<std::string> editor_command(const std::vector<std::string>& candidat
 
 // ---- generating grab.conf from rclone.conf ---------------------------------------------------
 
-namespace {
-
-// Section name for a remote; "grab" is taken by the global section.
 std::string section_name_for(std::string_view remote) {
     return remote == "grab" ? std::string("grab_remote") : std::string(remote);
 }
+
+namespace {
 
 // Splits rclone.conf into usable sftp remotes and "name (reason)" labels for the rest.
 void classify_remotes(const ini::Document& rclone, std::vector<RcloneRemote>& usable,
@@ -521,8 +522,8 @@ std::string_view search_method(const RemoteSettings& settings, const RcloneRemot
     return "probe";
 }
 
-std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings, std::string_view login) {
-    const auto method = search_method(settings, remote, settings.engine.value_or(Engine::rclone));
+std::string describe_remote(const RcloneRemote& remote, std::string_view method, std::string_view login) {
+    if (method.empty()) method = search_method(RemoteSettings{}, remote, Engine::grab);
     const char* lookup = method == "ssh"    ? "via ssh + find"
                          : method == "rclone" ? "via rclone lsf"
                          : method == "find"   ? "with find"
@@ -546,9 +547,9 @@ std::string remote_section(const RcloneRemote& remote, const std::vector<std::st
     s += std::format("[{}]\n", section_name_for(remote.name));
     if (connection.empty()) s += std::format("rclone_remote = {}\n", remote.name);
     for (const auto& [key, value] : connection) s += std::format("{} = {}\n", key, value);
-    s += "# auto = ssh + find when the server uses a key file or ssh-agent, otherwise rclone lsf.\n";
-    s += "# With engine = grab: auto = find where grab's check finds GNU find on the server, else by\n";
-    s += "# listing folders (Storage Boxes always); ssh = find only; rclone or walk = listing folders.\n";
+    s += "# auto = find where grab's check finds GNU find on the server, else by listing folders\n";
+    s += "# (Storage Boxes always); ssh = find only; walk = listing folders (grab 0.19 and before\n";
+    s += "# refuse walk: write rclone, which means the same, while one of them reads this file).\n";
     s += "find = auto\n";
     s += "# Where to search: comma-separated absolute (/srv) or home-relative (media) dirs.\n";
     s += "# Blank = the login home. Narrow it to speed up searches on big servers.\n";
@@ -556,11 +557,14 @@ std::string remote_section(const RcloneRemote& remote, const std::vector<std::st
                               : std::format("search_roots = {}\n", search_roots_value(search_roots));
     s += std::format("max_depth = {}\n", max_depth);
     s += "skip_hidden = true\n";
-    s += "# Built-in defaults, shown for reference; uncomment a line to override it here.\n";
-    s += "# ssh_options = -o ServerAliveInterval=30\n";
-    s += std::format("# common_flags = {}\n", default_common_flags);
-    s += std::format("# folder_flags = {}\n", default_folder_flags);
-    s += std::format("# file_flags = {}\n", default_file_flags);
+    s += "# The local address to connect from, the time to reach the server (off = as long as TCP\n";
+    s += "# tries) and the longest wait for it after that (1s to 24h). Blank = any, 30s and 30s.\n";
+    s += "# bind = 192.0.2.10\n";
+    s += "# connect_timeout = 30s\n";
+    s += "# io_timeout = 30s\n";
+    s += "# grab's own SSH client downloads, searches and lists (the default); rclone does for\n";
+    s += "# engine = rclone, the fallback until a later grab removes it.\n";
+    s += "# engine = rclone\n";
     return s;
 }
 
@@ -586,11 +590,13 @@ std::string generate_grab_config(const ini::Document* rclone, std::string_view r
                            util::join(skipped, ", "));
     }
     out += "\n[grab]\n";
-    out += "# rclone executable. Blank = the rclone.exe bundled with grab (else rclone on PATH).\n";
+    out += "# rclone executable, for servers with engine = rclone. Blank = the rclone.exe bundled with\n"
+           "# grab (else rclone on PATH).\n";
     out += "rclone =\n";
     out += "# The rclone.conf whose remote a section without `host` takes its details from, once (grab\n"
            "# only reads it). Blank = grab's own (%APPDATA%\\grab\\rclone.conf), then rclone's.\n";
     out += "rclone_config =\n";
+    out += "# ssh executable for the searches of servers with engine = rclone (ssh + find).\n";
     out += "ssh = ssh\n";
     out += "# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.\n";
     out += "editor =\n";

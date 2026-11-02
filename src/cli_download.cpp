@@ -820,7 +820,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     DownloadTally tally;
-    if (effective_engine(ctx.settings) == Engine::grab) {
+    if (ctx.engine == Engine::grab) {
         // The connection flags after `--` apply to grab's own connections too, as they did to
         // rclone's (`--bind`, `--contimeout`, `--timeout`).
         auto target = engine::ssh_target(ctx, given);
@@ -831,9 +831,12 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
             return tally;
         }
         s.pool = pools.get(server, *target, budget);
-        if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client (engine = grab)", server);
+        if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client", server);
     } else if (auto env = engine::rclone_env(ctx); env) {
         s.rclone_env = std::move(*env);
+        // engine = rclone in its section, GRAB_ENGINE=rclone, or settings grab's client can't
+        // serve (the guard, whose note -v repeats).
+        if (opts.verbose) std::println(stderr, "grab: {} through rclone (the fallback)", server);
     } else {
         std::println(stderr, "grab: {}", env.error());
         tally.code = exit_download_failed;

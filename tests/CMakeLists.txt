@@ -73,6 +73,8 @@ add_executable(grab_tests
 # OpenSSL's MD5 for the checks' own sums (test_ssh_hash.cpp, test_live_server.cpp) and the local
 # hash timing; made-up keys and rclone's obscuring for test_rclone_env.cpp.
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest OpenSSL::Crypto)
+# grab.conf.example as shipped, compared with the example built into grab (test_config.cpp).
+target_compile_definitions(grab_tests PRIVATE GRAB_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 if(WIN32)
     # The programs' manifest (long paths), so the tests see paths as grab does.
     target_sources(grab_tests PRIVATE grab_tests.rc)

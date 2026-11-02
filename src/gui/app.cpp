@@ -956,8 +956,11 @@ void App::send_init() {
             if (ctx) {
                 entry.set("host", str(ctx->remote.host));
                 entry.set("user", str(ctx->remote.user));
-                // ssh, rclone; on engine = grab find, walk or probe (search_method).
-                entry.set("method", str(std::string(search_method(ctx->settings, ctx->remote, ctx->engine))));
+                // ssh, rclone; on engine = grab find, walk or probe (search_method). On rclone as
+                // the context resolved it: a route rclone takes keeps ssh.exe find off the server.
+                entry.set("method", str(ctx->engine == Engine::rclone
+                                            ? std::string(ctx->method == FindMethod::ssh ? "ssh" : "rclone")
+                                            : std::string(search_method(ctx->settings, ctx->remote, ctx->engine))));
             } else {
                 entry.set("error", str(ctx.error()));
             }
@@ -1901,7 +1904,7 @@ void App::post_servers(const server_ops::Env& env) const {
     Value msg = Value::make_object();
     msg.set("type", str("servers"));
     msg.set("configPath", str(util::path_to_utf8(env.grab_conf)));
-    // A new server's (GRAB_ENGINE can make it grab), for the form's hints.
+    // A new server's: grab's own client (GRAB_ENGINE=rclone makes it rclone), for the form's hints.
     msg.set("engine", str(effective_engine(RemoteSettings{}) == Engine::grab ? "grab" : "rclone"));
     msg.set("items", std::move(items));
     post(msg);
@@ -2882,7 +2885,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.limiter = &limiter_;
     d.weight = &item->weight;
     // engine = grab: through grab's own SSH client, its connections kept open between files.
-    if (effective_engine(ctx->settings) == Engine::grab) {
+    if (ctx->engine == Engine::grab) {
         auto target = engine::ssh_target(*ctx);
         if (!target) return set(Status::failed, target.error());
         d.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
@@ -3126,7 +3129,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
         return std::max(1, parallel_ - files_in_use(item.get()));
     };
     // engine = grab: walked and fetched through grab's own SSH client.
-    if (effective_engine(ctx->settings) == Engine::grab) {
+    if (ctx->engine == Engine::grab) {
         auto target = engine::ssh_target(*ctx);
         if (!target) return fail(target.error());
         job.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));

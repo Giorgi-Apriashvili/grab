@@ -13,15 +13,16 @@
 
 namespace grab {
 
-// How TARGET is located on the server (`find = auto | ssh | rclone`, `walk` the same as rclone).
+// How TARGET is located on the server (`find = auto | ssh | walk`; `rclone`, the name grab 0.19
+// and before know, the same as walk), as engine = rclone reads it (GrabMethod on grab's client).
 enum class FindMethod {
     auto_detect, // ssh when the rclone remote has a key_file, otherwise rclone
     ssh,         // ssh + find: one round trip, needs a shell and a key or password prompt
     rclone       // rclone lsf: SFTP walk, no shell and no prompt needed
 };
 
-// What moves a server's files: rclone, or grab's own SSH/SFTP client (the rclone replacement,
-// taking over phase by phase while rclone stays the default).
+// What moves a server's files: grab's own SSH/SFTP client (the default since 0.20), or rclone
+// (`engine = rclone`), the fallback until a later grab removes it (RCLONE-REPLACEMENT.md, phase 8).
 enum class Engine { rclone, grab };
 
 // How searches and file lists run on engine = grab: GNU find over an SSH command on a pooled
@@ -41,7 +42,7 @@ struct RemoteSettings {
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
     bool skip_hidden = true;
-    std::optional<Engine> engine; // `engine = rclone | grab`; absent: the default (effective_engine)
+    std::optional<Engine> engine; // `engine = grab | rclone`; absent: the default (effective_engine)
     // How every connection to the server is made (grab's own client, Trust's host-key fetch, and
     // on engine = rclone its rclone runs and ssh.exe; RCLONE-REPLACEMENT.md, phase 8): the local
     // address to connect from, the time to reach the server (0: off, as long as TCP tries) and
@@ -93,9 +94,12 @@ struct RcloneRemote {
 inline constexpr std::chrono::milliseconds min_io_timeout{1'000};
 inline constexpr std::chrono::milliseconds max_io_timeout{24 * 3'600'000};
 
-// The server's engine, unless GRAB_ENGINE (grab or rclone) overrides it for every server, as
-// tests comparing both do; without an `engine` line the default, rclone.
-[[nodiscard]] Engine effective_engine(const RemoteSettings& settings);
+// The server's engine: GRAB_ENGINE (grab or rclone) for every server, as tests comparing both do;
+// else its `engine` line; else the default, grab's own client, unless `guarded`: a setting of the
+// server's that grab's client can't serve (guard.hpp: a proxy, an ssh command, a quirk switch)
+// keeps it on rclone by itself (phase 8 step 8). engine::make_context and server_ops::list_servers
+// know the guard; callers without it get the server's engine as grab.conf alone says it.
+[[nodiscard]] Engine effective_engine(const RemoteSettings& settings, bool guarded = false);
 
 // Resolve auto_detect: ssh when the remote authenticates with a key file (a shell is very
 // likely), otherwise rclone (password remotes and storage boxes usually have no shell).
@@ -193,11 +197,16 @@ private:
 [[nodiscard]] std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote,
                                              Engine engine);
 
-// "alice@host:22, key file, lookup via ssh + find": the lookup as `settings` (its engine as
-// grab.conf says it, and its find setting) has it; `login`, when given, says how it logs in
+// "alice@host:22, key file, lookup with find, else by listing folders": `method` is the lookup
+// as search_method says it for the engine the caller resolved, the guard's included (a route
+// rclone takes is "rclone"; server_ops::list_servers has it); without one, grab's own client's on
+// a server nothing guards with the default find setting. `login`, when given, says how it logs in
 // ("key in grab's store") instead of what `remote` says.
-[[nodiscard]] std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings = {},
+[[nodiscard]] std::string describe_remote(const RcloneRemote& remote, std::string_view method = {},
                                           std::string_view login = {});
+
+// The grab.conf section of rclone remote `remote`; "grab" is taken by the global section.
+[[nodiscard]] std::string section_name_for(std::string_view remote);
 
 // grab's comment line right above a server's section: "# server [NAME]: DESCRIPTION". grab 0.19
 // and before wrote "# rclone remote [NAME]: ...", which servers::remove_section and
@@ -205,8 +214,9 @@ private:
 [[nodiscard]] std::string lead_in(std::string_view name, std::string_view description);
 
 // A commented grab.conf section for one rclone remote. search_roots is left blank (the login
-// home, correct for both lookup methods) and the rclone flag keys are written commented out,
-// so later changes to the built-in defaults still apply. With `connection` (server_conf::lines),
+// home, correct for both lookup methods); bind, connect_timeout, io_timeout and engine are
+// written commented out, so grab's defaults apply (the rclone flag keys, engine = rclone's only,
+// aren't written). With `connection` (server_conf::lines),
 // those lines go after the header instead of `rclone_remote`, which a new server leaves to its
 // name.
 [[nodiscard]] std::string remote_section(const RcloneRemote& remote,

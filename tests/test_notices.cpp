@@ -3,10 +3,12 @@
 #include "ini.hpp"
 #include "notices.hpp"
 #include "passwords.hpp"
+#include "rclone_import.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <format>
@@ -27,8 +29,10 @@ using namespace grab;
 
 namespace {
 
+// `moved`: the servers the import moved, which N0 can name.
 std::vector<notices::Notice> notices_of(std::string_view text, const notices::Extras& extras = {},
-                                        const std::map<std::string, std::string>& variables = {}) {
+                                        const std::map<std::string, std::string>& variables = {},
+                                        const notices::Moved& moved = {}) {
     const auto doc = ini::parse(text);
     REQUIRE(doc.has_value());
     const auto cfg = parse_grab_config(*doc);
@@ -37,7 +41,7 @@ std::vector<notices::Notice> notices_of(std::string_view text, const notices::Ex
         const auto it = variables.find(name);
         if (it == variables.end()) return std::nullopt;
         return it->second;
-    });
+    }, moved);
 }
 
 std::vector<std::string> texts_of(const std::vector<notices::Notice>& list) {
@@ -72,6 +76,7 @@ struct NoEngineOverride {
 
 TEST_CASE("notices: the old defaults say nothing, flag by flag (grab.conf.example, --init)") {
     const NoEngineOverride no_override;
+    // Its server has no `engine` line, but no import moved it: no switch to tell of either.
     CHECK(notices_of(example_config).empty());
     CHECK(notices_of(generate_grab_config(nullptr, "")).empty());
     // The defaults written out on a grab server, and blank keys.
@@ -80,6 +85,71 @@ TEST_CASE("notices: the old defaults say nothing, flag by flag (grab.conf.exampl
               .empty());
     // A default flag left out says nothing either.
     CHECK(notices_of(section("Main", "common_flags = --sftp-chunk-size 255Ki\n")).empty());
+}
+
+TEST_CASE("notices: the switch to grab's own client, once, naming the servers it moved and the fallback (N0)") {
+    const NoEngineOverride no_override;
+    // Main and Edge have no `engine` line; Box's proxy keeps it on rclone (the guard says so),
+    // Old asks for rclone, Opt chose grab before the switch, Bare has no details yet.
+    const std::string base = "[Main]\nhost = m.example\nuser = u\nauth = agent\n"
+                             "[Box]\nhost = b.example\nuser = u\nauth = password\n" +
+                             section("Old", "", "rclone") + section("Opt", "") + "[Bare]\nmax_depth = 2\n";
+    notices::Extras extras{{"Box", {{"socks_proxy", "fake-user:fake-secret@127.0.0.1:9"}}}};
+    // All of them came from rclone.conf (the import moved them); New, below, was added since.
+    const notices::Moved moved{"Main", "Box", "Old", "Opt", "Bare", "Edge"};
+    const std::string edge = "[Edge]\nhost = e.example\nuser = u\nauth = agent\n";
+    const auto n = notices_of(base + edge, extras, {}, moved);
+    REQUIRE(n.size() == 2);
+    CHECK(n[0].server == "grab");
+    CHECK(n[0].key == "engine");
+    CHECK(n[0].flag == "default");
+    CHECK(n[0].digest == util::sha256_hex("grab"));
+    CHECK(n[0].text == "Downloads, searches and lists now use grab's own SSH client, no longer rclone (Main, Edge); "
+                       "their saved file lists are fetched again once. To go back to rclone for a server until a later "
+                       "grab removes it, set engine = rclone in its section (grab config, or Open grab.conf in grab's "
+                       "Settings).");
+    // Box stays on rclone by itself, and says why.
+    CHECK(n[1].key == "guard");
+    CHECK(n[1].text.find("[Box] connects through a SOCKS proxy (rclone.socks_proxy)") != std::string::npos);
+    CHECK(n[1].text.find("its downloads go through rclone") != std::string::npos);
+
+    // Once per configuration: a server added later doesn't bring it back.
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-notices-n0";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = notices::path_in(dir);
+    auto fresh = notices::take_new(file, notices_of(base, extras, {}, moved));
+    REQUIRE(fresh);
+    REQUIRE_FALSE(fresh->empty());
+    CHECK((*fresh)[0].text.find("(Main);") != std::string::npos);
+    fresh = notices::take_new(file, n);
+    REQUIRE(fresh);
+    CHECK(fresh->empty());
+    // Nor does engine = rclone tried on every server and taken out again (live on Main it showed
+    // again): unlike the others, N0 stays shown once it was.
+    REQUIRE(notices::take_new(file, notices_of(section("Old", "", "rclone"), {}, {}, moved)));
+    fresh = notices::take_new(file, n);
+    REQUIRE(fresh);
+    REQUIRE(fresh->size() == 1);
+    CHECK((*fresh)[0].key == "guard"); // Box's, which went and came back
+    std::filesystem::remove_all(dir);
+
+    // Nothing moved, nothing to say: every server on rclone by its own line, or for the run.
+    CHECK(notices_of(section("Old", "", "rclone") + section("Opt", ""), {}, {}, moved).empty());
+    // One added since never used rclone: nothing changed for it.
+    const std::string added = "[New]\nhost = n.example\nuser = u\nauth = agent\n";
+    const auto with_new = notices_of(base + edge + added, extras, {}, moved);
+    REQUIRE_FALSE(with_new.empty());
+    CHECK(with_new[0].text.find("(Main, Edge);") != std::string::npos);
+    CHECK(notices_of(added, {}, {}, moved).empty());
+    NoEngineOverride::set("rclone");
+    CHECK(notices_of(base, {}, {}, moved).empty());
+    // GRAB_ENGINE=grab (A/B tests): Box's proxy still keeps it out of N0; grab's client refuses it.
+    NoEngineOverride::set("grab");
+    const auto forced = notices_of(base, extras, {}, moved);
+    REQUIRE_FALSE(forced.empty());
+    CHECK(forced[0].text.find("(Main);") != std::string::npos);
+    NoEngineOverride::set(nullptr);
 }
 
 TEST_CASE("notices: common_flags' --bind, --contimeout and --timeout on a grab server read as the keys (N1)") {
@@ -129,7 +199,7 @@ TEST_CASE("notices: grab's store that can't be read is a guard notice for every 
     REQUIRE(doc.has_value());
     const auto cfg = parse_grab_config(*doc);
     REQUIRE(cfg.has_value());
-    const auto n = notices::settings_notices(*doc, *cfg, {}, [](const std::string&) { return std::nullopt; }, true);
+    const auto n = notices::settings_notices(*doc, *cfg, {}, [](const std::string&) { return std::nullopt; }, {}, true);
     REQUIRE(n.size() == 1);
     CHECK(n[0].key == "guard");
     CHECK(n[0].flag == "grab's store, which can't be read");
@@ -282,6 +352,20 @@ TEST_CASE("notices: a configuration's notices from its grab.conf, its store's ex
     REQUIRE_MESSAGE(n, n.error_or(""));
     REQUIRE(n->size() == 1);
     CHECK((*n)[0].flag == "rclone.socks_proxy");
+    // N0 names a server the import moved (imported.json), not one added in grab.conf since.
+    REQUIRE(util::write_file_atomic(conf, section("Box", "", "rclone") + "[Main]\nhost = m.example\nuser = u\nauth = agent\n" +
+                                              "[New]\nhost = n.example\nuser = u\nauth = agent\n"));
+    const auto without = notices::for_config(conf);
+    REQUIRE_MESSAGE(without, without.error_or(""));
+    CHECK(std::ranges::none_of(*without, [](const notices::Notice& x) { return x.key == "engine"; }));
+    rclone_import::Record record;
+    record.imported = {"Box", "Main"};
+    REQUIRE(util::write_file_atomic(rclone_import::record_path(state_dir(conf)), rclone_import::to_json(record)));
+    const auto with = notices::for_config(conf);
+    REQUIRE_MESSAGE(with, with.error_or(""));
+    REQUIRE(with->size() == 2);
+    CHECK((*with)[0].key == "engine");
+    CHECK((*with)[0].text.find("(Main);") != std::string::npos);
     std::filesystem::remove_all(passwords::path_in(state_dir(conf)).parent_path());
     std::filesystem::remove_all(dir);
 }

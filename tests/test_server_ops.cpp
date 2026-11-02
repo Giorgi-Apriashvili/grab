@@ -235,12 +235,12 @@ TEST_CASE("server list from grab.conf: details, pins read now (G209), sections w
     CHECK(list[0].host == "box.example.com");
     CHECK(list[0].port == 23);
     CHECK(list[0].host_key_pinned);
-    CHECK(list[0].engine == Engine::rclone);
-    CHECK(list[0].search == "rclone");
+    CHECK(list[0].engine == Engine::grab); // no `engine` line: grab's own client (phase 8)
+    CHECK(list[0].search == "probe");     // find where the server has it, else by listing folders
     CHECK(list[0].search_roots == std::vector<std::string>{"/home/movies"});
     CHECK(list[1].name == "agent");
     CHECK(list[1].auth == Auth::agent);
-    CHECK(list[1].search == "ssh");
+    CHECK(list[1].search == "probe");
     CHECK(list[1].port == 22);
     CHECK_FALSE(list[1].host_key_pinned);
     CHECK(list[1].max_depth == 6);
@@ -271,10 +271,14 @@ TEST_CASE("server list: the guard's reasons, the connection keys; Trust's reach 
     // box: its store's proxy (bound to its login); agent: one saved for another login doesn't count.
     REQUIRE(list[0].guard.size() == 1);
     CHECK(list[0].guard[0].where == "rclone.socks_proxy");
+    CHECK(list[0].engine == Engine::rclone); // no `engine` line: the guard keeps it on rclone
     CHECK(list[1].guard.empty());
-    CHECK(list[1].search == "ssh");
-    // An agent server routed by rclone: searched by rclone's listing, never ssh.exe find past it.
+    CHECK(list[1].engine == Engine::grab);
+    CHECK(list[1].search == "probe");
+    // An agent server routed by rclone: on rclone by itself, searched by rclone's listing, never
+    // ssh.exe find past it.
     REQUIRE(list[3].guard.size() == 1);
+    CHECK(list[3].engine == Engine::rclone);
     CHECK(list[3].search == "rclone");
     CHECK(list[1].connection_keys == "bind 10.0.0.2, connect_timeout 1500ms, io_timeout 120s");
     CHECK(list[0].connection_keys.empty());
@@ -316,13 +320,41 @@ TEST_CASE("an edit of search folders keeps comments, refreshes grab's line and l
     CHECK(text.find("max_depth = 7\n") != std::string::npos);
     CHECK(text.find("# my own note about roots\n") != std::string::npos);
     // grab 0.19's lead-in becomes grab's own.
-    CHECK(text.find("# server [box]: u1@box.example.com:23, password, lookup via rclone lsf\n[box]\n") != std::string::npos);
+    CHECK(text.find("# server [box]: u1@box.example.com:23, password, lookup with find, else by listing folders\n[box]\n") !=
+          std::string::npos);
     CHECK(text.find("# rclone remote [box]") == std::string::npos);
     // The connection lines and what rclone found are as they were.
     CHECK(text.find("host = box.example.com\nport = 23\nuser = u1\nauth = password\nshell_type = unix\n"
                     "md5sum_command = md5sum\nrclone.ciphers = aes256-ctr\n") != std::string::npos);
     CHECK(text.find("[agent]\nhost = h.example.com\nuser = me\nauth = agent\nmax_depth = 6\n") != std::string::npos);
     CHECK(s.store_bytes() == sealed); // byte for byte: not even saved again
+}
+
+TEST_CASE("grab's comment above a section says the lookup the guard leaves it (describe_servers, an edit)") {
+    Scratch s;
+    s.write("grab.conf", grab_conf);
+    // box has no `engine` line, but its store's proxy keeps it on rclone, past which only
+    // rclone's listing searches.
+    REQUIRE(passwords::save(s.store(), {{"box", {{"password", fake("fake-pw")},
+                                                 {"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}}}));
+    const std::string said = "# server [box]: u1@box.example.com:23, password, lookup via rclone lsf\n[box]\n";
+    const auto described = server_ops::describe_servers(s.env());
+    REQUIRE_MESSAGE(described.has_value(), described.error_or(""));
+    auto text = s.read("grab.conf");
+    CHECK(text.find(said) != std::string::npos);
+    CHECK(text.find("# rclone remote [box]") == std::string::npos);
+    CHECK(text.find("fake-pass") == std::string::npos);
+    // Nothing changed: grab.conf isn't written again.
+    const auto before = std::filesystem::last_write_time(s.dir / "grab.conf");
+    REQUIRE(server_ops::describe_servers(s.env()).has_value());
+    CHECK(std::filesystem::last_write_time(s.dir / "grab.conf") == before);
+    // An edit writes the same.
+    auto wanted = server(Auth::password);
+    wanted.max_depth = 7;
+    const auto done = server_ops::update_server(s.env(), wanted, std::nullopt, std::nullopt);
+    REQUIRE_MESSAGE(done.has_value(), done.error_or(""));
+    text = s.read("grab.conf");
+    CHECK(text.find(said) != std::string::npos);
 }
 
 TEST_CASE("a server's connection limit is written only once set, and blank means automatic") {
@@ -893,7 +925,8 @@ TEST_CASE("server ops: Test runs rclone's listing on engine = rclone only, and r
                              "common_flags = --bind 192.0.2.1\n"
                              "\n[r]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\nengine = rclone\nfind = rclone\n"
                              "common_flags = --bind 192.0.2.1\n"
-                             "\n[u]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\nengine = rclone\n");
+                             "\n[u]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\nengine = rclone\n"
+                             "\n[d]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\ncommon_flags = --bind 192.0.2.1\n");
     Scratch::pins("[127.0.0.1]:1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n");
     const auto env = s.env();
     const auto g = server_ops::test_connection(env, "g");
@@ -902,7 +935,15 @@ TEST_CASE("server ops: Test runs rclone's listing on engine = rclone only, and r
     CHECK_FALSE(g->rclone_ok.has_value()); // not asked
     CHECK(g->grab_ok == false);
     CHECK(g->grab_error.find("--bind") != std::string::npos);
+    CHECK(g->grab_error.find("engine = rclone") == std::string::npos); // rclone couldn't bind there either
     CHECK_FALSE(g->ok());
+    // No `engine` line: grab's own client, as on [g] (phase 8: the default).
+    const auto d = server_ops::test_connection(env, "d");
+    REQUIRE(d.has_value());
+    CHECK(d->grab_engine);
+    CHECK_FALSE(d->rclone_ok.has_value());
+    CHECK_FALSE(d->ssh_ok.has_value());
+    CHECK(d->grab_ok == false);
     const auto r = server_ops::test_connection(env, "r");
     REQUIRE(r.has_value());
     CHECK_FALSE(r->grab_engine);

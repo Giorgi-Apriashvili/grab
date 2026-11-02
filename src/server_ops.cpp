@@ -315,6 +315,37 @@ std::string time_text(std::chrono::milliseconds t) {
     return t.count() % 1000 == 0 ? std::format("{}s", t.count() / 1000) : std::format("{}ms", t.count());
 }
 
+// The guard's reasons, the engine and the search method of server `s` as make_context resolves
+// them: grab's own client by default, rclone where the guard keeps it off (a `store` that can't
+// be read may hold a route), and rclone's listing past a route rclone takes, which ssh.exe find
+// would connect past.
+struct Resolved {
+    std::vector<guard::Reason> guard;
+    Engine engine = Engine::grab;
+    std::string search;
+};
+Resolved resolve(const RemoteSettings& s, const server_conf::Connection& conn, const RcloneRemote& remote,
+                 const std::expected<passwords::Store, std::string>& store) {
+    const passwords::Binding login{.user = conn.user, .host = conn.host, .port = conn.port};
+    auto sources = guard::sources(s, conn, store ? guard::store_extras(*store, s.name, login)
+                                                 : std::vector<std::pair<std::string, std::string>>{});
+    auto found = guard::evaluate(sources);
+    // Its copy of the extras (a proxy can hold a password), wiped as make_context does.
+    for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
+    if (!store) guard::add_unreadable_store(found);
+    Resolved out;
+    out.guard = guard::reasons(found);
+    out.engine = effective_engine(s, !out.guard.empty());
+    out.search = std::string(search_method(s, remote, out.engine));
+    if (out.engine == Engine::rclone && guard::routed(out.guard)) out.search = "rclone";
+    return out;
+}
+
+// What grab's comment above a section says how it logs in, when the remote can't say it.
+std::string_view login_said(const server_conf::Connection& conn) {
+    return conn.auth == servers::Auth::stored_key ? "key in grab's store" : "";
+}
+
 } // namespace
 
 std::vector<ServerInfo> list_servers(const Env& env) {
@@ -355,8 +386,6 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             info.port = conn.port;
             info.auth = conn.auth;
             info.key_file = conn.key_file.value_or("");
-            info.engine = effective_engine(s);
-            info.search = std::string(search_method(s, remote, info.engine));
             info.host_key_pinned = server_conf::pinned(known, conn.host, conn.port);
             info.default_connections = budget::default_budget(conn.host);
             const std::string_view key = conn.auth == servers::Auth::password ? passwords::password
@@ -366,14 +395,10 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             const passwords::Binding login{.user = conn.user, .host = conn.host, .port = conn.port};
             if (!key.empty() && store) info.secret_saved = passwords::value_for(*store, s.name, key, login).has_value();
             if (!store) info.store_error = store.error();
-            auto extras = store ? guard::store_extras(*store, s.name, login) : std::vector<std::pair<std::string, std::string>>{};
-            // As make_context has it: an unreadable store may hold a route.
-            auto found = guard::evaluate(guard::sources(s, conn, extras));
-            if (!store) guard::add_unreadable_store(found);
-            info.guard = guard::reasons(found);
-            // As make_context has it: ssh.exe find would connect past a route rclone takes.
-            if (info.engine == Engine::rclone && guard::routed(info.guard)) info.search = "rclone";
-            for (auto& [k, v] : extras) std::ranges::fill(v, '\0');
+            auto resolved = resolve(s, conn, remote, store);
+            info.guard = std::move(resolved.guard);
+            info.engine = resolved.engine;
+            info.search = std::move(resolved.search);
         }
         out.push_back(std::move(info));
     }
@@ -674,10 +699,10 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     }
     if (!text) return undo(text.error());
     const RcloneRemote remote = server_conf::to_remote(settings->rclone_remote, next, env.known_hosts);
+    // The lookup as the next run resolves it, the guard's included (the store as just saved).
+    const auto resolved = resolve(*settings, next, remote, passwords::load(env.passwords));
     const std::string described = servers::replace_lead_in(
-        *text, wanted.name,
-        lead_in(wanted.name, describe_remote(remote, *settings,
-                                             next.auth == servers::Auth::stored_key ? "key in grab's store" : "")));
+        *text, wanted.name, lead_in(wanted.name, describe_remote(remote, resolved.search, login_said(next))));
     if (auto written = write_grab_conf(env, described); !written) return undo(written.error());
 
     std::vector<std::string> notes;
@@ -764,6 +789,23 @@ std::expected<void, std::string> set_default(const Env& loaded, std::string_view
     auto text = servers::set_value(env.grab_text, "grab", "default_remote", name);
     if (!text) return util::fail(text.error());
     return write_grab_conf(env, *text);
+}
+
+std::expected<void, std::string> describe_servers(const Env& loaded) {
+    auto locked = lock_current(loaded);
+    if (!locked) return util::fail(locked.error());
+    const Env& env = locked->env;
+    const auto store = passwords::load(env.passwords);
+    std::string text = env.grab_text;
+    for (const auto& s : env.cfg.remotes) {
+        const auto c = connection_in(text, s.name);
+        if (!c || !*c) continue; // no details yet: the comment stays as it is
+        const RcloneRemote remote = server_conf::to_remote(s.rclone_remote, **c, env.known_hosts);
+        const auto resolved = resolve(s, **c, remote, store);
+        text = servers::replace_lead_in(text, s.name,
+                                        lead_in(s.name, describe_remote(remote, resolved.search, login_said(**c))));
+    }
+    return write_grab_conf(env, text);
 }
 
 // ---- texts ---------------------------------------------------------------------------------

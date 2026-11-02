@@ -98,10 +98,11 @@ int server_list(const Env& env) {
             std::println("{} {:<14} not usable: {}", mark, s.name, s.error);
             continue;
         }
-        // Each server's engine: on engine = grab, grab's own client searches with find or by listing
-        // folders; on engine = rclone, ssh.exe runs find or rclone lists.
-        const char* search = s.search == "ssh"    ? "engine rclone, search with ssh + find"
-                             : s.search == "rclone" ? "engine rclone, search by rclone's listing"
+        // Each server's engine: on grab's own client (the default) it searches with find or by
+        // listing folders; on rclone, the fallback (engine = rclone, or settings grab's client can't
+        // serve, said below), ssh.exe runs find or rclone lists.
+        const char* search = s.search == "ssh"    ? "engine rclone (fallback), search with ssh + find"
+                             : s.search == "rclone" ? "engine rclone (fallback), search by rclone's listing"
                              : s.search == "find"   ? "engine grab, search with find"
                              : s.search == "walk"   ? "engine grab, search by listing folders"
                                                     : "engine grab, search with find or by listing folders";

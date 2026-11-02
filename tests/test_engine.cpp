@@ -276,6 +276,7 @@ TEST_CASE("a search for folders and files walks the server once over rclone (G19
            "echo 1697000000,-1,tv/Lioness/\r\n"
            "echo 1697354554,300,tv/Lioness/Lioness.S03E08.mkv\r\n";
     auto ctx = grab_context("Box", connection("box.example", "u", server_conf::Auth::agent));
+    ctx.engine = Engine::rclone; // the fallback: grab's own client is the default
     ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
     ctx.method = FindMethod::rclone;
     engine::SearchRequest req;
@@ -481,6 +482,7 @@ TEST_CASE("the guard: a server whose settings route it is refused by grab's clie
     MESSAGE(std::format("make_context with the guard's store read: {:.2f} ms each",
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() / 20));
 
+    // No `engine` line: the guard keeps it on rclone by itself (phase 8 step 8).
     const auto ctx = engine::make_context(GrabConfig{}, s, c, conf);
     CHECK(ctx.engine == Engine::rclone);
     CHECK(ctx.method == FindMethod::rclone); // an agent server: ssh + find, but ssh.exe would ignore the proxy
@@ -504,6 +506,7 @@ TEST_CASE("the guard: a server whose settings route it is refused by grab's clie
     s.engine.reset();
     s.ssh_options = {"-o", "ProxyCommand=fake-proxy %h %p"};
     const auto proxied = engine::make_context(GrabConfig{}, s, c, plain_conf);
+    CHECK(proxied.engine == Engine::rclone); // any reason keeps it on rclone, ssh.exe's own too
     CHECK(proxied.method == FindMethod::ssh);
     CHECK(engine::ssh_target(proxied).error_or("").find("connects through a ProxyCommand (ssh_options' -o ProxyCommand)") !=
           std::string::npos);
@@ -511,6 +514,7 @@ TEST_CASE("the guard: a server whose settings route it is refused by grab's clie
     s.ssh_options.clear();
     const auto plain = engine::make_context(GrabConfig{}, s, c, plain_conf);
     CHECK(plain.guard.empty());
+    CHECK(plain.engine == Engine::grab); // the default
     CHECK(engine::ssh_target(plain).has_value());
     const std::vector<std::string> run{"--sftp-http-proxy", "fake-proxy:3128"};
     CHECK(engine::grab_blockers(plain, run).size() == 1);
@@ -533,6 +537,23 @@ TEST_CASE("the guard: a server whose settings route it is refused by grab's clie
     std::filesystem::remove(grab_known_hosts_path());
 }
 
+TEST_CASE("grab's own client names the fallback where it downloads (phase 8, decision 3: grab.conf only)") {
+    std::filesystem::remove(grab_known_hosts_path());
+    auto ctx = grab_context("Main", connection("main.example", "u", server_conf::Auth::agent));
+    CHECK(ctx.engine == Engine::grab); // no `engine` line, nothing guarded: the default
+    const auto on_grab = engine::ssh_target(ctx);
+    REQUIRE_MESSAGE(on_grab, on_grab.error_or(""));
+    CHECK(on_grab->fallback == "; for Main's downloads, searches and lists to go through rclone until a later grab "
+                               "removes it, set engine = rclone in [Main] (grab config, or Open grab.conf in grab's "
+                               "Settings)");
+    // On rclone, grab's client only previews, plays and verifies: there's nothing to fall back to.
+    ctx.engine = Engine::rclone;
+    const auto on_rclone = engine::ssh_target(ctx);
+    REQUIRE_MESSAGE(on_rclone, on_rclone.error_or(""));
+    CHECK(on_rclone->fallback.empty());
+    std::filesystem::remove(grab_known_hosts_path());
+}
+
 #ifdef _WIN32
 TEST_CASE("the keys and the command's flags reach rclone's listing and ssh.exe, after grab's own") {
     using std::chrono::milliseconds;
@@ -542,6 +563,7 @@ TEST_CASE("the keys and the command's flags reach rclone's listing and ssh.exe, 
     std::ofstream(dir / "rclone.cmd", std::ios::binary) << "@echo off\r\n>> \"%~dp0calls.log\" echo %*\r\n";
     std::ofstream(dir / "ssh.cmd", std::ios::binary) << "@echo off\r\n";
     auto ctx = grab_context("Box", connection("box.example", "u", server_conf::Auth::agent));
+    ctx.engine = Engine::rclone; // the fallback, whose runs these are
     ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
     ctx.config.ssh = util::path_to_utf8(dir / "ssh.cmd");
     ctx.settings.bind = "10.0.0.2";
@@ -825,6 +847,7 @@ TEST_CASE("each rclone run gets its own server's variables and no other's; grab 
     SetEnvironmentVariableW(L"RCLONE_SFTP_CHUNK_SIZE", L"64Ki");
     auto env_of = [&](engine::Context ctx) {
         std::filesystem::remove(dir / "env.log");
+        ctx.engine = Engine::rclone; // the fallback, whose runs these are
         ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
         ctx.method = FindMethod::rclone;
         engine::SearchRequest req;

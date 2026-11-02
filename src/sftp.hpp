@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace grab::sftp {
@@ -38,6 +39,11 @@ struct Broken : std::runtime_error {
 };
 // The server refused to start SFTP at all (no sftp subsystem): another connection can't help.
 struct Unavailable : Broken {
+    using Broken::Broken;
+};
+// The server broke the protocol (a malformed or unexpected reply, a version below 3), which a
+// dropped link doesn't: its text ends with the Client's fallback (Client::set_fallback).
+struct ProtocolError : Broken {
     using Broken::Broken;
 };
 
@@ -95,8 +101,11 @@ public:
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    // INIT and the server's VERSION. Throws Broken (also for a version below 3).
+    // INIT and the server's VERSION. Throws Broken (ProtocolError for a version below 3).
     void start();
+    // Ends the text of each ProtocolError start() and pump() throw: what to do about a server
+    // grab's client can't speak to (ssh::Target::fallback; nothing by default).
+    void set_fallback(std::string text) { fallback_ = std::move(text); }
     [[nodiscard]] std::uint32_t version() const { return version_; }
     [[nodiscard]] bool has_extension(std::string_view name) const;
 
@@ -119,8 +128,8 @@ public:
     void flush();
     // Requests sent or queued whose replies haven't come yet.
     [[nodiscard]] std::size_t pending() const { return pending_.size(); }
-    // Flushes, waits for the next reply and runs its callback. Throws Broken; also when nothing
-    // is pending, as no reply would ever come.
+    // Flushes, waits for the next reply and runs its callback. Throws Broken (ProtocolError for a
+    // reply that breaks the protocol); also when nothing is pending, as no reply would ever come.
     void pump();
 
 private:
@@ -143,6 +152,7 @@ private:
     std::vector<char> in_;
     std::size_t in_pos_ = 0, in_len_ = 0;
     std::string packet_; // the last packet, reused
+    std::string fallback_;
 };
 
 // Blocking helpers: send one request and pump until its reply (other replies run their callbacks
