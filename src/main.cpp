@@ -1,31 +1,23 @@
 // grab: locate a file or folder on a Linux server by name (ssh + find), then download it with
-// grab's resumable engine (cli_download.hpp), or with plain rclone (--rclone). See README.md.
+// grab's resumable engine (cli_download.hpp). See README.md.
 
 #include "cli.hpp"
 #include "cli_download.hpp"
 #include "config.hpp"
 #include "conn_budget.hpp"
 #include "engine.hpp"
-#include "existing.hpp"
-#include "fetch.hpp"
 #include "file_list.hpp"
-#include "folder_job.hpp"
 #include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
-#include "local_name.hpp"
 #include "match.hpp"
 #include "notices.hpp"
 #include "process.hpp"
 #include "quote.hpp"
-#include "rate.hpp"
-#include "rclone.hpp"
 #include "rclone_flags.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
-#include "schedule.hpp"
 #include "server_cli.hpp"
-#include "server_ops.hpp"
 #include "ssh_pool.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -208,209 +200,6 @@ std::expected<std::filesystem::path, std::string> prepare_destination(const std:
     return dest;
 }
 
-// --rclone: one `rclone copyto` / `rclone copy` per item with rclone's own progress, as before
-// grab had its own download engine. Ctrl+C goes to rclone.
-DownloadTally download_with_rclone(const engine::Context& ctx, const Options& opts,
-                                   const std::vector<std::string>& paths, const std::filesystem::path& dest) {
-    // --limit becomes rclone's --bwlimit, placed before anything given after `--` (which wins).
-    // Without it, rclone follows the speed schedule by itself, as a weekly timetable.
-    std::vector<std::string> extra;
-    const auto gui = window_settings(state_dir(opts.config.value_or(default_grab_config_path())) / "gui.json");
-    if (opts.limit) {
-        if (*opts.limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(*opts.limit)});
-    } else if (!gui.speed_schedule.empty()) {
-        extra.insert(extra.end(), {"--bwlimit", schedule::rclone_bwlimit(gui.speed_schedule)});
-        if (auto note = schedule_note(gui.speed_schedule, schedule::local_now())) std::println(stderr, "grab: {}", *note);
-    }
-    // --verify (or the window's setting): rclone compares checksums after each transfer itself,
-    // which grab's default --sftp-disable-hashcheck would switch off.
-    if (opts.verify.value_or(gui.verify_downloads)) extra.emplace_back("--sftp-disable-hashcheck=false");
-    extra.insert(extra.end(), opts.extra.begin(), opts.extra.end());
-
-    DownloadTally tally;
-    const std::size_t total = paths.size();
-    // The server in rclone's environment (its config in memory), for the copies and grab's checks
-    // before them alike: they take the flags the copy does. On engine = grab nothing has asked
-    // whether this rclone can be used yet.
-    auto env = ctx.engine == Engine::grab
-                   ? engine::check_rclone(ctx).and_then([&] { return engine::rclone_env(ctx, true); })
-                   : engine::rclone_env(ctx, true);
-    if (!env) {
-        error(env.error());
-        tally.code = exit_config;
-        tally.failed = paths;
-        return tally;
-    }
-    // Picks of the same name get numbered ones (review G103).
-    const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
-    // Different files already where rclone would write (another size, or a time off): asked first,
-    // all of them at once. Skip leaves them (--ignore-existing, which also keeps anything that
-    // appears meanwhile); a file can be kept beside the new one, a folder can't (rclone copies it
-    // under the server's names).
-    existing::Choice choice = opts.existing.value_or(existing::Choice::ask);
-    // Remote path -> the server's size and time when a different file is there; nullopt when it is
-    // there but couldn't be compared.
-    std::unordered_map<std::string, std::optional<std::pair<std::uint64_t, std::string>>> in_the_way;
-    if (!opts.dry_run) {
-        std::vector<ExistingFile> shown;
-        std::size_t count = 0;
-        auto add = [&](const std::string& path, std::string name, const std::filesystem::path& local, std::uint64_t size,
-                       const std::string& modtime) {
-            if (!existing::rclone_replaces(local, size, util::parse_rfc3339(modtime))) return;
-            in_the_way.try_emplace(path, std::pair{size, modtime});
-            if (++count <= 10) shown.push_back({std::move(name), local, size, util::parse_rfc3339_seconds(modtime)});
-        };
-        // A check that failed (a network hiccup, a refusal) can't tell: whatever is there is asked
-        // about as not compared, never left to --ignore-existing unseen (review G183).
-        auto uncompared = [&](const std::string& path, const std::filesystem::path& local, std::string why) {
-            std::error_code ec;
-            if (!std::filesystem::exists(local, ec)) return; // nothing there to replace
-            in_the_way.try_emplace(path, std::nullopt);
-            if (++count <= 10) {
-                shown.push_back({.name = util::path_to_utf8(local.filename()), .local = local, .size = 0,
-                                 .modified = std::nullopt, .uncompared = std::move(why)});
-            }
-        };
-        // grab's own check before rclone runs: the connection flags only (rclone_flags.hpp), so a
-        // -vP or a filter meant for the copy can't break it (G182, G183).
-        const auto flags = rclone_flags::connection(ctx.settings.common_flags);
-        auto after = engine::key_flags(ctx.settings);
-        const auto given = rclone_flags::connection(opts.extra);
-        after.insert(after.end(), given.begin(), given.end());
-        for (std::size_t i = 0; i < total; ++i) {
-            const auto& path = paths[i];
-            const auto& target = targets[i];
-            if (opts.mode == Mode::file) {
-                const fetch::Source src{.rclone = ctx.config.rclone,
-                                        .environment = *env,
-                                        .rclone_remote = ctx.settings.rclone_remote,
-                                        .path = path,
-                                        .flags = flags,
-                                        .after = after};
-                const auto stat = fetch::stat_argv(src);
-                if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(stat));
-                proc::RunOptions quiet;
-                quiet.detached = true;
-                quiet.environment = *env;
-                const auto ran = proc::run_capture(stat, quiet);
-                if (!ran) {
-                    uncompared(path, target, ran.error());
-                } else if (ran->exit_code != 0) {
-                    uncompared(path, target, server_ops::clean_rclone_error(ran->err));
-                } else if (const auto remote = fetch::parse_stat(ran->out); !remote) {
-                    uncompared(path, target, remote.error());
-                } else if (!remote->is_dir) {
-                    add(path, util::path_to_utf8(target.filename()), target, remote->size, remote->modtime);
-                }
-                continue;
-            }
-            folder::Job job;
-            job.ctx = &ctx;
-            job.remote_path = path;
-            job.dest = dest;
-            if (target != folder::local_dir(dest, path)) job.local_name = target.filename();
-            job.extra = opts.extra;
-            if (opts.verbose) job.on_command = [](const std::vector<std::string>& argv) { std::println(stderr, "+ {}", quote::display_cmdline(argv)); };
-            folder::Tree tree;
-            std::mutex m;
-            if (auto listed = folder::list(job, tree, m, std::stop_token{}); !listed) {
-                uncompared(path, target, listed.error());
-                continue;
-            }
-            const std::string folder_name = util::path_to_utf8(target.filename());
-            for (const auto& f : tree.files) {
-                add(path, folder_name + "/" + f.path, target / local::relative(f.path), f.size, f.modtime);
-            }
-        }
-        if (count > 0 && choice == existing::Choice::ask) {
-            const auto answer = choose_existing(opts, shown, count, opts.mode == Mode::file);
-            if (!answer) {
-                tally.code = answer.error();
-                tally.failed = paths;
-                return tally;
-            }
-            choice = answer->choice;
-        } else if (count > 0 && choice == existing::Choice::keep_both && opts.mode == Mode::folder) {
-            if (const auto answer = choose_existing(opts, shown, count, false); !answer) {
-                tally.code = answer.error();
-                tally.failed = paths;
-                return tally;
-            }
-        }
-    }
-    if (choice != existing::Choice::replace) extra.emplace_back("--ignore-existing");
-
-    for (std::size_t i = 0; i < total; ++i) {
-        const std::string& path = paths[i];
-        const auto& target = targets[i];
-        std::optional<std::filesystem::path> local_name;
-        const bool renamed = target != (opts.mode == Mode::folder ? folder::local_dir(dest, path)
-                                                                  : dest / local::relative(remote_basename(path)));
-        if (renamed) local_name = target.filename();
-        if (const auto way = in_the_way.find(path); way != in_the_way.end() && opts.mode == Mode::file) {
-            if (choice == existing::Choice::skip) {
-                std::println(stderr, "grab: skipped {}: your file is kept", util::path_to_utf8(target.filename()));
-                ++tally.done;
-                continue;
-            }
-            if (choice == existing::Choice::keep_both) {
-                // A copy an earlier run kept that already is the server's file (review G112).
-                if (const auto& server = way->second) {
-                    if (const auto kept = existing::kept_copy(target, server->first, util::parse_rfc3339(server->second))) {
-                        std::println(stderr, "grab: {} is already there as {}, nothing fetched",
-                                     util::path_to_utf8(target.filename()), util::path_to_utf8(kept->filename()));
-                        ++tally.done;
-                        continue;
-                    }
-                }
-                const auto second = existing::second_copy(target);
-                if (!second) {
-                    error("no free name for a second copy next to " + util::path_to_utf8(target));
-                    if (tally.code == 0) tally.code = exit_download_failed;
-                    tally.failed.push_back(path);
-                    continue;
-                }
-                local_name = second->filename();
-            }
-        }
-        const auto built = engine::download_argv(ctx, opts.mode, path, dest, extra, local_name);
-        if (!built) {
-            error(built.error());
-            if (tally.code == 0) tally.code = exit_download_failed;
-            tally.failed.push_back(path);
-            continue;
-        }
-        const auto& rclone_argv = *built;
-        if (opts.verbose || opts.dry_run) {
-            std::println(stderr, "+ {}", quote::display_cmdline(rclone_argv));
-        }
-        if (opts.dry_run) continue;
-
-        const std::string position = total > 1 ? std::format(" {}/{}", i + 1, total) : "";
-        std::println(stderr, "grab: {}{} {}  ->  {}", mode_noun(opts.mode), position,
-                     remote_spec(ctx.settings.rclone_remote, path),
-                     util::path_to_utf8(local_name ? dest / *local_name : dest / local::relative(remote_basename(path))));
-        auto code = proc::run_inherit(rclone_argv, *env);
-        if (!code) {
-            error(code.error());
-            tally.code = exit_config;
-            tally.failed.push_back(path);
-            break;
-        }
-        if (*code == 0) {
-            ++tally.done;
-            continue;
-        }
-        if (tally.code == 0) tally.code = *code;
-        tally.failed.push_back(path);
-        if (*code == proc::exit_stopped) {
-            tally.stopped = i + 1 < total;
-            break;
-        }
-    }
-    return tally;
-}
-
 // "45 s", "12 min", "3 h", "2 days".
 std::string age_text(std::int64_t seconds) {
     if (seconds < 90) return std::format("{} s", seconds);
@@ -531,8 +320,15 @@ int run(const Options& opts) {
             }
         }
     }
-    // A guard setting after `--` (--sftp-socks-proxy...; guard.hpp): a route keeps this run's
-    // searches off ssh.exe find too, which would connect past it; -v says it, as the settings' own.
+    // The flags after `--`, now that the server's engine is known: refused before anything
+    // connects or any folder is made (RCLONE-REPLACEMENT.md, phase 8 step 6).
+    if (auto usable = engine::check_run_flags(*ctx, opts.extra); !usable) {
+        error(usable.error());
+        return exit_usage;
+    }
+    // A guard setting after `--` on engine = rclone (--sftp-socks-proxy...; guard.hpp): a route
+    // keeps this run's searches off ssh.exe find too, which would connect past it; -v says it, as
+    // the settings' own.
     const auto run_flags = rclone_flags::connection(opts.extra);
     if (const auto blocked = engine::grab_blockers(*ctx, run_flags); blocked != engine::grab_blockers(*ctx)) {
         if (ctx->engine == Engine::rclone && guard::routed(blocked)) ctx->method = FindMethod::rclone;
@@ -567,8 +363,8 @@ int run(const Options& opts) {
     };
     // grab's own SSH connections (engine = grab), for the search and the download after it, so
     // `grab -s x DEST` logs in once; closed when the command ends.
-    std::optional<ssh::Pools> pools(std::in_place);
-    auto found = search(*ctx, req, opts, trace, *pools);
+    ssh::Pools pools;
+    auto found = search(*ctx, req, opts, trace, pools);
     if (!found) {
         error(found.error());
         return exit_lookup;
@@ -647,10 +443,7 @@ int run(const Options& opts) {
     }
 
     // 4 + 5. download each chosen item -------------------------------------------------
-    // rclone's downloads open connections of their own: the search's, idle, aren't kept beside them.
-    if (opts.rclone) pools.reset();
-    const DownloadTally tally = opts.rclone ? download_with_rclone(*ctx, opts, *chosen, dest)
-                                            : download_with_grab(*ctx, opts, *chosen, sizes, modified, dest, *pools);
+    const DownloadTally tally = download_with_grab(*ctx, opts, *chosen, sizes, modified, dest, pools);
     if (opts.dry_run) return exit_ok;
 
     if (const std::size_t total = chosen->size(); total > 1) {

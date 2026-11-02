@@ -71,17 +71,16 @@ skip_hidden = true
 engine = rclone
 # Extra raw ssh arguments, e.g.  -o ServerAliveInterval=30
 ssh_options =
-# rclone flags for --rclone copies; grab's own downloads, listings, previews, Play and checks
-# use only the connection ones (--sftp-*, --bind, --timeout...). 255Ki is the largest SFTP packet OpenSSH accepts and
+# rclone flags for this server's rclone runs (engine = rclone), which use only the connection
+# ones (--sftp-*, --bind, --timeout...). 255Ki is the largest SFTP packet OpenSSH accepts and
 # cuts round trips roughly 8x compared with the 32Ki default. --sftp-disable-hashcheck skips
 # the md5sum rclone would otherwise run on the server after each of its own copies (minutes
 # for a 30 GB file); SSH already guarantees integrity in flight. To check downloads against
 # the server's copy, turn on Verify downloads (or grab --verify): grab's own check, which no
 # rclone flag changes.
 common_flags = -P --sftp-chunk-size 255Ki --sftp-disable-hashcheck
-# rclone flags for -f/--folder (rclone copy). More transfers hide per-file round trips on
-# trees of small files; 8 keeps connections (transfers x multi-thread streams) modest.
+# rclone flags for -f/--folder: their connection ones reach rclone's batch of small files on
+# engine = rclone; the rest were for --rclone copies, which are gone.
 folder_flags = --transfers 8 --checkers 8
-# rclone flags for -s/--file (rclone copyto). One big object: parallel range reads. Keep the
-# chunk size large: 8Mi chunks measured ~2x slower than 64Mi (each chunk re-opens the file).
+# rclone flags for -s/--file: they were for --rclone copies, which are gone; nothing uses them.
 file_flags = --multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi

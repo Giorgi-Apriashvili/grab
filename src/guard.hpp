@@ -80,7 +80,8 @@ using Settings = std::map<std::string, Found, std::less<>>;
 
 [[nodiscard]] Settings evaluate(const Sources& sources);
 // grab's store exists but can't be read: the extras it may keep (a proxy, an ssh command) are
-// unknown, so the server counts as routed ("store", where "grab's store, which can't be read").
+// unknown, so the server counts as routed ("store", where "grab's store, which can't be read"),
+// and rclone isn't started for it either (engine::rclone_env).
 void add_unreadable_store(Settings& settings);
 // A command's connection flags after `--` on top: they beat everything before them.
 void add_run_flags(Settings& settings, std::span<const std::string> run_flags);
@@ -95,7 +96,8 @@ void add_run_flags(Settings& settings, std::span<const std::string> run_flags);
 // What it means for `server` on `engine`, as errors, Test, `grab server list`, -v and the notice
 // say it: "[Box] connects through a SOCKS proxy (rclone.socks_proxy), which grab's own client
 // can't: its downloads go through rclone, and its searches and lists by rclone's listing;
-// previews, Play and Verify are off for it". On engine = grab it says to set engine = rclone.
+// previews, Play and Verify are off for it". On engine = grab it says to set engine = rclone; with
+// an unreadable store, that rclone isn't started either.
 [[nodiscard]] std::string text(std::string_view server, std::span<const Reason> reasons, Engine engine);
 
 } // namespace grab::guard

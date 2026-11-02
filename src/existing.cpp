@@ -51,14 +51,6 @@ bool differs(const fs::path& local, std::uint64_t size, std::optional<std::int64
     return s && !fetch::up_to_date(s->first, s->second, size, modtime_ns);
 }
 
-bool rclone_replaces(const fs::path& local, std::uint64_t size, std::optional<std::int64_t> modtime_ns) {
-    const auto s = stat(local);
-    if (!s) return false;
-    if (s->first != size) return true;
-    constexpr std::int64_t window = 1'000'000'000; // rclone's modify window over SFTP
-    return modtime_ns && (s->second > *modtime_ns + window || s->second < *modtime_ns - window);
-}
-
 std::string numbered(std::string_view name, int n) {
     const auto dot = name.rfind('.');
     if (dot == std::string_view::npos || dot == 0) return std::format("{} ({})", name, n);

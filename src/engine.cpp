@@ -96,17 +96,28 @@ std::expected<void, std::string> check_rclone(const std::string& rclone, const s
     return util::fail(why);
 }
 
-std::expected<void, std::string> check_rclone(const Context& ctx) {
-    return check_rclone(ctx.config.rclone, util::self_exe_path().parent_path(), ctx.config.rclone != "rclone");
-}
-
 namespace {
 
-// Why the saved passwords can't be used, with what to do about it.
-std::string password_again(std::string_view why, std::string_view server) {
-    return std::format("{}. Enter the password of {} again: Settings → Edit in grab's window, or `grab server remove "
-                       "{}` and `grab server add {}`",
-                       why, server, server, server);
+// Why grab's store can't be used for `server`, logging in with `auth`, with what to do about it:
+// a change through Edit sets the unreadable file aside (passwords::load_for_change) and starts a
+// new one.
+std::string store_unreadable(std::string_view why, std::string_view server, server_conf::Auth auth) {
+    const std::string edit = std::format("with Edit (Settings → Edit in grab's window, or `grab server edit {}`)", server);
+    switch (auth) {
+    case server_conf::Auth::password:
+        return std::format("{}. Enter the password of {} again {}, which sets the unreadable file aside", why, server,
+                           edit);
+    case server_conf::Auth::stored_key:
+        return std::format("{}. {} logs in with a key kept there: choose a key file or ssh-agent for it {}, which sets "
+                           "the unreadable file aside",
+                           why, server, edit);
+    default: break;
+    }
+    // ssh-agent or a key file: the store may still keep the server's rclone settings (a proxy, an
+    // ssh command), so rclone runs stop as grab's own client does (guard::add_unreadable_store).
+    return std::format("{}; it may keep rclone settings of {} (a proxy, an ssh command), so grab doesn't start rclone "
+                       "for it. Saving it unchanged {} sets the unreadable file aside",
+                       why, server, edit);
 }
 
 } // namespace
@@ -173,8 +184,7 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
 
     const auto exe_dir = util::self_exe_path().parent_path();
     cfg->rclone = resolve_rclone_exe(*cfg, exe_dir);
-    // Asked only where rclone runs: an engine = grab server loads with a missing or too old one
-    // (--rclone asks for itself).
+    // Asked only where rclone runs: an engine = grab server loads with a missing or too old one.
     if (effective_engine(settings) == Engine::rclone) {
         if (auto usable = check_rclone(cfg->rclone, exe_dir, cfg->rclone != "rclone"); !usable) {
             return util::fail(usable.error());
@@ -202,16 +212,25 @@ std::expected<void, std::string> check_pinned(const Context& ctx) {
 
 namespace {
 
-// grab's store of the context's server, when it has one that can be read; an error only for a
-// server that can't log in without it.
-std::expected<passwords::Store, std::string> server_secrets(const Context& ctx) {
+// grab's store of the context's server, when it has one that can be read. One that can't is an
+// error for a server that can't log in without it, and `for_rclone` for any: its rclone extras
+// are unknown then (rclone_env).
+std::expected<passwords::Store, std::string> server_secrets(const Context& ctx, bool for_rclone) {
     if (ctx.passwords.empty()) return passwords::Store{};
     auto store = passwords::load(ctx.passwords);
     if (store) return store;
-    if (ctx.connection.auth == server_conf::Auth::password || ctx.connection.auth == server_conf::Auth::stored_key) {
-        return util::fail(password_again(store.error(), ctx.settings.name));
+    const auto auth = ctx.connection.auth;
+    if (for_rclone || auth == server_conf::Auth::password || auth == server_conf::Auth::stored_key) {
+        return util::fail(store_unreadable(store.error(), ctx.settings.name, auth));
     }
     return passwords::Store{};
+}
+
+// Why a --bind can't be used, nullopt when it can: an address goes to rclone and ssh.exe as it
+// is, so one that isn't one is refused first.
+std::optional<std::string> bind_problem(const std::string& bind) {
+    if (bind.starts_with('-')) return "the address can't start with -";
+    return server_conf::check_host(bind);
 }
 
 } // namespace
@@ -233,18 +252,13 @@ std::expected<ConnectSettings, std::string> connect_settings(const RemoteSetting
     }
     out.connect_timeout = settings.connect_timeout;
     out.io_timeout = settings.io_timeout;
-    // An address goes to rclone and ssh.exe as it is: one that isn't one is refused first.
-    const auto address = [](const std::string& bind) -> std::optional<std::string> {
-        if (bind.starts_with('-')) return "the address can't start with -";
-        return server_conf::check_host(bind);
-    };
     // Legacy: common_flags' --bind, --contimeout and --timeout, read as the keys left blank (G189).
     auto legacy = ssh::read_flags(rclone_flags::connection(settings.common_flags));
     if (!legacy) return util::failf("[{}] common_flags: {}", name, legacy.error());
     // A blank --bind ("--bind=") is no bind, as rclone reads it.
     const auto blank = [](const std::optional<std::string>& bind) { return bind && util::trim(*bind).empty(); };
     if (!out.bind && legacy->bind && !blank(legacy->bind)) {
-        if (auto bad = address(*legacy->bind)) return util::failf("[{}] common_flags: --bind {}: {}", name, *legacy->bind, *bad);
+        if (auto bad = bind_problem(*legacy->bind)) return util::failf("[{}] common_flags: --bind {}: {}", name, *legacy->bind, *bad);
         out.bind = legacy->bind;
         out.bind_from = "common_flags' --bind";
         out.legacy.emplace_back("bind");
@@ -266,7 +280,7 @@ std::expected<ConnectSettings, std::string> connect_settings(const RemoteSetting
         out.bind.reset();
         out.bind_from.clear();
     } else if (given->bind) {
-        if (auto bad = address(*given->bind)) return util::failf("the flags after --: --bind {}: {}", *given->bind, *bad);
+        if (auto bad = bind_problem(*given->bind)) return util::failf("the flags after --: --bind {}: {}", *given->bind, *bad);
         out.bind = given->bind;
         out.bind_from = "--bind";
     }
@@ -276,6 +290,45 @@ std::expected<ConnectSettings, std::string> connect_settings(const RemoteSetting
         out.io_from = std::format("the flags after --: --timeout {}", given->timeout_text);
     }
     return out;
+}
+
+std::expected<void, std::string> check_run_flags(const Context& ctx, std::span<const std::string> extra) {
+    const std::string& name = ctx.settings.name;
+    const bool on_grab = ctx.engine == Engine::grab;
+    if (const auto bad = rclone_flags::first_refused(extra)) {
+        // A certificate or an ssh command isn't in grab's own client's settings at all.
+        const bool unusable = bad->in_grab == "rclone.pubkey_file" || bad->in_grab == "ssh";
+        return util::failf("{} after -- would replace the server's {}, which {}; {}", bad->flag, bad->what,
+                           !on_grab   ? "grab gives rclone itself"
+                           : unusable ? "grab's own client can't use"
+                                      : "grab's own client takes from its settings",
+                           rclone_flags::change_instead(*bad, name));
+    }
+    if (!on_grab) {
+        // Anything else would be ignored, or worse ("-- --dry-run" still downloaded the big files, G186).
+        if (const auto bad = rclone_flags::first_unusable(extra)) {
+            return util::failf("{} after -- isn't used on [{}] (engine = rclone), whose rclone runs take only connection "
+                               "flags (--sftp-*, --bind, --timeout...){}",
+                               bad->flag, name, bad->hint.empty() ? std::string() : ": " + bad->hint);
+        }
+    } else if (auto unused = rclone_flags::first_unused_by_grab(extra, name)) {
+        // The 2026-10-21 rule: refused, never ignored.
+        return util::fail(*unused);
+    }
+    // The values of the connection flags, on either engine, before anything connects or DEST is
+    // made (ssh.exe's searches read them too, through connect_settings).
+    const auto given = ssh::read_flags(extra);
+    if (!given) return util::failf("the flags after --: {}", given.error());
+    if (given->bind && !given->bind->empty()) {
+        if (auto bad = bind_problem(*given->bind)) return util::failf("the flags after --: --bind {}: {}", *given->bind, *bad);
+    }
+    // No limit would leave a stalled READ waiting for ever (ssh_target); rclone takes "off".
+    if (on_grab && given->timeout && (*given->timeout < min_io_timeout || *given->timeout > max_io_timeout)) {
+        return util::failf("the flags after --: --timeout {}: grab's own client takes a time from 1s to 24h there (with "
+                           "none, a stalled download couldn't be cancelled)",
+                           given->timeout_text);
+    }
+    return {};
 }
 
 namespace {
@@ -311,7 +364,7 @@ std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span
     if (const auto blocked = grab_blockers(ctx, extra); !blocked.empty()) {
         return util::fail(guard::text(ctx.settings.name, blocked, ctx.engine));
     }
-    auto store = server_secrets(ctx);
+    auto store = server_secrets(ctx, false);
     if (!store) return util::fail(store.error());
     const auto known_hosts = ctx.remote.known_hosts_file ? util::path_from_utf8(*ctx.remote.known_hosts_file)
                                                          : grab_known_hosts_path();
@@ -357,21 +410,20 @@ std::string path_variable(std::string_view key) {
 
 } // namespace
 
-std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, bool user_copy) {
-    if (!user_copy) {
-        if (const auto bad = rclone_flags::first_refused(ctx.settings.common_flags)) {
-            return util::failf("[{}] common_flags: {} would replace the server's {}, which grab gives rclone itself; "
-                               "take it out ({} instead; only --rclone copies take such a flag)",
-                               ctx.settings.name, bad->flag, bad->what,
-                               rclone_flags::change_instead(*bad, ctx.settings.name));
-        }
+std::expected<proc::Environment, std::string> rclone_env(const Context& ctx) {
+    if (const auto bad = rclone_flags::first_refused(ctx.settings.common_flags)) {
+        return util::failf("[{}] common_flags: {} would replace the server's {}, which grab gives rclone itself; "
+                           "take it out ({})",
+                           ctx.settings.name, bad->flag, bad->what, rclone_flags::change_instead(*bad, ctx.settings.name));
     }
     if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
     // common_flags' --bind reaches rclone as it is: checked as the bind key is.
     if (auto reach = connect_settings(ctx.settings); !reach) return util::fail(reach.error());
     const auto& c = ctx.connection;
     const std::string& name = ctx.settings.name;
-    auto store = server_secrets(ctx);
+    // A store that can't be read stops every login method here: it may keep a proxy or an ssh
+    // command rclone would otherwise go without (fail closed, as the guard does for grab's client).
+    auto store = server_secrets(ctx, true);
     if (!store) return util::fail(store.error());
     const passwords::Binding login{.user = c.user, .host = c.host, .port = c.port};
     const auto saved = [&](std::string_view key) { return passwords::value_for(*store, name, key, login); };
@@ -436,15 +488,10 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
     }
     values["known_hosts_file"] = ctx.remote.known_hosts_file.value_or(util::path_to_utf8(grab_known_hosts_path()));
     // What rclone would otherwise ask the server on every run (RCLONE-REPLACEMENT.md, phase 7
-    // chunk A: 0.1 s for the shell, 0.6 s for the sum commands on Main). The --rclone copy leaves
-    // what grab.conf doesn't know to rclone: its --verify turns rclone's hash check on, and with
-    // "none" rclone would compare sizes only and say nothing (most imported servers never had the
-    // sum commands saved, since grab's flags kept the hash check off). With the check off rclone
-    // asks nothing anyway.
+    // chunk A: 0.1 s for the shell, 0.6 s for the sum commands on Main).
     for (const auto& [key, known] : {std::pair{"shell_type", &c.shell_type}, std::pair{"md5sum_command", &c.md5sum_command},
                                      std::pair{"sha1sum_command", &c.sha1sum_command}}) {
-        if (known->has_value()) values[key] = **known;
-        else if (!user_copy) values[key] = "none";
+        values[key] = known->value_or("none");
     }
     if (c.path_override) values["path_override"] = *c.path_override;
 
@@ -903,25 +950,6 @@ SearchResult make_result(const Context& ctx, const SearchRequest& req, std::vect
         result.hits.push_back(Hit{std::move(p), std::move(name), k.size, false, k.modified});
     }
     return result;
-}
-
-std::expected<std::vector<std::string>, std::string>
-download_argv(const Context& ctx, Mode mode, const std::string& remote_path, const std::filesystem::path& dest_dir,
-              std::span<const std::string> extra, std::optional<std::filesystem::path> local_name) {
-    RcloneRequest rq;
-    rq.mode = mode;
-    rq.rclone_exe = ctx.config.rclone;
-    rq.rclone_remote = ctx.settings.rclone_remote;
-    rq.remote_path = remote_path;
-    rq.dest_dir = dest_dir;
-    rq.common_flags = ctx.settings.common_flags;
-    rq.mode_flags = mode == Mode::folder ? ctx.settings.folder_flags : ctx.settings.file_flags;
-    // The server's keys before the command's own flags.
-    auto tail = key_flags(ctx.settings);
-    tail.insert(tail.end(), extra.begin(), extra.end());
-    rq.extra = tail;
-    rq.local_name = std::move(local_name);
-    return build_rclone_argv(rq);
 }
 
 std::optional<Progress> parse_stats_line(std::string_view line) {

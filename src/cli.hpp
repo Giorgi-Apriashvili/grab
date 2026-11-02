@@ -31,12 +31,13 @@ struct Options {
     bool first = false;
     bool all = false;                // --all: take every match without asking
     bool exact = false;              // --exact: whole-name, case-sensitive matching
-    bool rclone = false;             // --rclone: plain rclone copyto / copy instead of grab's engine
     bool fresh = false;              // --fresh: fetch the server's file list before searching
     bool dry_run = false;
     bool verbose = false;
     bool check = false;              // `grab update --check`
-    std::vector<std::string> extra;  // everything after "--", added to every rclone call
+    // Everything after "--": connection flags for this run, checked per engine once the server is
+    // known (engine::check_run_flags).
+    std::vector<std::string> extra;
     std::vector<std::string> server_args; // `grab server SUBCOMMAND [NAME]`
 };
 

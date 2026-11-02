@@ -107,26 +107,6 @@ TEST_CASE("an old rclone that isn't the bundled one is refused with a reason (G1
 }
 #endif
 
-TEST_CASE("download_argv uses the remote's flags and DEST\\<name>") {
-    engine::Context ctx;
-    ctx.config.rclone = "rclone";
-    ctx.settings.rclone_remote = "hetzner";
-    ctx.settings.common_flags = {"-P"};
-    ctx.settings.file_flags = {"--multi-thread-streams", "8"};
-    ctx.settings.folder_flags = {"--transfers", "8"};
-    const auto dest = util::path_from_utf8("E:\\TV");
-
-    CHECK(engine::download_argv(ctx, Mode::file, "/srv/tv/Lioness.S03E08.mkv", dest).value() ==
-          std::vector<std::string>{"rclone", "copyto", "hetzner:/srv/tv/Lioness.S03E08.mkv",
-                                   util::path_to_utf8(dest / "Lioness.S03E08.mkv"), "--config",
-                                   std::string(config_in_memory), "-P", "--multi-thread-streams", "8"});
-    const std::vector<std::string> extra{"--bwlimit", "10M"};
-    CHECK(engine::download_argv(ctx, Mode::folder, "/srv/tv/show", dest, extra).value() ==
-          std::vector<std::string>{"rclone", "copy", "hetzner:/srv/tv/show", util::path_to_utf8(dest / "show"),
-                                   "--config", std::string(config_in_memory), "-P", "--transfers", "8", "--bwlimit",
-                                   "10M"});
-}
-
 TEST_CASE("rclone's temp files: only those of the run's files, made by the run") {
     namespace fs = std::filesystem;
     const auto dir = fs::temp_directory_path() / "grab_test_partials";
@@ -537,11 +517,16 @@ TEST_CASE("the guard: a server whose settings route it is refused by grab's clie
     CHECK(engine::ssh_target(plain, run).error_or("").find("(--sftp-http-proxy after --)") != std::string::npos);
 #ifdef _WIN32
     // A store that exists but can't be read may hold a route: the guard fails closed, for an
-    // agent login too (rclone's listing searches, grab's client refuses).
+    // agent login too (grab's client refuses, ssh.exe find isn't used), and so does rclone.
     std::ofstream(store, std::ios::binary | std::ios::trunc) << "grab-passwords-sealed 1\nanother account's";
     const auto unreadable = engine::make_context(GrabConfig{}, s, c, conf);
     CHECK(unreadable.method == FindMethod::rclone);
-    CHECK(engine::ssh_target(unreadable).error_or("").find("(grab's store, which can't be read)") != std::string::npos);
+    const auto direct = engine::ssh_target(unreadable).error_or("");
+    CHECK(direct.starts_with("[Box] may connect through a proxy or an ssh command (grab's store, which can't be read), "
+                             "which grab's own client can't; grab doesn't start rclone for it either until the store "
+                             "can be read; saving the server with Edit (no change needed) sets the unreadable file "
+                             "aside"));
+    CHECK(engine::rclone_env(unreadable).error_or("").find("so grab doesn't start rclone for it") != std::string::npos);
 #endif
     std::filesystem::remove_all(store.parent_path());
     std::filesystem::remove_all(dir);
@@ -585,6 +570,80 @@ TEST_CASE("the keys and the command's flags reach rclone's listing and ssh.exe, 
     std::filesystem::remove(grab_known_hosts_path());
 }
 #endif
+
+TEST_CASE("the flags after --, per engine, before anything connects (phase 8 step 6)") {
+    using V = std::vector<std::string>;
+    engine::Context ctx;
+    ctx.settings.name = "Main";
+    ctx.engine = Engine::grab;
+    const auto error = [&](V extra) { return engine::check_run_flags(ctx, extra).error_or(""); };
+    // grab's own client takes --bind, --contimeout and --timeout for the run, either way written.
+    CHECK(engine::check_run_flags(ctx, V{}).has_value());
+    CHECK(engine::check_run_flags(ctx, V{"--bind", "10.0.0.2", "--contimeout=5s", "--timeout", "2m"}).has_value());
+    CHECK(engine::check_run_flags(ctx, V{"--bind="}).has_value()); // no bind for this run
+    CHECK(engine::check_run_flags(ctx, V{"--contimeout", "off", "--timeout=24h"}).has_value());
+    // The rest refused, naming what to use instead (the 2026-10-21 rule: refused, never ignored).
+    CHECK(error({"--timeout", "1m", "--sftp-connections", "4"}) ==
+          "--sftp-connections after -- isn't used by grab's own client; set max_connections in [Main] (grab config)");
+    CHECK(error({"--sftp-chunk-size", "1Mi"}) == "--sftp-chunk-size after -- isn't used by grab's own client; it reads "
+                                                 "255 KiB at a time, 64 in flight, and splits big files over its "
+                                                 "connections, with nothing to set");
+    CHECK(error({"--multi-thread-streams=4"}).find("with nothing to set") != std::string::npos);
+    CHECK(error({"--low-level-retries", "3"}).ends_with("; it retries a failed piece by itself"));
+    CHECK(error({"--bwlimit", "5M"}).ends_with("; grab's own --limit sets the speed"));
+    CHECK(error({"--tpslimit", "5"}).ends_with("; grab's own --limit sets the speed"));
+    CHECK(error({"--transfers", "4"}).ends_with("; files at once: At once in grab's window"));
+    CHECK(error({"--dry-run"}).ends_with("; grab's own -n shows what would be fetched"));
+    CHECK(error({"-P"}).ends_with("; grab shows its own progress"));
+    CHECK(error({"--dscp", "CS1"}).ends_with("; it isn't used over SFTP"));
+    CHECK(error({"--size-only"}) ==
+          "--size-only after -- isn't used by grab's own client; it takes only --bind, --contimeout and --timeout there");
+    CHECK(error({"--bind", "10.0.0.2", "stray"}).starts_with("'stray' after -- isn't a flag"));
+    // What only rclone can follow says to set engine = rclone, and never quotes the value.
+    const auto proxy = error({"--sftp-socks-proxy", "fake-user:fake-secret@127.0.0.1:9"});
+    CHECK(proxy == "--sftp-socks-proxy after --: grab's own client can't use a proxy; set engine = rclone in [Main] "
+                   "(grab config) to use it through rclone");
+    CHECK(error({"--sftp-ciphers=aes128-ctr"}).find("offers only its own algorithms; set engine = rclone in [Main]") !=
+          std::string::npos);
+    CHECK(error({"--sftp-disable-concurrent-reads"}).find("set engine = rclone") != std::string::npos);
+    // The server's address, login and host keys, as before.
+    CHECK(error({"--sftp-host", "elsewhere.example"}) ==
+          "--sftp-host after -- would replace the server's address, which grab's own client takes from its settings; "
+          "change grab.conf's `host` with `grab server edit Main` or Edit in grab's Settings");
+    CHECK(error({"--sftp-ssh", "ssh -i key"}).ends_with("which grab's own client can't use; an ssh command can't be "
+                                                         "given there"));
+    CHECK(error({"--sftp-pubkey-file", "C:\\id-cert.pub"}) ==
+          "--sftp-pubkey-file after -- would replace the server's certificate, which grab's own client can't use; "
+          "write `rclone.pubkey_file = PATH` in [Main] (grab config); only rclone logs in with a certificate "
+          "(engine = rclone)");
+    // Values grab's own client can't use: refused now, not when it connects.
+    CHECK(error({"--timeout", "off"}) == "the flags after --: --timeout off: grab's own client takes a time from 1s to "
+                                         "24h there (with none, a stalled download couldn't be cancelled)");
+    CHECK(error({"--timeout=0.5s"}).starts_with("the flags after --: --timeout 0.5s: grab's own client takes"));
+    CHECK(error({"--timeout", "25h"}).starts_with("the flags after --: --timeout 25h:"));
+    CHECK(error({"--timeout", "abc"}).starts_with("the flags after --: --timeout abc: not a time grab can read"));
+    CHECK(error({"--bind"}) == "the flags after --: --bind needs a value");
+    CHECK(error({"--bind=-x"}) == "the flags after --: --bind -x: the address can't start with -");
+
+    // engine = rclone: connection flags, as before (a guard flag makes the run guarded instead).
+    ctx.engine = Engine::rclone;
+    CHECK(engine::check_run_flags(ctx, V{"--sftp-chunk-size", "1Mi", "--bind=10.8.0.2", "--timeout", "off",
+                                         "--sftp-socks-proxy", "127.0.0.1:9", "--sftp-connections", "4"})
+              .has_value());
+    CHECK(error({"--dry-run"}) == "--dry-run after -- isn't used on [Main] (engine = rclone), whose rclone runs take "
+                                  "only connection flags (--sftp-*, --bind, --timeout...): grab's own -n shows what "
+                                  "would be fetched");
+    CHECK(error({"--exclude", "*.part"}).ends_with("(--sftp-*, --bind, --timeout...)")); // nothing instead
+    CHECK(error({"--sftp-user", "u"}) == "--sftp-user after -- would replace the server's user, which grab gives rclone "
+                                         "itself; change grab.conf's `user` with `grab server edit Main` or Edit in "
+                                         "grab's Settings");
+    for (const auto& e : {error({"--exclude", "*.part"}), error({"-vP"})}) CHECK(e.find("--rclone") == std::string::npos);
+    // Their values too, before DEST is made; "off" and a blank --bind stay rclone's to take.
+    CHECK(error({"--timeout", "abc"}).starts_with("the flags after --: --timeout abc: not a time grab can read"));
+    CHECK(error({"--bind=-x"}) == "the flags after --: --bind -x: the address can't start with -");
+    CHECK(error({"--bind"}) == "the flags after --: --bind needs a value");
+    CHECK(engine::check_run_flags(ctx, V{"--timeout", "off", "--bind="}).has_value());
+}
 
 TEST_CASE("an unpinned server is refused before any rclone run, grab's login or ssh: use Trust") {
     std::filesystem::remove(grab_known_hosts_path());
@@ -647,7 +706,7 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
                             {"RCLONE_CONFIG_MAIN_SHELL_TYPE", "unix"},
                             {"RCLONE_CONFIG_MAIN_TYPE", "sftp"},
                             {"RCLONE_CONFIG_MAIN_USER", "me"}});
-    // The user's own RCLONE_CONFIG_MAIN_* can't add to it (--rclone, whose environment is whole).
+    // The user's own RCLONE_CONFIG_MAIN_* can't add to it.
     CHECK(main->without_prefix == std::vector<std::string>{"RCLONE_CONFIG_MAIN_"});
 
     // What grab.conf doesn't know yet is "none", so rclone asks nothing on every run (chunk B's
@@ -657,17 +716,6 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
     for (const char* key : {"SHELL_TYPE", "MD5SUM_COMMAND", "SHA1SUM_COMMAND"}) {
         CHECK(var(*pw, std::string("RCLONE_CONFIG_PW_") + key) == "none");
     }
-    // The --rclone copy leaves them to rclone, whose --verify needs a sum command; known ones
-    // still go.
-    const auto pw_copy = engine::rclone_env(grab_context("pw", pw_c, store), true);
-    REQUIRE_MESSAGE(pw_copy, pw_copy.error_or(""));
-    for (const char* key : {"SHELL_TYPE", "MD5SUM_COMMAND", "SHA1SUM_COMMAND"}) {
-        CHECK_FALSE(var(*pw_copy, std::string("RCLONE_CONFIG_PW_") + key).has_value());
-    }
-    const auto main_copy = engine::rclone_env(ctx, true);
-    REQUIRE_MESSAGE(main_copy, main_copy.error_or(""));
-    CHECK(var(*main_copy, "RCLONE_CONFIG_MAIN_MD5SUM_COMMAND") == "md5sum");
-    CHECK(var(*main_copy, "RCLONE_CONFIG_MAIN_SHA1SUM_COMMAND") == "none");
     const auto pass = var(*pw, "RCLONE_CONFIG_PW_PASS");
     REQUIRE(pass.has_value());
     CHECK(*pass != "fake-pw");
@@ -710,13 +758,13 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
     CHECK(var(*dollar, "GRAB_RCLONE_PUBKEY_FILE") == "C:\\$sync\\id.pub");
     CHECK_FALSE(var(*main, "GRAB_RCLONE_KEY_FILE").has_value()); // no '$', no variable
 
-    // A flag that would replace the server is refused for grab's own runs, not for --rclone's.
+    // A flag that would replace the server is refused.
     ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki", "--sftp-known-hosts-file", "C:\\other"};
     const auto refused = engine::rclone_env(ctx);
     REQUIRE_FALSE(refused);
-    CHECK(refused.error().starts_with(
-        "[Main] common_flags: --sftp-known-hosts-file would replace the server's trusted host keys"));
-    CHECK(engine::rclone_env(ctx, true).has_value());
+    CHECK(refused.error() == "[Main] common_flags: --sftp-known-hosts-file would replace the server's trusted host keys, "
+                             "which grab gives rclone itself; take it out (pin its host keys with `grab server trust "
+                             "Main` or Trust in grab's Settings)");
     // A common_flags --bind that isn't an address doesn't reach rclone either.
     ctx.settings.common_flags = {"--bind", "-x"};
     CHECK(engine::rclone_env(ctx).error_or("").starts_with("[Main] common_flags: --bind needs a value"));
@@ -726,12 +774,28 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
     ctx.settings.common_flags = {"--bind="};
     CHECK(engine::rclone_env(ctx).has_value());
 #ifdef _WIN32
-    // A store that can't be read: a password server can't log in; the others still can.
+    // A store that can't be read: a password server can't log in, nor one with a key kept there.
+    // Neither starts rclone, nor does any other: the store may keep the server's proxy or ssh
+    // command, which rclone would go without (fail closed, as the guard does for grab's client).
     std::ofstream(store, std::ios::binary) << "grab-passwords-sealed 1\nanother account's";
-    CHECK(engine::rclone_env(grab_context("pw", pw_c, store)).error_or("").find("Enter the password of pw again") !=
-          std::string::npos);
+    const auto why = std::format("the saved passwords in {} can't be read (they belong to another Windows account, or "
+                                 "the file is damaged)",
+                                 util::path_to_utf8(store));
+    CHECK(engine::rclone_env(grab_context("pw", pw_c, store)).error_or("") ==
+          why + ". Enter the password of pw again with Edit (Settings → Edit in grab's window, or `grab server edit "
+                "pw`), which sets the unreadable file aside");
+    CHECK(engine::rclone_env(grab_context("pem", pem_c, store)).error_or("") ==
+          why + ". pem logs in with a key kept there: choose a key file or ssh-agent for it with Edit (Settings → Edit "
+                "in grab's window, or `grab server edit pem`), which sets the unreadable file aside");
     ctx.settings.common_flags.clear();
-    CHECK(engine::rclone_env(ctx).has_value());
+    for (const auto& unreadable : {ctx, grab_context("k", key_c, store)}) {
+        const auto& name = unreadable.settings.name;
+        CHECK(engine::rclone_env(unreadable).error_or("") ==
+              why + std::format("; it may keep rclone settings of {} (a proxy, an ssh command), so grab doesn't start "
+                                "rclone for it. Saving it unchanged with Edit (Settings → Edit in grab's window, "
+                                "or `grab server edit {}`) sets the unreadable file aside",
+                                name, name));
+    }
 #endif
     std::filesystem::remove_all(dir);
     std::filesystem::remove(grab_known_hosts_path());

@@ -137,7 +137,7 @@ std::string why_unused(std::string_view flag) {
     return "grab's own client doesn't use it";
 }
 
-// What grab has instead of a flag only --rclone copies use (N8), after "grab doesn't use it".
+// What grab has instead of a flag only --rclone copies used (N8), after "grab doesn't use it".
 std::string instead_of(std::string_view flag) {
     if (flag == "--transfers" || flag == "--checkers") return " (files at once: At once in grab's window)";
     if (flag == "--bwlimit") return " (speed: --limit or the speed schedule)";
@@ -219,9 +219,8 @@ void flag_notices(const Builder& b, const RemoteSettings& r, bool on_grab) {
             continue;
         }
         b.add("common_flags", item.name, item.value,
-              std::format("[{}] common_flags: {} is only for --rclone copies, which go with rclone; grab doesn't use "
-                          "it{}.",
-                          s, shown(item), instead_of(item.name)));
+              std::format("[{}] common_flags: {} was for --rclone, which is gone; grab doesn't use it{}.", s, shown(item),
+                          instead_of(item.name)));
     }
     // folder_flags and file_flags
     for (const auto& [key, flags, defaults, batch] :
@@ -230,12 +229,13 @@ void flag_notices(const Builder& b, const RemoteSettings& r, bool on_grab) {
         for (const auto& item : items_of(*flags)) {
             if (std::ranges::contains(defaults, item)) continue;
             if (rclone_flags::is_connection(item.name)) {
-                // folder_flags' reach the batch of engine = rclone; file_flags' only --rclone -s.
+                // folder_flags' reach the batch of engine = rclone; file_flags' nothing, since
+                // --rclone -s went.
                 if (batch && !on_grab) continue;
                 if (item.name == "--bind" && util::trim(item.value).empty()) continue; // no bind
                 const auto as = key_for(item.name);
-                const std::string reaches = batch ? "rclone's folder batch" : "--rclone -s copies";
-                std::string text = std::format("[{}] {}: {} reaches only {}", s, key, shown(item), reaches);
+                const std::string reaches = batch ? "only rclone's folder batch" : "nothing (it was for --rclone, which is gone)";
+                std::string text = std::format("[{}] {}: {} reaches {}", s, key, shown(item), reaches);
                 if (const auto bad = as.empty() ? std::nullopt : refused({.key = as, .value = item.value})) {
                     text += std::format("; for every connection write an `{}` line ({}).", as, *bad);
                 } else if (!as.empty()) {
@@ -247,8 +247,8 @@ void flag_notices(const Builder& b, const RemoteSettings& r, bool on_grab) {
                 continue;
             }
             b.add(key, item.name, item.value,
-                  std::format("[{}] {}: {} is only for --rclone copies, which go with rclone; grab doesn't use it{}.", s,
-                              key, shown(item), instead_of(item.name)));
+                  std::format("[{}] {}: {} was for --rclone, which is gone; grab doesn't use it{}.", s, key, shown(item),
+                              instead_of(item.name)));
         }
     }
 }

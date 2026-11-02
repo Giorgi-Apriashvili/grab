@@ -608,14 +608,23 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
         }
     }
 
-    // The store, only when the login method, the secret or the login changes (G85).
+    // The store, only when the login method, the secret or the login changes (G85), or when it
+    // can't be read: grab then starts no rclone for any server, and saving one with Edit, changed
+    // or not, is the way out the messages give (load_store sets the file aside). A store that
+    // still can't be read stops only an Edit that needs it.
     std::optional<passwords::Store> before;
     passwords::Store store;
     std::string store_note;
     const bool secret_kind = wanted.auth == servers::Auth::password || wanted.auth == servers::Auth::key;
-    if (method || moved || key_changed || (typed && secret_kind)) {
-        auto loaded_store = load_store(env, wanted.name);
-        if (!loaded_store) return util::fail(loaded_store.error());
+    const bool needs_store = method || moved || key_changed || (typed && secret_kind);
+    const bool unreadable = !passwords::load(env.passwords).has_value();
+    std::optional<StoreForChange> loaded_store;
+    if (needs_store || unreadable) {
+        auto got = load_store(env, wanted.name);
+        if (!got && needs_store) return util::fail(got.error());
+        if (got) loaded_store = std::move(*got);
+    }
+    if (loaded_store) {
         store_note = std::move(loaded_store->note);
         before = loaded_store->store;
         store = std::move(loaded_store->store);

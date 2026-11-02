@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "engine.hpp"
+#include "fetch.hpp"
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "gui_state.hpp"
@@ -206,8 +207,8 @@ TEST_CASE("a folder's local directory and its files' remote paths") {
 }
 
 #ifdef _WIN32
-TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's listing)") {
-    const auto dir = std::filesystem::temp_directory_path() / "grab-test-list-no-pool";
+TEST_CASE("a folder is listed by rclone with connections from the server's pool (engine = rclone)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-list-rclone";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     // A stand-in rclone: logs its arguments, lists one file.
@@ -223,24 +224,30 @@ TEST_CASE("a folder is listed without a connection pool (--rclone, a dry run's l
     RemoteSettings settings;
     settings.name = "Main";
     settings.rclone_remote = "Main";
-    // --rclone's check before its copy takes the flags the copy does (rclone_flags::first_refused).
-    settings.common_flags = {"--sftp-port", "2222"};
+    // common_flags' connection flags only, then the walk's connections, then the command's.
+    settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki"};
     auto ctx = engine::make_context(GrabConfig{}, settings, c, dir / "grab.conf");
     ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
     std::filesystem::create_directories(grab_known_hosts_path().parent_path());
     std::ofstream(grab_known_hosts_path(), std::ios::binary) << "main.example ssh-ed25519 FAKEKEY\n";
+    fetch::Connections connections;
+    connections.configure("Main", 4);
     folder::Job job;
-    job.ctx = &ctx; // no job.connections
+    job.ctx = &ctx;
+    job.connections = &connections;
+    job.server = "Main";
     job.remote_path = "/tmp/f";
     job.dest = dir / "out";
+    job.extra = {"--timeout", "1m"};
     folder::Tree tree;
     std::mutex m;
-    REQUIRE(folder::list(job, tree, m, std::stop_token{}).has_value());
+    const auto listed = folder::list(job, tree, m, std::stop_token{});
+    REQUIRE_MESSAGE(listed.has_value(), listed.error_or(""));
     REQUIRE(tree.files.size() == 1);
     CHECK(tree.files[0].path == "a.txt");
     const auto calls = util::read_file(dir / "calls.log").value_or("");
-    CHECK(calls.find("--checkers") == std::string::npos); // rclone's own walk
-    CHECK(calls.find("--config NUL --sftp-port 2222") != std::string::npos);
+    CHECK(calls.find("--config NUL --sftp-chunk-size 255Ki --checkers 4 --sftp-connections 4 --timeout 1m") !=
+          std::string::npos);
     std::filesystem::remove_all(dir);
     std::filesystem::remove(grab_known_hosts_path());
 }

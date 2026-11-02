@@ -944,21 +944,15 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     std::vector<std::string> argv{ctx.config.rclone, "lsjson", "-R", "--files-only",
                                   remote_spec(ctx.settings.rclone_remote, job.remote_path), "--config",
                                   std::string(config_in_memory)};
-    // Without a pool's connections it is --rclone's check before its copy, which takes the flags
-    // the copy does.
-    auto env = engine::rclone_env(ctx, job.connections == nullptr);
+    auto env = engine::rclone_env(ctx);
     if (!env) return util::fail(env.error());
     const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
-    // Its walk's connections come from the pool, as the downloads' do (review G191); without one
-    // (--rclone), rclone's own.
-    std::optional<fetch::Listing> walk;
-    if (job.connections != nullptr) {
-        walk.emplace(*job.connections, job.server, stop);
-        if (stop.stop_requested()) return {};
-        const auto walk_flags = walk->flags();
-        argv.insert(argv.end(), walk_flags.begin(), walk_flags.end());
-    }
+    // Its walk's connections come from the pool, as the downloads' do (review G191).
+    const fetch::Listing walk(*job.connections, job.server, stop);
+    if (stop.stop_requested()) return {};
+    const auto walk_flags = walk.flags();
+    argv.insert(argv.end(), walk_flags.begin(), walk_flags.end());
     // The server's keys, then the command's flags, last so they win.
     const auto keys = engine::key_flags(ctx.settings);
     argv.insert(argv.end(), keys.begin(), keys.end());

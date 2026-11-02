@@ -143,8 +143,13 @@ TEST_CASE("guard: grab's store that can't be read counts as a route") {
     CHECK(r[0].kind == guard::Kind::route);
     CHECK(guard::routed(r));
     CHECK(guard::describe(r[0]) == "may connect through a proxy or an ssh command (grab's store, which can't be read)");
-    CHECK(guard::text("Box", r, Engine::rclone).find("its searches and lists by rclone's listing") != std::string::npos);
-    CHECK(guard::text("Box", r, Engine::grab).find("sets the unreadable file aside") != std::string::npos);
+    // Nothing connects on either engine: rclone isn't started for it either (engine::rclone_env).
+    for (const auto engine : {Engine::rclone, Engine::grab}) {
+        CHECK(guard::text("Box", r, engine) ==
+              "[Box] may connect through a proxy or an ssh command (grab's store, which can't be read), which grab's own "
+              "client can't; grab doesn't start rclone for it either until the store can be read; saving the server "
+              "with Edit (no change needed) sets the unreadable file aside");
+    }
 }
 
 TEST_CASE("guard: a server's sources from its section, the store's extras for its login and the environment") {

@@ -800,7 +800,8 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
 
     StopOnCtrlC ctrl_c;
     // rclone's checks and reads: only the connection flags of the configured ones and of `--`
-    // (rclone_flags.hpp; cli.cpp refuses any other after `--`), the server's keys between them.
+    // (rclone_flags.hpp; engine::check_run_flags refuses any other after `--`), the server's keys
+    // between them.
     Session s{ctx, opts, dest, line, connections, limiter, rclone_flags::connection(ctx.settings.common_flags),
               engine::key_flags(ctx.settings), {}, ctrl_c.token()};
     if (follower) s.follower = &*follower;

@@ -4,7 +4,7 @@
 // at all (RCLONE-REPLACEMENT.md, phase 8 step 5): common_flags' --bind, --contimeout and --timeout
 // read as the new keys (N1), rclone's other connection flags (N2, N3), ssh_options (N4), connection
 // flags in folder_flags and file_flags (N5), rclone settings that change what grab does (N6), keys
-// grab doesn't know (N7), flags only --rclone copies use (N8), and what keeps grab's client off a
+// grab doesn't know (N7), flags only the --rclone copies used (N8), and what keeps grab's client off a
 // server (guard.hpp). Only for what differs from the old defaults, flag by flag: grab.conf.example's
 // lines and `--init`'s commented ones say nothing. No text quotes a value but a bind, a time, a
 // size or a count: a proxy, an ssh command or a ProxyCommand can hold a user:password.

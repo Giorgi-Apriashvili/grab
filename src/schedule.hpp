@@ -45,11 +45,6 @@ struct Change {
 };
 [[nodiscard]] std::optional<Change> next_change(const std::vector<Rule>& rules, int minute);
 
-// An rclone --bwlimit value that follows the rules by itself: a weekly timetable
-// ("Mon-18:00,5120K Tue-00:00,off"), or one rate when the limit never changes. "" without
-// rules.
-[[nodiscard]] std::string rclone_bwlimit(const std::vector<Rule>& rules);
-
 [[nodiscard]] std::uint64_t bytes_per_s(double mibps);
 
 // "18:00" and "8:30" to minutes since midnight; "24:00" reads as 1440.

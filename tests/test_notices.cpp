@@ -159,8 +159,8 @@ TEST_CASE("notices: rclone's other connection flags, ssh_options and rclone sett
           "[Main] folder_flags: --bind 10.0.0.2 reaches only rclone's folder batch; write `bind = 10.0.0.2` for every "
           "connection.\n"
           "[Main] folder_flags: --sftp-concurrency 8 reaches only rclone's folder batch.\n"
-          "[Main] file_flags: --contimeout 9s reaches only --rclone -s copies; write `connect_timeout = 9s` for every "
-          "connection.\n"
+          "[Main] file_flags: --contimeout 9s reaches nothing (it was for --rclone, which is gone); write "
+          "`connect_timeout = 9s` for every connection.\n"
           "[Main] ssh_options is for ssh.exe, which grab's own client doesn't use (-o ConnectTimeout=10: use "
           "connect_timeout = 10s).\n"
           "[Main] ssh_options is for ssh.exe, which grab's own client doesn't use (-o BindAddress=10.0.0.2: use bind "
@@ -177,21 +177,21 @@ TEST_CASE("notices: rclone's other connection flags, ssh_options and rclone sett
     CHECK(texts_of(notices_of(section("Main", "file_flags = --bind 10.0.0.2\nssh_options = -o ConnectTimeout=10\n"
                                               "folder_flags = --bind 10.0.0.2\n",
                                       "rclone"))) ==
-          std::vector<std::string>{"[Main] file_flags: --bind 10.0.0.2 reaches only --rclone -s copies; write `bind = "
-                                   "10.0.0.2` for every connection."});
+          std::vector<std::string>{"[Main] file_flags: --bind 10.0.0.2 reaches nothing (it was for --rclone, which is "
+                                   "gone); write `bind = 10.0.0.2` for every connection."});
 }
 
-TEST_CASE("notices: flags only --rclone copies use, on any engine (N8), and keys grab doesn't know (N7)") {
+TEST_CASE("notices: flags only the --rclone copies used, on any engine (N8), and keys grab doesn't know (N7)") {
     const NoEngineOverride no_override;
     CHECK(texts_of(notices_of(section("Main", "folder_flags = --transfers 16 --checkers 8\nfile_flags = -vv\n"
                                               "connect_timout = 10s\n",
                                       "rclone") +
                               "[grab]\nsh = ssh\n")) ==
           std::vector<std::string>{
-              "[Main] folder_flags: --transfers 16 is only for --rclone copies, which go with rclone; grab doesn't use it "
-              "(files at once: At once in grab's window).",
-              "[Main] file_flags: -vv is only for --rclone copies, which go with rclone; grab doesn't use it (grab's own -v "
-              "shows what it runs).",
+              "[Main] folder_flags: --transfers 16 was for --rclone, which is gone; grab doesn't use it (files at once: "
+              "At once in grab's window).",
+              "[Main] file_flags: -vv was for --rclone, which is gone; grab doesn't use it (grab's own -v shows what it "
+              "runs).",
               "[Main] connect_timout isn't a grab.conf setting (ignored).", "[grab] sh isn't a grab.conf setting (ignored)."});
 }
 

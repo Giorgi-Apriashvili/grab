@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <format>
-#include <utility>
 
 namespace grab::rclone_flags {
 
@@ -40,8 +40,63 @@ constexpr std::array server_settings{
     ServerSetting{.key = "pubkey_file", .what = "certificate", .in_grab = "rclone.pubkey_file"},
     ServerSetting{.key = "key_use_agent", .what = "login method (ssh-agent)", .in_grab = "auth"},
     ServerSetting{.key = "known_hosts_file", .what = "trusted host keys", .in_grab = "trust"},
-    ServerSetting{.key = "ssh", .what = "connection (an ssh command instead of rclone's own)", .in_grab = "ssh"},
+    ServerSetting{.key = "ssh", .what = "connection (an ssh command in place of the SSH client)", .in_grab = "ssh"},
 };
+
+// What grab has instead of a flag that isn't about reaching the server, after "isn't used by
+// ...": "" when nothing.
+std::string_view instead(std::string_view name) {
+    if (name == "--dry-run" || name == "-n") return "grab's own -n shows what would be fetched";
+    if (name == "--bwlimit" || name == "--tpslimit" || name == "--tpslimit-burst") return "grab's own --limit sets the speed";
+    if (name == "-v" || name == "-vv" || name == "--verbose") return "grab's own -v shows what it runs";
+    if (name == "-P" || name == "--progress") return "grab shows its own progress";
+    if (name == "--transfers") return "files at once: At once in grab's window";
+    return {};
+}
+
+// rclone's settings grab's own client can't follow (guard.hpp's), as flags, with what it can't do.
+struct RcloneOnly {
+    std::string_view flag;
+    std::string_view cant;
+};
+constexpr auto rclone_only = std::to_array<RcloneOnly>({
+    {.flag = "--sftp-socks-proxy", .cant = "can't use a proxy"},
+    {.flag = "--sftp-http-proxy", .cant = "can't use a proxy"},
+    {.flag = "--sftp-subsystem", .cant = "can't use another SFTP subsystem or server command"},
+    {.flag = "--sftp-server-command", .cant = "can't use another SFTP subsystem or server command"},
+    {.flag = "--sftp-use-insecure-cipher", .cant = "offers only its own algorithms"},
+    {.flag = "--sftp-ciphers", .cant = "offers only its own algorithms"},
+    {.flag = "--sftp-key-exchange", .cant = "offers only its own algorithms"},
+    {.flag = "--sftp-macs", .cant = "offers only its own algorithms"},
+    {.flag = "--sftp-host-key-algorithms", .cant = "offers only its own algorithms"},
+    {.flag = "--sftp-disable-concurrent-reads", .cant = "always reads several pieces at once"},
+    {.flag = "--sftp-use-fstat", .cant = "can't use fstat in place of stat"},
+});
+
+// Why grab's own client doesn't use a flag after `--`, and what to use instead.
+std::string grab_hint(std::string_view name, std::string_view server) {
+    if (name == "--sftp-connections") return std::format("set max_connections in [{}] (grab config)", server);
+    for (const std::string_view fixed : {"--sftp-chunk-size", "--sftp-concurrency", "--buffer-size", "--multi-thread-streams",
+                                         "--multi-thread-cutoff", "--multi-thread-chunk-size",
+                                         "--multi-thread-write-buffer-size"}) {
+        if (name == fixed) {
+            return "it reads 255 KiB at a time, 64 in flight, and splits big files over its connections, with nothing to "
+                   "set";
+        }
+    }
+    if (name == "--low-level-retries" || name == "--retries") return "it retries a failed piece by itself";
+    for (const std::string_view other : {"--dscp", "--user-agent", "--ca-cert", "--client-cert", "--client-key",
+                                         "--no-check-certificate", "--password-command"}) {
+        if (name == other) return "it isn't used over SFTP";
+    }
+    if (name == "--sftp-idle-timeout") return "it closes idle connections itself";
+    if (name == "--sftp-disable-hashcheck") return "grab's own --verify checks downloads";
+    if (name == "--sftp-skip-links") return "it follows links";
+    if (name == "--sftp-set-modtime") return "it never changes the server's files";
+    if (name == "--sftp-set-env") return "it sets no environment on the server";
+    if (const auto use = instead(name); !use.empty()) return std::string(use);
+    return "it takes only --bind, --contimeout and --timeout there";
+}
 
 std::string_view name_of(std::string_view flag) { return flag.substr(0, flag.find('=')); }
 
@@ -85,13 +140,31 @@ std::vector<std::string> connection(std::span<const std::string> flags) {
 std::optional<Unusable> first_unusable(std::span<const std::string> extra) {
     for (const auto& f : extra) {
         if (!f.starts_with('-') || is_connection(f)) continue;
+        return Unusable{.flag = f, .hint = std::string(instead(name_of(f)))};
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> first_unused_by_grab(std::span<const std::string> extra, std::string_view server) {
+    for (std::size_t i = 0; i < extra.size(); ++i) {
+        const std::string& f = extra[i];
         const auto name = name_of(f);
-        std::string hint = "add --rclone for a plain rclone copy that uses it";
-        if (name == "--dry-run" || name == "-n") hint = "grab's own -n shows what would be fetched";
-        else if (name == "--bwlimit") hint = "grab's own --limit sets the speed";
-        else if (name == "-v" || name == "-vv" || name == "--verbose") hint = "grab's own -v shows the rclone commands";
-        else if (name == "-P" || name == "--progress") hint = "grab shows its own progress";
-        return Unusable{f, std::move(hint)};
+        if (name == "--bind" || name == "--contimeout" || name == "--timeout") {
+            // Its value, as ssh::read_flags takes it.
+            if (name.size() == f.size() && i + 1 < extra.size() && !extra[i + 1].starts_with('-')) ++i;
+            continue;
+        }
+        if (!f.starts_with('-')) {
+            return std::format("'{}' after -- isn't a flag; grab's own client takes only --bind, --contimeout and "
+                               "--timeout there",
+                               f);
+        }
+        if (const auto it = std::ranges::find(rclone_only, name, &RcloneOnly::flag); it != rclone_only.end()) {
+            return std::format("{} after --: grab's own client {}; set engine = rclone in [{}] (grab config) to use it "
+                               "through rclone",
+                               name, it->cant, server);
+        }
+        return std::format("{} after -- isn't used by grab's own client; {}", name, grab_hint(name, server));
     }
     return std::nullopt;
 }
@@ -112,7 +185,13 @@ std::string change_instead(const Refused& refused, std::string_view server) {
     if (refused.in_grab == "trust") {
         return std::format("pin its host keys with `grab server trust {}` or Trust in grab's Settings", server);
     }
-    if (refused.in_grab == "ssh") return "grab's runs use rclone's own SSH client, which takes no ssh command";
+    if (refused.in_grab == "ssh") return "an ssh command can't be given there";
+    // Edit has no field for it: only a hand-written line, and only rclone logs in with one.
+    if (refused.in_grab == "rclone.pubkey_file") {
+        return std::format("write `rclone.pubkey_file = PATH` in [{}] (grab config); only rclone logs in with a "
+                           "certificate (engine = rclone)",
+                           server);
+    }
     if (refused.in_grab.empty()) {
         return std::format("change it with `grab server edit {}` or Edit in grab's Settings (grab keeps it in its "
                            "password store)",

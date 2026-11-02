@@ -25,9 +25,6 @@ enum class Choice { ask, replace, keep_both, skip };
 // fetch::up_to_date.
 [[nodiscard]] bool differs(const std::filesystem::path& local, std::uint64_t size,
                            std::optional<std::int64_t> modtime_ns);
-// The same as rclone copy decides it (--rclone): another size, or a time more than 1 s off.
-[[nodiscard]] bool rclone_replaces(const std::filesystem::path& local, std::uint64_t size,
-                                   std::optional<std::int64_t> modtime_ns);
 
 // "name (n).ext": the extension is what follows the last '.', unless the name starts with it.
 [[nodiscard]] std::string numbered(std::string_view name, int n);

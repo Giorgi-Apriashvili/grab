@@ -4,10 +4,12 @@
 // every secret is an obviously fake one.
 
 #include "config.hpp"
+#include "engine.hpp"
 #include "file_list.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "passwords.hpp"
+#include "server_conf.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "util.hpp"
@@ -764,6 +766,55 @@ TEST_CASE("a store that can't be decrypted is moved aside by a change, which nam
     REQUIRE_MESSAGE(edited.has_value(), edited.error_or(""));
     CHECK(edited->find("moved aside") == std::string::npos);
     CHECK(s.secrets() == passwords::Store{{"box", {{"password", fake("fake-pw2")}}}});
+}
+
+TEST_CASE("an unchanged Edit of an agent server moves an undecryptable store aside, so rclone starts again") {
+    Scratch s;
+    s.write("grab.conf", grab_conf);
+    Scratch::pins("h.example.com ssh-ed25519 FAKEKEY\n");
+    std::filesystem::create_directories(s.store().parent_path());
+    std::ofstream(s.store(), std::ios::binary) << "grab-passwords-sealed 1\nanother account's";
+    RemoteSettings settings;
+    settings.name = "agent";
+    settings.rclone_remote = "agent";
+    server_conf::Connection c;
+    c.host = "h.example.com";
+    c.user = "me";
+    c.auth = server_conf::Auth::agent;
+    // The store may keep its proxy, so no rclone runs for it (engine::rclone_env)...
+    CHECK(engine::rclone_env(engine::make_context(GrabConfig{}, settings, c, s.conf)).error_or("").find(
+              "Saving it unchanged with Edit") != std::string::npos);
+    // ...until it is saved with nothing changed: the agent server needs no store, but the file
+    // that can't be read goes aside and the note names who needs a secret again.
+    auto agent = server(Auth::agent, "agent");
+    agent.host = "h.example.com";
+    agent.port = 22;
+    agent.user = "me";
+    agent.max_depth = 6;
+    const auto edited = server_ops::update_server(s.env(), agent, std::nullopt, std::nullopt);
+    REQUIRE_MESSAGE(edited.has_value(), edited.error_or(""));
+    CHECK(edited->find("moved aside to ") != std::string::npos);
+    CHECK(edited->find("enter the password of box again with Edit") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(s.store()));
+    const auto env = engine::rclone_env(engine::make_context(GrabConfig{}, settings, c, s.conf));
+    CHECK_MESSAGE(env.has_value(), env.error_or(""));
+}
+
+TEST_CASE("an unchanged Edit goes on when the store can't be read at all") {
+    // A folder in the store's place can't be read nor moved aside by passwords::load_for_change:
+    // an Edit that needs no store still saves, one that types a password stops.
+    Scratch s;
+    s.write("grab.conf", grab_conf);
+    std::filesystem::create_directories(s.store());
+    auto agent = server(Auth::agent, "agent");
+    agent.host = "h.example.com";
+    agent.port = 22;
+    agent.user = "me";
+    agent.max_depth = 7;
+    const auto edited = server_ops::update_server(s.env(), agent, std::nullopt, std::nullopt);
+    REQUIRE_MESSAGE(edited.has_value(), edited.error_or(""));
+    CHECK(s.read("grab.conf").find("max_depth = 7") != std::string::npos);
+    CHECK_FALSE(server_ops::update_server(s.env(), server(Auth::password), std::string("fake-pw"), std::nullopt));
 }
 
 TEST_CASE("a removal moves an undecryptable store aside too, and goes on") {

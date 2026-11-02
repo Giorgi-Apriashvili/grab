@@ -63,8 +63,7 @@ struct RunOptions {
 // grab's internal rclone calls must not see (rclone_flags::kept_variable; review G8): no inherited
 // RCLONE_CONFIG_* at all, since each run gets its own server's in RunOptions::environment.
 // run_capture, run_streaming and run_piped give their children this one with that environment
-// added; run_inherit (the user's own --rclone copy, an editor, an installer) and start_independent
-// everything.
+// added; run_inherit (an editor, an installer) and start_independent everything.
 [[nodiscard]] std::wstring internal_environment();
 // The same without any RCLONE_* variable at all: for a long-lived program of someone else's (the
 // media player Play starts; review G7).
@@ -111,8 +110,7 @@ run_piped(std::span<const std::string> argv, const std::function<bool(std::strin
 // outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
 [[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
                                                           bool contain_descendants = true);
-// The same with `environment` added to the whole environment: the user's own --rclone copy, given
-// its server (engine::rclone_env).
+// The same with `environment` added to the whole environment.
 [[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
                                                           const Environment& environment,
                                                           bool contain_descendants = true);

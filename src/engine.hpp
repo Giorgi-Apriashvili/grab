@@ -113,14 +113,22 @@ struct ConnectSettings {
 [[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx,
                                                                  std::span<const std::string> extra = {});
 
+// The command's flags after `--` (`extra`) for a run on the context's server, checked once its
+// engine is known and before anything connects (RCLONE-REPLACEMENT.md, phase 8 step 6). None may
+// replace the server grab sets itself (rclone_flags::first_refused). grab's own client (engine =
+// grab) takes only --bind, --contimeout and --timeout, with values it can use (an address, times,
+// a --timeout from 1 s to 24 h), and refuses the rest naming the setting to use instead
+// (rclone_flags::first_unused_by_grab); engine = rclone takes connection flags
+// (rclone_flags::first_unusable). The error is ready to show.
+[[nodiscard]] std::expected<void, std::string> check_run_flags(const Context& ctx, std::span<const std::string> extra);
+
 // What an rclone run on the context's server gets in its environment, its config in memory
 // (`--config NUL`, config_in_memory; RCLONE-REPLACEMENT.md phase 7, decision 1), as
 // RCLONE_CONFIG_<NAME>_<KEY> (secrets::env_name): TYPE sftp, HOST, PORT, USER, the login (agent:
 // KEY_USE_AGENT and its KEY_FILE; key: KEY_FILE and KEY_FILE_PASS; password: PASS; stored_key:
 // KEY_PEM as stored and KEY_FILE_PASS; a password saved beside a key too, which rclone tries after it), grab's
 // known_hosts as KNOWN_HOSTS_FILE, SHELL_TYPE, MD5SUM_COMMAND and SHA1SUM_COMMAND ("none" when
-// grab.conf doesn't know them, so rclone doesn't ask the server on every run; unset for
-// `user_copy`, so that a --rclone --verify lets rclone find the sum commands), PATH_OVERRIDE,
+// grab.conf doesn't know them, so rclone doesn't ask the server on every run), PATH_OVERRIDE,
 // the section's rclone.<key> lines and the store's rclone extras. Secrets come from grab's store
 // for exactly that login, PASS and KEY_FILE_PASS obscured as rclone takes them (secrets::obscure).
 // A path holding '$' (rclone expands its key_file, pubkey_file and known_hosts_file again) goes
@@ -128,9 +136,10 @@ struct ConnectSettings {
 // substituted. Only that run sees them, never grab itself nor another program it starts (review
 // G7), nor another server's run (G84). An unpinned server (check_pinned), or one whose password
 // isn't saved for its login, is an error, and so is a common_flags --bind that isn't an address
-// (connect_settings). grab's own runs refuse a flag in common_flags that would replace these
-// (rclone_flags::first_refused); `user_copy`, for the --rclone copy and its checks, lets it through.
-[[nodiscard]] std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, bool user_copy = false);
+// (connect_settings) or a flag there that would replace these (rclone_flags::first_refused). A
+// store that exists but can't be read is an error for every login method (phase 8): it may keep
+// the server's proxy or ssh command, which rclone would otherwise go without, connecting directly.
+[[nodiscard]] std::expected<proc::Environment, std::string> rclone_env(const Context& ctx);
 
 // rclone's version from `rclone version`'s output ("rclone v1.75.1").
 struct RcloneVersion {
@@ -144,12 +153,10 @@ struct RcloneVersion {
 inline constexpr RcloneVersion min_rclone{1, 67, 0};
 // Whether `rclone` can be used: the one grab ships always; another (grab.conf's `rclone =`
 // when `configured`, else PATH's because the bundled one is missing) is asked its version once
-// per process and refused below min_rclone (review G190).
+// per process and refused below min_rclone (review G190). Asked only where rclone runs:
+// load_context on engine = rclone.
 [[nodiscard]] std::expected<void, std::string> check_rclone(const std::string& rclone,
                                                             const std::filesystem::path& exe_dir, bool configured);
-// The same for the context's rclone, which resolve_rclone_exe left "rclone" only when it falls back
-// to PATH's. Asked only where rclone runs: load_context on engine = rclone, --rclone itself.
-[[nodiscard]] std::expected<void, std::string> check_rclone(const Context& ctx);
 
 // A search, list or Browse through grab's own SSH client (engine = grab): find over an exec
 // channel where the server's check says it works, else the SFTP walk (RCLONE-REPLACEMENT.md,
@@ -266,14 +273,6 @@ grab_find(const Context& ctx, ssh::Pool& pool, const GrabSide& side, ssh::Lookup
 // grab's find check: ...)"; a saved answer with its date ("with find (GNU find, checked on
 // 2026-10-27)"), one asked again with why.
 [[nodiscard]] std::string lookup_text(const Context& ctx, const ssh::Lookup& way);
-
-// rclone argv for downloading `remote_path` into `dest_dir` (DEST\<name>), with the remote's
-// flags as configured (including -P for the console). Fails as build_rclone_argv does.
-[[nodiscard]] std::expected<std::vector<std::string>, std::string> download_argv(const Context& ctx, Mode mode,
-                                                     const std::string& remote_path,
-                                                     const std::filesystem::path& dest_dir,
-                                                     std::span<const std::string> extra = {},
-                                                     std::optional<std::filesystem::path> local_name = {});
 
 // One file rclone is transferring right now.
 struct Transfer {

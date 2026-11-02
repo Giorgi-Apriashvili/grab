@@ -160,7 +160,7 @@ enum class Event {
 
 struct Job {
     const engine::Context* ctx = nullptr;
-    fetch::Connections* connections = nullptr; // nullptr: list() walks with rclone's own (--rclone)
+    fetch::Connections* connections = nullptr; // the server's pool; list() and run() need it
     // How many of its files it may download at the same time now: "At once", less what other
     // downloads hold; at least 1. Called without the caller's mutex. Unset: 4.
     std::function<int()> files_at_once;

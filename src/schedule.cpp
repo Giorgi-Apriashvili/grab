@@ -1,7 +1,5 @@
 #include "schedule.hpp"
 
-#include "rate.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -71,25 +69,6 @@ std::optional<Change> next_change(const std::vector<Rule>& rules, int minute) {
         if (auto then = limit_at(rules, minute + a); then != now) return Change{a, then};
     }
     return std::nullopt;
-}
-
-std::string rclone_bwlimit(const std::vector<Rule>& rules) {
-    const auto points = boundaries(rules);
-    if (points.empty()) return "";
-    auto rate_text = [](std::optional<double> mibps) {
-        return mibps ? rate::bwlimit_arg(bytes_per_s(*mibps)) : std::string("off");
-    };
-    // The limit is the same from one boundary to the next: an entry wherever it changes.
-    std::string out;
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        const auto limit = limit_at(rules, points[i]);
-        const auto before = limit_at(rules, points[(i + points.size() - 1) % points.size()]);
-        if (limit == before) continue;
-        if (!out.empty()) out += ' ';
-        out += std::format("{}-{},{}", day_names[static_cast<std::size_t>(points[i] / day)], time_text(points[i] % day),
-                           rate_text(limit));
-    }
-    return out.empty() ? rate_text(limit_at(rules, 0)) : out; // one limit all week
 }
 
 std::uint64_t bytes_per_s(double mibps) { return static_cast<std::uint64_t>(mibps * 1024 * 1024); }

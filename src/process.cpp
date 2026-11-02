@@ -281,7 +281,7 @@ struct StdHandles {
 
 // `contain_descendants` false: only the child itself is in the job; programs it starts are
 // not, so they outlive it (see RunOptions for run_inherit). `whole_environment`: the child sees
-// every variable (run_inherit: the user's own rclone copy, an editor, an installer); otherwise the
+// every variable (run_inherit: an editor, an installer); otherwise the
 // RCLONE_* ones grab's internal calls must not see are left out (internal_environment). `extra` is
 // added either way.
 std::expected<void, std::string> launch(std::span<const std::string> argv, const StdHandles& std_h,

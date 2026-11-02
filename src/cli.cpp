@@ -1,11 +1,12 @@
 #include "cli.hpp"
 
 #include "rate.hpp"
-#include "rclone_flags.hpp"
 #include "util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <format>
 #include <string_view>
 
 #ifndef GRAB_VERSION
@@ -18,7 +19,7 @@ std::string usage() {
     return R"(grab )" GRAB_VERSION R"( - fetch a file or folder from a Linux server by name
 
 Usage:
-  grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- extra rclone args]
+  grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- FLAGS]
   grab config [-c PATH]
   grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]
   grab update [--check]
@@ -71,12 +72,11 @@ Options:
                        older than the server's): replace it, both (keep yours and save the
                        new one as "name (2).ext") or skip it. Without it grab asks first, or
                        stops when there is no console to ask on
-      --rclone         download with plain rclone copyto / copy and rclone's own progress
-                       instead of grab's resumable download over several connections
-  -- FLAGS             rclone flags: connection ones (--sftp-chunk-size, --bind, --timeout...)
-                       for grab's downloads, but not the server's address, login or host
-                       keys (grab.conf's host, port, user, auth, key_file: grab server edit
-                       NAME); with --rclone, any rclone flags for its copy
+  -- FLAGS             connection flags for this run: --bind ADDRESS, --contimeout TIME and
+                       --timeout TIME (1s to 24h on grab's own client) win over the server's
+                       bind, connect_timeout and io_timeout. A server on engine = rclone also
+                       takes rclone's other connection flags (--sftp-*...), but not its
+                       address, login or host keys (grab server edit NAME)
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
   -v, --verbose        echo the ssh and rclone command lines before running them
       --init           write grab.conf to the config path if absent, with the sftp remotes of
@@ -92,7 +92,6 @@ already on disk (same size, not older than the server's) is not fetched again.
 
 Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
 (ssh or rclone listing) failed, 5 update failed, 6 download failed, 130 stopped by Ctrl+C.
-With --rclone, a failed download exits with rclone's own code.
 )";
 }
 
@@ -108,6 +107,11 @@ namespace {
     return value;
 }
 
+// The long options that take no value.
+constexpr auto switches = std::to_array<std::string_view>({"--file", "--folder", "--verify", "--no-verify", "--first",
+                                                           "--all", "--exact", "--fresh", "--dry-run", "--verbose",
+                                                           "--check", "--init", "--help", "--version"});
+
 } // namespace
 
 std::expected<CliResult, std::string> parse_args(std::span<const std::string> args) {
@@ -115,6 +119,7 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     std::optional<Mode> mode;
     std::vector<std::string> positionals;
     bool passthrough = false;
+    bool rclone_copy = false; // --rclone, which is gone
 
     // `grab config` and `grab update` are subcommands only as the first argument, so a folder
     // literally named "config" or "update" is still reachable with a mode flag first.
@@ -157,6 +162,12 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             if (i + 1 >= args.size()) return util::failf("option {} requires a value", name);
             return args[++i];
         };
+        // A switch takes no value: `--verify=false` turned verification on, `--all=no` took every
+        // match (review G108).
+        if (inline_value && std::ranges::contains(switches, name)) {
+            return util::failf("option {} takes no value{}", name,
+                               name == "--verify" ? " (--no-verify turns verification off)" : "");
+        }
 
         if (name == "-s" || name == "--file" || name == "-f" || name == "--folder") {
             const Mode m = (name == "-s" || name == "--file") ? Mode::file : Mode::folder;
@@ -222,7 +233,7 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         } else if (name == "--exact") {
             result.opts.exact = true;
         } else if (name == "--rclone") {
-            result.opts.rclone = true;
+            rclone_copy = true;
         } else if (name == "--fresh") {
             result.opts.fresh = true;
         } else if (name == "-n" || name == "--dry-run") {
@@ -246,8 +257,27 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         }
     }
 
+    // The plain rclone copy went with the switch to grab's own client (RCLONE-REPLACEMENT.md, phase 8
+    // step 7); engine = rclone keeps a server on rclone, with grab's progress and resume.
+    if (rclone_copy) {
+        return util::failf("--rclone is gone: grab no longer runs a plain rclone copy. To download from a server "
+                           "through rclone until a later grab removes it, set engine = rclone in {} (grab config)",
+                           result.opts.remote ? std::format("[{}]", *result.opts.remote) : "its section");
+    }
     if (result.opts.check && result.action != CliAction::update) {
         return util::fail("--check only applies to `grab update`");
+    }
+    // Only a download hands flags on; the rest would ignore them (refused, never ignored).
+    if (!result.opts.extra.empty() && (result.action == CliAction::server || result.action == CliAction::init ||
+                                       result.action == CliAction::config || result.action == CliAction::update)) {
+        const bool server = result.action == CliAction::server;
+        const char* cmd = server                                 ? "server"
+                          : result.action == CliAction::init     ? "--init"
+                          : result.action == CliAction::config   ? "config"
+                                                                 : "update";
+        return util::failf("`grab {}` takes no flags after --{}", cmd,
+                           server ? "; a server's bind, connect_timeout and io_timeout are set in its section (grab config)"
+                                  : "");
     }
     if (result.action == CliAction::server) {
         if (mode) return util::fail("`grab server` takes no -s/-f");
@@ -295,22 +325,7 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         if (util::trim(positionals[1]).empty()) return util::fail("DEST must not be empty");
         result.opts.dest = util::path_from_utf8(positionals[1]);
     }
-    // grab's engine uses only connection flags (rclone_flags.hpp): anything else after `--` would
-    // be ignored, or worse ("-- --dry-run" still downloaded the big files, G186).
-    if (!result.opts.rclone) {
-        // Nor one that would replace the server grab gives rclone (its address, login, host keys).
-        if (const auto bad = rclone_flags::first_refused(result.opts.extra)) {
-            return util::failf("{} after -- would replace the server's {}, which grab gives rclone itself; {}, or add "
-                               "--rclone for a plain rclone copy that takes it",
-                               bad->flag, bad->what,
-                               rclone_flags::change_instead(*bad, result.opts.remote.value_or("NAME")));
-        }
-        if (const auto bad = rclone_flags::first_unusable(result.opts.extra)) {
-            return util::failf("{} after -- isn't used by grab's downloads, which take only connection flags "
-                               "(--sftp-*, --bind, --timeout...): {}",
-                               bad->flag, bad->hint);
-        }
-    }
+    // The flags after `--` are checked once the server's engine is known (engine::check_run_flags).
     return result;
 }
 

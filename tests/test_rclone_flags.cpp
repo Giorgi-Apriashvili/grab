@@ -34,14 +34,40 @@ TEST_CASE("grab's own rclone calls take only connection flags (G182, G184-G187)"
     CHECK_FALSE(rclone_flags::is_connection("--binder"));
 }
 
-TEST_CASE("a flag after -- that grab's engine doesn't use, with what to use instead") {
+TEST_CASE("a flag after -- that engine = rclone's runs don't use, with what to use instead") {
     using V = std::vector<std::string>;
     CHECK_FALSE(rclone_flags::first_unusable(V{"--sftp-chunk-size", "1Mi", "--bind", "10.0.0.2"}).has_value());
     CHECK(rclone_flags::first_unusable(V{"--bind", "10.0.0.2", "--dry-run"})->flag == "--dry-run");
     CHECK(rclone_flags::first_unusable(V{"-n"})->hint.find("-n") != std::string::npos);
     CHECK(rclone_flags::first_unusable(V{"--bwlimit=5M"})->hint.find("--limit") != std::string::npos);
     CHECK(rclone_flags::first_unusable(V{"-P"})->hint.find("own progress") != std::string::npos);
-    CHECK(rclone_flags::first_unusable(V{"--size-only"})->hint.find("--rclone") != std::string::npos);
+    const auto hint = [](V extra) { return rclone_flags::first_unusable(extra).value_or(rclone_flags::Unusable{}).hint; };
+    CHECK(hint({"--transfers", "4"}).find("At once") != std::string::npos);
+    // --rclone, which took any flag, is gone: nothing to point at.
+    REQUIRE(rclone_flags::first_unusable(V{"--size-only"}).has_value());
+    CHECK(hint({"--size-only"}).empty());
+}
+
+TEST_CASE("a flag after -- that grab's own client doesn't use, with what to use instead (phase 8)") {
+    using V = std::vector<std::string>;
+    // Its three, each with its value, whichever way written.
+    CHECK_FALSE(rclone_flags::first_unused_by_grab(V{"--bind", "10.0.0.2", "--contimeout=5s", "--timeout", "1m"}, "Main")
+                    .has_value());
+    // A value that looks like a flag isn't taken as one's (ssh::read_flags refuses it later).
+    CHECK(rclone_flags::first_unused_by_grab(V{"--bind", "--sftp-connections", "4"}, "Main").value_or("").starts_with(
+        "--sftp-connections after -- isn't used by grab's own client"));
+    CHECK(rclone_flags::first_unused_by_grab(V{"--sftp-connections=4"}, "Box") ==
+          "--sftp-connections after -- isn't used by grab's own client; set max_connections in [Box] (grab config)");
+    CHECK(rclone_flags::first_unused_by_grab(V{"--sftp-http-proxy", "fake-secret-proxy:3128"}, "Box") ==
+          "--sftp-http-proxy after --: grab's own client can't use a proxy; set engine = rclone in [Box] (grab config) "
+          "to use it through rclone");
+    CHECK(rclone_flags::first_unused_by_grab(V{"--sftp-subsystem", "other"}, "Box").value_or("").find(
+              "can't use another SFTP subsystem or server command") != std::string::npos);
+    CHECK(rclone_flags::first_unused_by_grab(V{"--sftp-use-fstat"}, "Box").value_or("").find("set engine = rclone") !=
+          std::string::npos);
+    CHECK(rclone_flags::first_unused_by_grab(V{"--sftp-idle-timeout", "5m"}, "Box").value_or("").ends_with(
+        "; it closes idle connections itself"));
+    CHECK(rclone_flags::first_unused_by_grab(V{"-vv"}, "Box").value_or("").ends_with("; grab's own -v shows what it runs"));
 }
 
 TEST_CASE("which RCLONE_* variables grab's own rclone calls see (G8; phase 7)") {
@@ -103,7 +129,12 @@ TEST_CASE("a refused --sftp-* flag names where grab keeps that setting instead (
     CHECK(change("--sftp-user").find("grab.conf's `user`") != std::string::npos);
     CHECK(change("--sftp-key-file").find("grab.conf's `key_file`") != std::string::npos);
     CHECK(change("--sftp-key-use-agent").find("grab.conf's `auth`") != std::string::npos);
-    CHECK(change("--sftp-pubkey-file").find("grab.conf's `rclone.pubkey_file`") != std::string::npos);
+    // Edit has no field for a certificate: it is written by hand.
+    for (const char* cert : {"--sftp-pubkey-file", "--sftp-pubkey"}) {
+        CHECK_MESSAGE(change(cert) == "write `rclone.pubkey_file = PATH` in [Main] (grab config); only rclone logs in "
+                                      "with a certificate (engine = rclone)",
+                      cert);
+    }
     for (const char* secret : {"--sftp-pass", "--sftp-ask-password", "--sftp-key-file-pass"}) {
         CHECK_MESSAGE(change(secret) == "change it with `grab server edit Main` or Edit in grab's Settings (grab keeps it "
                                         "in its password store)",
@@ -111,7 +142,7 @@ TEST_CASE("a refused --sftp-* flag names where grab keeps that setting instead (
     }
     CHECK(change("--sftp-known-hosts-file") ==
           "pin its host keys with `grab server trust Main` or Trust in grab's Settings");
-    CHECK(change("--sftp-ssh").find("rclone's own SSH client") != std::string::npos);
+    CHECK(change("--sftp-ssh") == "an ssh command can't be given there");
 }
 
 #ifdef _WIN32

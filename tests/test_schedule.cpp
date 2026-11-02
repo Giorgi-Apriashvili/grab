@@ -4,7 +4,6 @@
 #include <doctest/doctest.h>
 
 #include <optional>
-#include <string>
 #include <vector>
 
 using namespace grab;
@@ -116,17 +115,6 @@ TEST_CASE("times and speeds as text") {
     CHECK(schedule::speed_text(2.5) == "2.5 MiB/s");
     CHECK(schedule::speed_text(10000) == "10000 MiB/s");
     CHECK(schedule::bytes_per_s(2.5) == 5u * 1024 * 1024 / 2);
-}
-
-TEST_CASE("rclone gets the schedule as a weekly --bwlimit timetable") {
-    CHECK(schedule::rclone_bwlimit({}).empty());
-    CHECK(schedule::rclone_bwlimit({{mon, 18 * 60, 20 * 60, 5}, {mon, 20 * 60, 22 * 60, 2}}) ==
-          "Mon-18:00,5120K Mon-20:00,2048K Mon-22:00,off");
-    CHECK(schedule::rclone_bwlimit({{weekdays, 18 * 60, 0, 5}}) ==
-          "Mon-18:00,5120K Tue-00:00,off Tue-18:00,5120K Wed-00:00,off Wed-18:00,5120K Thu-00:00,off "
-          "Thu-18:00,5120K Fri-00:00,off Fri-18:00,5120K Sat-00:00,off");
-    CHECK(schedule::rclone_bwlimit({{sun, 23 * 60, 60, 1}}) == "Mon-01:00,off Sun-23:00,1024K");
-    CHECK(schedule::rclone_bwlimit({{every_day, 0, 0, 5}}) == "5120K"); // one limit all week
 }
 
 TEST_CASE("rules as JSON; invalid ones are dropped") {

@@ -71,11 +71,6 @@ TEST_CASE("a file there differs unless it is up to date with the server's") {
     CHECK(existing::differs(f, 11, server * ns_per_s));            // another size
     CHECK(existing::differs(f, 10, (server + 3600) * ns_per_s));   // older than the server's
     CHECK_FALSE(existing::differs(f, 10, (server - 3600) * ns_per_s)); // newer: a later copy
-    // rclone copy also replaces one that is newer.
-    CHECK(existing::rclone_replaces(f, 10, (server - 3600) * ns_per_s));
-    CHECK_FALSE(existing::rclone_replaces(f, 10, server * ns_per_s));
-    CHECK(existing::rclone_replaces(f, 9, server * ns_per_s));
-    CHECK_FALSE(existing::rclone_replaces(dir / "none", 10, std::nullopt));
     const auto mine = existing::local_file(f);
     REQUIRE(mine.has_value());
     CHECK(mine->size == 10);

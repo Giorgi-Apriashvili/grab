@@ -238,22 +238,25 @@ std::string text(std::string_view server, std::span<const Reason> reasons, Engin
         if (i > 0) said += i + 1 == reasons.size() ? " and " : ", ";
         said += describe(reasons[i]);
     }
+    const auto has = [&](std::string_view key, bool ssh_only) {
+        return std::ranges::any_of(reasons, [&](const Reason& r) { return r.key == key && r.ssh_only == ssh_only; });
+    };
     std::string out = std::format("[{}] {}, which grab's own client can't", server, said);
-    if (engine == Engine::grab) {
+    if (has("store", false)) {
+        // rclone isn't started either (engine::rclone_env): it would go without what the store keeps.
+        out += "; grab doesn't start rclone for it either until the store can be read";
+    } else if (engine == Engine::grab) {
         out += std::format(": set engine = rclone in [{}] (grab config) to use it through rclone", server);
     } else {
         out += std::format(": its downloads go through rclone{}; previews, Play and Verify are off for it",
                            routed(reasons) ? ", and its searches and lists by rclone's listing" : "");
     }
-    const auto has = [&](std::string_view key, bool ssh_only) {
-        return std::ranges::any_of(reasons, [&](const Reason& r) { return r.key == key && r.ssh_only == ssh_only; });
-    };
     if (has("ssh", false)) {
         out += "; rclone hands the connection to that ssh command, which picks the host and checks host keys "
                "itself, not against grab's known_hosts";
     }
     if (has("store", false)) {
-        out += "; saving a password or key again with Edit sets the unreadable file aside";
+        out += "; saving the server with Edit (no change needed) sets the unreadable file aside";
     }
     if (has("ProxyCommand", true) || has("ProxyJump", true)) {
         out += "; ssh_options reach only ssh.exe's searches: rclone's downloads never went through them";

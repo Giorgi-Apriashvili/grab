@@ -44,29 +44,51 @@ TEST_CASE("file mode, long flags and options in any order") {
     CHECK(util::path_to_utf8(*r->opts.config) == "C:\\g.conf");
 }
 
-TEST_CASE("everything after -- goes to rclone verbatim with --rclone") {
-    auto r = parse_args(args({"-s", "x", "d", "--rclone", "--", "--bwlimit", "10M", "-f", "--dry-run"}));
+TEST_CASE("everything after -- is kept as it is, for run() to check once the server's engine is known (phase 8)") {
+    // Not ours to judge here: engine::check_run_flags does, per engine, before anything connects.
+    auto r = parse_args(args({"-s", "x", "d", "--", "--bwlimit", "10M", "-f", "--dry-run", "--sftp-host", "h"}));
     REQUIRE(r.has_value());
     CHECK(r->opts.mode == Mode::file);
     CHECK_FALSE(r->opts.dry_run);
-    CHECK(r->opts.extra == std::vector<std::string>{"--bwlimit", "10M", "-f", "--dry-run"});
+    CHECK(r->opts.extra == std::vector<std::string>{"--bwlimit", "10M", "-f", "--dry-run", "--sftp-host", "h"});
+    auto ok = parse_args(args({"x", "d", "--", "--bind=10.8.0.2", "--timeout", "2m"}));
+    REQUIRE(ok.has_value());
+    CHECK(ok->opts.extra == std::vector<std::string>{"--bind=10.8.0.2", "--timeout", "2m"});
 }
 
-TEST_CASE("grab's own downloads take only connection flags after -- (G186)") {
-    auto ok = parse_args(args({"x", "d", "--", "--sftp-chunk-size", "1Mi", "--bind=10.8.0.2", "--timeout", "2m"}));
-    REQUIRE(ok.has_value());
-    CHECK(ok->opts.extra.size() == 5);
-    // "-- --dry-run" still downloaded the big files; now it says what to use instead.
-    auto dry = parse_args(args({"-f", "x", "d", "--", "--dry-run"}));
-    REQUIRE_FALSE(dry.has_value());
-    CHECK(dry.error().find("--dry-run after -- isn't used by grab's downloads") != std::string::npos);
-    CHECK(dry.error().find("grab's own -n") != std::string::npos);
-    auto limit = parse_args(args({"x", "d", "--", "--bwlimit", "10M"}));
-    REQUIRE_FALSE(limit.has_value());
-    CHECK(limit.error().find("--limit") != std::string::npos);
-    auto filter = parse_args(args({"x", "d", "--", "--exclude", "*.part"}));
-    REQUIRE_FALSE(filter.has_value());
-    CHECK(filter.error().find("--rclone") != std::string::npos);
+TEST_CASE("--rclone is gone: a usage error naming engine = rclone (phase 8, decision 2)") {
+    auto bare = parse_args(args({"movie.mkv", "d", "--rclone"}));
+    REQUIRE_FALSE(bare.has_value());
+    CHECK(bare.error() == "--rclone is gone: grab no longer runs a plain rclone copy. To download from a server through "
+                          "rclone until a later grab removes it, set engine = rclone in its section (grab config)");
+    // The server's section when -r names it, before or after.
+    auto named = parse_args(args({"--rclone", "-f", "x", "d", "-r", "Box.Guest"}));
+    REQUIRE_FALSE(named.has_value());
+    CHECK(named.error().find("set engine = rclone in [Box.Guest] (grab config)") != std::string::npos);
+    CHECK_FALSE(parse_args(args({"movie.mkv", "--rclone=1"})).has_value());
+    // After --, it is one of the flags run() checks.
+    auto after = parse_args(args({"movie.mkv", "d", "--", "--rclone"}));
+    REQUIRE(after.has_value());
+    CHECK(after->opts.extra == std::vector<std::string>{"--rclone"});
+    CHECK(usage().find("--rclone") == std::string::npos);
+}
+
+TEST_CASE("a switch refuses a value: --verify=false no longer turns verification on (G108)") {
+    auto verify = parse_args(args({"movie.mkv", "--verify=false"}));
+    REQUIRE_FALSE(verify.has_value());
+    CHECK(verify.error() == "option --verify takes no value (--no-verify turns verification off)");
+    for (const char* bad : {"--all=no", "--first=0", "--no-verify=1", "--exact=", "--fresh=yes", "--dry-run=false",
+                            "--verbose=0", "--file=x", "--folder=x"}) {
+        CAPTURE(bad);
+        auto r = parse_args(args({"movie.mkv", bad}));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().ends_with(" takes no value"));
+    }
+    CHECK(parse_args(args({"update", "--check=1"})).error_or("") == "option --check takes no value");
+    CHECK(parse_args(args({"--init=1"})).error_or("") == "option --init takes no value");
+    // Options that take a value still take it either way.
+    CHECK(parse_args(args({"movie.mkv", "--depth=2"}))->opts.depth == 2);
+    CHECK(parse_args(args({"movie.mkv", "--all"}))->opts.all);
 }
 
 TEST_CASE("grab server: list, add [NAME], and edit, test, trust and remove with a NAME (phase 7)") {
@@ -92,25 +114,13 @@ TEST_CASE("grab server: list, add [NAME], and edit, test, trust and remove with 
     CHECK(usage().find("grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]") !=
           std::string::npos);
     CHECK(usage().find("rclone.conf with") == std::string::npos);
-}
-
-TEST_CASE("after --, a flag that would replace the server grab gives rclone is refused; --rclone takes it (phase 7)") {
-    auto host = parse_args(args({"x", "d", "--", "--sftp-chunk-size", "1Mi", "--sftp-host=elsewhere.example"}));
-    REQUIRE_FALSE(host.has_value());
-    CHECK(host.error().starts_with("--sftp-host after -- would replace the server's address"));
-    CHECK(host.error().find("--rclone") != std::string::npos);
-    // It says where grab keeps that setting, for the server named, else a placeholder.
-    CHECK(host.error().find("change grab.conf's `host` with `grab server edit NAME`") != std::string::npos);
-    auto named = parse_args(args({"-r", "Box", "x", "d", "--", "--sftp-user", "u"}));
-    REQUIRE_FALSE(named.has_value());
-    CHECK(named.error().find("`grab server edit Box`") != std::string::npos);
-    auto keys = parse_args(args({"x", "d", "--", "--sftp-known-hosts-file", "C:\\other"}));
-    REQUIRE_FALSE(keys.has_value());
-    CHECK(keys.error().find("trusted host keys") != std::string::npos);
-    CHECK(keys.error().find("`grab server trust NAME`") != std::string::npos);
-    auto copy = parse_args(args({"x", "d", "--rclone", "--", "--sftp-host", "elsewhere.example"}));
-    REQUIRE(copy.has_value());
-    CHECK(copy->opts.extra == std::vector<std::string>{"--sftp-host", "elsewhere.example"});
+    // Flags after -- reach only a download: elsewhere they are refused, not ignored.
+    CHECK(parse_args(args({"server", "test", "Main", "--", "--bind", "10.0.0.2"})).error_or("") ==
+          "`grab server` takes no flags after --; a server's bind, connect_timeout and io_timeout are set in its "
+          "section (grab config)");
+    CHECK(parse_args(args({"config", "--", "-x"})).error_or("") == "`grab config` takes no flags after --");
+    CHECK(parse_args(args({"update", "--", "-x"})).error_or("") == "`grab update` takes no flags after --");
+    CHECK(parse_args(args({"--init", "--", "-x"})).error_or("") == "`grab --init` takes no flags after --");
 }
 
 TEST_CASE("mode defaults to file and the two mode flags are exclusive") {
@@ -200,13 +210,6 @@ TEST_CASE("--verify and --no-verify override the window's setting for one run") 
     CHECK(parse_args(args({"movie.mkv", "--verify"}))->opts.verify == true);
     CHECK(parse_args(args({"movie.mkv", "--no-verify"}))->opts.verify == false);
     CHECK(parse_args(args({"movie.mkv", "--no-verify", "--verify"}))->opts.verify == true); // the last one wins
-}
-
-TEST_CASE("--rclone downloads with plain rclone, as before") {
-    auto r = parse_args(args({"movie.mkv", "--rclone"}));
-    REQUIRE(r.has_value());
-    CHECK(r->opts.rclone);
-    CHECK_FALSE(parse_args(args({"movie.mkv"}))->opts.rclone);
 }
 
 TEST_CASE("help, version and init short-circuit") {
