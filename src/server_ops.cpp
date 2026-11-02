@@ -7,6 +7,7 @@
 #include "ini.hpp"
 #include "passwords.hpp"
 #include "process.hpp"
+#include "rclone_flags.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "server_conf.hpp"
@@ -306,6 +307,16 @@ const RemoteSettings* find_server(const GrabConfig& cfg, std::string_view name) 
     return nullptr;
 }
 
+namespace {
+
+// A time as grab.conf takes it: "30s", "1500ms", "off".
+std::string time_text(std::chrono::milliseconds t) {
+    if (t.count() == 0) return "off";
+    return t.count() % 1000 == 0 ? std::format("{}s", t.count() / 1000) : std::format("{}ms", t.count());
+}
+
+} // namespace
+
 std::vector<ServerInfo> list_servers(const Env& env) {
     std::vector<ServerInfo> out;
     // Read when asked (G209): pinned is what the file holds now.
@@ -319,6 +330,11 @@ std::vector<ServerInfo> list_servers(const Env& env) {
         for (const auto& r : s.search_roots) info.search_roots.push_back(r.empty() ? "~" : r);
         info.max_depth = s.max_depth;
         info.max_connections = s.max_connections;
+        std::vector<std::string> keys;
+        if (s.bind) keys.push_back("bind " + *s.bind);
+        if (s.connect_timeout) keys.push_back("connect_timeout " + time_text(*s.connect_timeout));
+        if (s.io_timeout) keys.push_back("io_timeout " + time_text(*s.io_timeout));
+        info.connection_keys = util::join(keys, ", ");
         auto c = connection_in(env.grab_text, s.name);
         if (!c) {
             info.error = c.error();
@@ -347,12 +363,17 @@ std::vector<ServerInfo> list_servers(const Env& env) {
                                          : conn.auth == servers::Auth::key    ? passwords::passphrase
                                          : conn.auth == servers::Auth::stored_key ? passwords::key_pem
                                                                                   : std::string_view{};
-            if (!key.empty() && store) {
-                const passwords::Binding login{.user = conn.user, .host = conn.host, .port = conn.port};
-                info.secret_saved = passwords::value_for(*store, s.name, key, login).has_value();
-            } else if (!key.empty()) {
-                info.store_error = store.error();
-            }
+            const passwords::Binding login{.user = conn.user, .host = conn.host, .port = conn.port};
+            if (!key.empty() && store) info.secret_saved = passwords::value_for(*store, s.name, key, login).has_value();
+            if (!store) info.store_error = store.error();
+            auto extras = store ? guard::store_extras(*store, s.name, login) : std::vector<std::pair<std::string, std::string>>{};
+            // As make_context has it: an unreadable store may hold a route.
+            auto found = guard::evaluate(guard::sources(s, conn, extras));
+            if (!store) guard::add_unreadable_store(found);
+            info.guard = guard::reasons(found);
+            // As make_context has it: ssh.exe find would connect past a route rclone takes.
+            if (info.engine == Engine::rclone && guard::routed(info.guard)) info.search = "rclone";
+            for (auto& [k, v] : extras) std::ranges::fill(v, '\0');
         }
         out.push_back(std::move(info));
     }
@@ -361,8 +382,9 @@ std::vector<ServerInfo> list_servers(const Env& env) {
 
 // ---- host keys -----------------------------------------------------------------------------
 
-std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port, std::stop_token stop) {
-    auto scanned = ssh::scan_host_keys(host, port, std::chrono::seconds(10), std::move(stop));
+std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port, std::stop_token stop,
+                                                    const ssh::Reach& reach) {
+    auto scanned = ssh::scan_host_keys(host, port, std::chrono::seconds(10), std::move(stop), reach);
     if (!scanned) return util::fail(scanned.error());
     HostKeys keys;
     for (const auto& key : *scanned) {
@@ -370,6 +392,30 @@ std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int
         keys.fingerprints.push_back(servers::Fingerprint{.hash = key.fingerprint, .type = servers::key_label(key.type)});
     }
     return keys;
+}
+
+std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name) {
+    const auto* s = find_server(env.cfg, name);
+    if (s == nullptr) return ssh::Reach{};
+    auto reach = engine::connect_settings(*s);
+    if (!reach) return util::fail(reach.error());
+    ssh::Reach out;
+    if (reach->bind) {
+        out.bind = *reach->bind;
+        out.bind_from = reach->bind_from;
+    }
+    out.connect_timeout = reach->connect_timeout;
+    return out;
+}
+
+std::string direct_warning(const ServerInfo& s, const std::string& host, int port) {
+    std::vector<std::string> routes;
+    for (const auto& r : s.guard) {
+        if (r.kind == guard::Kind::route) routes.push_back(guard::describe(r));
+    }
+    if (routes.empty()) return {};
+    return std::format("{} {}: fetching its host key connects to {}:{} directly from this PC, past that", s.name,
+                       util::join(routes, " and "), host, port);
 }
 
 namespace {
@@ -930,7 +976,11 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
         auto probe = engine::rclone_env(ctx).and_then([&](proc::Environment server) {
             auto run = quiet(stop);
             run.environment = std::move(server);
-            return proc::run_capture(servers::probe_argv(env.rclone, s->rclone_remote), run);
+            // common_flags' connection flags before its short times, the server's keys after them.
+            return proc::run_capture(servers::probe_argv(env.rclone, s->rclone_remote,
+                                                         rclone_flags::connection(s->common_flags),
+                                                         engine::key_flags(*s)),
+                                     run);
         });
         if (stop.stop_requested()) return util::fail("cancelled");
         result.rclone_ok = ok(probe);
@@ -938,12 +988,22 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
     }
 
     if (with_ssh) {
-        std::vector<std::string> options{"-o", "BatchMode=yes", "-o", "ConnectTimeout=15"};
-        options.insert(options.end(), s->ssh_options.begin(), s->ssh_options.end());
-        auto ssh = proc::run_capture(build_ssh_argv(env.cfg.ssh, ctx.remote, options, "echo grab-ok"), quiet(stop));
-        if (stop.stop_requested()) return util::fail("cancelled");
-        result.ssh_ok = ok(ssh) && ssh->out.find("grab-ok") != std::string::npos;
-        if (!*result.ssh_ok) result.ssh_error = ssh ? first_line(ssh->err) : ssh.error();
+        // The server's bind and connect time before the test's own 15 s and its ssh_options:
+        // OpenSSH keeps the first value it sees.
+        if (auto reach = engine::connect_settings(*s); !reach) {
+            result.ssh_ok = false;
+            result.ssh_error = reach.error();
+        } else {
+            std::vector<std::string> options{"-o", "BatchMode=yes"};
+            const auto own = engine::ssh_connect_options(*reach);
+            options.insert(options.end(), own.begin(), own.end());
+            options.insert(options.end(), {"-o", "ConnectTimeout=15"});
+            options.insert(options.end(), s->ssh_options.begin(), s->ssh_options.end());
+            auto ssh = proc::run_capture(build_ssh_argv(env.cfg.ssh, ctx.remote, options, "echo grab-ok"), quiet(stop));
+            if (stop.stop_requested()) return util::fail("cancelled");
+            result.ssh_ok = ok(ssh) && ssh->out.find("grab-ok") != std::string::npos;
+            if (!*result.ssh_ok) result.ssh_error = ssh ? first_line(ssh->err) : ssh.error();
+        }
     }
     // Every server: grab's own login, which downloads and searches use on engine = grab, and
     // previews, Play and verification on any.

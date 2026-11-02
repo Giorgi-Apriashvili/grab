@@ -1,6 +1,9 @@
 #include "server_cli.hpp"
 
 #include "config.hpp"
+#include "guard.hpp"
+#include "gui_state.hpp"
+#include "notices.hpp"
 #include "server_conf.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
@@ -48,10 +51,18 @@ bool confirm(std::string_view prompt) {
 }
 
 // Scans the server's host keys, shows their fingerprints and asks to trust them. Nothing is
-// written before the yes.
-std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::string& host, int port) {
+// written before the yes. `reach`: the server's bind and connect time; `direct`, when its settings
+// route its connections (server_ops::direct_warning), is said first and the scan waits for a yes,
+// since it connects directly.
+std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::string& host, int port,
+                                                                const ssh::Reach& reach = {},
+                                                                const std::string& direct = {}) {
+    if (!direct.empty()) {
+        std::println(stderr, "{}.", direct);
+        if (!confirm("Connect directly?")) return util::fail("not connected; nothing was changed");
+    }
     std::println(stderr, "Fetching the host key of {}:{} ...", host, port);
-    auto keys = server_ops::scan_host_keys(host, port);
+    auto keys = server_ops::scan_host_keys(host, port, {}, reach);
     if (!keys) return keys;
 
     std::println(stderr, "\nThe server presents these keys:");
@@ -93,8 +104,10 @@ int server_list(const Env& env) {
                              : s.search == "find"   ? "engine grab, search with find"
                              : s.search == "walk"   ? "engine grab, search by listing folders"
                                                     : "engine grab, search with find or by listing folders";
-        std::println("{} {:<14} {}@{}:{}  {}, {}, {}", mark, s.name, s.user, s.host, s.port, server_ops::login_text(s),
-                     search, server_ops::host_key_text(s));
+        std::println("{} {:<14} {}@{}:{}  {}, {}, {}{}", mark, s.name, s.user, s.host, s.port, server_ops::login_text(s),
+                     search, server_ops::host_key_text(s),
+                     s.connection_keys.empty() ? std::string() : ", " + s.connection_keys);
+        if (!s.guard.empty()) std::println("  {:<14} {}", "", guard::text(s.name, s.guard, s.engine));
     }
     return exit_ok;
 }
@@ -300,7 +313,12 @@ int server_edit(const Env& env, const std::string& name) {
     // A new address, or one never pinned: its host key first, as for add.
     std::optional<server_ops::HostKeys> keys;
     if (server_ops::edit_needs_host_key(*current, s)) {
-        auto fetched = fetch_host_key(s.host, s.port);
+        auto reach = server_ops::reach_for(env, name);
+        if (!reach) {
+            error(reach.error());
+            return exit_config;
+        }
+        auto fetched = fetch_host_key(s.host, s.port, *reach, server_ops::direct_warning(*current, s.host, s.port));
         if (!fetched) {
             error(fetched.error());
             return exit_config;
@@ -319,7 +337,8 @@ int server_edit(const Env& env, const std::string& name) {
     return test_saved(env, name, ssh_hint(s.auth, passphrase));
 }
 
-int server_test(const Env& env, const std::string& name) {
+// `again`: the server's notices (notices.hpp) not printed already, which a test repeats.
+int server_test(const Env& env, const std::string& name, const std::vector<std::string>& again) {
     const auto s = server_named(env, name);
     if (!s) return exit_not_found;
     if (!s->error.empty()) {
@@ -328,6 +347,7 @@ int server_test(const Env& env, const std::string& name) {
     }
     std::println(stderr, "Testing {} ({}@{}:{}) ...", name, s->user, s->host, s->port);
     const int rc = print_test(env, name, ssh_hint(s->auth, s->secret_saved == true));
+    for (const auto& text : again) std::println(stderr, "  note: {}", text);
     if (rc == exit_ok) std::println(stderr, "\n{} works.", name);
     else std::println(stderr, "\n{} has a problem: see above (grab server edit {} changes it).", name, name);
     return rc;
@@ -342,7 +362,12 @@ int server_trust(const Env& env, const std::string& name) {
         error(s->error);
         return exit_config;
     }
-    auto keys = fetch_host_key(s->host, s->port);
+    auto reach = server_ops::reach_for(env, name);
+    if (!reach) {
+        error(reach.error());
+        return exit_config;
+    }
+    auto keys = fetch_host_key(s->host, s->port, *reach, server_ops::direct_warning(*s, s->host, s->port));
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -396,10 +421,20 @@ int run_server_command(const Options& opts) {
     for (const auto& note : env->import_notes) std::println(stderr, "grab: note: {}", note);
     const std::string& sub = opts.server_args.at(0);
     const std::string arg = opts.server_args.size() > 1 ? opts.server_args[1] : std::string{};
+    // The settings' notices this configuration hasn't shown yet; a test repeats its server's.
+    std::vector<std::string> again;
+    if (auto all = notices::for_config(env->grab_conf)) {
+        auto fresh = notices::take_new(notices::path_in(state_dir(env->grab_conf)), *all);
+        const auto& shown = fresh ? *fresh : *all; // unsaved: said every time rather than never
+        for (const auto& n : shown) std::println(stderr, "grab: note: {}", n.text);
+        for (const auto& n : *all) {
+            if (n.server == arg && !std::ranges::contains(shown, n)) again.push_back(n.text);
+        }
+    }
     if (sub == "list") return server_list(*env);
     if (sub == "add") return server_add(*env, arg);
     if (sub == "edit") return server_edit(*env, arg);
-    if (sub == "test") return server_test(*env, arg);
+    if (sub == "test") return server_test(*env, arg, again);
     if (sub == "trust") return server_trust(*env, arg);
     if (sub == "remove") return server_remove(*env, arg);
     error(std::format("unknown `grab server` command '{}'", sub));

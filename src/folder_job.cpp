@@ -116,6 +116,9 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     if (limit > 0) extra.insert(extra.end(), {"--bwlimit", rate::bwlimit_arg(limit)});
     // Conflicts were answered before: a file that appeared at one of these names since stays.
     if (job.existing != existing::Choice::replace) extra.emplace_back("--ignore-existing");
+    // The server's keys after grab's own, then the command's.
+    const auto keys = engine::key_flags(job.ctx->settings);
+    extra.insert(extra.end(), keys.begin(), keys.end());
     const auto given = rclone_flags::connection(job.extra);
     extra.insert(extra.end(), given.begin(), given.end());
     // What rclone leaves when stopped: its temp files next to these, made by this run.
@@ -565,9 +568,10 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
         std::lock_guard lock(m);
         reserved = reserved_names(dir, tree);
     }
-    auto flags = rclone_flags::connection(job.ctx->settings.common_flags);
+    const auto flags = rclone_flags::connection(job.ctx->settings.common_flags);
+    auto after = engine::key_flags(job.ctx->settings);
     const auto extra = rclone_flags::connection(job.extra);
-    flags.insert(flags.end(), extra.begin(), extra.end());
+    after.insert(after.end(), extra.begin(), extra.end());
     // rclone's environment for the server, unless grab's own pool fetches them; without it each
     // file fails with why.
     const auto env = job.pool ? std::expected<proc::Environment, std::string>{} : engine::rclone_env(*job.ctx);
@@ -618,7 +622,8 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& s
                                      .environment = env.value_or(proc::Environment{}),
                                      .rclone_remote = job.ctx->settings.rclone_remote,
                                      .path = child_remote_path(job.remote_path, path),
-                                     .flags = flags};
+                                     .flags = flags,
+                                     .after = after};
             d.server = job.server;
             d.id = job.id;
             d.target = target;
@@ -945,8 +950,6 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
     if (!env) return util::fail(env.error());
     const auto flags = rclone_flags::connection(ctx.settings.common_flags);
     argv.insert(argv.end(), flags.begin(), flags.end());
-    const auto extra = rclone_flags::connection(job.extra);
-    argv.insert(argv.end(), extra.begin(), extra.end());
     // Its walk's connections come from the pool, as the downloads' do (review G191); without one
     // (--rclone), rclone's own.
     std::optional<fetch::Listing> walk;
@@ -956,6 +959,11 @@ std::expected<void, std::string> list(const Job& job, Tree& tree, std::mutex& m,
         const auto walk_flags = walk->flags();
         argv.insert(argv.end(), walk_flags.begin(), walk_flags.end());
     }
+    // The server's keys, then the command's flags, last so they win.
+    const auto keys = engine::key_flags(ctx.settings);
+    argv.insert(argv.end(), keys.begin(), keys.end());
+    const auto extra = rclone_flags::connection(job.extra);
+    argv.insert(argv.end(), extra.begin(), extra.end());
     if (job.on_command) job.on_command(argv);
     proc::RunOptions quiet;
     quiet.detached = true;

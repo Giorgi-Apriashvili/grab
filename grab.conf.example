@@ -33,7 +33,7 @@ user = alice
 # How to log in: agent (the keys in Windows' ssh-agent; with key_file, only that one), key
 # (key_file; its passphrase, if any, in grab's store), password (in grab's store: enter it
 # with `grab server edit hetzner`) or stored_key (a key imported from rclone.conf, kept in
-# grab's store; only rclone can use it).
+# grab's store with its passphrase).
 auth = key
 key_file = C:\Users\alice\.ssh\id_ed25519
 # What the server told grab's Test, so rclone needn't ask it again on every run: its shell

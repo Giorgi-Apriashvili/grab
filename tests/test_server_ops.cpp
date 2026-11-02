@@ -18,6 +18,7 @@
 #include <windows.h> // IWYU pragma: keep (LockFileEx, SetFileAttributesW)
 #endif
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -251,6 +252,50 @@ TEST_CASE("server list from grab.conf: details, pins read now (G209), sections w
     const auto again = server_ops::list_servers(env);
     CHECK_FALSE(again[0].host_key_pinned);
     CHECK(again[1].host_key_pinned);
+}
+
+TEST_CASE("server list: the guard's reasons, the connection keys; Trust's reach and its word before a direct fetch") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "bind = 10.0.0.2\nconnect_timeout = 1500ms\nio_timeout = 2m\n"
+                                     "\n[plain]\nhost = p.example\nuser = p\nauth = agent\ncommon_flags = --bind 10.0.0.7\n"
+                                     "\n[routed]\nhost = r.example\nuser = r\nauth = agent\n");
+    REQUIRE(passwords::save(s.store(), {{"box", {{"password", fake("fake-pw")},
+                                                 {"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}},
+                                        {"agent", {{"rclone.http_proxy", fake("p:1", "someone-else", "h.example.com", 22)}}},
+                                        {"routed", {{"rclone.ssh", fake("ssh fake-jump", "r", "r.example", 22)}}}}));
+    const auto env = s.env();
+    const auto list = server_ops::list_servers(env);
+    REQUIRE(list.size() == 4);
+    // box: its store's proxy (bound to its login); agent: one saved for another login doesn't count.
+    REQUIRE(list[0].guard.size() == 1);
+    CHECK(list[0].guard[0].where == "rclone.socks_proxy");
+    CHECK(list[1].guard.empty());
+    CHECK(list[1].search == "ssh");
+    // An agent server routed by rclone: searched by rclone's listing, never ssh.exe find past it.
+    REQUIRE(list[3].guard.size() == 1);
+    CHECK(list[3].search == "rclone");
+    CHECK(list[1].connection_keys == "bind 10.0.0.2, connect_timeout 1500ms, io_timeout 120s");
+    CHECK(list[0].connection_keys.empty());
+    // Trust says it connects directly, naming the setting, never its value.
+    const auto said = server_ops::direct_warning(list[0], list[0].host, list[0].port);
+    CHECK(said == "box connects through a SOCKS proxy (rclone.socks_proxy): fetching its host key connects to "
+                  "box.example.com:23 directly from this PC, past that");
+    CHECK(server_ops::direct_warning(list[1], list[1].host, list[1].port).empty());
+    // The host-key fetch connects from the server's bind, within its connect time (common_flags'
+    // --bind where the key is blank); a new server has none.
+    const auto agent = server_ops::reach_for(env, "agent");
+    REQUIRE(agent);
+    CHECK(agent->bind == "10.0.0.2");
+    CHECK(agent->bind_from == "bind in [agent]");
+    CHECK(agent->connect_timeout == std::chrono::milliseconds(1'500));
+    const auto plain = server_ops::reach_for(env, "plain");
+    REQUIRE(plain);
+    CHECK(plain->bind == "10.0.0.7");
+    CHECK(plain->bind_from == "common_flags' --bind");
+    CHECK_FALSE(plain->connect_timeout);
+    const auto none = server_ops::reach_for(env, "new");
+    REQUIRE(none);
+    CHECK(none->bind.empty());
 }
 
 TEST_CASE("an edit of search folders keeps comments, refreshes grab's line and leaves the store alone (G85)") {
@@ -864,7 +909,13 @@ TEST_CASE("server list says whether each login's secret is saved for that very l
     CHECK_FALSE(list[0].secret_saved.has_value());
     CHECK_FALSE(list[0].store_error.empty());
     CHECK(server_ops::login_text(list[0]).starts_with("password (grab's saved passwords can't be read: "));
-    CHECK(list[1].store_error.empty()); // ssh-agent needs none
+    // ssh-agent needs none to log in, but the store may hold a route: the guard counts it as one,
+    // so Trust asks "Connect directly?" first.
+    CHECK_FALSE(list[1].store_error.empty());
+    CHECK(server_ops::login_text(list[1]) == "ssh-agent");
+    REQUIRE(list[1].guard.size() == 1);
+    CHECK(list[1].guard[0].where == "grab's store, which can't be read");
+    CHECK_FALSE(server_ops::direct_warning(list[1], "a.example", 22).empty());
     // So an edit can't keep "the saved one".
     CHECK(server_ops::edit_needs_password(list[0], server(Auth::password)));
 #endif

@@ -47,6 +47,8 @@ namespace grab::util {
 
 // Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
 [[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
+// Lowercase hex SHA-256 of `data` (OpenSSL's EVP).
+[[nodiscard]] std::string sha256_hex(std::string_view data);
 
 // How md5_file reads a file.
 struct FileHashOptions {

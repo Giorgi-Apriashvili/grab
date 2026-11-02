@@ -128,7 +128,10 @@ struct Source {
     proc::Environment environment;
     std::string rclone_remote;
     std::string path;
-    std::vector<std::string> flags; // the remote's common flags, without console progress
+    std::vector<std::string> flags; // common_flags' connection flags (rclone_flags::connection)
+    // After grab's fixed --contimeout, --timeout and --low-level-retries, so they win: the server's
+    // keys (engine::key_flags), then the command's connection flags after `--`.
+    std::vector<std::string> after;
 };
 [[nodiscard]] std::vector<std::string> stat_argv(const Source& src);
 // `low_read_ahead`: under a speed limit, keep rclone from downloading far ahead of what grab

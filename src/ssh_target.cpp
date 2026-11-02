@@ -27,10 +27,20 @@ std::expected<Target, std::string> target_for(std::string_view name, const serve
     const auto saved = [&](std::string_view key) { return passwords::value_for(store, name, key, login).value_or(""); };
 
     switch (c.auth) {
-    case server_conf::Auth::stored_key:
-        return util::failf("{} logs in with a key kept in grab's password store (imported from rclone.conf), which "
-                           "grab's own client can't use yet: it works on engine = rclone only",
-                           name);
+    case server_conf::Auth::stored_key: {
+        auto pem = passwords::value_for(store, name, passwords::key_pem, login);
+        if (!pem) return util::failf("{}: {}", name, passwords::why_none(store, name, passwords::key_pem, login));
+        auto key = unquote_key_pem(*pem);
+        std::ranges::fill(*pem, '\0');
+        if (!key) {
+            return util::failf("{}: the key kept in grab's store isn't written as rclone reads key_pem (on one line, its "
+                               "line breaks as \\n): choose a key file or ssh-agent with `grab server edit {}`",
+                               name, name);
+        }
+        t.key_pem = std::move(*key);
+        t.key_passphrase = saved(passwords::passphrase);
+        break;
+    }
     case server_conf::Auth::agent:
         t.agent = true;
         break;
@@ -48,6 +58,94 @@ std::expected<Target, std::string> target_for(std::string_view name, const serve
     // A password saved beside a key is tried after it, as rclone does.
     t.password = saved(passwords::password);
     return t;
+}
+
+std::optional<std::string> unquote_key_pem(std::string_view value) {
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    // A code point as UTF-8 (valid ones only, as Go's utf8.ValidRune).
+    auto append_utf8 = [](std::string& out, std::uint32_t r) {
+        if (r < 0x80) {
+            out += static_cast<char>(r);
+        } else if (r < 0x800) {
+            out += static_cast<char>(0xC0 | (r >> 6));
+            out += static_cast<char>(0x80 | (r & 0x3F));
+        } else if (r < 0x10000) {
+            out += static_cast<char>(0xE0 | (r >> 12));
+            out += static_cast<char>(0x80 | ((r >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (r & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (r >> 18));
+            out += static_cast<char>(0x80 | ((r >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((r >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (r & 0x3F));
+        }
+    };
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size();) {
+        const char c = value[i];
+        // A bare quote would end Go's string early, a bare line break isn't allowed in one.
+        if (c == '"' || c == '\n') return std::nullopt;
+        if (c != '\\') {
+            out += c; // bytes over 0x7F as they are: a key is ASCII
+            ++i;
+            continue;
+        }
+        if (i + 1 >= value.size()) return std::nullopt;
+        const char e = value[i + 1];
+        i += 2;
+        switch (e) {
+        case 'a': out += '\a'; continue;
+        case 'b': out += '\b'; continue;
+        case 'f': out += '\f'; continue;
+        case 'n': out += '\n'; continue;
+        case 'r': out += '\r'; continue;
+        case 't': out += '\t'; continue;
+        case 'v': out += '\v'; continue;
+        case '\\': out += '\\'; continue;
+        case '"': out += '"'; continue;
+        default: break;
+        }
+        if (e == 'x' || e == 'u' || e == 'U') {
+            const std::size_t digits = e == 'x' ? 2 : e == 'u' ? 4 : 8;
+            if (i + digits > value.size()) return std::nullopt;
+            std::uint32_t v = 0;
+            for (std::size_t k = 0; k < digits; ++k) {
+                const int d = hex(value[i + k]);
+                if (d < 0) return std::nullopt;
+                v = (v << 4) | static_cast<std::uint32_t>(d);
+            }
+            i += digits;
+            if (e == 'x') {
+                out += static_cast<char>(v); // a byte
+            } else {
+                if (v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return std::nullopt;
+                append_utf8(out, v);
+            }
+            continue;
+        }
+        if (e >= '0' && e <= '7') {
+            // Three octal digits in all, at most 0377.
+            if (i + 2 > value.size()) return std::nullopt;
+            auto v = static_cast<std::uint32_t>(e - '0');
+            for (std::size_t k = 0; k < 2; ++k) {
+                const char o = value[i + k];
+                if (o < '0' || o > '7') return std::nullopt;
+                v = (v << 3) | static_cast<std::uint32_t>(o - '0');
+            }
+            if (v > 0xFF) return std::nullopt;
+            i += 2;
+            out += static_cast<char>(v);
+            continue;
+        }
+        return std::nullopt; // \' and anything else Go doesn't know in a "..." string
+    }
+    return out;
 }
 
 std::optional<std::chrono::milliseconds> parse_duration(std::string_view text) {
@@ -103,13 +201,13 @@ std::optional<std::chrono::milliseconds> parse_duration(std::string_view text) {
     return std::chrono::milliseconds{total > 0 && ms == 0 ? 1 : ms};
 }
 
-std::expected<std::vector<std::string>, std::string> apply_flags(Target& target, std::span<const std::string> flags) {
-    std::vector<std::string> unused;
+std::expected<ConnectionFlags, std::string> read_flags(std::span<const std::string> flags) {
+    ConnectionFlags out;
     for (std::size_t i = 0; i < flags.size(); ++i) {
         const std::string& flag = flags[i];
         const std::string name = flag.substr(0, flag.find('='));
         if (name != "--bind" && name != "--contimeout" && name != "--timeout") {
-            unused.push_back(flag);
+            out.unused.push_back(flag);
             continue;
         }
         std::string value;
@@ -117,14 +215,28 @@ std::expected<std::vector<std::string>, std::string> apply_flags(Target& target,
         else if (i + 1 < flags.size() && !flags[i + 1].starts_with('-')) value = flags[++i];
         else return util::failf("{} needs a value", name);
         if (name == "--bind") {
-            target.bind = std::string(util::trim(value));
+            out.bind = std::string(util::trim(value));
             continue;
         }
         const auto time = parse_duration(value);
         if (!time) return util::failf("{} {}: not a time grab can read (such as 30s, 1m30s or off)", name, value);
-        (name == "--contimeout" ? target.connect_timeout : target.timeout) = *time;
+        if (name == "--contimeout") {
+            out.connect_timeout = *time;
+        } else {
+            out.timeout = *time;
+            out.timeout_text = std::string(util::trim(value));
+        }
     }
-    return unused;
+    return out;
+}
+
+std::expected<std::vector<std::string>, std::string> apply_flags(Target& target, std::span<const std::string> flags) {
+    auto read = read_flags(flags);
+    if (!read) return util::fail(read.error());
+    if (read->bind) target.bind = *read->bind;
+    if (read->connect_timeout) target.connect_timeout = *read->connect_timeout;
+    if (read->timeout) target.timeout = *read->timeout;
+    return std::move(read->unused);
 }
 
 } // namespace grab::ssh

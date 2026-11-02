@@ -786,6 +786,16 @@ std::expected<std::string, std::string> md5_file(const std::filesystem::path& p,
     return hex;
 }
 
+std::string sha256_hex(std::string_view data) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int size = 0;
+    EVP_Digest(data.data(), data.size(), digest.data(), &size, EVP_sha256(), nullptr);
+    std::string hex;
+    hex.reserve(std::size_t{size} * 2);
+    for (unsigned int i = 0; i < size; ++i) hex += std::format("{:02x}", digest[i]);
+    return hex;
+}
+
 #ifdef _WIN32
 
 std::string error_message(unsigned long code) {

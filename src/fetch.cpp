@@ -189,6 +189,7 @@ std::vector<std::string> base_argv(const Source& src, std::initializer_list<std:
     argv.insert(argv.end(), src.flags.begin(), src.flags.end());
     // A dead connection is noticed in a minute; grab retries the chunk from where it stopped.
     argv.insert(argv.end(), {"--contimeout", "15s", "--timeout", "60s", "--low-level-retries", "1"});
+    argv.insert(argv.end(), src.after.begin(), src.after.end());
     return argv;
 }
 

@@ -65,7 +65,10 @@ add_executable(grab_tests
     test_fetch_grab.cpp
     test_folder_grab.cpp
     test_lookup_grab.cpp
-    test_live_server.cpp)
+    test_live_server.cpp
+    test_guard.cpp
+    test_notices.cpp
+    test_ssh_keys.cpp)
 
 # OpenSSL's MD5 for the checks' own sums (test_ssh_hash.cpp, test_live_server.cpp) and the local
 # hash timing; made-up keys and rclone's obscuring for test_rclone_env.cpp.

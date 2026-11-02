@@ -1,11 +1,14 @@
 #include "config.hpp"
 #include "engine.hpp"
+#include "fetch.hpp"
+#include "gui_state.hpp"
 #include "listing.hpp"
 #include "passwords.hpp"
 #include "rclone.hpp"
 #include "remote.hpp"
 #include "secrets.hpp"
 #include "server_conf.hpp"
+#include "servers.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -330,8 +333,258 @@ TEST_CASE("grab's own target: common_flags, then the command's flags after --, w
     CHECK(given->timeout == std::chrono::minutes(1));
     const std::vector<std::string> bad{"--timeout", "soon"};
     CHECK(engine::ssh_target(ctx, bad).error_or("").starts_with("the flags after --: --timeout soon"));
+    // A blank --bind after `--` clears the bind for the run; in common_flags it is no bind.
+    const std::vector<std::string> unbind{"--bind="};
+    auto unbound = engine::ssh_target(ctx, unbind);
+    REQUIRE_MESSAGE(unbound, unbound.error_or(""));
+    CHECK(unbound->bind.empty());
+    ctx.settings.common_flags = {"--bind="};
+    auto blank = engine::ssh_target(ctx);
+    REQUIRE_MESSAGE(blank, blank.error_or(""));
+    CHECK(blank->bind.empty());
     std::filesystem::remove(grab_known_hosts_path());
 }
+
+TEST_CASE("connection settings: the keys, else common_flags' --bind, --contimeout and --timeout, then the command's") {
+    using std::chrono::milliseconds;
+    RemoteSettings s;
+    s.name = "Main";
+    s.common_flags = {"-P", "--bind", "10.0.0.1", "--contimeout=10s", "--timeout", "2m", "--sftp-chunk-size", "255Ki"};
+    const auto legacy = engine::connect_settings(s);
+    REQUIRE_MESSAGE(legacy, legacy.error_or(""));
+    CHECK(legacy->bind == "10.0.0.1");
+    CHECK(legacy->bind_from == "common_flags' --bind");
+    CHECK(legacy->connect_timeout == milliseconds(10'000));
+    CHECK(legacy->io_timeout == milliseconds(120'000));
+    CHECK(legacy->legacy == std::vector<std::string>{"bind", "connect_timeout", "io_timeout"});
+    // A key set wins over common_flags'; connect_timeout = off is a setting too.
+    s.bind = "10.0.0.2";
+    s.connect_timeout = milliseconds(0);
+    s.io_timeout = milliseconds(45'000);
+    const auto keys = engine::connect_settings(s);
+    REQUIRE(keys);
+    CHECK(keys->bind == "10.0.0.2");
+    CHECK(keys->bind_from == "bind in [Main]");
+    CHECK(keys->connect_timeout == milliseconds(0));
+    CHECK(keys->io_timeout == milliseconds(45'000));
+    CHECK(keys->legacy.empty());
+    // The command's flags after `--` win over both.
+    const std::vector<std::string> run{"--bind=10.8.0.2", "--contimeout", "3s"};
+    const auto given = engine::connect_settings(s, run);
+    REQUIRE(given);
+    CHECK(given->bind == "10.8.0.2");
+    CHECK(given->bind_from == "--bind");
+    CHECK(given->connect_timeout == milliseconds(3'000));
+    CHECK(given->io_timeout == milliseconds(45'000));
+    // A --bind that isn't an address never reaches a program (ssh.exe would take "-o..." for an option).
+    s.bind.reset();
+    s.common_flags = {"--bind=-oProxyCommand=x"};
+    CHECK(engine::connect_settings(s).error_or("") == "[Main] common_flags: --bind -oProxyCommand=x: the address can't start with -");
+    s.common_flags = {"--contimeout", "soon"};
+    CHECK(engine::connect_settings(s).error_or("").starts_with("[Main] common_flags: --contimeout soon: not a time"));
+    s.common_flags.clear();
+    const std::vector<std::string> bad{"--bind=10.0.0.2;x"};
+    CHECK(engine::connect_settings(s, bad).error_or("").starts_with("the flags after --: --bind 10.0.0.2;x: "));
+    // A blank --bind is no bind, as rclone reads it: in common_flags nothing, after `--` it
+    // clears the server's for the run.
+    s.common_flags = {"--bind="};
+    const auto blank = engine::connect_settings(s);
+    REQUIRE_MESSAGE(blank, blank.error_or(""));
+    CHECK_FALSE(blank->bind);
+    CHECK(blank->legacy.empty());
+    s.bind = "10.0.0.2";
+    const std::vector<std::string> clear{"--bind", ""};
+    const auto cleared = engine::connect_settings(s, clear);
+    REQUIRE_MESSAGE(cleared, cleared.error_or(""));
+    CHECK_FALSE(cleared->bind);
+    CHECK(cleared->bind_from.empty());
+}
+
+TEST_CASE("the keys on rclone's and ssh.exe's command lines: only when set, after grab's fixed values") {
+    using std::chrono::milliseconds;
+    RemoteSettings s;
+    CHECK(engine::key_flags(s).empty()); // blank keys: rclone keeps its own times
+    s.bind = "10.0.0.2";
+    s.connect_timeout = milliseconds(1'500);
+    s.io_timeout = milliseconds(30'000);
+    CHECK(engine::key_flags(s) == std::vector<std::string>{"--bind", "10.0.0.2", "--contimeout", "1500ms", "--timeout", "30s"});
+    s.connect_timeout = milliseconds(0);
+    CHECK(engine::key_flags(s)[3] == "0s");
+
+    // ssh.exe: whole seconds rounded up, nothing for off.
+    engine::ConnectSettings reach;
+    CHECK(engine::ssh_connect_options(reach).empty());
+    reach.bind = "10.0.0.2";
+    reach.connect_timeout = milliseconds(500);
+    CHECK(engine::ssh_connect_options(reach) ==
+          std::vector<std::string>{"-o", "BindAddress=10.0.0.2", "-o", "ConnectTimeout=1"});
+    reach.connect_timeout = milliseconds(1'500);
+    CHECK(engine::ssh_connect_options(reach).back() == "ConnectTimeout=2");
+    reach.connect_timeout = milliseconds(0);
+    CHECK(engine::ssh_connect_options(reach) == std::vector<std::string>{"-o", "BindAddress=10.0.0.2"});
+
+    // fetch's stat and cat: common_flags', grab's fixed times, then the keys and the command's,
+    // which win (rclone takes the last of a repeated flag).
+    const fetch::Source src{.rclone = "rclone",
+                            .environment = {},
+                            .rclone_remote = "Main",
+                            .path = "a/b",
+                            .flags = {"--bind", "10.0.0.1", "--timeout", "9m"},
+                            .after = {"--timeout", "5m", "--contimeout", "1s"}};
+    for (const auto& argv : {fetch::stat_argv(src), fetch::cat_argv(src, 0, 10)}) {
+        const auto at = [&](std::string_view v) { return std::ranges::find(argv, v) - argv.begin(); };
+        CHECK(at("9m") < at("60s"));
+        CHECK(at("60s") < at("5m"));
+        CHECK(at("15s") < at("1s"));
+    }
+    // Test's probe: common_flags' connection flags before its short times, the keys after them.
+    const std::vector<std::string> before{"--bind", "10.0.0.1"};
+    const std::vector<std::string> after{"--contimeout", "2s"};
+    const auto probe = servers::probe_argv("rclone", "box", before, after);
+    const auto at = [&](std::string_view v) { return std::ranges::find(probe, v) - probe.begin(); };
+    CHECK(at("10.0.0.1") < at("15s"));
+    CHECK(at("15s") < at("2s"));
+    CHECK(probe.back() == config_in_memory);
+}
+
+TEST_CASE("grab's own target: the keys, common_flags' legacy flags and the command's; never without an I/O time") {
+    using std::chrono::milliseconds;
+    auto ctx = grab_context("Main", connection("main.example", "me", server_conf::Auth::agent));
+    ctx.settings.bind = "10.0.0.5";
+    ctx.settings.io_timeout = milliseconds(45'000);
+    ctx.settings.common_flags = {"--bind", "10.0.0.1", "--contimeout", "10s"};
+    const auto t = engine::ssh_target(ctx);
+    REQUIRE_MESSAGE(t, t.error_or(""));
+    CHECK(t->bind == "10.0.0.5");
+    CHECK(t->bind_from == "bind in [Main]");
+    CHECK(t->connect_timeout == milliseconds(10'000)); // common_flags', the key being blank
+    CHECK(t->timeout == milliseconds(45'000));
+    // No I/O limit (or more than 24 h) would leave a stalled read that Cancel can't end.
+    ctx.settings.io_timeout.reset();
+    ctx.settings.common_flags = {"--timeout", "off"};
+    CHECK(engine::ssh_target(ctx).error_or("").starts_with(
+        "[Main] common_flags: --timeout off: grab's own client takes a time from 1s to 24h there"));
+    ctx.settings.common_flags.clear();
+    for (const char* time : {"0", "25h", "500ms"}) {
+        const std::vector<std::string> run{"--timeout", time};
+        CHECK_MESSAGE(engine::ssh_target(ctx, run).error_or("").starts_with(std::format("the flags after --: --timeout {}:", time)),
+                      time);
+    }
+    const std::vector<std::string> fine{"--timeout", "24h"};
+    CHECK(engine::ssh_target(ctx, fine).has_value());
+    std::filesystem::remove(grab_known_hosts_path());
+}
+
+TEST_CASE("the guard: a server whose settings route it is refused by grab's client and searched by rclone's listing") {
+    using std::chrono::milliseconds;
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-guard";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto conf = dir / "grab.conf";
+    const auto store = passwords::path_in(state_dir(conf));
+    std::filesystem::create_directories(store.parent_path());
+    std::filesystem::remove(grab_known_hosts_path());
+    std::filesystem::create_directories(grab_known_hosts_path().parent_path());
+    std::ofstream(grab_known_hosts_path(), std::ios::binary) << "box.example ssh-ed25519 FAKEKEY\n";
+    const auto c = connection("box.example", "u", server_conf::Auth::agent);
+    REQUIRE(passwords::save(store, {{"Box", {{"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9", c)},
+                                             {"rclone.set_env", fake("X=1", c)}}}}));
+    RemoteSettings s;
+    s.name = "Box";
+    s.rclone_remote = "Box";
+    // What the store's decryption costs load_context (the window calls it per server): timed.
+    const auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        const auto made = engine::make_context(GrabConfig{}, s, c, conf);
+        CHECK(!made.guard.empty());
+    }
+    MESSAGE(std::format("make_context with the guard's store read: {:.2f} ms each",
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() / 20));
+
+    const auto ctx = engine::make_context(GrabConfig{}, s, c, conf);
+    CHECK(ctx.engine == Engine::rclone);
+    CHECK(ctx.method == FindMethod::rclone); // an agent server: ssh + find, but ssh.exe would ignore the proxy
+    const auto refused = engine::ssh_target(ctx);
+    REQUIRE_FALSE(refused);
+    CHECK(refused.error().starts_with("[Box] connects through a SOCKS proxy (rclone.socks_proxy), which grab's own client "
+                                      "can't: its downloads go through rclone, and its searches and lists by rclone's "
+                                      "listing; previews, Play and Verify are off for it"));
+    CHECK(refused.error().find("fake-") == std::string::npos);
+    // rclone still gets it: its runs go through the proxy.
+    const auto env = engine::rclone_env(ctx);
+    REQUIRE_MESSAGE(env, env.error_or(""));
+    CHECK(var(*env, "RCLONE_CONFIG_BOX_SOCKS_PROXY") == "fake-user:fake-pass@127.0.0.1:9");
+    // engine = grab: refused where it's used, never at load, saying to set engine = rclone.
+    s.engine = Engine::grab;
+    const auto on_grab = engine::make_context(GrabConfig{}, s, c, conf);
+    CHECK(engine::ssh_target(on_grab).error_or("").find("set engine = rclone in [Box] (grab config)") != std::string::npos);
+
+    // ssh_options' ProxyCommand: grab's client refused, ssh.exe find kept (it goes through it).
+    const auto plain_conf = dir / "plain" / "grab.conf";
+    s.engine.reset();
+    s.ssh_options = {"-o", "ProxyCommand=fake-proxy %h %p"};
+    const auto proxied = engine::make_context(GrabConfig{}, s, c, plain_conf);
+    CHECK(proxied.method == FindMethod::ssh);
+    CHECK(engine::ssh_target(proxied).error_or("").find("connects through a ProxyCommand (ssh_options' -o ProxyCommand)") !=
+          std::string::npos);
+    // A guard flag after `--` on a server that has none.
+    s.ssh_options.clear();
+    const auto plain = engine::make_context(GrabConfig{}, s, c, plain_conf);
+    CHECK(plain.guard.empty());
+    CHECK(engine::ssh_target(plain).has_value());
+    const std::vector<std::string> run{"--sftp-http-proxy", "fake-proxy:3128"};
+    CHECK(engine::grab_blockers(plain, run).size() == 1);
+    CHECK(engine::ssh_target(plain, run).error_or("").find("(--sftp-http-proxy after --)") != std::string::npos);
+#ifdef _WIN32
+    // A store that exists but can't be read may hold a route: the guard fails closed, for an
+    // agent login too (rclone's listing searches, grab's client refuses).
+    std::ofstream(store, std::ios::binary | std::ios::trunc) << "grab-passwords-sealed 1\nanother account's";
+    const auto unreadable = engine::make_context(GrabConfig{}, s, c, conf);
+    CHECK(unreadable.method == FindMethod::rclone);
+    CHECK(engine::ssh_target(unreadable).error_or("").find("(grab's store, which can't be read)") != std::string::npos);
+#endif
+    std::filesystem::remove_all(store.parent_path());
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove(grab_known_hosts_path());
+}
+
+#ifdef _WIN32
+TEST_CASE("the keys and the command's flags reach rclone's listing and ssh.exe, after grab's own") {
+    using std::chrono::milliseconds;
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-keys-argv";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / "rclone.cmd", std::ios::binary) << "@echo off\r\n>> \"%~dp0calls.log\" echo %*\r\n";
+    std::ofstream(dir / "ssh.cmd", std::ios::binary) << "@echo off\r\n";
+    auto ctx = grab_context("Box", connection("box.example", "u", server_conf::Auth::agent));
+    ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
+    ctx.config.ssh = util::path_to_utf8(dir / "ssh.cmd");
+    ctx.settings.bind = "10.0.0.2";
+    ctx.settings.connect_timeout = milliseconds(1'500);
+    ctx.settings.common_flags = {"--contimeout", "9s"};
+    ctx.settings.ssh_options = {"-o", "ConnectTimeout=99"};
+    engine::SearchRequest req;
+    req.target = "x";
+    req.walk_flags = {"--sftp-connections", "3"};
+    req.run_flags = {"--timeout", "1m"};
+    ctx.method = FindMethod::rclone;
+    REQUIRE(engine::search(ctx, req));
+    const auto calls = util::read_file(dir / "calls.log").value_or("");
+    CHECK(calls.find("--contimeout 9s --sftp-connections 3 --bind 10.0.0.2 --contimeout 1500ms --timeout 1m") !=
+          std::string::npos);
+    // ssh.exe: the key's (or the command's) bind and time first, then the server's ssh_options.
+    ctx.method = FindMethod::ssh;
+    std::vector<std::string> ran;
+    req.run_flags = {"--bind", "10.0.0.9"};
+    REQUIRE(engine::search(ctx, req, {}, [&](const std::vector<std::string>& argv) { ran = argv; }));
+    const auto at = [&](std::string_view v) { return std::ranges::find(ran, v) - ran.begin(); };
+    CHECK(at("BindAddress=10.0.0.9") < at("ConnectTimeout=2"));
+    CHECK(at("ConnectTimeout=2") < at("ConnectTimeout=99"));
+    CHECK(std::ranges::find(ran, "BindAddress=10.0.0.2") == ran.end());
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove(grab_known_hosts_path());
+}
+#endif
 
 TEST_CASE("an unpinned server is refused before any rclone run, grab's login or ssh: use Trust") {
     std::filesystem::remove(grab_known_hosts_path());
@@ -375,7 +628,8 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
     REQUIRE(passwords::save(store, {{"Main", {{"rclone.set_env", fake("FAKE_VAR=1", main_c)}}},
                                     {"pw", {{"password", fake("fake-pw", pw_c)}}},
                                     {"k", {{"passphrase", fake("fake-phrase", key_c)}, {"password", fake("fake-beside", key_c)}}},
-                                    {"pem", {{"key_pem", fake("-----BEGIN FAKE KEY-----", pem_c)}}},
+                                    {"pem", {{"key_pem", fake("-----BEGIN FAKE KEY-----", pem_c)},
+                                             {"passphrase", fake("fake-pem-phrase", pem_c)}}},
                                     {"moved", {{"password", fake("fake-pw", pw_c)}}}}));
 
     auto ctx = grab_context("Main", main_c, store);
@@ -429,6 +683,8 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
     const auto pem = engine::rclone_env(grab_context("pem", pem_c, store));
     REQUIRE_MESSAGE(pem, pem.error_or(""));
     CHECK(var(*pem, "RCLONE_CONFIG_PEM_KEY_PEM") == "-----BEGIN FAKE KEY-----");
+    // Its passphrase too: rclone reads key_file_pass for key_pem as for a key file.
+    CHECK(secrets::reveal(var(*pem, "RCLONE_CONFIG_PEM_KEY_FILE_PASS").value_or("")) == "fake-pem-phrase");
     // A password saved for another login is never sent (G40), nor is one never saved.
     const auto moved = engine::rclone_env(grab_context("moved", connection("evil.example", "u", server_conf::Auth::password), store));
     REQUIRE_FALSE(moved);
@@ -461,6 +717,14 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
     CHECK(refused.error().starts_with(
         "[Main] common_flags: --sftp-known-hosts-file would replace the server's trusted host keys"));
     CHECK(engine::rclone_env(ctx, true).has_value());
+    // A common_flags --bind that isn't an address doesn't reach rclone either.
+    ctx.settings.common_flags = {"--bind", "-x"};
+    CHECK(engine::rclone_env(ctx).error_or("").starts_with("[Main] common_flags: --bind needs a value"));
+    ctx.settings.common_flags = {"--bind=a b"};
+    CHECK(engine::rclone_env(ctx).error_or("").starts_with("[Main] common_flags: --bind a b: "));
+    // A blank one is no bind, as rclone reads it.
+    ctx.settings.common_flags = {"--bind="};
+    CHECK(engine::rclone_env(ctx).has_value());
 #ifdef _WIN32
     // A store that can't be read: a password server can't log in; the others still can.
     std::ofstream(store, std::ios::binary) << "grab-passwords-sealed 1\nanother account's";

@@ -64,8 +64,11 @@ struct Fingerprint {
 // removed in grab.conf and grab's store, never with `rclone config` or `rclone obscure` (G12, G27).
 
 // A quick connection test: list the login home's folders once, with short timeouts. The server
-// comes in the run's environment (engine::rclone_env), its config in memory.
-[[nodiscard]] std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name);
+// comes in the run's environment (engine::rclone_env), its config in memory. `before` (common_flags'
+// connection flags) goes before the short timeouts, `after` (the server's keys) after them.
+[[nodiscard]] std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name,
+                                                  std::span<const std::string> before = {},
+                                                  std::span<const std::string> after = {});
 
 // ---- grab.conf text edits (everything else, comments included, is kept) -------------------
 

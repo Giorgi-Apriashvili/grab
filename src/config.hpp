@@ -2,6 +2,7 @@
 
 #include "ini.hpp"
 
+#include <chrono>
 #include <expected>
 #include <filesystem>
 #include <optional>
@@ -40,7 +41,15 @@ struct RemoteSettings {
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
     bool skip_hidden = true;
-    Engine engine = Engine::rclone; // `engine = rclone | grab`
+    std::optional<Engine> engine; // `engine = rclone | grab`; absent: the default (effective_engine)
+    // How every connection to the server is made (grab's own client, Trust's host-key fetch, and
+    // on engine = rclone its rclone runs and ssh.exe; RCLONE-REPLACEMENT.md, phase 8): the local
+    // address to connect from, the time to reach the server (0: off, as long as TCP tries) and
+    // any single wait after that (1 s to 24 h, never off: a stalled read couldn't be cancelled).
+    // nullopt when not set: grab's 30 s, rclone's own times, nothing added to their commands.
+    std::optional<std::string> bind;
+    std::optional<std::chrono::milliseconds> connect_timeout;
+    std::optional<std::chrono::milliseconds> io_timeout;
     std::vector<std::string> ssh_options;
     std::vector<std::string> common_flags;
     std::vector<std::string> folder_flags;
@@ -54,6 +63,9 @@ struct GrabConfig {
     std::optional<std::string> editor; // [grab] editor, used by `grab config`
     std::optional<std::string> default_remote;
     std::vector<RemoteSettings> remotes;
+    // Keys of [grab] and the server sections that grab doesn't read ("[Main]", "connect_timout"),
+    // in file order: ignored, never an error, and named once in a notice (notices.hpp, N7).
+    std::vector<std::pair<std::string, std::string>> unknown_keys;
 
     [[nodiscard]] std::expected<const RemoteSettings*, std::string>
     select(const std::optional<std::string>& name) const;
@@ -77,8 +89,12 @@ struct RcloneRemote {
     std::optional<std::string> path_override;
 };
 
+// io_timeout's range, which grab's own client also holds `--timeout` to: a wait, never off.
+inline constexpr std::chrono::milliseconds min_io_timeout{1'000};
+inline constexpr std::chrono::milliseconds max_io_timeout{24 * 3'600'000};
+
 // The server's engine, unless GRAB_ENGINE (grab or rclone) overrides it for every server, as
-// tests comparing both do.
+// tests comparing both do; without an `engine` line the default, rclone.
 [[nodiscard]] Engine effective_engine(const RemoteSettings& settings);
 
 // Resolve auto_detect: ssh when the remote authenticates with a key file (a shell is very

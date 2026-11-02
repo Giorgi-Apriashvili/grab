@@ -215,6 +215,8 @@ std::vector<std::string> listing_argv(const engine::Context& ctx, std::string_vi
                                   "--no-mimetype", "--config", std::string(config_in_memory)};
     const auto flags = rclone_flags::connection(ctx.settings.common_flags); // rclone_flags.hpp
     argv.insert(argv.end(), flags.begin(), flags.end());
+    const auto keys = engine::key_flags(ctx.settings);
+    argv.insert(argv.end(), keys.begin(), keys.end());
     return argv;
 }
 

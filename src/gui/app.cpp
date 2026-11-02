@@ -7,10 +7,12 @@
 #include "engine.hpp"
 #include "file_list.hpp"
 #include "folder.hpp"
+#include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "listing.hpp"
 #include "local_name.hpp"
+#include "notices.hpp"
 #include "play_server.hpp"
 #include "preview.hpp"
 #include "process.hpp"
@@ -162,6 +164,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     // never waits on the settings lock for it; the list is sent again once it's done. Then the
     // one-time notice naming the servers moved (by this window or by a command before it), with
     // what each still needs (server_ops::import_banner); imported.json forgets them as it's made.
+    // The settings' notices not shown yet in this configuration follow it (notices.hpp).
     settings_task([this](std::stop_token) {
         const auto files = rclone_import::files_for(config_path_);
         auto applied = rclone_import::apply(files);
@@ -179,6 +182,10 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
                     banner = server_ops::import_banner(names, server_ops::list_servers(*env), notes);
                 }
             }
+        }
+        if (auto all = notices::for_config(config_path_)) {
+            auto fresh = notices::take_new(notices::path_in(state_dir(config_path_)), *all);
+            for (const auto& n : fresh ? *fresh : *all) banner += (banner.empty() ? "" : "\n") + n.text;
         }
         const bool changed = !applied || !applied->imported.empty() || !applied->failed.empty();
         if (!changed && banner.empty()) return;
@@ -885,7 +892,10 @@ void App::on_message(const std::string& text) {
             auto it = std::ranges::find(list, name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + name);
             if (!it->error.empty()) return settings_error(it->error);
-            auto keys = server_ops::scan_host_keys(it->host, it->port, stop);
+            // The page asked first when its settings route it (server_ops::direct_warning).
+            auto reach = server_ops::reach_for(*env, name);
+            if (!reach) return settings_error(reach.error());
+            auto keys = server_ops::scan_host_keys(it->host, it->port, stop, *reach);
             if (stop.stop_requested()) return;
             if (!keys) return settings_error(keys.error());
             Pending p;
@@ -1879,6 +1889,10 @@ void App::post_servers(const server_ops::Env& env) const {
         v.set("search", str(s.search)); // search_method(): ssh, rclone; find, walk, probe on grab
         v.set("engine", str(s.engine == Engine::grab ? "grab" : "rclone"));
         v.set("pinned", Value::make_bool(s.host_key_pinned));
+        // What keeps grab's own client off it, and the routes Trust says it connects past.
+        v.set("guard", str(s.guard.empty() ? std::string() : guard::text(s.name, s.guard, s.engine)));
+        v.set("route", str(server_ops::direct_warning(s, s.host, s.port)));
+        v.set("connectionKeys", str(s.connection_keys)); // grab.conf's bind and times, when set
         // Whether its password (passphrase, stored key) is saved for this login; null for ssh-agent
         // or a store that can't be read. Never the value.
         v.set("secretSaved", s.secret_saved ? Value::make_bool(*s.secret_saved) : Value{});
@@ -1987,7 +2001,14 @@ void App::save_server(const Value& msg) {
         }
         if (!need_keys) return apply_pending(std::move(p), stop);
 
-        auto keys = server_ops::scan_host_keys(s.host, s.port, stop);
+        // An edited server's bind and connect time (the page asked first when its settings route it).
+        ssh::Reach reach;
+        if (editing) {
+            auto r = server_ops::reach_for(*env, s.name);
+            if (!r) return settings_error(r.error());
+            reach = std::move(*r);
+        }
+        auto keys = server_ops::scan_host_keys(s.host, s.port, stop, reach);
         if (stop.stop_requested()) return;
         if (!keys) return settings_error(keys.error());
         p.keys = std::move(*keys);
@@ -2847,7 +2868,8 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                              .environment = {}, // engine = rclone: below
                              .rclone_remote = ctx->settings.rclone_remote,
                              .path = item->path,
-                             .flags = rclone_flags::connection(ctx->settings.common_flags)};
+                             .flags = rclone_flags::connection(ctx->settings.common_flags),
+                             .after = engine::key_flags(ctx->settings)};
     d.server = item->remote;
     d.id = item->id;
     existing::Choice choice{};

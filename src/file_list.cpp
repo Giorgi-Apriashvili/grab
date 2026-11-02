@@ -248,7 +248,8 @@ std::expected<void, std::string> fetch_grab(const engine::Context& ctx, List& li
 
 std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh,
                                        const proc::RunOptions& run, const engine::CommandHook& on_command,
-                                       const std::vector<std::string>& walk_flags, const engine::GrabSide& grab) {
+                                       const std::vector<std::string>& walk_flags, const engine::GrabSide& grab,
+                                       std::span<const std::string> run_flags) {
     List list;
     list.fetched = now;
     list.fingerprint = fingerprint(ctx);
@@ -259,7 +260,7 @@ std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t 
     }
     if (ctx.method == FindMethod::ssh) {
         auto out = engine::run_over_ssh(ctx, find_command(roots, ctx.settings.max_depth, ctx.settings.skip_hidden),
-                                        batch_ssh, run, on_command);
+                                        batch_ssh, run, on_command, run_flags);
         if (!out) return util::fail(out.error());
         list.entries = parse_find(*out);
         return list;
@@ -275,8 +276,13 @@ std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t 
         req.rclone_exe = ctx.config.rclone;
         req.rclone_remote = ctx.settings.rclone_remote;
         req.all_entries = true;
-        req.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches the list too (G189)
+        // common_flags', grab's own, the server's keys, then the command's (a --bind reaches the
+        // list too, G189).
+        req.flags = rclone_flags::connection(ctx.settings.common_flags);
         req.flags.insert(req.flags.end(), walk_flags.begin(), walk_flags.end());
+        const auto keys = engine::key_flags(ctx.settings);
+        req.flags.insert(req.flags.end(), keys.begin(), keys.end());
+        req.flags.insert(req.flags.end(), run_flags.begin(), run_flags.end());
         auto out = engine::run_listing(build_lsf_argv(req), with_server, on_command);
         if (!out) return util::fail(out.error());
         auto entries = parse_lsf(*out, root);

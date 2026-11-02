@@ -130,10 +130,14 @@ std::string merge_known_hosts(std::string_view existing, const std::vector<std::
 
 // ---- rclone command lines --------------------------------------------------------------------
 
-std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name) {
-    return {rclone, "lsf", name + ":", "--dirs-only", "--max-depth", "1", "--contimeout", "15s",
-            "--timeout", "30s", "--low-level-retries", "1", "--retries", "1", "--config",
-            std::string(config_in_memory)};
+std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name,
+                                    std::span<const std::string> before, std::span<const std::string> after) {
+    std::vector<std::string> argv{rclone, "lsf", name + ":", "--dirs-only", "--max-depth", "1"};
+    argv.insert(argv.end(), before.begin(), before.end());
+    argv.insert(argv.end(), {"--contimeout", "15s", "--timeout", "30s", "--low-level-retries", "1", "--retries", "1"});
+    argv.insert(argv.end(), after.begin(), after.end());
+    argv.insert(argv.end(), {"--config", std::string(config_in_memory)});
+    return argv;
 }
 
 // ---- grab.conf text edits --------------------------------------------------------------------

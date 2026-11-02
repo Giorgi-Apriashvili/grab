@@ -40,16 +40,22 @@ struct Target {
     int port = 22;
     std::string user;
     std::filesystem::path known_hosts; // grab's: the server's key must be in it
-    // How to log in: the Windows OpenSSH agent, a key file (OpenSSH or PEM format), or a
-    // password (also answers keyboard-interactive prompts). Secrets stay in memory.
+    // How to log in: the Windows OpenSSH agent, a key file (OpenSSH or PEM format) or a key
+    // itself (key_pem: the same text, as an imported stored_key; a key file's passphrase goes
+    // for it too), or a password (also answers keyboard-interactive prompts). Secrets stay in
+    // memory.
     bool agent = false;
     std::filesystem::path key_file;
+    std::string key_pem;
     std::string key_passphrase;
     std::string password;
-    // rclone's connection flags, as engine::ssh_target takes them from common_flags (review G189):
-    // the local address to connect from (--bind; empty: any), the time to reach the server
-    // (--contimeout) and any single wait after that (--timeout). A time of 0 is no limit.
+    // The server's connection settings, as engine::ssh_target takes them (grab.conf's bind,
+    // connect_timeout and io_timeout, else common_flags' --bind, --contimeout and --timeout,
+    // review G189; then the command's flags after `--`): the local address to connect from
+    // (empty: any) and which setting named it, for messages ("bind in [Main]"), the time to reach
+    // the server and any single wait after that. A time of 0 is no limit.
     std::string bind;
+    std::string bind_from = "--bind";
     std::chrono::milliseconds connect_timeout{30'000};
     std::chrono::milliseconds timeout{30'000};
     bool operator==(const Target&) const = default;
@@ -262,16 +268,26 @@ struct ShakeError {
 };
 using Shake = std::function<std::expected<std::string, ShakeError>(std::string_view offer)>;
 
+// How a scan reaches the server: from the server's `bind` address (empty: any; `bind_from` names
+// the setting in messages) within its connect_timeout (nullopt: the scan's own time).
+struct Reach {
+    std::string bind;
+    std::string bind_from = "--bind";
+    std::optional<std::chrono::milliseconds> connect_timeout;
+};
+
 // Every host key `host`:`port` has of the types grab checks (scan_algorithms), read without a
 // login and without looking at any known_hosts: handshakes one after another, each offering the
 // algorithms whose key wasn't found yet (an RSA key covers both rsa-sha2 ones); the first one the
 // server can't agree on ends the scan (Main: 2 handshakes, a Storage Box 4, at most 6). Each
-// handshake has `timeout`; `stop` is looked at between them ("cancelled"). Nothing is written. An
-// error when no key could be read (the server has only key types or key exchanges grab doesn't
-// support: SHA-1 ssh-rsa, DSA, old Diffie-Hellman) or a handshake fails for another reason.
+// handshake has `timeout` (and so has its connection, unless `reach` sets one); `stop` is looked
+// at between them ("cancelled"). Nothing is written. An error when no key could be read (the
+// server has only key types or key exchanges grab doesn't support: SHA-1 ssh-rsa, DSA, old
+// Diffie-Hellman) or a handshake fails for another reason.
 [[nodiscard]] std::expected<std::vector<HostKey>, std::string> scan_host_keys(const std::string& host, int port,
                                                                              std::chrono::milliseconds timeout,
-                                                                             std::stop_token stop = {});
+                                                                             std::stop_token stop = {},
+                                                                             const Reach& reach = {});
 // The same over any handshake (exposed for tests); `where` ("host:port") is for messages.
 [[nodiscard]] std::expected<std::vector<HostKey>, std::string> scan_host_keys(const Shake& shake, std::string_view where,
                                                                              const std::stop_token& stop = {});

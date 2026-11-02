@@ -361,14 +361,48 @@ TEST_CASE("ssh: a server's target from its grab.conf section and the secrets sav
         CHECK(t->key_passphrase == "fake-phrase");
         CHECK(t->password == "fake-pw");
     }
-    SUBCASE("what it can't use is said, not guessed") {
+    SUBCASE("a key kept in the store (stored_key): from memory, as rclone reads key_pem, with its passphrase") {
         c.auth = server_conf::Auth::stored_key;
-        save(passwords::key_pem, "-----BEGIN fake-----", login);
-        CHECK(ssh::target_for("Box", c, store, grab_known).error_or("").find("engine = rclone only") != std::string::npos);
+        save(passwords::key_pem, R"(-----BEGIN FAKE KEY-----\nAAAA\nBBBB\n-----END FAKE KEY-----)", login);
+        save(passwords::passphrase, "fake-phrase", login);
+        auto t = ssh::target_for("Box", c, store, grab_known);
+        REQUIRE(t);
+        CHECK(t->key_pem == "-----BEGIN FAKE KEY-----\nAAAA\nBBBB\n-----END FAKE KEY-----");
+        CHECK(t->key_passphrase == "fake-phrase");
+        CHECK(t->key_file.empty());
+        CHECK_FALSE(t->agent);
+        // One saved for another login is refused, as a password is.
+        save(passwords::key_pem, "-----BEGIN FAKE KEY-----", passwords::Binding{.user = "u1", .host = "x", .port = 23});
+        const auto other = ssh::target_for("Box", c, store, grab_known);
+        REQUIRE_FALSE(other);
+        CHECK(other.error().find("BEGIN") == std::string::npos);
+        // Not as rclone writes it: rclone would refuse it too ("pem key not formatted properly").
+        save(passwords::key_pem, "-----BEGIN FAKE KEY-----\nreal line break", login);
+        const auto bad = ssh::target_for("Box", c, store, grab_known);
+        REQUIRE_FALSE(bad);
+        CHECK(bad.error().find("as rclone reads key_pem") != std::string::npos);
+        CHECK(bad.error().find("BEGIN") == std::string::npos);
+    }
+    SUBCASE("what it can't use is said, not guessed") {
         c.auth = server_conf::Auth::password;
         save(passwords::password, "fake", login);
         c.user.clear();
         CHECK_FALSE(ssh::target_for("Box", c, store, grab_known));
+    }
+}
+
+TEST_CASE("ssh: a stored key's text as rclone reads key_pem (Go's strconv.Unquote)") {
+    CHECK(ssh::unquote_key_pem("plain") == "plain");
+    CHECK(ssh::unquote_key_pem(R"(a\nb\r\nc\td)") == "a\nb\r\nc\td");
+    CHECK(ssh::unquote_key_pem(R"(q\"x\\y)") == "q\"x\\y");
+    CHECK(ssh::unquote_key_pem(R"(\x41\101B\U00000043)") == "AABC");
+    CHECK(ssh::unquote_key_pem(R"(é)") == "\xC3\xA9");
+    CHECK(ssh::unquote_key_pem(R"(\a\b\f\v)") == "\a\b\f\v");
+    CHECK(ssh::unquote_key_pem("") == "");
+    // Where rclone says "pem key not formatted properly".
+    for (const char* bad : {"a\"b", "a\nb", R"(a\)", R"(\q)", R"(\')", R"(\x4)", R"(\xZZ)", R"(\400)", R"(\18)",
+                            R"(\uD800)", R"(\U00110000)", R"(\u12)"}) {
+        CHECK_MESSAGE(!ssh::unquote_key_pem(bad), bad);
     }
 }
 

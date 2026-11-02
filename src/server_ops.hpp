@@ -8,7 +8,9 @@
 // or writes an rclone.conf (RCLONE-REPLACEMENT.md, phase 7).
 
 #include "config.hpp"
+#include "guard.hpp"
 #include "servers.hpp"
+#include "ssh.hpp"
 
 #include <expected>
 #include <filesystem>
@@ -64,9 +66,15 @@ struct ServerInfo {
     // Whether grab's store has the secret this login uses, saved for this very user@host:port
     // (passwords::value_for): the password (auth = password), the key's passphrase (key, where
     // none is fine too), the imported key (stored_key). nullopt for ssh-agent, and when the store
-    // can't be read (store_error says why).
+    // can't be read (store_error says why, for any login: the guard then counts it as routed).
     std::optional<bool> secret_saved;
     std::string store_error;
+    // What keeps grab's own client off it (guard.hpp; its rclone extras read from grab's store for
+    // this very login): the reasons Trust asks about first when one is a route, and the list shows.
+    std::vector<guard::Reason> guard;
+    // The connection keys its section sets, as grab.conf has them (no window field sets them):
+    // "bind 10.0.0.2, connect_timeout 10s, io_timeout 1m"; empty when none is.
+    std::string connection_keys;
 };
 
 [[nodiscard]] bool is_default_server(const GrabConfig& cfg, std::string_view name);
@@ -82,9 +90,18 @@ struct HostKeys {
 
 // The server's host keys and their fingerprints, read by grab's own client (ssh::scan_host_keys:
 // handshakes with no login, nothing written) for every server, whichever engine it uses: no
-// ssh-keyscan, ssh.exe or ssh-keygen. 10 s for each handshake.
+// ssh-keyscan, ssh.exe or ssh-keygen. 10 s for each handshake; `reach`: the server's bind and
+// connect_timeout (reach_for), when it has a section already.
 [[nodiscard]] std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port,
-                                                                  std::stop_token stop = {});
+                                                                  std::stop_token stop = {}, const ssh::Reach& reach = {});
+// How server `name`'s host-key fetch connects: its bind and connect_timeout as every connection
+// takes them (engine::connect_settings); none for a server grab.conf doesn't have yet.
+[[nodiscard]] std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name);
+// What Trust and a host-key fetch say before they connect to a server whose settings route its
+// connections (a proxy, an ssh command, a ProxyCommand): "Box connects through a SOCKS proxy
+// (rclone.socks_proxy): fetching its host key connects to host:port directly from this PC, past
+// that". Empty for any other server.
+[[nodiscard]] std::string direct_warning(const ServerInfo& s, const std::string& host, int port);
 
 // Pins `lines` for host:port in known_hosts, in place of every key it held for host:port before
 // (servers::forget_host; review G87). Each line has to be one for host:port. Under the settings

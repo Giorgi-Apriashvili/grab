@@ -2893,12 +2893,15 @@ function serverCard(s) {
     ? `<span class="bad">${esc(s.error)}</span>`
     : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}${s.engine === 'grab' ? ' · grab\'s engine' : ''}` +
       ` · searched ${SEARCHED_TEXT[s.search] || 'with rclone listing'} in ${esc(where)}, depth ${s.depth}` +
-      ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}`;
+      ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}` +
+      (s.connectionKeys ? ` · ${esc(s.connectionKeys)}` : '');
   const status = [];
   if (!s.error) {
     status.push(s.pinned ? '<span class="good">✓ Host key pinned</span>'
       : '<span class="warn">⚠ Host key not trusted yet: grab won\'t connect to this server until you pin its key with Trust….</span>');
   }
+  // What keeps grab's own client off it (a proxy, an ssh command...): its previews, Play and Verify.
+  if (!s.error && s.guard) status.push(`<span class="warn">⚠ ${esc(s.guard)}</span>`);
   const test = testLine(settings.tests[s.name]);
   return `<div class="server">` +
     `<div class="server-top"><span class="server-name">${esc(s.name)}</span>` +
@@ -3009,11 +3012,22 @@ function intOf(id) {
   return /^\d{1,6}$/.test(v) ? Number(v) : 0;
 }
 
+// Fetching the host key of a server whose settings route its connections (a proxy, an ssh
+// command) connects directly from this PC: said first, and only a yes goes on.
+function confirmDirect(route, go) {
+  showModal({
+    title: 'Connect directly?',
+    html: `<p>${esc(route)}.</p>`,
+    ok: 'Connect directly',
+    onOk: go,
+  });
+}
+
 function submitForm() {
   if (settings.busy || !settings.form) return;
   clearFieldErrors();
   showSettingsBanner('');
-  send({
+  const msg = {
     type: 'serverSave',
     editing: settings.form.editing,
     name: settings.form.editing ? settings.form.name : $('#f-name').value.trim(),
@@ -3026,9 +3040,19 @@ function submitForm() {
     roots: $('#f-roots').value.split(/\r?\n/).map((r) => r.trim()).filter(Boolean),
     depth: intOf('#f-depth'),
     connections: $('#f-conns').value.trim() === '' ? 0 : (intOf('#f-conns') || -1),
-  });
-  $('#f-secret').value = ''; // the backend holds it until the host key is trusted
-  setStatus('Checking the host key…');
+  };
+  const go = () => {
+    send(msg);
+    $('#f-secret').value = ''; // the backend holds it until the host key is trusted
+    setStatus('Checking the host key…');
+  };
+  // An edit that fetches the host key again (a new address, none pinned yet), as the backend's
+  // edit_needs_host_key has it.
+  const s = settings.form.editing ? settings.servers.find((x) => x.name === msg.name) : null;
+  if (s && s.route && (s.error || !s.pinned || s.host !== msg.host || s.port !== msg.port)) {
+    return confirmDirect(s.route.replace(`${s.host}:${s.port}`, `${msg.host}:${msg.port}`), go);
+  }
+  go();
 }
 
 // ---- modal -------------------------------------------------------------------------------
@@ -3120,8 +3144,12 @@ function onSettingsAction(act, name) {
     return send({ type: 'serverTest', name });
   }
   if (act === 'trust') {
-    setStatus('Checking the host key…');
-    return send({ type: 'serverTrust', name });
+    const trust = () => {
+      setStatus('Checking the host key…');
+      send({ type: 'serverTrust', name });
+    };
+    const s = settings.servers.find((x) => x.name === name);
+    return s && s.route ? confirmDirect(s.route, trust) : trust();
   }
   if (act === 'default') return send({ type: 'serverDefault', name });
   if (act === 'remove') {

@@ -1,9 +1,12 @@
 #include "config.hpp"
 
 #include "conn_budget.hpp"
+#include "server_conf.hpp"
+#include "ssh_target.hpp"
 #include "util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <format>
@@ -47,7 +50,7 @@ user = alice
 # How to log in: agent (the keys in Windows' ssh-agent; with key_file, only that one), key
 # (key_file; its passphrase, if any, in grab's store), password (in grab's store: enter it
 # with `grab server edit hetzner`) or stored_key (a key imported from rclone.conf, kept in
-# grab's store; only rclone can use it).
+# grab's store with its passphrase).
 auth = key
 key_file = C:\Users\alice\.ssh\id_ed25519
 # What the server told grab's Test, so rclone needn't ask it again on every run: its shell
@@ -132,6 +135,36 @@ namespace {
     return util::failf("[{}] {} must be true/false, got '{}'", s.name, key, *v);
 }
 
+// The keys grab reads in [grab] and in a server's section (server_conf::keys and its rclone.<key>
+// lines aside); any other is named in a notice (N7), never an error.
+constexpr std::array grab_keys{std::string_view("rclone"), std::string_view("rclone_config"), std::string_view("ssh"),
+                               std::string_view("editor"), std::string_view("default_remote")};
+constexpr std::array server_keys{
+    std::string_view("rclone_remote"),   std::string_view("search_roots"), std::string_view("find"),
+    std::string_view("max_depth"),       std::string_view("max_connections"), std::string_view("skip_hidden"),
+    std::string_view("engine"),          std::string_view("bind"),         std::string_view("connect_timeout"),
+    std::string_view("io_timeout"),      std::string_view("ssh_options"),  std::string_view("common_flags"),
+    std::string_view("folder_flags"),    std::string_view("file_flags")};
+
+bool known_server_key(std::string_view key) {
+    return std::ranges::contains(server_keys, key) || std::ranges::contains(server_conf::keys, key) ||
+           key.starts_with(server_conf::rclone_prefix);
+}
+
+// A time key (connect_timeout, io_timeout) as ssh::parse_duration reads it; nullopt when absent.
+std::expected<std::optional<std::chrono::milliseconds>, std::string> time_value(const ini::Section& s,
+                                                                                 std::string_view key, bool off) {
+    auto v = nonblank(s, key);
+    if (!v) return std::nullopt;
+    const auto t = ssh::parse_duration(*v);
+    if (off) {
+        if (t) return t; // 0 (off) included
+        return util::failf("[{}] {}: not a time grab can read (such as 30s, 1m30s or off)", s.name, key);
+    }
+    if (t && *t >= min_io_timeout && *t <= max_io_timeout) return t;
+    return util::failf("[{}] {}: not a time grab can read (such as 30s or 1m30s; 1s to 24h)", s.name, key);
+}
+
 } // namespace
 
 std::string normalize_root(std::string_view root) {
@@ -169,7 +202,7 @@ Engine effective_engine(const RemoteSettings& settings) {
         if (e == "grab") return Engine::grab;
         if (e == "rclone") return Engine::rclone;
     }
-    return settings.engine;
+    return settings.engine.value_or(Engine::rclone);
 }
 
 std::filesystem::path default_grab_config_path() {
@@ -288,7 +321,13 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
     }
 
     for (const auto& s : doc.sections) {
-        if (s.name.empty() || s.name == "grab") continue;
+        if (s.name.empty()) continue;
+        for (const auto& [key, value] : s.values) {
+            if (s.name == "grab" ? !std::ranges::contains(grab_keys, key) : !known_server_key(key)) {
+                cfg.unknown_keys.emplace_back(s.name, key);
+            }
+        }
+        if (s.name == "grab") continue;
         RemoteSettings r;
         r.name = s.name;
         r.rclone_remote = nonblank(s, "rclone_remote").value_or(s.name);
@@ -330,6 +369,19 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
             else if (engine == "grab") r.engine = Engine::grab;
             else return util::failf("[{}] engine must be rclone or grab, got '{}'", s.name, *v);
         }
+        if (auto v = nonblank(s, "bind")) {
+            if (auto bad = server_conf::check_host(*v)) {
+                return util::failf("[{}] bind: {}", s.name,
+                                   v->starts_with('-') ? std::string("the address can't start with -") : *bad);
+            }
+            r.bind = *v;
+        }
+        auto connect = time_value(s, "connect_timeout", true);
+        if (!connect) return util::fail(connect.error());
+        r.connect_timeout = *connect;
+        auto io = time_value(s, "io_timeout", false);
+        if (!io) return util::fail(io.error());
+        r.io_timeout = *io;
         r.ssh_options = flag_list(s, "ssh_options", "");
         r.common_flags = flag_list(s, "common_flags", default_common_flags);
         r.folder_flags = flag_list(s, "folder_flags", default_folder_flags);
@@ -471,7 +523,7 @@ std::string_view search_method(const RemoteSettings& settings, const RcloneRemot
 }
 
 std::string describe_remote(const RcloneRemote& remote, const RemoteSettings& settings, std::string_view login) {
-    const auto method = search_method(settings, remote, settings.engine);
+    const auto method = search_method(settings, remote, settings.engine.value_or(Engine::rclone));
     const char* lookup = method == "ssh"    ? "via ssh + find"
                          : method == "rclone" ? "via rclone lsf"
                          : method == "find"   ? "with find"

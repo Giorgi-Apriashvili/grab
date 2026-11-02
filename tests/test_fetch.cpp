@@ -78,7 +78,7 @@ TEST_CASE("a download whose logins are refused for good stops with the reason, a
     connections.configure("Main", 12);
     fetch::Download d;
     d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .environment = {},
-                             .rclone_remote = "Main", .path = "f.bin", .flags = {}};
+                             .rclone_remote = "Main", .path = "f.bin", .flags = {}, .after = {}};
     d.server = "Main";
     d.id = 1;
     d.target = dir / "f.bin";
@@ -321,7 +321,7 @@ TEST_CASE("rclone lsjson --stat") {
 
 TEST_CASE("rclone command lines for ranges") {
     fetch::Source src{.rclone = "rclone.exe", .environment = {}, .rclone_remote = "box", .path = "/home/a b.mkv",
-                      .flags = {"--sftp-chunk-size", "255Ki"}};
+                      .flags = {"--sftp-chunk-size", "255Ki"}, .after = {}};
     const auto cat = fetch::cat_argv(src, 1000, 2000);
     CHECK(cat[0] == "rclone.exe");
     CHECK(cat[1] == "cat");
@@ -537,7 +537,7 @@ TEST_CASE("a size check refused by a full server is asked again, not failed (G19
     connections.configure("Main", 12);
     fetch::Download d;
     d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .environment = {},
-                             .rclone_remote = "Main", .path = "f.bin", .flags = {}};
+                             .rclone_remote = "Main", .path = "f.bin", .flags = {}, .after = {}};
     d.server = "Main";
     d.id = 1;
     d.target = dir / "f.bin";
@@ -625,7 +625,7 @@ TEST_CASE("a file that already is the server's wins over a partial download of i
     connections.configure("Main", 12);
     fetch::Download d;
     d.source = fetch::Source{.rclone = util::path_to_utf8(dir / "rclone.cmd"), .environment = {},
-                             .rclone_remote = "Main", .path = "/f.bin", .flags = {}};
+                             .rclone_remote = "Main", .path = "/f.bin", .flags = {}, .after = {}};
     d.server = "Main";
     d.id = 1;
     d.target = target;

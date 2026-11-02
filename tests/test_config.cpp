@@ -13,11 +13,13 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h> // IWYU pragma: keep (SetEnvironmentVariableW)
@@ -502,7 +504,7 @@ TEST_CASE("RCLONE_CONFIG overrides the default rclone.conf path") {
 TEST_CASE("engine: rclone by default, grab when asked, GRAB_ENGINE over every server") {
     const auto cfg = parse_ok("[a]\n[b]\nengine = grab\n[c]\nengine = RClone\n");
     REQUIRE(cfg.remotes.size() == 3);
-    CHECK(cfg.remotes[0].engine == Engine::rclone);
+    CHECK_FALSE(cfg.remotes[0].engine.has_value()); // absent: the default, resolved by effective_engine
     CHECK(cfg.remotes[1].engine == Engine::grab);
     CHECK(cfg.remotes[2].engine == Engine::rclone);
     CHECK_FALSE(parse_grab_config(*ini::parse("[h]\nengine = libssh\n")).has_value());
@@ -518,6 +520,56 @@ TEST_CASE("engine: rclone by default, grab when asked, GRAB_ENGINE over every se
     set_env("GRAB_ENGINE", "something else"); // ignored
     CHECK(effective_engine(cfg.remotes[1]) == Engine::grab);
     set_env("GRAB_ENGINE", previous ? previous->c_str() : nullptr);
+}
+
+TEST_CASE("bind, connect_timeout and io_timeout: read, checked, blank when absent (phase 8)") {
+    using std::chrono::milliseconds;
+    const auto cfg = parse_ok("[a]\nbind = 10.0.0.2\nconnect_timeout = 1m30s\nio_timeout = 45s\n"
+                              "[b]\nconnect_timeout = off\nio_timeout = 24h\nbind = fe80::1%eth0\n[c]\nbind =\n");
+    REQUIRE(cfg.remotes.size() == 3);
+    CHECK(cfg.remotes[0].bind == "10.0.0.2");
+    CHECK(cfg.remotes[0].connect_timeout == milliseconds(90'000));
+    CHECK(cfg.remotes[0].io_timeout == milliseconds(45'000));
+    CHECK(cfg.remotes[1].connect_timeout == milliseconds(0)); // off: as long as TCP tries
+    CHECK(cfg.remotes[1].io_timeout == milliseconds(86'400'000));
+    CHECK(cfg.remotes[1].bind == "fe80::1%eth0");
+    CHECK_FALSE(cfg.remotes[2].bind); // blank: not set, nothing added anywhere
+    CHECK_FALSE(cfg.remotes[2].connect_timeout);
+    CHECK_FALSE(cfg.remotes[2].io_timeout);
+    CHECK(cfg.unknown_keys.empty());
+
+    // A bad value fails the load as a bad max_depth does, naming the section and the key.
+    auto error_of = [](std::string_view text) {
+        const auto doc = ini::parse(text);
+        REQUIRE(doc.has_value());
+        const auto parsed = parse_grab_config(*doc);
+        REQUIRE_FALSE(parsed.has_value());
+        return parsed.error();
+    };
+    CHECK(error_of("[Main]\nio_timeout = abc\n") ==
+          "[Main] io_timeout: not a time grab can read (such as 30s or 1m30s; 1s to 24h)");
+    for (const char* io : {"off", "0", "500ms", "25h", "30d"}) { // never off: a stalled read couldn't be cancelled
+        CHECK_MESSAGE(error_of(std::format("[Main]\nio_timeout = {}\n", io)).starts_with("[Main] io_timeout: "), io);
+    }
+    CHECK(error_of("[Main]\nconnect_timeout = soon\n") ==
+          "[Main] connect_timeout: not a time grab can read (such as 30s, 1m30s or off)");
+    CHECK(error_of("[Main]\nbind = -oProxyCommand=x\n") == "[Main] bind: the address can't start with -");
+    CHECK(error_of("[Main]\nbind = 10.0.0.2 -x\n").starts_with("[Main] bind: "));
+}
+
+TEST_CASE("keys grab doesn't read are collected for a notice, never an error (N7)") {
+    const auto cfg = parse_ok("[grab]\nrclone =\nsh = ssh\n[Main]\nhost = h\nconnect_timout = 10s\nrclone.skip_links = true\n"
+                              "auth = agent\nuser = u\nbind = 10.0.0.2\n");
+    CHECK(cfg.unknown_keys == std::vector<std::pair<std::string, std::string>>{{"grab", "sh"}, {"Main", "connect_timout"}});
+}
+
+TEST_CASE("the new keys sit beside the old ones, which keep their meaning for rclone and grab 0.19") {
+    // 0.19.0's parse_grab_config (v0.19.0 config.cpp) reads only the keys it knew and skips any
+    // other: it sees this section's common_flags as written, its bind lost (README says so).
+    const auto cfg = parse_ok("[Main]\nhost = h\nbind = 10.0.0.2\nconnect_timeout = 10s\nio_timeout = 1m\n"
+                              "common_flags = --bind 10.0.0.2\n");
+    REQUIRE(cfg.remotes.size() == 1);
+    CHECK(cfg.remotes[0].common_flags == std::vector<std::string>{"--bind", "10.0.0.2"});
 }
 
 TEST_CASE("example config parses and matches the defaults") {

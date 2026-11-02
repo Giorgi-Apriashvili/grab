@@ -529,9 +529,9 @@ auth = password
   that key.
 - `auth = key`: `key_file`, with its passphrase, if it has one, in grab's password store.
 - `auth = password`: the password in grab's password store.
-- `auth = stored_key`: a key an rclone.conf held inline (`key_pem`), imported into grab's store.
-  Only rclone can log in with it, so the server works on `engine = rclone` only (Test says so);
-  Edit can switch it to a key file or ssh-agent.
+- `auth = stored_key`: a key an rclone.conf held inline (`key_pem`), imported into grab's store
+  with its passphrase; grab and rclone both log in with it. Edit can switch it to a key file or
+  ssh-agent.
 
 `grab server add` asks for:
 - the server's host, port and user

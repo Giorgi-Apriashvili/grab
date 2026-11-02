@@ -117,7 +117,7 @@ struct Dir {
 fetch::Download download(const fs::path& target, std::shared_ptr<ssh::Pool> pool, const std::string& path = "/data/f.bin") {
     fetch::Download d;
     d.source =
-        fetch::Source{.rclone = "rclone-is-not-run", .environment = {}, .rclone_remote = "Fake", .path = path, .flags = {}};
+        fetch::Source{.rclone = "rclone-is-not-run", .environment = {}, .rclone_remote = "Fake", .path = path, .flags = {}, .after = {}};
     d.server = "Fake";
     d.id = 1;
     d.target = target;

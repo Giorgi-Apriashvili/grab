@@ -122,6 +122,22 @@ Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Co
     ctx.settings = std::move(settings);
     ctx.connection = std::move(connection);
     ctx.passwords = passwords::path_in(state_dir(grab_conf));
+
+    // The guard (phase 8 step 4): the store's rclone extras for this very login, as rclone_env
+    // gives them to rclone. A store that exists but can't be read may hold a proxy or an ssh
+    // command: the guard then counts the server as routed rather than connect past one.
+    std::vector<std::pair<std::string, std::string>> extras;
+    const auto store = passwords::load(ctx.passwords);
+    if (store) {
+        const passwords::Binding login{.user = ctx.connection.user, .host = ctx.connection.host, .port = ctx.connection.port};
+        extras = guard::store_extras(*store, ctx.settings.name, login);
+    }
+    auto sources = guard::sources(ctx.settings, ctx.connection, std::move(extras));
+    ctx.guard = guard::evaluate(sources);
+    if (!store) guard::add_unreadable_store(ctx.guard);
+    for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
+    // ssh.exe find would connect past a route rclone takes.
+    if (ctx.engine == Engine::rclone && guard::routed(guard::reasons(ctx.guard))) ctx.method = FindMethod::rclone;
     return ctx;
 }
 
@@ -200,26 +216,125 @@ std::expected<passwords::Store, std::string> server_secrets(const Context& ctx) 
 
 } // namespace
 
+std::vector<guard::Reason> grab_blockers(const Context& ctx, std::span<const std::string> run_flags) {
+    if (run_flags.empty()) return guard::reasons(ctx.guard);
+    auto settings = ctx.guard;
+    guard::add_run_flags(settings, run_flags);
+    return guard::reasons(settings);
+}
+
+std::expected<ConnectSettings, std::string> connect_settings(const RemoteSettings& settings,
+                                                             std::span<const std::string> run_flags) {
+    const std::string& name = settings.name;
+    ConnectSettings out;
+    if (settings.bind) {
+        out.bind = settings.bind;
+        out.bind_from = std::format("bind in [{}]", name);
+    }
+    out.connect_timeout = settings.connect_timeout;
+    out.io_timeout = settings.io_timeout;
+    // An address goes to rclone and ssh.exe as it is: one that isn't one is refused first.
+    const auto address = [](const std::string& bind) -> std::optional<std::string> {
+        if (bind.starts_with('-')) return "the address can't start with -";
+        return server_conf::check_host(bind);
+    };
+    // Legacy: common_flags' --bind, --contimeout and --timeout, read as the keys left blank (G189).
+    auto legacy = ssh::read_flags(rclone_flags::connection(settings.common_flags));
+    if (!legacy) return util::failf("[{}] common_flags: {}", name, legacy.error());
+    // A blank --bind ("--bind=") is no bind, as rclone reads it.
+    const auto blank = [](const std::optional<std::string>& bind) { return bind && util::trim(*bind).empty(); };
+    if (!out.bind && legacy->bind && !blank(legacy->bind)) {
+        if (auto bad = address(*legacy->bind)) return util::failf("[{}] common_flags: --bind {}: {}", name, *legacy->bind, *bad);
+        out.bind = legacy->bind;
+        out.bind_from = "common_flags' --bind";
+        out.legacy.emplace_back("bind");
+    }
+    if (!out.connect_timeout && legacy->connect_timeout) {
+        out.connect_timeout = legacy->connect_timeout;
+        out.legacy.emplace_back("connect_timeout");
+    }
+    if (!out.io_timeout && legacy->timeout) {
+        out.io_timeout = legacy->timeout;
+        out.io_from = std::format("[{}] common_flags: --timeout {}", name, legacy->timeout_text);
+        out.legacy.emplace_back("io_timeout");
+    }
+    // The command's, which win.
+    auto given = ssh::read_flags(run_flags);
+    if (!given) return util::failf("the flags after --: {}", given.error());
+    if (blank(given->bind)) {
+        // Clears the server's bind for this run.
+        out.bind.reset();
+        out.bind_from.clear();
+    } else if (given->bind) {
+        if (auto bad = address(*given->bind)) return util::failf("the flags after --: --bind {}: {}", *given->bind, *bad);
+        out.bind = given->bind;
+        out.bind_from = "--bind";
+    }
+    if (given->connect_timeout) out.connect_timeout = given->connect_timeout;
+    if (given->timeout) {
+        out.io_timeout = given->timeout;
+        out.io_from = std::format("the flags after --: --timeout {}", given->timeout_text);
+    }
+    return out;
+}
+
+namespace {
+
+// A time as rclone's flags take it: "30s", "1500ms", "0s" for off.
+std::string rclone_time(std::chrono::milliseconds t) {
+    return t.count() % 1000 == 0 ? std::format("{}s", t.count() / 1000) : std::format("{}ms", t.count());
+}
+
+} // namespace
+
+std::vector<std::string> key_flags(const RemoteSettings& settings) {
+    std::vector<std::string> out;
+    if (settings.bind) out.insert(out.end(), {"--bind", *settings.bind});
+    if (settings.connect_timeout) out.insert(out.end(), {"--contimeout", rclone_time(*settings.connect_timeout)});
+    if (settings.io_timeout) out.insert(out.end(), {"--timeout", rclone_time(*settings.io_timeout)});
+    return out;
+}
+
+std::vector<std::string> ssh_connect_options(const ConnectSettings& reach) {
+    std::vector<std::string> out;
+    if (reach.bind) out.insert(out.end(), {"-o", "BindAddress=" + *reach.bind});
+    if (reach.connect_timeout && reach.connect_timeout->count() > 0) {
+        const auto seconds = (reach.connect_timeout->count() + 999) / 1000;
+        out.insert(out.end(), {"-o", std::format("ConnectTimeout={}", seconds)});
+    }
+    return out;
+}
+
 std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span<const std::string> extra) {
     if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
+    // A route, another server, a certificate...: grab's client would connect anyway, past them.
+    if (const auto blocked = grab_blockers(ctx, extra); !blocked.empty()) {
+        return util::fail(guard::text(ctx.settings.name, blocked, ctx.engine));
+    }
     auto store = server_secrets(ctx);
     if (!store) return util::fail(store.error());
     const auto known_hosts = ctx.remote.known_hosts_file ? util::path_from_utf8(*ctx.remote.known_hosts_file)
                                                          : grab_known_hosts_path();
     auto target = ssh::target_for(ctx.settings.name, ctx.connection, *store, known_hosts);
     if (!target) return target;
-    // --bind, --contimeout and --timeout reach grab's connections as they reached rclone's (G189).
-    if (auto flags = ssh::apply_flags(*target, rclone_flags::connection(ctx.settings.common_flags)); !flags) {
-        return util::failf("[{}] common_flags: {}", ctx.settings.name, flags.error());
+    auto reach = connect_settings(ctx.settings, extra);
+    if (!reach) return util::fail(reach.error());
+    if (reach->bind) {
+        target->bind = *reach->bind;
+        target->bind_from = reach->bind_from;
     }
-    if (auto flags = ssh::apply_flags(*target, extra); !flags) return util::failf("the flags after --: {}", flags.error());
+    if (reach->connect_timeout) target->connect_timeout = *reach->connect_timeout;
+    if (reach->io_timeout) {
+        // No limit, or one past what select and libssh2 hold, would leave a stalled READ waiting
+        // for ever: sftp::Client::pump doesn't look at the stop token, so Cancel couldn't end it.
+        if (*reach->io_timeout < min_io_timeout || *reach->io_timeout > max_io_timeout) {
+            return util::failf("{}: grab's own client takes a time from 1s to 24h there (with none, a stalled download "
+                               "couldn't be cancelled)",
+                               reach->io_from);
+        }
+        target->timeout = *reach->io_timeout;
+    }
     return target;
-}
-
-std::vector<std::string> unused_flags(const Context& ctx) {
-    ssh::Target ignored;
-    auto unused = ssh::apply_flags(ignored, rclone_flags::connection(ctx.settings.common_flags));
-    return unused ? std::move(*unused) : std::vector<std::string>{};
 }
 
 namespace {
@@ -252,6 +367,8 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
         }
     }
     if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
+    // common_flags' --bind reaches rclone as it is: checked as the bind key is.
+    if (auto reach = connect_settings(ctx.settings); !reach) return util::fail(reach.error());
     const auto& c = ctx.connection;
     const std::string& name = ctx.settings.name;
     auto store = server_secrets(ctx);
@@ -302,6 +419,12 @@ std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, boo
         const auto pem = saved(passwords::key_pem);
         if (!pem) return util::failf("{}: {}", name, passwords::why_none(*store, name, passwords::key_pem, login));
         values["key_pem"] = *pem;
+        // rclone takes key_file_pass for key_pem too (backend/sftp), as the import saved it.
+        if (const auto pass = saved(passwords::passphrase)) {
+            auto text = obscured(*pass);
+            if (!text) return util::fail(text.error());
+            values["key_file_pass"] = std::move(*text);
+        }
         break;
     }
     }
@@ -365,7 +488,7 @@ lookup_via_ssh(const Context& ctx, const SearchRequest& req, const std::vector<s
     find.roots = roots;
     find.max_depth = max_depth;
     find.skip_hidden = ctx.settings.skip_hidden;
-    auto out = run_over_ssh(ctx, build_find_command(find), req.batch_ssh, run, on_command);
+    auto out = run_over_ssh(ctx, build_find_command(find), req.batch_ssh, run, on_command, req.run_flags);
     if (!out) return util::fail(out.error());
     return parse_find_output(*out, req.mode == Mode::file);
 }
@@ -394,8 +517,13 @@ lookup_via_rclone(const Context& ctx, const SearchRequest& req, std::span<const 
         list.skip_hidden = ctx.settings.skip_hidden;
         list.rclone_exe = ctx.config.rclone;
         list.rclone_remote = ctx.settings.rclone_remote;
-        list.flags = rclone_flags::connection(ctx.settings.common_flags); // a --bind reaches searches too (G189)
+        // common_flags', grab's own, the server's keys, then the command's (a --bind reaches searches
+        // too, G189).
+        list.flags = rclone_flags::connection(ctx.settings.common_flags);
         list.flags.insert(list.flags.end(), req.walk_flags.begin(), req.walk_flags.end());
+        const auto keys = key_flags(ctx.settings);
+        list.flags.insert(list.flags.end(), keys.begin(), keys.end());
+        list.flags.insert(list.flags.end(), req.run_flags.begin(), req.run_flags.end());
 
         auto out = run_listing(build_lsf_argv(list), with_server, on_command);
         if (!out) return util::fail(out.error());
@@ -645,9 +773,14 @@ std::vector<std::string> search_roots(const Context& ctx) {
 }
 
 std::expected<std::string, std::string> run_over_ssh(const Context& ctx, const std::string& command, bool batch_ssh,
-                                                     const proc::RunOptions& run, const CommandHook& on_command) {
+                                                     const proc::RunOptions& run, const CommandHook& on_command,
+                                                     std::span<const std::string> run_flags) {
     if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
-    std::vector<std::string> ssh_options = ctx.settings.ssh_options;
+    // The server's bind and connect time first: OpenSSH keeps the first value it sees.
+    auto reach = connect_settings(ctx.settings, run_flags);
+    if (!reach) return util::fail(reach.error());
+    std::vector<std::string> ssh_options = ssh_connect_options(*reach);
+    ssh_options.insert(ssh_options.end(), ctx.settings.ssh_options.begin(), ctx.settings.ssh_options.end());
     if (batch_ssh) ssh_options.insert(ssh_options.end(), {"-o", "BatchMode=yes"});
     const auto argv = build_ssh_argv(ctx.config.ssh, ctx.remote, ssh_options, command);
     if (on_command) on_command(argv);
@@ -783,7 +916,10 @@ download_argv(const Context& ctx, Mode mode, const std::string& remote_path, con
     rq.dest_dir = dest_dir;
     rq.common_flags = ctx.settings.common_flags;
     rq.mode_flags = mode == Mode::folder ? ctx.settings.folder_flags : ctx.settings.file_flags;
-    rq.extra = extra;
+    // The server's keys before the command's own flags.
+    auto tail = key_flags(ctx.settings);
+    tail.insert(tail.end(), extra.begin(), extra.end());
+    rq.extra = tail;
     rq.local_name = std::move(local_name);
     return build_rclone_argv(rq);
 }

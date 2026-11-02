@@ -36,7 +36,7 @@ enum class Auth {
     agent,      // ssh-agent, only its key_file's key when one is given (as rclone's key_use_agent)
     key,        // key_file, with its passphrase from the store when it has one
     password,   // the store's password
-    stored_key, // an inline key imported from rclone.conf (key_pem), in the store; rclone only
+    stored_key, // an inline key imported from rclone.conf (key_pem), in the store with its passphrase
 };
 [[nodiscard]] std::string_view auth_name(Auth auth);
 [[nodiscard]] std::optional<Auth> parse_auth(std::string_view text);

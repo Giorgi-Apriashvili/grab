@@ -103,7 +103,7 @@ socket_t connect_tcp(const Target& t) {
         throw Error(budget::Failure::other, std::format("can't find the server {}", t.host));
     Addresses local;
     if (!t.bind.empty() && !local.resolve(t.bind, 0))
-        throw Error(budget::Failure::fatal, std::format("can't find the address {} to connect from (--bind)", t.bind));
+        throw Error(budget::Failure::fatal, std::format("can't find the address {} to connect from ({})", t.bind, t.bind_from));
     auto from_for = [&](const addrinfo* a) -> const addrinfo* {
         for (const addrinfo* l = local.first; l; l = l->ai_next) {
             if (l->ai_family == a->ai_family) return l;
@@ -115,7 +115,8 @@ socket_t connect_tcp(const Target& t) {
         for (const addrinfo* a = found.first; a && !any; a = a->ai_next) any = from_for(a) != nullptr;
         if (!any)
             throw Error(budget::Failure::fatal,
-                        std::format("{} (--bind) and {} have no address of the same kind (IPv4, IPv6)", t.bind, t.host));
+                        std::format("{} ({}) and {} have no address of the same kind (IPv4, IPv6)", t.bind, t.bind_from,
+                                    t.host));
     }
     std::string why = "no address";
     socket_t s = no_socket;
@@ -127,7 +128,7 @@ socket_t connect_tcp(const Target& t) {
         if (from && ::bind(c, from->ai_addr, static_cast<int>(from->ai_addrlen)) != 0) {
             const int e = last_socket_error();
             close_socket(c);
-            throw Error(budget::Failure::fatal, std::format("can't connect from {} (--bind): error {}", t.bind, e));
+            throw Error(budget::Failure::fatal, std::format("can't connect from {} ({}): error {}", t.bind, t.bind_from, e));
         }
         set_blocking(c, false);
         int rc = ::connect(c, a->ai_addr, static_cast<int>(a->ai_addrlen));
@@ -564,13 +565,16 @@ std::expected<std::vector<HostKey>, std::string> scan_host_keys(const Shake& sha
 }
 
 std::expected<std::vector<HostKey>, std::string> scan_host_keys(const std::string& host, int port,
-                                                               std::chrono::milliseconds timeout, std::stop_token stop) {
+                                                               std::chrono::milliseconds timeout, std::stop_token stop,
+                                                               const Reach& reach) {
     init_once();
     Target t;
     t.host = host;
     t.port = port;
-    t.connect_timeout = timeout;
+    t.connect_timeout = reach.connect_timeout.value_or(timeout);
     t.timeout = timeout;
+    t.bind = reach.bind;
+    t.bind_from = reach.bind_from;
     const Shake shake = [&t](std::string_view offer) { return read_host_key(t, offer); };
     return scan_host_keys(shake, std::format("{}:{}", host, port), stop);
 }
@@ -735,6 +739,14 @@ void Connection::log_in(const Target& target) {
         } else {
             tried.push_back("the key file can't be read: " + util::path_to_utf8(target.key_file));
         }
+    }
+    if (!target.key_pem.empty()) {
+        // As a key file's bytes: libssh2 reads it from memory and keeps nothing of it.
+        const char* passphrase = target.key_passphrase.empty() ? nullptr : target.key_passphrase.c_str();
+        const int rc = libssh2_userauth_publickey_frommemory(session_, user, target.user.size(), nullptr, 0,
+                                                             target.key_pem.data(), target.key_pem.size(), passphrase);
+        if (rc == 0) return;
+        tried.push_back("it refused the key kept in grab's store (" + last_error(session_) + ")");
     }
     if (!password_.empty()) {
         const char* listed = libssh2_userauth_list(session_, user, ulen);

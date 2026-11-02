@@ -278,7 +278,8 @@ struct Session {
     LiveLine& line;
     fetch::Connections& connections;
     rate::RateLimiter& limiter;
-    std::vector<std::string> flags; // common flags without console progress, plus `-- extra`
+    std::vector<std::string> flags; // common_flags' connection flags (fetch::Source::flags)
+    std::vector<std::string> after; // the server's keys and the connection flags of `-- extra`
     engine::CommandHook trace;      // -v
     std::stop_token stop;
     ScheduleFollower* follower = nullptr; // when the speed schedule applies
@@ -391,7 +392,8 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
                              .environment = s.rclone_env,
                              .rclone_remote = s.ctx.settings.rclone_remote,
                              .path = path,
-                             .flags = s.flags};
+                             .flags = s.flags,
+                             .after = s.after};
     d.server = s.ctx.settings.name;
     d.id = id;
     d.limiter = &s.limiter;
@@ -797,10 +799,10 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     StopOnCtrlC ctrl_c;
-    // grab's engine: only the connection flags of the configured ones and of `--` (rclone_flags.hpp;
-    // cli.cpp refuses any other after `--`).
-    Session s{ctx, opts, dest, line, connections, limiter, rclone_flags::connection(ctx.settings.common_flags), {},
-              ctrl_c.token()};
+    // rclone's checks and reads: only the connection flags of the configured ones and of `--`
+    // (rclone_flags.hpp; cli.cpp refuses any other after `--`), the server's keys between them.
+    Session s{ctx, opts, dest, line, connections, limiter, rclone_flags::connection(ctx.settings.common_flags),
+              engine::key_flags(ctx.settings), {}, ctrl_c.token()};
     if (follower) s.follower = &*follower;
     s.verify = verify;
     s.files_at_once = std::clamp(gui.parallel, min_parallel, max_parallel);
@@ -810,7 +812,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     s.for_rest = &for_rest;
     s.several = paths.size() > 1;
     const auto given = rclone_flags::connection(opts.extra);
-    s.flags.insert(s.flags.end(), given.begin(), given.end());
+    s.after.insert(s.after.end(), given.begin(), given.end());
     if (opts.verbose) {
         s.trace = [&line](const std::vector<std::string>& argv) { line.message("+ " + quote::display_cmdline(argv)); };
         std::println(stderr, "grab: up to {} connections to {}", budget, server);

@@ -10,10 +10,12 @@
 #include "fetch.hpp"
 #include "file_list.hpp"
 #include "folder_job.hpp"
+#include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "local_name.hpp"
 #include "match.hpp"
+#include "notices.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rate.hpp"
@@ -271,9 +273,10 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
         };
         // grab's own check before rclone runs: the connection flags only (rclone_flags.hpp), so a
         // -vP or a filter meant for the copy can't break it (G182, G183).
-        auto flags = rclone_flags::connection(ctx.settings.common_flags);
+        const auto flags = rclone_flags::connection(ctx.settings.common_flags);
+        auto after = engine::key_flags(ctx.settings);
         const auto given = rclone_flags::connection(opts.extra);
-        flags.insert(flags.end(), given.begin(), given.end());
+        after.insert(after.end(), given.begin(), given.end());
         for (std::size_t i = 0; i < total; ++i) {
             const auto& path = paths[i];
             const auto& target = targets[i];
@@ -282,7 +285,8 @@ DownloadTally download_with_rclone(const engine::Context& ctx, const Options& op
                                         .environment = *env,
                                         .rclone_remote = ctx.settings.rclone_remote,
                                         .path = path,
-                                        .flags = flags};
+                                        .flags = flags,
+                                        .after = after};
                 const auto stat = fetch::stat_argv(src);
                 if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(stat));
                 proc::RunOptions quiet;
@@ -487,7 +491,7 @@ std::expected<engine::SearchResult, std::string> search(const engine::Context& c
         if (!made) return util::fail(made.error());
         side = std::move(*made);
     }
-    auto fetched = file_list::fetch(ctx, now, false, {}, trace, {}, side);
+    auto fetched = file_list::fetch(ctx, now, false, {}, trace, {}, side, req.run_flags);
     if (!fetched) return util::fail(fetched.error());
     if (!file_list::save(file, *fetched) && opts.verbose) {
         std::println(stderr, "grab: could not save the file list to {}", util::path_to_utf8(file));
@@ -513,12 +517,26 @@ int run(const Options& opts) {
                      util::join(ctx->imported, ", "), util::path_to_utf8(cfg_path));
     }
     for (const auto& note : ctx->import_notes) std::println(stderr, "grab: note: {}", note);
-    // grab's own client takes --bind, --contimeout and --timeout of them (review G189).
-    if (opts.verbose && ctx->engine == Engine::grab) {
-        if (const auto unused = engine::unused_flags(*ctx); !unused.empty()) {
-            std::println(stderr, "grab: [{}] common_flags grab's own SSH client doesn't use: {}", ctx->settings.name,
-                         util::join(unused, " "));
+    // The settings' notices this configuration hasn't shown yet (notices.hpp); -v repeats the
+    // server's. They name settings, never print a value (a proxy can hold a password).
+    if (auto all = notices::for_config(cfg_path)) {
+        auto fresh = notices::take_new(notices::path_in(state_dir(cfg_path)), *all);
+        const auto& shown = fresh ? *fresh : *all; // unsaved: said every time rather than never
+        for (const auto& n : shown) std::println(stderr, "grab: note: {}", n.text);
+        if (opts.verbose) {
+            for (const auto& n : *all) {
+                if (n.server == ctx->settings.name && !std::ranges::contains(shown, n)) {
+                    std::println(stderr, "grab: note: {}", n.text);
+                }
+            }
         }
+    }
+    // A guard setting after `--` (--sftp-socks-proxy...; guard.hpp): a route keeps this run's
+    // searches off ssh.exe find too, which would connect past it; -v says it, as the settings' own.
+    const auto run_flags = rclone_flags::connection(opts.extra);
+    if (const auto blocked = engine::grab_blockers(*ctx, run_flags); blocked != engine::grab_blockers(*ctx)) {
+        if (ctx->engine == Engine::rclone && guard::routed(blocked)) ctx->method = FindMethod::rclone;
+        if (opts.verbose) std::println(stderr, "grab: note: {}", guard::text(ctx->settings.name, blocked, ctx->engine));
     }
 
     // destination: a given DEST is checked before the search so a typo fails fast; a missing
@@ -543,6 +561,7 @@ int run(const Options& opts) {
     req.mode = opts.mode;
     req.exact = opts.exact;
     req.depth = opts.depth;
+    req.run_flags = run_flags;
     const engine::CommandHook trace = [&](const std::vector<std::string>& argv) {
         if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
     };

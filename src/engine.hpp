@@ -5,12 +5,14 @@
 
 #include "cli.hpp"
 #include "config.hpp"
+#include "guard.hpp"
 #include "process.hpp"
 #include "remote.hpp"
 #include "server_conf.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -46,10 +48,16 @@ struct Context {
     server_conf::Connection connection; // the server's grab.conf section
     std::filesystem::path passwords;    // grab's store of this configuration (passwords::path_in)
     std::vector<std::string> import_notes; // that import's notes, "[server] ..."
+    // What keeps grab's own client off the server (guard.hpp), from its settings, grab's store
+    // and the environment, read when the context was made; grab_blockers adds a command's `--`.
+    guard::Settings guard;
 };
 
 // The Context of `settings`, a server of `config` (rclone resolved) whose grab.conf section holds
-// `connection`, in the configuration at `grab_conf` (whose state_dir keeps its passwords).
+// `connection`, in the configuration at `grab_conf` (whose state_dir keeps its passwords). The
+// guard reads grab's store (one decryption) for the server's rclone extras; a route rclone takes
+// (guard::routed) makes an engine = rclone server search with rclone's listing, since ssh.exe
+// find would connect past it.
 [[nodiscard]] Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Connection connection,
                                    const std::filesystem::path& grab_conf);
 
@@ -68,22 +76,48 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 // run_over_ssh ask it.
 [[nodiscard]] std::expected<void, std::string> check_pinned(const Context& ctx);
 
+// What keeps grab's own client off the context's server for a run whose connection flags after
+// `--` are `run_flags` (guard.hpp): none for most servers.
+[[nodiscard]] std::vector<guard::Reason> grab_blockers(const Context& ctx, std::span<const std::string> run_flags = {});
+
+// A server's connection settings for one run (RCLONE-REPLACEMENT.md, phase 8 step 3): grab.conf's
+// bind, connect_timeout and io_timeout; for each one not set, common_flags' --bind, --contimeout
+// or --timeout, read as it; then the command's connection flags after `--` (`run_flags`), which
+// win. Each with the setting it came from, for messages ("bind in [Main]", "common_flags'
+// --bind", "--bind"). An error names the setting that can't be read, or a --bind that isn't an
+// address (server_conf::check_host) before any program gets it.
+struct ConnectSettings {
+    std::optional<std::string> bind;
+    std::string bind_from;
+    std::optional<std::chrono::milliseconds> connect_timeout; // 0: off
+    std::optional<std::chrono::milliseconds> io_timeout;
+    std::string io_from; // "[Main] common_flags: --timeout off", for an error
+    std::vector<std::string> legacy; // the keys common_flags gave: "bind", "connect_timeout", "io_timeout"
+};
+[[nodiscard]] std::expected<ConnectSettings, std::string> connect_settings(const RemoteSettings& settings,
+                                                                           std::span<const std::string> run_flags = {});
+// The keys that are set as rclone flags (--bind, --contimeout, --timeout), for every rclone run on
+// the server after grab's fixed values (common_flags' come before them): nothing for blank ones,
+// so rclone keeps its own times.
+[[nodiscard]] std::vector<std::string> key_flags(const RemoteSettings& settings);
+// The same for ssh.exe, before any of the server's ssh_options (OpenSSH keeps the first value):
+// -o BindAddress=, -o ConnectTimeout= in whole seconds rounded up, none for off.
+[[nodiscard]] std::vector<std::string> ssh_connect_options(const ConnectSettings& reach);
+
 // How grab's own SSH client logs in to the context's server: its grab.conf section, with the
-// secrets grab's store keeps for exactly that login (ssh::target_for), once check_pinned passes.
-// --bind, --contimeout and --timeout in its common_flags apply (ssh::apply_flags; an error when
-// one can't be read), then those of `extra`, the command's connection flags after `--`, so they
-// win as they did for rclone.
+// secrets grab's store keeps for exactly that login (ssh::target_for), once check_pinned passes
+// and nothing keeps grab's client off it (grab_blockers, with `extra`; the error says why and what
+// that means on its engine). Its connection settings as connect_settings has them with `extra`,
+// the command's connection flags after `--`; an I/O time outside 1 s to 24 h is refused (with no
+// limit a stalled read couldn't be cancelled).
 [[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx,
                                                                  std::span<const std::string> extra = {});
-// The connection flags of the context's common_flags that grab's own client doesn't use (all but
-// --bind, --contimeout and --timeout), with their values, for a -v line.
-[[nodiscard]] std::vector<std::string> unused_flags(const Context& ctx);
 
 // What an rclone run on the context's server gets in its environment, its config in memory
 // (`--config NUL`, config_in_memory; RCLONE-REPLACEMENT.md phase 7, decision 1), as
 // RCLONE_CONFIG_<NAME>_<KEY> (secrets::env_name): TYPE sftp, HOST, PORT, USER, the login (agent:
 // KEY_USE_AGENT and its KEY_FILE; key: KEY_FILE and KEY_FILE_PASS; password: PASS; stored_key:
-// KEY_PEM as stored; a password saved beside a key too, which rclone tries after it), grab's
+// KEY_PEM as stored and KEY_FILE_PASS; a password saved beside a key too, which rclone tries after it), grab's
 // known_hosts as KNOWN_HOSTS_FILE, SHELL_TYPE, MD5SUM_COMMAND and SHA1SUM_COMMAND ("none" when
 // grab.conf doesn't know them, so rclone doesn't ask the server on every run; unset for
 // `user_copy`, so that a --rclone --verify lets rclone find the sum commands), PATH_OVERRIDE,
@@ -93,9 +127,9 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 // in its own GRAB_RCLONE_<KEY> variable, which the value names, since Go doesn't expand what it
 // substituted. Only that run sees them, never grab itself nor another program it starts (review
 // G7), nor another server's run (G84). An unpinned server (check_pinned), or one whose password
-// isn't saved for its login, is an error. grab's own runs refuse a flag in common_flags that
-// would replace these (rclone_flags::first_refused); `user_copy`, for the --rclone copy and its
-// checks, lets it through.
+// isn't saved for its login, is an error, and so is a common_flags --bind that isn't an address
+// (connect_settings). grab's own runs refuse a flag in common_flags that would replace these
+// (rclone_flags::first_refused); `user_copy`, for the --rclone copy and its checks, lets it through.
 [[nodiscard]] std::expected<proc::Environment, std::string> rclone_env(const Context& ctx, bool user_copy = false);
 
 // rclone's version from `rclone version`'s output ("rclone v1.75.1").
@@ -143,6 +177,8 @@ struct SearchRequest {
     bool batch_ssh = false;   // never let ssh prompt (GUI): -o BatchMode=yes
     // For a walk with rclone: its connections from the pool (fetch::Listing::flags).
     std::vector<std::string> walk_flags;
+    // The command's connection flags after `--`: last on rclone's and ssh.exe's command lines.
+    std::vector<std::string> run_flags;
     GrabSide grab; // engine = grab
 };
 
@@ -171,10 +207,12 @@ using CommandHook = std::function<void(const std::vector<std::string>&)>;
 
 // Runs `command` on the server through ssh (never prompting with `batch_ssh`): its stdout, or a
 // readable error when ssh itself failed (exit 255). Other exit codes count as success: find
-// reports unreadable folders that way, and what it printed is still good.
+// reports unreadable folders that way, and what it printed is still good. ssh gets the server's
+// connection settings with `run_flags` (connect_settings, ssh_connect_options) before its
+// ssh_options.
 [[nodiscard]] std::expected<std::string, std::string>
 run_over_ssh(const Context& ctx, const std::string& command, bool batch_ssh, const proc::RunOptions& run = {},
-             const CommandHook& on_command = {});
+             const CommandHook& on_command = {}, std::span<const std::string> run_flags = {});
 
 // Runs an `rclone lsf` command line: its stdout, or a readable error.
 [[nodiscard]] std::expected<std::string, std::string>
