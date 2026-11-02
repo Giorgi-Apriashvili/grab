@@ -19,33 +19,42 @@ remote name.
 ```
 grab -f releases E:\Backup
   ├─ 1. parse args      mode=folder, target="releases", dest="E:\Backup"
-  ├─ 2. load config     grab.conf  ->  the server (host, port, user, login), where to search,
-  │                     which flags; its password from grab's encrypted store
-  ├─ 3. resolve remote  ssh user@host "find ROOTS -maxdepth N -name 'releases' -type d -printf '%T@\t%p\0'"
-  │                     (or `rclone lsf -R` for remotes without a key / shell, see Lookup methods)
+  ├─ 2. load config     grab.conf  ->  the server (host, port, user, login), where to search;
+  │                     its password or key passphrase from grab's encrypted store
+  ├─ 3. resolve remote  the server's saved file list, or over one SSH connection:
+  │                     find -L ROOTS -maxdepth N -iname '*releases*' ... where the server has
+  │                     GNU find, else its folders listed over SFTP (see Lookup methods)
   │                     0 hits -> exit 3   1 hit -> go   N hits -> numbered pick, several allowed
-  ├─ 4. download        file:   byte ranges over up to 14 connections, `rclone cat --offset N
-  │                             --count M` each, into movie.mkv.grabpart (progress in
-  │                             movie.mkv.grabpart.json); renamed when complete
-  │                     folder: listed once (rclone lsjson -R); files of 64 MiB and more as
-  │                             above, the rest in one `rclone copy --files-from-raw` batch
+  ├─ 4. download        file:   byte ranges over up to 14 connections, each asking for exactly
+  │                             its bytes (255 KiB reads, up to 64 in flight per connection),
+  │                             into movie.mkv.grabpart (progress in movie.mkv.grabpart.json);
+  │                             renamed when complete
+  │                     folder: listed once over SFTP; files of 2 MiB and more as above, as many
+  │                             at a time as At once; smaller ones beside them on every free
+  │                             connection, many at a time
   └─ 5. progress        one live line; Ctrl+C stops and keeps the partial files for next time
 ```
 
-`--rclone` replaces steps 4 and 5 with a plain `rclone copyto` / `rclone copy` using
-`file_flags` / `folder_flags`, with rclone's own `-P` progress; Ctrl+C then goes to rclone.
+All of it goes through grab's own SSH client (libssh2 and OpenSSL, built in), which logs in once
+per connection and keeps the connections open between files, searches and downloads. Logging in
+never prompts: grab uses the keys in ssh-agent, or the password or key passphrase from its
+encrypted store (see [Servers](#servers)).
 
-With a key loaded in ssh-agent the ssh step never prompts; otherwise it asks for the key
-passphrase once per run. The rclone step never prompts: grab hands rclone the password or
-passphrase from its encrypted store (see [Servers](#servers)).
+rclone, which grab used for all of this up to 0.19, is still inside grab as a fallback until a
+later grab removes it: `engine = rclone` in a server's section downloads, searches and lists that
+server through rclone and ssh.exe as 0.19 did (see
+[grab's own client and the rclone fallback](#grabs-own-client-and-the-rclone-fallback)). Measured
+on a Storage Box sub-account: a 3.6 MiB file 4.9 s through grab's client against 10.9 s through
+rclone, a 3-file folder 7.3 s against 10.5 s, its file list 3.5 s against 9.6 s.
 
 ## Requirements
 
-- Windows 10/11 with the built-in OpenSSH client (`ssh.exe`), or any OS with `ssh` on PATH.
-- Nothing else: [rclone](https://rclone.org) ships inside grab (see *Third-party software*),
-  and servers are set up with `grab server add`. You never need to run `rclone config`.
-- A private key used for ssh must have an ACL restricted to your user (OpenSSH refuses
-  world-readable keys).
+- Windows 10/11. Nothing to install: grab's SSH client is built in, servers are set up with
+  `grab server add` (or Settings in the window), and the [rclone](https://rclone.org) for the
+  fallback ships inside grab (see *Third-party software*). You never need to run `rclone config`.
+- `ssh.exe` (the OpenSSH client built into Windows 10/11) only for servers on `engine = rclone`
+  whose searches use ssh + find, and for their line in Test. A private key ssh.exe uses must have
+  an ACL restricted to your user (OpenSSH refuses world-readable keys).
 
 ## Build
 
@@ -72,8 +81,9 @@ In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 Download from the [Releases page](https://github.com/Giorgi-Apriashvili/grab/releases):
 
 - `grab-x.y.z-windows-x64-setup.exe`: per-user installer, no admin rights.
-  - Installs `grab.exe`, the `grab-gui.exe` window and the bundled `rclone.exe` in
-    `%USERPROFILE%\programs\grab\bin`, and adds that folder to your user PATH.
+  - Installs `grab.exe`, the `grab-gui.exe` window and the bundled `rclone.exe` (for servers on
+    the rclone fallback) in `%USERPROFILE%\programs\grab\bin`, and adds that folder to your user
+    PATH.
   - Adds a **grab** Start-menu entry (and optionally a desktop shortcut) for the window.
   - Writes a starter config to `%APPDATA%\grab\grab.conf` if you don't have one.
   - Registers an uninstaller (Settings → Apps) that removes the files, shortcuts, PATH entry
@@ -143,8 +153,8 @@ too and goes on without them.
   with ↑ (Backspace) to go up and ⟳ to list the folder from the server again.
   - Folders open instantly from the server's saved file list (see [File lists](#file-lists)),
     with their date and item count. Folders deeper than the list (past `max_depth`) are listed
-    from the server (`rclone lsjson`, about 2 s on a Storage Box) and remembered while the
-    window is open.
+    from the server (one SFTP listing; `rclone lsjson` on `engine = rclone`, about 2 s on a
+    Storage Box) and remembered while the window is open.
   - Each start opens the server at its top; while the window is open, each server reopens
     where you left it.
   - **Type-ahead**, as in Explorer: with the list focused, typing a name's first letters picks
@@ -223,8 +233,8 @@ too and goes on without them.
     first.
   - The sort stays, across searches, folders and restarts, until you change it.
 - **The status bar shows what grab is doing** whenever something takes a while, with a loading
-  bar: "Listing movies on Box.Guest… 12 items so far", "Searching Main with ssh + find… 37
-  found so far", "Preparing S04E07.mkv: 18 of 38 MiB", "Loading cover.jpg: 3.2 of 8.0 MiB",
+  bar: "Listing movies on Box.Guest… 12 items so far", "Searching Main with find… 37 found so
+  far", "Preparing S04E07.mkv: 18 of 38 MiB", "Loading cover.jpg: 3.2 of 8.0 MiB",
   "Refreshing Box.Guest's file list: 3,100 of ~4,925 entries".
   - The bar shows real progress where grab can count (bytes, entries against the last list,
     servers searched); otherwise it fills over how long the same step took last time on that
@@ -300,19 +310,21 @@ too and goes on without them.
     on a drive that makes short names, `REPORT~1.DOC` could be your "Report for the board.docx").
     Bidi controls, which make a name read backwards (`invoice` + U+202E + `fdp.exe` shows as
     `invoiceexe.pdf`), are left out of the saved name (`invoicefdp.exe`) and show as `⟨U+202E⟩` in
-    the window and its notifications. grab fetches such renamed files itself and checks them by
-    their MD5 sums. rclone encodes every local path it's given once more, so
-    grab tells it each folder and file name in the form that comes back as grab's: a folder like
-    `Mission: Impossible (1996)` lands in one `Mission： Impossible (1996)`, also when the Save-to
-    folder's own name has such characters. A folder whose name rclone can't be told (a `‛` in the
-    Save-to folder's name) is fetched by grab's own engine, and checked by its MD5 sums.
+    the window and its notifications. A folder like `Mission: Impossible (1996)` lands in one
+    `Mission： Impossible (1996)`, also when the Save-to folder's own name has such characters.
+    - On `engine = rclone`, grab fetches such renamed files itself and checks them by their MD5
+      sums. rclone encodes every local path it's given once more, so grab tells it each folder
+      and file name in the form that comes back as grab's; a folder whose name rclone can't be
+      told (a `‛` in the Save-to folder's name) is fetched by grab's own client, and checked by its
+      MD5 sums.
   - **Names that are one on Windows** in a server folder (`README` and `readme`, folders `Docs`
     and `docs`) all arrive: the later file gets a number (`readme (2)`), which the download's
-    file list and the command say. rclone would copy one of them and drop the others (a folder
-    with all it holds), so grab fetches these itself and checks them by their MD5 sums; the same
-    goes for a name spelled two ways in Unicode (`café`), which Windows keeps apart. Names with a
-    line break arrive too (`report␊notes.txt`). A server name that isn't UTF-8 (an old Latin-1
-    name) can't be given to rclone: such a file fails saying so; rename it on the server.
+    file list and the command say. The same goes for a name spelled two ways in Unicode (`café`),
+    which Windows keeps apart. Names with a line break arrive too (`report␊notes.txt`), and so do
+    server names that aren't UTF-8 (an old Latin-1 name).
+    - On `engine = rclone`, which would copy one of such names and drop the others (a folder with
+      all it holds), grab fetches these itself and checks them by their MD5 sums. A name that
+      isn't UTF-8 can't be given to rclone: such a file fails there, saying so.
   - **Paths past 260 characters** (deep folders with long release names) work where Windows'
     long paths are on (the "Enable Win32 long paths" policy, or `LongPathsEnabled` in the
     registry; many PCs have it). Where they're off, a file whose path would be too long fails
@@ -342,22 +354,25 @@ too and goes on without them.
     Skip and Copy path.
   - Shift+F10 or the menu key opens the menu for the row under the cursor.
 - **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4, is how many
-  files download at the same time, all downloads together. Each file of a folder counts: at 1 a
-  folder goes file by file; at 4 it runs up to 4 of its files, fewer while other downloads run.
+  files download at the same time, all downloads together. Each file of a folder counts (on
+  grab's own client each one of 2 MiB and more; smaller ones go beside them, see Folders): at 1
+  a folder goes file by file; at 4 it runs up to 4 of its files, fewer while other downloads run.
   A file then gets more of the server's connections, so fewer at once costs no speed. The
   grab command downloads a folder's files as many at a time as the window's At once. Each
   download can be paused, resumed or cancelled, or all together with Pause all / Resume all and
   Cancel all.
-- **Resumable file downloads:** grab fetches a file in byte ranges, several `rclone cat`
-  streams at once, into `<name>.grabpart`. It records each range's progress in
-  `<name>.grabpart.json` and renames the file when it is complete.
+- **Resumable file downloads:** grab fetches a file in byte ranges over several connections at
+  once, each asking the server for exactly its range's bytes (`rclone cat` streams on `engine =
+  rclone`), into `<name>.grabpart`. It records each range's progress in `<name>.grabpart.json`
+  and renames the file when it is complete. A partial file from either engine resumes on the
+  other.
   - Pausing keeps both; resuming continues from the last saved bytes.
   - grab reuses or deletes only partial files it made: their `.json` record names the server
     and its file (the same path on another server is another file). When something else
     already has those names (your own files, or files of the folder
     being downloaded), it uses `<name>.2.grabpart` and so on, and leaves them alone. Cancelling
-    deletes only grab's partial files, and of rclone's temporary `.partial` files only the ones
-    its stopped copy had just made.
+    deletes only grab's partial files, and, on `engine = rclone`, of rclone's temporary
+    `.partial` files only the ones its stopped copy had just made.
   - This survives closing grab: unfinished downloads come back paused (the list is kept in
     `%APPDATA%\grab\queue.json`). Should the list be damaged, the queue starts empty, the old
     file is kept as `queue.json.bad-<date>-<time>` and the window says so.
@@ -381,9 +396,11 @@ too and goes on without them.
 - **Speed limit:** the bar below the downloads shows the total speed. On its right, "Limit
   speed" caps all downloads together, in MiB/s; the switch keeps the value, and both are
   remembered.
-  - Changes apply at once. Streams through grab are paced by a shared token bucket, and while
-    limited, rclone is told not to read ahead, so the network really follows the limit.
-  - A folder's small-file batch gets rclone's `--bwlimit` and counts against the same total.
+  - Changes apply at once. Downloads are paced by a shared token bucket: while limited, grab's
+    client asks each connection for one read at a time, after taking its tokens, so the network
+    really follows the limit (on `engine = rclone`, rclone is told not to read ahead).
+  - On `engine = rclone`, a folder's small-file batch gets rclone's `--bwlimit` and counts
+    against the same total.
 - **Verify downloads** (Settings → Downloads, off by default): after each download, the server
   computes an MD5 checksum of its copy (`md5sum`, run through grab's own SSH connection) while
   grab computes yours, and the two are compared. The row shows "Verifying the checksum…" (a
@@ -417,20 +434,23 @@ too and goes on without them.
     ("Schedule resumes at 24:00"), also across a restart. Editing the schedule ends it.
   - The `grab` command follows the same schedule (see [Usage](#usage)). Each program caps its
     own downloads.
-  - At each change, a folder's small-file batch starts again with the new cap; the files it
-    had in flight start over. Other downloads keep their connections and just follow the new
-    speed; they reconnect only when the limit switches on or off.
+  - At each change, downloads keep their connections and just follow the new speed. On `engine
+    = rclone`, a folder's small-file batch starts again with the new cap (the files it had in
+    flight start over), and the other downloads reconnect when the limit switches on or off.
 - **Folders** are listed once and shown as a tree under their row, collapsible with ▸/▾.
   - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
   - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
     files.
-  - Files of 64 MiB and more take the resumable path above, as many at a time as At once allows.
-  - Smaller files go in one `rclone copy` batch that reuses its connections, since a new SSH
-    login per small file would dominate; it copies as many at a time as At once allows. Pausing drops the progress of small files that were
-    in flight.
-  - The batch's connections follow its share: when another download from the same server
-    starts, it starts again with fewer within a few seconds, and with more once they're free
-    again (the small files in flight start over).
+  - Files of 2 MiB and more take the resumable path above, as many at a time as At once allows,
+    their pieces spread over the server's connections.
+  - Smaller files go beside them on every free connection, many at a time (up to 32 files and 8
+    MiB of reads in flight per connection), over connections already logged in, since a new SSH
+    login per small file would dominate. Pausing drops the progress of small files that were in
+    flight.
+  - On `engine = rclone` the line is at 64 MiB: smaller files go in one `rclone copy` batch that
+    copies as many at a time as At once allows. Its connections follow its share: when another
+    download from the same server starts, it starts again with fewer within a few seconds, and
+    with more once they're free again (the small files in flight start over).
   - The tree and each file's state survive closing grab. Files already complete on disk are
     not fetched again.
 - **Connections per server:** every download from a server shares that server's connection
@@ -445,8 +465,8 @@ too and goes on without them.
   - Play takes up to 8 connections of a Storage Box's budget (2 elsewhere), ahead of
     downloads, while a video plays (see Previews). Previews take one connection of the budget,
     ahead of downloads, and only free ones beyond it.
-  - Connections open slightly staggered. If a server refuses one while others of grab's get
-    data, grab lowers that server's budget and remembers it (in `limits.json` next to
+  - If a server refuses a connection while others of grab's get data, grab lowers that server's
+    budget and remembers it (in `limits.json` next to
     gui.json, shared with the `grab` command). Each download from that server that ends
     without a refusal raises it by one again, back to the default, so a drop caused by a
     passing hiccup wears off.
@@ -462,8 +482,10 @@ too and goes on without them.
     reached about 5 MB/s.
   - Hetzner documents 10 connections per Storage Box account, but boxes accepted 16 on one
     account, and 28 across a main account and its sub-account at once. Searches, file lists
-    and folder listings that walk the server over rclone take their connections from the same
+    and folder listings that walk the server's folders take their connections from the same
     budget (see [File lists](#file-lists)).
+  - Which connections, how long grab waits for a server, and the local address to connect from
+    are set per server: see [Connections](#connections).
 
 - **Updates:** once a day, when the window opens, grab asks GitHub for the latest release (one
   request; a failure stays silent). A newer one shows a banner: `grab 0.7.0 is available ·
@@ -482,7 +504,10 @@ too and goes on without them.
   and writes nothing until you trust them. A saved password stays with the user, host and port
   it was typed for: changing any of them asks for it again. A server without connection details
   (one grab couldn't import, see [Servers](#servers)) opens with Edit to fill them in. "Open
-  grab.conf" covers the rarer settings (rclone flags, ssh options, find method).
+  grab.conf" covers the rarer settings: `bind`, `connect_timeout` and `io_timeout` (see
+  [Connections](#connections)), the find method, and `engine = rclone` for the fallback. A
+  server card says "rclone (fallback)" for a server on rclone, and the settings' one-time notes
+  (see [Notes about settings](#notes-about-settings)) show once in the notice above the search.
 - **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
   only that page's messages reach grab, and files dragged in from outside are ignored.
 - **Tray:** closing the window while downloads run keeps them going in the notification
@@ -491,9 +516,10 @@ too and goes on without them.
   front. Clicking it, or the tray icon, brings the window back.
 - It needs the Microsoft Edge WebView2 Runtime, which ships with Windows 11 and current
   Windows 10. Without it, grab-gui offers the download link.
-- It never prompts for an ssh passphrase, since it has no console. For key-based servers,
-  load the key into ssh-agent (`ssh-add <key file>`). A search then fails fast with that
-  hint instead of hanging.
+- It never prompts for a passphrase, since it has no console: grab's client takes a key file's
+  passphrase from grab's store (Settings → Edit), or the key from ssh-agent. On `engine =
+  rclone`, searches through ssh + find need a passphrase-protected key loaded into ssh-agent
+  (`ssh-add <key file>`); without it a search fails fast with that hint instead of hanging.
 - Start-up is about half a second. Memory use is ~20 MB for grab-gui plus the WebView2
   browser processes, typically 150–300 MB.
 - UI development: set `GRAB_UI_DIR` to `src\gui\ui` and grab-gui serves the page from there,
@@ -508,7 +534,7 @@ The GUI is built with the rest (`GRAB_BUILD_GUI=ON` by default); in a source bui
 
 ```powershell
 grab server add              # step by step: host, port, user, login, folders to search
-grab server list             # each server's login, saved password, host key
+grab server list             # each server's login, saved password, engine and search, host key
 grab server edit NAME        # the same questions, with the current answers as defaults
 grab server test NAME        # log in as downloads, searches and verification do
 grab server trust NAME       # pin a server's host key (for servers imported without one)
@@ -530,8 +556,12 @@ auth = password
 - `auth = key`: `key_file`, with its passphrase, if it has one, in grab's password store.
 - `auth = password`: the password in grab's password store.
 - `auth = stored_key`: a key an rclone.conf held inline (`key_pem`), imported into grab's store
-  with its passphrase; grab and rclone both log in with it. Edit can switch it to a key file or
-  ssh-agent.
+  with its passphrase; grab's client (from memory, as it reads key files) and rclone both log in
+  with it. Edit can switch it to a key file or ssh-agent.
+
+How every connection to it is made (`bind`, `connect_timeout`, `io_timeout`, `max_connections`)
+is in [Connections](#connections); which client does the work, in
+[grab's own client and the rclone fallback](#grabs-own-client-and-the-rclone-fallback).
 
 `grab server add` asks for:
 - the server's host, port and user
@@ -549,12 +579,13 @@ Then it:
   can't be added.
 - **saves the server:** its section goes into grab.conf, its password or passphrase into grab's
   password store.
-- **tests the connection:** grab's own client logs in and lists the home folder (previews, Play
-  and Verify use it on every server); on `engine = rclone` also one check through rclone (its
-  downloads) and, for key or agent logins, one through ssh (its searches); on `engine = grab`
-  whether searches will use find or list folders. What rclone would otherwise ask the server on
-  each of its runs (its shell and checksum commands) is noted in the section as `shell_type`,
-  `md5sum_command` and `sha1sum_command`.
+- **tests the connection:** grab's own client logs in, lists the home folder and says whether
+  searches will use find or list folders, and whether Verify can run. On a server on `engine =
+  rclone` it adds one check through rclone (its downloads) and, for key or agent logins
+  searched with ssh + find, one through ssh.exe (its searches); grab's own login is then only a
+  warning when it fails (previews, Play and Verify can't run). The server's shell and checksum
+  commands, which rclone would otherwise ask the server on each of its runs and Verify goes by,
+  are noted in the section as `shell_type`, `md5sum_command` and `sha1sum_command`.
 
 `grab server edit NAME` asks the same questions with the current answers in brackets; Enter
 keeps one. The name stays, since partial downloads, file lists, limits and the saved password
@@ -565,14 +596,21 @@ what grab learned about the old one (its connection limit, the window's timings,
 checksum commands). A section without connection details is filled in the same way.
 
 `grab server list` shows each server's login (`password saved` or `no password saved`, a key
-file's `passphrase saved`) and `host key pinned` or `host key not trusted (grab server trust
-NAME)`. `grab server test NAME` prints what Test in Settings shows:
+file's `passphrase saved`), its engine and how it is searched (`engine grab, search with find or
+by listing folders`, `engine rclone (fallback), search with ssh + find`), `host key pinned` or
+`host key not trusted (grab server trust NAME)`, and the connection keys that are set (`bind
+10.0.0.2`). A server kept on rclone by itself gets a second line saying why (see
+[grab's own client and the rclone fallback](#grabs-own-client-and-the-rclone-fallback)).
+`grab server test NAME` prints what Test in Settings shows, and repeats the server's
+[notes about settings](#notes-about-settings):
 
 ```
 Testing box (u123456@u123456.your-storagebox.de:23) ...
-  rclone (downloads): OK
-  grab (previews, Play, verify): OK, home folder listed, checksums: md5sum
+  grab (downloads, searches, previews, Play, verify): OK, home folder listed, searches by listing folders (a Storage Box has no find, so grab doesn't ask), checksums: md5sum
 ```
+
+On `engine = rclone` the same server shows `rclone (downloads): OK` first and `grab (previews,
+Play, verify): ...` after it.
 
 Passwords and passphrases are never shown and never put on a command line.
 - grab keeps them in its own store, `passwords` in `%APPDATA%\grab` (a configuration elsewhere
@@ -583,27 +621,34 @@ Passwords and passphrases are never shown and never put on a command line.
 - Each one is kept with the user@host:port it was typed for, and grab sends it nowhere else: a
   hand edit of `host` in grab.conf, or a grab.conf copied from somewhere else, gets "the saved
   password is for ...: enter it again with Edit" instead.
-- When grab runs rclone, it hands that rclone run alone the server's details and password (in
-  rclone's obscured form, which rclone reads like its config), in its own environment, with
-  rclone's config kept in memory (`--config NUL`): never on disk, on a command line, or in
-  grab's own environment, where every program grab starts would see it.
+- grab's own client gets them in memory. When grab runs rclone (`engine = rclone`), it hands
+  that rclone run alone the server's details and password (in rclone's obscured form, which
+  rclone reads like its config), in its own environment, with rclone's config kept in memory
+  (`--config NUL`): never on disk, on a command line, or in grab's own environment, where every
+  program grab starts would see it.
 - If the store can't be read (another Windows account, a damaged file, or a Windows password an
-  admin reset), servers with passwords say so: enter the password again in Settings → Edit (or
-  `grab server edit NAME`). Servers without passwords keep working.
+  admin reset), downloads, searches, lists, previews, Play and Verify stop for every server of
+  that configuration and say why: the store may also hold a server's rclone settings (a proxy,
+  an ssh command, see [Coming from an earlier grab](#coming-from-an-earlier-grab)), which a
+  connection must not go past. Save a server in Settings → Edit (or `grab server edit NAME`):
+  for a password server, enter its password again; one that logs in with ssh-agent or a key
+  file needs no change. Saving sets the whole store aside, with any proxy or ssh command a
+  server kept there: that server then connects directly. Before saving, put the proxy in its
+  `common_flags` (`--sftp-socks-proxy`, `--sftp-http-proxy`); an ssh command comes back only
+  with the old file, once it can be read again.
   - That first change keeps the old store as `passwords.unreadable-<date>-<time>` (it may become
-    readable again, e.g. once a domain controller is reachable after a reset) and names the
-    other servers whose passwords need entering again.
+    readable again, e.g. once a domain controller is reachable after a reset), starts a new one
+    and names the other servers whose passwords need entering again.
 - Elsewhere than Windows the store is a plain file only you can read (mode 0600), not
   encrypted.
 
 The commands also take answers from piped input, one per line, so they can be scripted. When
 the input runs out, the command stops without changing anything.
 
-Password servers are searched with rclone. Key and ssh-agent servers are searched with ssh +
-find, which is faster; with a passphrase-protected key that needs the key in ssh-agent
-(`ssh-add <key file>`). With `engine = grab` every server is searched with find where it has
-GNU find (grab checks once a week and remembers the answer in `limits.json`; Test checks again),
-else by listing its folders.
+Every server is searched with find where it has GNU find (grab checks once a week and remembers
+the answer in `limits.json`; Test checks again), else by listing its folders, whatever its login
+(see [Lookup methods](#lookup-methods)). On `engine = rclone`, password servers are searched with
+rclone's listing and key and ssh-agent servers with ssh + find, as up to 0.19.
 
 #### Coming from an earlier grab
 
@@ -635,6 +680,22 @@ not sftp, an encrypted rclone.conf, an old store it can't read for a password se
 details: Settings and `grab server list` say why, Edit fills it in, and the next run tries
 again once that rclone.conf changes.
 
+The same first run of 0.20 also moves the work onto grab's own client. Up to 0.19 every download,
+search and list went through rclone and ssh.exe; from 0.20 a server without an `engine` line
+uses grab's own client, unless its rclone settings ask for something that client can't do (a
+proxy, an ssh command: it then stays on rclone by itself, see
+[grab's own client and the rclone fallback](#grabs-own-client-and-the-rclone-fallback)):
+- One note says so, once, naming the servers the import moved (not a server added since, nor
+  one with an `engine` line): "Downloads, searches and lists now use grab's own SSH client, no
+  longer rclone (Main, Box); their saved file lists are fetched again once. To go back to rclone
+  for a server until a later grab removes it, set engine = rclone in its section (grab config,
+  or Open grab.conf in grab's Settings)."
+- Each server's saved file list is fetched again once (a list remembers how it was made).
+- Of `common_flags`, grab's client takes `--bind`, `--contimeout` and `--timeout` as `bind`,
+  `connect_timeout` and `io_timeout` while those are blank; other flags you changed there, in
+  `folder_flags`, `file_flags` or `ssh_options` get a note once (see
+  [Notes about settings](#notes-about-settings)). grab.conf isn't rewritten for any of this.
+
 #### Going back to 0.19
 
 0.19.0 reads the same grab.conf: it ignores the new keys and finds each moved server through
@@ -650,7 +711,14 @@ servers as they were when you upgraded:
 - on the way forward again, addresses and passwords changed in 0.19 aren't seen by 0.20:
   grab.conf's details win;
 - 0.19's rclone still notes in that rclone.conf what it finds out about a server (its shell,
-  for one), as it always did.
+  for one), as it always did;
+- 0.19 has only rclone: it ignores `engine` lines, and every server downloads, searches and lists
+  through rclone and ssh.exe again;
+- 0.19 ignores `bind`, `connect_timeout` and `io_timeout`, so a bind written only as `bind =` is
+  lost there. To keep one for 0.19, keep `--bind` in `common_flags` too (0.20 notes once that
+  `bind` wins over it; nothing breaks);
+- 0.19 refuses the whole grab.conf on `find = walk`: write `find = rclone`, which 0.20 reads as
+  walk.
 
 If `rclone_config =` points at an rclone.conf you also use with rclone on its own, servers you
 add or change in grab no longer show up there.
@@ -668,8 +736,8 @@ for each, with its connection details and its password moved as described in
 [Coming from an earlier grab](#coming-from-an-earlier-grab) (rclone.conf is only read):
 - `search_roots` is blank, meaning the login home.
 - `default_remote` is the first one.
-- The rclone flag keys are written commented out, so later changes to the built-in defaults
-  still reach you. Uncomment one to override it.
+- `find = auto`, with commented-out `bind`, `connect_timeout` and `io_timeout` lines (see
+  [Connections](#connections)) and a commented-out `engine = rclone` for the fallback.
 
 Run `--init` again later: it never rewrites an existing file, but prints ready-to-paste
 sections for sftp remotes added to the standard rclone.conf since; the next grab run moves
@@ -706,37 +774,104 @@ configuration's folder leaves its passwords behind (`grab server list` then says
 saved"), as it leaves its lists. grab's known_hosts is shared by all of them.
 Add one `[section]` per server and choose with `-r NAME`.
 
-**grab's own engine (preview).** grab is replacing rclone with its own SSH client. Put
-`engine = grab` in a server's section to try it: files and folders then download through it, and
-searches, file lists and Browse go through it too (previews, Play and Verify use grab's client on
-every server, whatever its engine).
-A search or a list uses the server's GNU find when it has one and the `find` setting allows it,
-else it lists folders over SFTP, several at a time; links are followed. It logs in once and
-keeps the connections open between files, asks the server for exactly the bytes it needs, and
-continues partial downloads rclone started (and the other way round). In a folder, files of 2 MiB
-and more follow "At once" and spread over the connections; smaller ones go beside them on every
-free connection, many at a time. It also downloads names that aren't UTF-8, and a subfolder the
-server won't list is reported instead of failing the whole folder. Of `common_flags` it takes
-`--bind`, `--contimeout` and `--timeout` (`-v` names the ones it leaves out). Test in Settings
-logs in through it and says whether searches use find or list folders; it asks rclone nothing
-there (on an engine = rclone server it checks rclone's login for the downloads, and a failure of
-grab's own login is a warning: previews, Play and Verify can't run). `GRAB_ENGINE=grab` or
-`rclone` in the environment overrides every server.
+#### grab's own client and the rclone fallback
+
+Every server downloads, searches, lists and browses through grab's own SSH client unless its
+section says `engine = rclone`; previews, Play and Verify use grab's client on every server,
+whatever its engine. A search or a list uses the server's GNU find when it has one and the `find`
+setting allows it, else it lists folders over SFTP, several at a time; links are followed. It
+logs in once and keeps the connections open between files, asks the server for exactly the bytes
+it needs, and continues partial downloads rclone started (and the other way round). It also
+downloads names that aren't UTF-8, and a subfolder the server won't list is reported instead of
+failing the whole folder.
+
+**The fallback.** `engine = rclone` in a server's section (`grab config`, or Open grab.conf in
+Settings) sends its downloads, searches and lists through the bundled rclone, and ssh.exe for
+ssh + find, as 0.19 did, until a later grab removes it. `GRAB_ENGINE=rclone` in the environment
+does the same for every server of one run. It is there for a server grab's client fails on where
+rclone works: when the key exchange or the choice of algorithms fails, or the server's SFTP
+answers in a way grab can't read, the error ends "...; for Box's downloads, searches and lists
+to go through rclone until a later grab removes it, set engine = rclone in [Box] (grab config, or
+Open grab.conf in grab's Settings)". A wrong password, a refused key or a timeout fail the same
+way on both, so they don't say it. Such a server shows `engine rclone (fallback)` in `grab server
+list`, "rclone (fallback)" on its card, and `-v` says "Box through rclone (the fallback)". Only
+servers on rclone use:
+- `common_flags`, `folder_flags` and `file_flags`: rclone flags (see [Connections](#connections)
+  for which of them still do something);
+- `ssh_options`: options for ssh.exe, which searches with ssh + find and runs Test's ssh line;
+- `rclone.<key>` lines and the rclone settings the import kept in grab's store;
+- `[grab]`'s `rclone =` (blank: the rclone.exe beside grab) and `ssh =` (blank or `ssh`: Windows'
+  ssh.exe).
+
+**Servers kept on rclone.** Some rclone settings ask for what grab's client can't do: a SOCKS or
+HTTP proxy, an ssh command in place of the SSH client, a ProxyCommand or a jump host, another
+SFTP subsystem or server command, a certificate login, insecure ciphers, cipher, key exchange,
+MAC or host key lists that share nothing with grab's, one read at a time
+(`disable_concurrent_reads`) or fstat in place of stat (`use_fstat`). grab looks for them in
+`rclone.<key>` lines, the rclone settings the import kept in its store, `--sftp-*` flags in
+`common_flags`, `-o ProxyCommand`, `-o ProxyJump` or `-J` in `ssh_options`, and `RCLONE_SFTP_*`
+variables in the environment (`RCLONE_SFTP_SOCKS_PROXY`, `RCLONE_SFTP_HTTP_PROXY`...).
+- A server with one of them and no `engine` line stays on rclone by itself. grab's own client
+  refuses it rather than connect past what you set up, so previews, Play and Verify are off for
+  it; through a proxy or an ssh command its searches and lists go by rclone's listing (ssh.exe
+  wouldn't take that way either). `engine = grab` (or `GRAB_ENGINE=grab`) on it is refused where
+  it's used, with the same reason.
+- `grab server list`, Test and `-v` say why every time: "[Box] connects through a SOCKS proxy
+  (rclone.socks_proxy), which grab's own client can't: its downloads go through rclone, and its
+  searches and lists by rclone's listing; previews, Play and Verify are off for it". The reason
+  names the setting, never its value.
+- With an `ssh` setting, rclone hands the connection to that command, which picks the host and
+  checks host keys itself, not against grab's known_hosts; the reason says so.
+- Trust, and the host key check of Add and Edit, connect directly from this PC: for a server
+  that goes through a proxy or a command they ask first.
+- A password store that can't be read counts as such a setting for every server (see
+  [Servers](#servers)).
+
+#### Notes about settings
+
+Settings that mean something else, or nothing, on grab's own client get a note, once per
+configuration, in whichever program meets them first: the command prints `grab: note: ...`, the
+window shows it in the notice above the search. `grab server test NAME` and `-v` repeat a
+server's notes every time. A note comes again when its setting changes.
+- The switch to grab's own client, after the import (see
+  [Coming from an earlier grab](#coming-from-an-earlier-grab)).
+- `common_flags`: "[Main] common_flags: grab reads --bind 10.0.0.2 as `bind = 10.0.0.2` for now.
+  Write that line in [Main] (grab config); common_flags is only for rclone and goes away with
+  it." (likewise `--contimeout`, `--timeout`); "[Main] common_flags: --sftp-connections 4 is for
+  rclone only; to cap grab's connections to Main, set max_connections = 4 in [Main]."; other
+  flags with what grab does instead.
+- `folder_flags` and `file_flags`: a `--bind` there ("reaches only rclone's folder batch; write
+  `bind = 10.0.0.2` for every connection"), and flags that were for `--rclone`, which is gone.
+- `ssh_options` on a server on grab's client: what to use instead (`-o ConnectTimeout=10`:
+  `connect_timeout = 10s`; BindAddress: `bind`; ServerAliveInterval: grab sends its own
+  keepalives).
+- `rclone.<key>` settings that change what happens on grab's client (`skip_links`: grab follows
+  links; `connections`: `max_connections`; `chunk_size`, `concurrency`, `idle_timeout`, `set_env`,
+  `set_modtime`).
+- A server kept on rclone, with the reason.
+- A key grab.conf doesn't know: "[Main] connect_timout isn't a grab.conf setting (ignored)."
+
+Only flags that differ from the old defaults are noted, flag by flag, so a grab.conf with the
+defaults gets none. Notes name settings and quote binds, times, sizes and counts, never a proxy
+or an ssh command (they can hold a password). `notices.json` beside grab's other state
+(`%APPDATA%\grab`, or the configuration's own folder) remembers which were shown, by a SHA-256,
+never the setting's value.
 
 #### Environment
 
 - `GRAB_CONFIG`: grab.conf's path, as `--config`.
-- `GRAB_ENGINE=grab` or `rclone`: every server's engine, whatever grab.conf says.
+- `GRAB_ENGINE=grab` or `rclone`: every server's engine, whatever grab.conf says, for the
+  fallback or to compare the two; a server kept on rclone by itself is refused under `grab`.
 - `RCLONE_CONFIG`: the standard rclone.conf that `--init` and the import read.
-- rclone runs grab starts get one server's `RCLONE_CONFIG_<SERVER>_*` variables from grab alone
-  (see [Tuning](#tuning)); `RCLONE_CONFIG_*` variables of your own are left out of them, and
-  grab-gui drops any it inherited when it starts. Players, editors, ssh and the installer get no
-  server's details at all.
+- rclone runs grab starts (`engine = rclone`) get one server's `RCLONE_CONFIG_<SERVER>_*`
+  variables from grab alone (see [Connections](#connections)); `RCLONE_CONFIG_*` variables of
+  your own are left out of them, and grab-gui drops any it inherited when it starts. Players,
+  editors, ssh and the installer get no server's details at all.
 
 ## Usage
 
 ```
-grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- extra rclone args]
+grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- FLAGS]
 grab config [-c PATH]
 
   -r, --remote NAME    grab.conf section to use
@@ -758,11 +893,17 @@ grab config [-c PATH]
                        older than the server's): replace it, both (keep yours and save the
                        new one as "name (2).ext") or skip it. Without it grab asks first, or
                        stops when there is no console to ask on
-      --rclone         download with plain rclone copyto / copy and rclone's own progress
-  -n, --dry-run        resolve the target and show what would be fetched (with --rclone: the
-                       rclone command); transfers nothing and creates no folders
-  -v, --verbose        echo the ssh and rclone command lines
-      --init           write an example grab.conf
+  -- FLAGS             connection flags for this run: --bind ADDRESS, --contimeout TIME (or
+                       off) and --timeout TIME (1s to 24h on grab's own client) win over the
+                       server's bind, connect_timeout and io_timeout. A server on engine =
+                       rclone also takes rclone's other connection flags (--sftp-*...), but
+                       not its address, login or host keys (grab server edit NAME)
+  -n, --dry-run        resolve the target and show what would be fetched; transfers nothing
+                       and creates no folders
+  -v, --verbose        say how grab connects and searches, the settings' notes again, and the
+                       command lines of servers on rclone (engine = rclone) before they run
+      --init           write grab.conf to the config path if absent, with the sftp remotes of
+                       the standard rclone.conf as servers (rclone.conf is only read)
 ```
 
 - Searches use the server's saved [file list](#file-lists) when it is under 15 minutes old,
@@ -771,14 +912,15 @@ grab config [-c PATH]
 - `TARGET` is a search: every word must appear in the name, ignoring case, in any order.
   `grab -s lioness E:\TV` lists every file with "lioness" in its name.
   `grab -s "lioness s03e08" E:\TV` narrows that to one episode, and so does
-  `grab -s "the unravelling" E:\TV`. With the ssh lookup the filtering happens on the server
-  (`find -iname`), so only hits travel back.
+  `grab -s "the unravelling" E:\TV`. When a live search uses find, the filtering happens on the
+  server (`find -iname`), so only hits travel back.
 - A `TARGET` containing `*`, `?` or `[` is a glob instead, also case-insensitive:
   `grab -f 'Season.0[1-3]*' E:\Backup`. `--exact` matches the whole name, case-sensitive.
 - Matches show their size and date in the list, folders their date:
-  `[3] movies/x.avi  (897.9 MiB, 2023-10-15)`. The ssh lookup gets sizes and dates from GNU
-  find's `-printf`, which any mainstream Linux server has; a server without it finds nothing
-  over ssh, so use `find = rclone` for it.
+  `[3] movies/x.avi  (897.9 MiB, 2023-10-15)`. find gets sizes and dates from GNU find's
+  `-printf`, which any mainstream Linux server has; the find check sends a server without it to
+  the folder walk, which reads them over SFTP (on `engine = rclone`, use `find = rclone` for
+  such a server).
 - With several matches you get a numbered list, best first. Exact names rank first, then
   names starting with your first word, then the shallowest, then alphabetical, so a
   season lists in episode order. Answer `3`, `1-5,8`, `a` for all, Enter for `[1]`, or `q`.
@@ -800,8 +942,9 @@ grab config [-c PATH]
   target itself starts with a dot.
 - Downloads use the same engine as the window: a file in byte ranges over the server's
   connection budget (`max_connections`; 14 on Storage Boxes, 12 elsewhere), a folder listed
-  once with big files fetched the same way and small ones in one rclone batch. Picks run one
-  after another, each with the whole budget.
+  once with files of 2 MiB and more fetched the same way and smaller ones on every free
+  connection (on `engine = rclone`: 64 MiB, and one rclone batch). Picks run one after
+  another, each with the whole budget.
   - Progress is one line, redrawn in place:
     `412.0 MiB / 898.0 MiB  45%  18.0 MiB/s  14 conns  ETA 0:26` (folders add `4/13 files`).
     When stderr is not a console (a log file, a script), only the start and end lines appear.
@@ -821,9 +964,7 @@ grab config [-c PATH]
     what that question listed. With several picks, `R`, `K` or `S` (capital) answers every later
     question of the run too, and `q` stops the run: the picks after it don't start.
     `--existing replace`, `both` or `skip` answers everything in advance; without a console to
-    ask on, grab stops with exit code `6` and replaces nothing unless `--existing` is given. When
-    the check can't reach the server (`--rclone`), a file there is asked about as one that
-    couldn't be compared.
+    ask on, grab stops with exit code `6` and replaces nothing unless `--existing` is given.
   - Keep both doesn't download again what an earlier Keep both kept: a numbered copy that is
     already the server's file counts as there (`already there as movie (2).mkv`).
   - Picks with the same name (`sample.txt` in two server folders, three `Season 1` folders) land
@@ -837,49 +978,86 @@ grab config [-c PATH]
   - Without `--limit`, grab follows the window's [speed schedule](#gui), also mid-download:
     `grab: speed limited to 5 MiB/s until 24:00 by the speed schedule`, and a line at each
     change. `--limit RATE` replaces the schedule, and `--limit off` downloads without a limit.
-  - Measured on a Storage Box: one 898 MiB file took 1:09 this way and 1:50 with `--rclone`,
-    minutes apart.
+  - Measured on a Storage Box: one 898 MiB file took 1:09 in byte ranges (`rclone cat`
+    streams, before grab had its own client) and 1:50 with a plain `rclone copyto`, minutes
+    apart.
 - `--type`, `--min-size` and `--max-size` narrow the matching files before the pick list (and
   `--first` / `--all`): `grab "limits" --type video --min-size 50M`. The kinds are the window's
   (by extension: `.mkv` is video, `.r00` an archive). A file whose size isn't known doesn't
   pass a size bound. They pick files, so they don't go with `-f`; when nothing is left, grab
   says so: `grab: error: 12 files found, but none is video, at least 1.0 GiB` (exit code `3`).
-- `--rclone` downloads with plain `rclone copyto` / `rclone copy` instead, with rclone's own
-  progress and `file_flags` / `folder_flags`; `--limit` becomes rclone's `--bwlimit`, and the
-  speed schedule a weekly `--bwlimit` timetable ("Mon-18:00,5120K Tue-00:00,off ..."). With
-  `--verify`, rclone compares checksums after each transfer itself. grab looks first and asks
-  the same question before rclone would replace a file (another size, or a different time); a
-  folder offers Replace or Skip, since rclone copies it under the server's names, and Skip runs
-  rclone with `--ignore-existing`.
-- After `--` go rclone flags. grab's own downloads take only connection flags there
-  (`--sftp-*`, `--bind`, `--contimeout`, `--timeout`, certificates); any other one is refused
-  before anything runs, with what to use instead (`-- --dry-run`: grab's own `-n`; `-- --bwlimit`:
-  `--limit`, which also shares the speed across connections). With `--rclone`, every flag after
-  `--` goes to the rclone copy.
+- After `--` go connection flags for this run, checked once the server's engine is known and
+  before anything connects or any folder is made; a flag that isn't taken stops the run (exit
+  code `1`) saying what to use instead, never ignored.
+  - On grab's own client: `--bind ADDRESS`, `--contimeout TIME` (`off` for none) and `--timeout
+    TIME` (1 s to 24 h), which win over the server's `bind`, `connect_timeout` and `io_timeout` for every
+    connection of the run; `--bind=` (blank) connects from any address. Anything else is refused
+    with what to use: `-- --sftp-connections 4`: `max_connections` in grab.conf; `--bwlimit`,
+    `--tpslimit`: `--limit`; `--transfers`: At once; `--dry-run`: `-n`; `--low-level-retries`:
+    grab retries a failed piece by itself; chunk size, concurrency and multi-thread flags: grab
+    reads 255 KiB at a time, 64 in flight, with nothing to set; a proxy, an ssh command, another
+    SFTP subsystem or cipher flags: `engine = rclone` for that server.
+  - On `engine = rclone`: rclone's connection flags (`--sftp-*`, `--bind`, `--contimeout`,
+    `--timeout`, `--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`,
+    `--dscp`, `--password-command`), last on each rclone command line; `--bind` and
+    `--contimeout` also reach ssh.exe as `-o BindAddress` and `-o ConnectTimeout`. Any other flag
+    is refused, `-- --dry-run` with "grab's own -n". A proxy or ssh command flag there makes the
+    run search by rclone's listing and turns Verify off for it, as such a setting in grab.conf
+    does.
+  - On both, the `--sftp-*` flags that would replace the server's address, login or host keys
+    (`--sftp-host`, `-port`, `-user`, `-pass`, `-key-file`... `-known-hosts-file`, `-ssh`) are
+    refused, naming the setting or command that changes it.
+- `--rclone`, the plain rclone copy of earlier versions, is gone: it stops before anything
+  runs (exit code `1`) with "--rclone is gone: grab no longer runs a plain rclone copy. To
+  download from a server through rclone until a later grab removes it, set engine = rclone in
+  [Box] (grab config)".
+- `-v` says how grab connects and searches ("Main through grab's own SSH client", "the file list
+  of Main comes with find (GNU find, checked on 2026-11-03)"), each SFTP read and command it
+  sends (`+ sftp read ... --offset 0 --count 1048576`, `+ exec md5sum -z ...`), the server's
+  [notes about settings](#notes-about-settings) again, and on `engine = rclone` the rclone and
+  ssh command lines before they run.
 
-Exit codes: `0` ok, `1` usage, `2` config, `3` target not found or pick aborted,
-`4` remote lookup failed (ssh or rclone listing), `5` `grab update` failed, `6` a download
-failed, `130` stopped by Ctrl+C. With `--rclone`, a failed download exits with rclone's own
-code.
+Exit codes: `0` ok, `1` usage (also a flag after `--` that isn't taken, and `--rclone`), `2`
+config, `3` target not found or pick aborted, `4` remote lookup failed (search or file list),
+`5` `grab update` failed, `6` a download failed, `130` stopped by Ctrl+C.
 
 ## Lookup methods
 
-Per remote, `find =` in grab.conf picks how `TARGET` is located:
+Per server, `find =` in grab.conf picks how `TARGET` is located, and how its
+[file list](#file-lists) is made:
 
-| method   | how                                                          | auto picks it when |
-|----------|--------------------------------------------------------------|--------------------|
-| `ssh`    | one `ssh user@host "find ROOTS -maxdepth N -iname '*WORD*' ..."` | the server logs in with a key file or ssh-agent |
-| `rclone` | `rclone lsf REMOTE:ROOT -R --max-depth N`, filtered locally   | otherwise (password remotes, storage boxes) |
+| `find`               | how                                                                  |
+|----------------------|----------------------------------------------------------------------|
+| `auto` (the default) | find where the find check says the server has GNU find, else the walk; a Storage Box always the walk |
+| `ssh`                | find only                                                            |
+| `walk` (or `rclone`) | the walk                                                             |
 
-`ssh` is a single round trip but needs a shell on the server and prompts for the key
-passphrase. `rclone` walks the tree over SFTP, a few seconds for a few hundred directories,
-needs no shell and no prompt, and is the right choice for a Hetzner Storage Box, which
-does not run arbitrary commands. On a Storage Box use `search_roots = /home` or leave it
-blank for the home directory; `/` itself is not listable there.
+- **find:** one command over an SSH connection grab already holds:
+  `env LC_ALL=C find -L ROOTS -mindepth 1 -maxdepth N -iname '*WORD*' ... -printf ...`. A single
+  round trip, filtered on the server; it needs a shell and GNU find there.
+- **The walk:** grab lists the folders over SFTP itself, several folders in flight per
+  connection and up to 8 connections, and filters on this PC. It needs no shell, which makes it
+  the way for a Hetzner Storage Box, which doesn't run arbitrary commands. Links are followed (a
+  link to a folder only when it leads outside the tree, and once). A folder the server won't
+  list is reported, and the rest is searched.
+- **The find check** (`auto`): a short command whose exact answer shows that the server's find
+  works and that nothing (text a shell's start-up files print) gets into its output. The answer
+  is kept a week per login in `limits.json`, beside gui.json, for the window and the command;
+  Test asks again. A find that fails because of find itself sends the server to the walk too.
+  Storage Boxes (`*.your-storagebox.de`) aren't asked: they have no find.
 
-`search_roots` entries may be absolute (`/srv`) or relative to the login home
-(`learning`); blank or `.` means the home directory. ssh gets grab's known_hosts and the
-server's key file from grab.conf, never from your own ssh config's host keys.
+On a Storage Box use `search_roots = /home` or leave it blank for the home directory; `/`
+itself is not listable there. `search_roots` entries may be absolute (`/srv`) or relative to
+the login home (`learning`); blank or `.` means the home directory.
+
+**On `engine = rclone`** (the fallback) the methods are 0.19's: `auto` is ssh + find (`ssh
+user@host "find ROOTS -maxdepth N -iname '*WORD*' ..."` through ssh.exe) when the server logs
+in with a key file or ssh-agent, else rclone's listing (`rclone lsf REMOTE:ROOT -R --max-depth
+N`, filtered locally); `ssh` is ssh + find; `walk` and `rclone` are rclone's listing. ssh.exe
+gets grab's known_hosts and the server's key file from grab.conf, never your own ssh config's
+host keys, and asks for a key's passphrase unless the key is in ssh-agent. A server that goes
+through a proxy or an ssh command is always searched by rclone's listing (ssh.exe wouldn't take
+that way).
 
 ## File lists
 
@@ -893,13 +1071,19 @@ on your PC in milliseconds, with the same matching and ranking as a live search.
 | Storage Box sub-account | 8.4 s | 4,681 entries, 0.4 MB | 8 s |
 | Server with ssh  | 1.2 s       | 17,387 entries, 1.9 MB | 2–4 s |
 
+(Measured through rclone's listing and ssh + find. grab's own walk fetched the sub-account's
+list in 3.5 s where rclone took 9.6 s.)
+
 - A list covers what a search looks at: the search roots down to `max_depth`, dot-names left
-  out as searches leave them out. It is fetched in one go (ssh + find, or `rclone lsf -R`).
+  out as searches leave them out. It is fetched in one go, with find or the walk (see
+  [Lookup methods](#lookup-methods); on `engine = rclone` ssh + find or `rclone lsf -R`).
+  Lists are kept per engine: after a switch between grab's client and rclone the list is
+  fetched again once.
 - It is fresh for 15 minutes. The `grab` command then fetches a new one before searching;
   the window answers from the old one at once and refreshes it in the background.
 - When fetching a list fails, the window doesn't try again by itself for a minute, then 2, 4,
   8 and at most 15 minutes after each further failure; the Refresh button tries at once.
-- Walking a server over rclone opens up to 8 connections at once. In the window they come out
+- Walking a server opens up to 8 connections at once. In the window they come out
   of the server's connection budget, as downloads' do: all 8 when nothing else runs, a share
   while downloads run (they hand theirs back within moments). A search for files and folders
   walks once.
@@ -919,50 +1103,80 @@ on your PC in milliseconds, with the same matching and ranking as a live search.
     Windows password) is fetched again.
   - Delete the folder to remove them.
 
-## Tuning
+## Connections
 
-Defaults (override per remote in grab.conf):
+Per server in grab.conf (Open grab.conf in Settings, or `grab config`). The window has no fields
+for `bind` and the times; its server card and `grab server list` show the ones that are set.
 
-| key            | default                                                                     | why |
-|----------------|-----------------------------------------------------------------------------|-----|
-| `common_flags` | `-P --sftp-chunk-size 255Ki --sftp-disable-hashcheck`                       | live progress; 255 KiB is the largest SFTP packet OpenSSH accepts, ~8x fewer round trips than the 32 KiB default; skipping the post-transfer server-side `md5sum` measured 10–30% faster |
-| `folder_flags` | `--transfers 8 --checkers 8`                                                | more transfers hide per-file round trips on trees of small files; with rclone's default 4 streams that is ≤32 connections, which both test servers accepted without errors |
-| `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | one big object: parallel range reads over 8 connections. Keep chunks large: 8Mi measured ~2x slower than 64Mi because every chunk re-opens the file and re-ramps the SFTP pipeline |
+| key               | default | what |
+|-------------------|---------|------|
+| `max_connections` | blank = automatic: 14 on Storage Boxes, 12 elsewhere | how many connections downloads (and walks) may hold to the server at once, all downloads together; 1–64. Also in Settings → Edit. Automatic is lowered when the server refuses connections and raised again by clean downloads |
+| `bind`            | blank = any | the local address to connect from (one of this PC's addresses, to pick a network) |
+| `connect_timeout` | `30s`; `off` = as long as TCP tries | how long a new connection may take to reach the server |
+| `io_timeout`      | `30s`; `1s` to `24h` | the longest single wait after that: the handshake, the login, each read or listing. A download's piece that waits longer fails and is tried again |
 
-All three are for `--rclone`, the plain rclone copy, which gets them as they are. grab's own
-rclone calls (downloads, listings and searches of engine = rclone servers) take only
-their connection flags: `--sftp-*`, `--bind`, `--contimeout`, `--timeout`,
-`--low-level-retries`, `--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and
-`--password-command`. Those calls depend on rclone's exact output, so a progress, logging,
-filter or comparison flag there would break them (`-vP` failed every download, `--size-only`
-made verification compare sizes only). The `--sftp-*` flags that would replace the server
-itself (`--sftp-host`, `-port`, `-user`, `-pass`, `-ask-password`, `-key-pem`, `-key-file`,
-`-key-file-pass`, `-pubkey`, `-pubkey-file`, `-key-use-agent`, `-known-hosts-file`, `-ssh`) are
-refused there, in `common_flags` and after `--`; `--rclone` takes them. Likewise they see no
-`RCLONE_*` environment variable but `RCLONE_PASSWORD_COMMAND` and the `RCLONE_SFTP_*` ones that
-don't set the server's address, login or host keys: an `RCLONE_PROGRESS=true` meant for
-interactive rclone would put progress text into the bytes grab reads. Each rclone run gets its
-one server's details from grab alone, in its own environment, with rclone's config in memory
-(`--config NUL`); `--rclone` gets the whole environment, that server's variables replacing any
-`RCLONE_CONFIG_<SERVER>_*` of yours. A folder's small-file
-batch gets its `--transfers` from grab (the connections it may use), and grab's own engine
-fetches a file in byte ranges over `max_connections` (blank = automatic: 14 on Storage Boxes,
-12 elsewhere, lowered when a server refuses connections and raised again by clean downloads),
-in the window and in the `grab` command alike.
+Times are written as `30s`, `1m30s`, `500ms` or `2h`. A bad value stops grab before it does
+anything: `[Main] io_timeout: not a time grab can read (such as 30s or 1m30s; 1s to 24h)`.
+`io_timeout` has no `off`: a read that waits for ever couldn't be cancelled. A run's `-- --bind`,
+`--contimeout` and `--timeout` win over the three keys (see [Usage](#usage)).
 
-With `--rclone`, concurrent SFTP connections ≈ `transfers × multi-thread-streams`
-(+ checkers). If the server logs `MaxStartups` drops, lower one of them.
+The keys reach every connection to the server: grab's own client, the host key fetch of Trust,
+Add and Edit (which keeps its own 10 s limit for the handshake), and on `engine = rclone` every
+rclone run (`--bind`, `--contimeout`, `--timeout`) and ssh.exe (`-o BindAddress`, `-o
+ConnectTimeout` in whole seconds, rounded up). A key left blank adds nothing there, so rclone
+keeps its own times. On every command line the order is the same: `common_flags`' connection
+flags, grab's fixed values, the keys, the run's flags after `--`; ssh.exe gets grab's options
+before `ssh_options` (it takes the first value it sees, rclone the last).
+
+The rest is grab's, with nothing to set:
+- **Reads:** 255 KiB at a time (the largest SFTP packet OpenSSH accepts), up to 64 in flight per
+  connection, each for exactly the bytes a range still needs. Under a speed limit, one at a time
+  and smaller, so the limit holds.
+- **Files at once:** "At once" in the window's Downloads bar (1–8, default 4), which the command
+  follows too; a big file's pieces spread over the server's connections, small files of a folder
+  go beside them (see [GUI](#gui)).
+- **Speed:** Limit speed and the speed schedule in the window, `--limit` for a command.
+- **Staying connected:** connections stay open between files, searches and downloads, and close
+  by themselves after 15 to 60 seconds without use (Play keeps its own up to five minutes, see
+  Previews). A command the server works on quietly (find, md5sum over a big folder) gets a
+  keepalive every 15 s, and the link counts as lost only after 45 s without an answer.
+- **Retries:** a piece that fails is tried again; a server that refuses connections gets fewer
+  (see Connections per server, under [GUI](#gui)).
+
+**On `engine = rclone`** (the fallback) these keys feed rclone and ssh.exe as well:
+
+| key            | default | what still reaches rclone |
+|----------------|---------|---------------------------|
+| `common_flags` | `-P --sftp-chunk-size 255Ki --sftp-disable-hashcheck` | its connection flags, on every rclone run: 255 KiB reads (~8x fewer round trips than rclone's 32 KiB), and no `md5sum` after each of rclone's own copies (10–30% faster). Its `--bind`, `--contimeout` and `--timeout` also reach grab's own client while `bind`, `connect_timeout` and `io_timeout` are blank, on any engine |
+| `folder_flags` | `--transfers 8 --checkers 8` | its connection flags, on the folder batch only; the batch gets its `--transfers` from grab (the connections it may use) |
+| `file_flags`   | `--multi-thread-streams 8 --multi-thread-cutoff 64Mi --multi-thread-chunk-size 64Mi` | nothing: it was for `--rclone`, which is gone |
+| `ssh_options`  | blank | ssh.exe's options, for ssh + find and Test's ssh line |
+
+Connection flags are `--sftp-*`, `--bind`, `--contimeout`, `--timeout`, `--low-level-retries`,
+`--user-agent`, the certificate flags, `--tpslimit`, `--dscp` and `--password-command`. Other
+flags reach no run: grab's rclone runs depend on rclone's exact output, so a progress, logging,
+filter or comparison flag would break them (`-vP` failed every download, `--size-only` made
+verification compare sizes only); a changed one gets a [note](#notes-about-settings). The
+`--sftp-*` flags that would replace the server itself (`--sftp-host`, `-port`, `-user`, `-pass`,
+`-ask-password`, `-key-pem`, `-key-file`, `-key-file-pass`, `-pubkey`, `-pubkey-file`,
+`-key-use-agent`, `-known-hosts-file`, `-ssh`) are refused, in `common_flags` and after `--`.
+Likewise rclone runs see no `RCLONE_*` environment variable but `RCLONE_PASSWORD_COMMAND` and the
+`RCLONE_SFTP_*` ones that don't set the server's address, login or host keys: an
+`RCLONE_PROGRESS=true` meant for interactive rclone would put progress text into the bytes grab
+reads. Each rclone run gets its one server's details from grab alone, in its own environment,
+with rclone's config in memory (`--config NUL`).
+
 `--sftp-disable-hashcheck` skips the `md5sum` rclone runs on the server after each of its own
-copies (`--rclone`, and the small-file batch of an engine = rclone server); SSH already protects
-the bytes in flight. It doesn't touch grab's own check: to compare downloads with the server's
-copy end to end, turn on Verify downloads (or `--verify`), whatever `common_flags` say.
+copies (the small-file batch of an `engine = rclone` server); SSH already protects the bytes in
+flight. It doesn't touch grab's own check: to compare downloads with the server's copy end to
+end, turn on Verify downloads (or `--verify`), whatever `common_flags` say.
 
 ## Layout
 
 ```
 src/cli.*       argument parsing            src/remote.*   find command, ssh argv, match picking
 src/ini.*       INI reader (grab + rclone)  src/listing.*  rclone lsf lookup, glob matching
-src/config.*    grab.conf                   src/rclone.*   rclone argv for both modes
+src/config.*    grab.conf                   src/rclone.*   rclone copy argv (engine = rclone)
 src/quote.*     Windows + sh quoting        src/process.*  CreateProcess / posix_spawn wrappers
 src/util.*      strings, paths, environment src/main.cpp   the five steps
 src/engine.*    search + download for both  src/servers.*  server argv, host keys, conf edits
@@ -972,13 +1186,16 @@ src/server_conf.* a server's grab.conf keys (host, port, user, auth...) and the 
 src/passwords.* grab's password store: DPAPI, each value bound to its user@host:port
 src/rclone_conf.* rclone.conf read as rclone reads it (for the import only)
 src/rclone_import.* the one-time move of 0.19's servers from rclone.conf into grab.conf
+src/rclone_flags.* which rclone flags reach rclone runs (engine = rclone); what to use instead after --
+src/guard.*     settings grab's own client can't serve (a proxy, an ssh command...): kept on rclone, why
+src/notices.*   the one-time notes about settings (notices.json)
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    folder listing, rclone batch lines, which files the tree shows
 src/folder_job.*    a folder download, shared by the window and the command
 src/cli_download.*  the command's downloads: live progress line, Ctrl+C
 src/progress_line.* that line's text
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
-src/schedule.*  speed schedule: rules, the limit at a time of the week, rclone's timetable
+src/schedule.*  speed schedule: rules, the limit at a time of the week, its next change
 src/verify.*    checking downloads: the server's md5sum and grab's MD5, by path; what proves a mismatch
 src/play_stream.* Play: the player's local stream over grab's connections (warm start, cache, seeks)
 src/gui/play_server.* the player, started without rclone's variables
@@ -1023,20 +1240,21 @@ installer when Inno Setup 6 is installed (`winget install JRSoftware.InnoSetup`)
 
 - **[rclone](https://rclone.org)** v1.75.1, © Nick Craig-Wood, MIT license
   ([licenses/rclone.txt](licenses/rclone.txt)). `rclone.exe` ships next to `grab.exe`
-  (81 MB, which is why the installer is about 22 MB), and grab uses it rather than any rclone
-  on PATH (only when it is missing does grab look on PATH). Set `rclone = <path>` in `[grab]`
-  to use another copy. Another copy must be 1.67 or newer (folder downloads use
-  `--sftp-connections`); grab checks once, where it runs rclone (engine = rclone servers,
-  `--rclone`), and says so when it's older. For dates in listings it
-  must also understand `--time-format unix` (1.72 and newer; older ones show rows without dates).
+  (81 MB, which is why the installer is about 22 MB) for the servers on the fallback (`engine =
+  rclone`, or kept there by their settings) until a later grab removes it; nothing else runs
+  it. grab uses it rather than any rclone on PATH (only when it is missing does grab look on
+  PATH). Set `rclone = <path>` in `[grab]` to use another copy. Another copy must be 1.67 or
+  newer (folder downloads use `--sftp-connections`); grab checks once, where it runs rclone,
+  and says so when it's older. For dates in listings it must also understand `--time-format
+  unix` (1.72 and newer; older ones show rows without dates).
   - **Pin:** the build downloads the official Windows zip and checks it against the pinned
     SHA-256, which is rclone's own published `SHA256SUMS` value.
   - **To bump:** change `GRAB_RCLONE_VERSION` and the hash in `CMakeLists.txt`, then rebuild.
     `grab update` delivers the new rclone together with grab.
 - **[libssh2](https://libssh2.org)**, BSD-3-Clause ([licenses/libssh2.txt](licenses/libssh2.txt)),
   and **[OpenSSL](https://openssl-library.org)** 3.5 LTS, Apache-2.0
-  ([licenses/openssl.txt](licenses/openssl.txt)): built into grab, statically, for the SSH client
-  that is replacing rclone (in progress; not used by the programs yet).
+  ([licenses/openssl.txt](licenses/openssl.txt)): built into grab, statically: grab's own SSH
+  client, which downloads, searches, lists, browses, verifies, previews and plays.
   - **Pins:** libssh2 is a master commit (it has made no release since 1.11.1 in 2024 and its
     security fixes land on master), checked by SHA-256 in `CMakeLists.txt`. OpenSSL comes from
     vcpkg through grab's copy of its port, `cmake/vcpkg-ports/openssl` (vcpkg itself has moved

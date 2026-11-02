@@ -116,7 +116,8 @@ std::string store_unreadable(std::string_view why, std::string_view server, serv
     // ssh-agent or a key file: the store may still keep the server's rclone settings (a proxy, an
     // ssh command), so rclone runs stop as grab's own client does (guard::add_unreadable_store).
     return std::format("{}; it may keep rclone settings of {} (a proxy, an ssh command), so grab doesn't start rclone "
-                       "for it. Saving it unchanged {} sets the unreadable file aside",
+                       "for it. Saving it unchanged {} sets the unreadable file aside, and with it any proxy or ssh "
+                       "command kept there: it then connects directly",
                        why, server, edit);
 }
 

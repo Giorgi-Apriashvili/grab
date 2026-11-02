@@ -213,7 +213,8 @@ std::expected<StoreForChange, std::string> load_store(const Env& env, std::strin
         if ((*c)->auth == servers::Auth::stored_key) stored_key.push_back(name);
     }
     out.note = std::format("grab's saved passwords couldn't be read (another Windows account's, or damaged) and were "
-                           "moved aside to {}",
+                           "moved aside to {}, with any proxy or ssh command a server kept there (such a server now "
+                           "connects directly)",
                            util::path_to_utf8(*loaded->set_aside));
     if (!typed.empty()) out.note += std::format("; enter the password of {} again with Edit", util::join(typed, ", "));
     if (!stored_key.empty()) {

@@ -72,11 +72,11 @@ Options:
                        older than the server's): replace it, both (keep yours and save the
                        new one as "name (2).ext") or skip it. Without it grab asks first, or
                        stops when there is no console to ask on
-  -- FLAGS             connection flags for this run: --bind ADDRESS, --contimeout TIME and
-                       --timeout TIME (1s to 24h on grab's own client) win over the server's
-                       bind, connect_timeout and io_timeout. A server on engine = rclone also
-                       takes rclone's other connection flags (--sftp-*...), but not its
-                       address, login or host keys (grab server edit NAME)
+  -- FLAGS             connection flags for this run: --bind ADDRESS, --contimeout TIME (or
+                       off) and --timeout TIME (1s to 24h on grab's own client) win over the
+                       server's bind, connect_timeout and io_timeout. A server on engine =
+                       rclone also takes rclone's other connection flags (--sftp-*...), but
+                       not its address, login or host keys (grab server edit NAME)
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
   -v, --verbose        say how grab connects and searches, the settings' notes again, and the
                        command lines of servers on rclone (engine = rclone) before they run

@@ -256,7 +256,8 @@ std::string text(std::string_view server, std::span<const Reason> reasons, Engin
                "itself, not against grab's known_hosts";
     }
     if (has("store", false)) {
-        out += "; saving the server with Edit (no change needed) sets the unreadable file aside";
+        out += "; saving the server with Edit (no change needed) sets the unreadable file aside, and with it "
+               "any proxy or ssh command kept there: the server then connects directly";
     }
     if (has("ProxyCommand", true) || has("ProxyJump", true)) {
         out += "; ssh_options reach only ssh.exe's searches: rclone's downloads never went through them";

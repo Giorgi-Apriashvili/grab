@@ -3,7 +3,10 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace grab;
@@ -261,4 +264,49 @@ TEST_CASE("usage mentions both modes") {
     const auto u = usage();
     CHECK(u.find("--folder") != std::string::npos);
     CHECK(u.find("--file") != std::string::npos);
+}
+
+namespace {
+// The options an options list names, one a line ("  -r, --remote NAME   ...", "  -- FLAGS ..."):
+// the long name, or "--" for the flags after it. Continuation lines are indented further (one may
+// start with a flag: "--timeout TIME (1s to 24h ...").
+std::set<std::string> option_names(std::string_view block) {
+    std::set<std::string> out;
+    while (!block.empty()) {
+        const auto eol = std::min(block.find('\n'), block.size());
+        const std::string_view line = block.substr(0, eol);
+        block.remove_prefix(std::min(eol + 1, block.size()));
+        const auto indent = line.find_first_not_of(' ');
+        if (indent == std::string_view::npos || indent < 2 || indent > 6 || line[indent] != '-') continue;
+        std::string_view l = util::trim(line);
+        if (l.size() > 4 && l[1] != '-' && l.substr(2, 2) == ", ") l.remove_prefix(4); // "-r, "
+        out.emplace(l.substr(0, l.find(' ')));
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("README's Usage block names the options the help names, --rclone no longer (phase 8 step 11)") {
+    auto readme = util::read_file(util::path_from_utf8(GRAB_SOURCE_DIR) / "README.md");
+    REQUIRE_MESSAGE(readme, readme.error_or(""));
+    std::erase(*readme, '\r'); // a checkout may have made it CRLF
+    const auto start = readme->find("## Usage\n\n```\n");
+    REQUIRE(start != std::string::npos);
+    const auto body = start + std::string_view("## Usage\n\n```\n").size();
+    const auto end = readme->find("```", body);
+    REQUIRE(end != std::string::npos);
+    const auto documented = option_names(std::string_view(*readme).substr(body, end - body));
+
+    const std::string help = usage();
+    const auto options = help.find("Options:\n");
+    REQUIRE(options != std::string::npos);
+    const auto helped = option_names(std::string_view(help).substr(options, help.find("\n\n", options) - options));
+    CHECK(helped.contains("--"));
+    CHECK_FALSE(helped.contains("--rclone"));
+    // The README's block leaves out what its first line and the commands show.
+    for (const auto& name : helped) {
+        if (name == "--file" || name == "--folder" || name == "--help" || name == "--version") continue;
+        CHECK_MESSAGE(documented.contains(name), name);
+    }
+    for (const auto& name : documented) CHECK_MESSAGE(helped.contains(name), name);
 }

@@ -148,7 +148,8 @@ TEST_CASE("guard: grab's store that can't be read counts as a route") {
         CHECK(guard::text("Box", r, engine) ==
               "[Box] may connect through a proxy or an ssh command (grab's store, which can't be read), which grab's own "
               "client can't; grab doesn't start rclone for it either until the store can be read; saving the server "
-              "with Edit (no change needed) sets the unreadable file aside");
+              "with Edit (no change needed) sets the unreadable file aside, and with it any proxy or ssh command kept "
+              "there: the server then connects directly");
     }
 }
 

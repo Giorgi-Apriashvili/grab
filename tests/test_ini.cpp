@@ -43,6 +43,18 @@ TEST_CASE("ini keeps ; and # inside values and equals signs in values") {
     CHECK(s->get("x") == "a=b=c");
 }
 
+TEST_CASE("a UTF-8 BOM before the first line is no part of it: a grab.conf saved 'UTF-8 with BOM' loads (G88)") {
+    auto doc = ini::parse("\xEF\xBB\xBF[grab]\r\ndefault_remote = Main\r\n");
+    REQUIRE(doc.has_value());
+    REQUIRE(doc->sections.size() == 1);
+    CHECK(doc->sections[0].name == "grab");
+    CHECK(doc->find("grab")->get("default_remote") == "Main");
+    // Before the first section: the key's name, not "\xEF\xBB\xBFkey".
+    auto keyed = ini::parse("\xEF\xBB\xBFkey = v\n");
+    REQUIRE(keyed.has_value());
+    CHECK(keyed->find("")->get("key") == "v");
+}
+
 TEST_CASE("ini merges duplicate sections and keeps file order") {
     auto doc = ini::parse("[a]\nx=1\n[b]\ny=2\n[a]\nz=3\n");
     REQUIRE(doc.has_value());

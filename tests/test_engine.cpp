@@ -529,7 +529,8 @@ TEST_CASE("the guard: a server whose settings route it is refused by grab's clie
     CHECK(direct.starts_with("[Box] may connect through a proxy or an ssh command (grab's store, which can't be read), "
                              "which grab's own client can't; grab doesn't start rclone for it either until the store "
                              "can be read; saving the server with Edit (no change needed) sets the unreadable file "
-                             "aside"));
+                             "aside, and with it any proxy or ssh command kept there: the server then connects "
+                             "directly"));
     CHECK(engine::rclone_env(unreadable).error_or("").find("so grab doesn't start rclone for it") != std::string::npos);
 #endif
     std::filesystem::remove_all(store.parent_path());
@@ -815,7 +816,8 @@ TEST_CASE("rclone_env: a server's grab.conf section and its saved secrets as its
         CHECK(engine::rclone_env(unreadable).error_or("") ==
               why + std::format("; it may keep rclone settings of {} (a proxy, an ssh command), so grab doesn't start "
                                 "rclone for it. Saving it unchanged with Edit (Settings → Edit in grab's window, "
-                                "or `grab server edit {}`) sets the unreadable file aside",
+                                "or `grab server edit {}`) sets the unreadable file aside, and with it any proxy or "
+                                "ssh command kept there: it then connects directly",
                                 name, name));
     }
 #endif
