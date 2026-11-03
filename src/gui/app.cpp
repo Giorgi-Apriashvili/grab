@@ -18,7 +18,6 @@
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
-#include "rclone_flags.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "space.hpp"
@@ -460,7 +459,7 @@ void App::run_preview(const std::shared_ptr<preview::Previews::Job>& job) {
     // After the answer: the connections go back to the pool (the extra ones' seats with them),
     // then the viewer's seat.
     hold.reader.reset();
-    if (hold.seated) return_viewer_seat(job->server, hold);
+    if (hold.seated) return_viewer_seat(job->server);
 }
 
 bool App::take_viewer_seat(const std::string& server, const preview::Previews::Job& job, const std::stop_token& stop) {
@@ -500,8 +499,7 @@ bool App::take_viewer_seat(const std::string& server, const preview::Previews::J
     return got;
 }
 
-void App::return_viewer_seat(const std::string& server, const PreviewHold& hold) {
-    int idle = 0;
+void App::return_viewer_seat(const std::string& server) {
     {
         std::scoped_lock lock(preview_mutex_);
         auto& seat = viewer_seats_[server];
@@ -512,38 +510,20 @@ void App::return_viewer_seat(const std::string& server, const PreviewHold& hold)
             seat.held = keep;
         }
         seat.idle_since = std::chrono::steady_clock::now();
-        seat.rclone_pool = hold.rclone ? hold.pool : nullptr;
-        idle = seat.held - seat.in_use;
     }
     preview_wake_.notify_all();
-    // engine = rclone: rclone's own connections can't see the pool's idle ones, only the seats
-    // that count them, so no more stay open than the viewer keeps seats for.
-    if (hold.rclone && hold.pool) hold.pool->trim_idle(idle);
 }
 
 void App::release_viewer_seats() {
-    std::vector<std::shared_ptr<ssh::Pool>> close;
-    {
-        std::scoped_lock lock(preview_mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        for (auto& [server, seat] : viewer_seats_) {
-            if (seat.id == 0 || seat.in_use > 0 || seat.taking > 0) continue;
-            if (now - seat.idle_since < preview_seat_idle) continue;
-            if (seat.held > 0) connections_.release(server, seat.id, seat.held);
-            connections_.leave(server, seat.id);
-            seat.held = 0;
-            seat.id = 0;
-            if (seat.rclone_pool) close.push_back(std::move(seat.rclone_pool));
-        }
-    }
-    // Closing waits for the server (up to the session timeout on a dead path): a preview worker
-    // does it, not the UI thread.
-    if (!close.empty()) {
-        queue_preview(
-            [close = std::move(close)] {
-                for (const auto& pool : close) pool->trim_idle(0);
-            },
-            false);
+    std::scoped_lock lock(preview_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& [server, seat] : viewer_seats_) {
+        if (seat.id == 0 || seat.in_use > 0 || seat.taking > 0) continue;
+        if (now - seat.idle_since < preview_seat_idle) continue;
+        if (seat.held > 0) connections_.release(server, seat.id, seat.held);
+        connections_.leave(server, seat.id);
+        seat.held = 0;
+        seat.id = 0;
     }
 }
 
@@ -584,13 +564,12 @@ preview::Fetched App::preview_answer(const preview::Previews::Job& job, PreviewH
     if (preview::max_bytes(kind) == 0) return fail(preview::failed(415, "This kind of file has no preview."));
     auto ctx = engine::load_context(config_path_, remote);
     if (!ctx) return fail(preview::failed(500, ctx.error()));
-    // Every server through grab's own connections, engine = rclone too (RCLONE-REPLACEMENT.md,
-    // phase 6): its pool, shared with the downloads, Browse and verification, logs in once.
+    // Through grab's own connections (RCLONE-REPLACEMENT.md, phase 6): its pool, shared with the
+    // downloads, Browse and verification, logs in once.
     auto target = engine::ssh_target(*ctx);
     if (!target) return fail(preview::failed(502, std::format("Can't preview from {}: {}", remote, target.error())));
     connections_.configure(remote, connection_budget(remote, ctx->remote.host, ctx->settings.max_connections));
     hold.pool = pools_.get(remote, *target, connections_.budget(remote));
-    hold.rclone = ctx->engine != Engine::grab;
     const auto name = remote_basename(path);
     Activity loading(*this, std::format("Opening {} on {}…", name, remote), std::string(), preview_jobs_.ahead(job));
     if (!take_viewer_seat(remote, job, stop)) return fail(preview::cancelled());
@@ -680,8 +659,7 @@ void App::run_play(const PlayJob& job, const std::stop_token& stop) {
                             .logins_at_once = box ? play_logins_box : 0,
                             .ahead = box ? play_ahead_box : play_ahead_other,
                             .depth = box ? play_depth_box : play_depth_other,
-                            .spares = box ? play_spares_box : play_spares_other,
-                            .close_on_release = ctx->engine != Engine::grab};
+                            .spares = box ? play_spares_box : play_spares_other};
     std::string address;
     {
         // The player starts once the warm part is in (decision 3): the status bar shows it coming.
@@ -892,7 +870,7 @@ void App::on_message(const std::string& text) {
             auto it = std::ranges::find(list, name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + name);
             if (!it->error.empty()) return settings_error(it->error);
-            // The page asked first when its settings route it (server_ops::direct_warning).
+            // Refused for a server grab doesn't connect to, before anything dials.
             auto reach = server_ops::reach_for(*env, name);
             if (!reach) return settings_error(reach.error());
             auto keys = server_ops::scan_host_keys(it->host, it->port, stop, *reach);
@@ -956,11 +934,8 @@ void App::send_init() {
             if (ctx) {
                 entry.set("host", str(ctx->remote.host));
                 entry.set("user", str(ctx->remote.user));
-                // ssh, rclone; on engine = grab find, walk or probe (search_method). On rclone as
-                // the context resolved it: a route rclone takes keeps ssh.exe find off the server.
-                entry.set("method", str(ctx->engine == Engine::rclone
-                                            ? std::string(ctx->method == FindMethod::ssh ? "ssh" : "rclone")
-                                            : std::string(search_method(ctx->settings, ctx->remote, ctx->engine))));
+                // find, walk or probe (search_method).
+                entry.set("method", str(std::string(search_method(ctx->settings, ctx->remote))));
             } else {
                 entry.set("error", str(ctx.error()));
             }
@@ -993,7 +968,6 @@ void App::start_search(const Value& msg) {
     req.target = msg.string_of("query").value_or("");
     req.mode = mode_of(msg);
     req.exact = bool_of(msg, "exact");
-    req.batch_ssh = true; // no console to answer a prompt: fail fast instead
     if (int depth = int_of(msg, "depth"); depth > 0) req.depth = depth;
     std::optional<std::string> under;
     if (const Value* u = msg.find("under"); u != nullptr && u->kind == Value::Kind::string) under = u->str;
@@ -1007,7 +981,7 @@ void App::start_search(const Value& msg) {
 // its list is fetched for next time.
 void App::run_search(int id, const std::string& remote, const engine::SearchRequest& req, bool update, bool both,
                      const std::optional<std::string>& under) {
-    // A new search replaces the previous one; stopping kills its ssh/rclone child at once.
+    // A new search replaces the previous one; stopping ends its find or walk at once.
     if (search_thread_.joinable()) {
         search_replaced_ = true;
         search_thread_.request_stop();
@@ -1112,50 +1086,36 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
             }
             // One server without a usable list, or a search lists can't answer: live, as before.
             if (!found && (!all || !listable)) {
-                const bool on_grab = ctx->engine == Engine::grab;
-                bool over_ssh = !on_grab && ctx->method == FindMethod::ssh; // engine = grab: once find is chosen
-                std::string doing = on_grab ? std::format("Searching {}", server)
-                                            : std::format("Searching {} with {}", server, over_ssh ? "ssh + find" : "rclone lsf");
+                bool with_find = false; // once find is chosen: it counts matches, the walk entries
+                std::string doing = std::format("Searching {}", server);
                 Activity act(*this, doing + "…", "search:" + server);
                 auto counted_text = [&](std::size_t n) {
-                    act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(n))
-                                      : std::format("{}… {} looked at", doing, count_of(n, "entry", "entries")));
+                    act.text(with_find ? std::format("{}… {} found so far", doing, thousands(n))
+                                       : std::format("{}… {} looked at", doing, count_of(n, "entry", "entries")));
                 };
-                activity::Records records; // ssh + find prints the matches; rclone lsf everything
-                auto counted = run;
-                counted.on_output = [&](std::string_view chunk) {
-                    records.feed(chunk);
-                    counted_text(records.count());
-                };
-                // Over rclone the walk's connections come from the pool (review G191), and one walk
-                // lists both kinds (G197); on grab's engine the seat is one connection, widened for
-                // a walk.
+                // The seat is one connection, widened for a walk (review G191); one find or walk
+                // lists both kinds (G197).
                 auto r = req;
                 std::optional<fetch::Listing> walk;
-                std::optional<std::string> no_way; // grab's engine couldn't be set up
-                if (on_grab) {
-                    if (auto side = grab_side(*ctx, server, walk, stop)) {
-                        r.grab = std::move(*side);
-                        r.grab.on_lookup = [&](const ssh::Lookup& way) {
-                            over_ssh = way.find;
-                            doing = std::format("Searching {} {}", server, way.find ? "with find" : "by listing folders");
-                            act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
-                            act.text(doing + "…");
-                        };
-                        r.grab.progress = counted_text;
-                    } else {
-                        no_way = side.error();
-                    }
-                } else if (!over_ssh) {
-                    walk.emplace(connections_, server, stop);
-                    r.walk_flags = walk->flags();
+                std::optional<std::string> no_way; // grab's client couldn't be set up
+                if (auto side = grab_side(*ctx, server, walk, stop)) {
+                    r.grab = std::move(*side);
+                    r.grab.on_lookup = [&](const ssh::Lookup& way) {
+                        with_find = way.find;
+                        doing = std::format("Searching {} {}", server, way.find ? "with find" : "by listing folders");
+                        act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
+                        act.text(doing + "…");
+                    };
+                    r.grab.progress = counted_text;
+                } else {
+                    no_way = side.error();
                 }
                 const auto hook = [&](const std::vector<std::string>& argv) { act.detail(quote::display_cmdline(argv)); };
                 std::vector<std::pair<Mode, std::expected<engine::SearchResult, std::string>>> results;
                 if (no_way) {
                     results.emplace_back(kinds.front(), std::unexpected(*no_way));
                 } else if (kinds.size() == 2) {
-                    if (auto walked = engine::search_both(*ctx, r, counted, hook)) {
+                    if (auto walked = engine::search_both(*ctx, r, run, hook)) {
                         results.emplace_back(Mode::folder, std::move(walked->first));
                         results.emplace_back(Mode::file, std::move(walked->second));
                     } else {
@@ -1163,7 +1123,7 @@ void App::run_search(int id, const std::string& remote, const engine::SearchRequ
                     }
                 } else {
                     r.mode = kinds.front();
-                    results.emplace_back(kinds.front(), engine::search(*ctx, r, counted, hook));
+                    results.emplace_back(kinds.front(), engine::search(*ctx, r, run, hook));
                 }
                 walk.reset();
                 for (auto& [kind, live] : results) {
@@ -1248,7 +1208,7 @@ void App::start_refresh(const std::string& server, bool asked) {
         run.stop = stop;
         run.detached = true;
         const std::string base = std::format("{} {}'s file list", before > 0 ? "Refreshing" : "Building", server);
-        std::string doing = base; // engine = grab: and how, once that's chosen
+        std::string doing = base; // and how, once that's chosen
         Activity act(*this, doing + "…", "list:" + server, true);
         if (before > 0) act.progress(0, before); // against the last list's count, from the start
         auto counted_text = [&](std::uint64_t n) {
@@ -1259,40 +1219,28 @@ void App::start_refresh(const std::string& server, bool asked) {
                 act.text(std::format("{}: {}", doing, count_of(n, "entry", "entries")));
             }
         };
-        activity::Records records;
-        run.on_output = [&](std::string_view chunk) {
-            records.feed(chunk);
-            counted_text(records.count());
-        };
         auto ctx = engine::load_context(config_path_, server);
-        // Over rclone the walk's connections come from the pool (review G191); on grab's engine
-        // the seat is one connection, widened for a walk.
+        // The seat is one connection, widened for a walk (review G191).
         std::optional<fetch::Listing> walk;
-        std::vector<std::string> walk_flags;
         engine::GrabSide side;
         std::expected<void, std::string> ready;
         if (!ctx) {
             ready = std::unexpected(ctx.error());
-        } else if (ctx->engine == Engine::grab) {
-            if (auto got = grab_side(*ctx, server, walk, stop)) {
-                side = std::move(*got);
-                side.on_lookup = [&](const ssh::Lookup& way) {
-                    doing = std::format("{} {}", base, way.find ? "with find" : "by listing folders");
-                    act.timing(std::format("{}:{}", way.find ? "list.find" : "list.walk", server));
-                    if (before > 0) act.progress(0, before, doing + "…");
-                    else act.text(doing + "…");
-                };
-                side.progress = counted_text;
-            } else {
-                ready = std::unexpected(got.error());
-            }
-        } else if (ctx->method != FindMethod::ssh) {
-            walk.emplace(connections_, server, stop);
-            walk_flags = walk->flags();
+        } else if (auto got = grab_side(*ctx, server, walk, stop)) {
+            side = std::move(*got);
+            side.on_lookup = [&](const ssh::Lookup& way) {
+                doing = std::format("{} {}", base, way.find ? "with find" : "by listing folders");
+                act.timing(std::format("{}:{}", way.find ? "list.find" : "list.walk", server));
+                if (before > 0) act.progress(0, before, doing + "…");
+                else act.text(doing + "…");
+            };
+            side.progress = counted_text;
+        } else {
+            ready = std::unexpected(got.error());
         }
-        auto fetched = ready ? file_list::fetch(*ctx, unix_now(), true, run, [&](const std::vector<std::string>& argv) {
+        auto fetched = ready ? file_list::fetch(*ctx, unix_now(), run, [&](const std::vector<std::string>& argv) {
             act.detail(quote::display_cmdline(argv));
-        }, walk_flags, side)
+        }, side)
                              : std::expected<file_list::List, std::string>(std::unexpected(ready.error()));
         walk.reset();
         if (!fetched) act.failed();
@@ -1383,48 +1331,34 @@ std::expected<std::vector<engine::Hit>, std::string> App::search_below(const eng
     // Deeper than the list (or a search lists can't answer): live, the folder the only root.
     engine::Context below = ctx;
     below.settings.search_roots = {under};
-    const bool on_grab = ctx.engine == Engine::grab;
-    bool over_ssh = !on_grab && ctx.method == FindMethod::ssh; // engine = grab: once find is chosen
+    bool with_find = false; // once find is chosen: it counts matches, the walk entries
     const std::string base = !under.empty() ? std::format("Searching below {} on {}", under, server)
                                             : std::format("Searching all of {}", server);
-    // engine = grab: how it goes is said once it's chosen.
-    std::string doing = on_grab || !under.empty()
-                            ? base
-                            : std::format("{} with {}", base, over_ssh ? "ssh + find" : "rclone lsf");
+    // How it goes is said once it's chosen.
+    std::string doing = base;
     Activity act(*this, doing + "…", "search:" + server);
     auto counted_text = [&](std::size_t n) {
-        act.text(over_ssh ? std::format("{}… {} found so far", doing, thousands(n))
-                          : std::format("{}… {} looked at", doing, count_of(n, "entry", "entries")));
+        act.text(with_find ? std::format("{}… {} found so far", doing, thousands(n))
+                           : std::format("{}… {} looked at", doing, count_of(n, "entry", "entries")));
     };
-    activity::Records records;
-    auto counted = run;
-    counted.on_output = [&](std::string_view chunk) {
-        records.feed(chunk);
-        counted_text(records.count());
-    };
-    // Over rclone the walk's connections come from the pool (review G191), and one walk lists both
-    // kinds (G197); on grab's engine the seat is one connection, widened for a walk.
+    // The seat is one connection, widened for a walk (review G191); one find or walk lists both
+    // kinds (G197).
     auto r = req;
     std::optional<fetch::Listing> walk;
-    if (on_grab) {
-        auto side = grab_side(ctx, server, walk, run.stop);
-        if (!side) {
-            act.failed();
-            return util::fail(side.error());
-        }
-        r.grab = std::move(*side);
-        r.grab.on_lookup = [&](const ssh::Lookup& way) {
-            over_ssh = way.find;
-            doing = std::format("{} {}", base, way.find ? "with find" : "by listing folders");
-            act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
-            act.text(doing + "…");
-        };
-        r.grab.progress = counted_text;
-    } else if (!over_ssh) {
-        walk.emplace(connections_, server, run.stop);
-        r.walk_flags = walk->flags();
+    auto side = grab_side(ctx, server, walk, run.stop);
+    if (!side) {
+        act.failed();
+        return util::fail(side.error());
     }
-    auto found = engine::search_both(below, r, counted, [&](const std::vector<std::string>& argv) {
+    r.grab = std::move(*side);
+    r.grab.on_lookup = [&](const ssh::Lookup& way) {
+        with_find = way.find;
+        doing = std::format("{} {}", base, way.find ? "with find" : "by listing folders");
+        act.timing(std::format("{}:{}", way.find ? "find" : "walk", server));
+        act.text(doing + "…");
+    };
+    r.grab.progress = counted_text;
+    auto found = engine::search_both(below, r, run, [&](const std::vector<std::string>& argv) {
         act.detail(quote::display_cmdline(argv));
     });
     if (!found) {
@@ -1543,9 +1477,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             std::int64_t listed = 0;
             bool new_listing = false; // listed live just now, not kept yet
         };
-        const bool on_grab = ctx->engine == Engine::grab;
-        auto rows_of = [&](const std::string& at,
-                           const std::string& what = {}) -> std::expected<Rows, browse::ListError> {
+        auto rows_of = [&](const std::string& at) -> std::expected<Rows, browse::ListError> {
             std::optional<LiveFolder> cached;
             if (!live) {
                 std::lock_guard lock(browse_mutex_);
@@ -1561,27 +1493,18 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             proc::RunOptions run;
             run.stop = stop;
             run.detached = true;
-            const std::string doing = what.empty() ? std::format("Listing {} on {}", at.empty() ? "~" : at, remote) : what;
-            Activity act(*this, doing + "…", (on_grab ? "readdir:" : "lsjson:") + remote);
-            activity::Records records('{'); // lsjson: "[", an item a line, "]"
-            run.on_output = [&](std::string_view chunk) {
-                records.feed(chunk);
-                if (records.count() > 0) act.text(std::format("{}… {} so far", doing, count_of(records.count(), "item", "items")));
-            };
-            // On grab's engine one connection of the server's budget (fetch::Listing, review G191).
+            const std::string doing = std::format("Listing {} on {}", at.empty() ? "~" : at, remote);
+            Activity act(*this, doing + "…", "readdir:" + remote);
+            // One connection of the server's budget (fetch::Listing, review G191).
             std::optional<fetch::Listing> seat;
-            engine::GrabSide side;
-            if (on_grab) {
-                auto made = grab_side(*ctx, remote, seat, stop);
-                if (!made) {
-                    act.failed();
-                    return std::unexpected(browse::ListError{.kind = browse::ListError::Kind::other, .message = made.error()});
-                }
-                side = std::move(*made);
+            auto side = grab_side(*ctx, remote, seat, stop);
+            if (!side) {
+                act.failed();
+                return std::unexpected(browse::ListError{.kind = browse::ListError::Kind::other, .message = side.error()});
             }
             auto got = browse::list_live(*ctx, at, run, [&](const std::vector<std::string>& argv) {
                 act.detail(quote::display_cmdline(argv));
-            }, side);
+            }, *side);
             if (!got) {
                 act.failed();
                 return std::unexpected(got.error());
@@ -1612,30 +1535,14 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             auto rows = rows_of(folder);
             if (stop.stop_requested()) return; // the next request answers instead
             if (!rows && typed && select.empty() && rows.error().kind == browse::ListError::Kind::file) {
-                // grab's engine: one STAT said it's a file; its folder opens with it picked, when
-                // the folder shows it (a dot-name may be left out).
+                // One STAT said it's a file; its folder opens with it picked, when the folder shows
+                // it (a dot-name may be left out).
                 const std::string parent = parent_of(folder);
                 if (auto up = rows_of(parent)) {
                     const auto name = remote_basename(folder);
                     if (std::ranges::find(up->items, name, &browse::Item::name) != up->items.end()) select = folder;
                     folder = parent;
                     rows = std::move(up);
-                }
-                if (stop.stop_requested()) return;
-            }
-            if (rows && typed && select.empty() && rows->new_listing && !on_grab &&
-                browse::maybe_file(rows->items, folder)) {
-                // lsjson lists a file as that one file: its folder opens instead, when the file is
-                // there (rather than a folder of the same name holding just that file).
-                const std::string parent = parent_of(folder);
-                if (auto up = rows_of(parent, std::format("Checking whether {} is a file", remote_basename(folder)))) {
-                    const auto name = remote_basename(folder);
-                    const auto it = std::ranges::find(up->items, name, &browse::Item::name);
-                    if (it != up->items.end() && !it->dir) {
-                        select = folder;
-                        folder = parent;
-                        rows = std::move(up);
-                    }
                 }
                 if (stop.stop_requested()) return;
             }
@@ -1860,7 +1767,7 @@ void App::settings_error(const std::string& message) const {
 }
 
 std::expected<server_ops::Env, std::string> App::load_env() const {
-    return server_ops::load_env(config_path_, util::self_exe_path().parent_path());
+    return server_ops::load_env(config_path_);
 }
 
 void App::post_servers(const server_ops::Env& env) const {
@@ -1889,12 +1796,10 @@ void App::post_servers(const server_ops::Env& env) const {
         // "password", "key", "agent", or "stored_key" (an imported key_pem, kept as it is on Edit).
         v.set("auth", str(std::string(server_conf::auth_name(s.auth))));
         v.set("keyFile", str(s.key_file));
-        v.set("search", str(s.search)); // search_method(): ssh, rclone; find, walk, probe on grab
-        v.set("engine", str(s.engine == Engine::grab ? "grab" : "rclone"));
+        v.set("search", str(s.search)); // search_method(): find, walk, probe
         v.set("pinned", Value::make_bool(s.host_key_pinned));
-        // What keeps grab's own client off it, and the routes Trust says it connects past.
-        v.set("guard", str(s.guard.empty() ? std::string() : guard::text(s.name, s.guard, s.engine)));
-        v.set("route", str(server_ops::direct_warning(s, s.host, s.port)));
+        // Why grab doesn't connect to it at all (Trust included), when it doesn't.
+        v.set("guard", str(s.guard.empty() ? std::string() : guard::text(s.name, s.guard)));
         v.set("connectionKeys", str(s.connection_keys)); // grab.conf's bind and times, when set
         // Whether its password (passphrase, stored key) is saved for this login; null for ssh-agent
         // or a store that can't be read. Never the value.
@@ -1904,8 +1809,6 @@ void App::post_servers(const server_ops::Env& env) const {
     Value msg = Value::make_object();
     msg.set("type", str("servers"));
     msg.set("configPath", str(util::path_to_utf8(env.grab_conf)));
-    // A new server's: grab's own client (GRAB_ENGINE=rclone makes it rclone), for the form's hints.
-    msg.set("engine", str(effective_engine(RemoteSettings{}) == Engine::grab ? "grab" : "rclone"));
     msg.set("items", std::move(items));
     post(msg);
 }
@@ -2004,14 +1907,13 @@ void App::save_server(const Value& msg) {
         }
         if (!need_keys) return apply_pending(std::move(p), stop);
 
-        // An edited server's bind and connect time (the page asked first when its settings route it).
-        ssh::Reach reach;
-        if (editing) {
-            auto r = server_ops::reach_for(*env, s.name);
-            if (!r) return settings_error(r.error());
-            reach = std::move(*r);
-        }
-        auto keys = server_ops::scan_host_keys(s.host, s.port, stop, reach);
+        // The server's bind and connect time; refused for a server grab doesn't connect to (an
+        // inherited RCLONE_SFTP_SOCKS_PROXY covers a new one too), before anything dials. An Edit
+        // sets an unreadable store aside, so that doesn't stop its fetch.
+        const auto purpose = editing ? server_ops::Purpose::edit : server_ops::Purpose::trust;
+        auto reach = server_ops::reach_for(*env, s.name, purpose);
+        if (!reach) return settings_error(reach.error());
+        auto keys = server_ops::scan_host_keys(s.host, s.port, stop, *reach);
         if (stop.stop_requested()) return;
         if (!keys) return settings_error(keys.error());
         p.keys = std::move(*keys);
@@ -2087,16 +1989,11 @@ void App::test_server(const std::string& name, std::stop_token stop) {
         v.set("error", str(result.error()));
     } else {
         v.set("ok", Value::make_bool(result->ok()));
-        // rclone's listing: engine = rclone only (its downloads); engine = grab doesn't ask it.
-        v.set("rcloneOk", result->rclone_ok ? Value::make_bool(*result->rclone_ok) : Value{});
-        v.set("rcloneError", str(result->rclone_error));
-        v.set("sshOk", result->ssh_ok ? Value::make_bool(*result->ssh_ok) : Value{});
-        v.set("sshError", str(result->ssh_error));
-        // grab's own login (every server verifies through it), how searches go on engine = grab
-        // ("with find (GNU find)"), and whether downloads can be verified ("checksums: md5sum").
+        // grab's login, how searches go ("with find (GNU find)"), and whether downloads can be
+        // verified ("checksums: md5sum"); or why grab doesn't connect to it at all.
         v.set("grabOk", result->grab_ok ? Value::make_bool(*result->grab_ok) : Value{});
         v.set("grabError", str(result->grab_error));
-        v.set("grabEngine", Value::make_bool(result->grab_engine));
+        v.set("unusable", str(result->unusable));
         v.set("grabSearch", str(result->grab_search));
         v.set("checksums", str(result->checksums));
     }
@@ -2575,14 +2472,7 @@ void App::update_limit() {
 
 void App::set_rate(std::uint64_t bytes_per_s) {
     if (bytes_per_s == limiter_.rate()) return;
-    // Streams through grab follow the new rate at once. rclone batches (a folder's small
-    // files) have theirs fixed at start, so running ones restart with the new cap; only their
-    // in-flight small files start over.
-    limiter_.set_rate(bytes_per_s);
-    std::lock_guard lock(mutex_);
-    for (auto& item : items_) {
-        if (item->tree.batch_running) item->tree.batch_stop.request_stop();
-    }
+    limiter_.set_rate(bytes_per_s); // the streams follow the new rate at once
 }
 
 // What the status bar and Settings show: the limit that applies and why, when the schedule
@@ -2633,8 +2523,6 @@ void App::set_priority(int id, int weight) {
             item->weight = weight; // the limiter reads it at every request
             server = item->remote;
             running = item->status == Status::running;
-            // A folder's rclone batch has its --bwlimit share fixed at start: restart it.
-            if (item->tree.batch_running && limiter_.rate() > 0) item->tree.batch_stop.request_stop();
         }
     }
     if (running) connections_.set_weight(server, id, weight); // shares rebalance at the next reads
@@ -2867,12 +2755,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                            connection_budget(item->remote, ctx->remote.host, ctx->settings.max_connections));
 
     fetch::Download d;
-    d.source = fetch::Source{.rclone = ctx->config.rclone,
-                             .environment = {}, // engine = rclone: below
-                             .rclone_remote = ctx->settings.rclone_remote,
-                             .path = item->path,
-                             .flags = rclone_flags::connection(ctx->settings.common_flags),
-                             .after = engine::key_flags(ctx->settings)};
+    d.source = fetch::Source{.rclone_remote = ctx->settings.rclone_remote, .path = item->path};
     d.server = item->remote;
     d.id = item->id;
     existing::Choice choice{};
@@ -2884,16 +2767,10 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.replace = choice == existing::Choice::replace;
     d.limiter = &limiter_;
     d.weight = &item->weight;
-    // engine = grab: through grab's own SSH client, its connections kept open between files.
-    if (ctx->engine == Engine::grab) {
-        auto target = engine::ssh_target(*ctx);
-        if (!target) return set(Status::failed, target.error());
-        d.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
-    } else if (auto env = engine::rclone_env(*ctx); env) {
-        d.source.environment = std::move(*env);
-    } else {
-        return set(Status::failed, env.error());
-    }
+    // Through grab's own SSH client, its connections kept open between files.
+    auto target = engine::ssh_target(*ctx);
+    if (!target) return set(Status::failed, target.error());
+    d.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
     auto fetch_once = [&] {
         return fetch::run(d, connections_, [&](const fetch::Progress& p) {
             if (update_item(mutex_, last_progress_post_, [&] {
@@ -3002,13 +2879,12 @@ verify::Request App::verify_request(const engine::Context& ctx, const std::share
     r.connections = &connections_;
     r.server = item->remote;
     r.id = item->id;
-    // Every server verifies through grab's own client (RCLONE-REPLACEMENT.md, phase 5), engine =
-    // rclone too: its pool, shared with Browse and searches, logs in once.
+    // Through grab's own client (RCLONE-REPLACEMENT.md, phase 5): the download's pool, shared with
+    // Browse and searches, logs in once.
     if (download_pool) {
         r.pool = download_pool;
     } else if (auto target = engine::ssh_target(ctx)) {
         r.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
-        r.close_idle_after = true; // only verifies: rclone downloads don't count its connections
     } else {
         r.no_pool = target.error();
     }
@@ -3108,32 +2984,16 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     job.weight = &item->weight;
     job.remote_path = item->path;
     job.dest = item->dest;
-    // The batch's part of the speed limit: this download's weight over all running downloads'.
-    job.batch_limit = [this, item]() -> std::uint64_t {
-        const auto limit = limiter_.rate();
-        if (limit == 0) return 0;
-        int total_weight = 0;
-        {
-            std::lock_guard lock(mutex_);
-            for (const auto& other : items_) {
-                if (other->status == Status::running) total_weight += other->weight.load();
-            }
-        }
-        const int weight = item->weight.load();
-        return limit * static_cast<std::uint64_t>(weight) / static_cast<std::uint64_t>(std::max(total_weight, weight));
-    };
     job.on_event = [this, item](folder::Event e) { folder_event(*item, e); };
     // Its files at once: what "At once" leaves of the files other downloads hold.
     job.files_at_once = [this, item] {
         std::lock_guard lock(mutex_);
         return std::max(1, parallel_ - files_in_use(item.get()));
     };
-    // engine = grab: walked and fetched through grab's own SSH client.
-    if (ctx->engine == Engine::grab) {
-        auto target = engine::ssh_target(*ctx);
-        if (!target) return fail(target.error());
-        job.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
-    }
+    // Walked and fetched through grab's own SSH client.
+    auto target = engine::ssh_target(*ctx);
+    if (!target) return fail(target.error());
+    job.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
 
     if (auto listed = folder::list(job, item->tree, mutex_, item_stop); !listed) return fail(listed.error());
     // Files already complete on disk (an earlier run, or downloaded before) are not fetched

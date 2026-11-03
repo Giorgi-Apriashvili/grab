@@ -7,7 +7,6 @@
 #include "conn_budget.hpp"
 #include "engine.hpp"
 #include "file_list.hpp"
-#include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "match.hpp"
@@ -52,7 +51,7 @@ constexpr int exit_ok = 0;
 constexpr int exit_usage = 1;
 constexpr int exit_config = 2;
 constexpr int exit_not_found = 3;
-constexpr int exit_lookup = 4; // ssh or rclone listing failed
+constexpr int exit_lookup = 4; // the search or the file list failed
 
 void error(std::string_view msg) { std::println(stderr, "grab: error: {}", msg); }
 
@@ -145,11 +144,11 @@ int do_init(const std::filesystem::path& path) {
     std::filesystem::remove(rclone_import::record_path(files.state_dir), ec);
     const auto applied = rclone_import::apply(files);
     if (!applied) error(applied.error());
-    // The lookups as runs resolve them now that the details and the store are in, the guard's
-    // included (a server rclone.conf routes stays on rclone): in the comments and below.
+    // The lookups as runs resolve them now that the details and the store are in: in the comments
+    // and below.
     std::map<std::string, std::string, std::less<>> searches;
     if (applied) {
-        if (auto env = server_ops::load_env(path, util::self_exe_path().parent_path())) {
+        if (auto env = server_ops::load_env(path)) {
             if (auto described = server_ops::describe_servers(*env); !described) error(described.error());
             for (auto& info : server_ops::list_servers(*env)) searches[info.name] = std::move(info.search);
         }
@@ -221,9 +220,9 @@ std::string age_text(std::int64_t seconds) {
     return std::format("{} days", (seconds + 43200) / 86400);
 }
 
-// engine = grab: the server's pool, which the download after the search uses too, so the command
-// logs in once; a walk takes up to 8 of the server's connections. With -v, the way chosen is said
-// as `said` + its lookup_text.
+// The server's pool, which the download after the search uses too, so the command logs in once; a
+// walk takes up to 8 of the server's connections. With -v, the way chosen is said as `said` + its
+// lookup_text.
 std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ctx, const Options& opts,
                                                        ssh::Pools& pools, std::string said) {
     // The connection flags after `--` too, as the download's target takes them: one pool for both.
@@ -259,18 +258,12 @@ std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ct
 std::expected<engine::SearchResult, std::string> search(const engine::Context& ctx, engine::SearchRequest req,
                                                         const Options& opts, const engine::CommandHook& trace,
                                                         ssh::Pools& pools) {
-    const bool on_grab = ctx.engine == Engine::grab;
     if (!file_list::can_answer(ctx, req)) {
-        if (on_grab) {
-            auto side = grab_side(ctx, opts, pools, std::format("looking up '{}' on {}", opts.target, ctx.settings.name));
-            if (!side) return util::fail(side.error());
-            req.grab = std::move(*side);
-            if (opts.verbose && is_path_target(req.target)) {
-                std::println(stderr, "grab: looking up '{}' on {} with one SFTP stat", opts.target, ctx.settings.name);
-            }
-        } else if (opts.verbose) {
-            std::println(stderr, "grab: looking up '{}' via {}", opts.target,
-                         ctx.method == FindMethod::ssh ? "ssh + find" : "rclone lsf");
+        auto side = grab_side(ctx, opts, pools, std::format("looking up '{}' on {}", opts.target, ctx.settings.name));
+        if (!side) return util::fail(side.error());
+        req.grab = std::move(*side);
+        if (opts.verbose && is_path_target(req.target)) {
+            std::println(stderr, "grab: looking up '{}' on {} with one SFTP stat", opts.target, ctx.settings.name);
         }
         return engine::search(ctx, req, {}, trace);
     }
@@ -287,13 +280,9 @@ std::expected<engine::SearchResult, std::string> search(const engine::Context& c
         return file_list::search(ctx, *list, req);
     }
     std::println(stderr, "grab: fetching the file list of {}...", ctx.settings.name);
-    engine::GrabSide side;
-    if (on_grab) {
-        auto made = grab_side(ctx, opts, pools, std::format("the file list of {} comes", ctx.settings.name));
-        if (!made) return util::fail(made.error());
-        side = std::move(*made);
-    }
-    auto fetched = file_list::fetch(ctx, now, false, {}, trace, {}, side, req.run_flags);
+    auto side = grab_side(ctx, opts, pools, std::format("the file list of {} comes", ctx.settings.name));
+    if (!side) return util::fail(side.error());
+    auto fetched = file_list::fetch(ctx, now, {}, trace, *side);
     if (!fetched) return util::fail(fetched.error());
     if (!file_list::save(file, *fetched) && opts.verbose) {
         std::println(stderr, "grab: could not save the file list to {}", util::path_to_utf8(file));
@@ -333,19 +322,11 @@ int run(const Options& opts) {
             }
         }
     }
-    // The flags after `--`, now that the server's engine is known: refused before anything
-    // connects or any folder is made (RCLONE-REPLACEMENT.md, phase 8 step 6).
+    // The flags after `--`: refused before anything connects or any folder is made
+    // (RCLONE-REPLACEMENT.md, phase 8 step 6).
     if (auto usable = engine::check_run_flags(*ctx, opts.extra); !usable) {
         error(usable.error());
         return exit_usage;
-    }
-    // A guard setting after `--` on engine = rclone (--sftp-socks-proxy...; guard.hpp): a route
-    // keeps this run's searches off ssh.exe find too, which would connect past it; -v says it, as
-    // the settings' own.
-    const auto run_flags = rclone_flags::connection(opts.extra);
-    if (const auto blocked = engine::grab_blockers(*ctx, run_flags); blocked != engine::grab_blockers(*ctx)) {
-        if (ctx->engine == Engine::rclone && guard::routed(blocked)) ctx->method = FindMethod::rclone;
-        if (opts.verbose) std::println(stderr, "grab: note: {}", guard::text(ctx->settings.name, blocked, ctx->engine));
     }
 
     // destination: a given DEST is checked before the search so a typo fails fast; a missing
@@ -370,12 +351,11 @@ int run(const Options& opts) {
     req.mode = opts.mode;
     req.exact = opts.exact;
     req.depth = opts.depth;
-    req.run_flags = run_flags;
     const engine::CommandHook trace = [&](const std::vector<std::string>& argv) {
         if (opts.verbose) std::println(stderr, "+ {}", quote::display_cmdline(argv));
     };
-    // grab's own SSH connections (engine = grab), for the search and the download after it, so
-    // `grab -s x DEST` logs in once; closed when the command ends.
+    // grab's own SSH connections, for the search and the download after it, so `grab -s x DEST`
+    // logs in once; closed when the command ends.
     ssh::Pools pools;
     auto found = search(*ctx, req, opts, trace, pools);
     if (!found) {

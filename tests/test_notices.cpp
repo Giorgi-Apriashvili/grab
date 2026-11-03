@@ -108,10 +108,10 @@ TEST_CASE("notices: the switch to grab's own client, once, naming the servers it
                        "their saved file lists are fetched again once. To go back to rclone for a server until a later "
                        "grab removes it, set engine = rclone in its section (grab config, or Open grab.conf in grab's "
                        "Settings).");
-    // Box stays on rclone by itself, and says why.
+    // grab doesn't connect to Box, and says why.
     CHECK(n[1].key == "guard");
-    CHECK(n[1].text.find("[Box] connects through a SOCKS proxy (rclone.socks_proxy)") != std::string::npos);
-    CHECK(n[1].text.find("its downloads go through rclone") != std::string::npos);
+    CHECK(n[1].text.find("[Box] connects through a SOCKS proxy (rclone.socks_proxy in grab's store)") != std::string::npos);
+    CHECK(n[1].text.find("so it doesn't connect to Box rather than go around it") != std::string::npos);
 
     // Once per configuration: a server added later doesn't bring it back.
     const auto dir = std::filesystem::temp_directory_path() / "grab-test-notices-n0";
@@ -275,18 +275,19 @@ TEST_CASE("notices: what keeps grab's client off a server, on any engine, named 
         CHECK(one.key == "guard");
         CHECK(one.text.find("fake-") == std::string::npos);
         CHECK(one.text.find("127.0.0.1") == std::string::npos);
-        CHECK(one.text.find("previews, Play and Verify are off for it") != std::string::npos);
+        CHECK(one.text.find("which grab can't, so it doesn't connect to Box") != std::string::npos);
+        CHECK(one.text.find("engine = rclone") == std::string::npos);
     }
     CHECK(n[0].flag == "common_flags' --sftp-http-proxy");
     // Keyed on the text, never the value: notices.json is no guessing oracle for a proxy's password.
     CHECK(n[0].digest == util::sha256_hex(n[0].text));
     CHECK(n[1].digest == util::sha256_hex(n[1].text));
-    CHECK(n[1].flag == "rclone.socks_proxy");
+    CHECK(n[1].flag == "rclone.socks_proxy in grab's store");
     CHECK(n[2].flag == "RCLONE_SFTP_USE_FSTAT");
     // A common_flags proxy isn't also an N2 on a grab server: the guard's notice says it.
     const auto on_grab = notices_of(section("Box", "common_flags = --sftp-socks-proxy p:1\n"));
     REQUIRE(on_grab.size() == 1);
-    CHECK(on_grab[0].text.find("set engine = rclone in [Box]") != std::string::npos);
+    CHECK(on_grab[0].text.ends_with("take --sftp-socks-proxy out of common_flags in [Box] (grab config)"));
 }
 
 TEST_CASE("notices: each shows once per configuration, again when its value changes (notices.json)") {
@@ -351,7 +352,7 @@ TEST_CASE("notices: a configuration's notices from its grab.conf, its store's ex
     const auto n = notices::for_config(conf);
     REQUIRE_MESSAGE(n, n.error_or(""));
     REQUIRE(n->size() == 1);
-    CHECK((*n)[0].flag == "rclone.socks_proxy");
+    CHECK((*n)[0].flag == "rclone.socks_proxy in grab's store");
     // N0 names a server the import moved (imported.json), not one added in grab.conf since.
     REQUIRE(util::write_file_atomic(conf, section("Box", "", "rclone") + "[Main]\nhost = m.example\nuser = u\nauth = agent\n" +
                                               "[New]\nhost = n.example\nuser = u\nauth = agent\n"));

@@ -21,7 +21,6 @@ add_executable(grab_tests
     test_config.cpp
     test_remote.cpp
     test_listing.cpp
-    test_rclone.cpp
     test_process.cpp
     test_json.cpp
     test_match.cpp

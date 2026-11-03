@@ -1,7 +1,5 @@
 #pragma once
 
-#include "cli.hpp"
-#include "config.hpp"
 #include "match.hpp"
 
 #include <cstddef>
@@ -11,7 +9,6 @@
 #include <functional>
 #include <iosfwd>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,15 +24,6 @@ struct RemoteEntry {
     bool operator==(const RemoteEntry&) const = default;
 };
 
-struct FindRequest {
-    Mode mode = Mode::folder;
-    std::string target;              // search words / pattern, or a remote path containing '/'
-    bool exact = false;              // --exact: whole-name, case-sensitive (see match.hpp)
-    std::vector<std::string> roots;  // "" = login home; ignored when target is a path
-    int max_depth = 4;
-    bool skip_hidden = true;
-};
-
 // A target with a '/' is a path (absolute, or relative to the login home) to be checked
 // rather than a name to be searched for.
 [[nodiscard]] bool is_path_target(std::string_view target);
@@ -46,35 +34,8 @@ struct FindRequest {
 // target would be the download folder itself, review G15).
 [[nodiscard]] bool has_name(std::string_view remote_path);
 
-// "remote:/abs/path": how grab shows a server's path, and rclone's form of it.
+// "server:/abs/path": how grab shows a server's path (the server's rclone_remote, then its path).
 [[nodiscard]] std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path);
-
-// The `find -L` command run by the remote shell: links are followed, as rclone's listing and
-// grab's walk follow them (review G54). Name matching happens on the server: one
-// `-iname '*word*'` per word, `-iname` for a glob, `-name` for --exact. Files are printed
-// as "<size>\t<mtime>\t<path>\0" (GNU find -printf), folders as "<mtime>\t<path>\0"; <mtime>
-// is %T@, Unix seconds with a fraction.
-[[nodiscard]] std::string build_find_command(const FindRequest& req);
-
-// A file for an ssh -o option such as UserKnownHostsFile, as ssh reads it back (review G1): in
-// double quotes (a space would end it), '\' as '/' on Windows (ssh takes a backslash for an
-// escape) and '%' doubled (ssh expands %d, %u and the like there).
-[[nodiscard]] std::string ssh_file_value(std::string_view path);
-
-// ssh argv: options first, then user@host, then the remote command as one argument. With a
-// known_hosts_file the host key must be in it (StrictHostKeyChecking=yes), only it is read
-// (GlobalKnownHostsFile=NUL) and ssh never adds keys to it (UpdateHostKeys=no, whatever
-// ~/.ssh/config says), before `ssh_options` so these come first (review G4). The file goes in as
-// ssh_file_value writes it.
-[[nodiscard]] std::vector<std::string> build_ssh_argv(const std::string& ssh_exe,
-                                                      const RcloneRemote& remote,
-                                                      std::span<const std::string> ssh_options,
-                                                      const std::string& remote_command);
-
-// Split NUL-separated find output into entries: "[<size>\t]<mtime>\t<path>", the size when
-// `sized` (files). A field is taken off only when it parses; a leading "./" (from a
-// home-relative search) is dropped.
-[[nodiscard]] std::vector<RemoteEntry> parse_find_output(std::string_view out, bool sized);
 
 // Best first: match tier (exact name, then name starting with the first word), then
 // shallowest, then case-insensitive path order (so episodes list in order).

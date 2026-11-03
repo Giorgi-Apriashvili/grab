@@ -1,8 +1,5 @@
 #include "browse.hpp"
-#include "engine.hpp"
 #include "file_list.hpp"
-#include "rclone.hpp"
-#include "util.hpp"
 
 #include <doctest/doctest.h>
 
@@ -178,41 +175,4 @@ TEST_CASE("a path typed in the address bar") {
     CHECK(browse::address_path("") == "");
     CHECK(browse::address_path("~x/y") == "~x/y"); // only "~" alone or "~/" is the home
     CHECK(browse::address_path("Star Wars: A New Hope") == "Star Wars: A New Hope");
-}
-
-TEST_CASE("lsjson's answer for a file's path is that one file") {
-    const std::vector<Item> file{{"a.avi", "movies/a.avi/a.avi", false, 5, {}}};
-    CHECK(browse::maybe_file(file, "movies/a.avi"));
-    CHECK(browse::maybe_file(file, "movies/a.avi/")); // a trailing slash still names it
-    CHECK_FALSE(browse::maybe_file(file, "movies/b.avi"));
-    CHECK_FALSE(browse::maybe_file({{"a.avi", "x", true, {}, {}}}, "movies/a.avi")); // a folder inside
-    CHECK_FALSE(browse::maybe_file({{"a.avi", "x", false, 5, {}}, {"b", "y", false, 1, {}}}, "movies/a.avi"));
-    CHECK_FALSE(browse::maybe_file({}, "movies/a.avi"));
-}
-
-TEST_CASE("a folder listed live") {
-    const std::string json = R"([{"Path":"Season 1","Name":"Season 1","Size":-1,"ModTime":"2023-10-15T09:22:33Z","IsDir":true},
-        {"Path":".hidden","Name":".hidden","Size":3,"IsDir":false},
-        {"Path":"Ep 10.mkv","Name":"Ep 10.mkv","Size":10,"ModTime":"2023-10-15T11:22:33.987654321+02:00","IsDir":false},
-        {"Path":"Ep 2.mkv","Name":"Ep 2.mkv","Size":2,"ModTime":"0001-01-01T00:00:00Z","IsDir":false},
-        {"Path":"Ep 3.mkv","Name":"Ep 3.mkv","Size":3,"ModTime":"soon","IsDir":false}])";
-    const auto items = browse::parse_lsjson(json, "tv/show", true);
-    REQUIRE(items.has_value());
-    CHECK(*items == std::vector<Item>{{"Season 1", "tv/show/Season 1", true, std::nullopt, std::nullopt, 1697361753},
-                                      {"Ep 2.mkv", "tv/show/Ep 2.mkv", false, 2, std::nullopt}, // before 1970: unknown
-                                      {"Ep 3.mkv", "tv/show/Ep 3.mkv", false, 3, std::nullopt},
-                                      {"Ep 10.mkv", "tv/show/Ep 10.mkv", false, 10, std::nullopt, 1697361753}});
-    CHECK(browse::parse_lsjson(json, "", false)->size() == 5); // dot-entries kept when not skipped
-    CHECK((*browse::parse_lsjson(json, "", false))[0].path == "Season 1");
-    CHECK_FALSE(browse::parse_lsjson("not json", "x", true).has_value());
-
-    engine::Context ctx;
-    ctx.config.rclone = "rclone";
-    ctx.config.rclone_config = util::path_from_utf8("C:\\grab\\rclone.conf");
-    ctx.settings.rclone_remote = "Box";
-    ctx.settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki"};
-    // The server comes in rclone's environment (engine::rclone_env), never a file.
-    CHECK(browse::listing_argv(ctx, "tv/show") ==
-          std::vector<std::string>{"rclone", "lsjson", "Box:tv/show", "--no-mimetype", "--config",
-                                   std::string(config_in_memory), "--sftp-chunk-size", "255Ki"});
 }

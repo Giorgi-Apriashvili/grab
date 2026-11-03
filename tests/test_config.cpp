@@ -14,7 +14,6 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -223,21 +222,10 @@ TEST_CASE("search_roots may be absolute or home-relative and are normalized") {
     CHECK(normalize_root("/") == "/");
 }
 
-TEST_CASE("find method: explicit, or auto from how the rclone remote authenticates") {
+TEST_CASE("find method: auto, ssh, or rclone (the same as walk)") {
     CHECK(parse_ok("[h]\n").remotes[0].find == FindMethod::auto_detect);
     CHECK(parse_ok("[h]\nfind = SSH\n").remotes[0].find == FindMethod::ssh);
     CHECK(parse_ok("[h]\nfind = rclone\n").remotes[0].find == FindMethod::rclone);
-
-    RcloneRemote with_key;
-    with_key.key_file = "E:\\k.pem";
-    RcloneRemote with_password; // no key_file: rclone.conf carries `pass`
-    RemoteSettings automatic;
-    CHECK(resolve_find_method(automatic, with_key) == FindMethod::ssh);
-    CHECK(resolve_find_method(automatic, with_password) == FindMethod::rclone);
-
-    RemoteSettings forced;
-    forced.find = FindMethod::rclone;
-    CHECK(resolve_find_method(forced, with_key) == FindMethod::rclone);
 }
 
 TEST_CASE("find method on grab's engine: auto asks the server, except a Storage Box; walk = rclone") {
@@ -382,29 +370,6 @@ TEST_CASE("generate_grab_config without usable remotes is a [grab] block ready f
     }
 }
 
-TEST_CASE("resolve_rclone_exe: bundled next to grab, else PATH, explicit path wins") {
-    namespace fs = std::filesystem;
-    const auto dir = fs::temp_directory_path() / "grab_test_bundle";
-    fs::remove_all(dir);
-    fs::create_directories(dir);
-    GrabConfig cfg; // rclone = "rclone"
-    CHECK(resolve_rclone_exe(cfg, dir) == "rclone"); // nothing bundled
-#ifdef _WIN32
-    const auto bundled = dir / "rclone.exe";
-#else
-    const auto bundled = dir / "rclone";
-#endif
-    std::ofstream(bundled) << "x";
-    CHECK(resolve_rclone_exe(cfg, dir) == util::path_to_utf8(bundled));
-    cfg.rclone = "";
-    CHECK(resolve_rclone_exe(cfg, dir) == util::path_to_utf8(bundled));
-    cfg.rclone = "RCLONE.EXE";
-    CHECK(resolve_rclone_exe(cfg, dir) == util::path_to_utf8(bundled));
-    cfg.rclone = "C:\\Tools\\rclone.exe";
-    CHECK(resolve_rclone_exe(cfg, dir) == "C:\\Tools\\rclone.exe");
-    fs::remove_all(dir);
-}
-
 TEST_CASE("the tests' settings are a scratch folder's: grab's files never resolve to the real ones") {
     // test_main.cpp points APPDATA, LOCALAPPDATA, HOME and USERPROFILE at a folder of this run
     // and clears RCLONE_CONFIG and GRAB_CONFIG before any test: every default path grab writes to
@@ -433,15 +398,14 @@ TEST_CASE("the tests' settings are a scratch folder's: grab's files never resolv
     CHECK_FALSE(util::getenv_utf8("GRAB_CONFIG").has_value());
 }
 
-TEST_CASE("agent remotes are searched over ssh") {
+TEST_CASE("agent remotes say so in grab.conf's comment") {
     auto r = parse_rclone_remote(*ini::parse("[a]\ntype = sftp\nhost = h\nuser = u\nkey_use_agent = true\n"), "a");
     REQUIRE(r.has_value());
     CHECK(r->key_use_agent);
-    CHECK(resolve_find_method(RemoteSettings{}, *r) == FindMethod::ssh);
     CHECK(describe_remote(*r).find("ssh-agent") != std::string::npos);
 }
 
-TEST_CASE("a server's search method as lists and comments name it, per engine") {
+TEST_CASE("a server's search method as lists and comments name it") {
     RcloneRemote key;
     key.user = "u";
     key.host = "h";
@@ -451,29 +415,24 @@ TEST_CASE("a server's search method as lists and comments name it, per engine") 
     box.host = "u1.your-storagebox.de";
     box.port = 23;
     RemoteSettings s;
-    CHECK(search_method(s, key, Engine::rclone) == "ssh");
-    CHECK(search_method(s, box, Engine::rclone) == "rclone");
-    CHECK(search_method(s, key, Engine::grab) == "probe");
-    CHECK(search_method(s, box, Engine::grab) == "walk"); // a Storage Box isn't asked
+    CHECK(search_method(s, key) == "probe");
+    CHECK(search_method(s, box) == "walk"); // a Storage Box isn't asked
     s.find = FindMethod::ssh;
-    CHECK(search_method(s, box, Engine::grab) == "find");
+    CHECK(search_method(s, box) == "find");
     s.find = FindMethod::rclone;
-    CHECK(search_method(s, key, Engine::grab) == "walk");
+    CHECK(search_method(s, key) == "walk");
+    // `engine = rclone` changes nothing: every server is searched by grab's own client.
+    s.find = FindMethod::auto_detect;
+    s.engine = Engine::rclone;
+    CHECK(search_method(s, key) == "probe");
 
-    // grab.conf's comment says the lookup as the caller resolved it (engine, guard and find
-    // setting); without one, grab's own client's with the default find setting.
+    // grab.conf's comment says the lookup as the caller resolved it; without one, the default
+    // find setting's. No "via ssh + find" or "via rclone lsf" any more.
     CHECK(describe_remote(key) == "u@h:22, key file, lookup with find, else by listing folders");
     CHECK(describe_remote(box) == "u1@u1.your-storagebox.de:23, password, lookup by listing folders");
-    RemoteSettings on_rclone;
-    on_rclone.engine = Engine::rclone;
-    CHECK(describe_remote(key, search_method(on_rclone, key, Engine::rclone)) ==
-          "u@h:22, key file, lookup via ssh + find");
-    CHECK(describe_remote(box, search_method(on_rclone, box, Engine::rclone)) ==
-          "u1@u1.your-storagebox.de:23, password, lookup via rclone lsf");
-    CHECK(describe_remote(key, "rclone") == "u@h:22, key file, lookup via rclone lsf"); // a route rclone takes
     RemoteSettings grab;
     grab.find = FindMethod::ssh;
-    CHECK(describe_remote(key, search_method(grab, key, Engine::grab)) == "u@h:22, key file, lookup with find");
+    CHECK(describe_remote(key, search_method(grab, key)) == "u@h:22, key file, lookup with find");
     CHECK(describe_remote(key, "find", "key in grab's store") == "u@h:22, key in grab's store, lookup with find");
 }
 

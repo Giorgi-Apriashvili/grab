@@ -51,16 +51,10 @@ bool confirm(std::string_view prompt) {
 }
 
 // Scans the server's host keys, shows their fingerprints and asks to trust them. Nothing is
-// written before the yes. `reach`: the server's bind and connect time; `direct`, when its settings
-// route its connections (server_ops::direct_warning), is said first and the scan waits for a yes,
-// since it connects directly.
+// written before the yes. `reach`: the server's bind and connect time (server_ops::reach_for, which
+// refuses a server grab doesn't connect to).
 std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::string& host, int port,
-                                                                const ssh::Reach& reach = {},
-                                                                const std::string& direct = {}) {
-    if (!direct.empty()) {
-        std::println(stderr, "{}.", direct);
-        if (!confirm("Connect directly?")) return util::fail("not connected; nothing was changed");
-    }
+                                                                const ssh::Reach& reach) {
     std::println(stderr, "Fetching the host key of {}:{} ...", host, port);
     auto keys = server_ops::scan_host_keys(host, port, {}, reach);
     if (!keys) return keys;
@@ -98,18 +92,15 @@ int server_list(const Env& env) {
             std::println("{} {:<14} not usable: {}", mark, s.name, s.error);
             continue;
         }
-        // Each server's engine: on grab's own client (the default) it searches with find or by
-        // listing folders; on rclone, the fallback (engine = rclone, or settings grab's client can't
-        // serve, said below), ssh.exe runs find or rclone lists.
-        const char* search = s.search == "ssh"    ? "engine rclone (fallback), search with ssh + find"
-                             : s.search == "rclone" ? "engine rclone (fallback), search by rclone's listing"
-                             : s.search == "find"   ? "engine grab, search with find"
-                             : s.search == "walk"   ? "engine grab, search by listing folders"
-                                                    : "engine grab, search with find or by listing folders";
+        // How it searches: with find or by listing folders. A server grab doesn't connect to says
+        // why below.
+        const char* search = s.search == "find"   ? "search with find"
+                             : s.search == "walk" ? "search by listing folders"
+                                                  : "search with find or by listing folders";
         std::println("{} {:<14} {}@{}:{}  {}, {}, {}{}", mark, s.name, s.user, s.host, s.port, server_ops::login_text(s),
                      search, server_ops::host_key_text(s),
                      s.connection_keys.empty() ? std::string() : ", " + s.connection_keys);
-        if (!s.guard.empty()) std::println("  {:<14} {}", "", guard::text(s.name, s.guard, s.engine));
+        if (!s.guard.empty()) std::println("  {:<14} not usable: {}", "", guard::text(s.name, s.guard));
     }
     return exit_ok;
 }
@@ -226,27 +217,27 @@ bool ask_details(servers::NewServer& s, std::optional<std::string>& secret, cons
     return true;
 }
 
-// The connection test, printed: the same paths searches, downloads, previews, Play and
-// verification use. A failed ssh login gets `ssh_hint`. exit_ok when it passed.
-int print_test(const Env& env, const std::string& name, std::string_view ssh_hint) {
+// The connection test, printed: the same path searches, downloads, previews, Play and
+// verification use. exit_ok when it passed.
+int print_test(const Env& env, const std::string& name) {
     auto test = server_ops::test_connection(env, name);
     if (!test) {
         error(test.error());
         return exit_config;
     }
-    for (const auto& line : server_ops::test_lines(*test, ssh_hint)) std::println(stderr, "  {}", line);
+    for (const auto& line : server_ops::test_lines(*test)) std::println(stderr, "  {}", line);
     return test->ok() ? exit_ok : exit_config;
 }
 
 // After a change: the test, with the configuration read again so that it sees what was written.
-int test_saved(const Env& env, const std::string& name, std::string_view ssh_hint) {
+int test_saved(const Env& env, const std::string& name) {
     std::println(stderr, "Testing the connection ...");
-    auto fresh = server_ops::load_env(env.grab_conf, util::self_exe_path().parent_path());
+    auto fresh = server_ops::load_env(env.grab_conf);
     if (!fresh) {
         error(fresh.error());
         return exit_config;
     }
-    if (print_test(*fresh, name, ssh_hint) == exit_ok) {
+    if (print_test(*fresh, name) == exit_ok) {
         std::println(stderr, "\nReady:  grab -r {} WORDS [DEST]", name);
         return exit_ok;
     }
@@ -255,12 +246,6 @@ int test_saved(const Env& env, const std::string& name, std::string_view ssh_hin
                  "server remove {}",
                  name, name);
     return exit_config;
-}
-
-// What a passphrase-protected key means for ssh + find, after its failed login.
-std::string_view ssh_hint(servers::Auth auth, bool passphrase) {
-    return auth == servers::Auth::key && passphrase ? " (a passphrase-protected key needs ssh-agent: ssh-add <key file>)"
-                                                    : "";
 }
 
 // Answers come from the console, or from piped stdin one per line (scriptable); running out
@@ -280,8 +265,14 @@ int server_add(const Env& env, const std::string& prefill) {
     std::optional<std::string> secret;
     if (!ask_details(s, secret, nullptr)) return aborted();
 
-    // Host key first: nothing is written unless the user trusts the server.
-    auto keys = fetch_host_key(s.host, s.port);
+    // Host key first: nothing is written unless the user trusts the server. Not fetched past a
+    // route grab can't take (an inherited RCLONE_SFTP_SOCKS_PROXY covers a new server too).
+    auto reach = server_ops::reach_for(env, s.name);
+    if (!reach) {
+        error(reach.error());
+        return exit_config;
+    }
+    auto keys = fetch_host_key(s.host, s.port, *reach);
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -294,7 +285,7 @@ int server_add(const Env& env, const std::string& prefill) {
     }
     if (!added->empty()) std::println(stderr, "note: {}", *added);
     std::println(stderr, "\nSaved {} to {}.", s.name, util::path_to_utf8(env.grab_conf));
-    return test_saved(env, s.name, ssh_hint(s.auth, secret.has_value()));
+    return test_saved(env, s.name);
 }
 
 // The add questions with the server's answers as defaults; its name stays (it keys partial
@@ -315,12 +306,12 @@ int server_edit(const Env& env, const std::string& name) {
     // A new address, or one never pinned: its host key first, as for add.
     std::optional<server_ops::HostKeys> keys;
     if (server_ops::edit_needs_host_key(*current, s)) {
-        auto reach = server_ops::reach_for(env, name);
+        auto reach = server_ops::reach_for(env, name, server_ops::Purpose::edit);
         if (!reach) {
             error(reach.error());
             return exit_config;
         }
-        auto fetched = fetch_host_key(s.host, s.port, *reach, server_ops::direct_warning(*current, s.host, s.port));
+        auto fetched = fetch_host_key(s.host, s.port, *reach);
         if (!fetched) {
             error(fetched.error());
             return exit_config;
@@ -334,9 +325,7 @@ int server_edit(const Env& env, const std::string& name) {
     }
     if (!done->empty()) std::println(stderr, "note: {}", *done);
     std::println(stderr, "\nSaved {} in {}.", name, util::path_to_utf8(env.grab_conf));
-    const bool passphrase = secret.has_value() || (current->auth == servers::Auth::key && s.key_file == current->key_file &&
-                                                   current->secret_saved == true);
-    return test_saved(env, name, ssh_hint(s.auth, passphrase));
+    return test_saved(env, name);
 }
 
 // `again`: the server's notices (notices.hpp) not printed already, which a test repeats.
@@ -348,7 +337,7 @@ int server_test(const Env& env, const std::string& name, const std::vector<std::
         return exit_config;
     }
     std::println(stderr, "Testing {} ({}@{}:{}) ...", name, s->user, s->host, s->port);
-    const int rc = print_test(env, name, ssh_hint(s->auth, s->secret_saved == true));
+    const int rc = print_test(env, name);
     for (const auto& text : again) std::println(stderr, "  note: {}", text);
     if (rc == exit_ok) std::println(stderr, "\n{} works.", name);
     else std::println(stderr, "\n{} has a problem: see above (grab server edit {} changes it).", name, name);
@@ -369,7 +358,7 @@ int server_trust(const Env& env, const std::string& name) {
         error(reach.error());
         return exit_config;
     }
-    auto keys = fetch_host_key(s->host, s->port, *reach, server_ops::direct_warning(*s, s->host, s->port));
+    auto keys = fetch_host_key(s->host, s->port, *reach);
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -378,9 +367,8 @@ int server_trust(const Env& env, const std::string& name) {
         error(trusted.error());
         return exit_config;
     }
-    std::println(stderr,
-                 "Pinned the host key of {} in place of any it had; grab, ssh and rclone now refuse a server that "
-                 "presents another.",
+    std::println(stderr, "Pinned the host key of {} in place of any it had; grab now refuses a server that presents "
+                         "another.",
                  name);
     return exit_ok;
 }
@@ -409,8 +397,7 @@ int server_remove(const Env& env, const std::string& name) {
 } // namespace
 
 int run_server_command(const Options& opts) {
-    auto env = server_ops::load_env(opts.config.value_or(default_grab_config_path()),
-                                    util::self_exe_path().parent_path());
+    auto env = server_ops::load_env(opts.config.value_or(default_grab_config_path()));
     if (!env) {
         error(env.error());
         return exit_config;
@@ -423,14 +410,15 @@ int run_server_command(const Options& opts) {
     for (const auto& note : env->import_notes) std::println(stderr, "grab: note: {}", note);
     const std::string& sub = opts.server_args.at(0);
     const std::string arg = opts.server_args.size() > 1 ? opts.server_args[1] : std::string{};
-    // The settings' notices this configuration hasn't shown yet; a test repeats its server's.
+    // The settings' notices this configuration hasn't shown yet; a test repeats its server's, but
+    // not the guard's, which the test says itself ("not usable: ...").
     std::vector<std::string> again;
     if (auto all = notices::for_config(env->grab_conf)) {
         auto fresh = notices::take_new(notices::path_in(state_dir(env->grab_conf)), *all);
         const auto& shown = fresh ? *fresh : *all; // unsaved: said every time rather than never
         for (const auto& n : shown) std::println(stderr, "grab: note: {}", n.text);
         for (const auto& n : *all) {
-            if (n.server == arg && !std::ranges::contains(shown, n)) again.push_back(n.text);
+            if (n.server == arg && n.key != "guard" && !std::ranges::contains(shown, n)) again.push_back(n.text);
         }
     }
     if (sub == "list") return server_list(*env);

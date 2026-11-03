@@ -878,7 +878,7 @@ TEST_CASE("the programs run the import: load_context and load_env fill a section
     REQUIRE_FALSE(bare.has_value());
     CHECK(bare.error().find("no connection details") != std::string::npos);
     // load_env does too, and says why it couldn't.
-    auto env = server_ops::load_env(old.conf, old.dir);
+    auto env = server_ops::load_env(old.conf);
     REQUIRE(env.has_value());
     CHECK(env->imported.empty());
     REQUIRE(env->import_notes.size() == 1);

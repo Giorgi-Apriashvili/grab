@@ -5,7 +5,6 @@
 
 #include <filesystem>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,10 +82,6 @@ TEST_CASE("Windows device names get an underscore") {
     CHECK(local::name("console.txt") == "console.txt");
     CHECK(local::is_device("con .txt")); // Windows ignores the spaces before the extension
     CHECK_FALSE(local::is_device("conn"));
-    CHECK(local::differs_from_rclone("season 1/CON/e01.mkv"));
-    CHECK(local::differs_from_rclone("aux.srt"));
-    CHECK_FALSE(local::differs_from_rclone("season 1/e01.mkv"));
-    CHECK_FALSE(local::differs_from_rclone("AC／DC/a:b.txt")); // rclone names those the same
 }
 
 TEST_CASE("names shaped like 8.3 short names get an underscore (G167)") {
@@ -104,7 +99,6 @@ TEST_CASE("names shaped like 8.3 short names get an underscore (G167)") {
     CHECK(local::name("a~1.tar.gz") == "a~1.tar.gz");
     CHECK(local::name("Ä~1.txt") == "Ä~1.txt"); // Windows makes them of ASCII
     CHECK(local::is_short_name("x~9"));
-    CHECK(local::differs_from_rclone("docs/PROGRA~1/a.txt"));
 }
 
 TEST_CASE("bidi controls are dropped from a saved name and shown as marks (G51)") {
@@ -114,7 +108,6 @@ TEST_CASE("bidi controls are dropped from a saved name and shown as marks (G51)"
     CHECK(local::name("end.\u202E") == "end．"); // what's left is encoded as a whole
     CHECK(local::name("\u202E..") == "．．");
     CHECK(local::name("bad\xFF\u202E") == "bad‛FF");
-    CHECK(local::differs_from_rclone("x/invoice\u202Efdp.exe"));
     CHECK(local::bidi_visible("invoice\u202Efdp.exe") == "invoice⟨U+202E⟩fdp.exe");
     CHECK(local::bidi_visible("a\u200Eb\xFF") == "a⟨U+200E⟩b\xFF");
     CHECK(local::bidi_visible("plain ✓") == "plain ✓");
@@ -164,15 +157,4 @@ TEST_CASE("a remote path never leaves the download folder") {
     CHECK(local::relative("").empty());
     CHECK(local::relative("///").empty());
     CHECK(local::relative("a:b/CON/c?.txt") == util::path_from_utf8("a：b") / "CON_" / util::path_from_utf8("c？.txt"));
-}
-
-TEST_CASE("names rclone takes for one on Windows (G25)") {
-    const std::vector<std::string> paths{"Docs/a.txt", "docs/b.txt", "README", "readme", "caf\u00e9.txt", "cafe\u0301.txt",
-                                         "plain.txt", "sub/x.txt", "sub/y.txt"};
-    const auto clash = local::clashing(paths);
-    CHECK(clash == std::unordered_set<std::string>{"Docs/a.txt", "docs/b.txt", "README", "readme", "caf\u00e9.txt",
-                                                    "cafe\u0301.txt"});
-    CHECK(local::clashing(std::vector<std::string>{"a/b", "a/c", "b"}).empty());
-    CHECK(local::fold(util::path_from_utf8("Caf\u00e9")) == local::fold(util::path_from_utf8("CAFE\u0301")));
-    CHECK(local::key(util::path_from_utf8("Caf\u00e9")) != local::key(util::path_from_utf8("CAFE\u0301"))); // two to NTFS
 }

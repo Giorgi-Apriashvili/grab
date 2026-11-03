@@ -381,9 +381,9 @@ std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig&
             rclone_notices(b, r.name, kept);
             rclone_notices(b, r.name, details->rclone);
         }
-        // Keyed on the text (kind, where, engine), never the value: a proxy can hold a password.
+        // Keyed on the text (kind, where), never the value: a proxy can hold a password.
         for (const auto& reason : reasons) {
-            b.add_keyed_on_text("guard", reason.where, guard::text(r.name, std::span(&reason, 1), engine));
+            b.add_keyed_on_text("guard", reason.where, guard::text(r.name, std::span(&reason, 1)));
         }
     }
     // N0 first, once per configuration whichever servers it names then (keyed on the default

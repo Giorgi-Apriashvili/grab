@@ -22,7 +22,7 @@ namespace {
 // client, channel, login.
 class SshSession : public Session {
 public:
-    explicit SshSession(const Target& target) : connection_(target), fallback_(target.fallback) {}
+    explicit SshSession(const Target& target) : connection_(target) {}
     sftp::Client& sftp() override {
         if (!client_) start_sftp();
         return *client_;
@@ -45,7 +45,6 @@ private:
         try {
             channel_ = connection_.open_sftp();
             client_.emplace(*channel_);
-            client_->set_fallback(fallback_);
             client_->start();
         } catch (const Error& e) {
             reset();
@@ -59,7 +58,6 @@ private:
     }
 
     Connection connection_;
-    std::string fallback_; // Target::fallback, for the SFTP client's protocol errors
     std::unique_ptr<sftp::Channel> channel_;
     std::optional<sftp::Client> client_;
     bool sftp_failed_ = false; // it couldn't start: the session isn't reused

@@ -137,8 +137,7 @@ private:
 };
 
 // While alive, Ctrl+C stops the downloads (its token) instead of ending grab, so partial files
-// and their progress stay for the next run. A second Ctrl+C ends grab at once; the rclone
-// processes are in kill-on-close job objects and go with it.
+// and their progress stay for the next run. A second Ctrl+C ends grab at once.
 class StopOnCtrlC {
 public:
     StopOnCtrlC() {
@@ -196,9 +195,8 @@ private:
 #endif
 };
 
-// Follows the speed schedule while downloads run: when the scheduled limit changes, the
-// limiter switches (grab's streams follow at once) and a folder's rclone batch, whose cap is
-// fixed when it starts, starts again with the new one.
+// Follows the speed schedule while downloads run: when the scheduled limit changes, the limiter
+// switches, and grab's streams follow at once.
 class ScheduleFollower {
 public:
     ScheduleFollower(std::vector<schedule::Rule> rules, rate::RateLimiter& limiter, LiveLine& line)
@@ -210,29 +208,7 @@ public:
     ScheduleFollower(const ScheduleFollower&) = delete;
     ScheduleFollower& operator=(const ScheduleFollower&) = delete;
 
-    // While alive, the folder being downloaded: its batch restarts on a change.
-    class Watch {
-    public:
-        Watch(ScheduleFollower* f, folder::Tree& tree, std::mutex& m) : f_(f) {
-            if (f_ != nullptr) f_->watch(&tree, &m);
-        }
-        ~Watch() {
-            if (f_ != nullptr) f_->watch(nullptr, nullptr);
-        }
-        Watch(const Watch&) = delete;
-        Watch& operator=(const Watch&) = delete;
-
-    private:
-        ScheduleFollower* f_;
-    };
-
 private:
-    void watch(folder::Tree* tree, std::mutex* m) {
-        std::lock_guard lock(m_);
-        tree_ = tree;
-        tree_mutex_ = m;
-    }
-
     void run(const std::stop_token& stop) {
         std::mutex sleep_m;
         std::condition_variable_any sleep;
@@ -247,13 +223,6 @@ private:
             if (limit == current_) continue;
             current_ = limit;
             limiter_.set_rate(limit ? schedule::bytes_per_s(*limit) : 0);
-            {
-                std::lock_guard lock(m_);
-                if (tree_ != nullptr) {
-                    std::lock_guard tree_lock(*tree_mutex_);
-                    if (tree_->batch_running) tree_->batch_stop.request_stop();
-                }
-            }
             const auto next = schedule::next_change(rules_, now.minute);
             const std::string until = next ? " until " + schedule::when_text(now.minute, next->minutes) : "";
             line_.message(limit ? std::format("grab: speed schedule: limited to {}{}", schedule::speed_text(*limit), until)
@@ -265,9 +234,6 @@ private:
     rate::RateLimiter& limiter_;
     LiveLine& line_;
     std::optional<double> current_; // the follower thread's
-    std::mutex m_;                  // guards tree_ and tree_mutex_
-    folder::Tree* tree_ = nullptr;
-    std::mutex* tree_mutex_ = nullptr;
     std::jthread thread_; // last: stops and joins first
 };
 
@@ -278,12 +244,9 @@ struct Session {
     LiveLine& line;
     fetch::Connections& connections;
     rate::RateLimiter& limiter;
-    std::vector<std::string> flags; // common_flags' connection flags (fetch::Source::flags)
-    std::vector<std::string> after; // the server's keys and the connection flags of `-- extra`
-    engine::CommandHook trace;      // -v
+    engine::CommandHook trace; // -v
     std::stop_token stop;
-    ScheduleFollower* follower = nullptr; // when the speed schedule applies
-    bool verify = false;                  // check downloads against the server's checksum
+    bool verify = false; // check downloads against the server's checksum
     int files_at_once = 4;                // a folder's files at once: the window's "At once"
     // "A different file is already there" (review G105): the answers given in the question before
     // fetching, for the files listed in it (remote path -> answer); one for all the rest
@@ -291,14 +254,8 @@ struct Session {
     const std::map<std::string, existing::Choice>* answered = nullptr;
     std::optional<existing::Choice>* for_rest = nullptr;
     bool several = false; // more than one pick: the question offers "the same for the rest"
-    // engine = grab: files and folders through grab's own SSH client.
+    // Files and folders through grab's own SSH client, which verifies them too.
     std::shared_ptr<ssh::Pool> pool = nullptr;
-    // engine = rclone: the server in rclone's environment (engine::rclone_env).
-    proc::Environment rclone_env = {};
-    // With `verify`: grab's own connections to the server, which every server verifies through
-    // (`pool` on engine = grab), or why there are none.
-    std::shared_ptr<ssh::Pool> verify_pool = nullptr;
-    std::string no_verify_pool = {};
 };
 
 // The live line while a verification runs: its text, a folder's files so far ("12 of 40"), and
@@ -355,9 +312,7 @@ private:
 verify::Request verify_request(const Session& s, int id) {
     verify::Request r;
     r.ctx = &s.ctx;
-    r.pool = s.verify_pool;
-    r.no_pool = s.no_verify_pool;
-    r.close_idle_after = !s.pool; // engine = rclone: a pool only to verify, closed between files
+    r.pool = s.pool;
     r.connections = &s.connections;
     r.server = s.ctx.settings.name;
     r.id = id;
@@ -388,12 +343,7 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
     if (auto p = fetch::saved_progress(target, path, {}, rclone_remote)) before = p->first;
 
     fetch::Download d;
-    d.source = fetch::Source{.rclone = s.ctx.config.rclone,
-                             .environment = s.rclone_env,
-                             .rclone_remote = s.ctx.settings.rclone_remote,
-                             .path = path,
-                             .flags = s.flags,
-                             .after = s.after};
+    d.source = fetch::Source{.rclone_remote = s.ctx.settings.rclone_remote, .path = path};
     d.server = s.ctx.settings.name;
     d.id = id;
     d.limiter = &s.limiter;
@@ -521,7 +471,6 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
 int fetch_folder(const Session& s, const std::string& path, int id, const std::filesystem::path& local_name) {
     folder::Tree tree;
     std::mutex m;
-    const ScheduleFollower::Watch watch(s.follower, tree, m);
     folder::Job job;
     job.ctx = &s.ctx;
     job.connections = &s.connections;
@@ -531,9 +480,7 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
     job.remote_path = path;
     job.dest = s.dest;
     job.local_name = local_name;
-    job.batch_limit = [&s] { return s.limiter.rate(); }; // one download at a time: all of it
     job.files_at_once = [&s] { return s.files_at_once; }; // the window's "At once"
-    job.extra = s.opts.extra;
     job.on_command = s.trace;
     job.pool = s.pool;
     job.on_event = [&](folder::Event) {
@@ -675,7 +622,6 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
         job.remote_path = path;
         job.dest = s.dest;
         if (target != folder::local_dir(s.dest, path)) job.local_name = target.filename();
-        job.extra = s.opts.extra;
         job.on_command = s.trace;
         job.id = id;
         job.pool = s.pool;
@@ -791,12 +737,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     StopOnCtrlC ctrl_c;
-    // rclone's checks and reads: only the connection flags of the configured ones and of `--`
-    // (rclone_flags.hpp; engine::check_run_flags refuses any other after `--`), the server's keys
-    // between them.
-    Session s{ctx, opts, dest, line, connections, limiter, rclone_flags::connection(ctx.settings.common_flags),
-              engine::key_flags(ctx.settings), {}, ctrl_c.token()};
-    if (follower) s.follower = &*follower;
+    Session s{ctx, opts, dest, line, connections, limiter, {}, ctrl_c.token()};
     s.verify = verify;
     s.files_at_once = std::clamp(gui.parallel, min_parallel, max_parallel);
     std::map<std::string, existing::Choice> answered;
@@ -804,48 +745,23 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     s.answered = &answered;
     s.for_rest = &for_rest;
     s.several = paths.size() > 1;
-    const auto given = rclone_flags::connection(opts.extra);
-    s.after.insert(s.after.end(), given.begin(), given.end());
     if (opts.verbose) {
         s.trace = [&line](const std::vector<std::string>& argv) { line.message("+ " + quote::display_cmdline(argv)); };
         std::println(stderr, "grab: up to {} connections to {}", budget, server);
     }
 
     DownloadTally tally;
-    if (ctx.engine == Engine::grab) {
-        // The connection flags after `--` apply to grab's own connections too, as they did to
-        // rclone's (`--bind`, `--contimeout`, `--timeout`).
-        auto target = engine::ssh_target(ctx, given);
-        if (!target) {
-            std::println(stderr, "grab: {}", target.error());
-            tally.code = exit_download_failed;
-            tally.failed = paths;
-            return tally;
-        }
-        s.pool = pools.get(server, *target, budget);
-        if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client", server);
-    } else if (auto env = engine::rclone_env(ctx); env) {
-        s.rclone_env = std::move(*env);
-        // engine = rclone in its section, GRAB_ENGINE=rclone, or settings grab's client can't
-        // serve (the guard, whose note -v repeats).
-        if (opts.verbose) std::println(stderr, "grab: {} through rclone (the fallback)", server);
-    } else {
-        std::println(stderr, "grab: {}", env.error());
+    // The connection flags after `--` apply to grab's connections (`--bind`, `--contimeout`,
+    // `--timeout`).
+    auto target = engine::ssh_target(ctx, rclone_flags::connection(opts.extra));
+    if (!target) {
+        std::println(stderr, "grab: {}", target.error());
         tally.code = exit_download_failed;
         tally.failed = paths;
         return tally;
     }
-    // Every server verifies through grab's own client (RCLONE-REPLACEMENT.md, phase 5); on engine =
-    // rclone it logs in only to verify. Without a login the downloads go on, "not verified".
-    if (verify && !opts.dry_run) {
-        if (s.pool) {
-            s.verify_pool = s.pool;
-        } else if (auto target = engine::ssh_target(ctx, given)) {
-            s.verify_pool = pools.get(server, *target, budget);
-        } else {
-            s.no_verify_pool = target.error();
-        }
-    }
+    s.pool = pools.get(server, *target, budget);
+    if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client", server);
     const std::size_t total = paths.size();
     const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
     // A picked file's size and time (nanoseconds), when the pick list had them.

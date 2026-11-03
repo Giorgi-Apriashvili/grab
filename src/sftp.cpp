@@ -141,23 +141,18 @@ bool Attrs::is_link() const { return permissions && (*permissions & 0170000) == 
 Client::Client(Channel& channel) : channel_(channel), in_(std::size_t{256} * 1024) {}
 
 void Client::start() {
-    try {
-        put_u32(out_, 5);
-        put_u8(out_, fxp_init);
-        put_u32(out_, 3);
-        flush();
-        read_packet();
-        if (static_cast<std::uint8_t>(packet_[0]) != fxp_version) throw ProtocolError("the server didn't start SFTP");
-        Fields f(std::string_view(packet_).substr(1));
-        version_ = f.u32();
-        if (version_ < 3) throw ProtocolError(std::format("the server speaks SFTP version {}; grab needs 3", version_));
-        while (!f.empty()) {
-            extensions_.emplace_back(f.str());
-            f.str(); // its data
-        }
-    } catch (const ProtocolError& e) {
-        if (fallback_.empty()) throw;
-        throw ProtocolError(e.what() + fallback_);
+    put_u32(out_, 5);
+    put_u8(out_, fxp_init);
+    put_u32(out_, 3);
+    flush();
+    read_packet();
+    if (static_cast<std::uint8_t>(packet_[0]) != fxp_version) throw ProtocolError("the server didn't start SFTP");
+    Fields f(std::string_view(packet_).substr(1));
+    version_ = f.u32();
+    if (version_ < 3) throw ProtocolError(std::format("the server speaks SFTP version {}; grab needs 3", version_));
+    while (!f.empty()) {
+        extensions_.emplace_back(f.str());
+        f.str(); // its data
     }
 }
 
@@ -182,25 +177,20 @@ void Client::flush() {
 
 void Client::pump() {
     if (pending_.empty()) throw Broken("waiting for an SFTP reply with no request pending");
-    try {
-        flush();
-        read_packet();
-        auto type = static_cast<std::uint8_t>(packet_[0]);
-        if (type != fxp_status && type != fxp_handle && type != fxp_data && type != fxp_name && type != fxp_attrs &&
-            type != fxp_extended_reply)
-            unexpected_reply(type);
-        Fields f(std::string_view(packet_).substr(1));
-        std::uint32_t id = f.u32();
-        auto it = pending_.find(id);
-        if (it == pending_.end()) throw ProtocolError("the server answered a request grab didn't send");
-        Handler handler = std::move(it->second);
-        pending_.erase(it);
-        // Its parsing throws ProtocolError too (a malformed reply).
-        handler(Reply{type, std::string_view(packet_).substr(5)});
-    } catch (const ProtocolError& e) {
-        if (fallback_.empty()) throw;
-        throw ProtocolError(e.what() + fallback_);
-    }
+    flush();
+    read_packet();
+    auto type = static_cast<std::uint8_t>(packet_[0]);
+    if (type != fxp_status && type != fxp_handle && type != fxp_data && type != fxp_name && type != fxp_attrs &&
+        type != fxp_extended_reply)
+        unexpected_reply(type);
+    Fields f(std::string_view(packet_).substr(1));
+    std::uint32_t id = f.u32();
+    auto it = pending_.find(id);
+    if (it == pending_.end()) throw ProtocolError("the server answered a request grab didn't send");
+    Handler handler = std::move(it->second);
+    pending_.erase(it);
+    // Its parsing throws ProtocolError too (a malformed reply).
+    handler(Reply{type, std::string_view(packet_).substr(5)});
 }
 
 void Client::read_packet() {

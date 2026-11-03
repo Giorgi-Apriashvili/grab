@@ -218,9 +218,7 @@ std::expected<engine::Context, std::string> read_context(const std::string& name
         *connection = found->connection;
         planned_store = std::move(plan->store);
     }
-    auto ctx = engine::make_context(std::move(*cfg), settings, std::move(**connection), conf);
-    ctx.engine = Engine::grab;
-    return ctx;
+    return engine::make_context(std::move(*cfg), settings, std::move(**connection), conf);
 }
 
 // grab's target for the server read_context read: engine::ssh_target's, or with the store the

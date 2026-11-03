@@ -13,20 +13,21 @@
 
 namespace grab {
 
-// How TARGET is located on the server (`find = auto | ssh | walk`; `rclone`, the name grab 0.19
-// and before know, the same as walk), as engine = rclone reads it (GrabMethod on grab's client).
+// How TARGET is located on the server: grab.conf's `find = auto | ssh | walk` (`rclone`, the name
+// grab 0.19 and before know, the same as walk), which GrabMethod resolves.
 enum class FindMethod {
-    auto_detect, // ssh when the rclone remote has a key_file, otherwise rclone
-    ssh,         // ssh + find: one round trip, needs a shell and a key or password prompt
-    rclone       // rclone lsf: SFTP walk, no shell and no prompt needed
+    auto_detect, // auto: find where grab's check finds GNU find on the server, else the walk
+    ssh,         // find only
+    rclone       // walk (or rclone): grab's SFTP walk, no shell needed
 };
 
-// What moves a server's files: grab's own SSH/SFTP client (the default since 0.20), or rclone
-// (`engine = rclone`), the fallback until a later grab removes it (RCLONE-REPLACEMENT.md, phase 8).
+// grab.conf's `engine = grab | rclone`, which 0.20 read (rclone was its fallback until this grab
+// removed it, RCLONE-REPLACEMENT.md phase 9): read only for the settings' notices now; every
+// server goes through grab's own SSH/SFTP client.
 enum class Engine { rclone, grab };
 
-// How searches and file lists run on engine = grab: GNU find over an SSH command on a pooled
-// connection, or grab's walk of the folders over SFTP.
+// How searches and file lists run: GNU find over an SSH command on a pooled connection, or grab's
+// walk of the folders over SFTP.
 enum class GrabMethod {
     probe, // find = auto: a check (its answer kept a week) picks find where the server has it
     find,  // find = ssh: find only; an error naming the server's answer where it doesn't work
@@ -42,12 +43,11 @@ struct RemoteSettings {
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
     bool skip_hidden = true;
-    std::optional<Engine> engine; // `engine = grab | rclone`; absent: the default (effective_engine)
-    // How every connection to the server is made (grab's own client, Trust's host-key fetch, and
-    // on engine = rclone its rclone runs and ssh.exe; RCLONE-REPLACEMENT.md, phase 8): the local
-    // address to connect from, the time to reach the server (0: off, as long as TCP tries) and
-    // any single wait after that (1 s to 24 h, never off: a stalled read couldn't be cancelled).
-    // nullopt when not set: grab's 30 s, rclone's own times, nothing added to their commands.
+    std::optional<Engine> engine; // `engine = grab | rclone`, for the notices only (effective_engine)
+    // How every connection to the server is made (grab's own client and Trust's host-key fetch;
+    // RCLONE-REPLACEMENT.md, phase 8): the local address to connect from, the time to reach the
+    // server (0: off, as long as TCP tries) and any single wait after that (1 s to 24 h, never off:
+    // a stalled read couldn't be cancelled). nullopt when not set: grab's 30 s.
     std::optional<std::string> bind;
     std::optional<std::chrono::milliseconds> connect_timeout;
     std::optional<std::chrono::milliseconds> io_timeout;
@@ -94,19 +94,14 @@ struct RcloneRemote {
 inline constexpr std::chrono::milliseconds min_io_timeout{1'000};
 inline constexpr std::chrono::milliseconds max_io_timeout{24 * 3'600'000};
 
-// The server's engine: GRAB_ENGINE (grab or rclone) for every server, as tests comparing both do;
-// else its `engine` line; else the default, grab's own client, unless `guarded`: a setting of the
-// server's that grab's client can't serve (guard.hpp: a proxy, an ssh command, a quirk switch)
-// keeps it on rclone by itself (phase 8 step 8). engine::make_context and server_ops::list_servers
-// know the guard; callers without it get the server's engine as grab.conf alone says it.
+// The server's engine as 0.20 resolved it, which the settings' notices (notices.hpp) still go by
+// until they learn the old keys' meaning in this grab: GRAB_ENGINE (grab or rclone) for every
+// server; else its `engine` line; else grab, unless `guarded` (guard.hpp), which kept a server on
+// rclone. Nothing connects by it: every server goes through grab's own client.
 [[nodiscard]] Engine effective_engine(const RemoteSettings& settings, bool guarded = false);
 
-// Resolve auto_detect: ssh when the remote authenticates with a key file (a shell is very
-// likely), otherwise rclone (password remotes and storage boxes usually have no shell).
-[[nodiscard]] FindMethod resolve_find_method(const RemoteSettings& settings,
-                                             const RcloneRemote& remote);
-// The same for engine = grab: auto asks the server (ssh::check_find), except a Storage Box
-// (*.your-storagebox.de), whose restricted shell has no find, so it walks without asking.
+// How searches and lists go: `find` as GrabMethod; auto asks the server (ssh::check_find), except a
+// Storage Box (*.your-storagebox.de), whose restricted shell has no find, so it walks without asking.
 [[nodiscard]] GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemote& remote);
 
 // "." and "~" mean the login home and become ""; "/" stays; other roots lose trailing '/'.
@@ -165,11 +160,6 @@ private:
 // Waits for the lock up to 30 seconds (another grab's change).
 [[nodiscard]] std::expected<SettingsLock, std::string> lock_settings();
 
-// The rclone executable to run. [grab] rclone blank or the bare name "rclone": the bundled
-// rclone.exe in `exe_dir` (the folder of the running grab) when present, else "rclone" from
-// PATH. Anything else is used as given.
-[[nodiscard]] std::string resolve_rclone_exe(const GrabConfig& cfg, const std::filesystem::path& exe_dir);
-
 [[nodiscard]] std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& doc);
 [[nodiscard]] std::expected<GrabConfig, std::string> load_grab_config(const std::filesystem::path& p);
 
@@ -190,18 +180,14 @@ private:
 [[nodiscard]] std::vector<RcloneRemote> missing_remotes(const GrabConfig& cfg,
                                                         const ini::Document& rclone);
 
-// How a server's searches and file lists go, as lists and texts name it. engine = rclone, as
-// resolve_find_method says: "ssh" (ssh + find) or "rclone" (rclone lsf). engine = grab, as
-// resolve_grab_method says: "find" (find only), "walk" (by listing folders) or "probe" (find where
-// grab's check finds GNU find, else by listing folders).
-[[nodiscard]] std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote,
-                                             Engine engine);
+// How a server's searches and file lists go, as lists and texts name it, as resolve_grab_method
+// says: "find" (find only), "walk" (by listing folders) or "probe" (find where grab's check finds
+// GNU find, else by listing folders).
+[[nodiscard]] std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote);
 
-// "alice@host:22, key file, lookup with find, else by listing folders": `method` is the lookup
-// as search_method says it for the engine the caller resolved, the guard's included (a route
-// rclone takes is "rclone"; server_ops::list_servers has it); without one, grab's own client's on
-// a server nothing guards with the default find setting. `login`, when given, says how it logs in
-// ("key in grab's store") instead of what `remote` says.
+// "alice@host:22, key file, lookup with find, else by listing folders": `method` is the lookup as
+// search_method says it; without one, the default find setting's. `login`, when given, says how it
+// logs in ("key in grab's store") instead of what `remote` says.
 [[nodiscard]] std::string describe_remote(const RcloneRemote& remote, std::string_view method = {},
                                           std::string_view login = {});
 

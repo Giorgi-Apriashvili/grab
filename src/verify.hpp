@@ -55,9 +55,6 @@ struct Request {
     // its login can't be made, `no_pool` saying why (engine::ssh_target).
     std::shared_ptr<ssh::Pool> pool;
     std::string no_pool;
-    // The pool is only for verifying (engine = rclone): its idle connections close when the check
-    // ends, as rclone check's did, so rclone's downloads in the freed seats stay under the cap.
-    bool close_idle_after = false;
     std::string remote_dir; // the server folder the files' paths are relative to; "": as they are
     std::vector<File> files;
     // The seats the check takes from the server's budget: one for a file, up to the download's

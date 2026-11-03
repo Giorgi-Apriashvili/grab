@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <format>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #ifdef _WIN32
@@ -146,17 +145,6 @@ std::string name(std::string_view remote_name) {
     return out;
 }
 
-bool differs_from_rclone(std::string_view remote_rel) {
-    while (!remote_rel.empty()) {
-        const auto slash = remote_rel.find('/');
-        const auto part = remote_rel.substr(0, slash);
-        if (!part.empty() && name(part) != rclone_enc::from_standard_name(part)) return true;
-        if (slash == std::string_view::npos) break;
-        remote_rel.remove_prefix(slash + 1);
-    }
-    return false;
-}
-
 std::string bidi_visible(std::string_view text) {
     std::string out;
     out.reserve(text.size());
@@ -183,55 +171,6 @@ std::filesystem::path::string_type key(const std::filesystem::path& p) {
     }
 #endif
     return s;
-}
-
-std::filesystem::path::string_type fold(const std::filesystem::path& p) {
-    auto k = key(p);
-#ifdef _WIN32
-    if (k.empty()) return k;
-    const int estimate = NormalizeString(NormalizationC, k.data(), static_cast<int>(k.size()), nullptr, 0);
-    if (estimate > 0) {
-        std::wstring out(static_cast<std::size_t>(estimate), L'\0');
-        const int n = NormalizeString(NormalizationC, k.data(), static_cast<int>(k.size()), out.data(), estimate);
-        if (n > 0) {
-            out.resize(static_cast<std::size_t>(n));
-            return out;
-        }
-    }
-#endif
-    return k;
-}
-
-std::unordered_set<std::string> clashing(std::span<const std::string> remote_rels) {
-    // Each spelling of every folder and file on the way, by how rclone matches it.
-    std::unordered_map<std::filesystem::path::string_type, std::unordered_set<std::filesystem::path::string_type>> spellings;
-    std::vector<std::filesystem::path> locals;
-    locals.reserve(remote_rels.size());
-    for (const auto& r : remote_rels) {
-        locals.push_back(relative(r));
-        std::filesystem::path prefix;
-        for (const auto& part : locals.back()) {
-            prefix /= part;
-            spellings[fold(prefix)].insert(prefix.native());
-        }
-    }
-    std::unordered_set<std::filesystem::path::string_type> spelled_twice;
-    for (const auto& [folded, spelled] : spellings) {
-        if (spelled.size() > 1) spelled_twice.insert(spelled.begin(), spelled.end());
-    }
-    std::unordered_set<std::string> out;
-    if (spelled_twice.empty()) return out;
-    for (std::size_t i = 0; i < remote_rels.size(); ++i) {
-        std::filesystem::path prefix;
-        for (const auto& part : locals[i]) {
-            prefix /= part;
-            if (spelled_twice.contains(prefix.native())) {
-                out.insert(remote_rels[i]);
-                break;
-            }
-        }
-    }
-    return out;
 }
 
 std::filesystem::path relative(std::string_view remote_rel) {

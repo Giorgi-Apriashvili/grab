@@ -116,8 +116,7 @@ struct Dir {
 
 fetch::Download download(const fs::path& target, std::shared_ptr<ssh::Pool> pool, const std::string& path = "/data/f.bin") {
     fetch::Download d;
-    d.source =
-        fetch::Source{.rclone = "rclone-is-not-run", .environment = {}, .rclone_remote = "Fake", .path = path, .flags = {}, .after = {}};
+    d.source = fetch::Source{.rclone_remote = "Fake", .path = path};
     d.server = "Fake";
     d.id = 1;
     d.target = target;
@@ -335,6 +334,43 @@ TEST_CASE("grab engine: a file changed on the server since the partial download 
     REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
     CHECK(r.note.find("started over") != std::string::npos);
     CHECK(util::read_file(target) == content); // none of the old partial's bytes
+}
+
+TEST_CASE("grab engine: a file that already is the server's wins over a partial download of it (G75)") {
+    Fake fake;
+    const std::string content = test::pattern(2u << 20);
+    fake.files["/data/f.bin"] = content;
+    Dir dir("present");
+    const fs::path target = dir.path / "f.bin";
+    auto state = fetch::new_state("Fake", "/data/f.bin", content.size(), "2023-11-14T22:13:20Z", 1u << 20);
+    state.ranges[0].done = 1u << 20;
+    const auto files = fetch::partial_files(target, 1);
+    REQUIRE(util::write_file_atomic(files.part, std::string(content.size(), 'z')));
+    REQUIRE(util::write_file_atomic(files.record, fetch::state_to_json(state)));
+    // The same size, written now: newer than the server's copy (2023-11-14).
+    const std::string mine(content.size(), 'y');
+    REQUIRE(util::write_file_atomic(target, mine));
+    auto pool = fake.pool(2);
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+    const auto r = fetch::run(download(target, pool), connections, {}, {});
+    CHECK(r.outcome == fetch::Outcome::done);
+    CHECK(r.present);
+    CHECK_FALSE(fs::exists(files.record)); // given up
+    CHECK_FALSE(fs::exists(files.part));
+    CHECK(util::read_file(target) == mine); // kept, nothing fetched
+    pool.reset();
+    CHECK(fake.asked() == 0);
+}
+
+TEST_CASE("grab engine: a download without a connection pool fails, nothing touched") {
+    Dir dir("no-pool");
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+    const auto r = fetch::run(download(dir.path / "f.bin", nullptr), connections, {}, {});
+    CHECK(r.outcome == fetch::Outcome::failed);
+    CHECK(r.error.find("no connection") != std::string::npos);
+    CHECK_FALSE(fs::exists(fetch::partial_files(dir.path / "f.bin", 1).record));
 }
 
 TEST_CASE("grab engine: the speed limit is taken before each request, in small ones") {

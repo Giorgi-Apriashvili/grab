@@ -25,7 +25,6 @@ engine::Context box_context() {
     ctx.remote.host = "u1.your-storagebox.de";
     ctx.remote.user = "u1";
     ctx.remote.port = 23;
-    ctx.method = FindMethod::rclone;
     return ctx;
 }
 
@@ -150,32 +149,15 @@ TEST_CASE("a list is fresh for 15 minutes") {
     CHECK_FALSE(file_list::fresh(0, t));
 }
 
-TEST_CASE("listing commands and their output") {
-    CHECK(file_list::find_command({"", "learning"}, 4, true) ==
-          "find -L . 'learning' -mindepth 1 -maxdepth 4 \\( -name '.*' -prune \\) -o "
-          "\\( -type d -printf 'd\\t%T@\\t%p\\0' -o -type f -printf 'f\\t%s\\t%T@\\t%p\\0' \\) 2>/dev/null");
-    CHECK(file_list::find_command({"/srv"}, 2, false).find("-prune") == std::string::npos);
-
-    using namespace std::string_literals;
-    const auto found = file_list::parse_find("d\t1697354553.1234567000\t./movies\0"
-                                             "f\t12\t1697354554.0000000000\t./movies/a b.mkv\0"
-                                             "f\t7\t0.0000000000\tlearning/x\0"
-                                             "d\tnot-a-time\tlearning/tab\there\0"
-                                             "d\t./no-time-field\0junk\0"s);
-    CHECK(found == std::vector<Entry>{{"movies", true, std::nullopt, 1697354553},
-                                      {"movies/a b.mkv", false, 12, 1697354554},
-                                      {"learning/x", false, 7, std::nullopt},
-                                      {"learning/tab\there", true, std::nullopt, std::nullopt}});
-
-    const auto listed = file_list::parse_lsf("1697354553,-1,movies/\r\n1697354554,941563904,movies/a;b.avi\n"
-                                             "-62135596800,-1,tv/\nmissing-fields\n5,x,y\n",
-                                             "/home");
-    CHECK(listed == std::vector<Entry>{{"/home/movies", true, std::nullopt, 1697354553},
-                                       {"/home/movies/a;b.avi", false, 941563904, 1697354554},
-                                       {"/home/tv", true, std::nullopt, std::nullopt}});
-    CHECK(file_list::parse_lsf("5,3,x\n", "")[0] == Entry{"x", false, 3, 5});
-    // An rclone without --time-format's "unix" prints its name: the entry stays, undated.
-    CHECK(file_list::parse_lsf("unix,3,x\n", "") == std::vector<Entry>{{"x", false, 3, std::nullopt}});
+TEST_CASE("a record of grab's find: a folder or a file, its size and time, the path less ./") {
+    CHECK(file_list::parse_find_record("d\t1697354553.1234567000\t./movies") == Entry{"movies", true, std::nullopt, 1697354553});
+    CHECK(file_list::parse_find_record("f\t12\t1697354554.0000000000\t./movies/a b.mkv") ==
+          Entry{"movies/a b.mkv", false, 12, 1697354554});
+    CHECK(file_list::parse_find_record("f\t7\t0.0000000000\tlearning/x") == Entry{"learning/x", false, 7, std::nullopt});
+    CHECK(file_list::parse_find_record("d\tnot-a-time\tlearning/tab\there") ==
+          Entry{"learning/tab\there", true, std::nullopt, std::nullopt});
+    CHECK_FALSE(file_list::parse_find_record("d\t./no-time-field"));
+    CHECK_FALSE(file_list::parse_find_record("junk"));
 }
 
 TEST_CASE("searching a list matches and ranks like a live search") {
@@ -243,13 +225,15 @@ TEST_CASE("a list's fingerprint follows what it covers") {
     changed = ctx;
     changed.grab_method = GrabMethod::walk;
     CHECK(file_list::fingerprint(changed) != fp);
-    // A list rclone fetched isn't grab's (the default since phase 8): fetched again once (N0).
-    changed = ctx;
-    changed.engine = Engine::rclone;
-    const auto by_rclone = file_list::fingerprint(changed);
-    CHECK(by_rclone != fp);
-    changed.method = FindMethod::ssh;
-    CHECK(file_list::fingerprint(changed) != by_rclone);
+    // The text as 0.20 wrote it for its own client, byte for byte, so the lists it saved stay
+    // valid (phase 9 step 5); one 0.20's rclone fallback saved ("ssh", "rclone") is fetched again.
+    CHECK(fp == "1|Box|grab+probe|u1@u1.your-storagebox.de:23|depth=4|hidden=skip|roots=");
+    CHECK(file_list::fingerprint(changed) == "1|Box|grab+walk|u1@u1.your-storagebox.de:23|depth=4|hidden=skip|roots=");
+    changed.grab_method = GrabMethod::find;
+    changed.settings.search_roots = {"", "learning"};
+    changed.settings.skip_hidden = false;
+    CHECK(file_list::fingerprint(changed) ==
+          "1|Box|grab+find|u1@u1.your-storagebox.de:23|depth=4|hidden=keep|roots=\x1flearning");
 }
 
 TEST_CASE("hits of several servers rank together") {

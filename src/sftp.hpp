@@ -20,7 +20,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace grab::sftp {
@@ -42,7 +41,7 @@ struct Unavailable : Broken {
     using Broken::Broken;
 };
 // The server broke the protocol (a malformed or unexpected reply, a version below 3), which a
-// dropped link doesn't: its text ends with the Client's fallback (Client::set_fallback).
+// dropped link doesn't.
 struct ProtocolError : Broken {
     using Broken::Broken;
 };
@@ -103,9 +102,6 @@ public:
 
     // INIT and the server's VERSION. Throws Broken (ProtocolError for a version below 3).
     void start();
-    // Ends the text of each ProtocolError start() and pump() throw: what to do about a server
-    // grab's client can't speak to (ssh::Target::fallback; nothing by default).
-    void set_fallback(std::string text) { fallback_ = std::move(text); }
     [[nodiscard]] std::uint32_t version() const { return version_; }
     [[nodiscard]] bool has_extension(std::string_view name) const;
 
@@ -152,7 +148,6 @@ private:
     std::vector<char> in_;
     std::size_t in_pos_ = 0, in_len_ = 0;
     std::string packet_; // the last packet, reused
-    std::string fallback_;
 };
 
 // Blocking helpers: send one request and pump until its reply (other replies run their callbacks

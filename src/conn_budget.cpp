@@ -25,34 +25,6 @@ std::optional<int> raised(int learned, int default_value) {
     return learned + 1;
 }
 
-Failure classify_failure(std::string_view stderr_text) {
-    const std::string t = util::to_lower(stderr_text);
-    // First, as Go's ssh library wraps them in "handshake failed" too: trying again only repeats
-    // a refused login (an account lock, fail2ban) or a changed host key (review G9).
-    // (Not a bare "host key": rclone's notice "No host key validation is being performed" comes
-    // with every failure of a server without a pinned key.)
-    static constexpr std::string_view fatal_signs[] = {
-        "unable to authenticate", "no supported methods remain", "too many authentication failures",
-        "permission denied",      "knownhosts:",                 "host key mismatch",
-        "host key verification failed", "remote host identification has changed",
-    };
-    // Messages from Go's ssh library and the OS when a server sheds connections: too many
-    // (Storage Box), MaxStartups dropping a login, the handshake cut short, or the port refusing
-    // (Windows: "actively refused").
-    static constexpr std::string_view refused_signs[] = {
-        "too many",          "max_startups",    "maxstartups",           "kex_exchange_identification",
-        "handshake failed: eof", "ssh: disconnect", "connection reset by peer", "forcibly closed",
-        "connection refused", "actively refused",
-    };
-    for (auto sign : fatal_signs) {
-        if (t.find(sign) != std::string::npos) return Failure::fatal;
-    }
-    for (auto sign : refused_signs) {
-        if (t.find(sign) != std::string::npos) return Failure::refused;
-    }
-    return Failure::other;
-}
-
 const ServerPool::User* ServerPool::find(int id) const {
     auto it = std::ranges::find(users_, id, &User::id);
     return it == users_.end() ? nullptr : &*it;

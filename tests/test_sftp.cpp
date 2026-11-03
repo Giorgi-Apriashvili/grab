@@ -207,8 +207,7 @@ TEST_CASE("sftp: a file shorter than listed ends the range with EOF") {
     CHECK(c.pending() == 0); // every reply was taken before giving up
 }
 
-TEST_CASE("sftp: a reply that breaks the protocol ends with the client's fallback; a broken link doesn't (phase 8)") {
-    const std::string fallback = "; to use rclone for Main until a later grab removes it, set engine = rclone in [Main]";
+TEST_CASE("sftp: a reply that breaks the protocol is a protocol error with its own text; a broken link isn't") {
     auto message = [](auto&& call) -> std::string {
         try {
             call();
@@ -220,29 +219,18 @@ TEST_CASE("sftp: a reply that breaks the protocol ends with the client's fallbac
     FakeServer srv;
     srv.files["/f"] = "abc";
     sftp::Client c(srv);
-    c.set_fallback(fallback);
     c.start();
     srv.corrupt = true;
-    CHECK(message([&] { std::ignore = sftp::stat(c, "/f"); }) ==
-          "protocol: the server sent an SFTP packet of 1073741824 bytes" + fallback);
-    // A link that drops, or grab waiting with nothing asked, isn't the server's protocol: rclone
-    // would fare no better, so no fallback is named.
+    CHECK(message([&] { std::ignore = sftp::stat(c, "/f"); }) == "protocol: the server sent an SFTP packet of 1073741824 bytes");
+    // A link that drops, or grab waiting with nothing asked, isn't the server's protocol.
     FakeServer gone;
     sftp::Client d(gone);
-    d.set_fallback(fallback);
     d.start();
     CHECK(message([&] { d.pump(); }) == "link: waiting for an SFTP reply with no request pending");
     gone.dropped = true;
     const auto dropped = message([&] { std::ignore = sftp::stat(d, "/f"); });
     CHECK(dropped.starts_with("link: "));
     CHECK(dropped.find("engine = rclone") == std::string::npos);
-    // Without a fallback (engine = rclone servers, tests) the text is the server's alone.
-    FakeServer plain;
-    plain.files["/f"] = "abc";
-    sftp::Client e(plain);
-    e.start();
-    plain.corrupt = true;
-    CHECK(message([&] { std::ignore = sftp::stat(e, "/f"); }) == "protocol: the server sent an SFTP packet of 1073741824 bytes");
 }
 
 TEST_CASE("sftp: a broken stream throws instead of being trusted") {

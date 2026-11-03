@@ -122,7 +122,7 @@ TEST_CASE("a folder's conflicts: skipped, kept beside, or replaced") {
     folder::mark_existing(job, t, m);
     folder::apply(Choice::keep_both, found, dir, t);
     CHECK(t.files[1].local == fs::path("e02 (3).mkv"));
-    CHECK(t.files[1].big); // grab writes it under that name
+    CHECK_FALSE(t.files[1].big); // a small file is written under that name all the same
     CHECK(folder::target_of(dir, t.files[1]) == dir / "e02 (3).mkv");
     CHECK(t.files[2].local == fs::path("sub") / "e03 (2).mkv");
     CHECK(t.files[3].local.empty());

@@ -81,8 +81,8 @@ using HashResult = std::expected<std::string, HashFailed>;
 // rclone finds out an SFTP server's shell and its MD5 and SHA-1 commands on its first run and
 // saves them in rclone.conf; with a server given in its environment it can't save them, and asks
 // on every run (0.1 s and 0.6 s on Main; RCLONE-REPLACEMENT.md, phase 7 chunk A). grab asks them
-// the same way over its own client when a server is tested (and so added), keeps them in
-// grab.conf, and gives them to rclone (engine::rclone_env).
+// the same way over its own client when a server is tested (and so added) and keeps them in
+// grab.conf, where verification reads them (hash_blocked).
 
 struct ServerCommands {
     std::optional<std::string> shell_type; // "unix", "cmd", "powershell", "none"

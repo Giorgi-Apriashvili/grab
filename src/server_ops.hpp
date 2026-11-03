@@ -27,7 +27,6 @@ struct Env {
     std::filesystem::path grab_conf;
     std::filesystem::path known_hosts; // grab's
     std::filesystem::path passwords;   // grab's store of this configuration (passwords::path_in)
-    std::string rclone;    // the rclone executable to run
     GrabConfig cfg;
     std::string grab_text; // grab.conf as it is on disk (or a fresh [grab] block)
     std::vector<std::string> imported;     // servers this load moved from rclone.conf into grab.conf
@@ -35,13 +34,8 @@ struct Env {
 };
 
 // Reads grab.conf (a missing file is an empty config), after the one-time move of servers from
-// rclone.conf into it (rclone_import::apply). `exe_dir` is where a bundled rclone.exe would be.
-[[nodiscard]] std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf,
-                                                       const std::filesystem::path& exe_dir);
-
-// rclone's first stderr line without its log prefix: "2026/09/24 00:38:10 CRITICAL: Failed to
-// create file system ..." -> "Failed to create file system ...".
-[[nodiscard]] std::string clean_rclone_error(std::string_view err);
+// rclone.conf into it (rclone_import::apply).
+[[nodiscard]] std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf);
 
 // ---- servers as shown in lists --------------------------------------------------------------
 
@@ -60,8 +54,7 @@ struct ServerInfo {
     int port = 22;
     servers::Auth auth = servers::Auth::password;
     std::string key_file;
-    Engine engine = Engine::grab;   // effective_engine() with the guard: what downloads and searches it
-    std::string search;             // search_method(): "ssh", "rclone"; on grab "find", "walk", "probe"
+    std::string search;             // search_method(): "find", "walk", "probe"
     bool host_key_pinned = false;   // grab's known_hosts has a key for [host]:port, read now (G209)
     // Whether grab's store has the secret this login uses, saved for this very user@host:port
     // (passwords::value_for): the password (auth = password), the key's passphrase (key, where
@@ -69,8 +62,8 @@ struct ServerInfo {
     // can't be read (store_error says why, for any login: the guard then counts it as routed).
     std::optional<bool> secret_saved;
     std::string store_error;
-    // What keeps grab's own client off it (guard.hpp; its rclone extras read from grab's store for
-    // this very login): the reasons Trust asks about first when one is a route, and the list shows.
+    // What keeps grab off it (guard.hpp; its rclone extras read from grab's store for this very
+    // login): such a server is refused everywhere, Trust included, and the list says why.
     std::vector<guard::Reason> guard;
     // The connection keys its section sets, as grab.conf has them (no window field sets them):
     // "bind 10.0.0.2, connect_timeout 10s, io_timeout 1m"; empty when none is.
@@ -80,7 +73,7 @@ struct ServerInfo {
 [[nodiscard]] bool is_default_server(const GrabConfig& cfg, std::string_view name);
 [[nodiscard]] std::vector<ServerInfo> list_servers(const Env& env);
 // grab's comment above each section with connection details (lead_in) says the lookup as
-// list_servers resolves it, the guard's included; grab.conf is written only when one changes.
+// list_servers resolves it; grab.conf is written only when one changes.
 // `grab --init` writes them before the import fills in the details and grab's store.
 [[nodiscard]] std::expected<void, std::string> describe_servers(const Env& env);
 [[nodiscard]] const RemoteSettings* find_server(const GrabConfig& cfg, std::string_view name);
@@ -93,19 +86,25 @@ struct HostKeys {
 };
 
 // The server's host keys and their fingerprints, read by grab's own client (ssh::scan_host_keys:
-// handshakes with no login, nothing written) for every server, whichever engine it uses: no
-// ssh-keyscan, ssh.exe or ssh-keygen. 10 s for each handshake; `reach`: the server's bind and
-// connect_timeout (reach_for), when it has a section already.
+// handshakes with no login, nothing written): no ssh-keyscan, ssh.exe or ssh-keygen. 10 s for each
+// handshake; `reach`: the server's bind and connect_timeout (reach_for).
 [[nodiscard]] std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port,
                                                                   std::stop_token stop = {}, const ssh::Reach& reach = {});
-// How server `name`'s host-key fetch connects: its bind and connect_timeout as every connection
-// takes them (engine::connect_settings); none for a server grab.conf doesn't have yet.
-[[nodiscard]] std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name);
-// What Trust and a host-key fetch say before they connect to a server whose settings route its
-// connections (a proxy, an ssh command, a ProxyCommand): "Box connects through a SOCKS proxy
-// (rclone.socks_proxy): fetching its host key connects to host:port directly from this PC, past
-// that". Empty for any other server.
-[[nodiscard]] std::string direct_warning(const ServerInfo& s, const std::string& host, int port);
+// How server `name`'s host-key fetch (Trust, Add, Edit) connects: its bind and connect_timeout as
+// every connection takes them (engine::connect_settings); none for a server grab.conf doesn't have
+// yet. Refused, before anything connects, for a server the guard keeps grab off (guard::text says
+// why and how to clear it; phase 9 step 6): a key pinned for a server grab won't use gains
+// nothing, and the fetch would connect past its route. A new server has only the environment's
+// guard settings (an inherited RCLONE_SFTP_SOCKS_PROXY covers every server).
+//
+// `Purpose::edit`: the fetch of an Edit, checked against what the save leaves: the section's
+// rclone.* lines even when its details can't be read, and every rclone extra the store keeps for
+// the server whatever login it is bound to (update_server binds them all to the new login). A store
+// that can't be read doesn't count there: the save sets it aside, the way out the guard's text
+// gives.
+enum class Purpose { trust, edit };
+[[nodiscard]] std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name,
+                                                               Purpose purpose = Purpose::trust);
 
 // Pins `lines` for host:port in known_hosts, in place of every key it held for host:port before
 // (servers::forget_host; review G87). Each line has to be one for host:port. Under the settings
@@ -188,24 +187,15 @@ struct Problem {
 [[nodiscard]] std::expected<void, std::string> set_default(const Env& env, std::string_view name);
 
 struct TestResult {
-    // rclone's listing, only on engine = rclone servers (their downloads, searches and lists go
-    // through rclone); engine = grab ones use rclone for nothing a test can show.
-    std::optional<bool> rclone_ok;
-    std::string rclone_error;
-    std::optional<bool> ssh_ok; // only for engine = rclone servers searched with ssh + find
-    std::string ssh_error;
-    // grab's own client: on engine = grab for downloads, searches, previews, Play and verification,
-    // on the others for previews, Play and verification, which every server runs through it.
+    // grab's own client, which downloads, searches, lists, previews, plays and verifies: its login
+    // and home folder listed (grab_ok), or why not (grab_error).
     std::optional<bool> grab_ok;
     std::string grab_error;
-    bool grab_engine = false; // engine = grab
-    std::string grab_search;  // engine = grab, grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
-    std::string checksums;    // grab_ok: "checksums: md5sum", or why verification can't run there
-    // grab's own login counts on engine = grab only: on engine = rclone the downloads go through
-    // rclone, so a failure there is a warning (no previews, Play or verification), not a failed test.
-    [[nodiscard]] bool ok() const {
-        return rclone_ok.value_or(true) && ssh_ok.value_or(true) && (!grab_engine || grab_ok.value_or(false));
-    }
+    // Why grab doesn't connect to the server at all (guard::text): nothing was tried.
+    std::string unusable;
+    std::string grab_search; // grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
+    std::string checksums;   // grab_ok: "checksums: md5sum", or why verification can't run there
+    [[nodiscard]] bool ok() const { return grab_ok.value_or(false); }
 };
 
 // ---- texts the command and the window show -----------------------------------------------
@@ -226,23 +216,19 @@ struct TestResult {
 [[nodiscard]] std::string import_banner(const std::vector<std::string>& names, const std::vector<ServerInfo>& servers,
                                         const std::vector<std::string>& notes);
 
-// The paths searches, downloads, previews, Play and verification use. An unpinned server
-// (engine::check_pinned) fails each part at once, nothing dialled. On engine = rclone an rclone
-// listing (`--config NUL`, the server in its environment), plus an ssh login (BatchMode) for
-// servers searched with ssh + find. On every server a login through grab's own client and its
-// home folder listed over SFTP, what rclone would ask the server (ssh::learn_commands: shell_type
-// and the sum commands, saved in grab.conf when grab.conf doesn't have them yet), and its hash
-// check, which says whether downloads can be verified there (ssh_hash.hpp); on engine = grab also
-// the find check, which says how its searches go.
+// The path searches, downloads, previews, Play and verification use: a login through grab's own
+// client and its home folder listed over SFTP, what the server's shell and sum commands are
+// (ssh::learn_commands, saved in grab.conf when grab.conf doesn't have them yet), the find check,
+// which says how its searches go, and the hash check, which says whether downloads can be verified
+// there (ssh_hash.hpp). A server the guard keeps grab off (`unusable`, guard::text) or an unpinned
+// one (engine::check_pinned) fails at once, nothing dialled.
 [[nodiscard]] std::expected<TestResult, std::string> test_connection(const Env& env, std::string_view name,
                                                                      std::stop_token stop = {});
 
-// A test's result as `grab server add | edit | test` print it, one line per part:
-//   rclone (downloads): OK                        engine = rclone
-//   grab (previews, Play, verify): OK, home folder listed, checksums: md5sum
-//   ssh (searches):     FAILED: ...               engine = rclone with ssh + find
-// grab's part names what it does there (downloads and searches too on engine = grab) and says
-// "can't run" where it is only a warning. `ssh_hint` follows a failed ssh login.
-[[nodiscard]] std::vector<std::string> test_lines(const TestResult& t, std::string_view ssh_hint = {});
+// A test's result as `grab server add | edit | test` print it, one line:
+//   grab: OK, home folder listed, searches with find (GNU find), checksums: md5sum
+//   grab: FAILED: <why>
+//   not usable: [Box] connects through a SOCKS proxy (rclone.socks_proxy), which grab can't, ...
+[[nodiscard]] std::vector<std::string> test_lines(const TestResult& t);
 
 } // namespace grab::server_ops

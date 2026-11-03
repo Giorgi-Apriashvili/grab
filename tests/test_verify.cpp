@@ -301,15 +301,11 @@ TEST_CASE("verify: a copy isn't read to the end once its server side failed") {
     CHECK(fs::exists(big));
 }
 
-TEST_CASE("verify: a pool made only to verify closes its idle connections at the end") {
-    for (const bool close : {false, true}) {
-        CAPTURE(close);
-        Check c(close ? "close-idle" : "keep-idle");
-        auto r = c.request({c.file("a.mkv", "aaa")});
-        r.close_idle_after = close;
-        CHECK(verify::run(r, {}).files == std::vector<verify::Result>{{Verdict::same, ""}});
-        CHECK((c.pool->open() == 0) == close);
-    }
+TEST_CASE("verify: the pool's connections stay open for the downloads and searches that share it") {
+    Check c("keep-idle");
+    auto r = c.request({c.file("a.mkv", "aaa")});
+    CHECK(verify::run(r, {}).files == std::vector<verify::Result>{{Verdict::same, ""}});
+    CHECK(c.pool->open() > 0);
 }
 
 TEST_CASE("verify: a stop keeps the copies, unchecked") {

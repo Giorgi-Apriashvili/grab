@@ -1,8 +1,9 @@
 #pragma once
 
-// Building blocks for `grab server add | list | trust | remove` (and the GUI's settings):
-// rclone's probe command line, host-key handling, and in-place edits of grab.conf text. Pure
-// functions; the dialogue lives in server_cli.cpp.
+// Building blocks for `grab server add | list | trust | remove` (and the GUI's settings): host-key
+// handling, and in-place edits of grab.conf text. Pure functions; the dialogue lives in
+// server_cli.cpp. grab writes no rclone.conf (RCLONE-REPLACEMENT.md, phase 7): servers are added,
+// changed and removed in grab.conf and grab's store (G12, G27).
 
 #include "server_conf.hpp"
 
@@ -58,17 +59,6 @@ struct Fingerprint {
 [[nodiscard]] std::string forget_host(std::string_view text, std::string_view host, int port);
 // `existing` known_hosts text plus the lines it does not already contain.
 [[nodiscard]] std::string merge_known_hosts(std::string_view existing, const std::vector<std::string>& lines);
-
-// ---- rclone command lines ----------------------------------------------------------------
-// grab writes no rclone.conf (RCLONE-REPLACEMENT.md, phase 7): servers are added, changed and
-// removed in grab.conf and grab's store, never with `rclone config` or `rclone obscure` (G12, G27).
-
-// A quick connection test: list the login home's folders once, with short timeouts. The server
-// comes in the run's environment (engine::rclone_env), its config in memory. `before` (common_flags'
-// connection flags) goes before the short timeouts, `after` (the server's keys) after them.
-[[nodiscard]] std::vector<std::string> probe_argv(const std::string& rclone, const std::string& name,
-                                                  std::span<const std::string> before = {},
-                                                  std::span<const std::string> after = {});
 
 // ---- grab.conf text edits (everything else, comments included, is kept) -------------------
 

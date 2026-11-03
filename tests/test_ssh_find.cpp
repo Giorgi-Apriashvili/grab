@@ -815,9 +815,10 @@ TEST_CASE("ssh find: run_find's notes, refusals, signals, and its caps drop the 
 }
 
 TEST_CASE("find output for lists: no hit without a name to save it under (G15)") {
-    const auto entries = file_list::parse_find("f\t1\t1\t/\0d\t1\t.\0d\t1\t./..\0f\t2\t1\t./a/b.txt\0"s);
-    REQUIRE(entries.size() == 1);
-    CHECK(entries[0].path == "a/b.txt");
+    CHECK_FALSE(file_list::parse_find_record("f\t1\t1\t/"));
+    CHECK_FALSE(file_list::parse_find_record("d\t1\t."));
+    CHECK_FALSE(file_list::parse_find_record("d\t1\t./.."));
+    CHECK(file_list::parse_find_record("f\t2\t1\t./a/b.txt").value_or(file_list::Entry{}).path == "a/b.txt");
     CHECK_FALSE(file_list::parse_find_record("d\t1\t./"));
     const auto x = file_list::parse_find_record("d\t1\t./x");
     REQUIRE(x);

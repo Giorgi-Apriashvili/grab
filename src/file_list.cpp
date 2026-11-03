@@ -2,10 +2,7 @@
 
 #include "cli.hpp"
 #include "config.hpp"
-#include "listing.hpp"
 #include "match.hpp"
-#include "quote.hpp"
-#include "rclone_flags.hpp"
 #include "remote.hpp"
 #include "ssh_find.hpp"
 #include "ssh_pool.hpp"
@@ -26,14 +23,12 @@ namespace grab::file_list {
 namespace fs = std::filesystem;
 
 std::string fingerprint(const engine::Context& ctx) {
-    // On grab's engine its find setting, not the check's answer, so no check is needed to compare.
-    // Lists made on the other engine differ (links, names in grab's form) and are fetched again.
-    std::string method = ctx.method == FindMethod::ssh ? "ssh" : "rclone";
-    if (ctx.engine == Engine::grab) {
-        method = ctx.grab_method == GrabMethod::find   ? "grab+find"
-                 : ctx.grab_method == GrabMethod::walk ? "grab+walk"
-                                                        : "grab+probe";
-    }
+    // The find setting, not the check's answer, so no check is needed to compare; the text as 0.20
+    // wrote it for its own client, so those lists stay valid. Lists 0.20's rclone fallback made
+    // ("ssh", "rclone") differ (links, names in grab's form) and are fetched again.
+    const std::string_view method = ctx.grab_method == GrabMethod::find   ? "grab+find"
+                                    : ctx.grab_method == GrabMethod::walk ? "grab+walk"
+                                                                           : "grab+probe";
     return std::format("1|{}|{}|{}@{}:{}|depth={}|hidden={}|roots={}", ctx.settings.rclone_remote, method,
                        ctx.remote.user, ctx.remote.host, ctx.remote.port, ctx.settings.max_depth,
                        ctx.settings.skip_hidden ? "skip" : "keep", util::join(engine::search_roots(ctx), "\x1f"));
@@ -87,19 +82,6 @@ void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req)
         return a.h.server < b.h.server;
     });
     for (std::size_t i = 0; i < keyed.size(); ++i) hits[i] = std::move(keyed[i].h);
-}
-
-std::string find_command(const std::vector<std::string>& roots, int max_depth, bool skip_hidden) {
-    std::string cmd = "find -L"; // links followed, as searches follow them (review G54)
-    for (const auto& root : roots) {
-        cmd += ' ';
-        cmd += root.empty() ? std::string(".") : quote::sh_single(root);
-    }
-    cmd += std::format(" -mindepth 1 -maxdepth {}", max_depth);
-    // Dot-entries are pruned as searches prune them (see build_find_command).
-    if (skip_hidden) cmd += " \\( -name '.*' -prune \\) -o";
-    cmd += " \\( -type d -printf 'd\\t%T@\\t%p\\0' -o -type f -printf 'f\\t%s\\t%T@\\t%p\\0' \\) 2>/dev/null";
-    return cmd;
 }
 
 namespace {
@@ -158,32 +140,6 @@ std::optional<Entry> parse_find_record(std::string_view rec) {
     if (!has_name(rec)) return std::nullopt; // "/", ".": nothing to save it under (review G15)
     e.path = std::string(rec);
     return e;
-}
-
-std::vector<Entry> parse_find(std::string_view out) {
-    std::vector<Entry> entries;
-    split_records(out, '\0', [&](std::string_view rec) {
-        if (auto e = parse_find_record(rec)) entries.push_back(std::move(*e));
-    });
-    return entries;
-}
-
-std::vector<Entry> parse_lsf(std::string_view out, std::string_view root) {
-    std::vector<Entry> entries;
-    for (const auto& record : parse_csv(out)) {
-        const auto fields = parse_lsf_record(record);
-        if (!fields) continue;
-        Entry e;
-        std::string_view line = fields->path;
-        e.dir = line.ends_with('/');
-        if (e.dir) line.remove_suffix(1);
-        else e.size = fields->size;
-        e.modified = fields->modified;
-        if (line.empty()) continue;
-        e.path = join_remote(root, line);
-        entries.push_back(std::move(e));
-    }
-    return entries;
 }
 
 namespace {
@@ -246,48 +202,13 @@ std::expected<void, std::string> fetch_grab(const engine::Context& ctx, List& li
 
 } // namespace
 
-std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh,
-                                       const proc::RunOptions& run, const engine::CommandHook& on_command,
-                                       const std::vector<std::string>& walk_flags, const engine::GrabSide& grab,
-                                       std::span<const std::string> run_flags) {
+std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, const proc::RunOptions& run,
+                                       const engine::CommandHook& on_command, const engine::GrabSide& grab) {
     List list;
     list.fetched = now;
     list.fingerprint = fingerprint(ctx);
-    const auto roots = engine::search_roots(ctx);
-    if (ctx.engine == Engine::grab) {
-        if (auto got = fetch_grab(ctx, list, roots, run.stop, on_command, grab); !got) return util::fail(got.error());
-        return list;
-    }
-    if (ctx.method == FindMethod::ssh) {
-        auto out = engine::run_over_ssh(ctx, find_command(roots, ctx.settings.max_depth, ctx.settings.skip_hidden),
-                                        batch_ssh, run, on_command, run_flags);
-        if (!out) return util::fail(out.error());
-        list.entries = parse_find(*out);
-        return list;
-    }
-    auto with_server = run;
-    if (auto env = engine::rclone_env(ctx); env) with_server.environment = std::move(*env);
-    else return util::fail(env.error());
-    for (const auto& root : roots) {
-        ListRequest req;
-        req.root = root;
-        req.max_depth = ctx.settings.max_depth;
-        req.skip_hidden = ctx.settings.skip_hidden;
-        req.rclone_exe = ctx.config.rclone;
-        req.rclone_remote = ctx.settings.rclone_remote;
-        req.all_entries = true;
-        // common_flags', grab's own, the server's keys, then the command's (a --bind reaches the
-        // list too, G189).
-        req.flags = rclone_flags::connection(ctx.settings.common_flags);
-        req.flags.insert(req.flags.end(), walk_flags.begin(), walk_flags.end());
-        const auto keys = engine::key_flags(ctx.settings);
-        req.flags.insert(req.flags.end(), keys.begin(), keys.end());
-        req.flags.insert(req.flags.end(), run_flags.begin(), run_flags.end());
-        auto out = engine::run_listing(build_lsf_argv(req), with_server, on_command);
-        if (!out) return util::fail(out.error());
-        auto entries = parse_lsf(*out, root);
-        list.entries.insert(list.entries.end(), std::make_move_iterator(entries.begin()),
-                            std::make_move_iterator(entries.end()));
+    if (auto got = fetch_grab(ctx, list, engine::search_roots(ctx), run.stop, on_command, grab); !got) {
+        return util::fail(got.error());
     }
     return list;
 }

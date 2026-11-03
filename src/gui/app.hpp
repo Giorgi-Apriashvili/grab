@@ -140,7 +140,6 @@ private:
         std::optional<ssh::Reader> reader;
         std::shared_ptr<ssh::Pool> pool;
         bool seated = false;
-        bool rclone = false; // engine = rclone: the pool's idle connections close when the seats go
     };
     // A job from the queue, on a preview worker (preview::Previews: the cache again, the fetch,
     // every request that joined it answered), then its connections and seat given back.
@@ -152,9 +151,8 @@ private:
     // takes it, else a free one, else waits for one as a download does (they step aside); a
     // neighbour fetched ahead takes it, else only a free one, waiting for either. False: stopped.
     bool take_viewer_seat(const std::string& server, const preview::Previews::Job& job, const std::stop_token& stop);
-    void return_viewer_seat(const std::string& server, const PreviewHold& hold);
-    // Gives back the viewer's seats idle longer than preview_seat_idle; on engine = rclone a
-    // preview worker then closes the idle connections they counted. UI thread (tick).
+    void return_viewer_seat(const std::string& server);
+    // Gives back the viewer's seats idle longer than preview_seat_idle. UI thread (tick).
     void release_viewer_seats();
     // A server saved, trusted or removed: its previews kept go (review G36) and the login the
     // previews remembered as failed is tried again (Pool::acquire_remembered).
@@ -271,7 +269,7 @@ private:
     [[nodiscard]] std::expected<std::vector<engine::Hit>, std::string> search_below(
         const engine::Context& ctx, const std::string& server, const engine::SearchRequest& req,
         const std::string& under, bool update, const proc::RunOptions& run, json::Value& status);
-    // A search, list or Browse through grab's own SSH client on `server` (engine = grab): its pool
+    // A search, list or Browse through grab's own SSH client on `server`: its pool
     // (the budget configured first), shared with the downloads, and a seat of one connection
     // taken from the budget into `seat` now (fetch::Listing, review G191), which a walk widens to
     // up to 8 (GrabSide::walk_seat). Any thread.
@@ -418,9 +416,9 @@ private:
     void run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
     void folder_event(Item& item, folder::Event e); // a running folder's progress, for the page
     void folder_totals(Item& item) const;          // caller holds mutex_
-    // What a verification of `item`'s download needs: grab's own connections to its server, which
-    // every server verifies through (the download's pool on engine = grab, else the server's from
-    // pools_), or why there are none; the budget and its id; the row's "12 of 40" as files end.
+    // What a verification of `item`'s download needs: grab's own connections to its server (the
+    // download's pool, else the server's from pools_), or why there are none; the budget and its
+    // id; the row's "12 of 40" as files end.
     [[nodiscard]] verify::Request verify_request(const engine::Context& ctx, const std::shared_ptr<Item>& item,
                                                  const std::shared_ptr<ssh::Pool>& download_pool);
     void discard_folder_partials(const Item& item) const; // cancelled folder: big files' .grabpart
@@ -543,7 +541,6 @@ private:
         int in_use = 0;
         int taking = 0; // in take_viewer_seat, waiting for a seat
         std::chrono::steady_clock::time_point idle_since;
-        std::shared_ptr<ssh::Pool> rclone_pool; // engine = rclone: idle connections close with the seat
     };
     std::map<std::string, ViewerSeat> viewer_seats_; // by server
     std::vector<std::jthread> preview_workers_; // after the members their jobs use

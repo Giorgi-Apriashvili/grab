@@ -302,8 +302,8 @@ std::string find_command(const FindSpec& spec) {
         cmd += quote::sh_single(raw.starts_with('/') ? raw : "./" + raw);
     }
     cmd += std::format(" -mindepth 1 -maxdepth {}", spec.max_depth);
-    // Dot-entries are pruned as build_find_command prunes them, and names filtered on the server
-    // so only hits cross the network.
+    // Dot-entries are pruned as the walk leaves them out, and names filtered on the server so only
+    // hits cross the network.
     if (spec.skip_hidden && !(spec.query && wants_hidden(*spec.query))) cmd += " \\( -name '.*' -prune \\) -o";
     if (spec.query) {
         const Query& q = *spec.query;

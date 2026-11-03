@@ -6,10 +6,7 @@
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "passwords.hpp"
-#include "process.hpp"
-#include "rclone_flags.hpp"
 #include "rclone_import.hpp"
-#include "remote.hpp"
 #include "server_conf.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
@@ -32,21 +29,6 @@
 namespace grab::server_ops {
 
 namespace {
-
-std::string first_line(std::string_view text) {
-    text = util::trim(text);
-    const auto nl = text.find('\n');
-    return std::string(util::trim(nl == std::string_view::npos ? text : text.substr(0, nl)));
-}
-
-proc::RunOptions quiet(std::stop_token stop = {}) {
-    proc::RunOptions o;
-    o.detached = true;
-    o.stop = std::move(stop);
-    return o;
-}
-
-bool ok(const std::expected<proc::CaptureResult, std::string>& run) { return run && run->exit_code == 0; }
 
 std::expected<void, std::string> write_grab_conf(const Env& env, const std::string& text) {
     if (text == env.grab_text) return {};
@@ -261,24 +243,7 @@ server_conf::Connection connection_of(const servers::NewServer& s) {
 
 } // namespace
 
-std::string clean_rclone_error(std::string_view err) {
-    std::string line = first_line(err);
-    std::string_view v = line;
-    auto digit = [](char ch) { return ch >= '0' && ch <= '9'; };
-    if (v.size() > 20 && digit(v[0]) && v[4] == '/' && v[7] == '/' && v[10] == ' ' && v[13] == ':' && v[19] == ' ') {
-        v.remove_prefix(20);
-    }
-    for (std::string_view level : {"CRITICAL: ", "ERROR : ", "NOTICE: ", "INFO  : "}) {
-        if (v.starts_with(level)) {
-            v.remove_prefix(level.size());
-            break;
-        }
-    }
-    return std::string(v);
-}
-
-std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf,
-                                         const std::filesystem::path& exe_dir) {
+std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf) {
     Env env;
     env.grab_conf = grab_conf;
     if (auto applied = rclone_import::apply(rclone_import::files_for(grab_conf)); !applied) {
@@ -290,7 +255,6 @@ std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf,
     if (auto exists = read_grab_conf(env); !exists) return util::fail(exists.error());
     env.known_hosts = grab_known_hosts_path();
     env.passwords = passwords::path_in(state_dir(grab_conf));
-    env.rclone = resolve_rclone_exe(env.cfg, exe_dir);
     return env;
 }
 
@@ -316,13 +280,10 @@ std::string time_text(std::chrono::milliseconds t) {
     return t.count() % 1000 == 0 ? std::format("{}s", t.count() / 1000) : std::format("{}ms", t.count());
 }
 
-// The guard's reasons, the engine and the search method of server `s` as make_context resolves
-// them: grab's own client by default, rclone where the guard keeps it off (a `store` that can't
-// be read may hold a route), and rclone's listing past a route rclone takes, which ssh.exe find
-// would connect past.
+// The guard's reasons and the search method of server `s` as make_context resolves them (a
+// `store` that can't be read may hold a route).
 struct Resolved {
     std::vector<guard::Reason> guard;
-    Engine engine = Engine::grab;
     std::string search;
 };
 Resolved resolve(const RemoteSettings& s, const server_conf::Connection& conn, const RcloneRemote& remote,
@@ -336,9 +297,7 @@ Resolved resolve(const RemoteSettings& s, const server_conf::Connection& conn, c
     if (!store) guard::add_unreadable_store(found);
     Resolved out;
     out.guard = guard::reasons(found);
-    out.engine = effective_engine(s, !out.guard.empty());
-    out.search = std::string(search_method(s, remote, out.engine));
-    if (out.engine == Engine::rclone && guard::routed(out.guard)) out.search = "rclone";
+    out.search = std::string(search_method(s, remote));
     return out;
 }
 
@@ -398,7 +357,6 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             if (!store) info.store_error = store.error();
             auto resolved = resolve(s, conn, remote, store);
             info.guard = std::move(resolved.guard);
-            info.engine = resolved.engine;
             info.search = std::move(resolved.search);
         }
         out.push_back(std::move(info));
@@ -420,7 +378,61 @@ std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int
     return keys;
 }
 
-std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name) {
+namespace {
+
+// What keeps server `name` off grab: for one with connection details, what list_servers says
+// (resolve); for a section without them, its own settings and the environment; for a server
+// grab.conf doesn't have yet, the environment alone (an inherited RCLONE_SFTP_* covers every
+// server). A store that can't be read counts only beside details: what it keeps is bound to a login.
+// For an Edit's fetch, what the save will leave (reach_for).
+std::vector<guard::Reason> guard_of(const Env& env, std::string_view name, Purpose purpose) {
+    const auto* s = find_server(env.cfg, name);
+    if (s != nullptr && purpose == Purpose::edit) {
+        // The section's rclone.* lines as they are: set_connection keeps them, read or not.
+        server_conf::Connection lines;
+        if (auto doc = ini::parse(env.grab_text)) {
+            if (const auto* section = doc->find(name)) {
+                for (const auto& [key, value] : section->values) {
+                    const auto v = util::trim(value);
+                    if (key.starts_with(server_conf::rclone_prefix) && !v.empty()) {
+                        lines.rclone.emplace_back(key.substr(server_conf::rclone_prefix.size()), v);
+                    }
+                }
+            }
+        }
+        std::vector<std::pair<std::string, std::string>> extras;
+        if (const auto store = passwords::load(env.passwords)) {
+            if (const auto it = store->find(name); it != store->end()) {
+                for (const auto& [key, saved] : it->second) {
+                    if (key.starts_with(passwords::rclone_prefix)) {
+                        extras.emplace_back(key.substr(passwords::rclone_prefix.size()), saved.value);
+                    }
+                }
+            }
+        }
+        auto sources = guard::sources(*s, lines, std::move(extras));
+        const auto found = guard::evaluate(sources);
+        for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
+        return guard::reasons(found);
+    }
+    if (s != nullptr) {
+        if (const auto c = connection_in(env.grab_text, name); c && *c) {
+            const RcloneRemote remote = server_conf::to_remote(s->rclone_remote, **c, env.known_hosts);
+            return resolve(*s, **c, remote, passwords::load(env.passwords)).guard;
+        }
+    }
+    RemoteSettings settings;
+    if (s != nullptr) settings = *s;
+    return guard::reasons(guard::evaluate(guard::sources(settings, server_conf::Connection{}, {})));
+}
+
+} // namespace
+
+std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name, Purpose purpose) {
+    // Not even its host key is fetched (phase 9 step 6).
+    if (const auto blocked = guard_of(env, name, purpose); !blocked.empty()) {
+        return util::fail(guard::text(name, blocked));
+    }
     const auto* s = find_server(env.cfg, name);
     if (s == nullptr) return ssh::Reach{};
     auto reach = engine::connect_settings(*s);
@@ -432,16 +444,6 @@ std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_vie
     }
     out.connect_timeout = reach->connect_timeout;
     return out;
-}
-
-std::string direct_warning(const ServerInfo& s, const std::string& host, int port) {
-    std::vector<std::string> routes;
-    for (const auto& r : s.guard) {
-        if (r.kind == guard::Kind::route) routes.push_back(guard::describe(r));
-    }
-    if (routes.empty()) return {};
-    return std::format("{} {}: fetching its host key connects to {}:{} directly from this PC, past that", s.name,
-                       util::join(routes, " and "), host, port);
 }
 
 namespace {
@@ -613,8 +615,8 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     if (!agent_kept) next.key_file = connection_of(wanted).key_file;
     const bool moved = !current || current->host != next.host || current->port != next.port || current->user != next.user;
     const bool method = !current || current->auth != next.auth;
-    // Another key file: the old one's passphrase goes unless a new one is typed (rclone refuses an
-    // unencrypted key given a passphrase).
+    // Another key file: the old one's passphrase goes unless a new one is typed (it was the old
+    // key's; 0.20's rclone refused an unencrypted key given one).
     const bool key_changed = current && current->auth == servers::Auth::key && next.auth == servers::Auth::key &&
                              current->key_file != next.key_file;
     if (moved) {
@@ -635,9 +637,9 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     }
 
     // The store, only when the login method, the secret or the login changes (G85), or when it
-    // can't be read: grab then starts no rclone for any server, and saving one with Edit, changed
-    // or not, is the way out the messages give (load_store sets the file aside). A store that
-    // still can't be read stops only an Edit that needs it.
+    // can't be read: grab then connects to no server, and saving one with Edit, changed or not, is
+    // the way out the messages give (load_store sets the file aside). A store that still can't be
+    // read stops only an Edit that needs it.
     std::optional<passwords::Store> before;
     passwords::Store store;
     std::string store_note;
@@ -912,21 +914,18 @@ void save_commands(const Env& env, std::string_view name, const server_conf::Con
     }
 }
 
-// grab's own client's part of a test: a login through it (the target downloads use) and its home
-// folder listed, then what rclone would ask the server (saved in grab.conf), then on engine = grab
-// the find check on that connection, which says how searches go; its answer replaces the one
-// saved in `limits_file` (engine::find_memory), so a server changed since is searched the new way
-// by the next command (the window drops its pool's answer, App::test_server). On every server the
-// hash check last, which says whether downloads can be verified there (phase 5). Nothing is set
-// when stopped.
+// The test: a login through grab's own client (the target downloads use) and its home folder
+// listed, then the server's shell and sum commands (saved in grab.conf), then the find check on
+// that connection, which says how searches go; its answer replaces the one saved in `limits_file`
+// (engine::find_memory), so a server changed since is searched the new way by the next command
+// (the window drops its pool's answer, App::test_server). The hash check last, which says whether
+// downloads can be verified there (phase 5). Nothing is set when stopped.
 void test_grab(const Env& env, engine::Context& ctx, const std::filesystem::path& limits_file, const std::stop_token& stop,
                TestResult& result) {
     auto failed = [&](std::string why) {
         result.grab_ok = false;
         result.grab_error = std::move(why);
     };
-    const bool grab_engine = ctx.engine == Engine::grab;
-    result.grab_engine = grab_engine;
     auto target = engine::ssh_target(ctx);
     if (!target) return failed(target.error());
     ssh::Pool::Options options;
@@ -936,8 +935,7 @@ void test_grab(const Env& env, engine::Context& ctx, const std::filesystem::path
     try {
         auto lease = pool.acquire(stop, ssh::interactive_retry);
         if (!lease) return;
-        // Its login folder listed on every server (phase 7 step 8): on engine = rclone a failure
-        // here is a warning, as for the login.
+        // Its login folder listed (phase 7 step 8).
         if (auto listed = sftp::list((*lease)->sftp(), "."); !listed) {
             return failed("its home folder can't be listed: " + sftp::describe(listed.error()));
         }
@@ -946,7 +944,7 @@ void test_grab(const Env& env, engine::Context& ctx, const std::filesystem::path
     } catch (const sftp::Broken& e) {
         return failed(e.what());
     }
-    // Once per server (and again after its login moves): rclone then needn't ask on every run.
+    // Once per server (and again after its login moves): verification needn't ask on every run.
     const ssh::ServerCommands known{.shell_type = ctx.connection.shell_type,
                                     .md5sum_command = ctx.connection.md5sum_command,
                                     .sha1sum_command = ctx.connection.sha1sum_command};
@@ -960,7 +958,7 @@ void test_grab(const Env& env, engine::Context& ctx, const std::filesystem::path
         ctx.remote.shell_type = learned.shell_type;
         ctx.remote.md5sum_command = learned.md5sum_command;
     }
-    if (grab_engine) {
+    {
         // Asked whatever was saved; a save that fails is only asked again by the next search.
         // gui.json's old limits, kept if this answer makes limits.json (review G195).
         auto gui = read_gui_state(limits_file.parent_path() / "gui.json");
@@ -998,92 +996,33 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
                            name, name);
     }
 
-    GrabConfig cfg = env.cfg;
-    cfg.rclone = env.rclone; // as load_context resolves it
-    engine::Context ctx = engine::make_context(std::move(cfg), *s, std::move(**c), env.grab_conf);
+    engine::Context ctx = engine::make_context(env.cfg, *s, std::move(**c), env.grab_conf);
     TestResult result;
-    const bool on_rclone = ctx.engine != Engine::grab;
-    const bool with_ssh = on_rclone && ctx.method == FindMethod::ssh;
+    // A server grab doesn't connect to says why, and nothing is tried (phase 9 step 6).
+    if (const auto blocked = engine::grab_blockers(ctx); !blocked.empty()) {
+        result.unusable = guard::text(name, blocked);
+        return result;
+    }
     // A server grab has no key for is refused before anything dials (Main's fail2ban counts each
     // handshake cut short).
     if (auto pinned = engine::check_pinned(ctx); !pinned) {
-        result.grab_engine = !on_rclone;
         result.grab_ok = false;
         result.grab_error = pinned.error();
-        if (on_rclone) {
-            result.rclone_ok = false;
-            result.rclone_error = pinned.error();
-        }
-        if (with_ssh) {
-            result.ssh_ok = false;
-            result.ssh_error = pinned.error();
-        }
         return result;
     }
-
-    // rclone only where it still downloads: on engine = grab nothing a test can show goes through it
-    // (previews and Play don't either since phase 6), and its listing costs a login (1-3.5 s on a
-    // Storage Box).
-    if (on_rclone) {
-        auto probe = engine::rclone_env(ctx).and_then([&](proc::Environment server) {
-            auto run = quiet(stop);
-            run.environment = std::move(server);
-            // common_flags' connection flags before its short times, the server's keys after them.
-            return proc::run_capture(servers::probe_argv(env.rclone, s->rclone_remote,
-                                                         rclone_flags::connection(s->common_flags),
-                                                         engine::key_flags(*s)),
-                                     run);
-        });
-        if (stop.stop_requested()) return util::fail("cancelled");
-        result.rclone_ok = ok(probe);
-        if (!*result.rclone_ok) result.rclone_error = probe ? clean_rclone_error(probe->err) : probe.error();
-    }
-
-    if (with_ssh) {
-        // The server's bind and connect time before the test's own 15 s and its ssh_options:
-        // OpenSSH keeps the first value it sees.
-        if (auto reach = engine::connect_settings(*s); !reach) {
-            result.ssh_ok = false;
-            result.ssh_error = reach.error();
-        } else {
-            std::vector<std::string> options{"-o", "BatchMode=yes"};
-            const auto own = engine::ssh_connect_options(*reach);
-            options.insert(options.end(), own.begin(), own.end());
-            options.insert(options.end(), {"-o", "ConnectTimeout=15"});
-            options.insert(options.end(), s->ssh_options.begin(), s->ssh_options.end());
-            auto ssh = proc::run_capture(build_ssh_argv(env.cfg.ssh, ctx.remote, options, "echo grab-ok"), quiet(stop));
-            if (stop.stop_requested()) return util::fail("cancelled");
-            result.ssh_ok = ok(ssh) && ssh->out.find("grab-ok") != std::string::npos;
-            if (!*result.ssh_ok) result.ssh_error = ssh ? first_line(ssh->err) : ssh.error();
-        }
-    }
-    // Every server: grab's own login, which downloads and searches use on engine = grab, and
-    // previews, Play and verification on any.
     test_grab(env, ctx, learned_limits_path(env.grab_conf), stop, result);
     if (stop.stop_requested()) return util::fail("cancelled");
     return result;
 }
 
-std::vector<std::string> test_lines(const TestResult& t, std::string_view ssh_hint) {
-    std::vector<std::string> out;
-    // grab's own client previews, plays and verifies on every server; on engine = grab it also
-    // downloads and searches, and rclone isn't asked.
-    if (t.rclone_ok) out.push_back("rclone (downloads): " + (*t.rclone_ok ? "OK" : "FAILED: " + t.rclone_error));
-    if (t.grab_ok) {
-        std::string how = "OK, home folder listed";
-        if (t.grab_engine) how += ", searches " + t.grab_search;
-        if (!t.checksums.empty()) how += ", " + t.checksums;
-        // On engine = rclone grab's login only previews, plays and verifies: a failure there is a warning.
-        const std::string failed = (t.grab_engine ? "FAILED: " : "can't run: ") + t.grab_error;
-        out.push_back(std::format("grab ({}): {}",
-                                  t.grab_engine ? "downloads, searches, previews, Play, verify" : "previews, Play, verify",
-                                  *t.grab_ok ? how : failed));
-    }
-    if (t.ssh_ok) {
-        out.push_back("ssh (searches):     " +
-                      (*t.ssh_ok ? std::string("OK") : "FAILED: " + t.ssh_error + std::string(ssh_hint)));
-    }
-    return out;
+std::vector<std::string> test_lines(const TestResult& t) {
+    if (!t.unusable.empty()) return {"not usable: " + t.unusable};
+    if (!t.grab_ok) return {};
+    if (!*t.grab_ok) return {"grab: FAILED: " + t.grab_error};
+    std::string how = "grab: OK, home folder listed";
+    if (!t.grab_search.empty()) how += ", searches " + t.grab_search;
+    if (!t.checksums.empty()) how += ", " + t.checksums;
+    return {how};
 }
 
 } // namespace grab::server_ops

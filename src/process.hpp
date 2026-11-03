@@ -18,8 +18,8 @@ namespace grab::proc {
 // for STATUS_CONTROL_C_EXIT), mirroring the POSIX 128 + SIGINT convention.
 inline constexpr int exit_stopped = 130;
 
-// What a child's environment gets beyond the one it inherits: a server's variables for the rclone
-// process that works on it, and for no other program (engine::rclone_env; review G7). Names are
+// What a child's environment gets beyond the one it inherits (the tests' rclone runs, which
+// compare grab with rclone 1.75.1, give it a server's RCLONE_CONFIG_<NAME>_* this way). Names are
 // compared as the system compares them: ignoring case on Windows (CompareStringOrdinal), exactly
 // elsewhere.
 struct Environment {
@@ -37,14 +37,11 @@ struct RunOptions {
     // No console: no console window for the child (CREATE_NO_WINDOW), stdin is NUL, stderr
     // is captured instead of shared. For the GUI, which has no console to share.
     bool detached = false;
-    // run_capture only: bytes written to the child's stdin (then closed), e.g. a password for
-    // `rclone obscure -`, so secrets never appear on a command line.
+    // Bytes written to the child's stdin (then closed), so secrets never appear on a command line.
     std::optional<std::string> input;
-    // run_capture only: each chunk of the child's stdout as it arrives (it is captured too), e.g.
-    // to count a listing's entries while it runs, for a progress bar. On the reading thread.
+    // Each chunk of the child's stdout as it arrives (it is captured too). On the reading thread.
     std::function<void(std::string_view)> on_output;
-    // Added to the child's environment (internal_environment's), for run_capture, run_streaming
-    // and run_piped alike.
+    // Added to the child's environment (internal_environment's).
     Environment environment;
 };
 
@@ -60,10 +57,10 @@ struct RunOptions {
 
 #ifdef _WIN32
 // This process's environment as a CreateProcess block (UTF-16), without the RCLONE_* variables
-// grab's internal rclone calls must not see (rclone_flags::kept_variable; review G8): no inherited
+// an rclone run must not see (rclone_flags::kept_variable; review G8): no inherited
 // RCLONE_CONFIG_* at all, since each run gets its own server's in RunOptions::environment.
-// run_capture, run_streaming and run_piped give their children this one with that environment
-// added; run_inherit (an editor, an installer) and start_independent everything.
+// run_capture gives its children this one with that environment added; run_inherit (an editor,
+// an installer) and start_independent everything.
 [[nodiscard]] std::wstring internal_environment();
 // The same without any RCLONE_* variable at all: for a long-lived program of someone else's (the
 // media player Play starts; review G7).
@@ -85,24 +82,6 @@ struct CaptureResult {
 // console so an ssh passphrase prompt still works, and Ctrl+C is left to the child.
 [[nodiscard]] std::expected<CaptureResult, std::string>
 run_capture(std::span<const std::string> argv, const RunOptions& opts = {});
-
-// Run argv[0] with stdin and stdout on NUL, calling `on_line` for every stderr line (without
-// the line break), e.g. rclone's --use-json-log output. Returns the exit code.
-[[nodiscard]] std::expected<int, std::string>
-run_streaming(std::span<const std::string> argv, const std::function<void(std::string_view)>& on_line,
-              const RunOptions& opts = {});
-
-struct PipedResult {
-    int exit_code = 0;
-    std::string err; // the child's stderr
-};
-
-// Run argv[0] with no console and stdin on NUL, handing its stdout to `on_data` in binary
-// chunks as they arrive (e.g. `rclone cat` of a byte range) and capturing stderr. `on_data`
-// returning false stops the child, like RunOptions::stop; the result is then exit_stopped.
-[[nodiscard]] std::expected<PipedResult, std::string>
-run_piped(std::span<const std::string> argv, const std::function<bool(std::string_view)>& on_data,
-          const RunOptions& opts = {});
 
 // Run argv[0] with all three streams and the whole environment inherited (live progress output).
 // Returns its exit code. On Windows the child is in a kill-on-close Job object, and by default so

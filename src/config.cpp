@@ -182,11 +182,6 @@ std::string search_roots_value(const std::vector<std::string>& roots) {
     return util::join(shown, ", ");
 }
 
-FindMethod resolve_find_method(const RemoteSettings& settings, const RcloneRemote& remote) {
-    if (settings.find != FindMethod::auto_detect) return settings.find;
-    return remote.key_file || remote.key_use_agent ? FindMethod::ssh : FindMethod::rclone;
-}
-
 GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemote& remote) {
     switch (settings.find) {
     case FindMethod::ssh: return GrabMethod::find;
@@ -264,20 +259,6 @@ SettingsLock::SettingsLock(SettingsLock&& other) noexcept : held_(std::exchange(
 
 SettingsLock::~SettingsLock() {
     if (held_ && --settings_depth == 0) settings_file = util::FileLock{};
-}
-
-std::string resolve_rclone_exe(const GrabConfig& cfg, const std::filesystem::path& exe_dir) {
-    const std::string configured(util::trim(cfg.rclone));
-    const std::string lower = util::to_lower(configured);
-    if (!configured.empty() && lower != "rclone" && lower != "rclone.exe") return configured;
-#ifdef _WIN32
-    const auto bundled = exe_dir / "rclone.exe";
-#else
-    const auto bundled = exe_dir / "rclone";
-#endif
-    std::error_code ec;
-    if (!exe_dir.empty() && std::filesystem::is_regular_file(bundled, ec)) return util::path_to_utf8(bundled);
-    return "rclone";
 }
 
 std::expected<const RemoteSettings*, std::string>
@@ -512,8 +493,7 @@ std::vector<RcloneRemote> missing_remotes(const GrabConfig& cfg, const ini::Docu
     return out;
 }
 
-std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote, Engine engine) {
-    if (engine == Engine::rclone) return resolve_find_method(settings, remote) == FindMethod::ssh ? "ssh" : "rclone";
+std::string_view search_method(const RemoteSettings& settings, const RcloneRemote& remote) {
     switch (resolve_grab_method(settings, remote)) {
     case GrabMethod::find: return "find";
     case GrabMethod::walk: return "walk";
@@ -523,12 +503,10 @@ std::string_view search_method(const RemoteSettings& settings, const RcloneRemot
 }
 
 std::string describe_remote(const RcloneRemote& remote, std::string_view method, std::string_view login) {
-    if (method.empty()) method = search_method(RemoteSettings{}, remote, Engine::grab);
-    const char* lookup = method == "ssh"    ? "via ssh + find"
-                         : method == "rclone" ? "via rclone lsf"
-                         : method == "find"   ? "with find"
-                         : method == "walk"   ? "by listing folders"
-                                              : "with find, else by listing folders";
+    if (method.empty()) method = search_method(RemoteSettings{}, remote);
+    const char* lookup = method == "find"   ? "with find"
+                         : method == "walk" ? "by listing folders"
+                                            : "with find, else by listing folders";
     const std::string_view auth = !login.empty()          ? login
                                   : remote.key_use_agent ? "ssh-agent"
                                   : remote.key_file      ? "key file"

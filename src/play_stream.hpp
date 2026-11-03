@@ -249,7 +249,6 @@ public:
         std::uint64_t ahead = 16 * mib;   // read-ahead in front of each request
         int depth = 0;                    // READs in flight per connection; 0: Options::depth
         int spares = 1;                   // connections left idle for a seek once the warm part is in
-        bool close_on_release = false;    // engine = rclone: rclone can't see idle pool connections
     };
     // Bytes of the warm part in so far, and in all.
     using Progress = std::function<void(std::uint64_t done, std::uint64_t total)>;

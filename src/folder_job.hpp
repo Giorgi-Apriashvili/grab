@@ -1,15 +1,11 @@
 #pragma once
 
-// A folder download, shared by grab-gui's queue and the grab command. The folder is listed once
-// (`rclone lsjson -R`), and files already on disk are not fetched again. Small files go in one
-// `rclone copy` batch that reuses its connections, since a new SSH login per small file would
-// dominate. Big ones take grab's resumable ranged download (fetch::run), up to three at a time.
-// The whole folder is one user of its server's connection budget.
-//
-// With grab's own engine (Job::pool, engine = grab) the folder is walked over SFTP instead; files
-// from small_limit up take fetch::run as many at once as "At once" says, their pieces spread over
-// the folder's connections, and smaller ones go beside them on every free connection, many in
-// flight on each (RCLONE-REPLACEMENT.md, phase 3).
+// A folder download, shared by grab-gui's queue and the grab command. The folder is walked once
+// over SFTP on the server's pooled connections (Job::pool), and files already on disk are not
+// fetched again. Files from small_limit up take grab's resumable ranged download (fetch::run) as
+// many at once as "At once" says, their pieces spread over the folder's connections; smaller ones
+// go beside them on every free connection, many in flight on each (RCLONE-REPLACEMENT.md, phase
+// 3). The whole folder is one user of its server's connection budget.
 //
 // The caller owns the folder's state (Tree) and the mutex guarding it, so it can show the
 // files and act on single ones (pause, resume, skip) while the download runs.
@@ -40,8 +36,8 @@ namespace grab::folder {
 // Why a running big file is being stopped; the folder's own stop ends every file.
 enum class StopReason { none, pause, skip };
 
-// grab's engine: files under this size go beside the At once files on any free connection, many
-// in flight on each (the user's choice, 2026-10-27). One can't be split over connections, so
+// Files under this size go beside the At once files on any free connection, many in flight on
+// each (the user's choice, 2026-10-27). One can't be split over connections, so
 // counting them against At once would leave most connections idle in a folder of small files.
 // From here up a file is fetched as a single download is (fetch::run): resumable, its pieces
 // spread over the folder's connections, and At once counts it.
@@ -51,7 +47,7 @@ struct File {
     std::string path; // relative to the folder, '/'-separated
     std::uint64_t size = 0;
     std::string modtime;
-    bool big = false; // fetched like a single file (resumable); otherwise in the batch
+    bool big = false; // fetched like a single file (resumable, At once counts it); otherwise beside them
     State status = State::queued;
     std::uint64_t bytes = 0;
     double speed = 0;
@@ -59,36 +55,28 @@ struct File {
     std::string error;
     std::stop_source stop; // a running big file's own stop
     StopReason stop_reason = StopReason::none;
-    bool in_batch = false; // in the running batch: queued until rclone starts it, then running
     bool fetched = false;  // done by this download, not found on disk already
     bool verified = false; // checked against the server's checksum (verify_files)
     // Where it goes instead, relative to the folder ("e01 (2).mkv"): Keep both, or a name another
-    // file of the folder has on Windows (settle_names); fetched by grab.
+    // file of the folder has on Windows (settle_names).
     std::filesystem::path local = {};
 };
 [[nodiscard]] File make_file(std::string path, std::uint64_t size, std::string modtime);
-// A folder's files (sorted by path) that are one name on Windows ("README" and "readme", folders
-// "Docs" and "docs") or to rclone's batch, which also takes "café" in its two Unicode spellings
-// for one (review G25). rclone keeps one of them and drops the others, a folder with all it holds,
-// so each of them is fetched by grab; and a file whose name an earlier file or any folder of the
-// listing has on Windows gets a numbered one, as Keep both names them: "readme (2)".
+// A file of a folder's files (sorted by path) whose name an earlier file or any folder of the
+// listing has on Windows ("README" and "readme", folders "Docs" and "docs"; review G25) gets a
+// numbered one, as Keep both names them: "readme (2)".
 void settle_names(std::vector<File>& files);
-// Which files take fetch::run (File::big), by engine: grab's sends every file from small_limit up
-// that way; rclone's batch takes the small ones except those it would write under another name or
-// keep only one of (make_file, settle_names, apply). Run again whenever the engine may differ.
-void set_big(std::vector<File>& files, bool grab_engine);
+// Which files take fetch::run (File::big): every file from small_limit up.
+void set_big(std::vector<File>& files);
 
 // A folder download's state. Every access holds the caller's mutex.
 struct Tree {
     bool listed = false;
     std::vector<File> files;
-    // The running small-file batch. Stopping it restarts it without paused or skipped files.
-    std::stop_source batch_stop;
-    bool batch_running = false;
     int connections = 0;   // open right now
-    int files_at_once = 0; // files it downloads right now: the batch's at once, or its big files running
-    // Folders below the folder that grab's engine couldn't read ("a/b: permission denied"): the
-    // rest is downloaded and these are said (review G55).
+    int files_at_once = 0; // its big files running
+    // Folders below the folder that the walk couldn't read ("a/b: permission denied"): the rest is
+    // downloaded and these are said (review G55).
     std::vector<std::string> unreadable;
 };
 
@@ -139,7 +127,7 @@ struct Outcome {
 // safe, or its Keep-both name.
 [[nodiscard]] std::filesystem::path target_of(const std::filesystem::path& dir, const File& f);
 
-// The folder's own local directory: DEST\<folder name>, as rclone copy names it.
+// The folder's own local directory: DEST\<folder name> (local::relative of its name).
 [[nodiscard]] std::filesystem::path local_dir(const std::filesystem::path& dest, const std::string& remote_path);
 [[nodiscard]] std::string child_remote_path(const std::string& folder, const std::string& rel);
 struct Job;
@@ -147,14 +135,13 @@ struct Job;
 [[nodiscard]] std::filesystem::path job_dir(const Job& job);
 
 // Deletes what a cancelled folder (`remote_path`) leaves behind: its big files' partial
-// downloads, grab's by their records. Finished files stay; rclone's temp files went when its
-// batch stopped.
+// downloads, grab's by their records. Finished files stay; a small file is only written whole.
 void discard_partials(const std::string& remote_path, const std::filesystem::path& dir, const Tree& tree,
                       std::string_view rclone_remote = {});
 
 enum class Event {
     progress,   // bytes moved; frequent, so throttle what it triggers
-    changed,    // a file started or ended, or the batch started
+    changed,    // a file started or ended
     checkpoint, // listed, or a pass over the queued files ended: worth saving
 };
 
@@ -176,14 +163,10 @@ struct Job {
     // Replace: different files already there may be replaced. Otherwise none is: conflicts were
     // answered before run() (skipped, or a second copy), and one that appears meanwhile fails.
     existing::Choice existing = existing::Choice::ask;
-    // The small-file batch's share of the speed limit in bytes per second (0: none), asked
-    // when a batch starts, without the mutex held.
-    std::function<std::uint64_t()> batch_limit;
-    std::vector<std::string> extra; // added to every rclone call
-    engine::CommandHook on_command; // sees every rclone command line before it runs
+    engine::CommandHook on_command; // sees each step before it is taken (the walk, a file's reads)
     std::function<void(Event)> on_event; // called without the mutex held
-    // The server's pool of grab's own SSH connections (engine = grab): set, the folder is walked
-    // and fetched through it instead of rclone. Needs `connections`.
+    // The server's pool of grab's own SSH connections, which the folder is walked and fetched
+    // through. Needed, and so is `connections`.
     std::shared_ptr<ssh::Pool> pool;
 };
 
@@ -204,7 +187,7 @@ struct Conflict {
 // After mark_existing: the queued files that would replace a different file.
 [[nodiscard]] std::vector<Conflict> conflicts(const Job& job, Tree& tree, std::mutex& m);
 // The answer, under the caller's mutex: Skip leaves those files out, Keep both gives each a
-// second-copy name (fetched by grab itself: rclone can't rename), Replace changes nothing.
+// second-copy name, Replace changes nothing.
 void apply(existing::Choice choice, const std::vector<Conflict>& found, const std::filesystem::path& dir, Tree& tree);
 // Fetches the queued files until none is left or `stop`. Files still running at a stop are
 // queued again, ready for the next run.

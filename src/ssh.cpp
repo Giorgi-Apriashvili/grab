@@ -673,7 +673,7 @@ void Connection::open(const Target& target) {
     libssh2_session_method_pref(session_, LIBSSH2_METHOD_MAC_CS, std::string(mac_algorithms).c_str());
     libssh2_session_method_pref(session_, LIBSSH2_METHOD_MAC_SC, std::string(mac_algorithms).c_str());
     if (libssh2_session_method_pref(session_, LIBSSH2_METHOD_HOSTKEY, hostkeys.c_str()) != 0)
-        fail(budget::Failure::fatal, "grab can't check this kind of host key (" + hostkeys + ")", target.fallback);
+        fail(budget::Failure::fatal, "grab can't check this kind of host key (" + hostkeys + ")");
 
     if (int rc = libssh2_session_handshake(session_, static_cast<socket_t>(socket_)); rc != 0) {
         // A dropped or reset connection before the login is the server turning grab away
@@ -683,15 +683,8 @@ void Connection::open(const Target& target) {
         // No common algorithm can't get better by trying again.
         bool hopeless = !lost && (rc == LIBSSH2_ERROR_KEX_FAILURE || rc == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED);
         bool slow = rc == LIBSSH2_ERROR_TIMEOUT;
-        // What the two sides couldn't agree on, or a protocol error, rclone might get past; a
-        // dropped or slow connection fails it the same way (no fallback said).
-        const bool negotiation = !lost && (hopeless || rc == LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE ||
-                                           rc == LIBSSH2_ERROR_ALGO_UNSUPPORTED || rc == LIBSSH2_ERROR_PROTO ||
-                                           rc == LIBSSH2_ERROR_HOSTKEY_INIT || rc == LIBSSH2_ERROR_HOSTKEY_SIGN ||
-                                           rc == LIBSSH2_ERROR_INVALID_MAC || rc == LIBSSH2_ERROR_MAC_FAILURE ||
-                                           rc == LIBSSH2_ERROR_DECRYPT);
         fail(hopeless ? budget::Failure::fatal : slow ? budget::Failure::other : budget::Failure::refused,
-             "SSH handshake with " + target.host + " failed", negotiation ? std::string_view(target.fallback) : "");
+             "SSH handshake with " + target.host + " failed");
     }
     check_host_key(target, text);
     log_in(target);
@@ -699,9 +692,8 @@ void Connection::open(const Target& target) {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
 }
 
-void Connection::fail(budget::Failure kind, std::string_view what, std::string_view then) const {
-    throw Error(kind, session_ ? std::format("{}: {}{}", what, last_error(session_), then)
-                               : std::format("{}{}", what, then));
+void Connection::fail(budget::Failure kind, std::string_view what) const {
+    throw Error(kind, session_ ? std::format("{}: {}", what, last_error(session_)) : std::string(what));
 }
 
 void Connection::check_host_key(const Target& target, std::string_view known_hosts_text) {
@@ -715,8 +707,7 @@ void Connection::check_host_key(const Target& target, std::string_view known_hos
     case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:
     case LIBSSH2_HOSTKEY_TYPE_ED25519: break;
     default:
-        throw Error(budget::Failure::fatal,
-                    std::format("{} offered a host key grab can't check{}", target.host, target.fallback));
+        throw Error(budget::Failure::fatal, std::format("{} offered a host key grab can't check", target.host));
     }
     // known_hosts was read by open() (libssh2's own reader takes a narrow path).
     switch (check_known(session_, known_hosts_text, target.host, target.port, std::string_view(key, len))) {

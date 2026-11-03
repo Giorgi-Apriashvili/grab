@@ -34,9 +34,6 @@ enum class Failure {
     other    // anything else: network, missing file, ...
 };
 
-// Classifies a failed `rclone cat`/`rclone lsjson --stat` by its stderr.
-[[nodiscard]] Failure classify_failure(std::string_view stderr_text);
-
 // One server's connections, shared fairly by the downloads using it. Not thread-safe; the
 // owner locks. Users are download ids, oldest first.
 class ServerPool {
@@ -66,8 +63,9 @@ public:
     // ahead of a waiting user that has none, and either below its share or borrowing capacity no
     // other download is waiting for (a small file that can only use one connection leaves the
     // rest of its share to the others).
-    // `staggered`: this start may be a login (rclone's are); grab's engine logs in through its
-    // pool, which paces logins itself, so its starts aren't kept `stagger` apart.
+    // `staggered`: kept `stagger` after the previous start (the first seat of a search, a list
+    // fetch, a walk or Verify, fetch::Connections::reserve); a download's starts aren't, its
+    // ssh::Pool pacing the logins itself.
     [[nodiscard]] bool may_start(int id, Clock::time_point now, bool staggered = true) const;
     // Whether `id` (a user) may take a connection that is free now without anyone handing one
     // back or waiting longer for it: below the budget, and no other user waiting for one.

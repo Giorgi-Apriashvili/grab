@@ -2,8 +2,7 @@
 
 // Browsing a server's folders in grab's window. A folder opens from the server's saved file list
 // (file_list.hpp) when the list holds all of its contents, which is instant; deeper folders,
-// beyond the list's max_depth, are listed live with one `rclone lsjson`, or on engine = grab one
-// SFTP listing on a pooled connection.
+// beyond the list's max_depth, are listed live with one SFTP listing on a pooled connection.
 
 #include "engine.hpp"
 #include "file_list.hpp"
@@ -24,7 +23,7 @@ namespace grab::browse {
 
 struct Item {
     std::string name;
-    std::string path; // ready for rclone
+    std::string path; // in grab's form (rclone_enc::grab_path)
     bool dir = false;
     std::optional<std::uint64_t> size;  // files only: a folder's total isn't known
     std::optional<std::size_t> items;   // folders whose contents are known: how many entries
@@ -43,10 +42,6 @@ void sort_items(std::vector<Item>& items);
 // A path typed in the window's address bar, as browse uses it: spaces around it and repeated or
 // trailing slashes go; "~" is the login home ("") and "~/x" a path in it.
 [[nodiscard]] std::string address_path(std::string_view text);
-
-// Whether `rclone lsjson <path>`'s answer may be `path` itself as a file: lsjson lists a file as
-// that one file. A folder holding just a file of its own name looks the same.
-[[nodiscard]] bool maybe_file(const std::vector<Item>& items, std::string_view path);
 
 // A server's folders as its saved file list knows them: every folder under its search roots
 // down to max_depth. A folder at max_depth is in the list, but its contents are not.
@@ -97,34 +92,25 @@ struct Crumb {
 };
 [[nodiscard]] std::vector<Crumb> crumbs(const std::vector<std::string>& roots, std::string_view path);
 
-// One folder live: `rclone lsjson <remote:path>`.
-[[nodiscard]] std::vector<std::string> listing_argv(const engine::Context& ctx, std::string_view path);
-// Its output, as items under `path`; dot-entries dropped when `skip_hidden`.
-[[nodiscard]] std::expected<std::vector<Item>, std::string> parse_lsjson(std::string_view json_text,
-                                                                        std::string_view path, bool skip_hidden);
-
-// Why a folder couldn't be listed live, by kind on both engines, so the window tells a typed path
-// that isn't there or isn't yours to list without reading rclone's text.
+// Why a folder couldn't be listed live, by kind, so the window tells a typed path that isn't there
+// or isn't yours to list without reading the server's text.
 struct ListError {
     enum class Kind {
         not_found,
         denied,
-        file, // grab's engine: the path is a file (lsjson lists a file as itself instead)
+        file, // the path is a file
         other,
     };
     Kind kind = Kind::other;
     std::string message; // ready to show
     bool operator==(const ListError&) const = default;
 };
-// The kind of an rclone lsjson failure, from its message.
-[[nodiscard]] ListError::Kind rclone_error_kind(std::string_view message);
 
-// Lists one folder live: `rclone lsjson`, or on engine = grab its SFTP listing on one of the
-// server's pooled connections (`grab`; OPENDIR and READDIRs, a STAT for each link, whose target
-// decides as the walk decides; a broken link, a socket or a device is left out). There, a path
-// that can't be opened as a folder gets one STAT, which tells a file (ListError::Kind::file) from
-// nothing there, and names that aren't UTF-8 are in grab's ‛XX form, so such folders open too
-// (review G60). Only `run.stop` of `run` counts there.
+// Lists one folder live: its SFTP listing on one of the server's pooled connections (`grab`;
+// OPENDIR and READDIRs, a STAT for each link, whose target decides as the walk decides; a broken
+// link, a socket or a device is left out). A path that can't be opened as a folder gets one STAT,
+// which tells a file (ListError::Kind::file) from nothing there, and names that aren't UTF-8 are in
+// grab's ‛XX form, so such folders open too (review G60). Only `run.stop` of `run` counts.
 [[nodiscard]] std::expected<std::vector<Item>, ListError> list_live(const engine::Context& ctx, std::string_view path,
                                                                    const proc::RunOptions& run,
                                                                    const engine::CommandHook& on_command = {},

@@ -26,41 +26,6 @@ extern char** environ;
 
 namespace grab::proc {
 
-namespace {
-
-// Splits a byte stream into lines for run_streaming, tolerating CRLF and a final line
-// without a terminator.
-class LineSplitter {
-public:
-    explicit LineSplitter(const std::function<void(std::string_view)>& sink) : sink_(sink) {}
-
-    void feed(std::string_view chunk) {
-        buffer_ += chunk;
-        std::size_t start = 0;
-        for (;;) {
-            const auto nl = buffer_.find('\n', start);
-            if (nl == std::string::npos) break;
-            emit(std::string_view(buffer_).substr(start, nl - start));
-            start = nl + 1;
-        }
-        buffer_.erase(0, start);
-    }
-    void finish() {
-        if (!buffer_.empty()) emit(buffer_);
-        buffer_.clear();
-    }
-
-private:
-    void emit(std::string_view line) {
-        if (line.ends_with('\r')) line.remove_suffix(1);
-        if (sink_) sink_(line);
-    }
-    const std::function<void(std::string_view)>& sink_;
-    std::string buffer_;
-};
-
-} // namespace
-
 #ifdef _WIN32
 
 std::expected<std::filesystem::path, std::string> find_program(std::string_view argv0, bool pathext) {
@@ -204,8 +169,8 @@ BOOL WINAPI ignore_ctrl(DWORD type) {
     return (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) ? TRUE : FALSE;
 }
 
-// While a console child runs, grab itself ignores Ctrl+C; the child (rclone/ssh) receives it,
-// cleans up, and grab reports the child's exit code.
+// While a console child runs, grab itself ignores Ctrl+C; the child (an editor, the installer)
+// receives it, cleans up, and grab reports the child's exit code.
 struct CtrlGuard {
     bool active;
     explicit CtrlGuard(bool on = true) : active(on) {
@@ -434,60 +399,6 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     if (err_reader.joinable()) err_reader.join();
     if (writer.joinable()) writer.join();
     result.exit_code = wait_exit(child); // a stopped job exits with exit_stopped
-    return result;
-}
-
-std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
-                                              const std::function<void(std::string_view)>& on_line,
-                                              const RunOptions& opts) {
-    Pipe err;
-    if (auto r = make_pipe(err, true); !r) return util::fail(r.error());
-    Handle null_io;
-    if (auto r = open_null(null_io); !r) return util::fail(r.error());
-
-    StdHandles std_h{null_io.h, null_io.h, err.write.h, true};
-    Child child;
-    if (auto r = launch(argv, std_h, opts.detached, child, opts.environment); !r) return util::fail(r.error());
-    err.write.close();
-    std::stop_callback on_stop(opts.stop, [&] { TerminateJobObject(child.job.h, exit_stopped); });
-
-    LineSplitter lines(on_line);
-    drain(err.read.h, [&](std::string_view s) { lines.feed(s); });
-    lines.finish();
-    return wait_exit(child); // a stopped job exits with exit_stopped
-}
-
-std::expected<PipedResult, std::string> run_piped(std::span<const std::string> argv,
-                                                  const std::function<bool(std::string_view)>& on_data,
-                                                  const RunOptions& opts) {
-    constexpr DWORD pipe_size = 1 << 20; // fewer round trips at full download speed
-    Pipe out;
-    if (auto r = make_pipe(out, true, pipe_size); !r) return util::fail(r.error());
-    Pipe err;
-    if (auto r = make_pipe(err, true); !r) return util::fail(r.error());
-    Handle null_in;
-    if (auto r = open_null(null_in); !r) return util::fail(r.error());
-
-    StdHandles std_h{null_in.h, out.write.h, err.write.h, true};
-    Child child;
-    if (auto r = launch(argv, std_h, true, child, opts.environment); !r) return util::fail(r.error());
-    out.write.close();
-    err.write.close();
-    std::stop_callback on_stop(opts.stop, [&] { TerminateJobObject(child.job.h, exit_stopped); });
-
-    PipedResult result;
-    std::jthread err_reader([&] { drain(err.read.h, [&](std::string_view s) { result.err += s; }); });
-    std::vector<char> buf(pipe_size);
-    DWORD n = 0;
-    while (ReadFile(out.read.h, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) && n > 0) {
-        if (!on_data(std::string_view(buf.data(), n))) {
-            TerminateJobObject(child.job.h, exit_stopped);
-            break;
-        }
-    }
-    out.read.close(); // a child still writing gets a broken pipe instead of blocking
-    err_reader.join();
-    result.exit_code = wait_exit(child);
     return result;
 }
 
@@ -756,90 +667,6 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
     if (opts.detached) close(err[0]);
     const int code = wait_pid(*pid);
     result.exit_code = opts.stop.stop_requested() ? exit_stopped : code;
-    return result;
-}
-
-std::expected<int, std::string> run_streaming(std::span<const std::string> argv,
-                                              const std::function<void(std::string_view)>& on_line,
-                                              const RunOptions& opts) {
-    int err[2];
-    if (pipe(err) != 0) return util::failf("cannot create pipe: {}", std::strerror(errno));
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&actions, err[0]);
-    posix_spawn_file_actions_addclose(&actions, err[1]);
-
-    auto pid = spawn(argv, &actions, true, opts.environment);
-    posix_spawn_file_actions_destroy(&actions);
-    close(err[1]);
-    if (!pid) {
-        close(err[0]);
-        return util::fail(pid.error());
-    }
-    std::stop_callback on_stop(opts.stop, [&] { kill(-*pid, SIGTERM); });
-
-    LineSplitter lines(on_line);
-    drain(err[0], [&](std::string_view s) { lines.feed(s); });
-    lines.finish();
-    close(err[0]);
-    const int code = wait_pid(*pid);
-    return opts.stop.stop_requested() ? exit_stopped : code;
-}
-
-std::expected<PipedResult, std::string> run_piped(std::span<const std::string> argv,
-                                                  const std::function<bool(std::string_view)>& on_data,
-                                                  const RunOptions& opts) {
-    int out[2];
-    int err[2];
-    if (pipe(out) != 0) return util::failf("cannot create pipe: {}", std::strerror(errno));
-    if (pipe(err) != 0) {
-        close(out[0]);
-        close(out[1]);
-        return util::failf("cannot create pipe: {}", std::strerror(errno));
-    }
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
-    for (int fd : {out[0], out[1], err[0], err[1]}) posix_spawn_file_actions_addclose(&actions, fd);
-
-    auto pid = spawn(argv, &actions, true, opts.environment);
-    posix_spawn_file_actions_destroy(&actions);
-    close(out[1]);
-    close(err[1]);
-    if (!pid) {
-        close(out[0]);
-        close(err[0]);
-        return util::fail(pid.error());
-    }
-    bool stopped = false;
-    std::stop_callback on_stop(opts.stop, [&] { kill(-*pid, SIGTERM); });
-
-    PipedResult result;
-    std::jthread err_reader([&] { drain(err[0], [&](std::string_view s) { result.err += s; }); });
-    std::vector<char> buf(1 << 20);
-    for (;;) {
-        const ssize_t n = read(out[0], buf.data(), buf.size());
-        if (n > 0) {
-            if (!on_data(std::string_view(buf.data(), static_cast<std::size_t>(n)))) {
-                stopped = true;
-                kill(-*pid, SIGTERM);
-                break;
-            }
-        } else if (n == 0 || errno != EINTR) {
-            break;
-        }
-    }
-    close(out[0]);
-    err_reader.join();
-    close(err[0]);
-    const int code = wait_pid(*pid);
-    result.exit_code = stopped || opts.stop.stop_requested() ? exit_stopped : code;
     return result;
 }
 

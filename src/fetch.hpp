@@ -1,7 +1,7 @@
 #pragma once
 
-// grab's own resumable file download. rclone cannot resume a stopped transfer, so a file is
-// fetched in byte ranges: several `rclone cat --offset N --count M` streams write into
+// grab's own resumable file download. A file is fetched in byte ranges: several streams, each on
+// a connection of the server's pool reading its range with SFTP READs of exact bounds, write into
 // "<name>.grabpart" at the right offsets, and "<name>.grabpart.json" records how much of each
 // chunk is on disk. Stopping keeps both; the next run continues from there, even after grab
 // restarts. The streams of all downloads share each server's connection budget (conn_budget).
@@ -12,14 +12,12 @@
 // "<name>.2.grabpart" and so on.
 
 #include "conn_budget.hpp"
-#include "process.hpp"
 #include "rate.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -40,8 +38,9 @@ namespace grab::fetch {
 
 inline constexpr std::uint64_t min_chunk = std::uint64_t{16} << 20;
 inline constexpr std::uint64_t max_chunk = std::uint64_t{128} << 20;
-// A busy range is split for an idle stream only when both halves get at least this much: a piece
-// costs rclone a new login, and grab's engine one round trip on a connection it keeps.
+// A busy range is split for an idle stream only when both halves get at least this much (split's
+// default); a download splits from min_split_grab, a piece costing one round trip on a connection
+// the pool keeps.
 inline constexpr std::uint64_t min_split = std::uint64_t{4} << 20;
 inline constexpr std::uint64_t min_split_grab = std::uint64_t{1} << 20;
 // READs grab's engine keeps in flight per connection (a Storage Box connection's speed follows it).
@@ -60,8 +59,8 @@ inline constexpr int max_retries = 6; // per range, before the download fails
 inline constexpr std::chrono::minutes refused_give_up{5};
 
 // Chunk size for a file of `size` bytes fetched over up to `streams` connections: enough chunks
-// to keep every stream busy, within [floor, max_chunk]. rclone's engine pays a login per chunk
-// (min_chunk); grab's a round trip, so a folder's 20 MiB file spreads over its connections too.
+// to keep every stream busy, within [floor, max_chunk]. A download passes min_split_grab (a chunk
+// costs a round trip), so a folder's 20 MiB file spreads over its connections too.
 [[nodiscard]] std::uint64_t chunk_size_for(std::uint64_t size, int streams, std::uint64_t floor = min_chunk);
 
 // A byte range of the file and how much of it, from its start, is on disk.
@@ -103,13 +102,12 @@ std::optional<std::size_t> split(State& s, std::size_t i, std::uint64_t asked = 
 // beyond a range).
 [[nodiscard]] std::optional<State> state_from_json(std::string_view text);
 
+// The server's file as one STAT gives it.
 struct RemoteStat {
     std::uint64_t size = 0;
     std::string modtime;
     bool is_dir = false;
 };
-// `rclone lsjson --stat` output.
-[[nodiscard]] std::expected<RemoteStat, std::string> parse_stat(std::string_view json_text);
 
 // Whether a local copy already holds the server's file: the same size, and modified no earlier
 // than the server's copy (2 s slack for coarse file systems). grab and rclone give a finished
@@ -120,24 +118,12 @@ struct RemoteStat {
 // The same for a file on disk (false when there is none); `modtime` as rclone reports it.
 [[nodiscard]] bool up_to_date(const std::filesystem::path& local, std::uint64_t size, std::string_view modtime);
 
-// Where a file comes from and how rclone reaches it.
+// Where a file comes from: the server (its rclone_remote, which partial downloads are told apart
+// by) and the file's path there.
 struct Source {
-    std::string rclone; // executable
-    // The server in rclone's environment, its config in memory (engine::rclone_env); unused when
-    // grab's own pool fetches (Download::pool).
-    proc::Environment environment;
     std::string rclone_remote;
     std::string path;
-    std::vector<std::string> flags; // common_flags' connection flags (rclone_flags::connection)
-    // After grab's fixed --contimeout, --timeout and --low-level-retries, so they win: the server's
-    // keys (engine::key_flags), then the command's connection flags after `--`.
-    std::vector<std::string> after;
 };
-[[nodiscard]] std::vector<std::string> stat_argv(const Source& src);
-// `low_read_ahead`: under a speed limit, keep rclone from downloading far ahead of what grab
-// takes (--buffer-size 0, few SFTP requests in flight), so the network follows the limit.
-[[nodiscard]] std::vector<std::string> cat_argv(const Source& src, std::uint64_t offset, std::uint64_t count,
-                                                bool low_read_ahead = false);
 
 // One partial download's files: the data, and the record of its State beside it.
 struct PartialFiles {
@@ -192,28 +178,25 @@ public:
     void set_weight(const std::string& server, int id, int weight);
     void leave(const std::string& server, int id);
     // Waits until `id` may open one more connection; false when `stop` was requested first.
-    // `staggered`: kept ServerPool::stagger after the last start (a login: rclone's); grab's
-    // engine passes false, its pool pacing its own logins.
+    // `staggered`: kept ServerPool::stagger after the last start, as reserve's first seat is (a
+    // search's, a list fetch's, a walk's or Verify's: logins on Main start as they always did);
+    // downloads pass false, the server's ssh::Pool pacing its own logins.
     bool acquire(const std::string& server, int id, std::stop_token stop, bool staggered = true);
     // One more connection for `id` (joined) only if one is free now: within the budget, and no
     // other user waiting for one. It never waits and never counts as waiting, so no download hands
     // a connection back for it: a preview's extra connections, the viewer's neighbours fetched
     // ahead. Released as acquire's.
     [[nodiscard]] bool try_acquire(const std::string& server, int id);
-    // Takes up to `id`'s whole share at once (for an rclone copy or listing that manages its own
-    // connections), at most `at_most`; at least 1 unless stopped (0). With `settle`, it waits that
-    // long for downloads above their shares to hand connections back first.
+    // Takes up to `id`'s whole share at once (for a walk that manages its own connections,
+    // Listing), at most `at_most`; at least 1 unless stopped (0). The first is acquire's, staggered;
+    // the rest follow at once. With `settle`, it waits that long for downloads above their shares
+    // to hand connections back first.
     int reserve(const std::string& server, int id, std::stop_token stop, int at_most = 1 << 20,
                 std::chrono::milliseconds settle = std::chrono::milliseconds(0));
     // `worked`: the connection got data (see working), and stops counting as working too.
     void release(const std::string& server, int id, int count = 1, bool worked = false);
     // `count` connections of `id` got their first data: the server takes grab's connections.
     void working(const std::string& server, int id, int count = 1);
-    // For an rclone copy holding `held` connections (reserve): whether it should start again
-    // with another number, because another download waits for its share while this holds more
-    // than its own, or because at least two more are free within its share (review G192), up to
-    // `at_most`.
-    [[nodiscard]] bool unbalanced(const std::string& server, int id, int held, int at_most = 1 << 20);
     // When `id` holds more connections than its share while another download waits for its own
     // (e.g. one just joined), gives one up and returns true; the caller then stops that stream
     // and must not release it again.
@@ -256,10 +239,10 @@ private:
     OnLearned on_learned_;
 };
 
-// Connections from a server's pool for one rclone walk of a tree (lsf -R, lsjson -R), which
-// opens as many as its --checkers (rclone's default 8; each a new SSH login): up to `at_most`,
-// its share at High priority while downloads run, given back when destroyed (review G191). Pass
-// connections() to rclone as --checkers N --sftp-connections N.
+// Connections from a server's pool for one walk of a tree (a search's, a list fetch's, a folder's
+// listing), which reads folders on as many at once: up to `at_most`, its share at High priority
+// while downloads run, given back when destroyed (review G191). Pass connections() to the walk
+// (ssh::WalkOptions::connections).
 class Listing {
 public:
     Listing(Connections& connections, std::string server, std::stop_token stop, int at_most = 8);
@@ -267,8 +250,6 @@ public:
     Listing(const Listing&) = delete;
     Listing& operator=(const Listing&) = delete;
     [[nodiscard]] int connections() const { return held_; } // 0: stopped while waiting
-    // The rclone flags for them.
-    [[nodiscard]] std::vector<std::string> flags() const;
 
 private:
     Connections& connections_;
@@ -318,11 +299,11 @@ struct Download {
     // gets an even part of the folder's connections beside its other files downloading. A stream
     // over it gives its connection up and goes on later from its bytes. Unset: no cap.
     std::function<int()> streams_cap;
-    // Sees every rclone command line before it runs (`grab -v`); called from several threads.
-    // grab's engine shows what it does the same way ("sftp read <path> --offset N --count M").
+    // Sees each step before it is taken (`grab -v`: "sftp stat <path>", "sftp read <path> --offset
+    // N --count M"); called from several threads.
     std::function<void(const std::vector<std::string>&)> on_command;
-    // The server's pool of grab's own SSH connections (engine = grab): set, the download's size
-    // check and byte ranges go through it instead of rclone; `source` then only gives the path.
+    // The server's pool of grab's own SSH connections, which the size check and the byte ranges go
+    // through. Needed: without one the download fails.
     std::shared_ptr<ssh::Pool> pool;
 };
 

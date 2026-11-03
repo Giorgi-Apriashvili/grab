@@ -1,9 +1,7 @@
 #include "servers.hpp"
-#include "rclone.hpp"
 
 #include <doctest/doctest.h>
 
-#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -112,14 +110,6 @@ TEST_CASE("merge_known_hosts appends only new lines") {
     CHECK(servers::merge_known_hosts(first, keys) == first);
     CHECK(servers::merge_known_hosts("other key", {"[h]:23 ssh-ed25519 AAAA"}) ==
           "other key\n[h]:23 ssh-ed25519 AAAA\n");
-}
-
-TEST_CASE("rclone's probe: the server in its environment, its config in memory; nothing else builds rclone config") {
-    const auto probe = servers::probe_argv("rclone", "box");
-    CHECK(probe[2] == "box:");
-    CHECK(std::ranges::find(probe, "--contimeout") != probe.end());
-    CHECK(probe.back() == config_in_memory); // the server comes in its environment (engine::rclone_env)
-    CHECK(std::ranges::find(probe, "config") == probe.end());
 }
 
 namespace {

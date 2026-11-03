@@ -264,9 +264,6 @@ Report run(const Request& r, std::stop_token stop) {
         std::ranges::sort(differing);
         prove(r, differing, stop, give);
     }
-    // A pool made only to verify (engine = rclone) drops its idle connections before the seats go
-    // back: rclone's own logins don't count them, and could otherwise pass the server's cap.
-    if (r.close_idle_after) r.pool->close_idle(ssh::Pool::Clock::now() + std::chrono::hours(1));
     done_with_seats();
     return report;
 }

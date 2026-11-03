@@ -162,8 +162,7 @@ struct Played {
     }
     play::Server::File file(int connections_count = 2, std::string path = "/v/a.mp4", std::string name = "a.mp4") {
         return play::Server::File{.server = "Main", .pool = pool, .path = std::move(path), .name = std::move(name),
-                                  .connections = connections_count, .logins_at_once = 0, .ahead = 16 * mib,
-                                  .close_on_release = false};
+                                  .connections = connections_count, .logins_at_once = 0, .ahead = 16 * mib};
     }
     std::expected<std::string, std::string> start(play::Server::File f, std::stop_token stop = {}) {
         return server->play(std::move(f), [this](std::uint64_t done, std::uint64_t total) { progress.emplace_back(done, total); },
@@ -834,26 +833,6 @@ TEST_CASE("play: a Play over its share hands a seat to a waiting download betwee
     t.fake.slow_from_now = 0;
     player.join();
     CHECK(r.body == t.content.substr(20000000, 40 * mib));
-}
-
-TEST_CASE("play: engine = rclone closes Play's connections as they go back, leaving none idle in the pool") {
-    play::Server::Options o;
-    o.release_after = 200ms;
-    o.free_after = 500ms; // nobody waits for a seat: they go back with the data
-    o.housekeeping = 50ms;
-    Played t(30 * mib, o);
-    auto f = t.file(2);
-    f.close_on_release = true;
-    const auto address = t.start(std::move(f));
-    REQUIRE_MESSAGE(address, address.error());
-    const auto u = url_of(*address);
-    REQUIRE(u);
-    CHECK(ask(*u, "Range: bytes=15000000-15999999\r\n").body == t.content.substr(15000000, 1000000));
-    CHECK(within(5s, [&] {
-        const auto s = t.server->stats();
-        return s.connected == 0 && s.seats == 0;
-    }));
-    CHECK(t.pool->idle() == 0);
 }
 
 TEST_CASE("play: a seek while every connection is busy reading for other requests is still served") {

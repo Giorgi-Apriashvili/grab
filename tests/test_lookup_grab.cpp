@@ -156,8 +156,6 @@ engine::Context grab_context() {
     ctx.settings.name = "Fake";
     ctx.settings.rclone_remote = "Fake";
     ctx.settings.search_roots = {"/data"};
-    ctx.settings.engine = Engine::grab;
-    ctx.engine = Engine::grab;
     ctx.grab_method = GrabMethod::probe;
     return ctx;
 }
@@ -396,7 +394,7 @@ TEST_CASE("grab engine file lists: find or the walk, the same entries in list fo
     const auto ctx = grab_context();
     engine::GrabSide side;
     side.pool = walked.pool();
-    auto list = file_list::fetch(ctx, 1234, false, {}, {}, {}, side);
+    auto list = file_list::fetch(ctx, 1234, {}, {}, side);
     REQUIRE_MESSAGE(list, list.error_or(""));
     CHECK(list->fetched == 1234);
     CHECK(list->fingerprint == file_list::fingerprint(ctx));
@@ -416,7 +414,7 @@ TEST_CASE("grab engine file lists: find or the walk, the same entries in list fo
     Server found;
     found.with_find({"d\t1700000000.0\t/data/tv\0"s, "f\t1\t1700000000.0\t/data/tv/caf\xE9.txt\0"s});
     side.pool = found.pool();
-    list = file_list::fetch(ctx, 1234, false, {}, {}, {}, side);
+    list = file_list::fetch(ctx, 1234, {}, {}, side);
     REQUIRE_MESSAGE(list, list.error_or(""));
     REQUIRE(list->entries.size() == 2);
     CHECK(list->entries[1] == file_list::Entry{"/data/tv/caf‛E9.txt", false, 1, 1700000000});
@@ -429,17 +427,16 @@ TEST_CASE("grab engine file lists: find or the walk, the same entries in list fo
 TEST_CASE("grab engine file lists: the fingerprint names the engine and the find setting") {
     auto ctx = grab_context();
     const auto probe = file_list::fingerprint(ctx);
-    CHECK(probe.find("|grab+probe|") != std::string::npos);
+    CHECK(probe == "1|Fake|grab+probe|@:22|depth=4|hidden=skip|roots=/data");
     auto other = ctx;
     other.grab_method = GrabMethod::walk;
     CHECK(file_list::fingerprint(other).find("|grab+walk|") != std::string::npos);
     other.grab_method = GrabMethod::find;
     CHECK(file_list::fingerprint(other).find("|grab+find|") != std::string::npos);
-    // The rclone engine's lists keep theirs.
+    // `engine = rclone` in the section changes nothing: 0.20's grab lists stay valid.
     other = ctx;
-    other.engine = Engine::rclone;
-    other.method = FindMethod::ssh;
-    CHECK(file_list::fingerprint(other) == "1|Fake|ssh|@:22|depth=4|hidden=skip|roots=/data");
+    other.settings.engine = Engine::rclone;
+    CHECK(file_list::fingerprint(other) == probe);
 }
 
 TEST_CASE("grab engine Browse: links followed, dot-names left out, odd names in grab's form, sorted") {
@@ -504,11 +501,6 @@ TEST_CASE("grab engine Browse: errors by kind; a file path is told by one STAT")
     failed = browse::list_live(ctx, "/data", run, {}, side);
     REQUIRE_FALSE(failed);
     CHECK(failed.error().message == "stopped");
-
-    // The rclone engine's errors get their kinds from rclone's text.
-    CHECK(browse::rclone_error_kind("error listing: directory not found") == browse::ListError::Kind::not_found);
-    CHECK(browse::rclone_error_kind("couldn't list: permission denied") == browse::ListError::Kind::denied);
-    CHECK(browse::rclone_error_kind("connection refused") == browse::ListError::Kind::other);
 }
 
 TEST_CASE("grab engine: a server that answers READDIR with empty NAMEs, never EOF, ends Browse and the walk") {
@@ -522,7 +514,7 @@ TEST_CASE("grab engine: a server that answers READDIR with empty NAMEs, never EO
     auto items = browse::list_live(ctx, "/data/tv", {}, {}, side);
     REQUIRE(items);
     CHECK(items->size() == 2);
-    auto list = file_list::fetch(ctx, 1234, false, {}, {}, {}, side);
+    auto list = file_list::fetch(ctx, 1234, {}, {}, side);
     REQUIRE_MESSAGE(list, list.error_or(""));
     CHECK(list->entries.size() == 6);
     CHECK(pool->idle() == 1); // every reply in
@@ -812,7 +804,7 @@ TEST_CASE("grab engine: a saved 'find works' that find contradicts is asked agai
     engine::GrabSide side;
     side.pool = s.pool();
     side.memory = engine::find_memory(file, main, {});
-    auto list = file_list::fetch(ctx, 1234, false, {}, {}, {}, side);
+    auto list = file_list::fetch(ctx, 1234, {}, {}, side);
     REQUIRE_MESSAGE(list, list.error_or(""));
     CHECK(list->entries.size() == 6);
     CHECK(s.ran().size() == 4);

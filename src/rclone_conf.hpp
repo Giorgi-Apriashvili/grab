@@ -1,9 +1,8 @@
 #pragma once
 
 // An rclone.conf as rclone 1.75.1 reads it (its config reader, goconfig v1.0.0), for what grab
-// takes from one: the rclone run of a server still defined there (engine::rclone_env) and the
-// one-time import of servers into grab.conf (rclone_import.hpp). grab's own ini reader (ini.hpp)
-// stays for grab.conf. Checked against `rclone config dump` (tests/test_rclone_env.cpp;
+// takes from one: the one-time import of servers into grab.conf (rclone_import.hpp). grab's own
+// ini reader (ini.hpp) stays for grab.conf. Checked against `rclone config dump` (tests/test_rclone_env.cpp;
 // RCLONE-REPLACEMENT.md, progress log 2026-10-29):
 // - A line is a comment when it starts with '#' or ';' after any indent; a '#' or ';' after a
 //   value is part of it. A UTF-8 byte order mark and CRLF are fine.

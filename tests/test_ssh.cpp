@@ -382,9 +382,8 @@ std::string kexinit_packet(std::string_view kex, std::string_view host_key, std:
 
 } // namespace
 
-TEST_CASE("ssh: a handshake the two sides can't agree on names the fallback; a dropped connection doesn't (phase 8)") {
+TEST_CASE("ssh: a handshake the two sides can't agree on is fatal with its own text; a dropped connection is turned away") {
     const auto known_hosts = std::filesystem::temp_directory_path() / "grab-test-fallback-known_hosts";
-    const std::string fallback = "; to use rclone for Old until a later grab removes it, set engine = rclone in [Old]";
     auto failure = [&](OneShotServer& server) {
         ssh::Target t;
         t.host = "127.0.0.1";
@@ -394,7 +393,6 @@ TEST_CASE("ssh: a handshake the two sides can't agree on names the fallback; a d
         t.known_hosts = known_hosts;
         t.connect_timeout = std::chrono::seconds(5);
         t.timeout = std::chrono::seconds(5);
-        t.fallback = fallback;
         std::ofstream(known_hosts, std::ios::binary | std::ios::trunc)
             << ssh::known_host_line("127.0.0.1", server.port, key_of(ed25519_key)) << "\n";
         try {
@@ -406,14 +404,15 @@ TEST_CASE("ssh: a handshake the two sides can't agree on names the fallback; a d
         }
         return std::pair{budget::Failure::other, std::string("connected")};
     };
-    // A server that offers only an old key exchange (SHA-1 group 1), which grab doesn't: rclone,
-    // with engine = rclone, might still agree with it.
+    // A server that offers only an old key exchange (SHA-1 group 1), which grab doesn't: trying
+    // again can't help, and nothing points at a fallback (phase 9: there is none).
     OneShotServer old(kexinit_packet("diffie-hellman-group1-sha1", "ssh-ed25519", "aes128-ctr", "hmac-sha2-256"));
     const auto disagreed = failure(old);
     CHECK(disagreed.first == budget::Failure::fatal);
     CHECK(disagreed.second.starts_with("SSH handshake with 127.0.0.1 failed: "));
-    CHECK(disagreed.second.ends_with(fallback));
-    // One that hangs up at once (MaxStartups, fail2ban): rclone would fare no better.
+    CHECK(disagreed.second.find("engine = rclone") == std::string::npos);
+    CHECK(disagreed.second.find("rclone") == std::string::npos);
+    // One that hangs up at once (MaxStartups, fail2ban): turned away, tried again later.
     OneShotServer dropping("", Shot::hang_up);
     const auto dropped = failure(dropping);
     CHECK(dropped.first == budget::Failure::refused);

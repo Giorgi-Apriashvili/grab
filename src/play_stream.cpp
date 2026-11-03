@@ -931,10 +931,9 @@ void Server::Stream::Lane::ping() {
 
 void Server::Stream::Lane::release(bool drop, bool seat_gone) {
     if (lease) {
-        // Closed rather than kept: replies still on their way, the window closing (no CLOSE to wait
-        // for: the server closes the handle with the connection), or engine = rclone, whose rclone
-        // can't see the pool's idle connections while a Storage Box counts them.
-        if ((drop && (reads > 0 || s.server.closing_)) || s.file.close_on_release) {
+        // Closed rather than kept: replies still on their way, or the window closing (no CLOSE to
+        // wait for: the server closes the handle with the connection).
+        if (drop && (reads > 0 || s.server.closing_)) {
             lease->broken();
         } else {
             try {

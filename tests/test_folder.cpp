@@ -1,18 +1,12 @@
-#include "config.hpp"
-#include "engine.hpp"
-#include "fetch.hpp"
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "gui_state.hpp"
-#include "server_conf.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
 #include <algorithm>
-#include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <stop_token>
 #include <string>
@@ -20,57 +14,7 @@
 #include <vector>
 
 using namespace grab;
-using namespace std::string_view_literals;
 using folder::State;
-
-TEST_CASE("folder listing: files only, sorted, sizes and times") {
-    const auto files = folder::parse_listing(
-        R"([{"Path":"b.mp4","Name":"b.mp4","Size":42642378,"ModTime":"2023-05-06T15:18:12+04:00","IsDir":false},)"
-        R"({"Path":"sub","Name":"sub","Size":-1,"IsDir":true},)"
-        R"({"Path":"sub/a #1 [x].mp4","Name":"a #1 [x].mp4","Size":5,"ModTime":"2023-01-01T00:00:00Z","IsDir":false},)"
-        R"({"Path":"a.txt","Size":0,"IsDir":false}])");
-    REQUIRE(files.has_value());
-    REQUIRE(files->size() == 3);
-    CHECK((*files)[0] == folder::FolderFile{"a.txt", 0, ""});
-    CHECK((*files)[1] == folder::FolderFile{"b.mp4", 42642378, "2023-05-06T15:18:12+04:00"});
-    CHECK((*files)[2].path == "sub/a #1 [x].mp4");
-    CHECK_FALSE(folder::parse_listing("{}").has_value());
-    CHECK(folder::parse_listing("[]")->empty());
-}
-
-TEST_CASE("big files take the resumable path") {
-    CHECK_FALSE(folder::is_big(0));
-    CHECK_FALSE(folder::is_big(folder::big_file_threshold - 1));
-    CHECK(folder::is_big(folder::big_file_threshold));
-    CHECK(folder::is_big(std::uint64_t{20} << 30));
-}
-
-TEST_CASE("rclone's file list and its per-file log lines") {
-    // Taken literally with --files-from-raw, so filter characters need no escaping.
-    CHECK(folder::files_from_text({"a #1 [x].mp4", "sub/b.mp4", "line\nbreak"}) ==
-          "a #1 [x].mp4\0sub/b.mp4\0line\nbreak\0"sv); // --files-from0 (G18)
-    CHECK(folder::files_from_text({}).empty());
-
-    // (R"j(...)j": the text itself contains `)"`.)
-    CHECK(folder::parse_copied_line(R"j({"time":"t","level":"info","msg":"Copied (new)","size":3771504,)j"
-                                    R"j("object":"sub/winrar.exe","objectType":"*sftp.Object"})j") == "sub/winrar.exe");
-    CHECK(folder::parse_copied_line(R"j({"level":"info","msg":"Copied (replaced existing)","object":"x"})j") == "x");
-    CHECK_FALSE(folder::parse_copied_line(R"({"level":"notice","msg":"stats","stats":{}})").has_value());
-    CHECK_FALSE(folder::parse_copied_line("Copied, but not JSON").has_value());
-}
-
-TEST_CASE("rclone stats list each file in flight") {
-    const auto p = engine::parse_stats_line(
-        R"({"level":"notice","stats":{"bytes":300,"totalBytes":1000,"speed":10,"transferring":[)"
-        R"({"name":"a.mp4","bytes":100,"size":400,"speed":4},{"name":"sub/b.mp4","bytes":200,"size":600,"speed":6}]}})");
-    REQUIRE(p.has_value());
-    REQUIRE(p->transferring.size() == 2);
-    CHECK(p->transferring[0].name == "a.mp4");
-    CHECK(p->transferring[0].bytes == 100);
-    CHECK(p->transferring[0].size == 400);
-    CHECK(p->transferring[1].name == "sub/b.mp4");
-    CHECK(p->transferring[1].speed == doctest::Approx(6));
-}
 
 TEST_CASE("a big folder shows its active files and the first few queued") {
     const std::vector<State> states{State::done,   State::queued, State::running, State::queued, State::skipped,
@@ -120,13 +64,18 @@ TEST_CASE("folder totals count finished and running files, not skipped ones") {
     CHECK(tot.speed == 10);
     REQUIRE(tot.eta.has_value());
     CHECK(*tot.eta == doctest::Approx(51.0));
-    CHECK(folder::make_file("x", folder::big_file_threshold, "").big);
-    CHECK_FALSE(folder::make_file("x", 10, "").big);
-    // A small file with a device name anywhere in its path goes through grab's engine, not rclone.
-    CHECK(folder::make_file("CON", 10, "").big);
-    CHECK(folder::make_file("season 1/nul.txt", 10, "").big);
-    CHECK(folder::make_file("aux/e01.srt", 10, "").big);
-    CHECK_FALSE(folder::make_file("console.txt", 10, "").big);
+    // From small_limit up a file takes the resumable path; a device name changes nothing (grab
+    // writes every file itself).
+    CHECK(folder::make_file("x", folder::small_limit, "").big);
+    CHECK_FALSE(folder::make_file("x", folder::small_limit - 1, "").big);
+    CHECK_FALSE(folder::make_file("CON", 10, "").big);
+    CHECK_FALSE(folder::make_file("season 1/nul.txt", 10, "").big);
+    std::vector<folder::File> files{folder::make_file("a", 10, ""), folder::make_file("b", folder::small_limit, "")};
+    files[0].big = true; // as an older run or a Keep both left it
+    files[1].big = false;
+    folder::set_big(files);
+    CHECK_FALSE(files[0].big);
+    CHECK(files[1].big);
     // A folder lands under its own name, made safe: never outside the download folder.
     const std::filesystem::path dest = util::path_from_utf8("D:\\Downloads");
     CHECK(folder::local_dir(dest, "/srv/..\\up") == dest / util::path_from_utf8("..＼up"));
@@ -138,24 +87,19 @@ TEST_CASE("single files of a folder: pause, resume, skip and retry") {
     folder::Tree t;
     t.files.push_back(folder::make_file("waiting", 10, ""));
     t.files.push_back(folder::make_file("copying", 10, ""));
-    t.files.push_back(folder::make_file("big", folder::big_file_threshold, ""));
-    t.files.push_back(folder::make_file("broken", folder::big_file_threshold, ""));
-    t.files[0].in_batch = true;
-    t.files[1].in_batch = true;
+    t.files.push_back(folder::make_file("big", folder::small_limit, ""));
+    t.files.push_back(folder::make_file("broken", folder::small_limit, ""));
     t.files[1].status = State::running;
     t.files[1].bytes = 5;
     t.files[2].status = State::running;
     t.files[3].status = State::failed;
     t.files[3].error = "oops";
 
-    folder::pause_file(t, "waiting"); // still queued in the batch: rclone would fetch it
+    folder::pause_file(t, "waiting"); // queued: not taken
     CHECK(t.files[0].status == State::paused);
-    CHECK(t.batch_stop.stop_requested());
-    t.batch_stop = {};
-    folder::pause_file(t, "copying"); // in the batch: restarts it without the file
+    folder::pause_file(t, "copying"); // a small file in flight: dropped once its replies are in
     CHECK(t.files[1].status == State::paused);
     CHECK(t.files[1].bytes == 0);
-    CHECK(t.batch_stop.stop_requested());
     folder::pause_file(t, "big"); // its own stop; it is marked paused once stopped
     CHECK(t.files[2].status == State::running);
     CHECK(t.files[2].stop_reason == folder::StopReason::pause);
@@ -175,12 +119,6 @@ TEST_CASE("single files of a folder: pause, resume, skip and retry") {
     REQUIRE(discard->reserved);
     CHECK(discard->reserved(dir / "BIG")); // the folder's files, as Windows compares names
     CHECK_FALSE(discard->reserved(dir / "broken.grabpart"));
-    // A folder file named like an rclone temp file is the folder's own: kept by the batch cleanup.
-    folder::Tree named;
-    named.files.push_back(folder::make_file("notes.txt", 1, ""));
-    named.files.push_back(folder::make_file("notes.txt.12345678.partial", 1, ""));
-    CHECK(folder::reserved_names(dir, named)(dir / "notes.txt.12345678.partial"));
-    CHECK_FALSE(folder::reserved_names(dir, named)(dir / "notes.txt.90c84c01.partial"));
     CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", "big").has_value()); // running: stopped, then discarded
     CHECK(t.files[2].stop_reason == folder::StopReason::skip);
 
@@ -206,63 +144,20 @@ TEST_CASE("a folder's local directory and its files' remote paths") {
     CHECK(folder::child_remote_path("", "b") == "b");
 }
 
-#ifdef _WIN32
-TEST_CASE("a folder is listed by rclone with connections from the server's pool (engine = rclone)") {
-    const auto dir = std::filesystem::temp_directory_path() / "grab-test-list-rclone";
-    std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
-    // A stand-in rclone: logs its arguments, lists one file.
-    std::ofstream(dir / "rclone.cmd", std::ios::binary)
-        << "@echo off\r\n"
-           ">> \"%~dp0calls.log\" echo %*\r\n"
-           "echo [{\"Path\":\"a.txt\",\"Name\":\"a.txt\",\"Size\":3,\"ModTime\":\"2026-10-21T10:00:00Z\",\"IsDir\":false}]\r\n";
-    // The server as grab.conf has it, pinned in grab's known_hosts (the runner's scratch APPDATA).
-    server_conf::Connection c;
-    c.host = "main.example";
-    c.user = "u";
-    c.auth = server_conf::Auth::agent;
-    RemoteSettings settings;
-    settings.name = "Main";
-    settings.rclone_remote = "Main";
-    // common_flags' connection flags only, then the walk's connections, then the command's.
-    settings.common_flags = {"-P", "--sftp-chunk-size", "255Ki"};
-    auto ctx = engine::make_context(GrabConfig{}, settings, c, dir / "grab.conf");
-    ctx.config.rclone = util::path_to_utf8(dir / "rclone.cmd");
-    std::filesystem::create_directories(grab_known_hosts_path().parent_path());
-    std::ofstream(grab_known_hosts_path(), std::ios::binary) << "main.example ssh-ed25519 FAKEKEY\n";
-    fetch::Connections connections;
-    connections.configure("Main", 4);
+TEST_CASE("a folder without a connection pool isn't listed") {
     folder::Job job;
-    job.ctx = &ctx;
-    job.connections = &connections;
     job.server = "Main";
     job.remote_path = "/tmp/f";
-    job.dest = dir / "out";
-    job.extra = {"--timeout", "1m"};
     folder::Tree tree;
     std::mutex m;
     const auto listed = folder::list(job, tree, m, std::stop_token{});
-    REQUIRE_MESSAGE(listed.has_value(), listed.error_or(""));
-    REQUIRE(tree.files.size() == 1);
-    CHECK(tree.files[0].path == "a.txt");
-    const auto calls = util::read_file(dir / "calls.log").value_or("");
-    CHECK(calls.find("--config NUL --sftp-chunk-size 255Ki --checkers 4 --sftp-connections 4 --timeout 1m") !=
-          std::string::npos);
-    std::filesystem::remove_all(dir);
-    std::filesystem::remove(grab_known_hosts_path());
-}
-#endif
-
-TEST_CASE("a path listed twice is one file (G81)") {
-    const auto files = folder::parse_listing(R"([{"Path":"a.txt","Size":3},{"Path":"b.txt","Size":1},{"Path":"a.txt","Size":3}])");
-    REQUIRE(files.has_value());
-    REQUIRE(files->size() == 2);
-    CHECK((*files)[0].path == "a.txt");
-    CHECK((*files)[1].path == "b.txt");
+    REQUIRE_FALSE(listed);
+    CHECK(listed.error().find("no connection") != std::string::npos);
+    CHECK_FALSE(tree.listed);
 }
 
-TEST_CASE("names that are one on Windows or to rclone's batch (G25)") {
-    // As rclone lists them, sorted: README before readme, Docs before docs.
+TEST_CASE("names that are one on Windows get numbered ones (G25)") {
+    // As a listing comes, sorted: README before readme, Docs before docs.
     std::vector<folder::File> files;
     for (const char* p : {"Docs/a.txt", "Docs/only-upper.txt", "NOTES/x.txt", "README", "caf\u00e9.txt", "cafe\u0301.txt",
                           "docs/a.txt", "docs/only-lower.txt", "notes", "plain.txt", "readme", "readme (2)"}) {
@@ -272,15 +167,8 @@ TEST_CASE("names that are one on Windows or to rclone's batch (G25)") {
     auto file = [&](std::string_view p) -> const folder::File& {
         return *std::ranges::find(files, p, &folder::File::path);
     };
-    // rclone would copy one of each and drop the rest (a folder with all it holds): grab fetches them.
-    for (const char* p : {"Docs/a.txt", "Docs/only-upper.txt", "README", "caf\u00e9.txt", "cafe\u0301.txt", "docs/a.txt",
-                          "docs/only-lower.txt", "readme"}) {
-        INFO(p);
-        CHECK(file(p).big);
-    }
-    CHECK_FALSE(file("plain.txt").big);
-    CHECK(file("NOTES/x.txt").big); // its folder and the file "notes" are one name to rclone
-    CHECK_FALSE(file("readme (2)").big);
+    // Every file is grab's to write, small ones beside the others: none is made big for its name.
+    for (const auto& f : files) CHECK_FALSE(f.big);
     // The first keeps its name; a later one with the same name on Windows gets the next free number.
     CHECK(file("README").local.empty());
     CHECK(file("readme").local == std::filesystem::path("readme (3)")); // "readme (2)" is the server's

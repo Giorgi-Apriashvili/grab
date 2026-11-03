@@ -14,7 +14,6 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -24,7 +23,7 @@ namespace grab::file_list {
 inline constexpr std::chrono::minutes fresh_for{15};
 
 struct Entry {
-    std::string path; // as a search returns it, ready for rclone
+    std::string path; // as a search returns it, in grab's form (rclone_enc::grab_path)
     bool dir = false;
     std::optional<std::uint64_t> size; // files
     std::optional<std::int64_t> modified{}; // Unix seconds
@@ -42,9 +41,10 @@ struct List {
     bool operator==(const List&) const = default;
 };
 
-// What a list covers: the server's address and login, lookup method (on engine = grab, the
-// engine and its find setting), search roots, depth and whether dot-entries are skipped. A list
-// whose fingerprint differs is stale.
+// What a list covers: the server's address and login, lookup method (grab's own client and its
+// find setting: "grab+find", "grab+walk", "grab+probe", as 0.20 wrote it, so its lists stay
+// valid), search roots, depth and whether dot-entries are skipped. A list whose fingerprint
+// differs is stale.
 [[nodiscard]] std::string fingerprint(const engine::Context& ctx);
 
 // Whether a list made at `fetched` is still fresh at `now` (both Unix seconds). A clock that
@@ -71,29 +71,18 @@ struct ServerHit {
 // (how well the name matches, then shallower first, then by path); the server name breaks ties.
 void rank_across(std::vector<ServerHit>& hits, const engine::SearchRequest& req);
 
-// The `find` command that lists everything under `roots` for the ssh lookup: one
-// "d\t<mtime>\t<path>\0" or "f\t<size>\t<mtime>\t<path>\0" record per entry (<mtime>: %T@).
-[[nodiscard]] std::string find_command(const std::vector<std::string>& roots, int max_depth, bool skip_hidden);
-// One record of that output (without its NUL), the path as find printed it less a leading "./";
-// nullopt for a malformed record or one with nothing to save it under ("/", ".", "..": review
-// G15).
+// One record of the find grab runs for a search or a list (ssh_find.hpp: "d\t<mtime>\t<path>" or
+// "f\t<size>\t<mtime>\t<path>", without its NUL; <mtime>: %T@), the path as find printed it less a
+// leading "./"; nullopt for a malformed record or one with nothing to save it under ("/", ".",
+// "..": review G15).
 [[nodiscard]] std::optional<Entry> parse_find_record(std::string_view record);
-[[nodiscard]] std::vector<Entry> parse_find(std::string_view out);
-// `rclone lsf --format tsp --time-format unix --csv -R` output of `root` (see parse_lsf_record).
-[[nodiscard]] std::vector<Entry> parse_lsf(std::string_view out, std::string_view root);
 
-// Fetches the server's list now (ssh + find, or rclone lsf per root). `batch_ssh`: never let
-// ssh prompt (the window).
-// `walk_flags`: an rclone walk's connections from the pool (fetch::Listing::flags); `run_flags`:
-// the command's connection flags after `--`, last on rclone's and ssh's command lines.
-// On engine = grab, one find or one walk through grab's own SSH client (`grab`), the same list
-// format; only `run.stop` of `run` counts.
-[[nodiscard]] std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now, bool batch_ssh = false,
+// Fetches the server's list now: one find or one walk through grab's own SSH client (`grab`).
+// Only `run.stop` of `run` counts.
+[[nodiscard]] std::expected<List, std::string> fetch(const engine::Context& ctx, std::int64_t now,
                                                      const proc::RunOptions& run = {},
                                                      const engine::CommandHook& on_command = {},
-                                                     const std::vector<std::string>& walk_flags = {},
-                                                     const engine::GrabSide& grab = {},
-                                                     std::span<const std::string> run_flags = {});
+                                                     const engine::GrabSide& grab = {});
 
 // %LOCALAPPDATA%\grab\lists (Windows), else $XDG_CACHE_HOME or ~/.cache, /grab/lists.
 [[nodiscard]] std::filesystem::path default_dir();

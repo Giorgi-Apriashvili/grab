@@ -1,6 +1,6 @@
 // rclone with a remote given only in its environment and its config in memory (`--config NUL`),
-// as grab starts it once grab.conf holds the servers (RCLONE-REPLACEMENT.md, Phase 7 step 1 and
-// decision 1: each rclone process gets its one server's details in its own environment), and
+// as grab 0.20 started it for its fallback (RCLONE-REPLACEMENT.md, Phase 7 step 1 and decision 1:
+// each rclone process got its one server's details in its own environment), and
 // rclone's config reader as the oracle for the import of an rclone.conf. Each case runs the test
 // rclone (test_tools.hpp: build\<preset>\test-tools\rclone.exe, the 1.75.1 grab bundled) with
 // exactly the environment it gives it (no inherited RCLONE_* variable) and is skipped without
@@ -9,16 +9,11 @@
 // connection and a refused dial ("127.0.0.1:<port>: connectex", Go's syscall name, never
 // translated) means rclone took them. Every key and password is made up here.
 
-#include "config.hpp"
-#include "engine.hpp"
 #include "json.hpp"
-#include "passwords.hpp"
 #include "process.hpp"
 #include "quote.hpp"
-#include "rclone.hpp"
 #include "rclone_conf.hpp"
 #include "secrets.hpp"
-#include "server_conf.hpp"
 #include "test_tools.hpp"
 #include "util.hpp"
 
@@ -32,7 +27,6 @@
 #include <cstdio>
 #include <expected>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <optional>
 #include <string>
@@ -561,97 +555,6 @@ TEST_CASE("rclone reveals what grab obscures, and grab reveals what rclone obscu
     std::string by_rclone = ran.out;
     while (!by_rclone.empty() && (by_rclone.back() == '\n' || by_rclone.back() == '\r')) by_rclone.pop_back();
     CHECK(secrets::reveal(by_rclone) == "fake-password-2");
-}
-
-namespace {
-
-// Server `name` of grab.conf, logging in with a made-up key file (or the passphrase-protected one
-// and its passphrase in a store of `scratch`) to a closed local port, pinned in grab's known_hosts
-// (the test runner's scratch APPDATA): its run of the test rclone, given the server by
-// engine::rclone_env with --config NUL. "dialled" when rclone took every setting and dialled.
-std::string dial_through_rclone_env(const fs::path& rclone, const Scratch& scratch, const std::string& name,
-                                    const std::string& key_file, int port, const std::string& passphrase = {}) {
-    server_conf::Connection c;
-    c.host = "127.0.0.1";
-    c.port = port;
-    c.user = "t";
-    c.auth = server_conf::Auth::key;
-    c.key_file = key_file;
-    RemoteSettings settings;
-    settings.name = name;
-    settings.rclone_remote = name;
-    auto ctx = engine::make_context(GrabConfig{}, settings, c, scratch.file("grab.conf"));
-    ctx.passwords = scratch.file("passwords");
-    passwords::Store store;
-    if (!passphrase.empty()) {
-        store[name]["passphrase"] = passwords::Secret{.binding = {.user = "t", .host = "127.0.0.1", .port = port}, .value = passphrase};
-    }
-    REQUIRE(passwords::save(ctx.passwords, store));
-    fs::create_directories(grab_known_hosts_path().parent_path());
-    // A made-up key rclone can parse (it reads the file before it dials).
-    std::ofstream(grab_known_hosts_path(), std::ios::binary)
-        << "[127.0.0.1]:" << port << " ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n";
-    auto env = engine::rclone_env(ctx);
-    REQUIRE_MESSAGE(env, env.error_or(""));
-    proc::RunOptions quiet;
-    quiet.detached = true;
-    quiet.environment = std::move(*env);
-    const auto ran = proc::run_capture(std::vector<std::string>{util::path_to_utf8(rclone), "lsf", name + ":", "--config",
-                                                                std::string(config_in_memory), "--low-level-retries",
-                                                                "1", "--retries", "1"},
-                                       quiet);
-    fs::remove(grab_known_hosts_path());
-    REQUIRE_MESSAGE(ran, ran.error_or(""));
-    if (ran->err.find("127.0.0.1:" + std::to_string(port) + ": connectex") != std::string::npos) return "dialled";
-    return ran->err;
-}
-
-} // namespace
-
-TEST_CASE("grab's own path: rclone_env and --config NUL reach rclone, under the user's names (phase 7)") {
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    const Scratch scratch("grab-test-rclone-env-grab");
-    scratch.write("id_fake", made_up_key("ED25519", nullptr));
-    scratch.write("id_fake_pass", made_up_key("EC", "P-256", "fake-passphrase"));
-    const int port = closed_port();
-    // Each run gets its one server from grab.conf's details: a Georgian name (Go's upper case,
-    // which Windows' doesn't match), '-' and a space, a dotted name (in memory, no parent to take
-    // keys from: G86).
-    for (const std::string& name :
-         {std::string("\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8"), std::string("my-box x"), std::string("box.eu")}) {
-        CHECK_MESSAGE(dial_through_rclone_env(*rclone, scratch, name, util::path_to_utf8(scratch.file("id_fake")), port) ==
-                          "dialled",
-                      name);
-    }
-    // A passphrase from grab's store, obscured by grab, read by rclone; without it rclone stops
-    // before it dials.
-    CHECK(dial_through_rclone_env(*rclone, scratch, "pp", util::path_to_utf8(scratch.file("id_fake_pass")), port,
-                                  "fake-passphrase") == "dialled");
-    CHECK(dial_through_rclone_env(*rclone, scratch, "pp", util::path_to_utf8(scratch.file("id_fake_pass")), port)
-              .find("passphrase") != std::string::npos);
-}
-
-TEST_CASE("a '$' in a key file's path reaches rclone as it is, not expanded a second time") {
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    const Scratch scratch("grab-test-rclone-env-dir");
-    fs::create_directories(scratch.dir() / "$sync");
-    scratch.write("$sync/id_fake", made_up_key("ED25519", nullptr));
-    const int port = closed_port();
-    // rclone expands key_file's value (os.ExpandEnv): given as it is, "$sync" would turn empty
-    // and the key wouldn't be found; through GRAB_RCLONE_KEY_FILE it is read and rclone dials.
-    CHECK(dial_through_rclone_env(*rclone, scratch, "dd", util::path_to_utf8(scratch.dir() / "$sync" / "id_fake"), port) ==
-          "dialled");
-    const auto missing = dial_through_rclone_env(*rclone, scratch, "dd", util::path_to_utf8(scratch.dir() / "$sync" / "none"), port);
-    CHECK_MESSAGE(missing.find("failed to read private key file") != std::string::npos, missing);
-    CHECK_MESSAGE(missing.find("$sync") != std::string::npos, missing);
 }
 
 namespace {

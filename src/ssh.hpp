@@ -58,13 +58,6 @@ struct Target {
     std::string bind_from = "--bind";
     std::chrono::milliseconds connect_timeout{30'000};
     std::chrono::milliseconds timeout{30'000};
-    // Added to the failures rclone might get past where grab's client can't (RCLONE-REPLACEMENT.md,
-    // phase 8 step 9): a handshake the two sides couldn't agree on, a host key type grab can't
-    // check, an SFTP server that breaks the protocol (sftp::ProtocolError). engine::ssh_target sets
-    // it on engine = grab servers ("; for Main's downloads, searches and lists to go through rclone
-    // ..., set engine = rclone in [Main]": previews, Play and verify stay on grab's client); a
-    // refused login, a timeout or a dropped connection fails rclone the same way and gets none.
-    std::string fallback;
     bool operator==(const Target&) const = default;
 };
 
@@ -163,8 +156,8 @@ public:
 private:
     void open(const Target& target);
     void close();
-    // Throws Error: `what`, libssh2's last error, then `then` (Target::fallback, or nothing).
-    [[noreturn]] void fail(budget::Failure kind, std::string_view what, std::string_view then = {}) const;
+    // Throws Error: `what`, then libssh2's last error.
+    [[noreturn]] void fail(budget::Failure kind, std::string_view what) const;
     void check_host_key(const Target& target, std::string_view known_hosts_text);
     void log_in(const Target& target);
 

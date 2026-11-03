@@ -1,12 +1,8 @@
 #include "browse.hpp"
 
-#include "json.hpp"
 #include "listing.hpp"
-#include "rclone.hpp"
 #include "rclone_encoding.hpp"
-#include "rclone_flags.hpp"
 #include "remote.hpp"
-#include "server_ops.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
@@ -94,10 +90,6 @@ std::string address_path(std::string_view text) {
     if (out.starts_with("~/")) out.erase(0, 2);
     while (out.size() > 1 && out.ends_with('/')) out.pop_back();
     return out;
-}
-
-bool maybe_file(const std::vector<Item>& items, std::string_view path) {
-    return items.size() == 1 && !items.front().dir && items.front().name == remote_basename(path);
 }
 
 std::optional<std::string> root_of(const std::vector<std::string>& roots, std::string_view path) {
@@ -209,47 +201,6 @@ std::vector<Crumb> crumbs(const std::vector<std::string>& roots, std::string_vie
         rel.remove_prefix(slash == std::string_view::npos ? rel.size() : slash + 1);
     }
     return out;
-}
-
-std::vector<std::string> listing_argv(const engine::Context& ctx, std::string_view path) {
-    std::vector<std::string> argv{ctx.config.rclone, "lsjson", remote_spec(ctx.settings.rclone_remote, path),
-                                  "--no-mimetype", "--config", std::string(config_in_memory)};
-    const auto flags = rclone_flags::connection(ctx.settings.common_flags); // rclone_flags.hpp
-    argv.insert(argv.end(), flags.begin(), flags.end());
-    const auto keys = engine::key_flags(ctx.settings);
-    argv.insert(argv.end(), keys.begin(), keys.end());
-    return argv;
-}
-
-std::expected<std::vector<Item>, std::string> parse_lsjson(std::string_view json_text, std::string_view path,
-                                                           bool skip_hidden) {
-    auto doc = json::parse(json_text);
-    if (!doc || doc->kind != json::Value::Kind::array) return util::fail("unexpected answer from rclone lsjson");
-    std::vector<Item> items;
-    items.reserve(doc->items.size());
-    for (const auto& v : doc->items) {
-        auto name = v.string_of("Name");
-        if (!name || name->empty() || (skip_hidden && name->starts_with('.'))) continue;
-        Item it;
-        it.path = join_remote(path, *name);
-        it.name = std::move(*name);
-        const auto* is_dir = v.find("IsDir");
-        it.dir = is_dir != nullptr && is_dir->kind == json::Value::Kind::boolean && is_dir->boolean;
-        const auto* size = v.find("Size");
-        if (!it.dir && size != nullptr && size->kind == json::Value::Kind::number && size->number >= 0) {
-            it.size = static_cast<std::uint64_t>(size->number);
-        }
-        if (const auto time = v.string_of("ModTime")) it.modified = util::known_time(util::parse_rfc3339_seconds(*time));
-        items.push_back(std::move(it));
-    }
-    sort_items(items);
-    return items;
-}
-
-ListError::Kind rclone_error_kind(std::string_view message) {
-    if (message.find("directory not found") != std::string_view::npos) return ListError::Kind::not_found;
-    if (message.find("permission denied") != std::string_view::npos) return ListError::Kind::denied;
-    return ListError::Kind::other;
 }
 
 namespace {
@@ -364,10 +315,12 @@ std::expected<std::vector<Item>, ListError> read_folder(sftp::Client& c, std::st
     return items;
 }
 
-// list_live on grab's engine.
-std::expected<std::vector<Item>, ListError> list_grab(const engine::Context& ctx, std::string_view path,
-                                                      const std::stop_token& stop, const engine::CommandHook& on_command,
-                                                      const engine::GrabSide& grab) {
+} // namespace
+
+std::expected<std::vector<Item>, ListError> list_live(const engine::Context& ctx, std::string_view path,
+                                                     const proc::RunOptions& run, const engine::CommandHook& on_command,
+                                                     const engine::GrabSide& grab) {
+    const std::stop_token& stop = run.stop;
     auto pool = engine::grab_pool(ctx, grab);
     if (!pool) return std::unexpected(list_error(ListError::Kind::other, pool.error()));
     if (on_command) on_command({"sftp", "readdir", path.empty() ? std::string(".") : std::string(path)});
@@ -388,32 +341,6 @@ std::expected<std::vector<Item>, ListError> list_grab(const engine::Context& ctx
             if (!lease->reused()) return std::unexpected(list_error(ListError::Kind::other, e.what()));
         }
     }
-}
-
-} // namespace
-
-std::expected<std::vector<Item>, ListError> list_live(const engine::Context& ctx, std::string_view path,
-                                                     const proc::RunOptions& run, const engine::CommandHook& on_command,
-                                                     const engine::GrabSide& grab) {
-    if (ctx.engine == Engine::grab) return list_grab(ctx, path, run.stop, on_command, grab);
-    const auto argv = listing_argv(ctx, path);
-    auto with_server = run;
-    if (auto env = engine::rclone_env(ctx); env) with_server.environment = std::move(*env);
-    else return std::unexpected(list_error(ListError::Kind::other, env.error()));
-    if (on_command) on_command(argv);
-    auto ran = proc::run_capture(argv, with_server);
-    if (!ran) return std::unexpected(list_error(ListError::Kind::other, ran.error()));
-    if (run.stop.stop_requested()) return std::unexpected(list_error(ListError::Kind::other, "stopped"));
-    if (ran->exit_code != 0) {
-        // A folder whose name came through rclone's JSON with U+FFFD for its bytes (review G60).
-        std::string message =
-            name_not_utf8(path) ? std::string(not_utf8_error) : server_ops::clean_rclone_error(ran->err);
-        const auto kind = rclone_error_kind(message);
-        return std::unexpected(list_error(kind, std::move(message)));
-    }
-    auto items = parse_lsjson(ran->out, path, ctx.settings.skip_hidden);
-    if (!items) return std::unexpected(list_error(ListError::Kind::other, items.error()));
-    return std::move(*items);
 }
 
 } // namespace grab::browse

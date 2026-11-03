@@ -160,7 +160,7 @@ function renderRemoteInfo() {
   if (!r) { info.hidden = true; return; }
   info.hidden = false;
   info.classList.toggle('error', !!r.error);
-  info.textContent = r.error ? 'misconfigured' : `${r.user}@${r.host} · ${SEARCH_TEXT[r.method] || 'rclone listing'}`;
+  info.textContent = r.error ? 'misconfigured' : `${r.user}@${r.host} · ${SEARCH_TEXT[r.method] || SEARCH_TEXT.probe}`;
   info.title = r.error || '';
 }
 
@@ -2765,8 +2765,7 @@ $('#limit-hint').addEventListener('click', () => {
 const settings = {
   open: false,
   servers: [],
-  engine: 'grab', // a new server's engine (GRAB_ENGINE=rclone can make it rclone)
-  form: null,     // null, or { editing, name, origAuth, engine } while the add/edit form is shown
+  form: null,     // null, or { editing, name, origAuth, ... } while the add/edit form is shown
   auth: 'password',
   tests: {},      // server name -> serverTested message, or { pending: true }
   busy: false,
@@ -2774,19 +2773,14 @@ const settings = {
 };
 
 const AUTH_TEXT = { password: 'password', key: 'key file', agent: 'ssh-agent', stored_key: 'key in grab\'s store' };
-// How a server is searched (the backend's search_method): ssh + find or rclone's listing on
-// engine = rclone; on engine = grab find, the folders listed by grab, or find where grab's check
-// finds it.
+// How a server is searched (the backend's search_method): find, the folders listed by grab, or
+// find where grab's check finds it.
 const SEARCH_TEXT = {
-  ssh: 'ssh + find',
-  rclone: 'rclone listing',
   find: 'find',
   walk: 'listing folders',
   probe: 'find or listing folders',
 };
 const SEARCHED_TEXT = {
-  ssh: 'with ssh + find',
-  rclone: 'with rclone listing',
   find: 'with find',
   walk: 'by listing folders',
   probe: 'with find, else by listing folders',
@@ -2839,29 +2833,15 @@ function testLine(t) {
   if (!t) return '';
   if (t.pending) return '<span class="muted"><span class="spinner"></span>Testing the connection…</span>';
   if (t.error) return `<span><span class="bad">✗ Test failed:</span> <span class="detail">${esc(t.error)}</span></span>`;
-  // grab's own client previews, plays and verifies on every server; on engine = grab it also
-  // downloads and searches, and rclone isn't asked (rcloneOk null).
-  const grab = t.grabEngine === true;
+  // A server grab doesn't connect to: why, and nothing tried.
+  if (t.unusable) return `<span><span class="bad">✗ Not usable:</span> <span class="detail">${esc(t.unusable)}</span></span>`;
   // As `grab server test` says it: grab's login listed the home folder.
-  const how = (t.grabOk ? ' · home folder listed' : '') + (t.grabOk && grab ? ` · searches ${esc(t.grabSearch)}` : '') +
-    (t.grabOk && t.checksums ? ` · ${esc(t.checksums)}` : '');
   if (t.ok) {
-    // On engine = rclone grab's login only previews, plays and verifies: a failure there is a
-    // warning, not a failed test (its downloads go through rclone).
-    const trust = /host key/.test(t.grabError || '') ? ' Use Trust… to pin the host key.' : '';
-    const verify = !grab && t.grabOk === false
-      ? ` · <span class="warn">Previews, Play and Verify (grab) can't run: ${esc(t.grabError || 'failed')}.${trust}</span>` : '';
-    return `<span class="good">✓ Connection OK</span>${how ? `<span class="muted">${how}</span>` : ''}${verify}`;
+    const how = ' · home folder listed' + (t.grabSearch ? ` · searches ${esc(t.grabSearch)}` : '') +
+      (t.checksums ? ` · ${esc(t.checksums)}` : '');
+    return `<span class="good">✓ Connection OK</span><span class="muted">${how}</span>`;
   }
-  const parts = [];
-  const mine = grab ? 'Downloads, searches, previews, Play and Verify (grab)' : 'Previews, Play and Verify (grab)';
-  if (t.rcloneOk === true) parts.push('<span class="good">✓ Downloads (rclone)</span>');
-  else if (t.rcloneOk === false) parts.push(`<span class="bad">✗ Downloads (rclone):</span> <span class="detail">${esc(t.rcloneError || 'failed')}</span>`);
-  if (t.grabOk === true) parts.push(`<span class="good">✓ ${mine}</span><span class="muted">${how}</span>`);
-  else if (t.grabOk === false) parts.push(`<span class="bad">✗ ${mine}:</span> <span class="detail">${esc(t.grabError || 'failed')}</span>`);
-  if (t.sshOk === true) parts.push('<span class="good">✓ Searches (ssh)</span>');
-  else if (t.sshOk === false) parts.push(`<span class="bad">✗ Searches (ssh):</span> <span class="detail">${esc(t.sshError || 'failed')}</span>`);
-  return parts.map((p) => `<span>${p}</span>`).join('');
+  return `<span><span class="bad">✗ Connection failed:</span> <span class="detail">${esc(t.grabError || 'failed')}</span></span>`;
 }
 
 // How a server logs in, and whether what it needs is saved (never the value): "password
@@ -2881,7 +2861,8 @@ function serverCard(s) {
   const actions = [];
   if (!s.error) {
     actions.push(btn('test', 'Test'));
-    if (!s.pinned) actions.push(btn('trust', 'Trust…'));
+    // Not for a server grab doesn't connect to (its card says why): Trust would be refused.
+    if (!s.pinned && !s.guard) actions.push(btn('trust', 'Trust…'));
   }
   // A section without connection details (or with ones grab can't read) is filled in with Edit.
   actions.push(btn('edit', 'Edit'));
@@ -2891,17 +2872,17 @@ function serverCard(s) {
   const where = s.roots.length ? s.roots.join(', ') : '~';
   const meta = s.error
     ? `<span class="bad">${esc(s.error)}</span>`
-    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}${s.engine === 'rclone' ? ' · rclone (fallback)' : ''}` +
-      ` · searched ${SEARCHED_TEXT[s.search] || 'with rclone listing'} in ${esc(where)}, depth ${s.depth}` +
+    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}` +
+      ` · searched ${SEARCHED_TEXT[s.search] || SEARCHED_TEXT.probe} in ${esc(where)}, depth ${s.depth}` +
       ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}` +
       (s.connectionKeys ? ` · ${esc(s.connectionKeys)}` : '');
   const status = [];
-  if (!s.error) {
+  if (!s.error && !s.guard) {
     status.push(s.pinned ? '<span class="good">✓ Host key pinned</span>'
       : '<span class="warn">⚠ Host key not trusted yet: grab won\'t connect to this server until you pin its key with Trust….</span>');
   }
-  // What keeps grab's own client off it (a proxy, an ssh command...): its previews, Play and Verify.
-  if (!s.error && s.guard) status.push(`<span class="warn">⚠ ${esc(s.guard)}</span>`);
+  // Why grab doesn't connect to it at all (a proxy, an ssh command...), and how to change that.
+  if (!s.error && s.guard) status.push(`<span class="bad">✗ Not usable: ${esc(s.guard)}</span>`);
   const test = testLine(settings.tests[s.name]);
   return `<div class="server">` +
     `<div class="server-top"><span class="server-name">${esc(s.name)}</span>` +
@@ -2952,22 +2933,16 @@ function setAuth(auth) {
   for (const el of document.querySelectorAll('[data-auth-only]')) el.hidden = !el.dataset.authOnly.split(' ').includes(auth);
   $('#secret-label').textContent = auth === 'key' ? 'Passphrase' : 'Password';
   setSecretPlaceholder();
-  // engine = grab logs in by itself, with the passphrase too, and searches every server the same
-  // way: find where the server has GNU find, else by listing folders.
-  const grab = (settings.form ? settings.form.engine : settings.engine) === 'grab';
-  $('#secret-hint').textContent = auth === 'key' && !grab
-    ? 'Searches use ssh, which cannot ask for a passphrase here: load such a key into ssh-agent (ssh-add) and choose ssh-agent instead.'
-    : 'Kept in grab\'s own password store, encrypted for your Windows account; never in grab.conf or on a command line.';
+  // grab logs in by itself, with the passphrase too, and searches every server the same way: find
+  // where the server has GNU find, else by listing folders.
+  $('#secret-hint').textContent =
+    'Kept in grab\'s own password store, encrypted for your Windows account; never in grab.conf or on a command line.';
   const searches = 'searches use find where the server has it, else grab lists its folders.';
-  $('#auth-hint').textContent = (grab ? {
+  $('#auth-hint').textContent = {
     password: `Works without a shell (e.g. storage boxes); ${searches}`,
     key: 'Searches use find where the server has it, else grab lists its folders.',
     agent: `Uses the keys loaded in the Windows ssh-agent (ssh-add); ${searches}`,
-  } : {
-    password: 'Works without a shell (e.g. storage boxes); searches use rclone\'s listing.',
-    key: 'Searches use ssh + find on the server, which is fastest.',
-    agent: 'Uses the keys loaded in the Windows ssh-agent (ssh-add); searches use ssh + find.',
-  })[auth];
+  }[auth];
 }
 
 function clearFieldErrors() {
@@ -2980,7 +2955,7 @@ function openForm(name) {
   const known = s && !s.error;
   settings.form = { editing: !!s, name: s ? s.name : '', origAuth: known ? s.auth : null,
     origHost: known ? s.host : '', origUser: known ? s.user : '', origPort: known ? s.port : 22,
-    origKey: known ? (s.keyFile || '') : '', secretSaved: !!known && s.secretSaved === true, engine: s ? s.engine : settings.engine };
+    origKey: known ? (s.keyFile || '') : '', secretSaved: !!known && s.secretSaved === true };
   $('#form-title').textContent = s ? (known ? `Edit ${s.name}` : `Fill in ${s.name}'s connection details`) : 'Add a server';
   $('#f-name').value = s ? s.name : '';
   $('#f-name').disabled = !!s;
@@ -3012,17 +2987,6 @@ function intOf(id) {
   return /^\d{1,6}$/.test(v) ? Number(v) : 0;
 }
 
-// Fetching the host key of a server whose settings route its connections (a proxy, an ssh
-// command) connects directly from this PC: said first, and only a yes goes on.
-function confirmDirect(route, go) {
-  showModal({
-    title: 'Connect directly?',
-    html: `<p>${esc(route)}.</p>`,
-    ok: 'Connect directly',
-    onOk: go,
-  });
-}
-
 function submitForm() {
   if (settings.busy || !settings.form) return;
   clearFieldErrors();
@@ -3041,18 +3005,9 @@ function submitForm() {
     depth: intOf('#f-depth'),
     connections: $('#f-conns').value.trim() === '' ? 0 : (intOf('#f-conns') || -1),
   };
-  const go = () => {
-    send(msg);
-    $('#f-secret').value = ''; // the backend holds it until the host key is trusted
-    setStatus('Checking the host key…');
-  };
-  // An edit that fetches the host key again (a new address, none pinned yet), as the backend's
-  // edit_needs_host_key has it.
-  const s = settings.form.editing ? settings.servers.find((x) => x.name === msg.name) : null;
-  if (s && s.route && (s.error || !s.pinned || s.host !== msg.host || s.port !== msg.port)) {
-    return confirmDirect(s.route.replace(`${s.host}:${s.port}`, `${msg.host}:${msg.port}`), go);
-  }
-  go();
+  send(msg);
+  $('#f-secret').value = ''; // the backend holds it until the host key is trusted
+  setStatus('Checking the host key…');
 }
 
 // ---- modal -------------------------------------------------------------------------------
@@ -3144,12 +3099,8 @@ function onSettingsAction(act, name) {
     return send({ type: 'serverTest', name });
   }
   if (act === 'trust') {
-    const trust = () => {
-      setStatus('Checking the host key…');
-      send({ type: 'serverTrust', name });
-    };
-    const s = settings.servers.find((x) => x.name === name);
-    return s && s.route ? confirmDirect(s.route, trust) : trust();
+    setStatus('Checking the host key…');
+    return send({ type: 'serverTrust', name });
   }
   if (act === 'default') return send({ type: 'serverDefault', name });
   if (act === 'remove') {
@@ -3194,7 +3145,6 @@ if (webview) {
       case 'played': flash(`Playing ${msg.name} in ${msg.program}`); break;
       case 'servers':
         settings.servers = msg.items;
-        settings.engine = msg.engine || 'grab';
         renderServers();
         break;
       case 'settingsBusy':

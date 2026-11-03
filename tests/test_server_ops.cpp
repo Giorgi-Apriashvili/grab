@@ -9,6 +9,7 @@
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "passwords.hpp"
+#include "scoped_env.hpp"
 #include "server_conf.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
@@ -83,7 +84,7 @@ struct Scratch {
     }
     [[nodiscard]] std::string read(const std::string& name) const { return util::read_file(dir / name).value_or(""); }
     [[nodiscard]] server_ops::Env env() const {
-        auto e = server_ops::load_env(conf, dir);
+        auto e = server_ops::load_env(conf);
         REQUIRE_MESSAGE(e.has_value(), e.error_or(""));
         return std::move(*e);
     }
@@ -186,15 +187,6 @@ TEST_CASE("a saved password stays with the user, host and port it was typed for 
     CHECK(s.secrets() == passwords::Store{{"box", {{"password", fake("fake-pw")}}}});
 }
 
-TEST_CASE("rclone errors lose their log prefix") {
-    CHECK(server_ops::clean_rclone_error("2026/09/24 00:38:10 CRITICAL: Failed to create file system for \"hz3:\": "
-                                         "ssh: this private key is passphrase protected\nmore\n") ==
-          "Failed to create file system for \"hz3:\": ssh: this private key is passphrase protected");
-    CHECK(server_ops::clean_rclone_error("2026/09/24 00:38:10 ERROR : x") == "x");
-    CHECK(server_ops::clean_rclone_error("Error: unknown flag\n") == "Error: unknown flag");
-    CHECK(server_ops::clean_rclone_error("").empty());
-}
-
 TEST_CASE("search_roots values and lead-in comments") {
     CHECK(search_roots_value({"", "/srv", "media"}) == "~, /srv, media");
     CHECK(search_roots_value({}).empty());
@@ -235,8 +227,7 @@ TEST_CASE("server list from grab.conf: details, pins read now (G209), sections w
     CHECK(list[0].host == "box.example.com");
     CHECK(list[0].port == 23);
     CHECK(list[0].host_key_pinned);
-    CHECK(list[0].engine == Engine::grab); // no `engine` line: grab's own client (phase 8)
-    CHECK(list[0].search == "probe");     // find where the server has it, else by listing folders
+    CHECK(list[0].search == "probe"); // find where the server has it, else by listing folders
     CHECK(list[0].search_roots == std::vector<std::string>{"/home/movies"});
     CHECK(list[1].name == "agent");
     CHECK(list[1].auth == Auth::agent);
@@ -256,37 +247,49 @@ TEST_CASE("server list from grab.conf: details, pins read now (G209), sections w
     CHECK(again[1].host_key_pinned);
 }
 
-TEST_CASE("server list: the guard's reasons, the connection keys; Trust's reach and its word before a direct fetch") {
+TEST_CASE("server list: the guard's reasons, the connection keys; Trust and the host-key fetch refused for a guarded server") {
     Scratch s;
     s.write("grab.conf", grab_conf + "bind = 10.0.0.2\nconnect_timeout = 1500ms\nio_timeout = 2m\n"
                                      "\n[plain]\nhost = p.example\nuser = p\nauth = agent\ncommon_flags = --bind 10.0.0.7\n"
-                                     "\n[routed]\nhost = r.example\nuser = r\nauth = agent\n");
+                                     "\n[routed]\nhost = r.example\nuser = r\nauth = agent\n"
+                                     "\n[jumped]\nhost = j.example\nuser = j\nauth = agent\n"
+                                     "ssh_options = -o ProxyJump=fake-jump.example\n"
+                                     "\n[quirky]\nauth = agent\nuser = q\nhost = q.example\n"
+                                     "rclone.disable_concurrent_reads = true\n");
     REQUIRE(passwords::save(s.store(), {{"box", {{"password", fake("fake-pw")},
                                                  {"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}},
                                         {"agent", {{"rclone.http_proxy", fake("p:1", "someone-else", "h.example.com", 22)}}},
                                         {"routed", {{"rclone.ssh", fake("ssh fake-jump", "r", "r.example", 22)}}}}));
     const auto env = s.env();
     const auto list = server_ops::list_servers(env);
-    REQUIRE(list.size() == 4);
+    REQUIRE(list.size() == 6);
     // box: its store's proxy (bound to its login); agent: one saved for another login doesn't count.
     REQUIRE(list[0].guard.size() == 1);
-    CHECK(list[0].guard[0].where == "rclone.socks_proxy");
-    CHECK(list[0].engine == Engine::rclone); // no `engine` line: the guard keeps it on rclone
+    CHECK(list[0].guard[0].where == "rclone.socks_proxy in grab's store");
     CHECK(list[1].guard.empty());
-    CHECK(list[1].engine == Engine::grab);
     CHECK(list[1].search == "probe");
-    // An agent server routed by rclone: on rclone by itself, searched by rclone's listing, never
-    // ssh.exe find past it.
+    // An agent server routed by its store's ssh command: searched as any other, never by rclone.
     REQUIRE(list[3].guard.size() == 1);
-    CHECK(list[3].engine == Engine::rclone);
-    CHECK(list[3].search == "rclone");
+    CHECK(list[3].search == "probe");
+    // ssh_options' jump host is no reason (decision 4); a quirk switch in the section is.
+    CHECK(list[4].guard.empty());
+    REQUIRE(list[5].guard.size() == 1);
+    CHECK(list[5].guard[0].where == "rclone.disable_concurrent_reads");
     CHECK(list[1].connection_keys == "bind 10.0.0.2, connect_timeout 1500ms, io_timeout 120s");
     CHECK(list[0].connection_keys.empty());
-    // Trust says it connects directly, naming the setting, never its value.
-    const auto said = server_ops::direct_warning(list[0], list[0].host, list[0].port);
-    CHECK(said == "box connects through a SOCKS proxy (rclone.socks_proxy): fetching its host key connects to "
-                  "box.example.com:23 directly from this PC, past that");
-    CHECK(server_ops::direct_warning(list[1], list[1].host, list[1].port).empty());
+    // Trust and the host-key fetch of an Edit: refused for a guarded server, naming the setting
+    // and how to clear it, never its value, before anything connects.
+    for (const char* name : {"box", "routed", "quirky"}) {
+        const auto refused = server_ops::reach_for(env, name);
+        REQUIRE_FALSE(refused);
+        CHECK(refused.error().starts_with(std::format("[{}] ", name)));
+        CHECK(refused.error().find("fake-") == std::string::npos);
+        CHECK(refused.error().find("Connect directly") == std::string::npos);
+    }
+    CHECK(server_ops::reach_for(env, "box").error().ends_with(
+        "the import kept rclone.socks_proxy in grab's store: remove box and add it again (Remove and Add in grab's "
+        "Settings, or `grab server remove box` and `grab server add`)"));
+    CHECK(server_ops::reach_for(env, "jumped").has_value());
     // The host-key fetch connects from the server's bind, within its connect time (common_flags'
     // --bind where the key is blank); a new server has none.
     const auto agent = server_ops::reach_for(env, "agent");
@@ -302,6 +305,18 @@ TEST_CASE("server list: the guard's reasons, the connection keys; Trust's reach 
     const auto none = server_ops::reach_for(env, "new");
     REQUIRE(none);
     CHECK(none->bind.empty());
+    {
+        // An inherited RCLONE_SFTP_SOCKS_PROXY covers every server, a new one's host-key fetch too.
+        const test::ScopedEnv proxy("RCLONE_SFTP_SOCKS_PROXY", "fake-user:fake-pass@127.0.0.1:1080");
+        for (const char* name : {"new", "agent"}) {
+            const auto refused = server_ops::reach_for(env, name);
+            REQUIRE_FALSE(refused);
+            CHECK(refused.error().find("RCLONE_SFTP_SOCKS_PROXY is set in grab's environment and covers every server") !=
+                  std::string::npos);
+            CHECK(refused.error().find("fake-") == std::string::npos);
+        }
+    }
+    CHECK(server_ops::reach_for(env, "new").has_value());
 }
 
 TEST_CASE("an edit of search folders keeps comments, refreshes grab's line and leaves the store alone (G85)") {
@@ -330,14 +345,14 @@ TEST_CASE("an edit of search folders keeps comments, refreshes grab's line and l
     CHECK(s.store_bytes() == sealed); // byte for byte: not even saved again
 }
 
-TEST_CASE("grab's comment above a section says the lookup the guard leaves it (describe_servers, an edit)") {
+TEST_CASE("grab's comment above a section says the lookup (describe_servers, an edit)") {
     Scratch s;
     s.write("grab.conf", grab_conf);
-    // box has no `engine` line, but its store's proxy keeps it on rclone, past which only
-    // rclone's listing searches.
+    // A proxy its store keeps changes nothing there: grab's own lookup, never "via rclone lsf".
     REQUIRE(passwords::save(s.store(), {{"box", {{"password", fake("fake-pw")},
                                                  {"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}}}));
-    const std::string said = "# server [box]: u1@box.example.com:23, password, lookup via rclone lsf\n[box]\n";
+    const std::string said =
+        "# server [box]: u1@box.example.com:23, password, lookup with find, else by listing folders\n[box]\n";
     const auto described = server_ops::describe_servers(s.env());
     REQUIRE_MESSAGE(described.has_value(), described.error_or(""));
     auto text = s.read("grab.conf");
@@ -382,7 +397,7 @@ TEST_CASE("a server's connection limit is written only once set, and blank means
 
     // Out of range is a config error.
     s.write("grab.conf", grab_conf + "max_connections = 0\n");
-    CHECK_FALSE(server_ops::load_env(s.conf, s.dir).has_value());
+    CHECK_FALSE(server_ops::load_env(s.conf).has_value());
 }
 
 TEST_CASE("a change starts from grab.conf as it is now, not as it was loaded (G175)") {
@@ -800,7 +815,7 @@ TEST_CASE("a store that can't be decrypted is moved aside by a change, which nam
     CHECK(s.secrets() == passwords::Store{{"box", {{"password", fake("fake-pw2")}}}});
 }
 
-TEST_CASE("an unchanged Edit of an agent server moves an undecryptable store aside, so rclone starts again") {
+TEST_CASE("an unchanged Edit of an agent server moves an undecryptable store aside, so grab connects again") {
     Scratch s;
     s.write("grab.conf", grab_conf);
     Scratch::pins("h.example.com ssh-ed25519 FAKEKEY\n");
@@ -813,9 +828,10 @@ TEST_CASE("an unchanged Edit of an agent server moves an undecryptable store asi
     c.host = "h.example.com";
     c.user = "me";
     c.auth = server_conf::Auth::agent;
-    // The store may keep its proxy, so no rclone runs for it (engine::rclone_env)...
-    CHECK(engine::rclone_env(engine::make_context(GrabConfig{}, settings, c, s.conf)).error_or("").find(
-              "Saving it unchanged with Edit") != std::string::npos);
+    // The store may keep its proxy, so grab doesn't connect to it, nor fetch its host key...
+    CHECK(engine::ssh_target(engine::make_context(GrabConfig{}, settings, c, s.conf)).error_or("").find(
+              "saving agent with Edit (no change needed) sets the unreadable store aside") != std::string::npos);
+    CHECK_FALSE(server_ops::reach_for(s.env(), "agent"));
     // ...until it is saved with nothing changed: the agent server needs no store, but the file
     // that can't be read goes aside and the note names who needs a secret again.
     auto agent = server(Auth::agent, "agent");
@@ -831,8 +847,60 @@ TEST_CASE("an unchanged Edit of an agent server moves an undecryptable store asi
           std::string::npos);
     CHECK(edited->find("enter the password of box again with Edit") != std::string::npos);
     CHECK_FALSE(std::filesystem::exists(s.store()));
-    const auto env = engine::rclone_env(engine::make_context(GrabConfig{}, settings, c, s.conf));
-    CHECK_MESSAGE(env.has_value(), env.error_or(""));
+    const auto target = engine::ssh_target(engine::make_context(GrabConfig{}, settings, c, s.conf));
+    CHECK_MESSAGE(target.has_value(), target.error_or(""));
+    CHECK(server_ops::reach_for(s.env(), "agent").has_value());
+}
+
+TEST_CASE("an Edit of a server never pinned gets past an undecryptable store: its host-key fetch goes on") {
+    Scratch s;
+    s.write("grab.conf", grab_conf);
+    std::filesystem::create_directories(s.store().parent_path());
+    std::ofstream(s.store(), std::ios::binary) << "grab-passwords-sealed 1\nanother account's";
+    // Trust stays refused; the Edit the refusal names fetches the host key, as the save sets the
+    // store aside.
+    const auto trust = server_ops::reach_for(s.env(), "agent");
+    REQUIRE_FALSE(trust.has_value());
+    CHECK(trust.error().find("saving agent with Edit (no change needed)") != std::string::npos);
+    CHECK(server_ops::reach_for(s.env(), "agent", server_ops::Purpose::edit).has_value());
+    auto agent = server(Auth::agent, "agent");
+    agent.host = "h.example.com";
+    agent.port = 22;
+    agent.user = "me";
+    agent.max_depth = 6;
+    const server_ops::HostKeys keys{.lines = {"h.example.com ssh-ed25519 FAKEKEY"}, .fingerprints = {}};
+    const auto edited = server_ops::update_server(s.env(), agent, std::nullopt, keys);
+    REQUIRE_MESSAGE(edited.has_value(), edited.error_or(""));
+    CHECK(edited->find("moved aside to ") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(s.store()));
+    CHECK(Scratch::pins() == "h.example.com ssh-ed25519 FAKEKEY\n");
+    CHECK(server_ops::reach_for(s.env(), "agent").has_value());
+}
+
+TEST_CASE("an Edit's host-key fetch counts what the save leaves: section lines and store extras of any login") {
+    Scratch s;
+    // Details that can't be read: the section's own rclone.* line and the store's proxy both stay
+    // through the save, so the fetch is refused too.
+    s.write("grab.conf", "[grab]\ndefault_remote = box\n\n[box]\nhost = box.example.com\nport = abc\nuser = u1\n"
+                         "auth = password\nrclone.disable_concurrent_reads = true\n"
+                         "\n[stored]\nhost = s.example.com\nport = abc\nuser = s\nauth = agent\n"
+                         "\n[agent]\nhost = h.example.com\nuser = me\nauth = agent\n");
+    REQUIRE(passwords::save(s.store(), {{"stored", {{"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9", "s",
+                                                                                 "s.example.com", 22)}}},
+                                        {"agent", {{"rclone.http_proxy", fake("p:1", "someone-else", "h.example.com", 22)}}}}));
+    const auto env = s.env();
+    const auto box = server_ops::reach_for(env, "box", server_ops::Purpose::edit);
+    REQUIRE_FALSE(box.has_value());
+    CHECK(box.error().find("rclone.disable_concurrent_reads") != std::string::npos);
+    const auto stored = server_ops::reach_for(env, "stored", server_ops::Purpose::edit);
+    REQUIRE_FALSE(stored.has_value());
+    CHECK(stored.error().find("rclone.socks_proxy in grab's store") != std::string::npos);
+    CHECK(stored.error().find("fake-") == std::string::npos);
+    // A proxy kept for another login: no reason for Trust, but an Edit binds it to the new login.
+    CHECK(server_ops::reach_for(env, "agent").has_value());
+    const auto agent = server_ops::reach_for(env, "agent", server_ops::Purpose::edit);
+    REQUIRE_FALSE(agent.has_value());
+    CHECK(agent.error().find("rclone.http_proxy in grab's store") != std::string::npos);
 }
 
 TEST_CASE("an unchanged Edit goes on when the store can't be read at all") {
@@ -883,87 +951,56 @@ TEST_CASE("the grab.conf grab writes still loads in grab 0.19's reader, rclone_r
     CHECK(cfg->remotes[2].common_flags == util::split_args(default_common_flags));
 }
 
-TEST_CASE("server ops: a test fails on grab's login only where grab downloads (engine = grab)") {
+TEST_CASE("server ops: a test stands on grab's login") {
     server_ops::TestResult t;
-    t.rclone_ok = true;
-    t.grab_ok = false;
-    t.grab_error = "h's host key isn't trusted yet";
-    CHECK(t.ok()); // engine = rclone: grab only verifies there, a warning
-    t.grab_engine = true;
-    CHECK_FALSE(t.ok());
-    t.grab_ok = true;
-    CHECK(t.ok());
-    t.rclone_ok = false;
-    CHECK_FALSE(t.ok());
-}
-
-TEST_CASE("server ops: on engine = grab a test asks rclone nothing and stands on grab's login") {
-    // rclone downloads nothing there (previews and Play go through grab's client since phase 6), so
-    // test_connection leaves rclone_ok unset.
-    server_ops::TestResult t;
-    t.grab_engine = true;
     CHECK_FALSE(t.ok()); // nothing tested yet
     t.grab_ok = true;
     CHECK(t.ok());
     t.grab_ok = false;
     CHECK_FALSE(t.ok());
-    // engine = rclone without its listing's answer is no failure either (a grab warning at most).
-    server_ops::TestResult r;
-    r.grab_ok = false;
-    CHECK(r.ok());
-    r.rclone_ok = false;
-    CHECK_FALSE(r.ok());
+    server_ops::TestResult guarded;
+    guarded.unusable = "[Box] connects through a SOCKS proxy (rclone.socks_proxy), ...";
+    CHECK_FALSE(guarded.ok());
 }
 
-TEST_CASE("server ops: Test runs rclone's listing on engine = rclone only, and refuses an unpinned server before anything dials") {
-    if (util::getenv_utf8("GRAB_ENGINE")) {
-        MESSAGE("GRAB_ENGINE is set; skipped");
-        return;
-    }
-    // Both servers fail without the network: grab's login binds to TEST-NET's 192.0.2.1, which
-    // this PC hasn't got, and the rclone asked is a program that isn't there.
+TEST_CASE("server ops: Test is grab's login only, whatever `engine` says; a guarded or unpinned server fails before anything dials") {
+    // Every server fails without the network: grab's login binds to TEST-NET's 192.0.2.1, which
+    // this PC hasn't got; the old `rclone =` names a program that isn't there and isn't asked.
     Scratch s;
     s.write("grab.conf", "[grab]\nrclone = " + util::path_to_utf8(s.dir / "no-rclone.exe") +
                              "\n\n[g]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\nengine = grab\n"
                              "common_flags = --bind 192.0.2.1\n"
                              "\n[r]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\nengine = rclone\nfind = rclone\n"
                              "common_flags = --bind 192.0.2.1\n"
-                             "\n[u]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\nengine = rclone\n"
-                             "\n[d]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\ncommon_flags = --bind 192.0.2.1\n");
+                             "\n[u]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\n"
+                             "\n[p]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\n"
+                             "common_flags = --sftp-socks-proxy fake-user:fake-pass@127.0.0.1:1080\n");
     Scratch::pins("[127.0.0.1]:1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n");
     const auto env = s.env();
-    const auto g = server_ops::test_connection(env, "g");
-    REQUIRE(g.has_value());
-    CHECK(g->grab_engine);
-    CHECK_FALSE(g->rclone_ok.has_value()); // not asked
-    CHECK(g->grab_ok == false);
-    CHECK(g->grab_error.find("--bind") != std::string::npos);
-    CHECK(g->grab_error.find("engine = rclone") == std::string::npos); // rclone couldn't bind there either
-    CHECK_FALSE(g->ok());
-    // No `engine` line: grab's own client, as on [g] (phase 8: the default).
-    const auto d = server_ops::test_connection(env, "d");
-    REQUIRE(d.has_value());
-    CHECK(d->grab_engine);
-    CHECK_FALSE(d->rclone_ok.has_value());
-    CHECK_FALSE(d->ssh_ok.has_value());
-    CHECK(d->grab_ok == false);
-    const auto r = server_ops::test_connection(env, "r");
-    REQUIRE(r.has_value());
-    CHECK_FALSE(r->grab_engine);
-    CHECK(r->rclone_ok == false); // asked, and it isn't there
-    CHECK_FALSE(r->rclone_error.empty());
-    CHECK(r->rclone_error.find("host key") == std::string::npos);
-    CHECK(r->grab_ok == false); // previews, Play and Verify can't run: a warning
-    CHECK_FALSE(r->ok());
-    // [u]: no key for [127.0.0.1]:2: every part says to use Trust; neither rclone nor grab's
-    // client nor ssh ran (else rclone's error would be the missing program's).
+    for (const char* name : {"g", "r"}) {
+        const auto t = server_ops::test_connection(env, name);
+        REQUIRE(t.has_value());
+        CHECK(t->grab_ok == false);
+        CHECK(t->grab_error.find("--bind") != std::string::npos);
+        CHECK(t->grab_error.find("engine = rclone") == std::string::npos);
+        CHECK(t->unusable.empty());
+        CHECK_FALSE(t->ok());
+        CHECK(server_ops::test_lines(*t) == std::vector<std::string>{"grab: FAILED: " + t->grab_error});
+    }
+    // [u]: no key for [127.0.0.1]:2: Trust, nothing dialled.
     const auto u = server_ops::test_connection(env, "u");
     REQUIRE(u.has_value());
-    CHECK(u->rclone_error.find("host key not trusted: use Trust") != std::string::npos);
     CHECK(u->grab_error.find("host key not trusted: use Trust") != std::string::npos);
-    CHECK(u->ssh_ok == false);
-    CHECK(u->ssh_error.find("host key not trusted: use Trust") != std::string::npos);
     CHECK_FALSE(u->ok());
+    // [p]: a proxy grab can't use, and not pinned either: the reason, which says how to clear it
+    // (Trust would be refused too).
+    const auto p = server_ops::test_connection(env, "p");
+    REQUIRE(p.has_value());
+    CHECK_FALSE(p->grab_ok.has_value()); // nothing tried
+    CHECK(p->unusable.starts_with("[p] connects through a SOCKS proxy (common_flags' --sftp-socks-proxy)"));
+    CHECK(p->unusable.find("fake-") == std::string::npos);
+    CHECK_FALSE(p->ok());
+    CHECK(server_ops::test_lines(*p) == std::vector<std::string>{"not usable: " + p->unusable});
     // A section without details can't be tested.
     s.write("grab.conf", "[grab]\n\n[bare]\nmax_depth = 2\n");
     CHECK_FALSE(server_ops::test_connection(s.env(), "bare").has_value());
@@ -1005,12 +1042,12 @@ TEST_CASE("server list says whether each login's secret is saved for that very l
     CHECK_FALSE(list[0].store_error.empty());
     CHECK(server_ops::login_text(list[0]).starts_with("password (grab's saved passwords can't be read: "));
     // ssh-agent needs none to log in, but the store may hold a route: the guard counts it as one,
-    // so Trust asks "Connect directly?" first.
+    // so Trust is refused until an Edit sets the store aside.
     CHECK_FALSE(list[1].store_error.empty());
     CHECK(server_ops::login_text(list[1]) == "ssh-agent");
     REQUIRE(list[1].guard.size() == 1);
     CHECK(list[1].guard[0].where == "grab's store, which can't be read");
-    CHECK_FALSE(server_ops::direct_warning(list[1], "a.example", 22).empty());
+    CHECK_FALSE(server_ops::reach_for(env, list[1].name).has_value());
     // So an edit can't keep "the saved one".
     CHECK(server_ops::edit_needs_password(list[0], server(Auth::password)));
 #endif
@@ -1048,33 +1085,26 @@ TEST_CASE("an edit starts from the server's answers; a section without details f
     CHECK(server_ops::edit_needs_password(list[2], wanted));
 }
 
-TEST_CASE("a test's lines as the command prints them") {
+TEST_CASE("a test's lines as the command prints them: one grab line, or why the server isn't usable") {
     server_ops::TestResult t;
-    t.rclone_ok = true;
     t.grab_ok = true;
+    t.grab_search = "with find (GNU find)";
     t.checksums = "checksums: md5sum";
-    CHECK(server_ops::test_lines(t) == std::vector<std::string>{
-                                           "rclone (downloads): OK",
-                                           "grab (previews, Play, verify): OK, home folder listed, checksums: md5sum"});
+    CHECK(server_ops::test_lines(t) ==
+          std::vector<std::string>{"grab: OK, home folder listed, searches with find (GNU find), checksums: md5sum"});
+    t.checksums = "verify can't run: no md5sum";
+    CHECK(server_ops::test_lines(t) == std::vector<std::string>{"grab: OK, home folder listed, searches with find (GNU "
+                                                                "find), verify can't run: no md5sum"});
     t.grab_ok = false;
     t.grab_error = "Box: host key not trusted: use Trust";
-    t.ssh_ok = false;
-    t.ssh_error = "Permission denied (publickey).";
-    CHECK(server_ops::test_lines(t, " (hint)") ==
-          std::vector<std::string>{"rclone (downloads): OK",
-                                   "grab (previews, Play, verify): can't run: Box: host key not trusted: use Trust",
-                                   "ssh (searches):     FAILED: Permission denied (publickey). (hint)"});
+    CHECK(server_ops::test_lines(t) == std::vector<std::string>{"grab: FAILED: Box: host key not trusted: use Trust"});
     server_ops::TestResult g;
-    g.grab_engine = true;
-    g.grab_ok = true;
-    g.grab_search = "with find (GNU find)";
-    g.checksums = "verify can't run: no md5sum";
-    CHECK(server_ops::test_lines(g) ==
-          std::vector<std::string>{"grab (downloads, searches, previews, Play, verify): OK, home folder listed, searches "
-                                   "with find (GNU find), verify can't run: no md5sum"});
-    g.grab_ok = false;
-    g.grab_error = "login refused";
-    CHECK(server_ops::test_lines(g).at(0) == "grab (downloads, searches, previews, Play, verify): FAILED: login refused");
+    g.unusable = "[Box] needs one read at a time (rclone.disable_concurrent_reads), which grab can't, ...";
+    CHECK(server_ops::test_lines(g) == std::vector<std::string>{"not usable: " + g.unusable});
+    for (const auto& line : server_ops::test_lines(t)) {
+        CHECK(line.find("rclone (") == std::string::npos);
+        CHECK(line.find("ssh (") == std::string::npos);
+    }
 }
 
 TEST_CASE("the window's notice after an import names the servers moved and what each still needs") {

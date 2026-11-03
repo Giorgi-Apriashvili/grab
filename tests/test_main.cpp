@@ -35,6 +35,13 @@ int main(int argc, char** argv) {
     for (const wchar_t* name : {L"HOMEDRIVE", L"HOMEPATH", L"RCLONE_CONFIG", L"GRAB_CONFIG"}) {
         SetEnvironmentVariableW(name, nullptr);
     }
+    // The guard's inherited variables: one set in the developer's shell would refuse every server.
+    for (const wchar_t* name : {L"RCLONE_SFTP_SOCKS_PROXY", L"RCLONE_SFTP_HTTP_PROXY", L"RCLONE_SFTP_SUBSYSTEM",
+                                L"RCLONE_SFTP_SERVER_COMMAND", L"RCLONE_SFTP_USE_INSECURE_CIPHER", L"RCLONE_SFTP_CIPHERS",
+                                L"RCLONE_SFTP_KEY_EXCHANGE", L"RCLONE_SFTP_MACS", L"RCLONE_SFTP_HOST_KEY_ALGORITHMS",
+                                L"RCLONE_SFTP_DISABLE_CONCURRENT_READS", L"RCLONE_SFTP_USE_FSTAT"}) {
+        SetEnvironmentVariableW(name, nullptr);
+    }
 #else
     setenv("XDG_CONFIG_HOME", (home / "Roaming").c_str(), 1);
     setenv("XDG_CACHE_HOME", (home / "Local").c_str(), 1);
