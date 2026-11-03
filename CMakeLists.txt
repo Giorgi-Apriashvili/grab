@@ -242,6 +242,10 @@ endif()
 install(FILES grab.conf.example DESTINATION .)
 
 if(WIN32)
+    # The README, the full documentation and the license, laid out as in the zip, so the links
+    # between them (README.md -> docs/doc.md -> ../LICENSE, ../licenses/) work in the install tree.
+    install(FILES README.md LICENSE DESTINATION .)
+    install(FILES docs/doc.md DESTINATION docs)
     option(GRAB_INSTALL_ADD_TO_PATH "On install, add <prefix>/bin to the user PATH" ON)
     if(GRAB_INSTALL_ADD_TO_PATH)
         # \${...} is evaluated at install time, so `cmake --install --prefix X` is honoured.
@@ -266,7 +270,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Release artifacts: `cmake --build --preset <p> --target dist` writes to <build>/dist/
 #   grab-<version>-windows-x64.zip        portable: grab.exe, grab-gui.exe, rclone.exe, example
-#                                         config, README, LICENSE
+#                                         config, README, docs/doc.md, licenses/, LICENSE
 #   grab-<version>-windows-x64-setup.exe  Inno Setup per-user installer, when ISCC is available
 # ---------------------------------------------------------------------------
 if(WIN32)
@@ -303,6 +307,7 @@ if(WIN32)
         "${GRAB_STAGE_DIR}/licenses/openssl.txt"
         "${GRAB_STAGE_DIR}/grab.conf.example"
         "${GRAB_STAGE_DIR}/README.md"
+        "${GRAB_STAGE_DIR}/docs/doc.md"
         "${GRAB_STAGE_DIR}/LICENSE")
     set(GRAB_LICENSES
         "${CMAKE_CURRENT_SOURCE_DIR}/licenses/rclone.txt"
@@ -313,14 +318,17 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "$<TARGET_FILE:grab-gui>" "${GRAB_RCLONE_EXE}"
                 ${GRAB_EXTRA_FILES} "${GRAB_STAGE_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy ${GRAB_LICENSES} "${GRAB_STAGE_DIR}/licenses"
+        # docs/doc.md keeps its folder, so the README's link to it works in the zip too.
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}/docs"
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/docs/doc.md" "${GRAB_STAGE_DIR}/docs"
         DEPENDS grab grab-gui "${GRAB_RCLONE_EXE}" ${GRAB_LICENSES}
-                ${GRAB_EXTRA_FILES}
+                "${CMAKE_CURRENT_SOURCE_DIR}/docs/doc.md" ${GRAB_EXTRA_FILES}
         COMMENT "Staging release files"
         VERBATIM)
     add_custom_command(OUTPUT "${GRAB_ZIP}"
         COMMAND ${CMAKE_COMMAND} -E tar cf "${GRAB_ZIP}" --format=zip --
                 grab.exe grab-gui.exe rclone.exe licenses/rclone.txt licenses/libssh2.txt
-                licenses/openssl.txt grab.conf.example README.md LICENSE
+                licenses/openssl.txt grab.conf.example README.md docs/doc.md LICENSE
         WORKING_DIRECTORY "${GRAB_STAGE_DIR}"
         DEPENDS ${GRAB_STAGED}
         COMMENT "Packing ${GRAB_ZIP}"

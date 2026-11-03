@@ -591,7 +591,8 @@ TEST_CASE("keys grab doesn't read are collected for a notice, never an error (N7
 
 TEST_CASE("the new keys sit beside the old ones, which keep their meaning for rclone and grab 0.19") {
     // 0.19.0's parse_grab_config (v0.19.0 config.cpp) reads only the keys it knew and skips any
-    // other: it sees this section's common_flags as written, its bind lost (README says so).
+    // other: it sees this section's common_flags as written, its bind lost (docs/doc.md says so,
+    // in Going back to 0.19).
     const auto cfg = parse_ok("[Main]\nhost = h\nbind = 10.0.0.2\nconnect_timeout = 10s\nio_timeout = 1m\n"
                               "common_flags = --bind 10.0.0.2\n");
     REQUIRE(cfg.remotes.size() == 1);

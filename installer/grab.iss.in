@@ -51,6 +51,8 @@ Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\libssh2.txt"; DestDir: "{app}\licenses
 Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\openssl.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab.conf.example"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\README.md"; DestDir: "{app}"; Flags: ignoreversion
+; The full documentation, which README.md links to as docs/doc.md.
+Source: "@GRAB_STAGE_DIR_NATIVE@\docs\doc.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "@GRAB_STAGE_DIR_NATIVE@\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
@@ -72,6 +74,7 @@ Name: "{userdesktop}\grab"; Filename: "{app}\bin\grab-gui.exe"; WorkingDir: "{ap
 Type: files; Name: "{app}\bin\*.exe.old"
 Type: dirifempty; Name: "{app}\bin"
 Type: dirifempty; Name: "{app}\licenses"
+Type: dirifempty; Name: "{app}\docs"
 Type: filesandordirs; Name: "{localappdata}\grab\WebView2"
 Type: dirifempty; Name: "{localappdata}\grab"
 

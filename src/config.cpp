@@ -92,7 +92,7 @@ skip_hidden = true
 # rclone, the fallback until a later grab removes it. A server whose rclone settings grab's
 # client can't serve (a proxy, an ssh command) stays on rclone by itself and says why. A server
 # on rclone also takes rclone's flags in common_flags and folder_flags, and ssh.exe's in
-# ssh_options (README: Configure).
+# ssh_options (docs/doc.md: Configure).
 # engine = rclone
 )";
 

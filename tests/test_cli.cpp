@@ -4,9 +4,11 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace grab;
@@ -268,9 +270,10 @@ TEST_CASE("usage mentions both modes") {
 
 namespace {
 // The options an options list names, one a line ("  -r, --remote NAME   ...", "  -- FLAGS ..."):
-// the long name, or "--" for the flags after it. Continuation lines are indented further (one may
-// start with a flag: "--timeout TIME (1s to 24h ...").
-std::set<std::string> option_names(std::string_view block) {
+// the long name, or "--" for the flags after it, and with `short_names` the short one too ("-r").
+// Continuation lines are indented further (one may start with a flag: "--timeout TIME (1s to 24h
+// ...").
+std::set<std::string> option_names(std::string_view block, bool short_names = false) {
     std::set<std::string> out;
     while (!block.empty()) {
         const auto eol = std::min(block.find('\n'), block.size());
@@ -279,34 +282,103 @@ std::set<std::string> option_names(std::string_view block) {
         const auto indent = line.find_first_not_of(' ');
         if (indent == std::string_view::npos || indent < 2 || indent > 6 || line[indent] != '-') continue;
         std::string_view l = util::trim(line);
-        if (l.size() > 4 && l[1] != '-' && l.substr(2, 2) == ", ") l.remove_prefix(4); // "-r, "
+        if (l.size() > 4 && l[1] != '-' && l.substr(2, 2) == ", ") { // "-r, "
+            if (short_names) out.emplace(l.substr(0, 2));
+            l.remove_prefix(4);
+        }
         out.emplace(l.substr(0, l.find(' ')));
     }
     return out;
 }
-} // namespace
 
-TEST_CASE("README's Usage block names the options the help names, --rclone no longer (phase 8 step 11)") {
-    auto readme = util::read_file(util::path_from_utf8(GRAB_SOURCE_DIR) / "README.md");
-    REQUIRE_MESSAGE(readme, readme.error_or(""));
-    std::erase(*readme, '\r'); // a checkout may have made it CRLF
-    const auto start = readme->find("## Usage\n\n```\n");
-    REQUIRE(start != std::string::npos);
-    const auto body = start + std::string_view("## Usage\n\n```\n").size();
-    const auto end = readme->find("```", body);
-    REQUIRE(end != std::string::npos);
-    const auto documented = option_names(std::string_view(*readme).substr(body, end - body));
+// Every option a text mentions, in an options list, prose or examples: "-n", "--first", "--type"
+// in "--type video", "--" before the connection flags. One starts after a space, a line break, a
+// backtick or one of ( [ |, so "1-5,8" and "case-sensitive" aren't options.
+std::set<std::string> mentioned_options(std::string_view text) {
+    constexpr std::string_view before = " \n`([|";
+    const auto name_char = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'; };
+    std::set<std::string> out;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '-' || (i > 0 && before.find(text[i - 1]) == std::string_view::npos)) continue;
+        const std::size_t name = i + (i + 1 < text.size() && text[i + 1] == '-' ? 2 : 1);
+        std::size_t j = name;
+        while (j < text.size() && name_char(text[j])) ++j;
+        if (j > name) {
+            out.emplace(text.substr(i, j - i));
+        } else if (name == i + 2 && (j == text.size() || text[j] == ' ')) {
+            out.emplace("--");
+        }
+        i = j - 1;
+    }
+    return out;
+}
 
-    const std::string help = usage();
+// A text file of the source tree, without the CRs a checkout may have added.
+std::string source_file(std::string_view relative) {
+    auto text = util::read_file(util::path_from_utf8(GRAB_SOURCE_DIR) / util::path_from_utf8(relative));
+    REQUIRE_MESSAGE(text, text.error_or(""));
+    std::erase(*text, '\r');
+    return std::move(*text);
+}
+
+// The help's options list: from "Options:" to the blank line after it.
+std::string_view help_options(const std::string& help) {
     const auto options = help.find("Options:\n");
     REQUIRE(options != std::string::npos);
-    const auto helped = option_names(std::string_view(help).substr(options, help.find("\n\n", options) - options));
+    return std::string_view(help).substr(options, help.find("\n\n", options) - options);
+}
+} // namespace
+
+TEST_CASE("docs/doc.md's Usage block names the options the help names, --rclone no longer (phase 8 step 11)") {
+    const std::string doc = source_file("docs/doc.md");
+    const auto start = doc.find("\n## Usage\n\n```\n");
+    REQUIRE(start != std::string::npos);
+    const auto body = start + std::string_view("\n## Usage\n\n```\n").size();
+    const auto end = doc.find("```", body);
+    REQUIRE(end != std::string::npos);
+    const auto documented = option_names(std::string_view(doc).substr(body, end - body));
+
+    const std::string help = usage();
+    const auto helped = option_names(help_options(help));
     CHECK(helped.contains("--"));
     CHECK_FALSE(helped.contains("--rclone"));
-    // The README's block leaves out what its first line and the commands show.
+    // The doc's block leaves out what its first line and the commands show.
     for (const auto& name : helped) {
         if (name == "--file" || name == "--folder" || name == "--help" || name == "--version") continue;
         CHECK_MESSAGE(documented.contains(name), name);
     }
     for (const auto& name : documented) CHECK_MESSAGE(helped.contains(name), name);
+}
+
+TEST_CASE("every option the README's Basic usage mentions is one the help names") {
+    const std::string readme = source_file("README.md");
+    const auto start = readme.find("\n## Basic usage\n");
+    REQUIRE(start != std::string::npos);
+    const auto end = readme.find("\n## ", start + 1);
+    REQUIRE(end != std::string::npos);
+    const std::string_view section = std::string_view(readme).substr(start, end - start);
+    const auto block = section.find("```\n");
+    REQUIRE(block != std::string_view::npos);
+    const auto block_end = section.find("```", block + 4);
+    REQUIRE(block_end != std::string_view::npos);
+    const auto listed = option_names(section.substr(block + 4, block_end - block - 4));
+
+    const std::string help = usage();
+    const auto helped = option_names(help_options(help));
+    const auto spellings = option_names(help_options(help), true);
+    CHECK(spellings.contains("-n"));
+    CHECK(spellings.contains("--dry-run"));
+    // Its options list, then every option its prose and examples use.
+    CHECK(listed.size() >= 5);
+    for (const auto& name : listed) CHECK_MESSAGE(helped.contains(name), name);
+    const auto mentioned = mentioned_options(section);
+    CHECK(mentioned.contains("--first"));
+    CHECK(mentioned.contains("-f"));
+    for (const auto& name : mentioned) CHECK_MESSAGE(spellings.contains(name), name);
+}
+
+TEST_CASE("mentioned_options finds options, not ranges or hyphenated words") {
+    const auto found =
+        mentioned_options("grab [-s|--file] x (`-n`) --type video,audio 1-5,8 case-sensitive\n- a\n[-- FLAGS]");
+    CHECK(found == std::set<std::string>{"-s", "--file", "-n", "--type", "--"});
 }

@@ -826,7 +826,7 @@ TEST_CASE("an unchanged Edit of an agent server moves an undecryptable store asi
     const auto edited = server_ops::update_server(s.env(), agent, std::nullopt, std::nullopt);
     REQUIRE_MESSAGE(edited.has_value(), edited.error_or(""));
     CHECK(edited->find("moved aside to ") != std::string::npos);
-    // The proxy or ssh command the store kept goes with it: the note says so (README, Passwords).
+    // The proxy or ssh command the store kept goes with it: the note says so (docs/doc.md, Servers).
     CHECK(edited->find("with any proxy or ssh command a server kept there (such a server now connects directly)") !=
           std::string::npos);
     CHECK(edited->find("enter the password of box again with Edit") != std::string::npos);
