@@ -10,8 +10,8 @@
 #include "progress_line.hpp"
 #include "quote.hpp"
 #include "rate.hpp"
-#include "rclone.hpp"
 #include "rclone_flags.hpp"
+#include "remote.hpp"
 #include "schedule.hpp"
 #include "space.hpp"
 #include "ssh_pool.hpp"
@@ -419,7 +419,7 @@ int fetch_file(const Session& s, const std::string& path, int id, std::filesyste
             s.line.clear();
             const ExistingFile f{util::path_to_utf8(target.filename()), target, result.size,
                                  util::parse_rfc3339_seconds(result.modtime)};
-            const auto answer = choose_existing(s.opts, {f}, 1, true, s.several);
+            const auto answer = choose_existing(s.opts, {f}, 1, s.several);
             if (!answer) return answer.error();
             choice = answer->choice;
             if (answer->for_all) *s.for_rest = choice;
@@ -582,7 +582,7 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
                 if (files.size() == 10) break;
                 files.push_back({folder_name + "/" + c.path, c.local, c.size, util::parse_rfc3339_seconds(c.modtime)});
             }
-            const auto answer = choose_existing(s.opts, files, found.size(), true, s.several);
+            const auto answer = choose_existing(s.opts, files, found.size(), s.several);
             if (!answer) return answer.error();
             job.existing = answer->choice;
             if (answer->for_all) *s.for_rest = answer->choice;
@@ -721,15 +721,8 @@ std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rule
 
 
 std::expected<Answer, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
-                                         std::size_t count, bool keep_both, bool offer_all) {
-    if (opts.existing) {
-        if (*opts.existing == existing::Choice::keep_both && !keep_both) {
-            std::println(stderr, "grab: error: --existing both can't be used here: rclone copies a folder under the "
-                                 "server's names; use replace or skip");
-            return std::unexpected(exit_aborted);
-        }
-        return Answer{.choice = *opts.existing, .for_all = true};
-    }
+                                         std::size_t count, bool offer_all) {
+    if (opts.existing) return Answer{.choice = *opts.existing, .for_all = true};
     const bool unsure = std::ranges::any_of(files, [](const ExistingFile& f) { return !f.uncompared.empty(); });
     std::println(stderr, "grab: {} already there {} from the server's:",
                  count == 1 ? std::string("1 file") : std::format("{} files", count),
@@ -738,23 +731,22 @@ std::expected<Answer, int> choose_existing(const Options& opts, const std::vecto
     if (count > files.size()) std::println(stderr, "  ... and {} more", count - files.size());
     if (!util::stdin_is_tty()) {
         std::println(stderr, "grab: error: nothing was replaced; to say what to do without being asked, add --existing "
-                             "replace, {}skip",
-                     keep_both ? "both or " : "");
+                             "replace, both or skip");
         return std::unexpected(exit_download_failed);
     }
     for (;;) {
-        std::print(stderr, "{}{}", keep_both ? "[r]eplace, [k]eep both, [s]kip, [q]uit" : "[r]eplace, [s]kip, [q]uit",
-                   !offer_all ? ": " : keep_both ? " (R, K, S: the same for the rest): " : " (R, S: the same for the rest): ");
+        std::print(stderr, "[r]eplace, [k]eep both, [s]kip, [q]uit{}",
+                   offer_all ? " (R, K, S: the same for the rest): " : ": ");
         std::string line;
         if (!std::getline(std::cin, line)) return std::unexpected(exit_aborted);
         const std::string typed(util::trim(line));
         // A capital letter answers every later question of this run too.
         if (offer_all && typed == "R") return Answer{.choice = existing::Choice::replace, .for_all = true};
-        if (offer_all && keep_both && typed == "K") return Answer{.choice = existing::Choice::keep_both, .for_all = true};
+        if (offer_all && typed == "K") return Answer{.choice = existing::Choice::keep_both, .for_all = true};
         if (offer_all && typed == "S") return Answer{.choice = existing::Choice::skip, .for_all = true};
         const auto answer = util::to_lower(typed);
         if (answer == "r" || answer == "replace") return Answer{.choice = existing::Choice::replace};
-        if (keep_both && (answer == "k" || answer == "keep both" || answer == "both")) {
+        if (answer == "k" || answer == "keep both" || answer == "both") {
             return Answer{.choice = existing::Choice::keep_both};
         }
         if (answer == "s" || answer == "skip") return Answer{.choice = existing::Choice::skip};
@@ -879,7 +871,7 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
             }
         }
         if (!listed.empty()) {
-            const auto answer = choose_existing(opts, found, listed.size(), true, total > listed.size());
+            const auto answer = choose_existing(opts, found, listed.size(), total > listed.size());
             if (!answer) {
                 tally.code = answer.error();
                 tally.failed = paths;

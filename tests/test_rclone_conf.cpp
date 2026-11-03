@@ -1,6 +1,6 @@
 // grab's reading of an rclone.conf as rclone reads it (rclone_conf.hpp), without rclone: what
 // rclone would hang or crash on, and the path expansion with a made-up environment.
-// tests/test_rclone_env.cpp checks the same reader against the bundled rclone.
+// tests/test_rclone_env.cpp checks the same reader against rclone itself (the test rclone).
 
 #include "rclone_conf.hpp"
 #include "util.hpp"

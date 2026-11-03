@@ -89,6 +89,27 @@ TEST_CASE("a path target only validates existence and type") {
     CHECK_FALSE(is_path_target("x"));
 }
 
+TEST_CASE("remote_basename ignores trailing slashes") {
+    CHECK(remote_basename("/home/alice/releases/movie.mkv") == "movie.mkv");
+    CHECK(remote_basename("/home/alice/releases/") == "releases");
+    CHECK(remote_basename("plain") == "plain");
+}
+
+TEST_CASE("remote_spec joins remote and absolute path") {
+    CHECK(remote_spec("hetzner", "/home/alice/releases") == "hetzner:/home/alice/releases");
+}
+
+TEST_CASE("a remote path with no name to save it under (G15)") {
+    CHECK(has_name("/srv/x"));
+    CHECK(has_name("x/"));
+    CHECK(has_name("a"));
+    CHECK_FALSE(has_name("/"));
+    CHECK_FALSE(has_name("//"));
+    CHECK_FALSE(has_name(""));
+    CHECK_FALSE(has_name("."));
+    CHECK_FALSE(has_name("/srv/.."));
+}
+
 TEST_CASE("a blank root searches the login home") {
     FindRequest req;
     req.mode = Mode::folder;

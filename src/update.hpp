@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <compare>
 #include <cstdint>
 #include <expected>
@@ -87,8 +88,14 @@ enum class InstallMode {
 // this is a portable copy lacking release programs, else nullopt. Windows only.
 [[nodiscard]] std::optional<std::string> incomplete_folder_note();
 
-// Deletes the "<name>.exe.old" files an update left next to the running program: grab.exe,
-// rclone.exe or grab-gui.exe it replaced while they ran. Each goes once nothing runs it.
+// The names an update gives the programs it replaced while they ran (update.cpp's swap): only
+// these are grab's to delete. Other programs in a shared folder keep their own .old files (G31).
+inline constexpr std::array<std::string_view, 3> replaced_programs{"grab.exe.old", "grab-gui.exe.old",
+                                                                    "rclone.exe.old"};
+
+// Deletes the replaced_programs files an update left in `dir`. Each goes once nothing runs it.
+void remove_replaced_programs(const std::filesystem::path& dir);
+// The same next to the running program.
 void remove_replaced_programs();
 
 // GRAB_UPDATE_API, else default_api_url.

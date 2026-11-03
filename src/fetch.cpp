@@ -4,6 +4,7 @@
 #include "process.hpp"
 #include "rclone.hpp"
 #include "rclone_encoding.hpp"
+#include "remote.hpp"
 #include "server_ops.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"

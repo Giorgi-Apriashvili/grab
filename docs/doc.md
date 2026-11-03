@@ -86,6 +86,10 @@ ctest --preset clang-cl-debug --output-on-failure
 # binary: build\clang-cl-debug\grab.exe   (release: clang-cl-release)
 ```
 
+The tests compare grab with rclone 1.75.1, which the configure downloads (checksum-verified)
+into `build\<preset>\test-tools` for them alone; it is never installed or packed. Configured
+with `-DGRAB_TEST_TOOLS=OFF`, the build leaves it out and those tests are skipped.
+
 In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 `build/clang-cl-debug/compile_commands.json`; `launch.json` has a CodeLLDB dry-run config.
 
@@ -1233,7 +1237,7 @@ src/ssh_hash.*  the server's MD5 for verification: md5sum over a command, batche
 cmake/vcpkg*    OpenSSL from vcpkg; cmake/vcpkg-ports/openssl pins 3.5 LTS
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
-tests/          doctest unit tests (fetched by CMake)
+tests/          doctest unit tests (doctest and the tests' rclone fetched by CMake)
 ```
 
 ## Releasing

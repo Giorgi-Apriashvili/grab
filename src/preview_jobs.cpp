@@ -2,7 +2,7 @@
 
 #include "conn_budget.hpp"
 #include "preview.hpp"
-#include "rclone.hpp"
+#include "remote.hpp"
 #include "sftp.hpp"
 #include "ssh_read.hpp"
 #include "util.hpp"

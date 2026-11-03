@@ -143,13 +143,19 @@ bool needs_install(const Version& current, const Version& latest, bool folder_in
     return latest > current || (latest == current && folder_incomplete);
 }
 
+void remove_replaced_programs(const std::filesystem::path& dir) {
+    std::error_code ignored;
+    for (const auto name : replaced_programs) {
+        const auto old = dir / util::path_from_utf8(name);
+        // Only a file: a folder of that name isn't one grab left.
+        if (std::filesystem::is_regular_file(old, ignored)) std::filesystem::remove(old, ignored);
+    }
+}
+
 void remove_replaced_programs() {
     const auto self = util::self_exe_path();
     if (self.empty()) return;
-    std::error_code ignored;
-    for (const auto& e : std::filesystem::directory_iterator(self.parent_path(), ignored)) {
-        if (e.path().filename().wstring().ends_with(L".exe.old")) std::filesystem::remove(e.path(), ignored);
-    }
+    remove_replaced_programs(self.parent_path());
 }
 
 std::string api_url() { return util::getenv_utf8("GRAB_UPDATE_API").value_or(std::string(default_api_url)); }

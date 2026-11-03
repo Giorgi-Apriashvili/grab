@@ -1,12 +1,12 @@
 #include "folder_job.hpp"
 
-#include "cli.hpp"
 #include "existing.hpp"
 #include "local_name.hpp"
 #include "process.hpp"
 #include "rclone.hpp"
 #include "rclone_encoding.hpp"
 #include "rclone_flags.hpp"
+#include "remote.hpp"
 #include "server_ops.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
@@ -136,7 +136,7 @@ void run_batch(const Job& job, Tree& tree, std::mutex& m, const std::vector<std:
     bool worked = false; // its connections count as working (fetch::Connections::working)
     auto last_check = std::chrono::steady_clock::now();
     auto result = engine::download(
-        *job.ctx, Mode::folder, job.remote_path, job.dest,
+        *job.ctx, job.remote_path, job.dest,
         [&](const engine::Progress& p) {
             if (p.bytes > charged) {
                 if (job.limiter != nullptr) job.limiter->debit(p.bytes - charged);

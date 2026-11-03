@@ -34,21 +34,12 @@ struct RcloneRequest {
     std::optional<std::filesystem::path> local_name; // a file's name instead of the server's (Keep both)
 };
 
-// Last path component, ignoring trailing slashes.
-[[nodiscard]] std::string remote_basename(std::string_view remote_path);
-// Whether a remote path ends in a name to save it under: not "/", "." or ".." (whose local
-// target would be the download folder itself, review G15).
-[[nodiscard]] bool has_name(std::string_view remote_path);
-
 // Whether a server path came without its real bytes: not UTF-8 (ssh + find prints them as they
 // are), or with U+FFFD where rclone's JSON put it for bytes that weren't. rclone can't be given
 // such a name on its command line or in a list, so it can't fetch it (review G17).
 [[nodiscard]] bool name_not_utf8(std::string_view remote_path);
 inline constexpr std::string_view not_utf8_error =
     "its name on the server isn't UTF-8 (shown with �), which rclone can't be given; rename it there to fetch it";
-
-// "remote:/abs/path"
-[[nodiscard]] std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path);
 
 // Where the transfer lands locally: DEST\<basename of remote_path>, in both modes.
 [[nodiscard]] std::filesystem::path local_target(const RcloneRequest& req);

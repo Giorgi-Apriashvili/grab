@@ -293,14 +293,14 @@ TEST_CASE("a run's own environment: added, replacing inherited names ignoring ca
                              {"GRAB_TEST_ENV_\u10E1\u10D4\u10E0", "\u10D2\u10D0\u10E0\u10D4 = x"}};
     quiet.environment.without_prefix = {"grab_test_env_drop_"};
     const auto ran = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/u", "/c", "set GRAB_TEST_ENV_"}, quiet);
-    // run_inherit's: the whole environment, the same rules (its output goes to the console, so the
-    // child writes it to a file).
+    // run_inherit's (an editor, an installer): the whole environment as it is, nothing added or left
+    // out (its output goes to the console, so the child writes it to a file).
     const auto dir = std::filesystem::temp_directory_path() / "grab-test-run-env";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const auto file = util::path_to_utf8(dir / "set.txt");
-    const auto inherited = proc::run_inherit(
-        std::vector<std::string>{"cmd", "/d", "/u", "/c", "set", "GRAB_TEST_ENV_", ">", file}, quiet.environment);
+    const auto inherited =
+        proc::run_inherit(std::vector<std::string>{"cmd", "/d", "/u", "/c", "set", "GRAB_TEST_ENV_", ">", file});
     SetEnvironmentVariableW(L"grab_test_env_replaced", nullptr);
     SetEnvironmentVariableW(L"GRAB_TEST_ENV_KEPT", nullptr);
     SetEnvironmentVariableW(L"GRAB_TEST_ENV_DROP_ONE", nullptr);
@@ -320,7 +320,9 @@ TEST_CASE("a run's own environment: added, replacing inherited names ignoring ca
     REQUIRE_MESSAGE(ran.has_value(), ran.error_or(""));
     CHECK(lines(ran->out) == expected);
     REQUIRE_MESSAGE(inherited.has_value(), inherited.error_or(""));
-    CHECK(lines(util::read_file(dir / "set.txt").value_or("")) == expected);
+    CHECK(lines(util::read_file(dir / "set.txt").value_or("")) ==
+          std::vector<std::string>{"GRAB_TEST_ENV_DROP_ONE=inherited", "GRAB_TEST_ENV_KEPT=inherited",
+                                   "grab_test_env_replaced=inherited"});
     std::filesystem::remove_all(dir);
     // A run with nothing of its own still leaves out what internal runs must not see.
     SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", L"x");

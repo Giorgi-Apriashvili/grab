@@ -40,6 +40,15 @@ struct FindRequest {
 // rather than a name to be searched for.
 [[nodiscard]] bool is_path_target(std::string_view target);
 
+// Last path component, ignoring trailing slashes.
+[[nodiscard]] std::string remote_basename(std::string_view remote_path);
+// Whether a remote path ends in a name to save it under: not "/", "." or ".." (whose local
+// target would be the download folder itself, review G15).
+[[nodiscard]] bool has_name(std::string_view remote_path);
+
+// "remote:/abs/path": how grab shows a server's path, and rclone's form of it.
+[[nodiscard]] std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path);
+
 // The `find -L` command run by the remote shell: links are followed, as rclone's listing and
 // grab's walk follow them (review G54). Name matching happens on the server: one
 // `-iname '*word*'` per word, `-iname` for a glob, `-name` for --exact. Files are printed

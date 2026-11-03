@@ -492,16 +492,11 @@ std::expected<PipedResult, std::string> run_piped(std::span<const std::string> a
 }
 
 std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool contain_descendants) {
-    return run_inherit(argv, Environment{}, contain_descendants);
-}
-
-std::expected<int, std::string> run_inherit(std::span<const std::string> argv, const Environment& environment,
-                                            bool contain_descendants) {
     const StdHandles std_h{GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE),
                            GetStdHandle(STD_ERROR_HANDLE), false};
     CtrlGuard guard;
     Child child;
-    if (auto r = launch(argv, std_h, false, child, environment, contain_descendants, true); !r) {
+    if (auto r = launch(argv, std_h, false, child, Environment{}, contain_descendants, true); !r) {
         return util::fail(r.error());
     }
     return wait_exit(child);
@@ -848,14 +843,9 @@ std::expected<PipedResult, std::string> run_piped(std::span<const std::string> a
     return result;
 }
 
-std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool contain_descendants) {
-    return run_inherit(argv, Environment{}, contain_descendants);
-}
-
-std::expected<int, std::string> run_inherit(std::span<const std::string> argv, const Environment& environment,
-                                            bool /*contain_descendants*/) {
+std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool /*contain_descendants*/) {
     SigintGuard guard;
-    auto pid = spawn(argv, nullptr, false, environment, true);
+    auto pid = spawn(argv, nullptr, false, Environment{}, true);
     if (!pid) return util::fail(pid.error());
     return wait_pid(*pid);
 }

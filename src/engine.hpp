@@ -315,12 +315,12 @@ std::size_t remove_rclone_temp_files(std::span<const std::filesystem::path> file
                                      std::span<const std::filesystem::path> before,
                                      const std::function<bool(const std::filesystem::path&)>& keep);
 
-// Downloads with progress callbacks instead of a console progress bar (for the GUI). A
-// cancelled download's partial files are removed. `on_copied` gets each file rclone reports
-// copied (relative name); that needs rclone's info level (-v in `extra`). `local_name`: the
-// name in `dest_dir` instead of the server's.
+// Downloads a folder (rclone copy, the folder batch) with progress callbacks instead of a console
+// progress bar. A cancelled download's partial files are removed. `on_copied` gets each file
+// rclone reports copied (relative name); that needs rclone's info level (-v in `extra`).
+// `local_name`: the name in `dest_dir` instead of the server's.
 [[nodiscard]] std::expected<DownloadResult, std::string>
-download(const Context& ctx, Mode mode, const std::string& remote_path,
+download(const Context& ctx, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run = {}, std::span<const std::string> extra = {},
          const CommandHook& on_command = {}, const std::function<void(const std::string&)>& on_copied = {},

@@ -131,6 +131,29 @@ TEST_CASE("missing programs in a portable folder") {
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("only the programs an update replaced are deleted, not other programs' .old files (G31)") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-replaced-programs";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    for (const auto* name : {"grab.exe.old", "grab-gui.exe.old", "rclone.exe.old", "ffmpeg.exe.old", "grab.exe",
+                             "rclone.exe", "notes.old", "grab.exe.old.txt"}) {
+        std::ofstream(dir / name) << "x";
+    }
+    std::filesystem::create_directories(dir / "tools.exe.old");
+    update::remove_replaced_programs(dir);
+    std::vector<std::string> left;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        left.push_back(util::path_to_utf8(e.path().filename()));
+    }
+    std::ranges::sort(left);
+    CHECK(left == std::vector<std::string>{"ffmpeg.exe.old", "grab.exe", "grab.exe.old.txt", "notes.old", "rclone.exe",
+                                           "tools.exe.old"});
+    // Nothing to delete is no error, and a missing folder neither.
+    update::remove_replaced_programs(dir);
+    update::remove_replaced_programs(dir / "missing");
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("install when newer, or the same version into an incomplete folder, never older") {
     const Version v020{0, 2, 0};
     const Version v030{0, 3, 0};

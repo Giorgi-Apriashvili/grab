@@ -1,13 +1,13 @@
-// The bundled rclone with a remote given only in its environment and its config in memory
-// (`--config NUL`), as grab starts it once grab.conf holds the servers (RCLONE-REPLACEMENT.md,
-// Phase 7 step 1 and decision 1: each rclone process gets its one server's details in its own
-// environment), and rclone's config reader as the oracle for the import of an rclone.conf. Each
-// case runs the rclone.exe one folder above this test program with exactly the environment it
-// gives it (no inherited RCLONE_* variable) and is skipped without one. Nothing here talks to a
-// server: remotes are alias remotes on a temp folder, or sftp remotes on a closed 127.0.0.1 port,
-// where a key or password rclone refuses fails before the connection and a refused dial
-// ("127.0.0.1:<port>: connectex", Go's syscall name, never translated) means rclone took them.
-// Every key and password is made up here.
+// rclone with a remote given only in its environment and its config in memory (`--config NUL`),
+// as grab starts it once grab.conf holds the servers (RCLONE-REPLACEMENT.md, Phase 7 step 1 and
+// decision 1: each rclone process gets its one server's details in its own environment), and
+// rclone's config reader as the oracle for the import of an rclone.conf. Each case runs the test
+// rclone (test_tools.hpp: build\<preset>\test-tools\rclone.exe, the 1.75.1 grab bundled) with
+// exactly the environment it gives it (no inherited RCLONE_* variable) and is skipped without
+// one. Nothing here talks to a server: remotes are alias remotes on a temp folder, or sftp
+// remotes on a closed 127.0.0.1 port, where a key or password rclone refuses fails before the
+// connection and a refused dial ("127.0.0.1:<port>: connectex", Go's syscall name, never
+// translated) means rclone took them. Every key and password is made up here.
 
 #include "config.hpp"
 #include "engine.hpp"
@@ -19,6 +19,7 @@
 #include "rclone_conf.hpp"
 #include "secrets.hpp"
 #include "server_conf.hpp"
+#include "test_tools.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -51,13 +52,6 @@ namespace fs = std::filesystem;
 namespace {
 
 using Vars = std::vector<std::pair<std::string, std::string>>;
-
-std::optional<fs::path> bundled_rclone() {
-    auto rclone = util::self_exe_path().parent_path().parent_path() / "rclone.exe";
-    std::error_code ec;
-    if (!fs::is_regular_file(rclone, ec)) return std::nullopt;
-    return rclone;
-}
 
 // A fresh folder in %TEMP%, gone again with the object.
 class Scratch {
@@ -232,10 +226,10 @@ std::optional<std::string> listing(const Ran& ran) {
 
 } // namespace
 
-TEST_CASE("the bundled rclone finds a remote given only in its environment, under Go's upper-case name") {
-    const auto rclone = bundled_rclone();
+TEST_CASE("rclone finds a remote given only in its environment, under Go's upper-case name") {
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-names");
@@ -277,9 +271,9 @@ TEST_CASE("the bundled rclone finds a remote given only in its environment, unde
 }
 
 TEST_CASE("rclone's config in memory: --config NUL says nothing, a lower-case nul is refused") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-nul");
@@ -297,9 +291,9 @@ TEST_CASE("rclone's config in memory: --config NUL says nothing, a lower-case nu
 }
 
 TEST_CASE("rclone's config reader, as `rclone config dump` shows it: the import's oracle") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-dump");
@@ -410,9 +404,9 @@ TEST_CASE("rclone's config reader, as `rclone config dump` shows it: the import'
 }
 
 TEST_CASE("a dotted name takes a key its section lacks from the parent section, as rclone reads it") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-parent");
@@ -458,9 +452,9 @@ TEST_CASE("a dotted name takes a key its section lacks from the parent section, 
 }
 
 TEST_CASE("key_pem, a key's passphrase and a password reach rclone through the environment") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-keys");
@@ -496,9 +490,9 @@ TEST_CASE("key_pem, a key's passphrase and a password reach rclone through the e
 }
 
 TEST_CASE("an inherited RCLONE_SFTP_* or a --sftp-* flag beats RCLONE_CONFIG_<NAME>_*: grab drops or refuses them") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-wins");
@@ -545,9 +539,9 @@ TEST_CASE("an inherited RCLONE_SFTP_* or a --sftp-* flag beats RCLONE_CONFIG_<NA
 }
 
 TEST_CASE("rclone reveals what grab obscures, and grab reveals what rclone obscures") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-obscure");
@@ -573,7 +567,7 @@ namespace {
 
 // Server `name` of grab.conf, logging in with a made-up key file (or the passphrase-protected one
 // and its passphrase in a store of `scratch`) to a closed local port, pinned in grab's known_hosts
-// (the test runner's scratch APPDATA): its run of the bundled rclone, given the server by
+// (the test runner's scratch APPDATA): its run of the test rclone, given the server by
 // engine::rclone_env with --config NUL. "dialled" when rclone took every setting and dialled.
 std::string dial_through_rclone_env(const fs::path& rclone, const Scratch& scratch, const std::string& name,
                                     const std::string& key_file, int port, const std::string& passphrase = {}) {
@@ -614,10 +608,10 @@ std::string dial_through_rclone_env(const fs::path& rclone, const Scratch& scrat
 
 } // namespace
 
-TEST_CASE("grab's own path: rclone_env and --config NUL reach the bundled rclone, under the user's names (phase 7)") {
-    const auto rclone = bundled_rclone();
+TEST_CASE("grab's own path: rclone_env and --config NUL reach rclone, under the user's names (phase 7)") {
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-grab");
@@ -642,9 +636,9 @@ TEST_CASE("grab's own path: rclone_env and --config NUL reach the bundled rclone
 }
 
 TEST_CASE("a '$' in a key file's path reaches rclone as it is, not expanded a second time") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-env-dir");
@@ -682,9 +676,9 @@ std::expected<Sections, std::string> read_like_dump(std::string_view text) {
 } // namespace
 
 TEST_CASE("grab's rclone.conf reader reads every shape as `rclone config dump` does (phase 7)") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-conf-dump");
@@ -780,9 +774,9 @@ TEST_CASE("grab's rclone.conf reader reads every shape as `rclone config dump` d
 }
 
 TEST_CASE("grab's reader follows a dotted name's parents as rclone does") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-conf-parents");
@@ -834,9 +828,9 @@ TEST_CASE("grab's reader follows a dotted name's parents as rclone does") {
 }
 
 TEST_CASE("~, $VAR and ${RCLONE_CONFIG_DIR} in a key_file expand as rclone expands them") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     if (!rclone) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     const Scratch scratch("grab-test-rclone-conf-paths");

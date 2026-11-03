@@ -83,3 +83,30 @@ if(WIN32)
 endif()
 
 add_test(NAME grab_tests COMMAND grab_tests)
+
+# rclone for the tests only (Windows): what grab is compared with, the rclone 1.75.1 grab bundled
+# (the same zip and SHA-256). The import's reader and reveal (test_rclone_env.cpp,
+# test_secrets.cpp), the key logins against `rclone serve sftp` (test_ssh_keys.cpp) and the live
+# `rclone hashsum` comparison (test_ssh_hash.cpp) run it from <build>/test-tools/rclone.exe, which
+# is never staged, installed or zipped. Declared under the bundled rclone's name
+# (../CMakeLists.txt), so a build that bundles it downloads it once. OFF for an offline build:
+# those tests then skip (a failed download fails the configure, URL_HASH).
+if(WIN32)
+    option(GRAB_TEST_TOOLS "Download rclone for the tests into <build>/test-tools" ON)
+endif()
+if(WIN32 AND GRAB_TEST_TOOLS)
+    FetchContent_Declare(rclone
+        URL https://downloads.rclone.org/v1.75.1/rclone-v1.75.1-windows-amd64.zip
+        URL_HASH SHA256=200EB602C126D82AA38B51E0F6B9AE837473FF99B51278D3F6F837574C494D6E
+        SOURCE_SUBDIR no-cmake-here)
+    FetchContent_MakeAvailable(rclone)
+    set(GRAB_TEST_RCLONE "${CMAKE_BINARY_DIR}/test-tools/rclone.exe")
+    add_custom_command(OUTPUT "${GRAB_TEST_RCLONE}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/test-tools"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${rclone_SOURCE_DIR}/rclone.exe" "${GRAB_TEST_RCLONE}"
+        DEPENDS "${rclone_SOURCE_DIR}/rclone.exe"
+        COMMENT "Copying rclone v1.75.1 for the tests into test-tools"
+        VERBATIM)
+    add_custom_target(grab_test_tools ALL DEPENDS "${GRAB_TEST_RCLONE}")
+    add_dependencies(grab_tests grab_test_tools)
+endif()

@@ -1,6 +1,7 @@
 #include "local_name.hpp"
 #include "process.hpp"
 #include "rclone_encoding.hpp"
+#include "test_tools.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -94,14 +95,14 @@ TEST_CASE("a local name goes to rclone in the form that comes back as itself (G8
 }
 
 #ifdef _WIN32
-TEST_CASE("the bundled rclone creates exactly grab's folder names from what grab tells it (G80)") {
+TEST_CASE("rclone creates exactly grab's folder names from what grab tells it (G80)") {
     namespace fs = std::filesystem;
-    const auto rclone = util::self_exe_path().parent_path().parent_path() / "rclone.exe";
-    std::error_code ec;
-    if (!fs::is_regular_file(rclone, ec)) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+    const auto rclone = test::test_rclone();
+    if (!rclone) {
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
+    std::error_code ec;
     const auto base = fs::temp_directory_path() / "grab-test-rclone-names";
     fs::remove_all(base, ec);
     // The base itself has a name rclone would re-encode, as a Save-to folder grab created can.
@@ -114,7 +115,7 @@ TEST_CASE("the bundled rclone creates exactly grab's folder names from what grab
         const auto want = dest / util::path_from_utf8(local::name(raw));
         const auto told = enc::local_path(want);
         REQUIRE_MESSAGE(told.has_value(), raw);
-        const auto ran = proc::run_capture(std::vector<std::string>{util::path_to_utf8(rclone), "mkdir", *told}, quiet);
+        const auto ran = proc::run_capture(std::vector<std::string>{util::path_to_utf8(*rclone), "mkdir", *told}, quiet);
         REQUIRE(ran.has_value());
         CHECK_MESSAGE(ran->exit_code == 0, ran->err);
         CHECK_MESSAGE(fs::is_directory(want, ec), raw);

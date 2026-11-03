@@ -19,6 +19,7 @@
 #include "ssh_hash.hpp"
 #include "ssh_pool.hpp"
 #include "ssh_walk.hpp"
+#include "test_tools.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -815,8 +816,8 @@ mk $'quote\'d dir/y\'s.txt'; mk $'\xe2\x80\x9bquote.txt'; : > empty.bin; head -c
 // run_hashes gives (-z where the server takes it), and those of md5sum without -z (GNU's
 // escapes), equal the MD5 of each file's bytes read over SFTP and hashed here by util::md5_file.
 // With GRAB_TEST_RCLONE_CONF / GRAB_TEST_REMOTE (the same server), also `rclone hashsum md5`'s for
-// every name rclone gives (GRAB_TEST_RCLONE: rclone.exe, else the one the build bundles). At most 2
-// logins of grab's own, then rclone's one.
+// every name rclone gives (GRAB_TEST_RCLONE: an rclone.exe, else test_tools.hpp's when it is
+// there). At most 2 logins of grab's own, then rclone's one.
 TEST_CASE("ssh hash: live, odd names hashed on the server equal local MD5 and rclone's (GRAB_TEST_SSH)") {
     auto t = live_target();
     if (!t) {
@@ -956,8 +957,13 @@ TEST_CASE("ssh hash: live, odd names hashed on the server equal local MD5 and rc
         MESSAGE("rclone not asked: GRAB_TEST_RCLONE_CONF / GRAB_TEST_REMOTE not set");
         return;
     }
-    const std::string rclone = util::getenv_utf8("GRAB_TEST_RCLONE")
-                                   .value_or(util::path_to_utf8(util::self_exe_path().parent_path().parent_path() / "rclone.exe"));
+    std::string rclone;
+    if (auto env = util::getenv_utf8("GRAB_TEST_RCLONE")) rclone = *env;
+    else if (auto tool = test::test_rclone()) rclone = util::path_to_utf8(*tool);
+    else {
+        MESSAGE(test::no_test_rclone << "; rclone not asked");
+        return;
+    }
     const std::vector<std::string> argv{rclone, "hashsum", "md5", *name + ":" + base, "--config", *conf,
                                         "--checkers", "1", "--sftp-connections", "1"};
     proc::RunOptions ro;

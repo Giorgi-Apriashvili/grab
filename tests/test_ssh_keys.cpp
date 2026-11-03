@@ -1,5 +1,5 @@
-// grab's own client logging in with keys, against a real SSH server on this PC: the bundled
-// rclone's `serve sftp` (skipped without build\<preset>\rclone.exe or Windows' ssh-keygen),
+// grab's own client logging in with keys, against a real SSH server on this PC: the test rclone's
+// `serve sftp` (skipped without build\<preset>\test-tools\rclone.exe or Windows' ssh-keygen),
 // with throwaway keys made for the run and a made-up login. Nothing leaves 127.0.0.1.
 
 #include "passwords.hpp"
@@ -10,6 +10,7 @@
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
 #include "ssh_target.hpp"
+#include "test_tools.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -32,13 +33,6 @@ using namespace grab;
 namespace fs = std::filesystem;
 
 namespace {
-
-std::optional<fs::path> bundled_rclone() {
-    auto rclone = util::self_exe_path().parent_path().parent_path() / "rclone.exe";
-    std::error_code ec;
-    if (!fs::is_regular_file(rclone, ec)) return std::nullopt;
-    return rclone;
-}
 
 std::optional<fs::path> ssh_keygen() {
     const fs::path keygen = R"(C:\Windows\System32\OpenSSH\ssh-keygen.exe)";
@@ -149,10 +143,10 @@ std::string as_key_pem(std::string_view text) {
 } // namespace
 
 TEST_CASE("ssh: a key kept in grab's store logs in from memory, with and without a passphrase (rclone serve sftp)") {
-    const auto rclone = bundled_rclone();
+    const auto rclone = test::test_rclone();
     const auto keygen = ssh_keygen();
     if (!rclone || !keygen) {
-        MESSAGE("no bundled rclone.exe next to the build, or no ssh-keygen.exe; skipped");
+        MESSAGE(test::no_test_rclone << ", or no ssh-keygen.exe; skipped");
         return;
     }
     const auto dir = fs::temp_directory_path() / "grab-test-ssh-keys";

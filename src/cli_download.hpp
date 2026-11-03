@@ -41,11 +41,11 @@ struct Answer {
     bool for_all = false;
 };
 // What to do with them (`count` of them in all, `files` some): --existing, else asked on the
-// console ([r]eplace, [k]eep both, [s]kip, [q]uit; no Keep both unless `keep_both`; with
-// `offer_all`, R, K or S answer the rest of the run too). An exit code instead when the user
-// quits, or there is no console to ask on (with a message).
+// console ([r]eplace, [k]eep both, [s]kip, [q]uit; with `offer_all`, R, K or S answer the rest
+// of the run too). An exit code instead when the user quits, or there is no console to ask on
+// (with a message).
 [[nodiscard]] std::expected<Answer, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
-                                                       std::size_t count, bool keep_both, bool offer_all = false);
+                                                       std::size_t count, bool offer_all = false);
 
 
 struct DownloadTally {

@@ -1015,7 +1015,7 @@ std::optional<std::string> parse_error_line(std::string_view line) {
 }
 
 std::expected<DownloadResult, std::string>
-download(const Context& ctx, Mode mode, const std::string& remote_path,
+download(const Context& ctx, const std::string& remote_path,
          const std::filesystem::path& dest_dir, const std::function<void(const Progress&)>& on_progress,
          const proc::RunOptions& run, std::span<const std::string> extra,
          const CommandHook& on_command, const std::function<void(const std::string&)>& on_copied,
@@ -1023,14 +1023,13 @@ download(const Context& ctx, Mode mode, const std::string& remote_path,
     // grab's own batch: only the connection flags of the configured ones (rclone_flags.hpp);
     // `extra` is grab's (--files-from-raw, --transfers...).
     const auto common = rclone_flags::connection(ctx.settings.common_flags);
-    const auto mode_flags =
-        rclone_flags::connection(mode == Mode::folder ? ctx.settings.folder_flags : ctx.settings.file_flags);
+    const auto mode_flags = rclone_flags::connection(ctx.settings.folder_flags);
     std::vector<std::string> tail(extra.begin(), extra.end());
     // Appended last so they win over anything configured.
     tail.insert(tail.end(), {"--use-json-log", "--stats", "500ms", "--stats-log-level", "NOTICE"});
 
     RcloneRequest rq;
-    rq.mode = mode;
+    rq.mode = Mode::folder;
     rq.rclone_exe = ctx.config.rclone;
     rq.rclone_remote = ctx.settings.rclone_remote;
     rq.remote_path = remote_path;

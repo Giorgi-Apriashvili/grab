@@ -2,33 +2,15 @@
 
 #include "local_name.hpp"
 #include "rclone_encoding.hpp"
+#include "remote.hpp"
 #include "util.hpp"
 
 #include <utility>
 
 namespace grab {
 
-std::string remote_basename(std::string_view remote_path) {
-    while (remote_path.size() > 1 && remote_path.back() == '/') remote_path.remove_suffix(1);
-    const auto slash = remote_path.rfind('/');
-    if (slash == std::string_view::npos) return std::string(remote_path);
-    return std::string(remote_path.substr(slash + 1));
-}
-
-bool has_name(std::string_view remote_path) {
-    const auto name = remote_basename(remote_path);
-    return !name.empty() && name != "/" && name != "." && name != "..";
-}
-
 bool name_not_utf8(std::string_view remote_path) {
     return !rclone_enc::valid_utf8(remote_path) || remote_path.find("\xEF\xBF\xBD") != std::string_view::npos;
-}
-
-std::string remote_spec(std::string_view rclone_remote, std::string_view remote_path) {
-    std::string out(rclone_remote);
-    out += ':';
-    out += remote_path;
-    return out;
 }
 
 std::filesystem::path local_target(const RcloneRequest& req) {

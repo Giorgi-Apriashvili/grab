@@ -104,15 +104,11 @@ struct PipedResult {
 run_piped(std::span<const std::string> argv, const std::function<bool(std::string_view)>& on_data,
           const RunOptions& opts = {});
 
-// Run argv[0] with all three streams inherited (live progress output). Returns its exit code.
-// On Windows the child is in a kill-on-close Job object, and by default so is everything it
-// starts. `contain_descendants` false lets the child's own children leave the job, so they
-// outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
+// Run argv[0] with all three streams and the whole environment inherited (live progress output).
+// Returns its exit code. On Windows the child is in a kill-on-close Job object, and by default so
+// is everything it starts. `contain_descendants` false lets the child's own children leave the
+// job, so they outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
 [[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
-                                                          bool contain_descendants = true);
-// The same with `environment` added to the whole environment.
-[[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
-                                                          const Environment& environment,
                                                           bool contain_descendants = true);
 
 // A program started by start_independent. Dropping this object leaves it running.

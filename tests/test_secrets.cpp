@@ -1,6 +1,7 @@
 #include "process.hpp"
 #include "rclone_encoding.hpp"
 #include "secrets.hpp"
+#include "test_tools.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -106,11 +107,9 @@ TEST_CASE("Go's upper case: simple mappings of Unicode 15, as rclone 1.75.1 name
 
 #ifdef _WIN32
 TEST_CASE("rclone finds a remote given only in its run's environment, under any name grab gives it") {
-    // The bundled rclone, one folder above this test program (build\<preset>\rclone.exe).
-    const auto rclone = util::self_exe_path().parent_path().parent_path() / "rclone.exe";
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(rclone, ec)) {
-        MESSAGE("no bundled rclone.exe next to the build; skipped");
+    const auto rclone = test::test_rclone();
+    if (!rclone) {
+        MESSAGE(test::no_test_rclone << "; skipped");
         return;
     }
     // An alias remote that only its run's environment defines, with its config in memory, as
@@ -126,11 +125,12 @@ TEST_CASE("rclone finds a remote given only in its run's environment, under any 
         quiet.environment.set = {{secrets::env_name(name, "type"), "alias"},
                                  {secrets::env_name(name, "remote"), util::path_to_utf8(dir / "target")}};
         const auto ran = proc::run_capture(
-            std::vector<std::string>{util::path_to_utf8(rclone), "lsf", name + ":", "--config", "NUL"}, quiet);
+            std::vector<std::string>{util::path_to_utf8(*rclone), "lsf", name + ":", "--config", "NUL"}, quiet);
         REQUIRE(ran.has_value());
         CHECK_MESSAGE(ran->exit_code == 0, name, ": ", ran->err);
         CHECK_MESSAGE(ran->out.find("found-it.txt") != std::string::npos, name);
     }
+    std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
 #endif
