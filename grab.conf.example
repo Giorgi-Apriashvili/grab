@@ -10,16 +10,11 @@
 # with `grab server add`, change them with `grab server edit NAME` (or grab's Settings).
 
 [grab]
-# rclone executable, for servers with engine = rclone. Blank = the rclone.exe bundled with
-# grab (else rclone on PATH); a full path uses that one instead.
-rclone =
 # The rclone.conf grab 0.19 and before kept servers in: a section without `host` takes its
-# details from the remote there once (grab only reads it, never writes it). Blank = grab's
-# own (%APPDATA%\grab\rclone.conf), then rclone's standard one.
+# details from the remote there once (grab only reads it). Blank = grab's own
+# (%APPDATA%\grab\rclone.conf, deleted once all its servers are here), then rclone's
+# standard one.
 rclone_config =
-# ssh executable for the searches of servers with engine = rclone (ssh + find). Blank = `ssh`
-# on PATH (Windows OpenSSH).
-ssh = ssh
 # Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.
 editor =
 # Remote section to use when -r/--remote is not given. Optional when only one remote exists.
@@ -37,21 +32,16 @@ user = alice
 # grab's store with its passphrase).
 auth = key
 key_file = C:\Users\alice\.ssh\id_ed25519
-# What the server told grab's Test, which Verify (and rclone, on engine = rclone) go by instead
-# of asking again: its shell (unix, cmd, powershell, none) and its checksum commands. Left out =
-# not known yet.
+# What the server told grab's Test, which Verify goes by instead of asking again: its shell
+# (unix, cmd, powershell, none) and its checksum commands. Left out = not known yet.
 # shell_type = unix
 # md5sum_command = md5sum
-# A non-secret rclone sftp setting for this server's rclone runs (engine = rclone), e.g.
-# rclone.ciphers = aes256-ctr
 # The rclone remote grab 0.19 and before used for this server (default: this section's name).
 # Kept in sections imported from rclone.conf: their partial downloads and 0.19 go by it.
 # rclone_remote = hetzner
 # How TARGET is located: auto = find where grab's check finds GNU find on the server, else by
 # listing folders (Storage Boxes always); ssh = find only; walk = by listing folders (grab 0.19
 # and before refuse walk: write rclone, which means the same, while one of them reads this file).
-# With engine = rclone: auto = ssh + find when the server logs in with a key file or ssh-agent,
-# else rclone's listing; ssh = ssh + find; walk or rclone = rclone's listing.
 find = auto
 # Comma-separated directories to search: absolute (/srv) or relative to the login home
 # (learning). Blank or . = the home directory itself.
@@ -66,14 +56,8 @@ max_connections =
 skip_hidden = true
 # How every connection to this server is made: the local address to connect from (blank =
 # any), the time to reach the server (blank = 30s; off = as long as TCP tries) and the longest
-# wait for it after that (blank = 30s; 1s to 24h). A run's -- --bind, --contimeout and
-# --timeout win over them.
+# wait for it after that (blank = 30s; 1s to 24h). A run's --bind, --contimeout and --timeout
+# win over them.
 # bind = 192.0.2.10
 # connect_timeout = 30s
 # io_timeout = 30s
-# What downloads from, searches and lists this server: grab's own SSH client (the default), or
-# rclone, the fallback until a later grab removes it. A server whose rclone settings grab's
-# client can't serve (a proxy, an ssh command) stays on rclone by itself and says why. A server
-# on rclone also takes rclone's flags in common_flags and folder_flags, and ssh.exe's in
-# ssh_options (docs/doc.md: Configure).
-# engine = rclone

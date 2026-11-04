@@ -10,9 +10,9 @@
 //   user = alice
 //   auth = agent | key | password | stored_key
 //   key_file = C:\Users\a\.ssh\id_ed25519   the key for `key`; beside `agent`, which agent key
-//   shell_type, md5sum_command, sha1sum_command, path_override   what rclone found on the server
-//   rclone.<key> = value          a non-secret rclone sftp setting (rclone_key_allowed), only for
-//                                 engine = rclone's rclone
+//   shell_type, md5sum_command, sha1sum_command, path_override   what Test (or rclone) found there
+//   rclone.<key> = value          a non-secret rclone sftp setting (rclone_key_allowed) the import
+//                                 kept; rclone is gone, so only the guard and the notices read it
 //
 // Passwords, passphrases and an imported inline key (stored_key) are in grab's store
 // (passwords.hpp), never here: grab.conf is plain text that editors open. Host keys are in grab's
@@ -100,11 +100,12 @@ inline constexpr std::string_view rclone_prefix = "rclone.";
 // Whether two server names are one to Windows: equal ignoring case as rclone names their
 // variables (Go's upper case) or as Windows compares file names (their file lists).
 [[nodiscard]] bool same_ignoring_case(std::string_view a, std::string_view b);
-// A new server's name: servers::validate_name's rules, at least 2 characters (G169: rclone takes
-// one letter for a drive), and no other section's name ignoring case (`sections`: grab.conf's).
+// A new server's name: servers::validate_name's rules, at least 2 characters (G169: grab 0.20 and
+// earlier, which may read the same grab.conf, took one letter for a drive), and no other section's
+// name ignoring case (`sections`: grab.conf's).
 [[nodiscard]] std::optional<std::string> check_new_name(std::string_view name, const std::vector<std::string>& sections);
-// What is wrong with a server's existing name, for a note (an imported name keeps working): one
-// character, a leading '-', another section of the same name ignoring case.
+// What is wrong with a server's existing name, for a note (an imported name keeps working): a
+// leading '-', another section of the same name ignoring case.
 [[nodiscard]] std::vector<std::string> name_problems(std::string_view name, const std::vector<std::string>& sections);
 
 // Whether grab's known_hosts (its text) pins host:port: a line naming [host]:port (for port 22

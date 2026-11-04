@@ -42,7 +42,7 @@ enum class Origin {
     line,         // a rclone.<key> line of the server's grab.conf section
     environment,  // an inherited RCLONE_SFTP_<KEY>, which covers every server
     common_flags, // common_flags' --sftp-<key>
-    run_flags,    // the command's --sftp-<key> after `--`
+    folder_flags, // folder_flags' --sftp-<key> (grab 0.19's folder downloads ran rclone with them)
     ssh_options,  // ssh_options' -o ProxyCommand, -o ProxyJump, -J: read, never a reason
     unreadable,   // grab's store can't be read: what it keeps is unknown
 };
@@ -53,7 +53,7 @@ struct Reason {
     std::string key; // rclone's option ("socks_proxy"); "store" for a store that can't be read
     // Where it is set, as texts name it: "rclone.socks_proxy" (a grab.conf line),
     // "rclone.socks_proxy in grab's store", "RCLONE_SFTP_SOCKS_PROXY", "common_flags'
-    // --sftp-socks-proxy", "--sftp-socks-proxy after --", "grab's store, which can't be read".
+    // --sftp-socks-proxy", "grab's store, which can't be read".
     std::string where;
     Origin origin = Origin::line;
     // The setting as written there, for how to clear it: "rclone.socks_proxy",
@@ -67,11 +67,13 @@ struct Sources {
     // rclone's settings, each beating the ones before as rclone had it: grab's store's rclone
     // extras (those bound to the server's login), the section's rclone.<key> lines, the inherited
     // RCLONE_SFTP_<KEY> variables (`environment`; not those 0.20's rclone runs never saw: SSH,
-    // PUBKEY and PUBKEY_FILE), common_flags' --sftp-<key> flags.
+    // PUBKEY and PUBKEY_FILE), common_flags' --sftp-<key> flags, then folder_flags' (after
+    // common_flags on 0.19's folder downloads' command line).
     std::vector<std::pair<std::string, std::string>> extras; // keys without "rclone."
     std::vector<std::pair<std::string, std::string>> lines;
     std::function<std::optional<std::string>(const std::string&)> environment;
     std::vector<std::string> common_flags;
+    std::vector<std::string> folder_flags;
     std::vector<std::string> ssh_options; // ssh.exe's: -o ProxyCommand, -o ProxyJump, -J (first wins)
 };
 
@@ -101,8 +103,6 @@ using Settings = std::map<std::string, Found, std::less<>>;
 // grab's store exists but can't be read: the extras it may keep (a proxy, an ssh command) are
 // unknown, so the server counts as routed ("store", where "grab's store, which can't be read").
 void add_unreadable_store(Settings& settings);
-// A command's connection flags after `--` on top: they beat everything before them.
-void add_run_flags(Settings& settings, std::span<const std::string> run_flags);
 // The settings that keep grab off, in key order: not ssh_options' (decision 4).
 [[nodiscard]] std::vector<Reason> reasons(const Settings& settings);
 
@@ -111,7 +111,7 @@ void add_run_flags(Settings& settings, std::span<const std::string> run_flags);
 // What it means for `server`, as errors, Test, `grab server list`, the window's cards, -v and the
 // notice say it: "[Box] connects through a SOCKS proxy (rclone.socks_proxy), which grab can't, so
 // it doesn't connect to Box rather than go around it: delete the rclone.socks_proxy line in [Box]
-// (grab config)". Each setting gets how to clear it: a grab.conf line deleted, common_flags edited,
+// (grab config)". Each setting gets how to clear it: a grab.conf line deleted, a flag key edited,
 // a setting the import kept in grab's store by removing the server and adding it again, an
 // inherited variable cleared (it covers every server; for grab alone, in the window it starts
 // from), a store that can't be read set aside by saving the server with Edit.

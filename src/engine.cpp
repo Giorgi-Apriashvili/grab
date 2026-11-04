@@ -6,7 +6,6 @@
 #include "match.hpp"
 #include "passwords.hpp"
 #include "rclone_encoding.hpp"
-#include "rclone_flags.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "ini.hpp"
@@ -91,6 +90,11 @@ std::expected<Context, std::string> load_context(const std::filesystem::path& co
     if (applied && *applied) {
         for (const auto& server : (*applied)->imported) ctx.imported.push_back(server.name);
         for (const auto& note : (*applied)->notes) ctx.import_notes.push_back(std::format("[{}] {}", note.server, note.text));
+        // Recorded, the note on grab's own old files is a notice (notices::for_config), which
+        // also reaches a later run when this one fails.
+        if (!(*applied)->old_files.empty() && !(*applied)->old_files_recorded) {
+            ctx.import_notes.push_back((*applied)->old_files);
+        }
     }
     return ctx;
 }
@@ -131,104 +135,55 @@ std::expected<passwords::Store, std::string> server_secrets(const Context& ctx) 
     return passwords::Store{};
 }
 
-// Why a --bind can't be used, nullopt when it can: one that isn't an address is refused before
-// anything connects.
-std::optional<std::string> bind_problem(const std::string& bind) {
-    if (bind.starts_with('-')) return "the address can't start with -";
-    return server_conf::check_host(bind);
+// "[Main] common_flags' --bind 10.0.0.2 isn't read any more: ...": `old` with no `bind` key.
+std::string old_bind_text(std::string_view server, const OldBind& old) {
+    // The value as written, when it is one grab.conf would take as `bind`.
+    const bool plain = !old.value.empty() && !old.value.starts_with('-') && !server_conf::check_host(old.value);
+    const std::string flag = !plain                          ? old.flag
+                             : old.flag == "-o BindAddress" ? std::format("{}={}", old.flag, old.value)
+                                                             : std::format("{} {}", old.flag, old.value);
+    return std::format("[{}] {}' {} isn't read any more: write {} in [{}] (grab config) and take it out of {}. Until then "
+                       "grab doesn't connect to {} rather than connect from another address",
+                       server, old.key, flag, plain ? "bind = " + old.value : std::string("a bind line"), server, old.key,
+                       server);
 }
 
 } // namespace
 
-std::vector<guard::Reason> grab_blockers(const Context& ctx, std::span<const std::string> run_flags) {
-    if (run_flags.empty()) return guard::reasons(ctx.guard);
-    auto settings = ctx.guard;
-    guard::add_run_flags(settings, run_flags);
-    return guard::reasons(settings);
-}
+std::vector<guard::Reason> grab_blockers(const Context& ctx) { return guard::reasons(ctx.guard); }
 
-std::expected<ConnectSettings, std::string> connect_settings(const RemoteSettings& settings,
-                                                             std::span<const std::string> run_flags) {
-    const std::string& name = settings.name;
+std::expected<ConnectSettings, std::string> connect_settings(const RemoteSettings& settings, const ConnectOptions& given) {
     ConnectSettings out;
     if (settings.bind) {
         out.bind = settings.bind;
-        out.bind_from = std::format("bind in [{}]", name);
+        out.bind_from = std::format("bind in [{}]", settings.name);
+    } else if (const auto old = old_bind(settings)) {
+        // Never dropped quietly: Trust takes its bind from here too (phase 9 step 7).
+        return util::fail(old_bind_text(settings.name, *old));
     }
     out.connect_timeout = settings.connect_timeout;
     out.io_timeout = settings.io_timeout;
-    // Legacy: common_flags' --bind, --contimeout and --timeout, read as the keys left blank (G189).
-    auto legacy = ssh::read_flags(rclone_flags::connection(settings.common_flags));
-    if (!legacy) return util::failf("[{}] common_flags: {}", name, legacy.error());
-    // A blank --bind ("--bind=") is no bind, as rclone read it.
-    const auto blank = [](const std::optional<std::string>& bind) { return bind && util::trim(*bind).empty(); };
-    if (!out.bind && legacy->bind && !blank(legacy->bind)) {
-        if (auto bad = bind_problem(*legacy->bind)) return util::failf("[{}] common_flags: --bind {}: {}", name, *legacy->bind, *bad);
-        out.bind = legacy->bind;
-        out.bind_from = "common_flags' --bind";
-        out.legacy.emplace_back("bind");
-    }
-    if (!out.connect_timeout && legacy->connect_timeout) {
-        out.connect_timeout = legacy->connect_timeout;
-        out.legacy.emplace_back("connect_timeout");
-    }
-    if (!out.io_timeout && legacy->timeout) {
-        out.io_timeout = legacy->timeout;
-        out.io_from = std::format("[{}] common_flags: --timeout {}", name, legacy->timeout_text);
-        out.legacy.emplace_back("io_timeout");
-    }
-    // The command's, which win.
-    auto given = ssh::read_flags(run_flags);
-    if (!given) return util::failf("the flags after --: {}", given.error());
-    if (blank(given->bind)) {
-        // Clears the server's bind for this run.
+    // The command's, which win (parse_args checked them).
+    if (given.bind && given.bind->empty()) {
         out.bind.reset();
         out.bind_from.clear();
-    } else if (given->bind) {
-        if (auto bad = bind_problem(*given->bind)) return util::failf("the flags after --: --bind {}: {}", *given->bind, *bad);
-        out.bind = given->bind;
+    } else if (given.bind) {
+        out.bind = given.bind;
         out.bind_from = "--bind";
     }
-    if (given->connect_timeout) out.connect_timeout = given->connect_timeout;
-    if (given->timeout) {
-        out.io_timeout = given->timeout;
-        out.io_from = std::format("the flags after --: --timeout {}", given->timeout_text);
-    }
+    if (given.connect_timeout) out.connect_timeout = given.connect_timeout;
+    if (given.io_timeout) out.io_timeout = given.io_timeout;
     return out;
 }
 
-std::expected<void, std::string> check_run_flags(const Context& ctx, std::span<const std::string> extra) {
-    const std::string& name = ctx.settings.name;
-    if (const auto bad = rclone_flags::first_refused(extra)) {
-        // A certificate or an ssh command isn't in grab's own client's settings at all.
-        const bool unusable = bad->in_grab == "rclone.pubkey_file" || bad->in_grab == "ssh";
-        return util::failf("{} after -- would replace the server's {}, which {}; {}", bad->flag, bad->what,
-                           unusable ? "grab's own client can't use" : "grab's own client takes from its settings",
-                           rclone_flags::change_instead(*bad, name));
-    }
-    // The 2026-10-21 rule: refused, never ignored.
-    if (auto unused = rclone_flags::first_unused_by_grab(extra, name)) return util::fail(*unused);
-    // The values of the connection flags, before anything connects or DEST is made.
-    const auto given = ssh::read_flags(extra);
-    if (!given) return util::failf("the flags after --: {}", given.error());
-    if (given->bind && !given->bind->empty()) {
-        if (auto bad = bind_problem(*given->bind)) return util::failf("the flags after --: --bind {}: {}", *given->bind, *bad);
-    }
-    // No limit would leave a stalled READ waiting for ever (ssh_target).
-    if (given->timeout && (*given->timeout < min_io_timeout || *given->timeout > max_io_timeout)) {
-        return util::failf("the flags after --: --timeout {}: grab's own client takes a time from 1s to 24h there (with "
-                           "none, a stalled download couldn't be cancelled)",
-                           given->timeout_text);
-    }
-    return {};
-}
-
-std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span<const std::string> extra) {
+std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, const ConnectOptions& given) {
     // A route, another server, a certificate...: grab would connect anyway, past them. First, as
-    // Trust is refused for such a server too (phase 9 step 6).
-    if (const auto blocked = grab_blockers(ctx, extra); !blocked.empty()) {
+    // Trust is refused for such a server too (phase 9 step 6); then a bind it can't take.
+    if (const auto blocked = grab_blockers(ctx); !blocked.empty()) {
         return util::fail(guard::text(ctx.settings.name, blocked));
     }
+    auto reach = connect_settings(ctx.settings, given);
+    if (!reach) return util::fail(reach.error());
     if (auto pinned = check_pinned(ctx); !pinned) return util::fail(pinned.error());
     auto store = server_secrets(ctx);
     if (!store) return util::fail(store.error());
@@ -236,23 +191,14 @@ std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, std::span
                                                          : grab_known_hosts_path();
     auto target = ssh::target_for(ctx.settings.name, ctx.connection, *store, known_hosts);
     if (!target) return target;
-    auto reach = connect_settings(ctx.settings, extra);
-    if (!reach) return util::fail(reach.error());
     if (reach->bind) {
         target->bind = *reach->bind;
         target->bind_from = reach->bind_from;
     }
     if (reach->connect_timeout) target->connect_timeout = *reach->connect_timeout;
-    if (reach->io_timeout) {
-        // No limit, or one past what select and libssh2 hold, would leave a stalled READ waiting
-        // for ever: sftp::Client::pump doesn't look at the stop token, so Cancel couldn't end it.
-        if (*reach->io_timeout < min_io_timeout || *reach->io_timeout > max_io_timeout) {
-            return util::failf("{}: grab's own client takes a time from 1s to 24h there (with none, a stalled download "
-                               "couldn't be cancelled)",
-                               reach->io_from);
-        }
-        target->timeout = *reach->io_timeout;
-    }
+    // io_timeout and --timeout are 1 s to 24 h (grab.conf's load, parse_args): never off, so
+    // a stalled READ can't wait for ever (sftp::Client::pump doesn't look at the stop token).
+    if (reach->io_timeout) target->timeout = *reach->io_timeout;
     return target;
 }
 

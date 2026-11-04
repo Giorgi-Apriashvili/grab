@@ -14,8 +14,8 @@
 // The tests never touch the real %APPDATA%\grab or %LOCALAPPDATA%\grab (servers, passwords, host
 // keys, file lists), the user's home (a key_file's ~) or the user's own rclone.conf
 // ($RCLONE_CONFIG): every place grab looks for its settings points at a fresh scratch folder of
-// this run before any test starts, and grab's own variables that pick a configuration are cleared
-// (test_config.cpp checks the defaults land there). A test that needs the real thing names it
+// this run before any test starts, and grab's own variables that pick a configuration or change
+// what it says (GRAB_ENGINE's notice) are cleared (test_config.cpp checks the defaults land there). A test that needs the real thing names it
 // itself (the live cases' GRAB_TEST_* variables).
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableW(L"LOCALAPPDATA", (home / "Local").c_str());
     SetEnvironmentVariableW(L"HOME", (home / "Home").c_str());
     SetEnvironmentVariableW(L"USERPROFILE", (home / "Home").c_str());
-    for (const wchar_t* name : {L"HOMEDRIVE", L"HOMEPATH", L"RCLONE_CONFIG", L"GRAB_CONFIG"}) {
+    for (const wchar_t* name : {L"HOMEDRIVE", L"HOMEPATH", L"RCLONE_CONFIG", L"GRAB_CONFIG", L"GRAB_ENGINE"}) {
         SetEnvironmentVariableW(name, nullptr);
     }
     // The guard's inherited variables: one set in the developer's shell would refuse every server.
@@ -48,6 +48,7 @@ int main(int argc, char** argv) {
     setenv("HOME", (home / "Home").c_str(), 1);
     unsetenv("RCLONE_CONFIG");
     unsetenv("GRAB_CONFIG");
+    unsetenv("GRAB_ENGINE");
 #endif
     doctest::Context context(argc, argv);
     const int result = context.run();

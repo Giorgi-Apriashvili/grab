@@ -110,6 +110,7 @@ TEST_CASE("rclone creates exactly grab's folder names from what grab tells it (G
     fs::create_directories(dest);
     proc::RunOptions quiet;
     quiet.detached = true;
+    quiet.environment.without_prefix = {"RCLONE_"}; // none of the user's own rclone settings
     for (const std::string raw : {"Mission: Impossible (1996)", "a*b?c<d>e|f\"g", "trail.", "trail ", "trail.\uFF0E",
                                   "already\uFF1Acolon", "q\u201By", "ctl\x01x"}) {
         const auto want = dest / util::path_from_utf8(local::name(raw));

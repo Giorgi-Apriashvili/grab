@@ -125,7 +125,7 @@ TEST_CASE("server_conf: the checks the command, the window and the import share 
 
     const std::vector<std::string> sections{"Main", "box", "\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8"};
     CHECK_FALSE(server_conf::check_new_name("Box.Guest", sections));
-    CHECK(server_conf::check_new_name("x", sections) == "use at least 2 characters (rclone takes one letter for a drive)");
+    CHECK(server_conf::check_new_name("x", sections) == "use at least 2 characters (grab 0.20 and earlier read one letter as a drive)");
     CHECK(server_conf::check_new_name("box", sections) == "there is a server called box already");
     CHECK(server_conf::check_new_name("BOX", sections) ==
           "BOX differs from the server box only in case, which Windows doesn't tell apart");
@@ -137,7 +137,8 @@ TEST_CASE("server_conf: the checks the command, the window and the import share 
     CHECK(server_conf::same_ignoring_case("Main", "mAIN"));
     CHECK_FALSE(server_conf::same_ignoring_case("box", "box2"));
     // An existing (imported) name only gets notes.
-    CHECK(server_conf::name_problems("x", sections).size() == 1);
+    // One letter is fine there: only grab 0.20 and earlier read it as a drive (a new one needs two).
+    CHECK(server_conf::name_problems("x", sections).empty());
     CHECK(server_conf::name_problems("MAIN", sections) ==
           std::vector<std::string>{"its name differs from [Main] only in case, so Windows gives both one file list"});
     CHECK(server_conf::name_problems("\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8", sections).empty());

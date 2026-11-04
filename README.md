@@ -29,7 +29,8 @@ connections, building and releasing) is in the full documentation,
 - **grab's own SSH client** (libssh2 and OpenSSL, built in) does all of it. It logs in once per
   connection and keeps the connections open between files, searches and downloads. Logging in
   never prompts: grab uses the keys in ssh-agent, or the password or key passphrase from its
-  encrypted store. A server's host key is pinned when you add it.
+  encrypted store. A server's host key is pinned when you add it. It connects to the server
+  directly: SOCKS and HTTP proxies and jump hosts aren't supported yet.
 - **Several connections, resumable.** A file comes in byte ranges over the server's connection
   budget (14 on Hetzner Storage Boxes, 12 elsewhere) into `<name>.grabpart`, renamed when
   complete. A folder is listed once; its files of 2 MiB and more come the same way, smaller ones
@@ -39,32 +40,25 @@ connections, building and releasing) is in the full documentation,
   engine, laid out like Explorer: browse and search a server's folders, preview images, text
   files and PDFs, play videos and audio in your own player streamed from the server, and follow
   a download queue with pause and resume, priorities, a speed limit and a speed schedule.
-- **rclone, the temporary fallback.** rclone, which grab used for all of this up to 0.19, is
-  still inside grab as a fallback until a later grab removes it: `engine = rclone` in a
-  server's section downloads, searches and lists that server through rclone and ssh.exe as
-  0.19 did.
 
 ## Requirements
 
-- Windows 10/11. Nothing to install: grab's SSH client is built in, servers are set up with
-  `grab server add` (or Settings in the window), and the rclone for the fallback ships inside
-  grab. You never need to run `rclone config`.
+- Windows 10/11. Nothing else to install: grab's SSH client is built in, and servers are set up
+  with `grab server add` (or Settings in the window). Neither rclone nor ssh.exe is needed.
 - The window needs the Microsoft Edge WebView2 Runtime, which ships with Windows 11 and current
   Windows 10. The `grab` command works without it.
-- `ssh.exe` (the OpenSSH client built into Windows 10/11) only for servers on `engine = rclone`
-  whose searches use ssh + find.
 
 ## Install
 
 Download from the [Releases page](https://github.com/Giorgi-Apriashvili/grab/releases):
 
 - `grab-x.y.z-windows-x64-setup.exe`: per-user installer, no admin rights. It installs
-  `grab.exe`, the `grab-gui.exe` window and the bundled `rclone.exe` in
-  `%USERPROFILE%\programs\grab\bin` and adds that folder to your user PATH, adds a **grab**
-  Start-menu entry, and writes a starter config to `%APPDATA%\grab\grab.conf` if you don't have
-  one. Its uninstaller keeps your config and servers.
+  `grab.exe` and the `grab-gui.exe` window in `%USERPROFILE%\programs\grab\bin` and adds that
+  folder to your user PATH, adds a **grab** Start-menu entry, and writes a starter config to
+  `%APPDATA%\grab\grab.conf` if you don't have one. Its uninstaller keeps your config and
+  servers.
 - `grab-x.y.z-windows-x64.zip`: the same programs without an installer. Unpack it anywhere,
-  keeping the three `.exe` files together.
+  keeping the two `.exe` files together.
 
 The installer is not code-signed, so SmartScreen shows "Windows protected your PC" the first
 time; choose "More info → Run anyway".
@@ -113,7 +107,7 @@ before that check passes. The window offers the same update. More in
 ## Basic usage
 
 ```
-grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- FLAGS]
+grab [-s|--file | -f|--folder] TARGET [DEST] [options]
 
   -r, --remote NAME    grab.conf section to use (default: [grab] default_remote)
   -n, --dry-run        resolve the target and show what would be fetched; transfers nothing
@@ -168,7 +162,7 @@ ctest --preset clang-cl-debug --output-on-failure
 # binary: build\clang-cl-debug\grab.exe   (release: clang-cl-release)
 ```
 
-`cmake --install build\clang-cl-release` puts `grab.exe`, `grab-gui.exe` and `rclone.exe` in
+`cmake --install build\clang-cl-release` puts `grab.exe` and `grab-gui.exe` in
 `%USERPROFILE%\programs\grab\bin` (no admin rights needed) and adds that directory to your user
 PATH. More in [Build](docs/doc.md#build) and [From source](docs/doc.md#from-source).
 
@@ -182,13 +176,13 @@ PATH. More in [Build](docs/doc.md#build) and [From source](docs/doc.md#from-sour
   server, updates
 - [Configure](docs/doc.md#configure): servers, logins, grab's password store and host keys,
   [grab.conf](docs/doc.md#grabconf),
-  [grab's own client and the rclone fallback](docs/doc.md#grabs-own-client-and-the-rclone-fallback),
+  [servers grab won't connect to](docs/doc.md#servers-grab-wont-connect-to),
   [notes about settings](docs/doc.md#notes-about-settings),
   [environment](docs/doc.md#environment)
-- [Coming from an earlier grab](docs/doc.md#coming-from-an-earlier-grab) (0.19 and before) and
+- [Coming from an earlier grab](docs/doc.md#coming-from-an-earlier-grab) (0.20 and before),
+  [Going back to 0.20](docs/doc.md#going-back-to-020) and
   [Going back to 0.19](docs/doc.md#going-back-to-019)
-- [Usage](docs/doc.md#usage): every option, matching and picking, downloads, flags after `--`,
-  exit codes
+- [Usage](docs/doc.md#usage): every option, matching and picking, downloads, `--`, exit codes
 - [Lookup methods](docs/doc.md#lookup-methods): find, the walk over SFTP, the find check
 - [File lists](docs/doc.md#file-lists): the saved lists searches use
 - [Connections](docs/doc.md#connections): `max_connections`, `bind`, the timeouts, and what
@@ -199,16 +193,16 @@ PATH. More in [Build](docs/doc.md#build) and [From source](docs/doc.md#from-sour
 
 ## Third-party software
 
-- **[rclone](https://rclone.org)** v1.75.1, © Nick Craig-Wood, MIT license
-  ([licenses/rclone.txt](licenses/rclone.txt)): `rclone.exe` ships next to `grab.exe` for the
-  servers on the fallback.
+- **[rclone](https://rclone.org)**, © Nick Craig-Wood, MIT license
+  ([licenses/rclone.txt](licenses/rclone.txt)): grab reuses its file-name encoding tables and its
+  password-obscuring key, to name files and read old settings as grab 0.19 and before (which ran
+  rclone) did. No rclone program ships with grab.
 - **[libssh2](https://libssh2.org)**, BSD-3-Clause
   ([licenses/libssh2.txt](licenses/libssh2.txt)): built into grab, statically.
 - **[OpenSSL](https://openssl-library.org)** 3.5 LTS, Apache-2.0
   ([licenses/openssl.txt](licenses/openssl.txt)): built into grab, statically.
 
-Pins, how to bump them, and which rclone grab runs:
-[Third-party software](docs/doc.md#third-party-software).
+Pins and how to bump them: [Third-party software](docs/doc.md#third-party-software).
 
 ## License
 

@@ -4,7 +4,7 @@ include(cmake/vcpkg.cmake) # OpenSSL on Windows; sets the toolchain, so before p
 
 project(grab
     VERSION 0.20.1
-    DESCRIPTION "Grab a file or folder from a Linux server by name: ssh+find to locate, rclone to download"
+    DESCRIPTION "Grab a file or folder from a Linux server by name, over grab's own SSH/SFTP client"
     LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -72,7 +72,6 @@ add_library(grab_core STATIC
     src/activity.cpp
     src/local_name.cpp
     src/rclone_encoding.cpp
-    src/rclone_flags.cpp
     src/ui_origin.cpp
     src/sftp.cpp
     src/ssh.cpp

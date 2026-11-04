@@ -251,6 +251,8 @@ std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf)
     } else {
         for (const auto& server : applied->imported) env.imported.push_back(server.name);
         for (const auto& note : applied->notes) env.import_notes.push_back(std::format("[{}] {}", note.server, note.text));
+        env.old_files = std::move(applied->old_files);
+        env.old_files_recorded = applied->old_files_recorded;
     }
     if (auto exists = read_grab_conf(env); !exists) return util::fail(exists.error());
     env.known_hosts = grab_known_hosts_path();
@@ -358,6 +360,11 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             auto resolved = resolve(s, conn, remote, store);
             info.guard = std::move(resolved.guard);
             info.search = std::move(resolved.search);
+            if (!info.guard.empty()) {
+                info.unusable = guard::text(s.name, info.guard);
+            } else if (auto reach = engine::connect_settings(s); !reach) {
+                info.unusable = reach.error();
+            }
         }
         out.push_back(std::move(info));
     }
@@ -874,7 +881,7 @@ std::string import_banner(const std::vector<std::string>& names, const std::vect
     std::vector<std::string> out;
     if (!moved.empty()) {
         out.push_back(std::format("Servers are kept in grab.conf now: the connection details of {} moved there from "
-                                  "rclone.conf, which stays as it was (grab no longer writes it).{}",
+                                  "rclone.conf.{}",
                                   util::join(moved, ", "),
                                   secrets ? " Their passwords are in grab's own encrypted store." : ""));
     }
@@ -998,9 +1005,13 @@ std::expected<TestResult, std::string> test_connection(const Env& env, std::stri
 
     engine::Context ctx = engine::make_context(env.cfg, *s, std::move(**c), env.grab_conf);
     TestResult result;
-    // A server grab doesn't connect to says why, and nothing is tried (phase 9 step 6).
+    // A server grab doesn't connect to says why, and nothing is tried (phase 9 steps 6 and 7).
     if (const auto blocked = engine::grab_blockers(ctx); !blocked.empty()) {
         result.unusable = guard::text(name, blocked);
+        return result;
+    }
+    if (auto reach = engine::connect_settings(ctx.settings); !reach) {
+        result.unusable = reach.error();
         return result;
     }
     // A server grab has no key for is refused before anything dials (Main's fail2ban counts each

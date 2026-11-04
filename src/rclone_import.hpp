@@ -10,7 +10,9 @@
 // imported.json. A section with `host` is never imported again, so grab.conf goes after what it
 // needs. A 'passwords' file that is there but can't be loaded stops the import (no plan, a note):
 // passing it as an empty Inputs.store would replace it. Nothing the import reads is ever written:
-// rclone.conf and the old store stay as they are, so 0.19 still works with them.
+// rclone.conf and the old store stay as they are, except that grab's own (not rclone's standard
+// rclone.conf, nor one [grab] rclone_config names) are deleted once nothing in them would be lost
+// (remove_old_files; the user's decision 2, phase 9).
 //
 // For each grab.conf section without `host` that this configuration hasn't imported before
 // (imported.json in its state_dir): its rclone remote (`rclone_remote`, else its name) from the
@@ -75,6 +77,9 @@ struct Record {
     std::set<std::string, std::less<>> imported;        // names never imported again
     std::map<std::string, Failure, std::less<>> failed; // by section name
     std::vector<std::string> banner;                               // imported servers the window still has to name once
+    // The note on grab's own old files when a run deleted them (or couldn't): kept here, so it
+    // shows once (notices::for_config) even when that run then failed and said nothing.
+    std::string old_files;
     bool operator==(const Record&) const = default;
 };
 [[nodiscard]] std::filesystem::path record_path(const std::filesystem::path& state_dir);
@@ -187,17 +192,63 @@ struct Result {
     std::vector<Imported> imported;
     std::vector<std::string> failed;
     std::vector<Note> notes;
+    // The note when this run deleted grab's own old files (remove_old_files), or couldn't. Recorded
+    // in imported.json, it shows as a notice (notices::for_config); a caller says it itself only
+    // when it couldn't be recorded.
+    std::string old_files;
+    bool old_files_recorded = false;
 };
 
 // The apply step, run by load_context, load_env, --init and the window's settings thread. First,
 // without the lock, whether any section waits for the import (no `host`, not imported before,
 // not failed with the same remote and source files): when none does, as on almost every run, it
-// returns at once. Else under the settings lock: read_inputs, plan, then the writes in the order
-// the header gives (store, known_hosts, grab.conf, imported.json), each only when it changes. A
-// write that fails stops it with an error; what was written before is what the next run plans
-// from, and it finishes then (the store and known_hosts lines come out the same again, and a
-// section is done once grab.conf has its `host`). No grab.conf: nothing to do.
+// goes on to the old files at once. Else under the settings lock: read_inputs, plan, then the
+// writes in the order the header gives (store, known_hosts, grab.conf, imported.json), each only
+// when it changes. A write that fails stops it with an error; what was written before is what the
+// next run plans from, and it finishes then (the store and known_hosts lines come out the same
+// again, and a section is done once grab.conf has its `host`). No grab.conf: nothing to do. Then
+// remove_old_files.
 [[nodiscard]] std::expected<Result, std::string> apply(const Files& files);
+
+// ---- grab's own old files (the user's decision 2, RCLONE-REPLACEMENT.md phase 9) ----------------
+
+// What becomes of grab 0.19's own rclone.conf (`own`: <config>/grab/rclone.conf, read with the
+// 'secrets' store beside it, read_old) now that grab reads it only to import from it: deleted, both,
+// only when nothing in them would be lost, so going back to 0.19 then means adding the servers and
+// their passwords again. They stay, with every reason why (`kept`), when [grab] rclone_config is set
+// (the import doesn't read them then, or that line names them), when rclone reads that file too
+// (`standard`: RCLONE_CONFIG names it), when either can't be read, when a remote there isn't
+// imported (imported.json, in.record) as the grab.conf section that names it or as a server of its
+// name removed since (when no grab.conf section has that name), when grab's store (in.store, read
+// back from the disk) lacks the password, passphrase or key the import takes from them for one of
+// those, or when 'secrets' holds a remote rclone.conf doesn't name. Only for the default
+// configuration's files: the caller checks that.
+struct OldFiles {
+    bool remove = false;
+    std::vector<std::string> kept; // "[Box] isn't imported", ...
+    // Of those, the servers removed from grab with their password since: only the user can clear
+    // these (by deleting the files), so the note promises no deletion for them.
+    std::vector<std::string> removed;
+};
+[[nodiscard]] OldFiles judge_old_files(const Inputs& in, Source own, bool standard);
+// An rclone.conf with the 'secrets' store beside it, that store read whether or not the file is
+// there (read_source reads it only beside one).
+[[nodiscard]] Source read_old(const std::filesystem::path& file);
+
+// Deletes grab's own old files (grab_rclone_config_path and the 'secrets' beside it) when
+// judge_old_files says so, under the settings lock: the 'secrets' first, the more private, and
+// rclone.conf only once it is gone. Only for the default configuration (state_dir <config>/grab,
+// whose files they are) and when one of them is there, which is all a run checks once they're
+// gone. Returns the one-time note naming what it deleted (or what it couldn't), nullopt when
+// nothing was deleted; the note is recorded in imported.json under the same lock (`recorded`).
+struct Removed {
+    std::string note;
+    bool recorded = false;
+};
+[[nodiscard]] std::optional<Removed> remove_old_files(const Files& files);
+// Why grab's own old files stay, as a note for the configuration at `grab_conf` (judge_old_files,
+// read now, without the lock); nullopt when they aren't there or it isn't the default configuration.
+[[nodiscard]] std::optional<std::string> old_files_kept(const std::filesystem::path& grab_conf);
 
 // The servers the window still has to name in its one-time notice about the import (Record's
 // banner; server_ops::import_banner), taken out of imported.json under the settings lock, so the

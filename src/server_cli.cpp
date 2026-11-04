@@ -1,7 +1,6 @@
 #include "server_cli.hpp"
 
 #include "config.hpp"
-#include "guard.hpp"
 #include "gui_state.hpp"
 #include "notices.hpp"
 #include "server_conf.hpp"
@@ -100,7 +99,7 @@ int server_list(const Env& env) {
         std::println("{} {:<14} {}@{}:{}  {}, {}, {}{}", mark, s.name, s.user, s.host, s.port, server_ops::login_text(s),
                      search, server_ops::host_key_text(s),
                      s.connection_keys.empty() ? std::string() : ", " + s.connection_keys);
-        if (!s.guard.empty()) std::println("  {:<14} not usable: {}", "", guard::text(s.name, s.guard));
+        if (!s.unusable.empty()) std::println("  {:<14} not usable: {}", "", s.unusable);
     }
     return exit_ok;
 }
@@ -236,6 +235,11 @@ int test_saved(const Env& env, const std::string& name) {
     if (!fresh) {
         error(fresh.error());
         return exit_config;
+    }
+    // The change may have let grab delete its own old files (the last password saved): said now.
+    if (!fresh->old_files.empty()) {
+        if (!fresh->old_files_recorded) std::println(stderr, "grab: note: {}", fresh->old_files);
+        for (const auto& n : notices::take_fresh(fresh->grab_conf)) std::println(stderr, "grab: note: {}", n.text);
     }
     if (print_test(*fresh, name) == exit_ok) {
         std::println(stderr, "\nReady:  grab -r {} WORDS [DEST]", name);
@@ -403,11 +407,12 @@ int run_server_command(const Options& opts) {
         return exit_config;
     }
     if (!env->imported.empty()) {
-        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time; rclone.conf "
-                             "unchanged)",
+        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time)",
                      util::join(env->imported, ", "), util::path_to_utf8(env->grab_conf));
     }
     for (const auto& note : env->import_notes) std::println(stderr, "grab: note: {}", note);
+    // Recorded, the note on grab's own old files comes with the notices below.
+    if (!env->old_files.empty() && !env->old_files_recorded) std::println(stderr, "grab: note: {}", env->old_files);
     const std::string& sub = opts.server_args.at(0);
     const std::string arg = opts.server_args.size() > 1 ? opts.server_args[1] : std::string{};
     // The settings' notices this configuration hasn't shown yet; a test repeats its server's, but

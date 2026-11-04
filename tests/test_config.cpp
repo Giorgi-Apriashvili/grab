@@ -40,8 +40,8 @@ GrabConfig parse_ok(std::string_view text) {
 
 TEST_CASE("minimal grab.conf gets built-in defaults") {
     const auto cfg = parse_ok("[hetzner]\nsearch_roots = /home/alice\n");
-    CHECK(cfg.rclone == "rclone");
-    CHECK(cfg.ssh == "ssh");
+    CHECK(cfg.rclone.empty()); // read only for a notice now
+    CHECK(cfg.ssh.empty());
     CHECK_FALSE(cfg.rclone_config.has_value());
     CHECK_FALSE(cfg.default_remote.has_value());
     REQUIRE(cfg.remotes.size() == 1);
@@ -74,7 +74,7 @@ TEST_CASE("explicit keys override defaults, blank flag keys mean no flags") {
     CHECK(cfg.rclone == "C:\\Tools\\rclone.exe");
     REQUIRE(cfg.rclone_config.has_value());
     CHECK(util::path_to_utf8(*cfg.rclone_config) == "C:\\cfg\\rclone.conf");
-    CHECK(cfg.ssh == "ssh"); // blank falls back
+    CHECK(cfg.ssh.empty()); // blank
     CHECK(cfg.default_remote == "box");
     REQUIRE(cfg.remotes.size() == 1);
     const auto& r = cfg.remotes[0];
@@ -312,15 +312,16 @@ TEST_CASE("generate_grab_config writes one ready-to-use section per usable sftp 
     CHECK(text.find("grab server add | list | edit | test | trust | remove") != std::string::npos);
     CHECK(text.find("u1-sub1@box.example.com:23, password, lookup with find, else by listing folders") !=
           std::string::npos);
-    // No rclone flag lines; the connection keys and the fallback commented out (grab's defaults
-    // apply), and `find = auto`, never walk (0.19 refuses it).
+    // No rclone flag lines, no `rclone =`, `ssh =` or engine line (phase 9); the connection keys
+    // commented out (grab's defaults apply), and `find = auto`, never walk (0.19 refuses it).
     CHECK(text.find("common_flags") == std::string::npos);
     CHECK(text.find("folder_flags") == std::string::npos);
     CHECK(text.find("# bind = ") != std::string::npos);
     CHECK(text.find("# connect_timeout = 30s\n") != std::string::npos);
     CHECK(text.find("# io_timeout = 30s\n") != std::string::npos);
-    CHECK(text.find("# engine = rclone\n") != std::string::npos);
-    CHECK(text.find("\nengine") == std::string::npos);
+    CHECK(text.find("engine") == std::string::npos);
+    CHECK(text.find("\nrclone =") == std::string::npos);
+    CHECK(text.find("\nssh =") == std::string::npos);
     CHECK(text.find("\nfind = walk") == std::string::npos);
 
     const auto cfg = parse_ok(text);
@@ -364,7 +365,7 @@ TEST_CASE("generate_grab_config without usable remotes is a [grab] block ready f
         const auto cfg = parse_ok(text);
         CHECK(cfg.remotes.empty());
         CHECK_FALSE(cfg.default_remote.has_value());
-        CHECK(cfg.rclone == "rclone"); // blank = bundled, else PATH
+        CHECK(cfg.rclone.empty()); // no `rclone =` line any more
         CHECK_FALSE(cfg.rclone_config.has_value());
         CHECK(text.find("grab server add") != std::string::npos);
     }
@@ -477,34 +478,45 @@ TEST_CASE("RCLONE_CONFIG overrides the default rclone.conf path") {
     set_env("RCLONE_CONFIG", previous ? previous->c_str() : nullptr);
 }
 
-TEST_CASE("engine: grab's own client by default, rclone when asked or guarded, GRAB_ENGINE over every server") {
+TEST_CASE("engine: read for a notice only; a value 0.20 would refuse still fails the load (phase 9)") {
     const auto cfg = parse_ok("[a]\n[b]\nengine = grab\n[c]\nengine = RClone\n");
     REQUIRE(cfg.remotes.size() == 3);
-    CHECK_FALSE(cfg.remotes[0].engine.has_value()); // absent: the default, resolved by effective_engine
+    CHECK_FALSE(cfg.remotes[0].engine.has_value());
     CHECK(cfg.remotes[1].engine == Engine::grab);
     CHECK(cfg.remotes[2].engine == Engine::rclone);
+    // 0.20.1, the way back, refuses it too: a file this grab takes still runs it.
     CHECK_FALSE(parse_grab_config(*ini::parse("[h]\nengine = libssh\n")).has_value());
+}
 
-    const auto previous = util::getenv_utf8("GRAB_ENGINE");
-    set_env("GRAB_ENGINE", nullptr);
-    CHECK(effective_engine(cfg.remotes[0]) == Engine::grab); // the default since phase 8 (0.20)
-    CHECK(effective_engine(cfg.remotes[1]) == Engine::grab);
-    CHECK(effective_engine(cfg.remotes[2]) == Engine::rclone); // the fallback
-    // A server grab's client can't serve as configured stays on rclone by itself; one that asks
-    // for grab is refused where it's used (engine::ssh_target), never moved.
-    CHECK(effective_engine(cfg.remotes[0], true) == Engine::rclone);
-    CHECK(effective_engine(cfg.remotes[1], true) == Engine::grab);
-    CHECK(effective_engine(cfg.remotes[2], true) == Engine::rclone);
-    set_env("GRAB_ENGINE", "grab");
-    CHECK(effective_engine(cfg.remotes[2]) == Engine::grab);
-    CHECK(effective_engine(cfg.remotes[0], true) == Engine::grab);
-    set_env("GRAB_ENGINE", "rclone");
-    CHECK(effective_engine(cfg.remotes[0]) == Engine::rclone);
-    CHECK(effective_engine(cfg.remotes[1]) == Engine::rclone);
-    set_env("GRAB_ENGINE", "something else"); // ignored
-    CHECK(effective_engine(cfg.remotes[0]) == Engine::grab);
-    CHECK(effective_engine(cfg.remotes[2]) == Engine::rclone);
-    set_env("GRAB_ENGINE", previous ? previous->c_str() : nullptr);
+TEST_CASE("old_bind: a bind left in common_flags, folder_flags or ssh_options, as rclone and ssh.exe read it") {
+    RemoteSettings s;
+    // The bind there now, or a blank OldBind for none.
+    const auto bind = [&s] { return old_bind(s).value_or(OldBind{}); };
+    CHECK_FALSE(old_bind(s).has_value());
+    s.common_flags = util::split_args(default_common_flags);
+    s.folder_flags = util::split_args(default_folder_flags);
+    CHECK_FALSE(old_bind(s).has_value());
+    s.common_flags = {"--bind", "10.0.0.1", "--bind=10.0.0.2"}; // rclone's: the last one
+    CHECK(bind().key == "common_flags");
+    CHECK(bind().flag == "--bind");
+    CHECK(bind().value == "10.0.0.2");
+    s.common_flags = {"--bind", ""};
+    CHECK_FALSE(old_bind(s).has_value()); // blank: no bind
+    s.folder_flags = {"--bind", "--transfers"}; // no value of its own
+    REQUIRE(old_bind(s).has_value());
+    CHECK(bind().key == "folder_flags");
+    CHECK(bind().value.empty());
+    s.folder_flags.clear();
+    s.ssh_options = {"-o", "bindaddress = 10.0.0.3", "-b", "10.0.0.4"}; // ssh.exe's: the first one
+    CHECK(bind().flag == "-o BindAddress");
+    CHECK(bind().value == "10.0.0.3");
+    s.ssh_options = {"-o", "ProxyJump=jump", "-b10.0.0.4"};
+    CHECK(bind().flag == "-b");
+    CHECK(bind().value == "10.0.0.4");
+    s.ssh_options = {"-o", "BindAddress="};
+    CHECK_FALSE(old_bind(s).has_value());
+    s.file_flags = {"--bind", "10.0.0.5"}; // reached no connection since 0.20
+    CHECK_FALSE(old_bind(s).has_value());
 }
 
 TEST_CASE("bind, connect_timeout and io_timeout: read, checked, blank when absent (phase 8)") {
@@ -548,7 +560,7 @@ TEST_CASE("keys grab doesn't read are collected for a notice, never an error (N7
     CHECK(cfg.unknown_keys == std::vector<std::pair<std::string, std::string>>{{"grab", "sh"}, {"Main", "connect_timout"}});
 }
 
-TEST_CASE("the new keys sit beside the old ones, which keep their meaning for rclone and grab 0.19") {
+TEST_CASE("the new keys sit beside the old ones, which grab 0.19 still reads") {
     // 0.19.0's parse_grab_config (v0.19.0 config.cpp) reads only the keys it knew and skips any
     // other: it sees this section's common_flags as written, its bind lost (docs/doc.md says so,
     // in Going back to 0.19).
@@ -577,19 +589,19 @@ TEST_CASE("example config parses and matches the defaults") {
     CHECK(conn.host == "files.example.com");
     CHECK(conn.auth == server_conf::Auth::key);
     CHECK(std::string_view(example_config).find("grab's own rclone.conf") == std::string_view::npos);
-    // grab's own client by default: the engine line and the connection keys commented out, no
-    // rclone flag keys, `find = auto` (0.19 refuses walk).
+    // The connection keys commented out, no rclone flag keys, no engine, `rclone =` or `ssh =`
+    // line and nothing that names engine = rclone (phase 9), `find = auto` (0.19 refuses walk).
     CHECK_FALSE(cfg.remotes[0].engine.has_value());
     CHECK_FALSE(cfg.remotes[0].bind.has_value());
     CHECK_FALSE(cfg.remotes[0].io_timeout.has_value());
     CHECK(cfg.remotes[0].find == FindMethod::auto_detect);
     CHECK(cfg.unknown_keys.empty());
     const std::string_view text = example_config;
-    for (const char* line : {"\n# engine = rclone\n", "\n# bind = ", "\n# connect_timeout = 30s\n", "\n# io_timeout = 30s\n",
-                             "\nfind = auto\n"}) {
+    for (const char* line : {"\n# bind = ", "\n# connect_timeout = 30s\n", "\n# io_timeout = 30s\n", "\nfind = auto\n"}) {
         CHECK_MESSAGE(text.find(line) != std::string_view::npos, line);
     }
-    for (const char* key : {"\ncommon_flags", "\nfolder_flags", "\nfile_flags", "\nssh_options", "\nengine"}) {
+    for (const char* key : {"\ncommon_flags", "\nfolder_flags", "\nfile_flags", "\nssh_options", "engine", "\nrclone =",
+                            "\nssh =", "rclone runs", "fallback", "-- --bind"}) {
         CHECK_MESSAGE(text.find(key) == std::string_view::npos, key);
     }
 }

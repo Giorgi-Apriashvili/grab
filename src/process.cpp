@@ -1,7 +1,6 @@
 #include "process.hpp"
 
 #include "quote.hpp"
-#include "rclone_flags.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -85,10 +84,9 @@ int compare_names(std::wstring_view a, std::wstring_view b) {
     return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE);
 }
 
-// This process's environment (all of it, or without what internal rclone calls must not see), less
-// what `extra` leaves out or replaces, plus extra.set, as a CreateProcess block sorted by name
-// ignoring case, as Windows keeps one.
-std::wstring environment_block(bool whole, const Environment& extra) {
+// This process's environment, less what `extra` leaves out or replaces, plus extra.set, as a
+// CreateProcess block sorted by name ignoring case, as Windows keeps one.
+std::wstring environment_block(const Environment& extra) {
     std::vector<std::wstring> added;
     added.reserve(extra.set.size());
     for (const auto& [name, value] : extra.set) added.push_back(util::to_wide(name + "=" + value));
@@ -101,7 +99,6 @@ std::wstring environment_block(bool whole, const Environment& extra) {
         for (const wchar_t* p = all; *p != L'\0'; p += std::wcslen(p) + 1) {
             const std::wstring_view entry(p);
             const auto name = name_of(entry);
-            if (!whole && !rclone_flags::kept_variable(util::to_utf8(name))) continue;
             const bool replaced = std::ranges::any_of(added, [&](const std::wstring& a) {
                 return compare_names(name, name_of(a)) == CSTR_EQUAL;
             });
@@ -129,8 +126,6 @@ std::wstring environment_block(bool whole, const Environment& extra) {
 }
 
 } // namespace
-
-std::wstring internal_environment() { return environment_block(false, {}); }
 
 std::wstring environment_without_rclone() {
     std::wstring block;
@@ -245,13 +240,11 @@ struct StdHandles {
 };
 
 // `contain_descendants` false: only the child itself is in the job; programs it starts are
-// not, so they outlive it (see RunOptions for run_inherit). `whole_environment`: the child sees
-// every variable (run_inherit: an editor, an installer); otherwise the
-// RCLONE_* ones grab's internal calls must not see are left out (internal_environment). `extra` is
-// added either way.
+// not, so they outlive it (see RunOptions for run_inherit). The child sees this process's
+// environment with `extra` (environment_block).
 std::expected<void, std::string> launch(std::span<const std::string> argv, const StdHandles& std_h,
                                         bool no_window, Child& child, const Environment& extra,
-                                        bool contain_descendants = true, bool whole_environment = false) {
+                                        bool contain_descendants = true) {
     if (argv.empty()) return util::fail("empty command");
 
     child.job.h = CreateJobObjectW(nullptr, nullptr);
@@ -304,8 +297,8 @@ std::expected<void, std::string> launch(std::span<const std::string> argv, const
     }
     std::wstring cmdline = util::to_wide(quote::windows_cmdline(argv));
     // The whole environment as it is needs no block of its own.
-    const bool inherited = whole_environment && extra.set.empty() && extra.without_prefix.empty();
-    std::wstring environment = inherited ? std::wstring() : environment_block(whole_environment, extra);
+    const bool inherited = extra.set.empty() && extra.without_prefix.empty();
+    std::wstring environment = inherited ? std::wstring() : environment_block(extra);
     PROCESS_INFORMATION pi{};
     // The program by its full path: Windows itself would look in the current folder first.
     const BOOL ok = CreateProcessW(program->c_str(), cmdline.data(), nullptr, nullptr, TRUE, flags,
@@ -407,7 +400,7 @@ std::expected<int, std::string> run_inherit(std::span<const std::string> argv, b
                            GetStdHandle(STD_ERROR_HANDLE), false};
     CtrlGuard guard;
     Child child;
-    if (auto r = launch(argv, std_h, false, child, Environment{}, contain_descendants, true); !r) {
+    if (auto r = launch(argv, std_h, false, child, Environment{}, contain_descendants); !r) {
         return util::fail(r.error());
     }
     return wait_exit(child);
@@ -517,13 +510,11 @@ int decode_status(int status) {
     return status;
 }
 
-// Spawns in a new process group so a stop can signal the child and its descendants.
-// `whole_environment`: as launch() on Windows (run_inherit); otherwise without the RCLONE_*
-// variables grab's internal calls must not see. `extra` is added either way (names compared
-// exactly, as POSIX does).
+// Spawns in a new process group so a stop can signal the child and its descendants. The child
+// sees this process's environment with `extra` (names compared exactly, as POSIX does).
 std::expected<pid_t, std::string> spawn(std::span<const std::string> argv,
                                         posix_spawn_file_actions_t* actions, bool own_group,
-                                        const Environment& extra, bool whole_environment = false) {
+                                        const Environment& extra) {
     if (argv.empty()) return util::fail("empty command");
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
@@ -536,7 +527,6 @@ std::expected<pid_t, std::string> spawn(std::span<const std::string> argv,
     for (char** e = environ; *e != nullptr; ++e) {
         const std::string_view entry(*e);
         const auto name = entry.substr(0, entry.find('='));
-        if (!whole_environment && !rclone_flags::kept_variable(name)) continue;
         if (std::ranges::any_of(extra.set, [&](const auto& v) { return v.first == name; })) continue;
         if (std::ranges::any_of(extra.without_prefix, [&](const std::string& p) { return name.starts_with(p); })) {
             continue;
@@ -672,7 +662,7 @@ std::expected<CaptureResult, std::string> run_capture(std::span<const std::strin
 
 std::expected<int, std::string> run_inherit(std::span<const std::string> argv, bool /*contain_descendants*/) {
     SigintGuard guard;
-    auto pid = spawn(argv, nullptr, false, Environment{}, true);
+    auto pid = spawn(argv, nullptr, false, Environment{});
     if (!pid) return util::fail(pid.error());
     return wait_pid(*pid);
 }

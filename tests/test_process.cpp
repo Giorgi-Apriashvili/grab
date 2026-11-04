@@ -261,14 +261,15 @@ TEST_CASE("a run's own environment: added, replacing inherited names ignoring ca
           std::vector<std::string>{"GRAB_TEST_ENV_DROP_ONE=inherited", "GRAB_TEST_ENV_KEPT=inherited",
                                    "grab_test_env_replaced=inherited"});
     std::filesystem::remove_all(dir);
-    // A run with nothing of its own still leaves out what internal runs must not see.
-    SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", L"x");
+    // A run with nothing of its own sees the environment as it is: grab runs no rclone any more,
+    // whose runs once left the RCLONE_* variables out (phase 9).
+    SetEnvironmentVariableW(L"RCLONE_GRABTEST_KEPT", L"x");
     proc::RunOptions bare;
     bare.detached = true;
-    const auto plain = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/c", "set RCLONE_CONFIG"}, bare);
-    SetEnvironmentVariableW(L"RCLONE_CONFIG_GRABTEST_PASS", nullptr);
+    const auto plain = proc::run_capture(std::vector<std::string>{"cmd", "/d", "/c", "set RCLONE_GRABTEST"}, bare);
+    SetEnvironmentVariableW(L"RCLONE_GRABTEST_KEPT", nullptr);
     REQUIRE(plain.has_value());
-    CHECK(plain->out.find("GRABTEST") == std::string::npos);
+    CHECK(plain->out.find("RCLONE_GRABTEST_KEPT=x") != std::string::npos);
 }
 #endif
 

@@ -19,9 +19,10 @@ namespace grab::server_conf {
 
 namespace {
 
-// rclone 1.75.1's sftp settings that hold no secret and that grab passes on as they are
-// (RCLONE-REPLACEMENT.md, phase 7 engineering defaults). md5sum_command, sha1sum_command,
-// shell_type and path_override are grab.conf keys of their own.
+// rclone 1.75.1's sftp settings that hold no secret, which grab.conf may keep as rclone.<key> lines
+// (RCLONE-REPLACEMENT.md, phase 7 engineering defaults); since rclone went (phase 9) only the
+// guard and the notices read them. md5sum_command, sha1sum_command, shell_type and path_override
+// are grab.conf keys of their own.
 constexpr auto allowed_rclone_keys = std::to_array<std::string_view>(
     {"use_insecure_cipher", "disable_hashcheck", "set_modtime", "hashes", "crc32sum_command", "sha256sum_command",
      "blake3sum_command", "xxh3sum_command", "xxh128sum_command", "skip_links", "subsystem", "server_command",
@@ -105,7 +106,7 @@ std::expected<std::optional<Connection>, std::string> parse(const ini::Section& 
         if (!key.starts_with(rclone_prefix)) continue;
         const auto option = std::string_view(key).substr(rclone_prefix.size());
         if (!rclone_key_allowed(option)) {
-            return util::failf("[{}] {} can't be set in grab.conf (grab gives rclone only the settings that hold no "
+            return util::failf("[{}] {} can't be set in grab.conf (grab.conf holds only the rclone settings that hold no "
                                "password; change the server with `grab server edit {}` or Edit in grab's Settings)",
                                name, key, name);
         }
@@ -242,7 +243,7 @@ bool same_ignoring_case(std::string_view a, std::string_view b) {
 
 std::optional<std::string> check_new_name(std::string_view name, const std::vector<std::string>& sections) {
     if (auto bad = servers::validate_name(name)) return bad;
-    if (characters(name) < 2) return "use at least 2 characters (rclone takes one letter for a drive)";
+    if (characters(name) < 2) return "use at least 2 characters (grab 0.20 and earlier read one letter as a drive)";
     for (const auto& other : sections) {
         if (other == name) return std::format("there is a server called {} already", name);
         if (same_ignoring_case(other, name)) {
@@ -255,7 +256,6 @@ std::optional<std::string> check_new_name(std::string_view name, const std::vect
 
 std::vector<std::string> name_problems(std::string_view name, const std::vector<std::string>& sections) {
     std::vector<std::string> out;
-    if (characters(name) == 1) out.emplace_back("its name is one character, which rclone takes for a drive letter");
     if (name.starts_with('-')) out.emplace_back("its name starts with -, which programs take for an option");
     for (const auto& other : sections) {
         if (other != name && same_ignoring_case(other, name)) {

@@ -31,6 +31,8 @@ struct Env {
     std::string grab_text; // grab.conf as it is on disk (or a fresh [grab] block)
     std::vector<std::string> imported;     // servers this load moved from rclone.conf into grab.conf
     std::vector<std::string> import_notes; // that import's notes ("[server] ..."), or why it stopped
+    std::string old_files; // the note when this load deleted grab's own old rclone.conf and 'secrets'
+    bool old_files_recorded = false; // that note is in imported.json: a notice (notices::for_config)
 };
 
 // Reads grab.conf (a missing file is an empty config), after the one-time move of servers from
@@ -65,6 +67,9 @@ struct ServerInfo {
     // What keeps grab off it (guard.hpp; its rclone extras read from grab's store for this very
     // login): such a server is refused everywhere, Trust included, and the list says why.
     std::vector<guard::Reason> guard;
+    // Why grab doesn't connect to it at all, as Test says it: guard::text of `guard`, else a bind
+    // left in an old key (engine::connect_settings); empty for a server grab uses.
+    std::string unusable;
     // The connection keys its section sets, as grab.conf has them (no window field sets them):
     // "bind 10.0.0.2, connect_timeout 10s, io_timeout 1m"; empty when none is.
     std::string connection_keys;
@@ -91,8 +96,9 @@ struct HostKeys {
 [[nodiscard]] std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port,
                                                                   std::stop_token stop = {}, const ssh::Reach& reach = {});
 // How server `name`'s host-key fetch (Trust, Add, Edit) connects: its bind and connect_timeout as
-// every connection takes them (engine::connect_settings); none for a server grab.conf doesn't have
-// yet. Refused, before anything connects, for a server the guard keeps grab off (guard::text says
+// every connection takes them (engine::connect_settings, which refuses a bind left in an old key);
+// none for a server grab.conf doesn't have yet. Refused, before anything connects, for a server the
+// guard keeps grab off (guard::text says
 // why and how to clear it; phase 9 step 6): a key pinned for a server grab won't use gains
 // nothing, and the fetch would connect past its route. A new server has only the environment's
 // guard settings (an inherited RCLONE_SFTP_SOCKS_PROXY covers every server).
@@ -191,7 +197,8 @@ struct TestResult {
     // and home folder listed (grab_ok), or why not (grab_error).
     std::optional<bool> grab_ok;
     std::string grab_error;
-    // Why grab doesn't connect to the server at all (guard::text): nothing was tried.
+    // Why grab doesn't connect to the server at all (guard::text, or a bind left in an old key):
+    // nothing was tried.
     std::string unusable;
     std::string grab_search; // grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
     std::string checksums;   // grab_ok: "checksums: md5sum", or why verification can't run there
@@ -220,8 +227,8 @@ struct TestResult {
 // client and its home folder listed over SFTP, what the server's shell and sum commands are
 // (ssh::learn_commands, saved in grab.conf when grab.conf doesn't have them yet), the find check,
 // which says how its searches go, and the hash check, which says whether downloads can be verified
-// there (ssh_hash.hpp). A server the guard keeps grab off (`unusable`, guard::text) or an unpinned
-// one (engine::check_pinned) fails at once, nothing dialled.
+// there (ssh_hash.hpp). A server the guard keeps grab off or one with a bind left in an old key
+// (`unusable`), or an unpinned one (engine::check_pinned), fails at once, nothing dialled.
 [[nodiscard]] std::expected<TestResult, std::string> test_connection(const Env& env, std::string_view name,
                                                                      std::stop_token stop = {});
 

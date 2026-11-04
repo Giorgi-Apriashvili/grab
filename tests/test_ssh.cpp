@@ -240,7 +240,7 @@ TEST_CASE("ssh: a scan of a port nobody listens on fails without waiting for its
     CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(8));
 }
 
-TEST_CASE("ssh: rclone's times, and the connection flags grab's client takes from them (G189)") {
+TEST_CASE("ssh: times as rclone wrote them, which grab.conf and --timeout take (G189)") {
     using std::chrono::milliseconds;
     CHECK(ssh::parse_duration("30s") == milliseconds(30'000));
     CHECK(ssh::parse_duration("1m30s") == milliseconds(90'000));
@@ -259,24 +259,6 @@ TEST_CASE("ssh: rclone's times, and the connection flags grab's client takes fro
     for (const char* bad : {"", "s", "1m30", "-5s", "1x", "1..5s", "5 s", "100000y"}) {
         CHECK_MESSAGE(!ssh::parse_duration(bad), bad);
     }
-
-    ssh::Target t;
-    const std::vector<std::string> flags{"--sftp-chunk-size", "255Ki", "--bind=10.0.0.2", "--contimeout", "15s",
-                                         "--timeout=2m", "--sftp-disable-hashcheck", "--low-level-retries", "3"};
-    auto unused = ssh::apply_flags(t, flags);
-    REQUIRE(unused);
-    CHECK(t.bind == "10.0.0.2");
-    CHECK(t.connect_timeout == milliseconds(15'000));
-    CHECK(t.timeout == milliseconds(120'000));
-    CHECK(*unused == std::vector<std::string>{"--sftp-chunk-size", "255Ki", "--sftp-disable-hashcheck",
-                                             "--low-level-retries", "3"});
-    // Without them the defaults stay.
-    ssh::Target plain;
-    REQUIRE(ssh::apply_flags(plain, std::vector<std::string>{"--sftp-chunk-size", "255Ki"}));
-    CHECK(plain == ssh::Target{});
-    CHECK_FALSE(ssh::apply_flags(t, std::vector<std::string>{"--timeout", "soon"}));
-    CHECK_FALSE(ssh::apply_flags(t, std::vector<std::string>{"--bind"}));
-    CHECK_FALSE(ssh::apply_flags(t, std::vector<std::string>{"--contimeout", "--timeout", "5s"}));
 }
 
 TEST_CASE("ssh: --bind connects from that address, and one this machine can't use is fatal") {

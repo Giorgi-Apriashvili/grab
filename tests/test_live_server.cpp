@@ -75,7 +75,6 @@
 #include "preview.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
-#include "rclone_flags.hpp"
 #include "rclone_import.hpp"
 #include "server_conf.hpp"
 #include "sftp.hpp"
@@ -228,9 +227,11 @@ std::expected<ssh::Target, std::string> live_target(const engine::Context& ctx) 
     auto target = ssh::target_for(ctx.settings.name, ctx.connection, *planned_store,
                                   util::path_from_utf8(ctx.remote.known_hosts_file.value_or("")));
     if (!target) return target;
-    if (auto flags = ssh::apply_flags(*target, rclone_flags::connection(ctx.settings.common_flags)); !flags) {
-        return std::unexpected(flags.error());
-    }
+    auto reach = engine::connect_settings(ctx.settings);
+    if (!reach) return std::unexpected(reach.error());
+    if (reach->bind) target->bind = *reach->bind;
+    if (reach->connect_timeout) target->connect_timeout = *reach->connect_timeout;
+    if (reach->io_timeout) target->timeout = *reach->io_timeout;
     return target;
 }
 

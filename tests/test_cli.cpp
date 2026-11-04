@@ -4,7 +4,10 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <format>
+#include <initializer_list>
 #include <set>
 #include <string>
 #include <string_view>
@@ -29,7 +32,7 @@ TEST_CASE("folder mode with positional target and dest") {
     CHECK(util::path_to_utf8(*r->opts.dest) == "E:\\Backup\\releases");
     CHECK_FALSE(r->opts.first);
     CHECK_FALSE(r->opts.dry_run);
-    CHECK(r->opts.extra.empty());
+    CHECK_FALSE(r->opts.connect.bind.has_value());
 }
 
 TEST_CASE("file mode, long flags and options in any order") {
@@ -49,33 +52,126 @@ TEST_CASE("file mode, long flags and options in any order") {
     CHECK(util::path_to_utf8(*r->opts.config) == "C:\\g.conf");
 }
 
-TEST_CASE("everything after -- is kept as it is, for run() to check once the server's engine is known (phase 8)") {
-    // Not ours to judge here: engine::check_run_flags does, per engine, before anything connects.
-    auto r = parse_args(args({"-s", "x", "d", "--", "--bwlimit", "10M", "-f", "--dry-run", "--sftp-host", "h"}));
-    REQUIRE(r.has_value());
-    CHECK(r->opts.mode == Mode::file);
-    CHECK_FALSE(r->opts.dry_run);
-    CHECK(r->opts.extra == std::vector<std::string>{"--bwlimit", "10M", "-f", "--dry-run", "--sftp-host", "h"});
-    auto ok = parse_args(args({"x", "d", "--", "--bind=10.8.0.2", "--timeout", "2m"}));
-    REQUIRE(ok.has_value());
-    CHECK(ok->opts.extra == std::vector<std::string>{"--bind=10.8.0.2", "--timeout", "2m"});
+TEST_CASE("-- ends the options: what follows is TARGET and DEST, even when it starts with - (G117, phase 9)") {
+    auto dash = parse_args(args({"-s", "--", "-notes.txt", "E:\\Docs"}));
+    REQUIRE_MESSAGE(dash.has_value(), dash.error_or(""));
+    CHECK(dash->opts.target == "-notes.txt");
+    CHECK(util::path_to_utf8(dash->opts.dest.value_or("")) == "E:\\Docs");
+    auto alone = parse_args(args({"-n", "--", "-grab-p9-none"}));
+    REQUIRE_MESSAGE(alone.has_value(), alone.error_or(""));
+    CHECK(alone->opts.target == "-grab-p9-none");
+    CHECK(alone->opts.dry_run);
+    // Options before it still count; after it, words are words.
+    auto words = parse_args(args({"-f", "--", "-v"}));
+    REQUIRE(words.has_value());
+    CHECK(words->opts.mode == Mode::folder);
+    CHECK(words->opts.target == "-v");
+    CHECK_FALSE(words->opts.verbose);
+    CHECK(parse_args(args({"--", "movie", "E:\\x"}))->opts.target == "movie");
+    // A dash word that would become DEST was most likely meant for grab 0.20's rclone: never a
+    // folder of that name (`grab movie -- --dry-run` would download for real).
+    for (const auto& list : {args({"movie", "--", "-x"}), args({"--", "movie", "-P"}), args({"--", "-a", "-b"})}) {
+        const auto refused = parse_args(list);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK_MESSAGE(refused.error().find("after -- would be DEST, the folder to save into: write .\\") != std::string::npos,
+                      refused.error());
+    }
+    CHECK(parse_args(args({"movie", "--", "--dry-run"})).error_or("").starts_with("--dry-run after -- is an option of grab's"));
+    CHECK(parse_args(args({"movie", "--", "-P"})).error_or("") ==
+          "-P after -- would be DEST, the folder to save into: write .\\-P for a folder of that name");
+    // A DEST given before it, or one that doesn't start with '-', is a DEST.
+    CHECK(parse_args(args({"movie", "--", "E:\\x"})).has_value());
+    CHECK(parse_args(args({"movie", "E:\\x", "--"})).has_value());
+    CHECK(parse_args(args({"movie", "--", ".\\-P"})).has_value());
 }
 
-TEST_CASE("--rclone is gone: a usage error naming engine = rclone (phase 8, decision 2)") {
+TEST_CASE("the flags grab 0.20 passed on to rclone after -- are refused with what to write instead (phase 9)") {
+    const auto error = [](std::initializer_list<const char*> list) { return parse_args(args(list)).error_or(""); };
+    CHECK(error({"movie", "--", "--bind", "10.0.0.2"}) ==
+          "--bind after -- is an option of grab's now: write --bind 10.0.0.2 before --");
+    CHECK(error({"--", "--bind=10.0.0.2", "movie"}) == "--bind after -- is an option of grab's now: write --bind 10.0.0.2 before --");
+    CHECK(error({"movie", "d", "--", "--timeout", "2m"}) == "--timeout after -- is an option of grab's now: write --timeout 2m before --");
+    CHECK(error({"movie", "--", "--contimeout"}) ==
+          "--contimeout after -- is an option of grab's now: write --contimeout TIME before --");
+    CHECK(error({"movie", "--", "--bind="}) == "--bind after -- is an option of grab's now: write --bind \"\" before --");
+    for (const char* flag : {"--sftp-chunk-size", "--sftp-socks-proxy", "--bwlimit", "--transfers", "--multi-thread-streams"}) {
+        CAPTURE(flag);
+        const auto refused = error({"movie", "d", "--", flag, "4"});
+        CHECK(refused == std::string(flag) + " after -- was a flag for rclone, which this grab doesn't have; leave it "
+                                             "out (after --, grab takes only TARGET and DEST)");
+    }
+    // Never quoted beyond its name: a proxy's password stays off the screen.
+    CHECK(error({"x", "--", "--sftp-socks-proxy=fake-user:fake-secret@127.0.0.1:9"}).find("fake-") == std::string::npos);
+    // Before `--`, rclone's flags are unknown options, as they always were.
+    CHECK(error({"movie", "--sftp-chunk-size", "1M"}) == "unknown option '--sftp-chunk-size'");
+    // `grab server`, config, update and --init too, which take none of them either way: their own
+    // refusal, never "write it before --".
+    CHECK(error({"server", "test", "Main", "--", "--bind", "10.0.0.2"}) ==
+          error({"server", "test", "Main", "--bind", "10.0.0.2"}));
+    CHECK(error({"server", "test", "Main", "--", "--bind", "10.0.0.2"}).starts_with("`grab server` takes no --bind"));
+    CHECK(error({"update", "--", "--timeout=2m"}) == "`grab update` takes no --bind, --contimeout or --timeout");
+    CHECK(error({"--init", "--", "--contimeout", "5s"}) == "`grab --init` takes no --bind, --contimeout or --timeout");
+}
+
+TEST_CASE("--bind, --contimeout and --timeout: this run's connection settings, checked before anything connects") {
+    using std::chrono::milliseconds;
+    auto r = parse_args(args({"movie", "d", "--bind", "10.8.0.2", "--contimeout=5s", "--timeout", "2m"}));
+    REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+    CHECK(r->opts.connect.bind == "10.8.0.2");
+    CHECK(r->opts.connect.connect_timeout == milliseconds(5'000));
+    CHECK(r->opts.connect.io_timeout == milliseconds(120'000));
+    const auto none = parse_args(args({"movie"}));
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->opts.connect.bind);
+    CHECK_FALSE(none->opts.connect.connect_timeout);
+    CHECK_FALSE(none->opts.connect.io_timeout);
+    // A blank --bind: no bind for this run, whatever the server's; --contimeout off: as long as TCP tries.
+    CHECK(parse_args(args({"movie", "--bind="}))->opts.connect.bind == "");
+    CHECK(parse_args(args({"movie", "--bind", ""}))->opts.connect.bind == "");
+    CHECK(parse_args(args({"movie", "--contimeout", "off"}))->opts.connect.connect_timeout == milliseconds(0));
+    CHECK(parse_args(args({"movie", "--timeout", "24h"}))->opts.connect.io_timeout == milliseconds(86'400'000));
+    const auto error = [](std::initializer_list<const char*> list) { return parse_args(args(list)).error_or(""); };
+    CHECK(error({"movie", "--bind", "-oProxyCommand=x"}) == "--bind -oProxyCommand=x: the address can't start with -");
+    CHECK(error({"movie", "--bind=10.0.0.2;x"}).starts_with("--bind 10.0.0.2;x: "));
+    CHECK(error({"movie", "--bind"}) == "option --bind requires a value");
+    CHECK(error({"movie", "--contimeout", "soon"}) == "--contimeout soon: not a time grab can read (such as 30s, 1m30s or off)");
+    // No limit would leave a stalled read that Cancel and Ctrl+C can't end.
+    for (const char* time : {"off", "0", "500ms", "25h", "abc"}) {
+        CHECK_MESSAGE(error({"movie", "--timeout", time}) ==
+                          std::format("--timeout {}: grab takes a time from 1s to 24h (such as 30s or 1m30s; with none, a "
+                                      "stalled download couldn't be cancelled)",
+                                      time),
+                      time);
+    }
+    // Only a download connects with them: elsewhere they are refused, not ignored.
+    CHECK(error({"server", "test", "Main", "--bind", "10.0.0.2"}) ==
+          "`grab server` takes no --bind, --contimeout or --timeout; a server's bind, connect_timeout and io_timeout are "
+          "set in its section (grab config)");
+    CHECK(error({"config", "--timeout", "1m"}) == "`grab config` takes no --bind, --contimeout or --timeout");
+    CHECK(error({"update", "--contimeout", "1m"}) == "`grab update` takes no --bind, --contimeout or --timeout");
+    CHECK(error({"--init", "--bind", "10.0.0.2"}) == "`grab --init` takes no --bind, --contimeout or --timeout");
+    CHECK(error({"config", "--", "x"}) == "`grab config` takes no TARGET/DEST arguments");
+    CHECK(error({"update", "--", "-x"}) == "`grab update` takes no TARGET/DEST arguments");
+}
+
+TEST_CASE("--first and --all don't go together (G117)") {
+    CHECK(parse_args(args({"movie", "--first", "--all"})).error_or("") ==
+          "--first and --all don't go together: --first takes the best match, --all every match");
+    CHECK(parse_args(args({"movie", "--first"})).has_value());
+    CHECK(parse_args(args({"movie", "--all"})).has_value());
+}
+
+TEST_CASE("--rclone is gone, and so is rclone") {
     auto bare = parse_args(args({"movie.mkv", "d", "--rclone"}));
     REQUIRE_FALSE(bare.has_value());
-    CHECK(bare.error() == "--rclone is gone: grab no longer runs a plain rclone copy. To download from a server through "
-                          "rclone until a later grab removes it, set engine = rclone in its section (grab config)");
-    // The server's section when -r names it, before or after.
-    auto named = parse_args(args({"--rclone", "-f", "x", "d", "-r", "Box.Guest"}));
-    REQUIRE_FALSE(named.has_value());
-    CHECK(named.error().find("set engine = rclone in [Box.Guest] (grab config)") != std::string::npos);
+    CHECK(bare.error() == "--rclone is gone: this grab has no rclone; it downloads with its own SSH client");
+    CHECK(parse_args(args({"--rclone", "-f", "x", "d", "-r", "Box.Guest"})).error_or("") == bare.error());
     CHECK_FALSE(parse_args(args({"movie.mkv", "--rclone=1"})).has_value());
-    // After --, it is one of the flags run() checks.
-    auto after = parse_args(args({"movie.mkv", "d", "--", "--rclone"}));
-    REQUIRE(after.has_value());
-    CHECK(after->opts.extra == std::vector<std::string>{"--rclone"});
     CHECK(usage().find("--rclone") == std::string::npos);
+    CHECK(usage().find("rclone (") == std::string::npos);
+    CHECK(usage().find("engine") == std::string::npos);
+    CHECK(usage().find("GRAB_ENGINE") == std::string::npos);
+    CHECK(usage().find("FLAGS") == std::string::npos);
 }
 
 TEST_CASE("a switch refuses a value: --verify=false no longer turns verification on (G108)") {
@@ -119,13 +215,8 @@ TEST_CASE("grab server: list, add [NAME], and edit, test, trust and remove with 
     CHECK(usage().find("grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]") !=
           std::string::npos);
     CHECK(usage().find("rclone.conf with") == std::string::npos);
-    // Flags after -- reach only a download: elsewhere they are refused, not ignored.
-    CHECK(parse_args(args({"server", "test", "Main", "--", "--bind", "10.0.0.2"})).error_or("") ==
-          "`grab server` takes no flags after --; a server's bind, connect_timeout and io_timeout are set in its "
-          "section (grab config)");
-    CHECK(parse_args(args({"config", "--", "-x"})).error_or("") == "`grab config` takes no flags after --");
-    CHECK(parse_args(args({"update", "--", "-x"})).error_or("") == "`grab update` takes no flags after --");
-    CHECK(parse_args(args({"--init", "--", "-x"})).error_or("") == "`grab --init` takes no flags after --");
+    // After `--`, a server's NAME too.
+    CHECK(parse_args(args({"server", "test", "--", "-odd"}))->opts.server_args == std::vector<std::string>{"test", "-odd"});
 }
 
 TEST_CASE("mode defaults to file and the two mode flags are exclusive") {
@@ -329,7 +420,7 @@ std::string_view help_options(const std::string& help) {
 }
 } // namespace
 
-TEST_CASE("docs/doc.md's Usage block names the options the help names, --rclone no longer (phase 8 step 11)") {
+TEST_CASE("docs/doc.md's Usage block names the options the help names, `--` and the connection options (phase 9)") {
     const std::string doc = source_file("docs/doc.md");
     const auto start = doc.find("\n## Usage\n\n```\n");
     REQUIRE(start != std::string::npos);
@@ -341,6 +432,9 @@ TEST_CASE("docs/doc.md's Usage block names the options the help names, --rclone 
     const std::string help = usage();
     const auto helped = option_names(help_options(help));
     CHECK(helped.contains("--"));
+    CHECK(helped.contains("--bind"));
+    CHECK(helped.contains("--contimeout"));
+    CHECK(helped.contains("--timeout"));
     CHECK_FALSE(helped.contains("--rclone"));
     // The doc's block leaves out what its first line and the commands show.
     for (const auto& name : helped) {

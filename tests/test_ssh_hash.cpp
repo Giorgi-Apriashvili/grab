@@ -968,6 +968,7 @@ TEST_CASE("ssh hash: live, odd names hashed on the server equal local MD5 and rc
                                         "--checkers", "1", "--sftp-connections", "1"};
     proc::RunOptions ro;
     ro.detached = true;
+    ro.environment.without_prefix = {"RCLONE_"}; // none of the user's own rclone settings
     const auto ran = proc::run_capture(argv, ro);
     REQUIRE_MESSAGE(ran, ran.error_or(""));
     MESSAGE("rclone exit " << ran->exit_code << (ran->err.empty() ? "" : "; stderr: " + ran->err.substr(0, 2000)));

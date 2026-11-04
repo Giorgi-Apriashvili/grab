@@ -3,6 +3,7 @@
 #include "existing.hpp"
 #include "file_type.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -14,6 +15,14 @@
 namespace grab {
 
 enum class Mode { file, folder };
+
+// A run's own connection settings (--bind, --contimeout, --timeout), which win over the server's
+// bind, connect_timeout and io_timeout (engine::connect_settings).
+struct ConnectOptions {
+    std::optional<std::string> bind; // "": no bind for this run, whatever the server's
+    std::optional<std::chrono::milliseconds> connect_timeout; // 0: off
+    std::optional<std::chrono::milliseconds> io_timeout;      // 1 s to 24 h
+};
 
 struct Options {
     Mode mode = Mode::file;
@@ -35,9 +44,7 @@ struct Options {
     bool dry_run = false;
     bool verbose = false;
     bool check = false;              // `grab update --check`
-    // Everything after "--": connection flags for this run, checked per engine once the server is
-    // known (engine::check_run_flags).
-    std::vector<std::string> extra;
+    ConnectOptions connect;          // --bind, --contimeout, --timeout
     std::vector<std::string> server_args; // `grab server SUBCOMMAND [NAME]`
 };
 
@@ -48,7 +55,9 @@ struct CliResult {
     Options opts;
 };
 
-// `args` excludes the program name.
+// `args` excludes the program name. `--` ends the options: what follows is TARGET and DEST even
+// when it starts with '-' (G117), except a word there that would become DEST, or one of the flags
+// grab 0.20 passed on to rclone after `--`, which is refused with what to write instead.
 [[nodiscard]] std::expected<CliResult, std::string> parse_args(std::span<const std::string> args);
 
 [[nodiscard]] std::string usage();

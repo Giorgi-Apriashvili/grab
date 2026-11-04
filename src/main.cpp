@@ -13,7 +13,6 @@
 #include "notices.hpp"
 #include "process.hpp"
 #include "quote.hpp"
-#include "rclone_flags.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "server_cli.hpp"
@@ -160,6 +159,12 @@ int do_init(const std::filesystem::path& path) {
     }
     if (applied) {
         for (const auto& note : applied->notes) std::println("  note: [{}] {}", note.server, note.text);
+        // grab's own old files deleted (or not): recorded, the note is a notice, said here with
+        // the configuration's others so that it isn't said again.
+        if (!applied->old_files.empty() && !applied->old_files_recorded) std::println("  note: {}", applied->old_files);
+        if (applied->old_files_recorded) {
+            for (const auto& n : notices::take_fresh(path)) std::println("  note: {}", n.text);
+        }
     }
     std::println("ready: grab NAME [DEST]   (search_roots is blank = login home; narrow it with "
                  "`grab config`)");
@@ -225,8 +230,9 @@ std::string age_text(std::int64_t seconds) {
 // lookup_text.
 std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ctx, const Options& opts,
                                                        ssh::Pools& pools, std::string said) {
-    // The connection flags after `--` too, as the download's target takes them: one pool for both.
-    auto target = engine::ssh_target(ctx, rclone_flags::connection(opts.extra));
+    // The command's --bind, --contimeout and --timeout too, as the download's target takes them:
+    // one pool for both.
+    auto target = engine::ssh_target(ctx, opts.connect);
     if (!target) return util::fail(target.error());
     // The download's budget, as download_with_grab counts it (limits.json: what refusals taught).
     const auto limits_file = learned_limits_path(opts.config.value_or(default_grab_config_path()));
@@ -303,8 +309,7 @@ int run(const Options& opts) {
         return exit_config;
     }
     if (!ctx->imported.empty()) {
-        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time; rclone.conf "
-                             "unchanged)",
+        std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time)",
                      util::join(ctx->imported, ", "), util::path_to_utf8(cfg_path));
     }
     for (const auto& note : ctx->import_notes) std::println(stderr, "grab: note: {}", note);
@@ -322,11 +327,11 @@ int run(const Options& opts) {
             }
         }
     }
-    // The flags after `--`: refused before anything connects or any folder is made
-    // (RCLONE-REPLACEMENT.md, phase 8 step 6).
-    if (auto usable = engine::check_run_flags(*ctx, opts.extra); !usable) {
-        error(usable.error());
-        return exit_usage;
+    // A bind left in an old key is refused before anything connects or any folder is made
+    // (RCLONE-REPLACEMENT.md, phase 9 step 7).
+    if (auto reach = engine::connect_settings(ctx->settings, opts.connect); !reach) {
+        error(reach.error());
+        return exit_config;
     }
 
     // destination: a given DEST is checked before the search so a typo fails fast; a missing

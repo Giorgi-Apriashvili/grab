@@ -9,8 +9,11 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <format>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <utility>
 
 namespace grab {
@@ -27,16 +30,11 @@ const std::string_view example_config = R"(# grab.conf - settings for the `grab`
 # with `grab server add`, change them with `grab server edit NAME` (or grab's Settings).
 
 [grab]
-# rclone executable, for servers with engine = rclone. Blank = the rclone.exe bundled with
-# grab (else rclone on PATH); a full path uses that one instead.
-rclone =
 # The rclone.conf grab 0.19 and before kept servers in: a section without `host` takes its
-# details from the remote there once (grab only reads it, never writes it). Blank = grab's
-# own (%APPDATA%\grab\rclone.conf), then rclone's standard one.
+# details from the remote there once (grab only reads it). Blank = grab's own
+# (%APPDATA%\grab\rclone.conf, deleted once all its servers are here), then rclone's
+# standard one.
 rclone_config =
-# ssh executable for the searches of servers with engine = rclone (ssh + find). Blank = `ssh`
-# on PATH (Windows OpenSSH).
-ssh = ssh
 # Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.
 editor =
 # Remote section to use when -r/--remote is not given. Optional when only one remote exists.
@@ -54,21 +52,16 @@ user = alice
 # grab's store with its passphrase).
 auth = key
 key_file = C:\Users\alice\.ssh\id_ed25519
-# What the server told grab's Test, which Verify (and rclone, on engine = rclone) go by instead
-# of asking again: its shell (unix, cmd, powershell, none) and its checksum commands. Left out =
-# not known yet.
+# What the server told grab's Test, which Verify goes by instead of asking again: its shell
+# (unix, cmd, powershell, none) and its checksum commands. Left out = not known yet.
 # shell_type = unix
 # md5sum_command = md5sum
-# A non-secret rclone sftp setting for this server's rclone runs (engine = rclone), e.g.
-# rclone.ciphers = aes256-ctr
 # The rclone remote grab 0.19 and before used for this server (default: this section's name).
 # Kept in sections imported from rclone.conf: their partial downloads and 0.19 go by it.
 # rclone_remote = hetzner
 # How TARGET is located: auto = find where grab's check finds GNU find on the server, else by
 # listing folders (Storage Boxes always); ssh = find only; walk = by listing folders (grab 0.19
 # and before refuse walk: write rclone, which means the same, while one of them reads this file).
-# With engine = rclone: auto = ssh + find when the server logs in with a key file or ssh-agent,
-# else rclone's listing; ssh = ssh + find; walk or rclone = rclone's listing.
 find = auto
 # Comma-separated directories to search: absolute (/srv) or relative to the login home
 # (learning). Blank or . = the home directory itself.
@@ -83,17 +76,11 @@ max_connections =
 skip_hidden = true
 # How every connection to this server is made: the local address to connect from (blank =
 # any), the time to reach the server (blank = 30s; off = as long as TCP tries) and the longest
-# wait for it after that (blank = 30s; 1s to 24h). A run's -- --bind, --contimeout and
-# --timeout win over them.
+# wait for it after that (blank = 30s; 1s to 24h). A run's --bind, --contimeout and --timeout
+# win over them.
 # bind = 192.0.2.10
 # connect_timeout = 30s
 # io_timeout = 30s
-# What downloads from, searches and lists this server: grab's own SSH client (the default), or
-# rclone, the fallback until a later grab removes it. A server whose rclone settings grab's
-# client can't serve (a proxy, an ssh command) stays on rclone by itself and says why. A server
-# on rclone also takes rclone's flags in common_flags and folder_flags, and ssh.exe's in
-# ssh_options (docs/doc.md: Configure).
-# engine = rclone
 )";
 
 namespace {
@@ -191,14 +178,54 @@ GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemot
     return budget::is_storage_box(remote.host) ? GrabMethod::walk : GrabMethod::probe;
 }
 
-Engine effective_engine(const RemoteSettings& settings, bool guarded) {
-    if (auto env = util::getenv_utf8("GRAB_ENGINE")) {
-        const std::string e = util::to_lower(util::trim(*env));
-        if (e == "grab") return Engine::grab;
-        if (e == "rclone") return Engine::rclone;
+namespace {
+
+// rclone's --bind in `flags` as pflag read it, the last one ("--bind=VALUE", "--bind VALUE"):
+// nullopt when there is none; its value, or nullopt for one with no value after it.
+std::optional<std::optional<std::string>> flag_bind(std::span<const std::string> flags) {
+    std::optional<std::optional<std::string>> out;
+    for (std::size_t i = 0; i < flags.size(); ++i) {
+        const std::string& f = flags[i];
+        if (f.starts_with("--bind=")) {
+            out.emplace(f.substr(std::string_view("--bind=").size()));
+        } else if (f == "--bind") {
+            out.emplace(i + 1 < flags.size() && !flags[i + 1].starts_with('-') ? std::optional(flags[++i]) : std::nullopt);
+        }
     }
-    if (settings.engine) return *settings.engine;
-    return guarded ? Engine::rclone : Engine::grab;
+    return out;
+}
+
+// ssh.exe's bind in `options` as OpenSSH read it: the first -o BindAddress or -b, its value trimmed.
+std::optional<OldBind> option_bind(std::span<const std::string> options) {
+    for (std::size_t i = 0; i < options.size(); ++i) {
+        const std::string_view arg = options[i];
+        if (arg.size() < 2 || arg[0] != '-' || (arg[1] != 'o' && arg[1] != 'b')) continue;
+        const std::string_view value = arg.size() > 2 ? arg.substr(2)
+                                       : i + 1 < options.size() ? std::string_view(options[++i])
+                                                                : std::string_view();
+        if (arg[1] == 'b') return OldBind{.key = "ssh_options", .flag = "-b", .value = std::string(util::trim(value))};
+        // "Keyword=value" or "Keyword value"; keywords ignore case.
+        const auto sep = value.find_first_of("= \t");
+        if (util::to_lower(util::trim(value.substr(0, sep))) != "bindaddress") continue;
+        std::string_view v = sep == std::string_view::npos ? std::string_view() : util::trim(value.substr(sep + 1));
+        if (v.starts_with('=')) v = util::trim(v.substr(1));
+        return OldBind{.key = "ssh_options", .flag = "-o BindAddress", .value = std::string(v)};
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<OldBind> old_bind(const RemoteSettings& settings) {
+    for (const auto& [key, flags] :
+         {std::pair{"common_flags", &settings.common_flags}, std::pair{"folder_flags", &settings.folder_flags}}) {
+        const auto bind = flag_bind(*flags);
+        if (!bind) continue;
+        if (*bind && util::trim(**bind).empty()) continue; // "--bind=": no bind
+        return OldBind{.key = key, .flag = "--bind", .value = std::string(util::trim(bind->value_or("")))};
+    }
+    if (auto bind = option_bind(settings.ssh_options); bind && !bind->value.empty()) return bind;
+    return std::nullopt;
 }
 
 std::filesystem::path default_grab_config_path() {
@@ -295,9 +322,9 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
     GrabConfig cfg;
 
     if (const auto* g = doc.find("grab")) {
-        if (auto v = nonblank(*g, "rclone")) cfg.rclone = *v;
+        cfg.rclone = nonblank(*g, "rclone").value_or("");
         if (auto v = nonblank(*g, "rclone_config")) cfg.rclone_config = util::path_from_utf8(*v);
-        if (auto v = nonblank(*g, "ssh")) cfg.ssh = *v;
+        cfg.ssh = nonblank(*g, "ssh").value_or("");
         if (auto v = nonblank(*g, "editor")) cfg.editor = *v;
         if (auto v = nonblank(*g, "default_remote")) cfg.default_remote = *v;
     }
@@ -325,7 +352,7 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
             } else if (method == "ssh") {
                 r.find = FindMethod::ssh;
             } else if (method == "rclone" || method == "walk") {
-                r.find = FindMethod::rclone; // `walk` says it plainly on engine = grab
+                r.find = FindMethod::rclone; // `walk` says it plainly; 0.19 knows only `rclone`
             } else {
                 return util::failf("[{}] find must be auto, ssh, rclone or walk, got '{}'", s.name, *v);
             }
@@ -345,6 +372,8 @@ std::expected<GrabConfig, std::string> parse_grab_config(const ini::Document& do
         auto hidden = bool_value(s, "skip_hidden", true);
         if (!hidden) return util::fail(hidden.error());
         r.skip_hidden = *hidden;
+        // 0.20's `engine`, read for a notice only; a value 0.20 would refuse still fails the load,
+        // so a file this grab takes still runs 0.20.1 (the way back).
         if (auto v = nonblank(s, "engine")) {
             const std::string engine = util::to_lower(*v);
             if (engine == "rclone") r.engine = Engine::rclone;
@@ -540,9 +569,6 @@ std::string remote_section(const RcloneRemote& remote, const std::vector<std::st
     s += "# bind = 192.0.2.10\n";
     s += "# connect_timeout = 30s\n";
     s += "# io_timeout = 30s\n";
-    s += "# grab's own SSH client downloads, searches and lists (the default); rclone does for\n";
-    s += "# engine = rclone, the fallback until a later grab removes it.\n";
-    s += "# engine = rclone\n";
     return s;
 }
 
@@ -568,14 +594,9 @@ std::string generate_grab_config(const ini::Document* rclone, std::string_view r
                            util::join(skipped, ", "));
     }
     out += "\n[grab]\n";
-    out += "# rclone executable, for servers with engine = rclone. Blank = the rclone.exe bundled with\n"
-           "# grab (else rclone on PATH).\n";
-    out += "rclone =\n";
     out += "# The rclone.conf whose remote a section without `host` takes its details from, once (grab\n"
            "# only reads it). Blank = grab's own (%APPDATA%\\grab\\rclone.conf), then rclone's.\n";
     out += "rclone_config =\n";
-    out += "# ssh executable for the searches of servers with engine = rclone (ssh + find).\n";
-    out += "ssh = ssh\n";
     out += "# Editor for `grab config`, e.g.  code --wait   Blank = $VISUAL, then $EDITOR, then notepad.\n";
     out += "editor =\n";
     out += "# Remote used when -r/--remote is not given.\n";

@@ -7,7 +7,6 @@
 #include "engine.hpp"
 #include "file_list.hpp"
 #include "folder.hpp"
-#include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "listing.hpp"
@@ -170,6 +169,8 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
         std::vector<std::string> notes;
         if (applied) {
             for (const auto& note : applied->notes) notes.push_back(std::format("[{}] {}", note.server, note.text));
+            // Recorded, the note on grab's own old files comes with the notices below.
+            if (!applied->old_files.empty() && !applied->old_files_recorded) notes.push_back(applied->old_files);
         }
         // The names leave imported.json only once the notice can be made (a grab.conf load_env
         // refuses keeps them for a later window).
@@ -1767,7 +1768,24 @@ void App::settings_error(const std::string& message) const {
 }
 
 std::expected<server_ops::Env, std::string> App::load_env() const {
-    return server_ops::load_env(config_path_);
+    auto env = server_ops::load_env(config_path_);
+    // grab's own old rclone.conf and 'secrets', deleted by this load once nothing in them was
+    // left to move (an Edit that saved the last password, say): said once, where the import's
+    // notice goes, with the configuration's other notices not shown yet when it is recorded as one.
+    // The start's import says it in its own notice.
+    if (env && !env->old_files.empty()) {
+        std::string text = env->old_files_recorded ? std::string() : env->old_files;
+        if (env->old_files_recorded) {
+            for (const auto& n : notices::take_fresh(config_path_)) text += (text.empty() ? "" : "\n") + n.text;
+        }
+        if (!text.empty()) {
+            Value v = Value::make_object();
+            v.set("type", str("importBanner"));
+            v.set("text", str(text));
+            post(v);
+        }
+    }
+    return env;
 }
 
 void App::post_servers(const server_ops::Env& env) const {
@@ -1798,8 +1816,9 @@ void App::post_servers(const server_ops::Env& env) const {
         v.set("keyFile", str(s.key_file));
         v.set("search", str(s.search)); // search_method(): find, walk, probe
         v.set("pinned", Value::make_bool(s.host_key_pinned));
-        // Why grab doesn't connect to it at all (Trust included), when it doesn't.
-        v.set("guard", str(s.guard.empty() ? std::string() : guard::text(s.name, s.guard)));
+        // Why grab doesn't connect to it at all (Trust included), when it doesn't: the guard's
+        // reason, or a bind left in an old key.
+        v.set("guard", str(s.unusable));
         v.set("connectionKeys", str(s.connection_keys)); // grab.conf's bind and times, when set
         // Whether its password (passphrase, stored key) is saved for this login; null for ssh-agent
         // or a store that can't be read. Never the value.

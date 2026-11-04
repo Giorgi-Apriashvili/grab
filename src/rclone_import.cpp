@@ -459,6 +459,7 @@ std::string to_json(const Record& record) {
     auto banner = json::Value::make_array();
     for (const auto& name : record.banner) banner.push(json::Value::make_string(name));
     root.set("banner", std::move(banner));
+    if (!record.old_files.empty()) root.set("old_files", json::Value::make_string(record.old_files));
     return json::stringify(root) + "\n";
 }
 
@@ -493,6 +494,7 @@ std::optional<Record> from_json(std::string_view text) {
             if (v.kind == json::Value::Kind::string) r.banner.push_back(v.str);
         }
     }
+    r.old_files = doc->string_of("old_files").value_or("");
     return r;
 }
 
@@ -773,43 +775,279 @@ std::expected<Inputs, std::string> read_inputs(const Files& files) {
 std::expected<Result, std::string> apply(const Files& files) {
     auto wait = waiting(files);
     if (!wait) return util::fail(wait.error());
-    if (!*wait) return Result{};
-    // From the files as they are under the lock: another grab may have imported them meanwhile.
-    auto lock = lock_settings();
-    if (!lock) return util::fail(lock.error());
-    auto in = read_inputs(files);
-    if (!in) return util::fail(in.error());
-    auto p = plan(*in);
-    if (!p) return util::fail(p.error());
-    Result result{.imported = std::move(p->imported), .failed = std::move(p->failed), .notes = std::move(p->notes)};
-    const auto stopped = [](std::string_view what, const std::string& why) {
-        return util::failf("moving servers from rclone.conf into grab.conf stopped ({}: {}); grab tries again next time",
-                           what, why);
-    };
-    if (p->store != in->store) {
-        if (auto saved = passwords::save(passwords::path_in(files.state_dir), p->store); !saved) {
-            return stopped("the saved passwords", saved.error());
+    Result result;
+    if (*wait) {
+        // From the files as they are under the lock: another grab may have imported them meanwhile.
+        auto lock = lock_settings();
+        if (!lock) return util::fail(lock.error());
+        auto in = read_inputs(files);
+        if (!in) return util::fail(in.error());
+        auto p = plan(*in);
+        if (!p) return util::fail(p.error());
+        result = Result{.imported = std::move(p->imported), .failed = std::move(p->failed), .notes = std::move(p->notes),
+                        .old_files = {}};
+        const auto stopped = [](std::string_view what, const std::string& why) {
+            return util::failf("moving servers from rclone.conf into grab.conf stopped ({}: {}); grab tries again next "
+                               "time",
+                               what, why);
+        };
+        if (p->store != in->store) {
+            if (auto saved = passwords::save(passwords::path_in(files.state_dir), p->store); !saved) {
+                return stopped("the saved passwords", saved.error());
+            }
         }
-    }
-    if (!p->host_key_lines.empty()) {
-        const auto merged = servers::merge_known_hosts(in->known_hosts_text, p->host_key_lines);
-        if (merged != in->known_hosts_text) {
-            if (auto written = util::write_file_atomic(files.known_hosts, merged); !written) {
-                return stopped("known_hosts", written.error());
+        if (!p->host_key_lines.empty()) {
+            const auto merged = servers::merge_known_hosts(in->known_hosts_text, p->host_key_lines);
+            if (merged != in->known_hosts_text) {
+                if (auto written = util::write_file_atomic(files.known_hosts, merged); !written) {
+                    return stopped("known_hosts", written.error());
+                }
+            }
+        }
+        if (p->grab_text != in->grab_text) {
+            if (auto written = util::write_file_atomic(files.grab_conf, p->grab_text); !written) {
+                return stopped("grab.conf", written.error());
+            }
+        }
+        if (p->record != in->record) {
+            if (auto written = util::write_file_atomic(record_path(files.state_dir), to_json(p->record)); !written) {
+                return stopped("imported.json", written.error());
             }
         }
     }
-    if (p->grab_text != in->grab_text) {
-        if (auto written = util::write_file_atomic(files.grab_conf, p->grab_text); !written) {
-            return stopped("grab.conf", written.error());
-        }
-    }
-    if (p->record != in->record) {
-        if (auto written = util::write_file_atomic(record_path(files.state_dir), to_json(p->record)); !written) {
-            return stopped("imported.json", written.error());
-        }
+    if (auto removed = remove_old_files(files)) {
+        result.old_files = std::move(removed->note);
+        result.old_files_recorded = removed->recorded;
     }
     return result;
+}
+
+// ---- grab's own old files -----------------------------------------------------------------------
+
+Source read_old(const fs::path& file) {
+    Source s = read_source(file);
+    if (!s.text && s.error.empty()) s.store = secrets::load(secrets::path_beside(file));
+    return s;
+}
+
+OldFiles judge_old_files(const Inputs& in, Source own, bool standard) {
+    OldFiles out;
+    const auto doc = ini::parse(in.grab_text);
+    if (!doc) {
+        out.kept.push_back(std::format("grab.conf can't be read ({})", doc.error()));
+        return out;
+    }
+    const auto cfg = parse_grab_config(*doc);
+    if (!cfg) {
+        out.kept.push_back(std::format("grab.conf can't be read ({})", cfg.error()));
+        return out;
+    }
+    // Any doubt keeps them: whatever can't be read, and files something else may still read.
+    if (cfg->rclone_config) {
+        out.kept.emplace_back(same_file(*cfg->rclone_config, own.file)
+                                  ? "[grab] rclone_config names it"
+                                  : "[grab] rclone_config is set, so the import reads that rclone.conf instead");
+    } else if (standard) {
+        out.kept.emplace_back("rclone reads that rclone.conf too (RCLONE_CONFIG names it)");
+    } else if (!own.error.empty()) {
+        out.kept.push_back(std::format("rclone.conf can't be read ({})", own.error));
+    } else if (!own.store) {
+        out.kept.push_back(own.store.error());
+    }
+    if (!out.kept.empty()) return out;
+    std::vector<std::string> remotes;
+    if (own.text) {
+        if (is_encrypted_rclone_config(*own.text)) {
+            out.kept.emplace_back("rclone.conf is encrypted, and grab can't read an encrypted rclone.conf");
+            return out;
+        }
+        const auto parsed = rclone_conf::parse(*own.text);
+        if (!parsed) {
+            out.kept.push_back(std::format("rclone can't read rclone.conf ({})", parsed.error()));
+            return out;
+        }
+        for (const auto& s : parsed->sections) {
+            if (s.name != rclone_conf::default_section) remotes.push_back(s.name);
+        }
+    }
+
+    // Each remote imported: as the grab.conf section that names it, else as a server of its name
+    // removed since (imported.json keeps every name it imported, but names only: a section of that
+    // name that comes from another remote leaves this one never imported).
+    struct Moved {
+        std::string server;
+        std::string remote;
+        bool removed = false; // a server of its name removed since
+    };
+    std::vector<Moved> moved;
+    for (const auto& remote : remotes) {
+        const auto server = [&](const ini::Section& s) { return !s.name.empty() && s.name != "grab"; };
+        const auto section = std::ranges::find_if(doc->sections, [&](const ini::Section& s) {
+            return server(s) && nonblank(s, "rclone_remote").value_or(s.name) == remote;
+        });
+        const auto* named = doc->find(remote);
+        if (section != doc->sections.end()) {
+            if (in.record.imported.contains(section->name)) {
+                moved.push_back(Moved{.server = section->name, .remote = remote, .removed = false});
+            } else {
+                out.kept.push_back(std::format("[{}] isn't imported", section->name));
+            }
+        } else if (named != nullptr && server(*named)) {
+            out.kept.push_back(std::format("rclone.conf's [{}] isn't imported (grab.conf's [{}] comes from [{}])", remote,
+                                           remote, nonblank(*named, "rclone_remote").value_or(remote)));
+        } else if (in.record.imported.contains(remote)) {
+            moved.push_back(Moved{.server = remote, .remote = remote, .removed = true});
+        } else {
+            out.kept.push_back(std::format("[{}] isn't a server in grab.conf", remote));
+        }
+    }
+    for (const auto& [remote, values] : *own.store) {
+        const bool any = std::ranges::any_of(values, [](const auto& kv) { return !util::trim(kv.second).empty(); });
+        if (any && !std::ranges::contains(remotes, remote)) {
+            out.kept.push_back(std::format("'secrets' keeps [{}]'s, which rclone.conf doesn't name", remote));
+        }
+    }
+
+    // What the import takes from them for each one moved, grab's store has: a password,
+    // passphrase or key it holds (whatever its value: Edit may have changed it since) is never lost.
+    if (!moved.empty()) {
+        Inputs one;
+        one.sources.push_back(std::move(own));
+        one.known_hosts = in.known_hosts;
+        one.getenv = in.getenv;
+        Importer importer(one);
+        for (const auto& m : moved) {
+            const ini::Section section{.name = m.server, .values = {{"rclone_remote", m.remote}}};
+            auto outcome = importer.run(section, in.known_hosts_text);
+            if (!outcome) {
+                out.kept.push_back(std::format("[{}] can't be read from rclone.conf again ({})", m.server, outcome.error()));
+                continue;
+            }
+            const auto held = in.store.find(m.server);
+            bool removed_named = false; // a removed server is named once, whatever it lacks
+            for (auto& [key, secret] : outcome->secrets) {
+                const bool taken = key == passwords::password || key == passwords::passphrase || key == passwords::key_pem;
+                if (taken && (held == in.store.end() || !held->second.contains(key))) {
+                    if (!m.removed) {
+                        out.kept.push_back(std::format("[{}]'s {} isn't in grab's store", m.server,
+                                                       key == passwords::password     ? "password"
+                                                       : key == passwords::passphrase ? "key passphrase"
+                                                                                      : "key"));
+                    } else if (!removed_named) {
+                        out.kept.push_back(std::format("[{}] was removed from grab with its {}", m.server,
+                                                       key == passwords::password ? "password" : "key"));
+                        out.removed.push_back(m.server);
+                        removed_named = true;
+                    }
+                }
+                std::ranges::fill(secret.value, '\0');
+            }
+        }
+    }
+    out.remove = out.kept.empty();
+    return out;
+}
+
+namespace {
+
+// grab's own old files of the configuration at `grab_conf`, when it is the default one (theirs)
+// and one of them is there.
+std::optional<std::pair<fs::path, fs::path>> old_files_of(const fs::path& grab_conf) {
+    if (config_folder_name(grab_conf)) return std::nullopt;
+    auto conf = grab_rclone_config_path();
+    auto store = secrets::path_beside(conf);
+    std::error_code ec;
+    if (!fs::exists(conf, ec) && !fs::exists(store, ec)) return std::nullopt;
+    return std::pair{std::move(conf), std::move(store)};
+}
+
+// The old files there, as the notes name them: "rclone.conf and 'secrets'" (`them`), or one
+// (`it`).
+struct Named {
+    std::string_view names;
+    std::string_view them;
+};
+Named names_of(bool conf, bool store) {
+    if (conf && store) return Named{.names = "rclone.conf and 'secrets'", .them = "them"};
+    return Named{.names = conf ? "rclone.conf" : "'secrets'", .them = "it"};
+}
+
+// The verdict on the old files of `files` (`conf` and the store beside it) as they are now.
+OldFiles judged(const Files& files, const fs::path& conf) {
+    auto in = read_inputs(files);
+    if (!in) return OldFiles{.remove = false, .kept = {in.error()}, .removed = {}};
+    // rclone's own rclone.conf, however RCLONE_CONFIG spells it (a short 8.3 name, another case).
+    const auto standard = standard_rclone_config_path();
+    std::error_code ec;
+    const bool same = same_file(conf, standard) || (fs::equivalent(conf, standard, ec) && !ec);
+    return judge_old_files(*in, read_old(conf), same);
+}
+
+} // namespace
+
+std::optional<Removed> remove_old_files(const Files& files) {
+    const auto old = old_files_of(files.grab_conf);
+    if (!old) return std::nullopt; // on almost every run: gone already
+    const auto& [conf, store] = *old;
+    // As they are under the lock: another grab may have deleted them meanwhile.
+    auto lock = lock_settings();
+    if (!lock) return std::nullopt; // tried again next time
+    std::error_code ec;
+    const bool conf_there = fs::exists(conf, ec);
+    const bool store_there = fs::exists(store, ec);
+    if (!conf_there && !store_there) return std::nullopt;
+    if (!judged(files, conf).remove) return std::nullopt; // old_files_kept says why
+    // 'secrets' first, and rclone.conf only once it is gone: a 'secrets' left alone would be kept
+    // for good (it would name remotes no rclone.conf names), while an rclone.conf left alone goes
+    // next time.
+    std::string failed;
+    bool store_left = false;
+    for (const auto& file : {store, conf}) {
+        if (!fs::remove(file, ec) && ec) {
+            failed = std::format("{} ({})", util::path_to_utf8(file), ec.message());
+            store_left = file == store;
+            break;
+        }
+    }
+    const std::string folder = util::path_to_utf8(conf.parent_path());
+    Removed out;
+    if (!failed.empty()) {
+        out.note = std::format("grab's old {} in {} couldn't be deleted: {}; grab tries again next time",
+                               names_of(conf_there, store_there && store_left).names, folder, failed);
+    } else {
+        const auto named = names_of(conf_there, store_there);
+        out.note = std::format("grab deleted its old {} in {}: every server in {} is in grab.conf now, with its passwords "
+                               "in grab's own store. Going back to grab 0.19 now means adding the servers and their "
+                               "passwords there again.",
+                               named.names, folder, named.them);
+    }
+    // Recorded under the same lock, so it shows once even when this run fails before saying it.
+    if (auto record = read_record(files.state_dir); record) {
+        Record r = record->value_or(Record{});
+        r.old_files = out.note;
+        out.recorded = util::write_file_atomic(record_path(files.state_dir), to_json(r)).has_value();
+    }
+    return out;
+}
+
+std::optional<std::string> old_files_kept(const fs::path& grab_conf) {
+    const auto old = old_files_of(grab_conf);
+    if (!old) return std::nullopt;
+    const auto& [conf, store] = *old;
+    const auto verdict = judged(files_for(grab_conf), conf);
+    if (verdict.remove) return std::nullopt; // the next run deletes them
+    std::error_code ec;
+    const auto named = names_of(fs::exists(conf, ec), fs::exists(store, ec));
+    const std::string folder = util::path_to_utf8(conf.parent_path());
+    // Only servers removed with their password keep them: nothing grab does clears that.
+    if (verdict.kept.size() == verdict.removed.size()) {
+        return std::format("grab keeps its old {} in {}: {}. Only going back to grab 0.19 needs {}: delete {} by hand if "
+                           "you don't need that.",
+                           named.names, folder, util::join(verdict.kept, "; "), named.them, named.them);
+    }
+    return std::format("grab keeps its old {} in {} for now: {}. It deletes {} once everything in {} is in grab.conf and "
+                       "grab's own store (only going back to grab 0.19 needs {}).",
+                       named.names, folder, util::join(verdict.kept, "; "), named.them, named.them, named.them);
 }
 
 bool banner_waiting(const fs::path& state_dir) {

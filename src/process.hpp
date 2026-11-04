@@ -19,14 +19,14 @@ namespace grab::proc {
 inline constexpr int exit_stopped = 130;
 
 // What a child's environment gets beyond the one it inherits (the tests' rclone runs, which
-// compare grab with rclone 1.75.1, give it a server's RCLONE_CONFIG_<NAME>_* this way). Names are
-// compared as the system compares them: ignoring case on Windows (CompareStringOrdinal), exactly
-// elsewhere.
+// compare grab with rclone 1.75.1, give it a server's RCLONE_CONFIG_<NAME>_* this way, and leave
+// out the user's own RCLONE_*). Names are compared as the system compares them: ignoring case on
+// Windows (CompareStringOrdinal), exactly elsewhere.
 struct Environment {
     // UTF-8 names and values, each replacing an inherited variable of the same name.
     std::vector<std::pair<std::string, std::string>> set;
-    // Inherited variables whose names start with one of these are left out (a remote's
-    // RCLONE_CONFIG_<NAME>_ that the user's own environment has: `set` defines that remote alone).
+    // Inherited variables whose names start with one of these are left out ("RCLONE_": the user's
+    // own rclone settings, which an rclone run of the tests mustn't see).
     std::vector<std::string> without_prefix;
 };
 
@@ -41,7 +41,7 @@ struct RunOptions {
     std::optional<std::string> input;
     // Each chunk of the child's stdout as it arrives (it is captured too). On the reading thread.
     std::function<void(std::string_view)> on_output;
-    // Added to the child's environment (internal_environment's).
+    // Added to the child's environment (this process's).
     Environment environment;
 };
 
@@ -56,14 +56,10 @@ struct RunOptions {
                                                                            bool pathext = false);
 
 #ifdef _WIN32
-// This process's environment as a CreateProcess block (UTF-16), without the RCLONE_* variables
-// an rclone run must not see (rclone_flags::kept_variable; review G8): no inherited
-// RCLONE_CONFIG_* at all, since each run gets its own server's in RunOptions::environment.
-// run_capture gives its children this one with that environment added; run_inherit (an editor,
-// an installer) and start_independent everything.
-[[nodiscard]] std::wstring internal_environment();
-// The same without any RCLONE_* variable at all: for a long-lived program of someone else's (the
-// media player Play starts; review G7).
+// This process's environment as a CreateProcess block (UTF-16) without any RCLONE_* variable: for
+// a long-lived program of someone else's (the media player Play starts; review G7). Every other
+// child (curl, tar, an editor, an installer) inherits the environment as it is, which holds no
+// server's secrets since grab stopped running rclone (RCLONE-REPLACEMENT.md, phases 7 and 9).
 [[nodiscard]] std::wstring environment_without_rclone();
 // Remove every RCLONE_CONFIG_* (any case) from this process's own environment; RCLONE_CONFIG
 // itself stays. grab-gui calls it first thing: a 0.19 grab-gui kept every server's secrets in its

@@ -21,7 +21,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <span>
 #include <stop_token>
 #include <string>
 #include <utility>
@@ -47,7 +46,7 @@ struct Context {
     std::filesystem::path passwords;    // grab's store of this configuration (passwords::path_in)
     std::vector<std::string> import_notes; // that import's notes, "[server] ..."
     // What keeps grab off the server (guard.hpp), from its settings, grab's store and the
-    // environment, read when the context was made; grab_blockers adds a command's `--`.
+    // environment, read when the context was made.
     guard::Settings guard;
 };
 
@@ -70,42 +69,33 @@ load_context(const std::filesystem::path& config_path, const std::optional<std::
 // dials (Main's fail2ban counts each handshake cut short). ssh_target asks it.
 [[nodiscard]] std::expected<void, std::string> check_pinned(const Context& ctx);
 
-// What keeps grab off the context's server for a run whose connection flags after `--` are
-// `run_flags` (guard.hpp): none for most servers.
-[[nodiscard]] std::vector<guard::Reason> grab_blockers(const Context& ctx, std::span<const std::string> run_flags = {});
+// What keeps grab off the context's server (guard.hpp): none for most servers.
+[[nodiscard]] std::vector<guard::Reason> grab_blockers(const Context& ctx);
 
-// A server's connection settings for one run (RCLONE-REPLACEMENT.md, phase 8 step 3): grab.conf's
-// bind, connect_timeout and io_timeout; for each one not set, common_flags' --bind, --contimeout
-// or --timeout, read as it; then the command's connection flags after `--` (`run_flags`), which
-// win. Each with the setting it came from, for messages ("bind in [Main]", "common_flags'
-// --bind", "--bind"). An error names the setting that can't be read, or a --bind that isn't an
-// address (server_conf::check_host) before anything connects.
+// A server's connection settings for one run (RCLONE-REPLACEMENT.md, phase 8 step 3 and phase 9
+// step 7): grab.conf's bind, connect_timeout and io_timeout, then the command's --bind,
+// --contimeout and --timeout (`given`), which win; a blank --bind clears the server's bind. The bind
+// with the setting it came from, for messages ("bind in [Main]", "--bind"). A bind left in an old
+// key with no `bind` key (old_bind: common_flags' or folder_flags' --bind, ssh_options' -o
+// BindAddress or -b) is an error that says to write it as `bind`: grab doesn't connect to the
+// server rather than connect from another address (a VPN or a firewall rule may count on it), so
+// every connection refuses it, Trust's and Test's too. The old keys' --contimeout and --timeout
+// aren't read (a notice says what to write instead).
 struct ConnectSettings {
     std::optional<std::string> bind;
     std::string bind_from;
     std::optional<std::chrono::milliseconds> connect_timeout; // 0: off
     std::optional<std::chrono::milliseconds> io_timeout;
-    std::string io_from; // "[Main] common_flags: --timeout off", for an error
-    std::vector<std::string> legacy; // the keys common_flags gave: "bind", "connect_timeout", "io_timeout"
 };
 [[nodiscard]] std::expected<ConnectSettings, std::string> connect_settings(const RemoteSettings& settings,
-                                                                           std::span<const std::string> run_flags = {});
+                                                                           const ConnectOptions& given = {});
 
 // How grab's own SSH client logs in to the context's server: its grab.conf section, with the
 // secrets grab's store keeps for exactly that login (ssh::target_for), once nothing keeps grab off
-// it (grab_blockers, with `extra`; the error names the setting and how to clear it, guard::text)
-// and check_pinned passes. Its connection settings as connect_settings has them with `extra`, the
-// command's connection flags after `--`; an I/O time outside 1 s to 24 h is refused (with no limit
-// a stalled read couldn't be cancelled).
-[[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx,
-                                                                 std::span<const std::string> extra = {});
-
-// The command's flags after `--` (`extra`) for a run on the context's server, checked before
-// anything connects (RCLONE-REPLACEMENT.md, phase 8 step 6). None may replace the server grab sets
-// itself (rclone_flags::first_refused). grab takes only --bind, --contimeout and --timeout, with
-// values it can use (an address, times, a --timeout from 1 s to 24 h), and refuses the rest naming
-// the setting to use instead (rclone_flags::first_unused_by_grab). The error is ready to show.
-[[nodiscard]] std::expected<void, std::string> check_run_flags(const Context& ctx, std::span<const std::string> extra);
+// it (grab_blockers; the error names the setting and how to clear it, guard::text), its
+// connection settings are usable (connect_settings, with the command's own `given`) and
+// check_pinned passes.
+[[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, const ConnectOptions& given = {});
 
 // A search, list or Browse through grab's own SSH client: find over an exec channel where the
 // server's check says it works, else the SFTP walk (RCLONE-REPLACEMENT.md, phase 4).

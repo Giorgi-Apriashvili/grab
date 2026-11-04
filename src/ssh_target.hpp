@@ -1,8 +1,7 @@
 #pragma once
 
 // A grab server as grab's own SSH client logs in to it: the connection details of its grab.conf
-// section, its secrets from grab's store (passwords.hpp), and how rclone's connection flags
-// (--bind, --contimeout, --timeout) read for it (engine::connect_settings).
+// section, its secrets from grab's store (passwords.hpp), and how its times read.
 
 #include "passwords.hpp"
 #include "server_conf.hpp"
@@ -12,10 +11,8 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace grab::ssh {
 
@@ -42,22 +39,5 @@ namespace grab::ssh {
 // 2^31-1 ms (about 24.8 days), more than the 32-bit times of Winsock's select and libssh2 hold;
 // nullopt for anything else.
 [[nodiscard]] std::optional<std::chrono::milliseconds> parse_duration(std::string_view text);
-
-// rclone's connection flags (rclone_flags::connection) as grab's client takes them (review G189):
-// --bind the address to connect from, --contimeout the time to reach the server, --timeout any
-// single wait after that, each as "--flag=VALUE" or "--flag VALUE" (the last one given counts).
-// `unused` holds the rest as it came. An error when one of those three has no value or a time
-// can't be read.
-struct ConnectionFlags {
-    std::optional<std::string> bind;
-    std::optional<std::chrono::milliseconds> connect_timeout;
-    std::optional<std::chrono::milliseconds> timeout;
-    std::string timeout_text; // --timeout as given, for messages
-    std::vector<std::string> unused;
-};
-[[nodiscard]] std::expected<ConnectionFlags, std::string> read_flags(std::span<const std::string> flags);
-// read_flags' values set in `target`; the rest returned.
-[[nodiscard]] std::expected<std::vector<std::string>, std::string> apply_flags(Target& target,
-                                                                             std::span<const std::string> flags);
 
 } // namespace grab::ssh

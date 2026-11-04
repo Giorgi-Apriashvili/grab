@@ -122,6 +122,7 @@ TEST_CASE("rclone finds a remote given only in its run's environment, under any 
                                    "\u03C3\u03C2 box"}) {
         proc::RunOptions quiet;
         quiet.detached = true;
+        quiet.environment.without_prefix = {"RCLONE_"}; // none of the user's own rclone settings
         quiet.environment.set = {{secrets::env_name(name, "type"), "alias"},
                                  {secrets::env_name(name, "remote"), util::path_to_utf8(dir / "target")}};
         const auto ran = proc::run_capture(

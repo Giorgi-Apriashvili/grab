@@ -89,13 +89,16 @@ TEST_CASE("guard: each source, and the one rclone went by when several set a key
     s.lines = {{"disable_concurrent_reads", "true"}};
     s.common_flags = {"--sftp-disable-concurrent-reads=false", "--sftp-http-proxy", "proxy.example:3128"};
     CHECK(keys_of(reasons_of(s)) == std::vector<std::string>{"http_proxy @ common_flags' --sftp-http-proxy"});
-    // The command's flags after `--` beat everything.
-    auto settings = guard::evaluate(s);
-    const std::vector<std::string> run{"--sftp-http-proxy=", "--sftp-ssh", "ssh -W %h:%p jump"};
-    guard::add_run_flags(settings, run);
-    const auto after = guard::reasons(settings);
-    CHECK(keys_of(after) == std::vector<std::string>{"ssh @ --sftp-ssh after --"});
-    CHECK(after[0].origin == guard::Origin::run_flags);
+    // folder_flags, after common_flags on grab 0.19's folder downloads: its own place to clear.
+    s = {};
+    s.common_flags = {"--sftp-socks-proxy", "fake-user:fake-pass@127.0.0.1:1"};
+    s.folder_flags = {"--transfers", "8", "--sftp-socks-proxy=", "--sftp-ssh", "fake-ssh -W %h:%p"};
+    const auto folder = reasons_of(s);
+    CHECK(keys_of(folder) == std::vector<std::string>{"ssh @ folder_flags' --sftp-ssh"});
+    REQUIRE(folder.size() == 1);
+    CHECK(folder[0].origin == guard::Origin::folder_flags);
+    CHECK(guard::text("Box", folder).ends_with("take --sftp-ssh out of folder_flags in [Box] (grab config)"));
+    CHECK(guard::text("Box", folder).find("fake-") == std::string::npos);
 }
 
 TEST_CASE("guard: inherited variables 0.20's rclone never saw don't count; the others cover every server") {
@@ -172,10 +175,6 @@ TEST_CASE("guard: texts name settings and how to clear them, never a value or en
           "Main rather than go around it: RCLONE_SFTP_SOCKS_PROXY is set in grab's environment and covers every "
           "server; clear it for grab alone (`set RCLONE_SFTP_SOCKS_PROXY=` in that window before starting grab) or "
           "for good");
-    auto run = guard::evaluate({});
-    const std::vector<std::string> given{"--sftp-socks-proxy", "fake-proxy:1080"};
-    guard::add_run_flags(run, given);
-    CHECK(guard::text("Main", guard::reasons(run)).ends_with(": leave --sftp-socks-proxy out after --"));
 }
 
 TEST_CASE("guard: grab's store that can't be read counts as a route, set aside by an Edit") {

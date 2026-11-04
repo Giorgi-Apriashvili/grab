@@ -10,7 +10,6 @@
 #include "progress_line.hpp"
 #include "quote.hpp"
 #include "rate.hpp"
-#include "rclone_flags.hpp"
 #include "remote.hpp"
 #include "schedule.hpp"
 #include "space.hpp"
@@ -751,9 +750,8 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     }
 
     DownloadTally tally;
-    // The connection flags after `--` apply to grab's connections (`--bind`, `--contimeout`,
-    // `--timeout`).
-    auto target = engine::ssh_target(ctx, rclone_flags::connection(opts.extra));
+    // The command's --bind, --contimeout and --timeout apply to grab's connections.
+    auto target = engine::ssh_target(ctx, opts.connect);
     if (!target) {
         std::println(stderr, "grab: {}", target.error());
         tally.code = exit_download_failed;

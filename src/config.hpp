@@ -22,8 +22,8 @@ enum class FindMethod {
 };
 
 // grab.conf's `engine = grab | rclone`, which 0.20 read (rclone was its fallback until this grab
-// removed it, RCLONE-REPLACEMENT.md phase 9): read only for the settings' notices now; every
-// server goes through grab's own SSH/SFTP client.
+// removed it, RCLONE-REPLACEMENT.md phase 9): read only for a notice that `engine = rclone` is
+// ignored now; every server goes through grab's own SSH/SFTP client.
 enum class Engine { rclone, grab };
 
 // How searches and file lists run: GNU find over an SSH command on a pooled connection, or grab's
@@ -43,7 +43,7 @@ struct RemoteSettings {
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
     bool skip_hidden = true;
-    std::optional<Engine> engine; // `engine = grab | rclone`, for the notices only (effective_engine)
+    std::optional<Engine> engine; // `engine = grab | rclone`, for a notice only
     // How every connection to the server is made (grab's own client and Trust's host-key fetch;
     // RCLONE-REPLACEMENT.md, phase 8): the local address to connect from, the time to reach the
     // server (0: off, as long as TCP tries) and any single wait after that (1 s to 24 h, never off:
@@ -51,16 +51,33 @@ struct RemoteSettings {
     std::optional<std::string> bind;
     std::optional<std::chrono::milliseconds> connect_timeout;
     std::optional<std::chrono::milliseconds> io_timeout;
+    // The keys grab 0.20 and before gave rclone and ssh.exe (phase 9): read only for the notices
+    // that they are ignored now (notices.hpp), the guard (guard.hpp) and a bind left in them
+    // (old_bind).
     std::vector<std::string> ssh_options;
     std::vector<std::string> common_flags;
     std::vector<std::string> folder_flags;
     std::vector<std::string> file_flags;
 };
 
+// A bind an old key still holds: common_flags' or folder_flags' --bind (the last one, as rclone
+// read it), else ssh_options' -o BindAddress or -b (the first, as ssh.exe read it). A blank one is
+// none. file_flags' reached only `--rclone -s`'s plain copy, gone since 0.20. With no `bind` key,
+// grab doesn't connect to the server rather than connect from another address
+// (engine::connect_settings).
+struct OldBind {
+    std::string key;   // "common_flags", "folder_flags", "ssh_options"
+    std::string flag;  // "--bind", "-o BindAddress", "-b"
+    std::string value; // "" when the flag has none
+};
+[[nodiscard]] std::optional<OldBind> old_bind(const RemoteSettings& settings);
+
 struct GrabConfig {
-    std::string rclone = "rclone";
+    // [grab] rclone and ssh, the programs grab 0.20 and before ran: blank when not set; read only
+    // for a notice that they are ignored now.
+    std::string rclone;
     std::optional<std::filesystem::path> rclone_config; // only when set explicitly
-    std::string ssh = "ssh";
+    std::string ssh;
     std::optional<std::string> editor; // [grab] editor, used by `grab config`
     std::optional<std::string> default_remote;
     std::vector<RemoteSettings> remotes;
@@ -94,12 +111,6 @@ struct RcloneRemote {
 inline constexpr std::chrono::milliseconds min_io_timeout{1'000};
 inline constexpr std::chrono::milliseconds max_io_timeout{24 * 3'600'000};
 
-// The server's engine as 0.20 resolved it, which the settings' notices (notices.hpp) still go by
-// until they learn the old keys' meaning in this grab: GRAB_ENGINE (grab or rclone) for every
-// server; else its `engine` line; else grab, unless `guarded` (guard.hpp), which kept a server on
-// rclone. Nothing connects by it: every server goes through grab's own client.
-[[nodiscard]] Engine effective_engine(const RemoteSettings& settings, bool guarded = false);
-
 // How searches and lists go: `find` as GrabMethod; auto asks the server (ssh::check_find), except a
 // Storage Box (*.your-storagebox.de), whose restricted shell has no find, so it walks without asking.
 [[nodiscard]] GrabMethod resolve_grab_method(const RemoteSettings& settings, const RcloneRemote& remote);
@@ -110,7 +121,8 @@ inline constexpr std::chrono::milliseconds max_io_timeout{24 * 3'600'000};
 // Normalized roots as a grab.conf search_roots value: "~" for the login home, ", " between.
 [[nodiscard]] std::string search_roots_value(const std::vector<std::string>& roots);
 
-// Built-in flag defaults, used when the key is absent from grab.conf.
+// The old flag keys' defaults, as grab 0.20 and before gave them to rclone when the key was absent:
+// what the notices compare with (only what differs is named).
 inline constexpr std::string_view default_common_flags =
     "-P --sftp-chunk-size 255Ki --sftp-disable-hashcheck";
 inline constexpr std::string_view default_folder_flags = "--transfers 8 --checkers 8";
@@ -132,7 +144,8 @@ extern const std::string_view example_config;
 // stay where they always were.
 [[nodiscard]] std::optional<std::string> config_folder_name(const std::filesystem::path& grab_conf);
 // The rclone config where grab 0.19 and before kept its servers: <config>/grab/rclone.conf. Only
-// the import (rclone_import.hpp) reads it now; grab never writes it again.
+// the import (rclone_import.hpp) reads it now, and deletes it with the 'secrets' beside it once
+// everything in them has moved (rclone_import::old_files).
 [[nodiscard]] std::filesystem::path grab_rclone_config_path();
 // Host keys pinned by `grab server add|trust`: <config>/grab/known_hosts.
 [[nodiscard]] std::filesystem::path grab_known_hosts_path();
@@ -200,9 +213,8 @@ private:
 [[nodiscard]] std::string lead_in(std::string_view name, std::string_view description);
 
 // A commented grab.conf section for one rclone remote. search_roots is left blank (the login
-// home, correct for both lookup methods); bind, connect_timeout, io_timeout and engine are
-// written commented out, so grab's defaults apply (the rclone flag keys, engine = rclone's only,
-// aren't written). With `connection` (server_conf::lines),
+// home, correct for both lookup methods); bind, connect_timeout and io_timeout are written
+// commented out, so grab's defaults apply. With `connection` (server_conf::lines),
 // those lines go after the header instead of `rclone_remote`, which a new server leaves to its
 // name.
 [[nodiscard]] std::string remote_section(const RcloneRemote& remote,

@@ -1,12 +1,17 @@
 #include "cli.hpp"
 
 #include "rate.hpp"
+#include "server_conf.hpp"
+#include "ssh_target.hpp"
 #include "util.hpp"
 
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstddef>
 #include <format>
+#include <optional>
+#include <span>
 #include <string_view>
 
 #ifndef GRAB_VERSION
@@ -19,7 +24,7 @@ std::string usage() {
     return R"(grab )" GRAB_VERSION R"( - fetch a file or folder from a Linux server by name
 
 Usage:
-  grab [-s|--file | -f|--folder] TARGET [DEST] [options] [-- FLAGS]
+  grab [-s|--file | -f|--folder] TARGET [DEST] [options]
   grab config [-c PATH]
   grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]
   grab update [--check]
@@ -39,7 +44,8 @@ Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
                        $EDITOR, else notepad. The file is created from the example if missing.
   server list          the configured servers: login, how it logs in, whether a password is
-                       saved, engine and lookup method, whether its host key is pinned
+                       saved, lookup method, whether its host key is pinned, and why grab
+                       doesn't connect to one it can't use
   server add [NAME]    set up a server step by step (host, login, host key, search roots);
                        writes grab.conf (a password to grab's encrypted store), then tests it
   server edit NAME     the same questions, the current answers as defaults; Enter keeps the
@@ -72,29 +78,27 @@ Options:
                        older than the server's): replace it, both (keep yours and save the
                        new one as "name (2).ext") or skip it. Without it grab asks first, or
                        stops when there is no console to ask on
-  -- FLAGS             connection flags for this run: --bind ADDRESS, --contimeout TIME (or
-                       off) and --timeout TIME (1s to 24h on grab's own client) win over the
-                       server's bind, connect_timeout and io_timeout. A server on engine =
-                       rclone also takes rclone's other connection flags (--sftp-*...), but
-                       not its address, login or host keys (grab server edit NAME)
+      --bind ADDRESS   connect from this local address, over the server's bind; a blank one
+                       (--bind=) connects from any address this time
+      --contimeout TIME
+                       the time to reach the server (30s, 1m30s, or off), over its
+                       connect_timeout
+      --timeout TIME   the longest wait for the server once connected (1s to 24h), over its
+                       io_timeout
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
-  -v, --verbose        say how grab connects and searches, the settings' notes again, and the
-                       command lines of servers on rclone (engine = rclone) before they run
+  -v, --verbose        say how grab connects and searches, and the settings' notes again
       --init           write grab.conf to the config path if absent, with the sftp remotes of
                        the standard rclone.conf as servers (rclone.conf is only read)
   -h, --help           show this help
       --version        show version
+  --                   end of the options: what follows is TARGET and DEST, even when it
+                       starts with - (grab -- -notes.txt E:\Docs)
 
 Searches use a saved list of the server's files when it is under 15 minutes old (instant);
 otherwise grab fetches a new list first. Path targets and searches for dot-names go live.
 Downloads run over several connections at once and survive interruptions: Ctrl+C keeps
 what is on disk, and the same command later continues from there. A file or folder file
 already on disk (same size, not older than the server's) is not fetched again.
-
-grab downloads, searches and lists with its own SSH client. `engine = rclone` in a server's
-section (or GRAB_ENGINE=rclone for a run) uses rclone for it instead, until a later grab
-removes it; a server whose rclone settings grab's client can't serve (a proxy, an ssh
-command) stays on rclone by itself, and `grab server list` says why.
 
 Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
 (search or file list) failed, 5 update failed, 6 download failed, 130 stopped by Ctrl+C.
@@ -118,14 +122,75 @@ constexpr auto switches = std::to_array<std::string_view>({"--file", "--folder",
                                                            "--all", "--exact", "--fresh", "--dry-run", "--verbose",
                                                            "--check", "--init", "--help", "--version"});
 
+// rclone's flags that grab 0.20 passed on after `--` (and its help named), which a script may
+// still put there: never taken for TARGET or DEST in this grab (RCLONE-REPLACEMENT.md, phase 9
+// step 8). --bind, --contimeout and --timeout are grab's own options now.
+constexpr auto connect_options = std::to_array<std::string_view>({"--bind", "--contimeout", "--timeout"});
+constexpr auto old_rclone_flags = std::to_array<std::string_view>(
+    {"--bwlimit", "--tpslimit", "--tpslimit-burst", "--transfers", "--checkers", "--low-level-retries", "--retries",
+     "--buffer-size", "--multi-thread-streams", "--multi-thread-cutoff", "--multi-thread-chunk-size",
+     "--multi-thread-write-buffer-size", "--dscp", "--user-agent", "--ca-cert", "--client-cert", "--client-key",
+     "--no-check-certificate", "--password-command", "--progress", "--stats"});
+
+// Why the word at `at` of `words` (each after `--`) can't be TARGET or DEST: the flag grab 0.20
+// passed on to rclone that it is, with what to write instead; nullopt for any other word.
+std::optional<std::string> old_flag(std::span<const std::string> words, std::size_t at) {
+    const std::string& word = words[at];
+    const std::string_view name = std::string_view(word).substr(0, word.find('='));
+    if (std::ranges::contains(connect_options, name)) {
+        // Its value as it came, or what it takes.
+        std::string value = name.size() < word.size() ? word.substr(name.size() + 1)
+                            : at + 1 < words.size()  ? words[at + 1]
+                                                     : std::string(name == "--bind" ? "ADDRESS" : "TIME");
+        if (value.empty() || value.find_first_of(" \t\"") != std::string::npos) value = "\"" + value + "\"";
+        return std::format("{} after -- is an option of grab's now: write {} {} before --", name, name, value);
+    }
+    if (name == "--dry-run") return "--dry-run after -- is an option of grab's: write it (or -n) before --";
+    if (name.starts_with("--sftp-") || std::ranges::contains(old_rclone_flags, name)) {
+        return std::format("{} after -- was a flag for rclone, which this grab doesn't have; leave it out (after --, "
+                           "grab takes only TARGET and DEST)",
+                           name);
+    }
+    return std::nullopt;
+}
+
+// A --bind, --contimeout or --timeout value into `into`, or why it can't be one.
+std::expected<void, std::string> take_connect(std::string_view name, std::string_view value, ConnectOptions& into) {
+    value = util::trim(value);
+    if (name == "--bind") {
+        // A blank one: no bind for this run, whatever the server's.
+        if (value.starts_with('-')) return util::failf("--bind {}: the address can't start with -", value);
+        if (!value.empty()) {
+            if (auto bad = server_conf::check_host(value)) return util::failf("--bind {}: {}", value, *bad);
+        }
+        into.bind = std::string(value);
+        return {};
+    }
+    const auto time = ssh::parse_duration(value);
+    if (name == "--contimeout") {
+        if (!time) return util::failf("--contimeout {}: not a time grab can read (such as 30s, 1m30s or off)", value);
+        into.connect_timeout = *time;
+        return {};
+    }
+    // No limit would leave a stalled read waiting for ever: Cancel and Ctrl+C couldn't end it.
+    if (!time || *time < min_io_timeout || *time > max_io_timeout) {
+        return util::failf("--timeout {}: grab takes a time from 1s to 24h (such as 30s or 1m30s; with none, a stalled "
+                           "download couldn't be cancelled)",
+                           value);
+    }
+    into.io_timeout = *time;
+    return {};
+}
+
 } // namespace
 
 std::expected<CliResult, std::string> parse_args(std::span<const std::string> args) {
     CliResult result;
     std::optional<Mode> mode;
     std::vector<std::string> positionals;
-    bool passthrough = false;
-    bool rclone_copy = false; // --rclone, which is gone
+    std::optional<std::size_t> ended; // `--` came before positionals[*ended]
+    bool rclone_copy = false;         // --rclone, which is gone
+    bool connect_given = false;       // --bind, --contimeout or --timeout
 
     // `grab config` and `grab update` are subcommands only as the first argument, so a folder
     // literally named "config" or "update" is still reachable with a mode flag first.
@@ -144,12 +209,13 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     for (std::size_t i = start; i < args.size(); ++i) {
         const std::string& a = args[i];
 
-        if (passthrough) {
-            result.opts.extra.push_back(a);
+        // The end of the options (G117): the rest is TARGET and DEST, checked below.
+        if (ended) {
+            positionals.push_back(a);
             continue;
         }
         if (a == "--") {
-            passthrough = true;
+            ended = positionals.size();
             continue;
         }
 
@@ -232,6 +298,11 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
                 return util::failf("--existing takes replace, both or skip; got '{}'", *v);
             }
             result.opts.existing = *choice;
+        } else if (std::ranges::contains(connect_options, name)) {
+            auto v = take_value();
+            if (!v) return util::fail(v.error());
+            if (auto taken = take_connect(name, *v, result.opts.connect); !taken) return util::fail(taken.error());
+            connect_given = true;
         } else if (name == "--first") {
             result.opts.first = true;
         } else if (name == "--all") {
@@ -264,26 +335,42 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     }
 
     // The plain rclone copy went with the switch to grab's own client (RCLONE-REPLACEMENT.md, phase 8
-    // step 7); engine = rclone keeps a server on rclone, with grab's progress and resume.
-    if (rclone_copy) {
-        return util::failf("--rclone is gone: grab no longer runs a plain rclone copy. To download from a server "
-                           "through rclone until a later grab removes it, set engine = rclone in {} (grab config)",
-                           result.opts.remote ? std::format("[{}]", *result.opts.remote) : "its section");
-    }
+    // step 7), and rclone itself in phase 9.
+    if (rclone_copy) return util::fail("--rclone is gone: this grab has no rclone; it downloads with its own SSH client");
     if (result.opts.check && result.action != CliAction::update) {
         return util::fail("--check only applies to `grab update`");
     }
-    // Only a download hands flags on; the rest would ignore them (refused, never ignored).
-    if (!result.opts.extra.empty() && (result.action == CliAction::server || result.action == CliAction::init ||
-                                       result.action == CliAction::config || result.action == CliAction::update)) {
+    // What grab 0.20 passed on to rclone after `--` is refused there, never searched for or made
+    // a folder of (`grab movie -- --dry-run` would download into a folder called --dry-run).
+    // Only a download connects with --bind, --contimeout and --timeout; the rest would ignore them
+    // (refused, never ignored).
+    const auto no_connect = [&]() -> std::optional<std::string> {
         const bool server = result.action == CliAction::server;
-        const char* cmd = server                                 ? "server"
-                          : result.action == CliAction::init     ? "--init"
-                          : result.action == CliAction::config   ? "config"
-                                                                 : "update";
-        return util::failf("`grab {}` takes no flags after --{}", cmd,
+        if (!server && result.action != CliAction::init && result.action != CliAction::config &&
+            result.action != CliAction::update) {
+            return std::nullopt;
+        }
+        const char* cmd = server                               ? "server"
+                          : result.action == CliAction::init   ? "--init"
+                          : result.action == CliAction::config ? "config"
+                                                               : "update";
+        return std::format("`grab {}` takes no --bind, --contimeout or --timeout{}", cmd,
                            server ? "; a server's bind, connect_timeout and io_timeout are set in its section (grab config)"
                                   : "");
+    };
+    if (ended) {
+        const std::span<const std::string> after = std::span(positionals).subspan(*ended);
+        for (std::size_t k = 0; k < after.size(); ++k) {
+            // Not "write it before --" where that is refused too.
+            const std::string_view word = after[k];
+            if (std::ranges::contains(connect_options, word.substr(0, word.find('=')))) {
+                if (auto refused = no_connect()) return util::fail(*refused);
+            }
+            if (auto old = old_flag(after, k)) return util::fail(*old);
+        }
+    }
+    if (connect_given) {
+        if (auto refused = no_connect()) return util::fail(*refused);
     }
     if (result.action == CliAction::server) {
         if (mode) return util::fail("`grab server` takes no -s/-f");
@@ -317,6 +404,15 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
                            positionals.size());
     }
     if (util::trim(positionals[0]).empty()) return util::fail("TARGET must not be empty");
+    // A TARGET after `--` may start with '-'; a DEST there that does was most likely an option
+    // meant for grab 0.20's rclone (`grab movie -- -P`), so it takes a folder name that says so.
+    if (ended && *ended <= 1 && positionals.size() == 2 && positionals[1].starts_with('-')) {
+        return util::failf("{} after -- would be DEST, the folder to save into: write .\\{} for a folder of that name",
+                           positionals[1], positionals[1]);
+    }
+    if (result.opts.first && result.opts.all) {
+        return util::fail("--first and --all don't go together: --first takes the best match, --all every match");
+    }
 
     result.opts.mode = mode.value_or(Mode::file); // a bare `grab NAME` looks for files
     result.opts.target = positionals[0];
@@ -331,7 +427,6 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         if (util::trim(positionals[1]).empty()) return util::fail("DEST must not be empty");
         result.opts.dest = util::path_from_utf8(positionals[1]);
     }
-    // The flags after `--` are checked once the server's engine is known (engine::check_run_flags).
     return result;
 }
 

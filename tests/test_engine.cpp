@@ -81,50 +81,54 @@ passwords::Secret fake(std::string value, const server_conf::Connection& at) {
 
 } // namespace
 
-TEST_CASE("grab's own target: common_flags, then the command's flags after --, which win") {
+TEST_CASE("grab's own target: the keys, then the command's --bind, --contimeout and --timeout, which win") {
+    using std::chrono::milliseconds;
     auto ctx = grab_context("Main", connection("main.example", "me", server_conf::Auth::agent));
-    ctx.settings.common_flags = {"-P", "--contimeout", "10s", "--bind", "10.0.0.1"};
+    ctx.settings.bind = "10.0.0.1";
+    ctx.settings.connect_timeout = milliseconds(10'000);
     auto plain = engine::ssh_target(ctx);
     REQUIRE_MESSAGE(plain, plain.error_or(""));
     CHECK(plain->agent);
     CHECK(plain->known_hosts == grab_known_hosts_path());
-    CHECK(plain->connect_timeout == std::chrono::seconds(10));
+    CHECK(plain->connect_timeout == milliseconds(10'000));
     CHECK(plain->bind == "10.0.0.1");
-    const std::vector<std::string> extra{"--bind", "10.8.0.2", "--timeout=1m"};
-    auto given = engine::ssh_target(ctx, extra);
-    REQUIRE_MESSAGE(given, given.error_or(""));
-    CHECK(given->connect_timeout == std::chrono::seconds(10));
-    CHECK(given->bind == "10.8.0.2");
-    CHECK(given->timeout == std::chrono::minutes(1));
-    const std::vector<std::string> bad{"--timeout", "soon"};
-    CHECK(engine::ssh_target(ctx, bad).error_or("").starts_with("the flags after --: --timeout soon"));
-    // A blank --bind after `--` clears the bind for the run; in common_flags it is no bind.
-    const std::vector<std::string> unbind{"--bind="};
-    auto unbound = engine::ssh_target(ctx, unbind);
+    CHECK(plain->bind_from == "bind in [Main]");
+    const ConnectOptions given{.bind = "10.8.0.2", .connect_timeout = std::nullopt, .io_timeout = milliseconds(60'000)};
+    auto run = engine::ssh_target(ctx, given);
+    REQUIRE_MESSAGE(run, run.error_or(""));
+    CHECK(run->connect_timeout == milliseconds(10'000));
+    CHECK(run->bind == "10.8.0.2");
+    CHECK(run->bind_from == "--bind");
+    CHECK(run->timeout == milliseconds(60'000));
+    // A blank --bind clears the server's bind for the run.
+    auto unbound = engine::ssh_target(ctx, ConnectOptions{.bind = "", .connect_timeout = {}, .io_timeout = {}});
     REQUIRE_MESSAGE(unbound, unbound.error_or(""));
     CHECK(unbound->bind.empty());
-    ctx.settings.common_flags = {"--bind="};
-    auto blank = engine::ssh_target(ctx);
-    REQUIRE_MESSAGE(blank, blank.error_or(""));
-    CHECK(blank->bind.empty());
+    // common_flags' --bind beside a `bind` key: the key, which wins (a notice says the flag is
+    // ignored); its --contimeout and --timeout aren't read at all (phase 9 step 7).
+    ctx.settings.common_flags = {"-P", "--bind", "10.0.0.9", "--contimeout", "3s", "--timeout", "5m"};
+    ctx.settings.connect_timeout.reset();
+    auto keyed = engine::ssh_target(ctx);
+    REQUIRE_MESSAGE(keyed, keyed.error_or(""));
+    CHECK(keyed->bind == "10.0.0.1");
+    CHECK(keyed->connect_timeout == ssh::Target{}.connect_timeout);
+    CHECK(keyed->timeout == ssh::Target{}.timeout);
     std::filesystem::remove(grab_known_hosts_path());
 }
 
-TEST_CASE("connection settings: the keys, else common_flags' --bind, --contimeout and --timeout, then the command's") {
+TEST_CASE("connection settings: grab.conf's keys, then the command's; the old keys' times aren't read") {
     using std::chrono::milliseconds;
     RemoteSettings s;
     s.name = "Main";
-    s.common_flags = {"-P", "--bind", "10.0.0.1", "--contimeout=10s", "--timeout", "2m", "--sftp-chunk-size", "255Ki"};
-    const auto legacy = engine::connect_settings(s);
-    REQUIRE_MESSAGE(legacy, legacy.error_or(""));
-    CHECK(legacy->bind == "10.0.0.1");
-    CHECK(legacy->bind_from == "common_flags' --bind");
-    CHECK(legacy->connect_timeout == milliseconds(10'000));
-    CHECK(legacy->io_timeout == milliseconds(120'000));
-    CHECK(legacy->legacy == std::vector<std::string>{"bind", "connect_timeout", "io_timeout"});
-    // A key set wins over common_flags'; connect_timeout = off is a setting too.
+    s.common_flags = {"-P", "--contimeout=10s", "--timeout", "2m", "--sftp-chunk-size", "255Ki"};
+    s.folder_flags = {"--timeout", "off"}; // 0.20 refused that on grab's client; ignored now
+    const auto none = engine::connect_settings(s);
+    REQUIRE_MESSAGE(none, none.error_or(""));
+    CHECK_FALSE(none->bind);
+    CHECK_FALSE(none->connect_timeout);
+    CHECK_FALSE(none->io_timeout);
     s.bind = "10.0.0.2";
-    s.connect_timeout = milliseconds(0);
+    s.connect_timeout = milliseconds(0); // off is a setting too
     s.io_timeout = milliseconds(45'000);
     const auto keys = engine::connect_settings(s);
     REQUIRE(keys);
@@ -132,65 +136,82 @@ TEST_CASE("connection settings: the keys, else common_flags' --bind, --contimeou
     CHECK(keys->bind_from == "bind in [Main]");
     CHECK(keys->connect_timeout == milliseconds(0));
     CHECK(keys->io_timeout == milliseconds(45'000));
-    CHECK(keys->legacy.empty());
-    // The command's flags after `--` win over both.
-    const std::vector<std::string> run{"--bind=10.8.0.2", "--contimeout", "3s"};
+    const ConnectOptions run{.bind = "10.8.0.2", .connect_timeout = milliseconds(3'000), .io_timeout = std::nullopt};
     const auto given = engine::connect_settings(s, run);
     REQUIRE(given);
     CHECK(given->bind == "10.8.0.2");
     CHECK(given->bind_from == "--bind");
     CHECK(given->connect_timeout == milliseconds(3'000));
     CHECK(given->io_timeout == milliseconds(45'000));
-    // A --bind that isn't an address is refused before anything connects.
-    s.bind.reset();
-    s.common_flags = {"--bind=-oProxyCommand=x"};
-    CHECK(engine::connect_settings(s).error_or("") == "[Main] common_flags: --bind -oProxyCommand=x: the address can't start with -");
-    s.common_flags = {"--contimeout", "soon"};
-    CHECK(engine::connect_settings(s).error_or("").starts_with("[Main] common_flags: --contimeout soon: not a time"));
-    s.common_flags.clear();
-    const std::vector<std::string> bad{"--bind=10.0.0.2;x"};
-    CHECK(engine::connect_settings(s, bad).error_or("").starts_with("the flags after --: --bind 10.0.0.2;x: "));
-    // A blank --bind is no bind, as rclone read it: in common_flags nothing, after `--` it clears
-    // the server's for the run.
-    s.common_flags = {"--bind="};
-    const auto blank = engine::connect_settings(s);
-    REQUIRE_MESSAGE(blank, blank.error_or(""));
-    CHECK_FALSE(blank->bind);
-    CHECK(blank->legacy.empty());
-    s.bind = "10.0.0.2";
-    const std::vector<std::string> clear{"--bind", ""};
-    const auto cleared = engine::connect_settings(s, clear);
-    REQUIRE_MESSAGE(cleared, cleared.error_or(""));
+    const auto cleared = engine::connect_settings(s, ConnectOptions{.bind = "", .connect_timeout = {}, .io_timeout = {}});
+    REQUIRE(cleared);
     CHECK_FALSE(cleared->bind);
     CHECK(cleared->bind_from.empty());
 }
 
-TEST_CASE("grab's own target: the keys, common_flags' legacy flags and the command's; never without an I/O time") {
-    using std::chrono::milliseconds;
-    auto ctx = grab_context("Main", connection("main.example", "me", server_conf::Auth::agent));
-    ctx.settings.bind = "10.0.0.5";
-    ctx.settings.io_timeout = milliseconds(45'000);
-    ctx.settings.common_flags = {"--bind", "10.0.0.1", "--contimeout", "10s"};
-    const auto t = engine::ssh_target(ctx);
-    REQUIRE_MESSAGE(t, t.error_or(""));
-    CHECK(t->bind == "10.0.0.5");
-    CHECK(t->bind_from == "bind in [Main]");
-    CHECK(t->connect_timeout == milliseconds(10'000)); // common_flags', the key being blank
-    CHECK(t->timeout == milliseconds(45'000));
-    // No I/O limit (or more than 24 h) would leave a stalled read that Cancel can't end.
-    ctx.settings.io_timeout.reset();
-    ctx.settings.common_flags = {"--timeout", "off"};
-    CHECK(engine::ssh_target(ctx).error_or("").starts_with(
-        "[Main] common_flags: --timeout off: grab's own client takes a time from 1s to 24h there"));
-    ctx.settings.common_flags.clear();
-    for (const char* time : {"0", "25h", "500ms"}) {
-        const std::vector<std::string> run{"--timeout", time};
-        CHECK_MESSAGE(engine::ssh_target(ctx, run).error_or("").starts_with(std::format("the flags after --: --timeout {}:", time)),
-                      time);
+TEST_CASE("a bind left in an old key with no `bind` key: refused before anything connects, never dropped (phase 9)") {
+    RemoteSettings s;
+    s.name = "Main";
+    const auto error = [&] { return engine::connect_settings(s).error_or(""); };
+    s.common_flags = {"-P", "--bind", "10.0.0.2", "--sftp-chunk-size", "255Ki"};
+    CHECK(error() == "[Main] common_flags' --bind 10.0.0.2 isn't read any more: write bind = 10.0.0.2 in [Main] (grab "
+                     "config) and take it out of common_flags. Until then grab doesn't connect to Main rather than connect "
+                     "from another address");
+    s.common_flags = {"--bind=10.0.0.3"};
+    CHECK(error().starts_with("[Main] common_flags' --bind 10.0.0.3 isn't read any more: write bind = 10.0.0.3 in"));
+    // rclone took the last one; a blank one is no bind, as rclone read it.
+    s.common_flags = {"--bind", "10.0.0.2", "--bind="};
+    CHECK(engine::connect_settings(s).has_value());
+    s.common_flags = {"--bind"}; // no value: what it meant is unknown, so it isn't guessed
+    CHECK(error() == "[Main] common_flags' --bind isn't read any more: write a bind line in [Main] (grab config) and take "
+                     "it out of common_flags. Until then grab doesn't connect to Main rather than connect from another "
+                     "address");
+    s.common_flags = {"--bind", "-oProxyCommand=x"}; // never quoted as a line to write
+    CHECK(error().starts_with("[Main] common_flags' --bind isn't read any more: write a bind line in [Main]"));
+    s.common_flags.clear();
+    s.folder_flags = {"--transfers", "8", "--bind", "fe80::1%eth0"};
+    CHECK(error().starts_with("[Main] folder_flags' --bind fe80::1%eth0 isn't read any more: write bind = fe80::1%eth0 "));
+    s.folder_flags.clear();
+    for (const auto& [options, shown] :
+         {std::pair{std::vector<std::string>{"-o", "BindAddress=10.0.0.4"}, "-o BindAddress=10.0.0.4"},
+          std::pair{std::vector<std::string>{"-oBindAddress 10.0.0.4"}, "-o BindAddress=10.0.0.4"},
+          std::pair{std::vector<std::string>{"-C", "-b", "10.0.0.4", "-o", "BindAddress=10.0.0.5"}, "-b 10.0.0.4"}}) {
+        s.ssh_options = options;
+        CHECK_MESSAGE(error().starts_with(std::format("[Main] ssh_options' {} isn't read any more: write bind = 10.0.0.4 "
+                                                      "in [Main] (grab config) and take it out of ssh_options.",
+                                                      shown)),
+                      shown);
     }
-    const std::vector<std::string> fine{"--timeout", "24h"};
-    CHECK(engine::ssh_target(ctx, fine).has_value());
+    s.ssh_options = {"-o", "BindAddress="};
+    CHECK(engine::connect_settings(s).has_value());
+    // file_flags' --bind reached no connection since 0.20: a notice only.
+    s.ssh_options.clear();
+    s.file_flags = {"--bind", "10.0.0.6"};
+    CHECK(engine::connect_settings(s).has_value());
+    // With a `bind` key the old ones are ignored (a notice says so).
+    s.common_flags = {"--bind", "10.0.0.2"};
+    s.bind = "10.0.0.7";
+    const auto keyed = engine::connect_settings(s);
+    REQUIRE(keyed);
+    CHECK(keyed->bind == "10.0.0.7");
+    s.bind.reset();
+    // The command's own --bind doesn't lift it: the server's setting is what's wrong.
+    CHECK_FALSE(engine::connect_settings(s, ConnectOptions{.bind = "10.0.0.8", .connect_timeout = {}, .io_timeout = {}}));
+
+    // Wherever grab would connect: its target is refused before the host key is even looked at,
+    // so a search, a file list and Browse fail with nothing dialled (Trust and Test: server_ops).
     std::filesystem::remove(grab_known_hosts_path());
+    auto ctx = grab_context("Main", connection("127.0.0.1", "u", server_conf::Auth::agent, 9), {}, false);
+    ctx.settings.common_flags = {"--bind", "10.0.0.2"};
+    const std::string refusal = "[Main] common_flags' --bind 10.0.0.2 isn't read any more";
+    CHECK(engine::ssh_target(ctx).error_or("").starts_with(refusal));
+    engine::SearchRequest req;
+    req.target = "x";
+    CHECK(engine::search(ctx, req).error_or("").starts_with(refusal));
+    CHECK(file_list::fetch(ctx, 1).error_or("").starts_with(refusal));
+    const auto listed = browse::list_live(ctx, "", {});
+    REQUIRE_FALSE(listed);
+    CHECK(listed.error().message.starts_with(refusal));
 }
 
 TEST_CASE("the guard: a server grab can't serve as configured is refused everywhere, before anything connects (phase 9)") {
@@ -256,7 +277,7 @@ TEST_CASE("the guard: a server grab can't serve as configured is refused everywh
     std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("the guard's other sources: a grab.conf line, common_flags, an inherited variable, a flag after --") {
+TEST_CASE("the guard's other sources: a grab.conf line, common_flags, an inherited variable") {
     std::filesystem::remove(grab_known_hosts_path());
     auto c = connection("127.0.0.1", "u", server_conf::Auth::agent, 9);
     auto ctx = grab_context("Main", c);
@@ -284,11 +305,6 @@ TEST_CASE("the guard's other sources: a grab.conf line, common_flags, an inherit
     CHECK(jumped.guard.contains("ProxyCommand"));
     CHECK(engine::grab_blockers(jumped).empty());
     CHECK(engine::ssh_target(jumped).has_value());
-
-    // A guard flag after `--` on a server that has none.
-    const std::vector<std::string> run{"--sftp-http-proxy", "fake-proxy:3128"};
-    CHECK(engine::grab_blockers(ctx, run).size() == 1);
-    CHECK(engine::ssh_target(ctx, run).error_or("").ends_with(": leave --sftp-http-proxy out after --"));
 
     {
         // An inherited RCLONE_SFTP_SOCKS_PROXY covers every server; RCLONE_SFTP_SSH never reached
@@ -321,62 +337,6 @@ TEST_CASE("engine = rclone and GRAB_ENGINE=rclone change nothing: every server g
         CHECK(engine::ssh_target(ctx).has_value());
     }
     std::filesystem::remove(grab_known_hosts_path());
-}
-
-TEST_CASE("the flags after --, before anything connects (phase 8 step 6)") {
-    using V = std::vector<std::string>;
-    engine::Context ctx;
-    ctx.settings.name = "Main";
-    const auto error = [&](V extra) { return engine::check_run_flags(ctx, extra).error_or(""); };
-    // grab's own client takes --bind, --contimeout and --timeout for the run, either way written.
-    CHECK(engine::check_run_flags(ctx, V{}).has_value());
-    CHECK(engine::check_run_flags(ctx, V{"--bind", "10.0.0.2", "--contimeout=5s", "--timeout", "2m"}).has_value());
-    CHECK(engine::check_run_flags(ctx, V{"--bind="}).has_value()); // no bind for this run
-    CHECK(engine::check_run_flags(ctx, V{"--contimeout", "off", "--timeout=24h"}).has_value());
-    // The rest refused, naming what to use instead (the 2026-10-21 rule: refused, never ignored).
-    CHECK(error({"--timeout", "1m", "--sftp-connections", "4"}) ==
-          "--sftp-connections after -- isn't used by grab's own client; set max_connections in [Main] (grab config)");
-    CHECK(error({"--sftp-chunk-size", "1Mi"}) == "--sftp-chunk-size after -- isn't used by grab's own client; it reads "
-                                                 "255 KiB at a time, 64 in flight, and splits big files over its "
-                                                 "connections, with nothing to set");
-    CHECK(error({"--multi-thread-streams=4"}).find("with nothing to set") != std::string::npos);
-    CHECK(error({"--low-level-retries", "3"}).ends_with("; it retries a failed piece by itself"));
-    CHECK(error({"--bwlimit", "5M"}).ends_with("; grab's own --limit sets the speed"));
-    CHECK(error({"--tpslimit", "5"}).ends_with("; grab's own --limit sets the speed"));
-    CHECK(error({"--transfers", "4"}).ends_with("; files at once: At once in grab's window"));
-    CHECK(error({"--dry-run"}).ends_with("; grab's own -n shows what would be fetched"));
-    CHECK(error({"-P"}).ends_with("; grab shows its own progress"));
-    CHECK(error({"--dscp", "CS1"}).ends_with("; it isn't used over SFTP"));
-    CHECK(error({"--size-only"}) ==
-          "--size-only after -- isn't used by grab's own client; it takes only --bind, --contimeout and --timeout there");
-    CHECK(error({"--bind", "10.0.0.2", "stray"}).starts_with("'stray' after -- isn't a flag"));
-    // What grab can't follow is refused, and never quotes the value.
-    const auto proxy = error({"--sftp-socks-proxy", "fake-user:fake-secret@127.0.0.1:9"});
-    CHECK(proxy.starts_with("--sftp-socks-proxy after --: grab's own client can't use a proxy"));
-    CHECK(proxy.find("fake-") == std::string::npos);
-    CHECK(error({"--sftp-ciphers=aes128-ctr"}).find("offers only its own algorithms") != std::string::npos);
-    CHECK_FALSE(error({"--sftp-disable-concurrent-reads"}).empty());
-    // The server's address, login and host keys, as before.
-    CHECK(error({"--sftp-host", "elsewhere.example"}) ==
-          "--sftp-host after -- would replace the server's address, which grab's own client takes from its settings; "
-          "change grab.conf's `host` with `grab server edit Main` or Edit in grab's Settings");
-    CHECK(error({"--sftp-ssh", "ssh -i key"}).ends_with("which grab's own client can't use; an ssh command can't be "
-                                                         "given there"));
-    CHECK(error({"--sftp-pubkey-file", "C:\\id-cert.pub"})
-              .starts_with("--sftp-pubkey-file after -- would replace the server's certificate, which grab's own client "
-                           "can't use; "));
-    // Values grab's own client can't use: refused now, not when it connects.
-    CHECK(error({"--timeout", "off"}) == "the flags after --: --timeout off: grab's own client takes a time from 1s to "
-                                         "24h there (with none, a stalled download couldn't be cancelled)");
-    CHECK(error({"--timeout=0.5s"}).starts_with("the flags after --: --timeout 0.5s: grab's own client takes"));
-    CHECK(error({"--timeout", "25h"}).starts_with("the flags after --: --timeout 25h:"));
-    CHECK(error({"--timeout", "abc"}).starts_with("the flags after --: --timeout abc: not a time grab can read"));
-    CHECK(error({"--bind"}) == "the flags after --: --bind needs a value");
-    CHECK(error({"--bind=-x"}) == "the flags after --: --bind -x: the address can't start with -");
-    // `engine = rclone` in the section changes none of it.
-    ctx.settings.engine = Engine::rclone;
-    CHECK(error({"--dry-run"}).ends_with("; grab's own -n shows what would be fetched"));
-    CHECK(error({"--sftp-chunk-size", "1Mi"}).starts_with("--sftp-chunk-size after -- isn't used by grab's own client"));
 }
 
 TEST_CASE("an unpinned server is refused before grab's client dials: use Trust") {

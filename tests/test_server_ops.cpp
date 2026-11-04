@@ -275,6 +275,13 @@ TEST_CASE("server list: the guard's reasons, the connection keys; Trust and the 
     CHECK(list[4].guard.empty());
     REQUIRE(list[5].guard.size() == 1);
     CHECK(list[5].guard[0].where == "rclone.disable_concurrent_reads");
+    // Why grab doesn't connect to one, as Test and the window's card say it: the guard's reason, or
+    // a bind left in common_flags with no `bind` key (phase 9 step 7).
+    CHECK(list[0].unusable.starts_with("[box] connects through a SOCKS proxy (rclone.socks_proxy in grab's store)"));
+    CHECK(list[1].unusable.empty());
+    CHECK(list[2].unusable.starts_with("[plain] common_flags' --bind 10.0.0.7 isn't read any more: write bind = 10.0.0.7"));
+    CHECK(list[4].unusable.empty());
+    CHECK(list[5].unusable.starts_with("[quirky] needs one read at a time (rclone.disable_concurrent_reads)"));
     CHECK(list[1].connection_keys == "bind 10.0.0.2, connect_timeout 1500ms, io_timeout 120s");
     CHECK(list[0].connection_keys.empty());
     // Trust and the host-key fetch of an Edit: refused for a guarded server, naming the setting
@@ -290,18 +297,18 @@ TEST_CASE("server list: the guard's reasons, the connection keys; Trust and the 
         "the import kept rclone.socks_proxy in grab's store: remove box and add it again (Remove and Add in grab's "
         "Settings, or `grab server remove box` and `grab server add`)"));
     CHECK(server_ops::reach_for(env, "jumped").has_value());
-    // The host-key fetch connects from the server's bind, within its connect time (common_flags'
-    // --bind where the key is blank); a new server has none.
+    // The host-key fetch connects from the server's bind, within its connect time; a new server
+    // has none. A bind left in common_flags with no `bind` key refuses it, rather than fetch from
+    // another address (phase 9 step 7).
     const auto agent = server_ops::reach_for(env, "agent");
     REQUIRE(agent);
     CHECK(agent->bind == "10.0.0.2");
     CHECK(agent->bind_from == "bind in [agent]");
     CHECK(agent->connect_timeout == std::chrono::milliseconds(1'500));
-    const auto plain = server_ops::reach_for(env, "plain");
-    REQUIRE(plain);
-    CHECK(plain->bind == "10.0.0.7");
-    CHECK(plain->bind_from == "common_flags' --bind");
-    CHECK_FALSE(plain->connect_timeout);
+    CHECK(server_ops::reach_for(env, "plain").error_or("") ==
+          "[plain] common_flags' --bind 10.0.0.7 isn't read any more: write bind = 10.0.0.7 in [plain] (grab config) and "
+          "take it out of common_flags. Until then grab doesn't connect to plain rather than connect from another address");
+    CHECK_FALSE(server_ops::reach_for(env, "plain", server_ops::Purpose::edit));
     const auto none = server_ops::reach_for(env, "new");
     REQUIRE(none);
     CHECK(none->bind.empty());
@@ -421,7 +428,7 @@ TEST_CASE("a new server's name: no other section's, ignoring case; 2 characters;
     const auto env = s.env();
     CHECK(server_ops::name_taken(env, "box").value_or("").find("already") != std::string::npos);
     CHECK(server_ops::name_taken(env, "BOX").value_or("").find("only in case") != std::string::npos);
-    CHECK(server_ops::name_taken(env, "x").has_value()); // one letter: a drive to rclone (G169)
+    CHECK(server_ops::name_taken(env, "x").has_value()); // one letter: a drive to grab 0.20 and earlier (G169)
     CHECK(server_ops::name_taken(env, "grab").has_value());
     CHECK_FALSE(server_ops::name_taken(env, "nas").has_value());
     CHECK_FALSE(server_ops::name_taken(env, "box.eu").has_value());
@@ -963,15 +970,17 @@ TEST_CASE("server ops: a test stands on grab's login") {
     CHECK_FALSE(guarded.ok());
 }
 
-TEST_CASE("server ops: Test is grab's login only, whatever `engine` says; a guarded or unpinned server fails before anything dials") {
+TEST_CASE("server ops: Test is grab's login only, whatever `engine` says; a guarded, bound or unpinned server fails before anything dials") {
     // Every server fails without the network: grab's login binds to TEST-NET's 192.0.2.1, which
     // this PC hasn't got; the old `rclone =` names a program that isn't there and isn't asked.
     Scratch s;
     s.write("grab.conf", "[grab]\nrclone = " + util::path_to_utf8(s.dir / "no-rclone.exe") +
                              "\n\n[g]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\nengine = grab\n"
-                             "common_flags = --bind 192.0.2.1\n"
+                             "bind = 192.0.2.1\n"
                              "\n[r]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\nengine = rclone\nfind = rclone\n"
-                             "common_flags = --bind 192.0.2.1\n"
+                             "bind = 192.0.2.1\ncommon_flags = --bind 10.0.0.9\n"
+                             "\n[b]\nhost = 127.0.0.1\nport = 1\nuser = me\nauth = agent\n"
+                             "ssh_options = -o BindAddress=192.0.2.1\n"
                              "\n[u]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\n"
                              "\n[p]\nhost = 127.0.0.1\nport = 2\nuser = me\nauth = agent\n"
                              "common_flags = --sftp-socks-proxy fake-user:fake-pass@127.0.0.1:1080\n");
@@ -981,7 +990,7 @@ TEST_CASE("server ops: Test is grab's login only, whatever `engine` says; a guar
         const auto t = server_ops::test_connection(env, name);
         REQUIRE(t.has_value());
         CHECK(t->grab_ok == false);
-        CHECK(t->grab_error.find("--bind") != std::string::npos);
+        CHECK(t->grab_error.find("bind in [") != std::string::npos);
         CHECK(t->grab_error.find("engine = rclone") == std::string::npos);
         CHECK(t->unusable.empty());
         CHECK_FALSE(t->ok());
@@ -1001,6 +1010,12 @@ TEST_CASE("server ops: Test is grab's login only, whatever `engine` says; a guar
     CHECK(p->unusable.find("fake-") == std::string::npos);
     CHECK_FALSE(p->ok());
     CHECK(server_ops::test_lines(*p) == std::vector<std::string>{"not usable: " + p->unusable});
+    // [b]: a bind left in ssh_options with no `bind` key: the refusal, nothing tried.
+    const auto b = server_ops::test_connection(env, "b");
+    REQUIRE(b.has_value());
+    CHECK_FALSE(b->grab_ok.has_value());
+    CHECK(b->unusable.starts_with("[b] ssh_options' -o BindAddress=192.0.2.1 isn't read any more: write bind = 192.0.2.1"));
+    CHECK(server_ops::test_lines(*b) == std::vector<std::string>{"not usable: " + b->unusable});
     // A section without details can't be tested.
     s.write("grab.conf", "[grab]\n\n[bare]\nmax_depth = 2\n");
     CHECK_FALSE(server_ops::test_connection(s.env(), "bare").has_value());
@@ -1130,8 +1145,7 @@ TEST_CASE("the window's notice after an import names the servers moved and what 
     const auto lines = util::split(text, '\n');
     REQUIRE(lines.size() == 5);
     CHECK(lines[0] == "Servers are kept in grab.conf now: the connection details of Main, Box, " + georgian +
-                          " moved there from rclone.conf, which stays as it was (grab no longer writes it). Their "
-                          "passwords are in grab's own encrypted store.");
+                          " moved there from rclone.conf. Their passwords are in grab's own encrypted store.");
     CHECK(lines[1] == "Box: its host key isn't trusted yet: use Trust in Settings, which shows its fingerprints to compare.");
     CHECK(lines[2] == georgian + ": no password is saved for it: enter it with Edit.");
     // The import's notes the lines above don't already say ("gone" was removed since).
@@ -1145,6 +1159,5 @@ TEST_CASE("the window's notice after an import names the servers moved and what 
     CHECK(server_ops::import_banner({"old"}, servers, {}).find("\n[old] has no details") != std::string::npos);
     // Only ssh-agent servers moved: no password to speak of.
     CHECK(server_ops::import_banner({"Main"}, servers, {}) ==
-          "Servers are kept in grab.conf now: the connection details of Main moved there from rclone.conf, which stays "
-          "as it was (grab no longer writes it).");
+          "Servers are kept in grab.conf now: the connection details of Main moved there from rclone.conf.");
 }

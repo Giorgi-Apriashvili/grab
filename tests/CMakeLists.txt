@@ -44,7 +44,6 @@ add_executable(grab_tests
     test_activity.cpp
     test_local_name.cpp
     test_rclone_encoding.cpp
-    test_rclone_flags.cpp
     test_rclone_env.cpp
     test_rclone_conf.cpp
     test_rclone_import.cpp

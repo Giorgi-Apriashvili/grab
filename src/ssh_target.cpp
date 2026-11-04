@@ -201,42 +201,4 @@ std::optional<std::chrono::milliseconds> parse_duration(std::string_view text) {
     return std::chrono::milliseconds{total > 0 && ms == 0 ? 1 : ms};
 }
 
-std::expected<ConnectionFlags, std::string> read_flags(std::span<const std::string> flags) {
-    ConnectionFlags out;
-    for (std::size_t i = 0; i < flags.size(); ++i) {
-        const std::string& flag = flags[i];
-        const std::string name = flag.substr(0, flag.find('='));
-        if (name != "--bind" && name != "--contimeout" && name != "--timeout") {
-            out.unused.push_back(flag);
-            continue;
-        }
-        std::string value;
-        if (name.size() < flag.size()) value = flag.substr(name.size() + 1);
-        else if (i + 1 < flags.size() && !flags[i + 1].starts_with('-')) value = flags[++i];
-        else return util::failf("{} needs a value", name);
-        if (name == "--bind") {
-            out.bind = std::string(util::trim(value));
-            continue;
-        }
-        const auto time = parse_duration(value);
-        if (!time) return util::failf("{} {}: not a time grab can read (such as 30s, 1m30s or off)", name, value);
-        if (name == "--contimeout") {
-            out.connect_timeout = *time;
-        } else {
-            out.timeout = *time;
-            out.timeout_text = std::string(util::trim(value));
-        }
-    }
-    return out;
-}
-
-std::expected<std::vector<std::string>, std::string> apply_flags(Target& target, std::span<const std::string> flags) {
-    auto read = read_flags(flags);
-    if (!read) return util::fail(read.error());
-    if (read->bind) target.bind = *read->bind;
-    if (read->connect_timeout) target.connect_timeout = *read->connect_timeout;
-    if (read->timeout) target.timeout = *read->timeout;
-    return std::move(read->unused);
-}
-
 } // namespace grab::ssh

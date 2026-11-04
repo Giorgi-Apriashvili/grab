@@ -175,7 +175,7 @@ std::string clear_text(std::string_view server, const Reason& r, const std::vect
                            "in that window before starting grab) or for good",
                            r.setting, r.setting);
     case Origin::common_flags: return std::format("take {} out of common_flags in [{}] (grab config)", r.setting, server);
-    case Origin::run_flags: return std::format("leave {} out after --", r.setting);
+    case Origin::folder_flags: return std::format("take {} out of folder_flags in [{}] (grab config)", r.setting, server);
     case Origin::ssh_options: return std::format("delete {} from ssh_options in [{}] (grab config)", r.setting, server);
     case Origin::unreadable: break;
     }
@@ -205,6 +205,7 @@ Sources sources(const RemoteSettings& settings, const server_conf::Connection& c
                    .lines = connection.rclone,
                    .environment = [](const std::string& name) { return util::getenv_utf8(name.c_str()); },
                    .common_flags = settings.common_flags,
+                   .folder_flags = settings.folder_flags,
                    .ssh_options = settings.ssh_options};
 }
 
@@ -228,6 +229,8 @@ Settings evaluate(const Sources& sources) {
     }
     read_flags(settings, sources.common_flags, Origin::common_flags,
                [](std::string_view flag) { return std::format("common_flags' {}", flag); });
+    read_flags(settings, sources.folder_flags, Origin::folder_flags,
+               [](std::string_view flag) { return std::format("folder_flags' {}", flag); });
     read_ssh_options(settings, sources.ssh_options);
     return settings;
 }
@@ -237,10 +240,6 @@ void add_unreadable_store(Settings& settings) {
                               .origin = Origin::unreadable,
                               .setting = {},
                               .blocks = Kind::route};
-}
-
-void add_run_flags(Settings& settings, std::span<const std::string> run_flags) {
-    read_flags(settings, run_flags, Origin::run_flags, [](std::string_view flag) { return std::format("{} after --", flag); });
 }
 
 std::vector<Reason> reasons(const Settings& settings) {
