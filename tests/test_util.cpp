@@ -159,6 +159,33 @@ TEST_CASE("a new file is written only where nothing is") {
     std::filesystem::remove_all(dir);
 }
 
+#ifdef _WIN32
+TEST_CASE("a log still open (its writer still runs) isn't deleted; a closed one is") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-remove-if-unused";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto log = dir / "grab-update-1234.log";
+    REQUIRE(util::write_new_file(log, "running the installer silently...\n"));
+    // Open as `grab update`'s stdout is: written, shared with readers, writers and deleters.
+    HANDLE writer = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(writer != INVALID_HANDLE_VALUE);
+    CHECK_FALSE(util::remove_if_unused(log));
+    CHECK(std::filesystem::exists(log));
+    // Only read (the window following it) holds it too.
+    CloseHandle(writer);
+    HANDLE reader = CreateFileW(log.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(reader != INVALID_HANDLE_VALUE);
+    CHECK_FALSE(util::remove_if_unused(log));
+    CloseHandle(reader);
+    CHECK(util::remove_if_unused(log));
+    CHECK_FALSE(std::filesystem::exists(log));
+    CHECK_FALSE(util::remove_if_unused(log)); // gone already
+    std::filesystem::remove_all(dir);
+}
+#endif
+
 namespace {
 
 std::filesystem::path fresh_dir(const char* name) {

@@ -82,7 +82,8 @@ run_capture(std::span<const std::string> argv, const RunOptions& opts = {});
 // Run argv[0] with all three streams and the whole environment inherited (live progress output).
 // Returns its exit code. On Windows the child is in a kill-on-close Job object, and by default so
 // is everything it starts. `contain_descendants` false lets the child's own children leave the
-// job, so they outlive it: an installer that restarts grab-gui after updating it (Restart Manager).
+// job, so they outlive it: an installer that starts grab-gui again (the Restart Manager's restart,
+// or its own after an install that failed).
 [[nodiscard]] std::expected<int, std::string> run_inherit(std::span<const std::string> argv,
                                                           bool contain_descendants = true);
 
@@ -106,7 +107,8 @@ private:
 
 // Starts argv[0] on its own: no console, stdin on NUL, stdout and stderr written to `output`
 // (created or emptied), and outside grab's job objects, so it keeps running when this process
-// ends. For grab-gui starting `grab update`, whose installer closes grab-gui. Windows only.
+// ends. For grab-gui starting `grab update`, which closes grab-gui for an installer, and for
+// `grab update` starting grab-gui again afterwards. Windows only.
 [[nodiscard]] std::expected<Independent, std::string> start_independent(std::span<const std::string> argv,
                                                                        const std::filesystem::path& output);
 

@@ -4,7 +4,7 @@
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 pauseChild, resumeChild, skipChild, resolveExisting, play, previewCancel,
-//                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, openReleasePage,
+//                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, error, update,
@@ -2579,7 +2579,7 @@ $('#update-banner').addEventListener('click', (ev) => {
   else if (act === 'notes') send({ type: 'openReleasePage' });
   else if (act === 'restart') { el.disabled = true; send({ type: 'updateRestart' }); }
   else if (act === 'later') { state.updateLater = true; renderUpdate(); }
-  else if (act === 'dismiss') { state.update = { state: '' }; renderUpdate(); }
+  else if (act === 'dismiss') { state.update = { state: '' }; renderUpdate(); send({ type: 'updateDismiss' }); }
 });
 
 // ---- the one-time notice after grab moved servers from rclone.conf into grab.conf -----------

@@ -296,4 +296,14 @@ struct Reach {
 [[nodiscard]] std::expected<std::vector<HostKey>, std::string> scan_host_keys(const Shake& shake, std::string_view where,
                                                                              const std::stop_token& stop = {});
 
+// The program is closing (grab-gui leaving, for an update too): every connection's socket is cut
+// now, so a connect, a login, a read or a command blocked on one fails at once, and so does every
+// connection tried after this, with Error(fatal, closing_text). No thread is left holding the exit
+// for a server that doesn't answer: a login stuck in the handshake waited out io_timeout, and the
+// Restart Manager gave up on grab-gui meanwhile (RCLONE-REPLACEMENT.md, Phase 9 chunk E). Any
+// thread; it lasts for the rest of the program (tests end it with allow_connections).
+void close_all_connections();
+void allow_connections();
+inline constexpr std::string_view closing_text = "grab is closing";
+
 } // namespace grab::ssh

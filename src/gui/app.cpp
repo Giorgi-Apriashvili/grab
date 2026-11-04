@@ -20,7 +20,9 @@
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "space.hpp"
+#include "ssh.hpp"
 #include "ssh_read.hpp"
+#include "update.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -146,12 +148,14 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     if (const auto applied = current_limit(schedule::local_now()); applied.limit.on) {
         limiter_.set_rate(schedule::bytes_per_s(applied.limit.mibps));
     }
-    // Output of an earlier update: an installer update outlives the window that followed it.
+    // Output of an earlier update: an installer update outlives the window that followed it. One
+    // still open stays: its `grab update` (or grab-gui) still runs and writes it, and what an
+    // update did is kept apart from it (update::Result).
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(std::filesystem::temp_directory_path(ec), ec)) {
         const auto name = e.path().filename().wstring();
         if ((name.starts_with(L"grab-update-") && name.ends_with(L".log")) || name == L"grab-gui-restart.log") {
-            std::filesystem::remove(e.path(), ec);
+            util::remove_if_unused(e.path());
         }
     }
     restore_queue();
@@ -210,6 +214,22 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
 }
 
 App::~App() {
+    try {
+        close();
+    } catch (...) {
+        // A save that threw (no memory left): the threads still stop as their members go, and
+        // nothing waits on a server meanwhile.
+        ssh::close_all_connections();
+    }
+}
+
+void App::close() {
+    if (closed_) return;
+    closed_ = true;
+    // First what outlives the program: running downloads are saved as unfinished (marked to go
+    // on by themselves when an update restarts grab-gui), however the threads end below.
+    save_state();
+    save_queue();
     // Previews and Play first (review G42): nothing queued starts any more, and the running ones
     // stop at their next READs; their workers are joined before the members they use.
     {
@@ -226,20 +246,31 @@ App::~App() {
         for (auto& worker : preview_workers_) worker.request_stop();
     }
     preview_wake_.notify_all();
+    // Every other thread is told now, not only when its member is destroyed: a Browse or a list
+    // refresh left for its turn could log in again meanwhile.
     if (search_thread_.joinable()) search_thread_.request_stop();
+    if (browse_thread_.joinable()) browse_thread_.request_stop();
+    {
+        std::scoped_lock lock(lists_mutex_);
+        for (auto& [server, refresh] : refresh_threads_) refresh.request_stop();
+    }
     if (settings_thread_.joinable()) settings_thread_.request_stop();
+    if (update_check_thread_.joinable()) update_check_thread_.request_stop();
+    if (update_thread_.joinable()) update_thread_.request_stop(); // `grab update` carries on by itself
     cancel_pending();
     // Running downloads stop where they are: file downloads keep their partial file and come
-    // back paused on the next start (save_queue below records them as unfinished).
+    // back paused on the next start (saved above as unfinished).
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->status == Status::running) item->stop.request_stop();
         }
     }
-    save_queue();
     for (auto& w : workers_) w.request_stop();
     wake_.notify_all();
+    // A login, read or command waiting on a server ends now; whatever is still connecting fails
+    // at once. Without this a login stuck in the handshake held the exit for io_timeout, twice.
+    ssh::close_all_connections();
 }
 
 void App::save_state() const { report_save("the window's settings", save_gui_state(state_path_, state_), state_unsaved_); }
@@ -741,6 +772,8 @@ void App::on_message(const std::string& text) {
         start_update();
     } else if (type == "updateRestart") {
         restart_for_update();
+    } else if (type == "updateDismiss") {
+        dismiss_update();
     } else if (type == "openReleasePage") {
         open_release_page();
     } else if (type == "prefs") {
@@ -3323,8 +3356,15 @@ void App::maybe_check_updates() {
     if (update_checks_started_) return;
     update_checks_started_ = true;
     const auto current = update::parse_version(GRAB_VERSION).value_or(update::Version{});
-    // A newer release an earlier check found shows at once, without asking GitHub again.
-    if (auto seen = update::parse_version(state_.latest_version); seen && *seen > current) {
+    // An update that failed while no window followed it (an installer update closes the one that
+    // started it) is shown until it is dismissed: "Update failed: <why>" with Try again.
+    // This copy's (grab.exe and grab-gui.exe share a folder), not another copy's sharing %LOCALAPPDATA%.
+    if (auto failed = update::pending_failure(update::result_path(), current, util::self_exe_path().parent_path())) {
+        update_ = UpdateBanner{"failed", failed->to, {}, {}, failed->error, false};
+        if (update_.error.empty()) update_.error = std::format("grab update exited with code {}", failed->exit_code);
+        post_update();
+    } else if (auto seen = update::parse_version(state_.latest_version); seen && *seen > current) {
+        // A newer release an earlier check found shows at once, without asking GitHub again.
         update_ = UpdateBanner{"available", update::to_string(*seen),
                                update::is_release_page(state_.latest_page) ? state_.latest_page : "", {}, {}, false};
         post_update();
@@ -3360,7 +3400,8 @@ void App::on_update_checked(const std::expected<update::Check, std::string>& res
     state_.latest_version = latest;
     state_.latest_page = c.release.page;
     save_state();
-    if (update_.state != "running" && update_.state != "installed") {
+    // A failure stays until it is dismissed; its Try again installs the latest release anyway.
+    if (update_.state != "running" && update_.state != "installed" && update_.state != "failed") {
         if (c.available()) {
             update_ = UpdateBanner{"available", latest, c.release.page, {}, {}, c.release.version == c.current};
         } else if (update_.state == "available") {
@@ -3379,8 +3420,8 @@ void App::on_update_checked(const std::expected<update::Check, std::string>& res
 }
 
 // `grab update` does the work (verify, then the installer or the portable swap). It runs on its
-// own, outside grab-gui's job, because the installer closes grab-gui; its output, written to a
-// file, tells the banner how far it got.
+// own, outside grab-gui's job, because for the installer it closes grab-gui (and starts it again);
+// its output, written to a file, tells the banner how far it got.
 void App::start_update() {
     if (update_.state == "running") return;
     auto fail = [this](std::string why) {
@@ -3442,8 +3483,9 @@ void App::on_update_line(const std::string& line) {
     case update::Phase::downloading: update_.phase = "downloading"; break;
     case update::Phase::verified: update_.phase = "verified"; break;
     case update::Phase::installing:
-        // The installer closes grab-gui next and starts it again afterwards: running downloads
-        // stop there (partial files kept) and continue in the new one.
+        // grab-gui is closed for the installer and started again afterwards (the close request
+        // marks them too): running downloads stop there (partial files kept) and continue in the
+        // new one.
         update_.phase = "installing";
         mark_for_restart(true);
         break;
@@ -3466,6 +3508,13 @@ void App::on_update_finished(int exit_code, const std::string& last_error) {
         update_.error = !last_error.empty() ? last_error : std::format("grab update exited with code {}", exit_code);
     }
     post_update();
+}
+
+void App::dismiss_update() {
+    if (update_.state != "failed") return;
+    update_ = {};
+    std::error_code ec;
+    std::filesystem::remove(update::result_path(), ec);
 }
 
 void App::restart_for_update() {

@@ -65,9 +65,19 @@ public:
     };
 
     App(Host host, std::filesystem::path config_path, std::filesystem::path state_path);
-    ~App(); // cancels the search and running download, joins the threads
+    ~App(); // close(), then joins the threads
     App(const App&) = delete;
     App& operator=(const App&) = delete;
+
+    // UI thread, as the window closes: what must outlive the program is saved first (the window's
+    // settings, the queue: running downloads come back paused, or go on after an update's
+    // restart), then every thread is told to stop and every server connection is cut
+    // (ssh::close_all_connections), so the destructor's joins end within moments, not after a
+    // login stuck on a server that doesn't answer. Once; the destructor calls it too.
+    void close();
+    // UI thread: `grab update` closes the window to replace grab-gui and starts it again: the
+    // running and queued downloads go on there by themselves.
+    void will_restart() { mark_for_restart(true); }
 
     // UI thread: one message from the page.
     void on_message(const std::string& json);
@@ -405,6 +415,8 @@ private:
     void start_update();        // runs `grab.exe update` from this program's folder
     void on_update_line(const std::string& line);
     void on_update_finished(int exit_code, const std::string& last_error);
+    // The failed banner closed: the failure `grab update` kept (update::Result) isn't shown again.
+    void dismiss_update();
     void restart_for_update();  // starts the new grab-gui, which waits for this one, and exits
     void mark_for_restart(bool on); // marks (or unmarks) running and queued downloads, then saves
     void post_update() const;
@@ -461,6 +473,7 @@ private:
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open
     std::string import_banner_;        // UI thread: the one-time notice after an import, until the page shows it
     bool page_ready_ = false;          // UI thread: the page has sent "init"
+    bool closed_ = false;              // UI thread: close() ran
     fetch::Connections connections_;
     ssh::Pools pools_;          // grab's own SSH connections: engine = grab servers, every server's verification
     rate::RateLimiter limiter_; // shared by every download's streams

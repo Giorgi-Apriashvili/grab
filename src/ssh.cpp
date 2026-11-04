@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -48,6 +49,54 @@ constexpr socket_t no_socket = -1;
 void close_socket(socket_t s) { ::close(s); }
 int last_socket_error() { return errno; }
 #endif
+
+// The sockets of the connections open now, for close_all_connections, and whether the program is
+// closing. A socket is in `open` from its creation until just before it is closed, so a cut never
+// reaches a socket number the system has given out again since. `closed` holds the ones
+// close_all_connections closed itself (Windows), which their threads then leave alone.
+struct Sockets {
+    std::mutex mutex;
+    std::vector<socket_t> open;
+    std::vector<socket_t> closed;
+    std::atomic<bool> closing{false};
+};
+
+Sockets& sockets() {
+    static Sockets s;
+    return s;
+}
+
+bool closing() { return sockets().closing.load(); }
+
+Error closing_error() { return {budget::Failure::fatal, std::string(closing_text)}; }
+
+// `s` joins the open sockets; once the program is closing it is closed instead (false).
+bool track(socket_t s) {
+    auto& all = sockets();
+    {
+        std::scoped_lock lock(all.mutex);
+        if (!all.closing) {
+            all.open.push_back(s);
+            return true;
+        }
+    }
+    close_socket(s);
+    return false;
+}
+
+// Closes `s`, which leaves the open sockets first; not when close_all_connections closed it already.
+void close_tracked(socket_t s) {
+    auto& all = sockets();
+    {
+        std::scoped_lock lock(all.mutex);
+        if (auto at = std::ranges::find(all.closed, s); at != all.closed.end()) {
+            all.closed.erase(at);
+            return;
+        }
+        std::erase(all.open, s);
+    }
+    close_socket(s);
+}
 
 void init_once() {
     static std::once_flag once;
@@ -98,6 +147,7 @@ std::int32_t ms_or_none(std::chrono::milliseconds t) {
 // A TCP connection to host:port within `connect_timeout`, from the `bind` address when one is set
 // (an address of the same family as the server's).
 socket_t connect_tcp(const Target& t) {
+    if (closing()) throw closing_error();
     Addresses found;
     if (!found.resolve(t.host, t.port))
         throw Error(budget::Failure::other, std::format("can't find the server {}", t.host));
@@ -125,9 +175,10 @@ socket_t connect_tcp(const Target& t) {
         if (local.first && !from) continue;
         socket_t c = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (c == no_socket) continue;
+        if (!track(c)) throw closing_error();
         if (from && ::bind(c, from->ai_addr, static_cast<int>(from->ai_addrlen)) != 0) {
             const int e = last_socket_error();
-            close_socket(c);
+            close_tracked(c);
             throw Error(budget::Failure::fatal, std::format("can't connect from {} ({}): error {}", t.bind, t.bind_from, e));
         }
         set_blocking(c, false);
@@ -141,23 +192,42 @@ socket_t connect_tcp(const Target& t) {
             bool in_progress = e == EINPROGRESS;
 #endif
             if (in_progress) {
+                // A quarter of a second at a time, so the program closing doesn't wait out
+                // connect_timeout. No limit: as long as the system tries. A refusal comes as an
+                // exception (Windows).
+                const std::int32_t ms = ms_or_none(t.connect_timeout);
+                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+                int ready = 0;
                 fd_set w;
                 fd_set x;
-                FD_ZERO(&w);
-                FD_ZERO(&x);
-                FD_SET(c, &w);
-                FD_SET(c, &x);
-                const std::int32_t ms = ms_or_none(t.connect_timeout);
-                timeval tv{.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
-                // No limit: as long as the system tries. A refusal comes as an exception (Windows).
-                if (select(static_cast<int>(c + 1), nullptr, &w, &x, ms > 0 ? &tv : nullptr) > 0) {
+                for (;;) {
+                    FD_ZERO(&w);
+                    FD_ZERO(&x);
+                    FD_SET(c, &w);
+                    FD_SET(c, &x);
+                    auto slice = std::chrono::milliseconds(250);
+                    if (ms > 0) {
+                        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            until - std::chrono::steady_clock::now());
+                        if (left.count() <= 0) break;
+                        slice = std::min(slice, left);
+                    }
+                    timeval tv{.tv_sec = 0, .tv_usec = static_cast<long>(slice.count() * 1000)};
+                    ready = select(static_cast<int>(c + 1), nullptr, &w, &x, &tv);
+                    if (ready != 0 || closing()) break;
+                }
+                if (closing()) {
+                    close_tracked(c);
+                    throw closing_error();
+                }
+                if (ready > 0) {
                     int err = 0;
                     socklen_t len = sizeof err;
                     getsockopt(c, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
                     ok = err == 0 && FD_ISSET(c, &w);
                     why = ok ? "" : std::format("connection failed ({})", err);
                 } else {
-                    why = "no answer";
+                    why = ready < 0 ? std::format("connection failed ({})", last_socket_error()) : "no answer";
                 }
             } else {
                 why = std::format("connection failed ({})", e);
@@ -167,7 +237,7 @@ socket_t connect_tcp(const Target& t) {
             set_blocking(c, true);
             s = c;
         } else {
-            close_socket(c);
+            close_tracked(c);
         }
     }
     if (s == no_socket) throw Error(budget::Failure::other, std::format("can't reach {}:{}: {}", t.host, t.port, why));
@@ -509,7 +579,8 @@ std::expected<std::string, ShakeError> read_host_key(const Target& t, std::strin
         libssh2_session_disconnect(session, "grab has read the host key");
         libssh2_session_free(session);
     }
-    close_socket(s);
+    close_tracked(s);
+    if (!result && closing()) result = std::unexpected(ShakeError{.message = std::string(closing_text)});
     return result;
 }
 
@@ -630,6 +701,9 @@ Connection::Connection(const Target& target) {
         open(target);
     } catch (...) {
         close(); // a constructor that throws gets no destructor
+        // A login cut short by close_all_connections isn't the server turning grab away (no
+        // connection limit is learned from it) nor a login refused.
+        if (closing()) throw closing_error();
         throw;
     }
 }
@@ -643,7 +717,7 @@ void Connection::close() {
         session_ = nullptr;
     }
     if (socket_ != ~std::uintptr_t{0}) {
-        close_socket(static_cast<socket_t>(socket_));
+        close_tracked(static_cast<socket_t>(socket_));
         socket_ = ~std::uintptr_t{0};
     }
     std::fill(password_.begin(), password_.end(), '\0');
@@ -938,5 +1012,31 @@ std::string Connection::algorithms() const {
     return std::format("{} {} {}", method(LIBSSH2_METHOD_KEX), method(LIBSSH2_METHOD_HOSTKEY),
                        method(LIBSSH2_METHOD_CRYPT_SC));
 }
+
+void close_all_connections() {
+    auto& all = sockets();
+    std::scoped_lock lock(all.mutex);
+    all.closing = true;
+#ifdef _WIN32
+    // Closed, not only shut down: a shutdown wakes a select() waiting to read only once the server
+    // answers the FIN, and a frozen or black-holed server never does (a login stuck in the
+    // handshake, a read in libssh2's blocking mode). A close wakes it at once, and a linger of 0
+    // resets the link instead of leaving it to time out. The thread using one gets WSAENOTSOCK
+    // from then on and doesn't close it again (close_tracked); no socket of grab's is made any
+    // more (track), so the number isn't given to one of its own connections meanwhile.
+    for (const socket_t s : all.open) {
+        const linger now{.l_onoff = 1, .l_linger = 0};
+        ::setsockopt(s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&now), sizeof(now));
+        close_socket(s);
+        all.closed.push_back(s);
+    }
+    all.open.clear();
+#else
+    // Shut down, not closed: the thread using one still owns it and closes it (close_tracked).
+    for (const socket_t s : all.open) cut(s);
+#endif
+}
+
+void allow_connections() { sockets().closing = false; }
 
 } // namespace grab::ssh

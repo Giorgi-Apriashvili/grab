@@ -452,6 +452,21 @@ bool write_new_file(const std::filesystem::path& p, std::string_view text) {
     return ok;
 }
 
+bool remove_if_unused(const std::filesystem::path& p) {
+#ifdef _WIN32
+    // Shared with nobody: the open fails while any other handle to the file is open, and the file
+    // goes when this one closes, so nothing can open it in between.
+    const HANDLE h = CreateFileW(p.c_str(), DELETE, 0, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+#else
+    std::error_code ec;
+    return std::filesystem::remove(p, ec);
+#endif
+}
+
 std::string escape_field(std::string_view s) {
     std::string out;
     out.reserve(s.size());

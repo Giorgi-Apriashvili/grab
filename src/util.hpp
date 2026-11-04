@@ -77,6 +77,9 @@ inline constexpr int local_hashes_at_once = 4;
 // Writes `text` to a new file `p`; false when anything exists at `p` already (it is left alone)
 // or the write fails (the new file is removed again).
 bool write_new_file(const std::filesystem::path& p, std::string_view text);
+// Deletes the file `p` only when no program has it open (Windows): a log a running program still
+// writes (`grab update`'s output) stays. True when it went. Elsewhere it is simply deleted.
+bool remove_if_unused(const std::filesystem::path& p);
 // A downloaded file into place: `data` goes to a new file of a random name beside `p`, which gets
 // the modification time `unix_ns` (nanoseconds since 1970, when given) and then takes p's place,
 // replacing a file there. Not flushed to the disk first: a download lost to a power cut is fetched

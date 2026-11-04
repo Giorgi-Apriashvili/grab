@@ -17,26 +17,29 @@
 #include <shellapi.h>
 #include <windowsx.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cwchar>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <memory>
-#include <cwchar>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 
 using namespace grab;
 
 namespace {
 
-constexpr wchar_t window_class[] = L"grab.gui.window";
+constexpr const wchar_t* window_class = update::gui_window_class;
 constexpr wchar_t instance_mutex[] = L"Local\\grab.gui.single-instance.";
 constexpr wchar_t instance_slot[] = L"Local\\grab.gui.window-handle.";
 constexpr UINT wm_post_json = WM_APP + 1; // lParam: std::string*
 constexpr UINT wm_run = WM_APP + 2;       // lParam: std::function<void()>*
 constexpr UINT wm_show = WM_APP + 3;      // from a second launch: bring the window back
+constexpr UINT wm_quit = WM_APP + 4;      // App::Host::quit, once the call that asked has returned (G138)
 constexpr UINT_PTR timer_tray = 1;        // every second: the tray tooltip and the speed schedule
 constexpr UINT_PTR timer_exit = 2;        // fallback exit when a notification never reports back
 constexpr UINT id_show = 1;               // tray menu
@@ -48,6 +51,7 @@ struct Globals {
     std::unique_ptr<gui::App> app;
     gui::TrayIcon tray;
     UINT wm_taskbar_created = 0;
+    UINT wm_close_for_update = 0; // update::gui_close_request
     std::wstring tip;
     bool in_tray = false;         // closed while downloads ran: hidden, not quit
     bool exit_after_notice = false; // the queue drained in the tray: quit once the toast is gone
@@ -130,8 +134,27 @@ void show_window(HWND hwnd) {
     SetForegroundWindow(hwnd);
 }
 
+// The last resort once grab-gui is leaving, its queue and settings saved: whatever still holds the
+// exit after update::gui_exit_deadline, the process ends then. An installer's Restart Manager gives
+// up on a program that takes more than about 30 s (and the update with it), and `grab update`
+// waits for it.
+void end_by_deadline() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            std::this_thread::sleep_for(update::gui_exit_deadline);
+            TerminateProcess(GetCurrentProcess(), 0);
+        }).detach();
+    });
+}
+
+// Leaves now, even with downloads running: saved first (the window's place here, the rest in
+// App::close), then every thread told to stop and every connection cut, so the joins in WM_DESTROY
+// take moments (RCLONE-REPLACEMENT.md, Phase 9 chunk E).
 void quit(HWND hwnd) {
     if (!g.in_tray) remember_placement(hwnd);
+    if (g.app) g.app->close();
+    end_by_deadline();
     DestroyWindow(hwnd);
 }
 
@@ -219,11 +242,21 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         g.tray.readd(); // Explorer restarted
         return 0;
     }
+    if (msg == g.wm_close_for_update && msg != 0) {
+        // `grab update` replaces grab-gui and starts it again afterwards: running and queued
+        // downloads go on there.
+        if (g.app) g.app->will_restart();
+        quit(hwnd);
+        return 0;
+    }
     switch (msg) {
     case gui::TrayIcon::callback_message:
         return on_tray_event(hwnd, wparam, lparam);
     case wm_show:
         show_window(hwnd);
+        return 0;
+    case wm_quit:
+        quit(hwnd);
         return 0;
     case WM_TIMER:
         if (wparam == timer_tray) {
@@ -281,8 +314,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         quit(hwnd);
         return 0;
     // Logoff, shutdown, or an installer closing grab-gui through the Restart Manager
-    // (ENDSESSION_CLOSEAPP): agree, then exit cleanly. Running downloads stop where they are and
-    // keep their partial files; an installer update starts grab-gui again afterwards.
+    // (ENDSESSION_CLOSEAPP): agree, then exit at once (quit). Running downloads stop where they
+    // are and keep their partial files; an installer update starts grab-gui again afterwards.
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
@@ -291,7 +324,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     case WM_DESTROY:
         KillTimer(hwnd, timer_tray);
         KillTimer(hwnd, timer_exit);
-        g.app.reset(); // cancels and joins worker threads while the window still exists
+        g.app.reset(); // joins the worker threads (told to stop by App::close) while the window still exists
         g.tray.remove();
         g.webview.close();
         g.hwnd = nullptr;
@@ -317,6 +350,34 @@ void place_window(HWND hwnd, const GuiState& state, int& show) {
     if (w.maximized) show = SW_SHOWMAXIMIZED;
 }
 
+// Whether `p` (the process --restart names) is the old window that started this one, before it is
+// waited for and ended. Its PID may already be another program's, once the old window left before
+// this one got here (or a hand-typed one): that one was created after this process, or runs
+// another program.
+bool is_old_window(HANDLE p) {
+    FILETIME created{};
+    FILETIME mine{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (!GetProcessTimes(p, &created, &exited, &kernel, &user) ||
+        !GetProcessTimes(GetCurrentProcess(), &mine, &exited, &kernel, &user) ||
+        CompareFileTime(&created, &mine) >= 0) {
+        return false;
+    }
+    std::wstring image(32768, L'\0');
+    auto size = static_cast<DWORD>(image.size());
+    if (QueryFullProcessImageNameW(p, 0, image.data(), &size) == 0) return false;
+    image.resize(size);
+    const std::filesystem::path program(image);
+    const auto name = util::to_lower(util::path_to_utf8(program.filename()));
+    if (name != "grab-gui.exe" && name != "grab-gui.exe.old") return false;
+    const auto here = util::self_exe_path().parent_path();
+    std::error_code ec;
+    return update::same_dir(util::path_to_utf8(program.parent_path()), util::path_to_utf8(here)) ||
+           std::filesystem::equivalent(program.parent_path(), here, ec);
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show) {
@@ -332,15 +393,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     bool already_running = mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS;
     // "--restart PID": started by an update's "Restart grab" while the old window (PID) is
     // closing. Wait until that process is gone, not merely its lock, so the programs it ran can
-    // be deleted next, instead of handing over to it.
+    // be deleted next, instead of handing over to it. It ends within update::gui_exit_deadline; one
+    // still there after gui_exit_wait (a grab 0.20 window, which has no deadline and took a minute
+    // with a login stuck) is ended here: it asked for this restart and saved its queue first.
     if (const auto restart = std::wstring_view(command_line).find(L"--restart"); restart != std::wstring_view::npos) {
         const DWORD old_pid = static_cast<DWORD>(std::wcstoul(command_line + restart + 9, nullptr, 10));
-        if (HANDLE old = old_pid != 0 ? OpenProcess(SYNCHRONIZE, FALSE, old_pid) : nullptr; old != nullptr) {
-            WaitForSingleObject(old, 30000);
+        constexpr DWORD access = SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        if (HANDLE old = old_pid != 0 ? OpenProcess(access, FALSE, old_pid) : nullptr; old != nullptr) {
+            const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(update::gui_exit_wait);
+            if (is_old_window(old) && WaitForSingleObject(old, static_cast<DWORD>(wait.count())) == WAIT_TIMEOUT) {
+                TerminateProcess(old, 1);
+                WaitForSingleObject(old, 5000);
+            }
             CloseHandle(old);
         }
+        // Gone, it left the lock behind (abandoned); held, it is another window's, which takes over.
         if (already_running) {
-            const DWORD waited = WaitForSingleObject(mutex, 30000);
+            const DWORD waited = WaitForSingleObject(mutex, 5000);
             already_running = waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED;
         }
     }
@@ -379,6 +448,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     wc.lpszClassName = window_class;
     RegisterClassExW(&wc);
 
+    g.wm_close_for_update = RegisterWindowMessageW(update::gui_close_request);
     const UINT dpi = GetDpiForSystem();
     g.hwnd = CreateWindowExW(0, window_class, L"grab", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                              MulDiv(1100, static_cast<int>(dpi), 96), MulDiv(720, static_cast<int>(dpi), 96),
@@ -401,8 +471,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
             if (g.hwnd != nullptr) on_download_finished(g.hwnd, name, ok, error);
         });
     };
+    // Posted: App's teardown must not run inside the App call that asked for it (review G138).
     host.quit = [] {
-        if (g.hwnd != nullptr) quit(g.hwnd);
+        if (g.hwnd != nullptr) PostMessageW(g.hwnd, wm_quit, 0, 0);
     };
     g.app = std::make_unique<gui::App>(std::move(host), default_grab_config_path(),
                                        state_dir(default_grab_config_path()) / "gui.json");

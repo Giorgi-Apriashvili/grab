@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <compare>
 #include <cstdint>
 #include <expected>
@@ -9,6 +10,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace grab::update {
@@ -70,6 +72,26 @@ enum class InstallMode {
 // Windows directory equality: case-insensitive, '/' == '\', repeated and trailing separators
 // ignored (Inno stores InstallLocation with a trailing '\', so "<loc>\bin" doubles it).
 [[nodiscard]] bool same_dir(std::string_view a, std::string_view b);
+// A name for the folder `dir` (UTF-8), the same for every spelling same_dir takes as that folder:
+// the SHA-256 (lowercase hex) of the folder as same_dir compares it (ASCII lower case, '\', no
+// trailing separator) in UTF-16LE. The installer computes it too (GetSHA256OfUnicodeString of
+// LowerCase('{app}\bin')), so the two must stay alike.
+[[nodiscard]] std::string folder_key(std::string_view dir);
+
+// grab-gui's window class (src/gui/main_gui.cpp), by which `grab update` and the installer find
+// the windows open.
+inline constexpr const wchar_t* gui_window_class = L"grab.gui.window";
+// A registered window message: `grab update` asks grab-gui to save and close, to replace it and
+// start it again afterwards (running and queued downloads go on there).
+inline constexpr const wchar_t* gui_close_request = L"grab.gui.close-for-update";
+// How long grab-gui takes at most to end once it closes: its queue and settings are saved first,
+// and after this it ends whatever still runs (the Restart Manager gives up on a program that takes
+// more than about 30 s, and the update with it).
+inline constexpr std::chrono::seconds gui_exit_deadline{5};
+// How long `grab update`, and a grab-gui restarted after a portable update, wait for an old
+// grab-gui to end before they end it: its deadline and room to spare (0.20.1's window has none,
+// and took up to a minute with a login stuck).
+inline constexpr std::chrono::seconds gui_exit_wait{15};
 
 // The programs a release ships next to grab.exe: grab.exe, and grab-gui.exe when this build has
 // the window.
@@ -113,13 +135,16 @@ enum class OldRclone {
     other_size, // someone else's: never opened
     not_opened, // grab's size, but it can't be opened to be deleted (a folder grab can't change, a
                 // file being written): not hashed either
-    other_file, // opened, but not grab's copy (another SHA-256, or unreadable): left as it was
+    other_file, // opened, but not grab's copy (another size or SHA-256): left as it was
+    unread,     // grab's size, opened, but its information or bytes couldn't be read (a lock, an I/O
+                // error, a placeholder offline): tried again at the next start
     renamed,    // grab's copy, running: renamed to old_rclone_aside, which a later start deletes
     removed,    // grab's copy, deleted
     stuck       // grab's copy, neither renamed nor deleted
 };
 struct OldRclones {
     bool skipped = false;            // grab.exe.old or grab-gui.exe.old is there: nothing looked at
+    bool done_before = false;        // remove_old_rclone_once: an earlier start did it; nothing looked at
     OldRclone exe = OldRclone::none; // rclone.exe
     OldRclone old = OldRclone::none; // rclone.exe.old
 };
@@ -131,9 +156,76 @@ struct OldRclones {
 OldRclones remove_old_rclone(const std::filesystem::path& dir, std::uintmax_t size = old_rclone_size,
                              std::string_view sha256 = old_rclone_sha256);
 
-// At the start of grab and grab-gui: remove_replaced_programs, then remove_old_rclone, next to the
-// running program.
+// The user's choice (2026-11-04): grab's old rclone goes once, right after the update to 0.21, and
+// an rclone.exe put in the folder later is never touched, even one that is the same 1.75.1 build.
+// remove_old_rclone_once runs remove_old_rclone in `dir` until a pass leaves nothing to come back
+// for, then marks the folder done: an empty file named folder_key(dir) in `markers`. Not done
+// while it was skipped, while grab's copy is still there (a folder grab can't change, a file it
+// couldn't delete) or while its rclone.exe.grab-old is (it still ran: remove_replaced_programs
+// deletes it at a later start). Once marked, nothing in the folder is looked at again. A folder
+// never marked before is looked at too, so the first start of 0.21 in a folder that already held an
+// rclone.exe of exactly that build removes it (docs/doc.md says to keep one's own rclone elsewhere).
+OldRclones remove_old_rclone_once(const std::filesystem::path& dir, const std::filesystem::path& markers,
+                                  std::uintmax_t size = old_rclone_size, std::string_view sha256 = old_rclone_sha256);
+// Where clean_up_at_start keeps those marks: %LOCALAPPDATA%\grab\old-rclone. The installer deletes
+// its folder's mark when it upgrades a grab older than 0.21, so going back to 0.20.1 (which brings
+// its rclone.exe back) and updating again removes it once more.
+[[nodiscard]] std::filesystem::path old_rclone_markers();
+
+// At the start of grab and grab-gui: remove_replaced_programs, then remove_old_rclone_once, next to
+// the running program.
 void clean_up_at_start();
+
+// What the last `grab update` that set out to install did, kept in %LOCALAPPDATA%\grab as
+// last-update.json, with what it printed as last-update.log beside it. An installer update closes
+// the window that started it, so nobody saw a failure: grab-gui shows it when it next opens, until
+// it is dismissed, and `grab update` says it too (RCLONE-REPLACEMENT.md, Phase 9 chunk E).
+struct Result {
+    std::string folder; // folder_key of the programs' folder: the record is that copy's
+    std::string from; // the version that ran it
+    std::string to;   // the release it installed, or tried to
+    std::string mode; // "installer" or "portable"
+    bool ok = false;
+    int exit_code = 0;                 // grab update's
+    std::optional<int> installer_exit; // the installer's, when it ran
+    std::string error;                 // its last error line, without text::error
+    std::string setup_log;             // the installer's log, kept when it failed
+    std::int64_t time = 0;             // when it ended, Unix seconds
+};
+[[nodiscard]] std::string result_json(const Result& r);
+// nullopt for anything that isn't such a record.
+[[nodiscard]] std::optional<Result> parse_result(std::string_view json_text);
+[[nodiscard]] std::filesystem::path result_path(); // %LOCALAPPDATA%\grab\last-update.json
+// Writes `r` to `json_path` and `log` beside it as last-update.log, each atomically.
+[[nodiscard]] std::expected<void, std::string> save_result(const std::filesystem::path& json_path, const Result& r,
+                                                           std::string_view log);
+// The failed update kept at `json_path` while it still matters: it was this copy's (the programs in
+// `dir`; the record is per user, and another copy may share it) and this build (`current`) is older
+// than the release it tried to install. nullopt otherwise (none, a success, another copy's,
+// unreadable).
+[[nodiscard]] std::optional<Result> pending_failure(const std::filesystem::path& json_path, const Version& current,
+                                                    const std::filesystem::path& dir);
+// "the update to 0.21.1 (2026-11-04) failed: <its error>", for the command; the window shows the
+// error itself.
+[[nodiscard]] std::string failure_text(const Result& r);
+
+// One `grab update` at a time for the programs in a folder (review G96): a named mutex keyed by
+// folder_key, held while the object lives.
+class FolderLock {
+public:
+    FolderLock() = default;
+    ~FolderLock();
+    FolderLock(FolderLock&& other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    FolderLock& operator=(FolderLock&& other) noexcept;
+    FolderLock(const FolderLock&) = delete;
+    FolderLock& operator=(const FolderLock&) = delete;
+
+private:
+    friend std::optional<FolderLock> lock_folder(const std::filesystem::path& dir);
+    void* handle_ = nullptr;
+};
+// nullopt while another `grab update` holds it (in any process). Windows; elsewhere always taken.
+[[nodiscard]] std::optional<FolderLock> lock_folder(const std::filesystem::path& dir);
 
 // GRAB_UPDATE_API, else default_api_url.
 [[nodiscard]] std::string api_url();

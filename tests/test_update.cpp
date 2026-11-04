@@ -323,6 +323,233 @@ TEST_CASE("a link named rclone.exe is never followed to the rclone it leads to")
     CHECK(fs::is_symlink(f.dir / "bin" / "rclone.exe"));
 }
 
+TEST_CASE("grab's old rclone goes once per folder; one put there later is never touched") {
+    const Folder f("grab-test-old-rclone-once");
+    const Folder marks("grab-test-old-rclone-marks");
+    const auto size = grabs_rclone().size();
+    const auto sha256 = util::sha256_hex(grabs_rclone());
+    const auto bin = f.dir / "bin";
+    fs::create_directories(bin);
+
+    // The first start after the update removes it and marks the folder done.
+    put(bin / "rclone.exe", grabs_rclone());
+    auto r = update::remove_old_rclone_once(bin, marks.dir, size, sha256);
+    CHECK_FALSE(r.done_before);
+    CHECK(r.exe == OldRclone::removed);
+    CHECK(names_in(marks.dir) == std::vector<std::string>{update::folder_key(util::path_to_utf8(bin))});
+    // The same build put there again later is the user's: nothing in the folder is looked at.
+    put(bin / "rclone.exe", grabs_rclone());
+    r = update::remove_old_rclone_once(bin, marks.dir, size, sha256);
+    CHECK(r.done_before);
+    CHECK(r.exe == OldRclone::none);
+    CHECK(bytes_of(bin / "rclone.exe") == grabs_rclone());
+    // The mark is the folder's, whatever its spelling.
+    CHECK(update::remove_old_rclone_once(f.dir / "BIN", marks.dir, size, sha256).done_before);
+
+    // Another folder has its own pass; one with nothing to remove is marked at once.
+    const auto other = f.dir / "portable";
+    fs::create_directories(other);
+    put(other / "rclone.exe", "someone else's rclone");
+    r = update::remove_old_rclone_once(other, marks.dir, size, sha256);
+    CHECK_FALSE(r.done_before);
+    CHECK(r.exe == OldRclone::other_size);
+    CHECK(names_in(marks.dir).size() == 2);
+    CHECK(bytes_of(other / "rclone.exe") == "someone else's rclone");
+}
+
+TEST_CASE("grab's old rclone isn't marked done while a pass leaves something to come back for") {
+    const Folder f("grab-test-old-rclone-pending");
+    const Folder marks("grab-test-old-rclone-pending-marks");
+    const auto size = grabs_rclone().size();
+    const auto sha256 = util::sha256_hex(grabs_rclone());
+
+    // Skipped beside a replaced program (an old grab-gui may still run): the next start tries.
+    put(f.dir / "rclone.exe", grabs_rclone());
+    put(f.dir / "grab-gui.exe.old", "x");
+    auto r = update::remove_old_rclone_once(f.dir, marks.dir, size, sha256);
+    CHECK(r.skipped);
+    CHECK_FALSE(fs::exists(marks.dir / update::folder_key(util::path_to_utf8(f.dir))));
+    CHECK(bytes_of(f.dir / "rclone.exe") == grabs_rclone());
+    fs::remove(f.dir / "grab-gui.exe.old");
+
+    // In a folder grab can't change it stays, and so does the chance to remove it later.
+    REQUIRE(set_dacl(f.dir / "rclone.exe", L"D:P(D;;SD;;;WD)(A;;FA;;;WD)"));
+    REQUIRE(set_dacl(f.dir, L"D:P(D;;0x40;;;WD)(A;OICI;FA;;;WD)"));
+    r = update::remove_old_rclone_once(f.dir, marks.dir, size, sha256);
+    CHECK(set_dacl(f.dir, L"D:P(A;OICI;FA;;;WD)"));
+    CHECK(set_dacl(f.dir / "rclone.exe", L"D:P(A;;FA;;;WD)"));
+    CHECK(r.exe == OldRclone::not_opened);
+    CHECK_FALSE(fs::exists(marks.dir / update::folder_key(util::path_to_utf8(f.dir))));
+
+    // Running, it is renamed aside: not done until that rclone.exe.grab-old is gone too.
+    fs::remove(f.dir / "rclone.exe");
+    std::wstring system(MAX_PATH, L'\0');
+    system.resize(GetSystemDirectoryW(system.data(), static_cast<UINT>(system.size())));
+    REQUIRE_FALSE(system.empty());
+    fs::copy_file(fs::path(system) / "version.dll", f.dir / "rclone.exe");
+    const auto real_size = fs::file_size(f.dir / "rclone.exe");
+    const auto real_sha256 = util::sha256_file(f.dir / "rclone.exe");
+    REQUIRE(real_sha256.has_value());
+    HMODULE running = LoadLibraryExW((f.dir / "rclone.exe").c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    REQUIRE(running != nullptr);
+    r = update::remove_old_rclone_once(f.dir, marks.dir, real_size, *real_sha256);
+    CHECK(r.exe == OldRclone::renamed);
+    update::remove_replaced_programs(f.dir); // a start while it still runs
+    r = update::remove_old_rclone_once(f.dir, marks.dir, real_size, *real_sha256);
+    CHECK_FALSE(r.done_before);
+    CHECK_FALSE(fs::exists(marks.dir / update::folder_key(util::path_to_utf8(f.dir))));
+    FreeLibrary(running);
+    update::remove_replaced_programs(f.dir); // the start after it ended
+    r = update::remove_old_rclone_once(f.dir, marks.dir, real_size, *real_sha256);
+    CHECK(r.exe == OldRclone::none);
+    CHECK(fs::exists(marks.dir / update::folder_key(util::path_to_utf8(f.dir))));
+    CHECK(names_in(f.dir).empty());
+}
+
+TEST_CASE("grab's old rclone that can't be read now isn't taken for someone else's") {
+    const Folder f("grab-test-old-rclone-unread");
+    const Folder marks("grab-test-old-rclone-unread-marks");
+    const auto size = grabs_rclone().size();
+    const auto sha256 = util::sha256_hex(grabs_rclone());
+    put(f.dir / "rclone.exe", grabs_rclone());
+
+    // Held by another handle that lets it be opened for the delete, with every byte locked: the
+    // hash's read fails (as on an I/O error or a placeholder offline).
+    HANDLE held = CreateFileW((f.dir / "rclone.exe").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(held != INVALID_HANDLE_VALUE);
+    OVERLAPPED whole{};
+    REQUIRE(LockFileEx(held, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &whole));
+    auto r = update::remove_old_rclone_once(f.dir, marks.dir, size, sha256);
+    CHECK(r.exe == OldRclone::unread);
+    CHECK_FALSE(fs::exists(marks.dir / update::folder_key(util::path_to_utf8(f.dir))));
+    CHECK(fs::exists(f.dir / "rclone.exe"));
+    UnlockFileEx(held, 0, MAXDWORD, MAXDWORD, &whole);
+    CloseHandle(held);
+
+    // Readable again at the next start: removed, and the folder is done.
+    CHECK(bytes_of(f.dir / "rclone.exe") == grabs_rclone());
+    r = update::remove_old_rclone_once(f.dir, marks.dir, size, sha256);
+    CHECK(r.exe == OldRclone::removed);
+    CHECK(fs::exists(marks.dir / update::folder_key(util::path_to_utf8(f.dir))));
+    CHECK_FALSE(fs::exists(f.dir / "rclone.exe"));
+}
+
+TEST_CASE("a folder's key is the installer's: SHA-256 of its lower-case path in UTF-16LE") {
+    const auto key = update::folder_key(R"(C:\Users\Alice\programs\grab\bin)");
+    // What Inno's GetSHA256OfUnicodeString(Lowercase('{app}\bin')) hashes for that folder.
+    std::string utf16;
+    for (const char c : std::string_view(R"(c:\users\alice\programs\grab\bin)")) {
+        utf16 += c;
+        utf16 += '\0';
+    }
+    CHECK(key == util::sha256_hex(utf16));
+    CHECK(key.size() == 64);
+    // Every spelling same_dir takes as that folder.
+    CHECK(update::folder_key("c:/users/alice/programs/grab/bin/") == key);
+    CHECK(update::folder_key("C:\\Users\\Alice\\programs\\grab\\\\bin\\") == key);
+    CHECK(update::folder_key("C:\\Users\\Alice\\programs\\grab\\bin2") != key);
+    // Beyond ASCII: UTF-16 code units, as Inno's strings are; only ASCII letters are lowered.
+    const auto georgian = update::folder_key("C:\\Users\\გიორგი\\bin");
+    std::string expected;
+    for (const char16_t ch : std::u16string(u"c:\\users\\გიორგი\\bin")) {
+        expected += static_cast<char>(ch & 0xFF);
+        expected += static_cast<char>(ch >> 8);
+    }
+    CHECK(georgian == util::sha256_hex(expected));
+}
+
+TEST_CASE("one grab update at a time for a folder (G96)") {
+    const auto dir = fs::temp_directory_path() / "grab-test-update-lock" / "bin";
+    auto first = update::lock_folder(dir);
+    REQUIRE(first.has_value());
+    // The same folder, however it is written, is taken; another folder isn't.
+    CHECK_FALSE(update::lock_folder(dir).has_value());
+    CHECK_FALSE(update::lock_folder(util::path_from_utf8(util::to_lower(util::path_to_utf8(dir)) + "\\")).has_value());
+    CHECK(update::lock_folder(dir.parent_path() / "other").has_value());
+    first.reset();
+    CHECK(update::lock_folder(dir).has_value());
+}
+
+TEST_CASE("what the last update did is kept, and a failure shows until something newer runs") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-last-update";
+    std::filesystem::remove_all(dir);
+    const auto file = dir / "last-update.json";
+    const auto programs = dir / "bin"; // the copy whose update this is
+    update::Result r;
+    r.folder = update::folder_key(util::path_to_utf8(programs));
+    r.from = "0.21.0";
+    r.to = "0.21.1";
+    r.mode = "installer";
+    r.ok = false;
+    r.exit_code = update::exit_update_failed;
+    r.installer_exit = 5;
+    r.error = "the installer failed (exit 5); the previous version was kept (setup log: C:\\T\\grab-setup-0.21.1.log)";
+    r.setup_log = "C:\\T\\grab-setup-0.21.1.log";
+    r.time = 1'762'300'000;
+    const auto parsed = update::parse_result(update::result_json(r));
+    REQUIRE(parsed.has_value());
+    const auto back = parsed.value_or(update::Result{});
+    CHECK(back.folder == r.folder);
+    CHECK(back.from == r.from);
+    CHECK(back.to == r.to);
+    CHECK(back.mode == r.mode);
+    CHECK_FALSE(back.ok);
+    CHECK(back.exit_code == update::exit_update_failed);
+    CHECK(back.installer_exit == std::optional<int>(5));
+    CHECK(back.error == r.error);
+    CHECK(back.setup_log == r.setup_log);
+    CHECK(back.time == r.time);
+
+    // Kept with what it printed beside it.
+    REQUIRE(update::save_result(file, r, "grab 0.21.0: checking for updates...\ngrab: error: x\n").has_value());
+    CHECK(util::read_file(dir / "last-update.log").value_or("") == "grab 0.21.0: checking for updates...\ngrab: error: x\n");
+    const auto pending = update::pending_failure(file, Version{0, 21, 0}, programs);
+    REQUIRE(pending.has_value());
+    const auto failed = pending.value_or(update::Result{});
+    CHECK(failed.to == "0.21.1");
+    CHECK(update::failure_text(failed).starts_with("the update to 0.21.1 ("));
+    CHECK(update::failure_text(failed).ends_with("failed: " + r.error));
+    // Once that version (or a newer one) runs, it no longer matters.
+    CHECK_FALSE(update::pending_failure(file, Version{0, 21, 1}, programs).has_value());
+    CHECK_FALSE(update::pending_failure(file, Version{0, 22, 0}, programs).has_value());
+    // Another copy's failure (a portable one sharing %LOCALAPPDATA%) isn't this one's, under any
+    // spelling of this one's folder it is.
+    CHECK(update::pending_failure(file, Version{0, 21, 0}, util::path_from_utf8(util::path_to_utf8(programs) + "\\"))
+              .has_value());
+    CHECK_FALSE(update::pending_failure(file, Version{0, 21, 0}, dir / "portable").has_value());
+    // A record with no folder (none is older than 0.21, but a file edited by hand) is nobody's.
+    update::Result nobodys = r;
+    nobodys.folder.clear();
+    REQUIRE(update::save_result(file, nobodys, "").has_value());
+    CHECK_FALSE(update::pending_failure(file, Version{0, 21, 0}, programs).has_value());
+    // A success, nothing kept, or something else in the file: nothing to show.
+    r.ok = true;
+    REQUIRE(update::save_result(file, r, "").has_value());
+    CHECK_FALSE(update::pending_failure(file, Version{0, 21, 0}, programs).has_value());
+    std::filesystem::remove(file);
+    CHECK_FALSE(update::pending_failure(file, Version{0, 21, 0}, programs).has_value());
+    std::ofstream(file, std::ios::binary) << R"({"to": "0.21.1")";
+    CHECK_FALSE(update::pending_failure(file, Version{0, 21, 0}, programs).has_value());
+    CHECK_FALSE(update::parse_result(R"({"to": "0.21.1"})").has_value()); // no outcome
+    CHECK_FALSE(update::parse_result("[]").has_value());
+    // Numbers out of range (a file edited by hand) count as missing.
+    const auto odd = update::parse_result(R"({"ok": false, "to": "0.21.1", "exit": 1e20, "installerExit": -1e300,
+                                              "time": 1e30})");
+    REQUIRE(odd.has_value());
+    CHECK(odd.value_or(update::Result{}).to == "0.21.1");
+    CHECK(odd.value_or(update::Result{}).exit_code == 0);
+    CHECK_FALSE(odd.value_or(update::Result{}).installer_exit.has_value());
+    CHECK(odd.value_or(update::Result{}).time == 0);
+    CHECK(update::parse_result(R"({"ok": false, "to": "0.21.1", "time": -5})").value_or(update::Result{}).time == 0);
+    // Without an error line, the exit code says what little is known.
+    update::Result bare;
+    bare.to = "0.21.1";
+    bare.exit_code = 5;
+    CHECK(update::failure_text(bare) == "the update to 0.21.1 failed: grab update exited with code 5");
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("install when newer, or the same version into an incomplete folder, never older") {
     const Version v020{0, 2, 0};
     const Version v030{0, 3, 0};
@@ -348,6 +575,41 @@ TEST_CASE("sha256_file and self_exe_path") {
     const auto self = util::self_exe_path();
     CHECK(self.is_absolute());
     CHECK(self.filename() == "grab_tests.exe");
+}
+
+TEST_CASE("an up-to-date grab update forgets this copy's failure, of a release since withdrawn") {
+    // The tests' own %LOCALAPPDATA% (a temp folder), never the user's.
+    const auto record = update::result_path();
+    REQUIRE(util::path_to_utf8(record).starts_with(util::path_to_utf8(fs::temp_directory_path())));
+    const Folder f("grab-test-update-withdrawn");
+    put(f.dir / "latest.json", R"({"tag_name": "v0.0.1", "assets": []})");
+    std::string url = "file:///" + util::path_to_utf8(f.dir / "latest.json");
+    std::ranges::replace(url, '\\', '/');
+    SetEnvironmentVariableW(L"GRAB_UPDATE_API", util::to_wide(url).c_str());
+    struct Unset {
+        ~Unset() { SetEnvironmentVariableW(L"GRAB_UPDATE_API", nullptr); }
+    } unset;
+
+    update::Result failed;
+    failed.folder = update::folder_key(util::path_to_utf8(util::self_exe_path().parent_path()));
+    failed.to = "99.0.0"; // withdrawn: the latest release is older than this build now
+    failed.error = "the installer failed (exit 5)";
+    REQUIRE(update::save_result(record, failed, "").has_value());
+    // --check changes nothing.
+    CHECK(update::run(true) == 0);
+    CHECK(fs::exists(record));
+    // Another copy's record stays for that copy.
+    update::Result others = failed;
+    others.folder = update::folder_key("C:\\somewhere\\else");
+    REQUIRE(update::save_result(record, others, "").has_value());
+    CHECK(update::run(false) == 0);
+    CHECK(fs::exists(record));
+    // This copy's goes.
+    REQUIRE(update::save_result(record, failed, "").has_value());
+    CHECK(update::run(false) == 0);
+    CHECK_FALSE(fs::exists(record));
+    std::error_code ec;
+    fs::remove(record.parent_path() / "last-update.log", ec);
 }
 #endif
 

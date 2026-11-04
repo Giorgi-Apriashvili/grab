@@ -294,8 +294,9 @@ namespace {
 // One SSH server on 127.0.0.1 for one connection: it sends its banner and `kexinit` (or, with
 // `hang_up`, closes the connection at once), then reads until grab hangs up (5 s at most).
 // What a OneShotServer does with its one connection: sends its banner and `kexinit`, hangs up at
-// once, or reads the client's banner, sends its own and closes cleanly (a FIN, not a reset).
-enum class Shot { talk, hang_up, banner_then_close };
+// once, reads the client's banner, sends its own and closes cleanly (a FIN, not a reset), or says
+// nothing at all and never closes (a frozen server: 60 s at most, or until it is destroyed).
+enum class Shot { talk, hang_up, banner_then_close, silent };
 
 class OneShotServer {
 public:
@@ -314,7 +315,10 @@ public:
         thread_ = std::jthread([this, kexinit = std::move(kexinit), shot] {
             const SOCKET c = ::accept(listening_, nullptr, nullptr);
             if (c == ~SOCKET{0}) return; // INVALID_SOCKET: the listening socket was closed
-            if (shot != Shot::hang_up) {
+            if (shot == Shot::silent) {
+                // Not even a read: grab's FIN gets no answer, as from a frozen server.
+                for (int i = 0; i < 600 && !done_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else if (shot != Shot::hang_up) {
                 const DWORD wait = 5'000;
                 ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&wait), sizeof(wait));
                 if (shot == Shot::banner_then_close) {
@@ -330,13 +334,17 @@ public:
             closesocket(c);
         });
     }
-    ~OneShotServer() { closesocket(listening_); } // accept() returns, then the thread is joined
+    ~OneShotServer() { // accept() returns, then the thread is joined
+        done_ = true;
+        closesocket(listening_);
+    }
     OneShotServer(const OneShotServer&) = delete;
     OneShotServer& operator=(const OneShotServer&) = delete;
     int port = 0;
 
 private:
     SOCKET listening_ = INVALID_SOCKET;
+    std::atomic<bool> done_{false};
     std::jthread thread_;
 };
 
@@ -406,6 +414,83 @@ TEST_CASE("ssh: a handshake the two sides can't agree on is fatal with its own t
     CHECK(closed.first == budget::Failure::refused);
     CHECK(closed.second.starts_with("SSH handshake with 127.0.0.1 failed"));
     CHECK(closed.second.find("engine = rclone") == std::string::npos);
+    std::filesystem::remove(known_hosts);
+}
+
+TEST_CASE("ssh: closing grab ends a login stuck in the handshake at once, and every connection after it") {
+    const auto known_hosts = std::filesystem::temp_directory_path() / "grab-test-closing-known_hosts";
+    OneShotServer silent("", Shot::silent);
+    std::ofstream(known_hosts, std::ios::binary | std::ios::trunc)
+        << ssh::known_host_line("127.0.0.1", silent.port, key_of(ed25519_key)) << "\n";
+    ssh::Target t;
+    t.host = "127.0.0.1";
+    t.port = silent.port;
+    t.user = "u";
+    t.agent = true;
+    t.known_hosts = known_hosts;
+    // A server that says nothing: the login would wait out the whole minute.
+    t.connect_timeout = std::chrono::seconds(60);
+    t.timeout = std::chrono::seconds(60);
+    struct Allow { // the rest of the tests connect again
+        ~Allow() { ssh::allow_connections(); }
+    } allow;
+
+    // Through a pool, as the window's downloads, Browse and lists log in: no retry after the cut.
+    ssh::Pool::Options o;
+    o.idle_timer = false;
+    ssh::Pool pool([&] { return ssh::open_session(t); }, o);
+    std::atomic<bool> ended{false};
+    std::string said;
+    auto kind = budget::Failure::other;
+    std::jthread login([&] {
+        try {
+            auto lease = pool.acquire();
+            said = "connected";
+        } catch (const ssh::Error& e) {
+            said = e.what();
+            kind = e.kind;
+        }
+        ended = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    REQUIRE_FALSE(ended.load()); // it is in the handshake
+    const auto cut = std::chrono::steady_clock::now();
+    ssh::close_all_connections();
+    login.join();
+    const auto took = std::chrono::steady_clock::now() - cut;
+    MESSAGE("ended ", std::chrono::duration_cast<std::chrono::milliseconds>(took).count(), " ms after the cut");
+    CHECK(took < std::chrono::seconds(2));
+    CHECK(said == ssh::closing_text);
+    // Not the server turning grab away: nothing is learned or tried again from it.
+    CHECK(kind == budget::Failure::fatal);
+
+    // A connection tried now fails at once, before it reaches the server.
+    const auto again = std::chrono::steady_clock::now();
+    try {
+        ssh::Connection c(t);
+        FAIL("connected while closing");
+    } catch (const ssh::Error& e) {
+        CHECK(std::string(e.what()) == ssh::closing_text);
+        CHECK(e.kind == budget::Failure::fatal);
+    }
+    CHECK(std::chrono::steady_clock::now() - again < std::chrono::milliseconds(500));
+    // So does a host-key scan (Trust, Add).
+    const auto scanned = ssh::scan_host_keys("127.0.0.1", silent.port, std::chrono::seconds(60));
+    REQUIRE_FALSE(scanned.has_value());
+    CHECK(scanned.error().find(ssh::closing_text) != std::string::npos);
+
+    // Allowed again (tests only), a connection reaches the server again: a port nobody listens on
+    // is refused as before, not "closing".
+    ssh::allow_connections();
+    ssh::Target nobody = t;
+    nobody.port = 1;
+    nobody.connect_timeout = std::chrono::seconds(5);
+    try {
+        ssh::Connection c(nobody);
+        FAIL("connected to port 1");
+    } catch (const ssh::Error& e) {
+        CHECK(std::string(e.what()).find(ssh::closing_text) == std::string::npos);
+    }
     std::filesystem::remove(known_hosts);
 }
 #endif

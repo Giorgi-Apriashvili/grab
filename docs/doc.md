@@ -127,24 +127,49 @@ grab update           # download, verify and install it over this copy
 asset and checks it against the release's `SHA256SUMS.txt`. It refuses anything that doesn't
 match. Nothing is changed before that check passes. A copy installed with the setup exe is
 upgraded by running the new installer silently, so Add/Remove Programs shows the new version.
-An open grab window is closed for the update and started again afterwards; downloads running in
-it stop with their partial files kept. A portable or `cmake --install` copy has its programs
-(`grab.exe`, `grab-gui.exe`) swapped in place. The replaced files are left as `grab.exe.old` and
-`grab-gui.exe.old` and removed the next time grab or its window starts. It uses the `curl.exe`
-and `tar.exe` that ship with Windows 10 and later. Versions before 0.2.0 have no `update`
-command; install 0.2.0 once from the Releases page.
+An open grab window of that copy is closed by `grab update` itself before the installer runs:
+the window saves its downloads first, and running ones stop with their partial files kept and go
+on by themselves in the new version. Afterwards `grab update` opens the window again, also when
+the installer failed (then it is the version you had). It opens it as the window was: run from an
+administrator console while the window wasn't, `grab update` opens it without administrator
+rights, or, when it can't, asks you to open grab from the Start menu. A portable or `cmake --install` copy has
+its programs (`grab.exe`, `grab-gui.exe`) swapped in place. The replaced files are left as
+`grab.exe.old` and `grab-gui.exe.old` and removed the next time grab or its window starts. It
+uses the `curl.exe` and `tar.exe` that ship with Windows 10 and later. Versions before 0.2.0 have
+no `update` command; install 0.2.0 once from the Releases page.
+
+One `grab update` runs at a time for a copy of grab; a second one says so and stops. What the last
+update did is kept in `%LOCALAPPDATA%\grab\last-update.json`, with what it printed in
+`last-update.log` beside it. When it failed, the window says "Update failed: …" the next time it
+opens, until you close that banner, and `grab update` repeats it before it tries again (only the
+copy whose update failed shows it, and a `grab update` that then finds nothing newer forgets it,
+the release having been withdrawn). When the
+installer itself failed, its log is `%TEMP%\grab-setup-<version>.log`, named in the message.
 
 The window offers the same update: see [GUI](#gui) → Updates.
 
-From 0.20 or earlier to 0.21: grab 0.20 and before shipped `rclone.exe` beside `grab.exe`. 0.21
-removes that copy at the first start after the update has finished, and the installer at every
-install; a copy that is running then is renamed to `rclone.exe.grab-old` and deleted at a later
-start. It goes by the file's exact size and SHA-256: only rclone 1.75.1 exactly as grab shipped
-it is removed, so a copy of that same official 1.75.1 build in grab's folder is removed too, at
-every start; any other `rclone.exe` stays. Since the installer put that folder on your PATH,
-`rclone` in a terminal ran grab's copy: if you used it, install rclone yourself, in another
-folder on your PATH, not in grab's. A folder download 0.20 ran through rclone and that was cut short may have left
-`*.partial` files in its folder; they can be deleted.
+From 0.20 to 0.21: 0.20's own `grab update` runs the 0.21 installer, and only that installer's
+side of the update could change. 0.20 left closing the window to the installer, which gave up and
+cancelled the update when the window took long to close (a server login that hung, for instance):
+the window closed and nothing was installed. The 0.21 installer ends such a window instead after
+about 30 seconds, and opens it again if the install fails anyway. From 0.21 on, `grab update`
+closes and reopens the window itself, and the window ends within seconds when asked.
+
+grab 0.20 and before shipped `rclone.exe` beside `grab.exe`. 0.21 removes that copy once, right
+after the update to it: at the first start after the update has finished in that folder (and the
+installer while it installs, when nothing of the old version still runs). A copy that is running
+then is renamed to `rclone.exe.grab-old` and deleted at a later start. It goes by the file's exact
+size and SHA-256: only rclone 1.75.1 exactly as grab shipped it is removed; any other
+`rclone.exe` stays. Once it is done in a folder, grab remembers that (in
+`%LOCALAPPDATA%\grab\old-rclone`) and never looks again: an `rclone.exe` you put there later,
+even that same 1.75.1 build, is never touched. The first start of 0.21 in a folder also removes
+an `rclone.exe` of exactly that build that was already there before grab, so keep your own rclone
+in another folder. Going back to 0.20.1 and updating again: the
+installer removes the rclone.exe 0.20.1 brought back once more; in a portable copy it stays, so
+delete it yourself. Since the installer put grab's folder on your PATH, `rclone` in a terminal ran
+grab's copy: if you used it, install rclone yourself, preferably in another folder on your PATH.
+A folder download 0.20 ran through rclone and that was cut short may have left `*.partial` files
+in its folder; they can be deleted.
 
 Portable copies of 0.2.0: that version's updater replaces only `grab.exe`. Afterwards grab
 notices that `grab-gui.exe` is missing and says so. Running `grab update` once more adds it,
@@ -500,10 +525,14 @@ too and goes on without them.
   What's new · Update · Later`.
   - Update runs `grab update` (the same SHA-256 check) and the banner follows it:
     downloading, verifying, installing.
-  - An installed copy: the installer closes the window and opens it again. A portable copy:
-    the programs are swapped, then "Restart grab" opens the new version.
+  - An installed copy: `grab update` closes the window, the installer runs, and the window opens
+    again, the new version or, when the update failed, the old one with `Update failed: <why> ·
+    Try again · Close`. That banner comes back each time the window opens until you close it. A
+    portable copy: the programs are swapped, then "Restart grab" opens the new version.
   - Downloads running at that moment continue by themselves in the new version; paused ones
     stay paused.
+  - Closing grab (the window with nothing running, Quit in the tray, signing out, an update)
+    saves the queue first and takes a few seconds at most, even while a server doesn't answer.
   - Later hides the banner until the window opens again. Settings → Updates has the daily
     check's switch and "Check now".
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,

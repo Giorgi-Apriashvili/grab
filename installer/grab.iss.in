@@ -6,9 +6,14 @@
 ; if none exists. The uninstaller removes the files, shortcuts, PATH entry and grab-gui's browser
 ; cache, but leaves %APPDATA%\grab (config, servers, host keys) alone.
 ;
-; `grab update` runs this silently over an existing install. A running grab-gui is closed through
-; the Restart Manager and started again afterwards (it calls RegisterApplicationRestart). grab 0.20
-; and earlier installed rclone.exe beside grab.exe; this one removes that copy (CurStepChanged).
+; `grab update` runs this silently over an existing install. grab 0.21 and later close grab-gui
+; themselves first and start it again afterwards, whatever this installer does (they pass
+; /NOCLOSEAPPLICATIONS /NORESTARTAPPLICATIONS /LOG=...). grab 0.20's `grab update` leaves that to
+; the Restart Manager, and its window may take longer to end than the Restart Manager waits (a
+; login stuck on a server): CloseApplications=force ends it then instead of cancelling the update,
+; and a grab-gui closed for an install that failed anyway is started again (DeinitializeSetup).
+; grab 0.20 and earlier installed rclone.exe beside grab.exe; an upgrade from them removes that
+; copy (CurStepChanged).
 
 [Setup]
 AppId={{B7E9C1D4-5F2A-4C3E-9A8B-2D6F1E0C7A55}
@@ -34,7 +39,9 @@ SetupIconFile=@GRAB_ICON_NATIVE@
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-CloseApplications=yes
+; force: a program still running when the Restart Manager has waited for it (about 30 s) is ended
+; rather than the install cancelled, which closed grab-gui and left it closed (Phase 9 chunk E).
+CloseApplications=force
 RestartApplications=yes
 
 [Tasks]
@@ -168,15 +175,141 @@ end;
 // exact size and SHA-256, so an rclone.exe of the user's own stays (review G31); nothing while a
 // replaced grab.exe.old or grab-gui.exe.old is still there (an old grab-gui may still run and start
 // it: grab removes it at a later start). A copy that runs can't be deleted, but it can be renamed:
-// it is left as rclone.exe.grab-old, which grab deletes when it next starts.
+// it is left as rclone.exe.grab-old, which grab deletes when it next starts. Only on an upgrade
+// from a grab older than 0.21 (the user's choice: it goes once, right after that upgrade; an
+// rclone.exe put there later is never touched), which also forgets that grab's start already did
+// it in bin (update::remove_old_rclone_once's mark), since that grab brought its rclone back.
 const
   OldRcloneSize = 85192704;
   OldRcloneSha256 = '033eee51c9ad47c2de2624b6674d355274bcd6cf0027a5f85db4437ba24ae81c';
   NotPlainFile = $410;        // FILE_ATTRIBUTE_DIRECTORY ($10) or FILE_ATTRIBUTE_REPARSE_POINT ($400)
   NoAttributes = $FFFFFFFF;   // INVALID_FILE_ATTRIBUTES
+  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7E9C1D4-5F2A-4C3E-9A8B-2D6F1E0C7A55}_is1';
+  GuiClass = 'grab.gui.window'; // src/update.hpp, gui_window_class
+  QueryLimited = $1000;         // PROCESS_QUERY_LIMITED_INFORMATION
+
+var
+  UpgradesOldGrab: Boolean; // the grab installed before this one is older than 0.21.0
+  GuiWasRunning: Boolean;   // a grab-gui of this installation was open when the install began
+  Installed: Boolean;       // the install finished
 
 function GetFileAttributes(lpFileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
+function FindWindowExW(Parent, After: HWND; ClassName: String; WindowName: Integer): HWND;
+  external 'FindWindowExW@user32.dll stdcall';
+function GetWindowThreadProcessId(Wnd: HWND; var ProcessId: Cardinal): Cardinal;
+  external 'GetWindowThreadProcessId@user32.dll stdcall';
+function OpenProcess(Access: Cardinal; Inherit: Integer; ProcessId: Cardinal): THandle;
+  external 'OpenProcess@kernel32.dll stdcall';
+function QueryFullProcessImageNameW(Process: THandle; Flags: Cardinal; Name: String; var Size: Cardinal): Integer;
+  external 'QueryFullProcessImageNameW@kernel32.dll stdcall';
+function CloseHandle(Handle: THandle): Integer;
+  external 'CloseHandle@kernel32.dll stdcall';
+function GetLongPathNameW(Short: String; Long: String; Size: Cardinal): Cardinal;
+  external 'GetLongPathNameW@kernel32.dll stdcall';
+
+// `Path` with its folders' long names (a program started through a short 8.3 name is the same).
+function LongPath(const Path: String): String;
+var
+  Long: String;
+  Count: Cardinal;
+begin
+  SetLength(Long, 1024);
+  Count := GetLongPathNameW(Path, Long, 1024);
+  if (Count > 0) and (Count < 1024) then
+    Result := Copy(Long, 1, Count)
+  else
+    Result := Path;
+end;
+
+// The next number of a version like "0.20.1" (-1 for none), and what follows it.
+function VersionPart(var Rest: String): Integer;
+var
+  Dot: Integer;
+begin
+  Dot := Pos('.', Rest);
+  if Dot = 0 then
+  begin
+    Result := StrToIntDef(Rest, -1);
+    Rest := '';
+  end else
+  begin
+    Result := StrToIntDef(Copy(Rest, 1, Dot - 1), -1);
+    Delete(Rest, 1, Dot);
+  end;
+end;
+
+// Before anything is installed: the version the previous installer recorded (Add/Remove Programs).
+function InitializeSetup(): Boolean;
+var
+  Previous: String;
+  Major, Minor: Integer;
+begin
+  if RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', Previous) then
+  begin
+    Major := VersionPart(Previous);
+    Minor := VersionPart(Previous);
+    UpgradesOldGrab := (Major = 0) and (Minor >= 0) and (Minor < 21);
+  end;
+  Result := True;
+end;
+
+// Whether a grab-gui window of this installation is open: one of its class whose program is
+// {app}\bin\grab-gui.exe (another copy of grab has windows of its own).
+function GuiRunsHere(): Boolean;
+var
+  Wnd: HWND;
+  Pid, Size: Cardinal;
+  Process: THandle;
+  Name, Own: String;
+begin
+  Result := False;
+  Own := Lowercase(LongPath(ExpandConstant('{app}\bin\grab-gui.exe')));
+  Wnd := FindWindowExW(0, 0, GuiClass, 0);
+  while (Wnd <> 0) and not Result do
+  begin
+    Pid := 0;
+    GetWindowThreadProcessId(Wnd, Pid);
+    Process := OpenProcess(QueryLimited, 0, Pid);
+    if Process <> 0 then
+    begin
+      Size := 1024;
+      SetLength(Name, Size);
+      if QueryFullProcessImageNameW(Process, 0, Name, Size) <> 0 then
+        Result := Lowercase(LongPath(Copy(Name, 1, Size))) = Own;
+      CloseHandle(Process);
+    end;
+    Wnd := FindWindowExW(0, Wnd, GuiClass, 0);
+  end;
+end;
+
+// Called before the Restart Manager closes what uses the files: whether grab-gui is among them.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  GuiWasRunning := GuiRunsHere();
+  Result := '';
+end;
+
+// The Restart Manager starts the programs it closed again only after an install that finished. A
+// grab-gui closed for one that failed or was cancelled comes back here, as the user who ran
+// Setup, outside any job grab update ran Setup in; grab 0.20's `grab update` would leave it closed.
+// "The user who ran Setup" is elevated when Setup itself was started elevated (0.20.1's `grab
+// update` from an administrator console): the window then comes back elevated. Left so: it matters
+// only when that update fails, and 0.21's `grab update` closes and starts the window itself.
+procedure DeinitializeSetup();
+var
+  Code: Integer;
+begin
+  if not GuiWasRunning or Installed then
+    exit;
+  try
+    if not GuiRunsHere() then
+      ExecAsOriginalUser(ExpandConstant('{app}\bin\grab-gui.exe'), '', ExpandConstant('{app}'), SW_SHOWNORMAL,
+        ewNoWait, Code);
+  except
+    // Nothing more to do: the window is opened from the Start menu as always.
+  end;
+end;
 
 // True for grab's old rclone: a plain file (a link may lead to someone's rclone elsewhere) of that
 // size, then that SHA-256.
@@ -212,12 +345,30 @@ begin
     DeleteFile(FileName);
 end;
 
+// The mark grab's start leaves once it removed the old rclone in bin (src/update.cpp,
+// remove_old_rclone_once): %LOCALAPPDATA%\grab\old-rclone\<update::folder_key of the folder>, the
+// SHA-256 of its lower-case path in UTF-16LE.
+function OldRcloneMark(): String;
+var
+  LocalAppData: String;
+begin
+  LocalAppData := GetEnv('LOCALAPPDATA');
+  if LocalAppData = '' then
+    LocalAppData := ExpandConstant('{localappdata}');
+  Result := AddBackslash(LocalAppData) + 'grab\old-rclone\' +
+    Lowercase(GetSHA256OfUnicodeString(Lowercase(RemoveBackslashUnlessRoot(ExpandConstant('{app}\bin')))));
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Bin: String;
 begin
   if CurStep <> ssPostInstall then
     exit;
+  Installed := True;
+  if not UpgradesOldGrab then
+    exit;
+  DeleteFile(OldRcloneMark());
   Bin := ExpandConstant('{app}\bin\');
   if FileOrDirExists(Bin + 'grab.exe.old') or FileOrDirExists(Bin + 'grab-gui.exe.old') then
     exit;
