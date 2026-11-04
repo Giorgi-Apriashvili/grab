@@ -8,7 +8,15 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
+
+#include <sddl.h>
+#endif
 
 using namespace grab;
 using update::Version;
@@ -105,15 +113,13 @@ TEST_CASE("same_dir normalizes case, separators and trailing slashes") {
 }
 
 #ifdef _WIN32
-TEST_CASE("release programs: grab.exe first, bundled programs when built") {
+TEST_CASE("release programs: grab.exe first, the window when built, no rclone since 0.21") {
     const auto programs = update::release_programs();
     REQUIRE_FALSE(programs.empty());
     CHECK(programs.front() == "grab.exe");
-#ifdef _WIN32
-    // The default Windows build bundles rclone and builds the GUI.
-    CHECK(std::ranges::find(programs, "rclone.exe") != programs.end());
+    // The default Windows build builds the GUI.
     CHECK(std::ranges::find(programs, "grab-gui.exe") != programs.end());
-#endif
+    CHECK(std::ranges::find(programs, "rclone.exe") == programs.end());
 }
 
 TEST_CASE("missing programs in a portable folder") {
@@ -135,8 +141,8 @@ TEST_CASE("only the programs an update replaced are deleted, not other programs'
     const auto dir = std::filesystem::temp_directory_path() / "grab-test-replaced-programs";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
-    for (const auto* name : {"grab.exe.old", "grab-gui.exe.old", "rclone.exe.old", "ffmpeg.exe.old", "grab.exe",
-                             "rclone.exe", "notes.old", "grab.exe.old.txt"}) {
+    for (const auto* name : {"grab.exe.old", "grab-gui.exe.old", "rclone.exe.grab-old", "rclone.exe.old",
+                             "ffmpeg.exe.old", "grab.exe", "rclone.exe", "notes.old", "grab.exe.old.txt"}) {
         std::ofstream(dir / name) << "x";
     }
     std::filesystem::create_directories(dir / "tools.exe.old");
@@ -146,12 +152,175 @@ TEST_CASE("only the programs an update replaced are deleted, not other programs'
         left.push_back(util::path_to_utf8(e.path().filename()));
     }
     std::ranges::sort(left);
+    // rclone.exe.old goes only when it is grab's old rclone (remove_old_rclone, below).
     CHECK(left == std::vector<std::string>{"ffmpeg.exe.old", "grab.exe", "grab.exe.old.txt", "notes.old", "rclone.exe",
-                                           "tools.exe.old"});
+                                           "rclone.exe.old", "tools.exe.old"});
     // Nothing to delete is no error, and a missing folder neither.
     update::remove_replaced_programs(dir);
     update::remove_replaced_programs(dir / "missing");
     std::filesystem::remove_all(dir);
+}
+
+namespace {
+
+namespace fs = std::filesystem;
+using update::OldRclone;
+
+// A fresh folder in %TEMP%, gone again with the object.
+struct Folder {
+    fs::path dir;
+    explicit Folder(const char* name) : dir(fs::temp_directory_path() / name) {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir);
+    }
+    ~Folder() {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    Folder(const Folder&) = delete;
+    Folder& operator=(const Folder&) = delete;
+};
+
+void put(const fs::path& file, std::string_view bytes) { std::ofstream(file, std::ios::binary) << bytes; }
+
+std::string bytes_of(const fs::path& file) { return util::read_file(file).value_or("(unreadable)"); }
+
+std::vector<std::string> names_in(const fs::path& dir) {
+    std::vector<std::string> names;
+    for (const auto& e : fs::directory_iterator(dir)) names.push_back(util::path_to_utf8(e.path().filename()));
+    std::ranges::sort(names);
+    return names;
+}
+
+// A stand-in for grab's rclone 1.75.1: the tests give remove_old_rclone its size and SHA-256.
+std::string grabs_rclone() { return "grab's old rclone, made up for the test " + std::string(200, 'r'); }
+
+// A security descriptor from SDDL, set as the DACL of `p`.
+bool set_dacl(const fs::path& p, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    const bool ok = SetFileSecurityW(p.c_str(), DACL_SECURITY_INFORMATION, sd) != 0;
+    LocalFree(sd);
+    return ok;
+}
+
+} // namespace
+
+TEST_CASE("grab's old rclone.exe goes by its exact size and SHA-256; any other rclone stays (G31)") {
+    const Folder f("grab-test-old-rclone");
+    const auto size = grabs_rclone().size();
+    const auto sha256 = util::sha256_hex(grabs_rclone());
+
+    put(f.dir / "rclone.exe", grabs_rclone());
+    put(f.dir / "rclone.exe.old", grabs_rclone());
+    put(f.dir / "grab.exe", "x");
+    auto r = update::remove_old_rclone(f.dir, size, sha256);
+    CHECK_FALSE(r.skipped);
+    CHECK(r.exe == OldRclone::removed);
+    CHECK(r.old == OldRclone::removed);
+    CHECK(names_in(f.dir) == std::vector<std::string>{"grab.exe"});
+    // Nothing left to do is no error.
+    r = update::remove_old_rclone(f.dir, size, sha256);
+    CHECK(r.exe == OldRclone::none);
+    CHECK(r.old == OldRclone::none);
+
+    // A decoy of the same size with other bytes is hashed and stays as it was.
+    std::string decoy = grabs_rclone();
+    decoy.back() = 'x';
+    put(f.dir / "rclone.exe", decoy);
+    // Another size is never opened: held without any sharing, an open would fail (not_opened).
+    put(f.dir / "rclone.exe.old", grabs_rclone() + "!");
+    HANDLE held = CreateFileW((f.dir / "rclone.exe.old").c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(held != INVALID_HANDLE_VALUE);
+    r = update::remove_old_rclone(f.dir, size, sha256);
+    CloseHandle(held);
+    CHECK(r.exe == OldRclone::other_file);
+    CHECK(r.old == OldRclone::other_size);
+    CHECK(bytes_of(f.dir / "rclone.exe") == decoy);
+    CHECK(bytes_of(f.dir / "rclone.exe.old") == grabs_rclone() + "!");
+
+    // A folder of that name isn't a file grab left.
+    fs::remove(f.dir / "rclone.exe");
+    fs::create_directories(f.dir / "rclone.exe");
+    CHECK(update::remove_old_rclone(f.dir, size, sha256).exe == OldRclone::none);
+    CHECK(fs::is_directory(f.dir / "rclone.exe"));
+    // The real rule: 1.75.1's size, so neither of these is opened.
+    CHECK(update::remove_old_rclone(f.dir).old == OldRclone::other_size);
+    CHECK(update::old_rclone_size == 85'192'704);
+}
+
+TEST_CASE("grab's old rclone waits while a replaced grab.exe or grab-gui.exe is still there") {
+    const Folder f("grab-test-old-rclone-skip");
+    const auto size = grabs_rclone().size();
+    const auto sha256 = util::sha256_hex(grabs_rclone());
+    put(f.dir / "rclone.exe", grabs_rclone());
+    for (const auto* replaced : {"grab-gui.exe.old", "grab.exe.old"}) {
+        put(f.dir / replaced, "x"); // an old grab-gui may still run, and start rclone
+        const auto r = update::remove_old_rclone(f.dir, size, sha256);
+        CHECK(r.skipped);
+        CHECK(r.exe == OldRclone::none);
+        CHECK(bytes_of(f.dir / "rclone.exe") == grabs_rclone());
+        fs::remove(f.dir / replaced);
+    }
+    CHECK(update::remove_old_rclone(f.dir, size, sha256).exe == OldRclone::removed);
+    CHECK_FALSE(fs::exists(f.dir / "rclone.exe"));
+}
+
+TEST_CASE("grab's old rclone that runs is renamed aside, and deleted at a later start") {
+    const Folder f("grab-test-old-rclone-held");
+    // A real program, mapped as an image the way a running one is: it can be renamed, not deleted.
+    std::wstring system(MAX_PATH, L'\0');
+    system.resize(GetSystemDirectoryW(system.data(), static_cast<UINT>(system.size())));
+    REQUIRE_FALSE(system.empty());
+    const auto file = f.dir / "rclone.exe";
+    fs::copy_file(fs::path(system) / "version.dll", file);
+    const auto size = fs::file_size(file);
+    const auto sha256 = util::sha256_file(file);
+    REQUIRE(sha256.has_value());
+
+    HMODULE running = LoadLibraryExW(file.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    REQUIRE(running != nullptr);
+    const auto r = update::remove_old_rclone(f.dir, size, *sha256);
+    CHECK(r.exe == OldRclone::renamed);
+    CHECK(names_in(f.dir) == std::vector<std::string>{"rclone.exe.grab-old"});
+    update::remove_replaced_programs(f.dir); // still running: stays
+    CHECK(names_in(f.dir) == std::vector<std::string>{"rclone.exe.grab-old"});
+    FreeLibrary(running);
+    update::remove_replaced_programs(f.dir); // the next start
+    CHECK(names_in(f.dir).empty());
+}
+
+TEST_CASE("grab's old rclone in a folder grab can't change costs no hash (G102)") {
+    const Folder f("grab-test-old-rclone-locked");
+    const auto file = f.dir / "rclone.exe";
+    put(file, grabs_rclone());
+    // No delete access, neither on the file nor through its folder.
+    REQUIRE(set_dacl(file, L"D:P(D;;SD;;;WD)(A;;FA;;;WD)"));
+    REQUIRE(set_dacl(f.dir, L"D:P(D;;0x40;;;WD)(A;OICI;FA;;;WD)"));
+    const auto r = update::remove_old_rclone(f.dir, grabs_rclone().size(), util::sha256_hex(grabs_rclone()));
+    CHECK(set_dacl(f.dir, L"D:P(A;OICI;FA;;;WD)"));
+    CHECK(set_dacl(file, L"D:P(A;;FA;;;WD)"));
+    CHECK(r.exe == OldRclone::not_opened);
+    CHECK(bytes_of(file) == grabs_rclone());
+}
+
+TEST_CASE("a link named rclone.exe is never followed to the rclone it leads to") {
+    const Folder f("grab-test-old-rclone-link");
+    fs::create_directories(f.dir / "bin");
+    fs::create_directories(f.dir / "elsewhere");
+    const auto target = f.dir / "elsewhere" / "rclone.exe";
+    put(target, grabs_rclone());
+    if (!CreateSymbolicLinkW((f.dir / "bin" / "rclone.exe").c_str(), target.c_str(),
+                             SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+        MESSAGE("no symbolic links here (no Developer Mode or privilege); skipped");
+        return;
+    }
+    const auto r = update::remove_old_rclone(f.dir / "bin", grabs_rclone().size(), util::sha256_hex(grabs_rclone()));
+    CHECK(r.exe == OldRclone::none);
+    CHECK(bytes_of(target) == grabs_rclone());
+    CHECK(fs::is_symlink(f.dir / "bin" / "rclone.exe"));
 }
 
 TEST_CASE("install when newer, or the same version into an incomplete folder, never older") {

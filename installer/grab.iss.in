@@ -7,7 +7,8 @@
 ; cache, but leaves %APPDATA%\grab (config, servers, host keys) alone.
 ;
 ; `grab update` runs this silently over an existing install. A running grab-gui is closed through
-; the Restart Manager and started again afterwards (it calls RegisterApplicationRestart).
+; the Restart Manager and started again afterwards (it calls RegisterApplicationRestart). grab 0.20
+; and earlier installed rclone.exe beside grab.exe; this one removes that copy (CurStepChanged).
 
 [Setup]
 AppId={{B7E9C1D4-5F2A-4C3E-9A8B-2D6F1E0C7A55}
@@ -43,8 +44,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 ; The window (WebView2); needs the Edge WebView2 Runtime, see WebView2Installed below.
 Source: "@GRAB_STAGE_DIR_NATIVE@\grab-gui.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-; Bundled rclone (MIT, notice in licenses\rclone.txt); grab prefers it over any on PATH.
-Source: "@GRAB_STAGE_DIR_NATIVE@\rclone.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+; rclone (MIT): grab reuses its file-name encoding tables and password-obscuring key.
 Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\rclone.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 ; libssh2 (BSD-3-Clause) and OpenSSL (Apache-2.0), built into grab.exe and grab-gui.exe.
 Source: "@GRAB_STAGE_DIR_NATIVE@\licenses\libssh2.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
@@ -70,8 +70,11 @@ Name: "{userdesktop}\grab"; Filename: "{app}\bin\grab-gui.exe"; WorkingDir: "{ap
 ; `cmake --install` into the same folder) this at least removes the emptied bin folder; {app}
 ; itself still holds unins000.exe while this runs, so an empty {app} stays behind in that case.
 ; %APPDATA%\grab is deliberately left alone; grab-gui's WebView2 profile (browser cache, not
-; settings) in %LOCALAPPDATA%\grab is removed.
-Type: files; Name: "{app}\bin\*.exe.old"
+; settings) in %LOCALAPPDATA%\grab is removed. Of the .old files only grab's own go: other programs
+; in the same folder keep theirs (review G31).
+Type: files; Name: "{app}\bin\grab.exe.old"
+Type: files; Name: "{app}\bin\grab-gui.exe.old"
+Type: files; Name: "{app}\bin\rclone.exe.grab-old"
 Type: dirifempty; Name: "{app}\bin"
 Type: dirifempty; Name: "{app}\licenses"
 Type: dirifempty; Name: "{app}\docs"
@@ -158,4 +161,66 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
     RemoveFromUserPath(ExpandConstant('{app}\bin'));
+end;
+
+// grab 0.20 and earlier installed rclone 1.75.1 in bin; 0.21 has no rclone. The rule grab itself
+// applies at start (src/update.cpp, remove_old_rclone): only that very file goes, known by its
+// exact size and SHA-256, so an rclone.exe of the user's own stays (review G31); nothing while a
+// replaced grab.exe.old or grab-gui.exe.old is still there (an old grab-gui may still run and start
+// it: grab removes it at a later start). A copy that runs can't be deleted, but it can be renamed:
+// it is left as rclone.exe.grab-old, which grab deletes when it next starts.
+const
+  OldRcloneSize = 85192704;
+  OldRcloneSha256 = '033eee51c9ad47c2de2624b6674d355274bcd6cf0027a5f85db4437ba24ae81c';
+  NotPlainFile = $410;        // FILE_ATTRIBUTE_DIRECTORY ($10) or FILE_ATTRIBUTE_REPARSE_POINT ($400)
+  NoAttributes = $FFFFFFFF;   // INVALID_FILE_ATTRIBUTES
+
+function GetFileAttributes(lpFileName: String): Cardinal;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
+// True for grab's old rclone: a plain file (a link may lead to someone's rclone elsewhere) of that
+// size, then that SHA-256.
+function IsOldRclone(const FileName: String): Boolean;
+var
+  Attributes: Cardinal;
+  Size: Int64;
+begin
+  Result := False;
+  Attributes := GetFileAttributes(FileName);
+  if (Attributes = NoAttributes) or ((Attributes and NotPlainFile) <> 0) then
+    exit;
+  if not FileSize64(FileName, Size) or (Size <> OldRcloneSize) then
+    exit;
+  try
+    Result := Lowercase(GetSHA256OfFile(FileName)) = OldRcloneSha256;
+  except
+    Result := False; // unreadable: not known to be grab's
+  end;
+end;
+
+procedure RemoveOldRclone(const FileName: String);
+var
+  Aside: String;
+begin
+  if not IsOldRclone(FileName) then
+    exit;
+  Aside := ExpandConstant('{app}\bin\rclone.exe.grab-old');
+  DeleteFile(Aside);
+  if RenameFile(FileName, Aside) then
+    DeleteFile(Aside)
+  else
+    DeleteFile(FileName);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Bin: String;
+begin
+  if CurStep <> ssPostInstall then
+    exit;
+  Bin := ExpandConstant('{app}\bin\');
+  if FileOrDirExists(Bin + 'grab.exe.old') or FileOrDirExists(Bin + 'grab-gui.exe.old') then
+    exit;
+  RemoveOldRclone(Bin + 'rclone.exe');
+  RemoveOldRclone(Bin + 'rclone.exe.old');
 end;

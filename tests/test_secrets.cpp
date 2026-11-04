@@ -1,17 +1,13 @@
-#include "process.hpp"
 #include "rclone_encoding.hpp"
 #include "secrets.hpp"
-#include "test_tools.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
 
 #include <filesystem>
 #include <fstream>
-#include <optional>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -60,21 +56,6 @@ TEST_CASE("the secret store survives its saved form, encrypted") {
     std::filesystem::remove_all(dir);
 }
 
-TEST_CASE("a server's settings reach rclone as RCLONE_CONFIG_<REMOTE>_<KEY>, upper case as Go makes it") {
-    CHECK(secrets::env_name("Box.Guest", "pass") == "RCLONE_CONFIG_BOX.GUEST_PASS");
-    // rclone keeps the remote's '-' (G6); only the key's become '_'.
-    CHECK(secrets::env_name("my-box", "key_file_pass") == "RCLONE_CONFIG_MY-BOX_KEY_FILE_PASS");
-    CHECK(secrets::env_name("my_box", "pass") == "RCLONE_CONFIG_MY_BOX_PASS");
-    CHECK(secrets::env_name("box", "key-file-pass") == "RCLONE_CONFIG_BOX_KEY_FILE_PASS");
-    CHECK(secrets::env_name("my box", "host") == "RCLONE_CONFIG_MY BOX_HOST");
-    CHECK(secrets::env_prefix("Main") == "RCLONE_CONFIG_MAIN_");
-    // Every letter by Go's simple upper-case mapping, which Windows' own ignoring of case doesn't
-    // match for Georgian and the like (phase 7, chunk A): Mkhedruli becomes Mtavruli.
-    CHECK(secrets::env_name("\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8", "pass") ==
-          "RCLONE_CONFIG_\u1CA1\u1C94\u1CA0\u1C95\u1C94\u1CA0\u1C98_PASS");
-    CHECK(secrets::env_prefix("\u0444\u0430\u0439\u043B\u044B") == "RCLONE_CONFIG_\u0424\u0410\u0419\u041B\u042B_");
-}
-
 TEST_CASE("Go's upper case: simple mappings of Unicode 15, as rclone 1.75.1 names a remote's variables") {
     using rclone_enc::go_upper;
     CHECK(go_upper("Main box-1.eu_x+y@z") == "MAIN BOX-1.EU_X+Y@Z");
@@ -103,68 +84,6 @@ TEST_CASE("Go's upper case: simple mappings of Unicode 15, as rclone 1.75.1 name
     for (const auto& [in, out] : letters) CHECK_MESSAGE(go_upper(in) == out, in);
     // A byte that isn't UTF-8 is U+FFFD, as Go's range loop reads it.
     CHECK(go_upper("a\xFF" "b\xE1\x83") == "A\uFFFDB\uFFFD\uFFFD");
-}
-
-#ifdef _WIN32
-TEST_CASE("rclone finds a remote given only in its run's environment, under any name grab gives it") {
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    // An alias remote that only its run's environment defines, with its config in memory, as
-    // engine::rclone_env gives a server: '-' (G6), Georgian (which Windows' ignoring of case
-    // doesn't upper-case), a long s and a final sigma (phase 7, chunk A).
-    const auto dir = fresh_dir("grab-test-env-name");
-    std::filesystem::create_directories(dir / "target");
-    write(dir / "target" / "found-it.txt", "x");
-    for (const std::string name : {"grab-test-box", "\u10E1\u10D4\u10E0\u10D5\u10D4\u10E0\u10D8", "\u017Ftore",
-                                   "\u03C3\u03C2 box"}) {
-        proc::RunOptions quiet;
-        quiet.detached = true;
-        quiet.environment.without_prefix = {"RCLONE_"}; // none of the user's own rclone settings
-        quiet.environment.set = {{secrets::env_name(name, "type"), "alias"},
-                                 {secrets::env_name(name, "remote"), util::path_to_utf8(dir / "target")}};
-        const auto ran = proc::run_capture(
-            std::vector<std::string>{util::path_to_utf8(*rclone), "lsf", name + ":", "--config", "NUL"}, quiet);
-        REQUIRE(ran.has_value());
-        CHECK_MESSAGE(ran->exit_code == 0, name, ": ", ran->err);
-        CHECK_MESSAGE(ran->out.find("found-it.txt") != std::string::npos, name);
-    }
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
-}
-#endif
-
-TEST_CASE("secret lines leave rclone.conf, everything else stays") {
-    const std::string conf = "# grab's servers\r\n"
-                             "[Box]\r\n"
-                             "type = sftp\r\n"
-                             "host = u1.your-storagebox.de\r\n"
-                             "pass = OBSCURED1\r\n"
-                             "port = 23\r\n"
-                             "\r\n"
-                             "[keyed]\r\n"
-                             "key_file = E:\\k.pem\r\n"
-                             "key_file_pass=PP\r\n"
-                             "; pass = not a value, a comment\r\n"
-                             "[agent]\r\n"
-                             "key_use_agent = true\r\n"
-                             "pass =\r\n";
-    const auto t = secrets::take_secrets(conf);
-    CHECK(t.found == Store{{"Box", {{"pass", "OBSCURED1"}}}, {"keyed", {{"key_file_pass", "PP"}}}});
-    CHECK(t.text == "# grab's servers\r\n"
-                    "[Box]\r\n"
-                    "type = sftp\r\n"
-                    "host = u1.your-storagebox.de\r\n"
-                    "port = 23\r\n"
-                    "\r\n"
-                    "[keyed]\r\n"
-                    "key_file = E:\\k.pem\r\n"
-                    "; pass = not a value, a comment\r\n"
-                    "[agent]\r\n"
-                    "key_use_agent = true\r\n");
-    CHECK(secrets::take_secrets(t.text).found.empty());
 }
 
 TEST_CASE("reveal: rclone's obscured values, made plain") {

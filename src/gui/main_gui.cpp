@@ -361,8 +361,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     }
 
     // An update replaced programs while they ran; the old ones can go now that this is the only
-    // grab-gui (one restarted after a portable update waited for the old window above).
-    update::remove_replaced_programs();
+    // grab-gui (one restarted after a portable update waited for the old window above), and so can
+    // the rclone.exe grab 0.20 and earlier shipped.
+    update::clean_up_at_start();
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
 

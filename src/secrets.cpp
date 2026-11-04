@@ -1,9 +1,7 @@
 #include "secrets.hpp"
 
-#include "rclone_encoding.hpp"
 #include "util.hpp"
 
-#include <algorithm>
 #include <format>
 #include <utility>
 #include <vector>
@@ -110,40 +108,6 @@ std::expected<void, std::string> save(const fs::path& file, const Store& store) 
     const auto sealed = util::protect_for_user(to_text(store), purpose);
     if (!sealed) return util::failf("cannot write {}: the passwords could not be encrypted", util::path_to_utf8(file));
     return util::write_file_atomic(file, std::string(sealed_header) + *sealed);
-}
-
-std::string env_prefix(std::string_view remote) {
-    // As rclone's fs.ConfigToEnv: the remote keeps its '-' and '.', or rclone never finds the
-    // password of a server called "my-box" (review G6), and is upper-cased as Go does it.
-    return "RCLONE_CONFIG_" + rclone_enc::go_upper(remote) + "_";
-}
-
-std::string env_name(std::string_view remote, std::string_view key) {
-    std::string k(key); // its '-' become '_'
-    std::ranges::replace(k, '-', '_');
-    return env_prefix(remote) + rclone_enc::go_upper(k);
-}
-
-Taken take_secrets(std::string_view rclone_text) {
-    Taken t;
-    std::string section;
-    each_line(rclone_text, [&](std::string_view raw) {
-        const auto line = util::trim(without_eol(raw));
-        if (line.starts_with('[') && line.ends_with(']')) {
-            section = std::string(util::trim(line.substr(1, line.size() - 2)));
-        } else if (!section.empty() && !line.starts_with('#') && !line.starts_with(';')) {
-            if (const auto eq = line.find('='); eq != std::string_view::npos) {
-                const auto key = util::trim(line.substr(0, eq));
-                if (is_secret_key(key)) {
-                    const auto value = util::trim(line.substr(eq + 1));
-                    if (!value.empty()) t.found[section][std::string(key)] = std::string(value);
-                    return; // the line goes, with its line ending
-                }
-            }
-        }
-        t.text += raw;
-    });
-    return t;
 }
 
 } // namespace grab::secrets

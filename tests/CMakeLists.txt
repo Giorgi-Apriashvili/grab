@@ -69,7 +69,7 @@ add_executable(grab_tests
     test_ssh_keys.cpp)
 
 # OpenSSL's MD5 for the checks' own sums (test_ssh_hash.cpp, test_live_server.cpp) and the local
-# hash timing; made-up keys and rclone's obscuring for test_rclone_env.cpp.
+# hash timing.
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest OpenSSL::Crypto)
 # grab.conf.example as shipped, compared with the example built into grab (test_config.cpp).
 target_compile_definitions(grab_tests PRIVATE GRAB_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
@@ -82,13 +82,13 @@ endif()
 
 add_test(NAME grab_tests COMMAND grab_tests)
 
-# rclone for the tests only (Windows): what grab is compared with, the rclone 1.75.1 grab bundled
-# (the same zip and SHA-256). The import's reader and reveal (test_rclone_env.cpp,
-# test_secrets.cpp), the key logins against `rclone serve sftp` (test_ssh_keys.cpp) and the live
+# rclone for the tests only (Windows): what grab is compared with, the rclone 1.75.1 grab 0.20 and
+# earlier bundled (the same zip and SHA-256). The import's reader and reveal (test_rclone_env.cpp),
+# the key logins against `rclone serve sftp` (test_ssh_keys.cpp) and the live
 # `rclone hashsum` comparison (test_ssh_hash.cpp) run it from <build>/test-tools/rclone.exe, which
-# is never staged, installed or zipped. Declared under the bundled rclone's name
-# (../CMakeLists.txt), so a build that bundles it downloads it once. OFF for an offline build:
-# those tests then skip (a failed download fails the configure, URL_HASH).
+# is never staged, installed or zipped. To bump: take the zip's line from
+# https://downloads.rclone.org/<version>/SHA256SUMS (PGP-signed). OFF for an offline build: those
+# tests then skip (a failed download fails the configure, URL_HASH).
 if(WIN32)
     option(GRAB_TEST_TOOLS "Download rclone for the tests into <build>/test-tools" ON)
 endif()

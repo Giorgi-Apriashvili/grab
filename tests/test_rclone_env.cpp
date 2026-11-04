@@ -1,27 +1,22 @@
-// rclone with a remote given only in its environment and its config in memory (`--config NUL`),
-// as grab 0.20 started it for its fallback (RCLONE-REPLACEMENT.md, Phase 7 step 1 and decision 1:
-// each rclone process got its one server's details in its own environment), and
-// rclone's config reader as the oracle for the import of an rclone.conf. Each case runs the test
-// rclone (test_tools.hpp: build\<preset>\test-tools\rclone.exe, the 1.75.1 grab bundled) with
-// exactly the environment it gives it (no inherited RCLONE_* variable) and is skipped without
-// one. Nothing here talks to a server: remotes are alias remotes on a temp folder, or sftp
-// remotes on a closed 127.0.0.1 port, where a key or password rclone refuses fails before the
-// connection and a refused dial ("127.0.0.1:<port>: connectex", Go's syscall name, never
-// translated) means rclone took them. Every key and password is made up here.
+// rclone as the oracle for what grab still reads of rclone's: the import of an rclone.conf (its
+// config reader, dotted parents, path expansion), rclone's obscuring (reveal) and the upper-case
+// names rclone gave a remote's variables (go_upper). Each case runs the test rclone
+// (test_tools.hpp: build\<preset>\test-tools\rclone.exe, the 1.75.1 grab 0.20 bundled) with exactly
+// the environment it gives it (no inherited RCLONE_* variable) and is skipped without one. Nothing
+// here talks to a server: remotes are alias remotes on a temp folder, or sftp remotes on a closed
+// 127.0.0.1 port, where a refused dial ("127.0.0.1:<port>: connectex", Go's syscall name, never
+// translated) means rclone got that far. Every key and password is made up here.
 
 #include "json.hpp"
 #include "process.hpp"
 #include "quote.hpp"
 #include "rclone_conf.hpp"
+#include "rclone_encoding.hpp"
 #include "secrets.hpp"
 #include "test_tools.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
-
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
 
 #include <cstddef>
 #include <cstdio>
@@ -157,38 +152,6 @@ std::string obscured(std::string_view plain) {
     return *text;
 }
 
-// A made-up private key in PEM, as OpenSSL writes it; `pass`: encrypted the old way (DEK-Info),
-// the form Go's ssh package opens with a passphrase.
-std::string made_up_key(const char* type, const char* curve, const std::string& pass = {}) {
-    EVP_PKEY* pkey = curve != nullptr ? EVP_PKEY_Q_keygen(nullptr, nullptr, type, curve)
-                                      : EVP_PKEY_Q_keygen(nullptr, nullptr, type);
-    REQUIRE(pkey != nullptr);
-    BIO* bio = BIO_new(BIO_s_mem());
-    const auto* p = reinterpret_cast<const unsigned char*>(pass.data());
-    const int written = pass.empty() ? PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr)
-                                     : PEM_write_bio_PrivateKey_traditional(bio, pkey, EVP_aes_128_cbc(), p,
-                                                                            static_cast<int>(pass.size()), nullptr,
-                                                                            nullptr);
-    char* data = nullptr;
-    const long size = BIO_get_mem_data(bio, &data);
-    std::string pem(data, static_cast<std::size_t>(size));
-    BIO_free(bio);
-    EVP_PKEY_free(pkey);
-    REQUIRE(written == 1);
-    return pem;
-}
-
-// A PEM on one line with "\n" for its line breaks, as rclone.conf holds a key_pem.
-std::string one_line(std::string_view pem) {
-    std::string s;
-    for (const char c : pem) {
-        if (c == '\n') s += "\\n";
-        else if (c != '\r') s += c;
-    }
-    while (s.ends_with("\\n")) s.resize(s.size() - 2);
-    return s;
-}
-
 using Sections = std::map<std::string, std::map<std::string, std::string>>;
 
 // `rclone config dump` of an rclone.conf holding `text`: section -> key -> value as rclone reads
@@ -233,7 +196,8 @@ TEST_CASE("rclone finds a remote given only in its environment, under Go's upper
     // rclone looks for RCLONE_CONFIG_<strings.ToUpper(name)>_<KEY>: Go's simple upper-case mapping
     // of every letter (Unicode 15 in rclone 1.75.1's Go), '.', '-', ' ' and the rest kept. Windows
     // matches variable names ignoring case only by its own, older table (ó and Cyrillic, but not
-    // Georgian or the rest below; phase7\main-results.txt), so grab has to write Go's form.
+    // Georgian or the rest below; phase7\main-results.txt). grab's go_upper, which decides which
+    // server names are one (server_conf.cpp), makes the same form.
     const std::vector<std::pair<std::string_view, std::string_view>> names = {
         {"Main", "MAIN"},
         {"box.eu", "BOX.EU"},
@@ -256,32 +220,13 @@ TEST_CASE("rclone finds a remote given only in its environment, under Go's upper
         const auto ran = run_rclone(*rclone, scratch, {"lsf", std::string(name) + ":", "--config", "NUL"},
                                     {{prefix + "TYPE", "alias"}, {prefix + "REMOTE", target}});
         CHECK_MESSAGE(listing(ran) == "marker.txt", name, " ", ran.err);
+        CHECK_MESSAGE(rclone_enc::go_upper(name) == upper, name);
     }
     // A name rclone takes for no remote at all, in a file or not: a combining accent (NFD).
     const auto nfd = run_rclone(*rclone, scratch, {"lsf", "cafe\u0301:", "--config", "NUL"},
                                 {{"RCLONE_CONFIG_CAFE\u0301_TYPE", "alias"}, {"RCLONE_CONFIG_CAFE\u0301_REMOTE", target}});
     CHECK(nfd.exit_code != 0);
     CHECK(nfd.err.find("config name contains invalid characters") != std::string::npos);
-}
-
-TEST_CASE("rclone's config in memory: --config NUL says nothing, a lower-case nul is refused") {
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    const Scratch scratch("grab-test-rclone-env-nul");
-    fs::create_directories(scratch.dir() / "target");
-    scratch.write("target/marker.txt", "x");
-    const Vars vars{{"RCLONE_CONFIG_MAIN_TYPE", "alias"},
-                    {"RCLONE_CONFIG_MAIN_REMOTE", util::path_to_utf8(scratch.dir() / "target")}};
-    const auto ran = run_rclone(*rclone, scratch, {"lsf", "Main:", "--config", "NUL"}, vars);
-    CHECK(listing(ran) == "marker.txt");
-    CHECK(ran.err.empty()); // no "Config file not found" notice
-    // Go's os.DevNull is "NUL" exactly; any other spelling is a file name Windows reserves.
-    const auto lower = run_rclone(*rclone, scratch, {"lsf", "Main:", "--config", "nul"}, vars);
-    CHECK(lower.exit_code != 0);
-    CHECK(lower.err.find("reserved windows device name") != std::string::npos);
 }
 
 TEST_CASE("rclone's config reader, as `rclone config dump` shows it: the import's oracle") {
@@ -443,93 +388,6 @@ TEST_CASE("a dotted name takes a key its section lacks from the parent section, 
     // The environment comes before the file, and so before the parent too.
     const auto env = run_rclone(*rclone, scratch, {"lsf", "p.c:", "--config", conf}, {{"RCLONE_CONFIG_P.C_REMOTE", b}});
     CHECK(listing(env) == "in-b.txt");
-}
-
-TEST_CASE("key_pem, a key's passphrase and a password reach rclone through the environment") {
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    const Scratch scratch("grab-test-rclone-env-keys");
-    scratch.write("known_hosts", "");
-    const int port = closed_port();
-    const Vars sftp{{"RCLONE_CONFIG_EK_TYPE", "sftp"},
-                    {"RCLONE_CONFIG_EK_HOST", "127.0.0.1"},
-                    {"RCLONE_CONFIG_EK_PORT", std::to_string(port)},
-                    {"RCLONE_CONFIG_EK_USER", "t"},
-                    {"RCLONE_CONFIG_EK_KNOWN_HOSTS_FILE", util::path_to_utf8(scratch.dir() / "known_hosts")}};
-    // On a closed port: a key or password rclone can't use fails before the connection.
-    const auto attempt = [&](const Vars& more) {
-        Vars vars = sftp;
-        vars.insert(vars.end(), more.begin(), more.end());
-        const auto ran = run_rclone(*rclone, scratch,
-                                    {"lsf", "EK:", "--config", "NUL", "--low-level-retries", "1", "--retries", "1"}, vars);
-        const bool refused = ran.err.find("127.0.0.1:" + std::to_string(port) + ": connectex") != std::string::npos;
-        return refused ? std::string("dialled") : ran.err;
-    };
-    const auto ed25519 = made_up_key("ED25519", nullptr);
-    CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ed25519)}}) == "dialled");
-    // rclone reads key_pem as the inside of a Go string literal: real line breaks are refused.
-    CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", ed25519}}).find("pem key not formatted properly") != std::string::npos);
-    const auto ec = made_up_key("EC", "P-256", "fake-passphrase");
-    CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ec)},
-                   {"RCLONE_CONFIG_EK_KEY_FILE_PASS", obscured("fake-passphrase")}}) == "dialled");
-    CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ec)}}).find("passphrase") != std::string::npos);
-    CHECK(attempt({{"RCLONE_CONFIG_EK_KEY_PEM", one_line(ec)}, {"RCLONE_CONFIG_EK_KEY_FILE_PASS", "fake-passphrase"}})
-              .find("is it obscured?") != std::string::npos);
-    // A password: only in rclone's obscured form.
-    CHECK(attempt({{"RCLONE_CONFIG_EK_PASS", obscured("fake-password")}}) == "dialled");
-    CHECK(attempt({{"RCLONE_CONFIG_EK_PASS", "fake-password"}}).find("is it obscured?") != std::string::npos);
-}
-
-TEST_CASE("an inherited RCLONE_SFTP_* or a --sftp-* flag beats RCLONE_CONFIG_<NAME>_*: grab drops or refuses them") {
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    const Scratch scratch("grab-test-rclone-env-wins");
-    scratch.write("known_hosts", "");
-    const int p1 = closed_port();
-    int p2 = closed_port();
-    while (p2 == p1) p2 = closed_port();
-    const Vars server{{"RCLONE_CONFIG_WN_TYPE", "sftp"},
-                      {"RCLONE_CONFIG_WN_HOST", "127.0.0.1"},
-                      {"RCLONE_CONFIG_WN_PORT", std::to_string(p1)},
-                      {"RCLONE_CONFIG_WN_USER", "t"},
-                      {"RCLONE_CONFIG_WN_PASS", obscured("fake-password")},
-                      {"RCLONE_CONFIG_WN_KNOWN_HOSTS_FILE", util::path_to_utf8(scratch.dir() / "known_hosts")}};
-    // The port rclone dialled, from Go's refused dial (its syscall name is never translated).
-    const auto dialled = [&](const Vars& more, const std::vector<std::string>& flags = {}) {
-        Vars vars = server;
-        vars.insert(vars.end(), more.begin(), more.end());
-        std::vector<std::string> args{"lsf", "WN:", "--config", "NUL", "--low-level-retries", "1", "--retries", "1"};
-        args.insert(args.end(), flags.begin(), flags.end());
-        const auto err = run_rclone(*rclone, scratch, args, vars).err;
-        for (const int port : {p1, p2, 22}) {
-            if (err.find("127.0.0.1:" + std::to_string(port) + ": connectex") != std::string::npos) return port;
-        }
-        // An sshd on this PC's port 22 answers instead, without naming the port; p1 and p2 are closed.
-        if (err.find("handshake failed") != std::string::npos) return 22;
-        return 0;
-    };
-    CHECK(dialled({}) == p1);
-    // rclone makes an inherited RCLONE_SFTP_PORT the flag's default, which a remote's own value
-    // doesn't override unless it's the option's default anyway.
-    CHECK(dialled({{"RCLONE_SFTP_PORT", std::to_string(p2)}}) == p2);
-    CHECK(dialled({{"RCLONE_SFTP_PORT", "22"}}) == p1);
-    CHECK(dialled({}, {"--sftp-port", std::to_string(p2)}) == p2);
-    CHECK(dialled({}, {"--sftp-port", "22"}) == 22); // an explicit flag wins even at the default
-    const auto missing = util::path_to_utf8(scratch.dir() / "inherited_known_hosts");
-    const auto err = run_rclone(*rclone, scratch, {"lsf", "WN:", "--config", "NUL", "--low-level-retries", "1"},
-                                [&] {
-                                    Vars vars = server;
-                                    vars.emplace_back("RCLONE_SFTP_KNOWN_HOSTS_FILE", missing);
-                                    return vars;
-                                }())
-                         .err;
-    CHECK(err.find("inherited_known_hosts") != std::string::npos);
 }
 
 TEST_CASE("rclone reveals what grab obscures, and grab reveals what rclone obscures") {

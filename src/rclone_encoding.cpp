@@ -462,40 +462,4 @@ std::string shown_line(std::string_view text, std::size_t max) {
     return {};
 }
 
-std::string from_standard_name(std::string_view name) { return encode(decode(name, standard), windows); }
-
-std::string to_standard_name(std::string_view name) { return encode(decode(name, windows), standard); }
-
-std::expected<std::string, std::string> local_path(const std::filesystem::path& p) {
-#ifdef _WIN32
-    // rclone's cleanRootPath encodes every part after the volume ("D:", "\\server\share"); "."
-    // and ".." stay.
-    const auto root_name = p.root_name().native();
-    const bool share = root_name.starts_with(L"\\\\") && !root_name.starts_with(L"\\\\?");
-    std::string out = util::path_to_utf8(p.root_name()) + util::path_to_utf8(p.root_directory());
-    bool first = true;
-    for (const auto& part : p.relative_path()) {
-        const std::string name = util::path_to_utf8(part);
-        if (name.empty()) continue;
-        std::string given = name;
-        if (!(first && share) && name != "." && name != "..") {
-            given = to_standard_name(name);
-            // A "\" (from a server's "＼") would split the part in two; bytes that aren't UTF-8
-            // can't be on a command line; and some names rclone can't write as they are ("a‛b").
-            if (given.find('\\') != std::string::npos || !valid_utf8(given) || from_standard_name(given) != name) {
-                return util::failf("rclone can't be given the folder or file name \"{}\" as it is; rename it or "
-                                   "choose another folder",
-                                   name);
-            }
-        }
-        if (!first) out += '\\';
-        out += given;
-        first = false;
-    }
-    return out;
-#else
-    return util::path_to_utf8(p);
-#endif
-}
-
 } // namespace grab::rclone_enc

@@ -890,12 +890,11 @@ std::filesystem::path self_exe_path() {
 
 namespace {
 
-// A file's digest in lower-case hex, with Windows' CNG `algorithm` (`size` bytes of digest).
-std::expected<std::string, std::string> hash_file(const std::filesystem::path& p, LPCWSTR algorithm,
-                                                  std::size_t size, std::string_view name) {
-    std::ifstream in(p, std::ios::binary);
-    if (!in) return failf("cannot open '{}'", path_to_utf8(p));
-
+// The digest of what `read` gives in lower-case hex, with Windows' CNG `algorithm` (`size` bytes
+// of digest). `read(buffer)` fills it and says how many bytes it put there, 0 at the end.
+template <class Read>
+std::expected<std::string, std::string> hash_chunks(Read&& read, LPCWSTR algorithm, std::size_t size,
+                                                    std::string_view name) {
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     if (BCryptOpenAlgorithmProvider(&alg, algorithm, nullptr, 0) < 0) {
@@ -914,14 +913,14 @@ std::expected<std::string, std::string> hash_file(const std::filesystem::path& p
     }
 
     std::vector<char> buf(1 << 16);
-    while (in) {
-        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-        const auto n = static_cast<ULONG>(in.gcount());
-        if (n > 0 && BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf.data()), n, 0) < 0) {
+    for (;;) {
+        const std::expected<std::size_t, std::string> n = read(buf);
+        if (!n) return fail(n.error());
+        if (*n == 0) break;
+        if (BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf.data()), static_cast<ULONG>(*n), 0) < 0) {
             return fail("BCryptHashData failed");
         }
     }
-    if (in.bad()) return failf("error reading '{}'", path_to_utf8(p));
 
     std::vector<unsigned char> digest(size);
     if (BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) {
@@ -936,7 +935,25 @@ std::expected<std::string, std::string> hash_file(const std::filesystem::path& p
 } // namespace
 
 std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p) {
-    return hash_file(p, BCRYPT_SHA256_ALGORITHM, 32, "SHA-256");
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return failf("cannot open '{}'", path_to_utf8(p));
+    const auto read = [&](std::vector<char>& buf) -> std::expected<std::size_t, std::string> {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        if (in.bad()) return failf("error reading '{}'", path_to_utf8(p));
+        return static_cast<std::size_t>(in.gcount());
+    };
+    return hash_chunks(read, BCRYPT_SHA256_ALGORITHM, 32, "SHA-256");
+}
+
+std::expected<std::string, std::string> sha256_handle(void* file) {
+    const auto read = [&](std::vector<char>& buf) -> std::expected<std::size_t, std::string> {
+        DWORD got = 0;
+        if (!ReadFile(file, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
+            return fail(error_message(GetLastError()));
+        }
+        return std::size_t{got};
+    };
+    return hash_chunks(read, BCRYPT_SHA256_ALGORITHM, 32, "SHA-256");
 }
 
 namespace {
@@ -1021,6 +1038,10 @@ std::filesystem::path self_exe_path() {
 }
 
 std::expected<std::string, std::string> sha256_file(const std::filesystem::path&) {
+    return fail("SHA-256 hashing is only implemented on Windows");
+}
+
+std::expected<std::string, std::string> sha256_handle(void*) {
     return fail("SHA-256 hashing is only implemented on Windows");
 }
 

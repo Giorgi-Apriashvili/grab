@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <print>
@@ -152,10 +154,93 @@ void remove_replaced_programs(const std::filesystem::path& dir) {
     }
 }
 
-void remove_replaced_programs() {
+#ifdef _WIN32
+
+namespace {
+
+// Renames the file `h` holds (open with delete access) to `to`, replacing a file of that name.
+bool rename_open(HANDLE h, const std::filesystem::path& to) {
+    const std::wstring& name = to.native();
+    // FILE_RENAME_INFO ends in the name; the zeroed buffer has room for its terminating NUL too.
+    std::vector<std::byte> buffer(sizeof(FILE_RENAME_INFO) + (name.size() * sizeof(wchar_t)));
+    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    info->ReplaceIfExists = TRUE;
+    info->RootDirectory = nullptr;
+    info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+    std::memcpy(info->FileName, name.data(), info->FileNameLength);
+    return SetFileInformationByHandle(h, FileRenameInfo, info, static_cast<DWORD>(buffer.size())) != 0;
+}
+
+// remove_old_rclone for one file, `name` in `dir`.
+OldRclone remove_if_old_rclone(const std::filesystem::path& dir, std::string_view name, std::uintmax_t size,
+                               std::string_view sha256) {
+    const auto file = dir / util::path_from_utf8(name);
+    const auto aside = dir / util::path_from_utf8(old_rclone_aside);
+    constexpr DWORD not_plain = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+    const auto size_of = [](DWORD high, DWORD low) { return (std::uintmax_t{high} << 32) | low; };
+    // The name's own entry, a link not followed: a link named rclone.exe may lead to someone's
+    // rclone elsewhere.
+    WIN32_FILE_ATTRIBUTE_DATA entry{};
+    if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &entry) || (entry.dwFileAttributes & not_plain) != 0) {
+        return OldRclone::none;
+    }
+    if (size_of(entry.nFileSizeHigh, entry.nFileSizeLow) != size) return OldRclone::other_size;
+
+    // One handle for the hash, the rename and the delete. Without FILE_SHARE_WRITE nobody can
+    // write the file while it is open, so what goes is what was hashed. A folder grab can't change
+    // refuses delete access here, before a byte is read, so it costs no hash at each start.
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return OldRclone::not_opened;
+    struct Close {
+        HANDLE h;
+        ~Close() { CloseHandle(h); }
+    } close{h};
+    // The file opened may not be the one looked at a moment ago.
+    BY_HANDLE_FILE_INFORMATION opened{};
+    if (!GetFileInformationByHandle(h, &opened) || (opened.dwFileAttributes & not_plain) != 0 ||
+        size_of(opened.nFileSizeHigh, opened.nFileSizeLow) != size) {
+        return OldRclone::other_file;
+    }
+    const auto hash = util::sha256_handle(h);
+    if (!hash || *hash != sha256) return OldRclone::other_file;
+
+    // Renamed first: a running copy can't be deleted, but it can be renamed, so `rclone` no longer
+    // finds it here and replaced_programs deletes it at a later start.
+    const bool renamed = rename_open(h, aside);
+    FILE_DISPOSITION_INFO gone{};
+    gone.DeleteFile = TRUE; // done when the handle closes
+    if (SetFileInformationByHandle(h, FileDispositionInfo, &gone, sizeof(gone)) != 0) return OldRclone::removed;
+    return renamed ? OldRclone::renamed : OldRclone::stuck;
+}
+
+} // namespace
+
+OldRclones remove_old_rclone(const std::filesystem::path& dir, std::uintmax_t size, std::string_view sha256) {
+    OldRclones r;
+    std::error_code ec;
+    for (const auto* replaced : {"grab.exe.old", "grab-gui.exe.old"}) {
+        if (std::filesystem::exists(std::filesystem::symlink_status(dir / replaced, ec))) {
+            r.skipped = true;
+            return r;
+        }
+    }
+    r.exe = remove_if_old_rclone(dir, "rclone.exe", size, sha256);
+    r.old = remove_if_old_rclone(dir, "rclone.exe.old", size, sha256);
+    return r;
+}
+
+#else
+
+OldRclones remove_old_rclone(const std::filesystem::path&, std::uintmax_t, std::string_view) { return {}; }
+
+#endif
+
+void clean_up_at_start() {
     const auto self = util::self_exe_path();
     if (self.empty()) return;
     remove_replaced_programs(self.parent_path());
+    remove_old_rclone(self.parent_path());
 }
 
 std::string api_url() { return util::getenv_utf8("GRAB_UPDATE_API").value_or(std::string(default_api_url)); }
@@ -412,8 +497,8 @@ int run(bool check_only) {
             error(std::format("cannot extract {}", name));
             return exit_update_failed;
         }
-        // Every program in the release (grab, the bundled rclone, grab-gui) is replaced
-        // together, so they stay a tested set. Running ones cannot be overwritten, but they can
+        // Every program in the release (grab, grab-gui) is replaced together, so they stay a
+        // tested set. Running ones cannot be overwritten, but they can
         // be renamed: each is moved aside as <name>.old, deleted on a later run.
         const auto dir = exe.parent_path();
         struct Swap {

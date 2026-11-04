@@ -461,7 +461,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-    update::remove_replaced_programs();
+    update::clean_up_at_start();
 #endif
     const auto args = collect_args(argc, argv);
     auto parsed = parse_args(args);

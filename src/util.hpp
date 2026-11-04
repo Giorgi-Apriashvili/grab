@@ -47,6 +47,9 @@ namespace grab::util {
 
 // Lowercase hex SHA-256 of a file (Windows CNG; not available on other platforms).
 [[nodiscard]] std::expected<std::string, std::string> sha256_file(const std::filesystem::path& p);
+// The same for a file already open (a Windows HANDLE with read access), from where it stands to its
+// end, so what is hashed is the file that handle holds.
+[[nodiscard]] std::expected<std::string, std::string> sha256_handle(void* file);
 // Lowercase hex SHA-256 of `data` (OpenSSL's EVP).
 [[nodiscard]] std::string sha256_hex(std::string_view data);
 

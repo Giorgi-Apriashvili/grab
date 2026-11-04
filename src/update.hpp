@@ -71,8 +71,8 @@ enum class InstallMode {
 // ignored (Inno stores InstallLocation with a trailing '\', so "<loc>\bin" doubles it).
 [[nodiscard]] bool same_dir(std::string_view a, std::string_view b);
 
-// The programs a release ships next to grab.exe: grab.exe, and rclone.exe and grab-gui.exe
-// when this build bundles them.
+// The programs a release ships next to grab.exe: grab.exe, and grab-gui.exe when this build has
+// the window.
 [[nodiscard]] std::vector<std::string> release_programs();
 
 // Those of `programs` that are not files in `dir`, in the same order.
@@ -88,15 +88,52 @@ enum class InstallMode {
 // this is a portable copy lacking release programs, else nullopt. Windows only.
 [[nodiscard]] std::optional<std::string> incomplete_folder_note();
 
-// The names an update gives the programs it replaced while they ran (update.cpp's swap): only
-// these are grab's to delete. Other programs in a shared folder keep their own .old files (G31).
+// grab 0.20 and earlier shipped rclone 1.75.1 next to grab.exe, the only rclone a grab ever
+// bundled; 0.20's portable update swaps only the programs of the new zip, so it stays behind. That
+// copy is known by its exact size and SHA-256: any other rclone.exe is someone else's (G31).
+inline constexpr std::uintmax_t old_rclone_size = 85'192'704;
+inline constexpr std::string_view old_rclone_sha256 =
+    "033eee51c9ad47c2de2624b6674d355274bcd6cf0027a5f85db4437ba24ae81c";
+// Where remove_old_rclone puts that copy when it runs and so can't be deleted yet.
+inline constexpr std::string_view old_rclone_aside = "rclone.exe.grab-old";
+
+// The names grab gives files it replaced or put aside while they ran (update.cpp's swap,
+// remove_old_rclone): only these are grab's to delete. Other programs in a shared folder keep their
+// own .old files (G31), rclone.exe.old included: remove_old_rclone deletes that one only when it is
+// grab's old rclone.
 inline constexpr std::array<std::string_view, 3> replaced_programs{"grab.exe.old", "grab-gui.exe.old",
-                                                                    "rclone.exe.old"};
+                                                                    old_rclone_aside};
 
 // Deletes the replaced_programs files an update left in `dir`. Each goes once nothing runs it.
 void remove_replaced_programs(const std::filesystem::path& dir);
-// The same next to the running program.
-void remove_replaced_programs();
+
+// What remove_old_rclone did with one file.
+enum class OldRclone {
+    none,       // no plain file of that name (a folder or a link is never grab's copy)
+    other_size, // someone else's: never opened
+    not_opened, // grab's size, but it can't be opened to be deleted (a folder grab can't change, a
+                // file being written): not hashed either
+    other_file, // opened, but not grab's copy (another SHA-256, or unreadable): left as it was
+    renamed,    // grab's copy, running: renamed to old_rclone_aside, which a later start deletes
+    removed,    // grab's copy, deleted
+    stuck       // grab's copy, neither renamed nor deleted
+};
+struct OldRclones {
+    bool skipped = false;            // grab.exe.old or grab-gui.exe.old is there: nothing looked at
+    OldRclone exe = OldRclone::none; // rclone.exe
+    OldRclone old = OldRclone::none; // rclone.exe.old
+};
+// Deletes the rclone.exe and rclone.exe.old in `dir` that are a grab's old rclone: exactly `size`
+// bytes, then that SHA-256, read through the one handle (read and delete access, nobody writing)
+// that renames the file to old_rclone_aside and deletes it. Skipped while grab.exe.old or
+// grab-gui.exe.old is still there: an old grab-gui may still run and start that rclone. Windows
+// only; the size and SHA-256 are for the tests.
+OldRclones remove_old_rclone(const std::filesystem::path& dir, std::uintmax_t size = old_rclone_size,
+                             std::string_view sha256 = old_rclone_sha256);
+
+// At the start of grab and grab-gui: remove_replaced_programs, then remove_old_rclone, next to the
+// running program.
+void clean_up_at_start();
 
 // GRAB_UPDATE_API, else default_api_url.
 [[nodiscard]] std::string api_url();

@@ -150,38 +150,12 @@ if(WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
-# Bundled rclone (Windows): a pinned, checksum-verified rclone.exe ships next to grab.exe,
-# and grab prefers it over any rclone on PATH. rclone is MIT-licensed; its notice ships as
-# licenses/rclone.txt. To bump: change the version, take the zip's line from
-# https://downloads.rclone.org/<version>/SHA256SUMS (PGP-signed) and update the hash.
+# Third-party notices, shipped with the programs: libssh2 (BSD-3-Clause) and OpenSSL (Apache-2.0)
+# are linked into grab statically, and grab reuses rclone's (MIT) file-name encoding tables and
+# password-obscuring key (src/rclone_encoding.cpp, src/secrets_reveal.cpp). No rclone program
+# ships since 0.21; the tests download their own (tests/CMakeLists.txt).
 # ---------------------------------------------------------------------------
-if(WIN32)
-    option(GRAB_BUNDLE_RCLONE "Ship a pinned rclone.exe next to grab.exe" ON)
-endif()
-if(WIN32 AND GRAB_BUNDLE_RCLONE)
-    include(FetchContent)
-    set(GRAB_RCLONE_VERSION v1.75.1)
-    FetchContent_Declare(rclone
-        URL https://downloads.rclone.org/${GRAB_RCLONE_VERSION}/rclone-${GRAB_RCLONE_VERSION}-windows-amd64.zip
-        URL_HASH SHA256=200EB602C126D82AA38B51E0F6B9AE837473FF99B51278D3F6F837574C494D6E
-        SOURCE_SUBDIR no-cmake-here)
-    FetchContent_MakeAvailable(rclone)
-    set(GRAB_RCLONE_EXE "${rclone_SOURCE_DIR}/rclone.exe")
-
-    # Next to the built grab.exe and grab-gui.exe, so development builds use it too.
-    add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/rclone.exe"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GRAB_RCLONE_EXE}" "${CMAKE_BINARY_DIR}/rclone.exe"
-        DEPENDS "${GRAB_RCLONE_EXE}"
-        COMMENT "Bundling rclone ${GRAB_RCLONE_VERSION}"
-        VERBATIM)
-    add_custom_target(bundled_rclone ALL DEPENDS "${CMAKE_BINARY_DIR}/rclone.exe")
-    add_dependencies(grab bundled_rclone)
-    install(PROGRAMS "${GRAB_RCLONE_EXE}" DESTINATION bin)
-    install(FILES licenses/rclone.txt DESTINATION licenses)
-endif()
-# libssh2 (BSD-3-Clause) and OpenSSL (Apache-2.0) are linked into grab statically; both licenses
-# ask for their text to ship with the programs.
-install(FILES licenses/libssh2.txt licenses/openssl.txt DESTINATION licenses)
+install(FILES licenses/rclone.txt licenses/libssh2.txt licenses/openssl.txt DESTINATION licenses)
 
 # ---------------------------------------------------------------------------
 # Install: <prefix>/bin/grab.exe plus the commented example config. On Windows the user
@@ -266,8 +240,9 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Release artifacts: `cmake --build --preset <p> --target dist` writes to <build>/dist/
-#   grab-<version>-windows-x64.zip        portable: grab.exe, grab-gui.exe, rclone.exe, example
-#                                         config, README, docs/doc.md, licenses/, LICENSE
+#   grab-<version>-windows-x64.zip        portable: grab.exe, grab-gui.exe, example config,
+#                                         README, docs/doc.md, licenses/, LICENSE; grab.exe at
+#                                         the top, where every earlier `grab update` looks for it
 #   grab-<version>-windows-x64-setup.exe  Inno Setup per-user installer, when ISCC is available
 # ---------------------------------------------------------------------------
 if(WIN32)
@@ -292,13 +267,12 @@ if(WIN32)
         DOC "Inno Setup compiler (ISCC.exe); enables the installer half of the dist target")
 
     # A release is always the full set, which `grab update` relies on (GRAB_RELEASE_PROGRAMS).
-    if(NOT GRAB_BUNDLE_RCLONE OR NOT GRAB_BUILD_GUI)
-        message(STATUS "dist: needs GRAB_BUNDLE_RCLONE and GRAB_BUILD_GUI, so the dist target is not available")
+    if(NOT GRAB_BUILD_GUI)
+        message(STATUS "dist: needs GRAB_BUILD_GUI, so the dist target is not available")
     else()
     set(GRAB_STAGED
         "${GRAB_STAGE_DIR}/grab.exe"
         "${GRAB_STAGE_DIR}/grab-gui.exe"
-        "${GRAB_STAGE_DIR}/rclone.exe"
         "${GRAB_STAGE_DIR}/licenses/rclone.txt"
         "${GRAB_STAGE_DIR}/licenses/libssh2.txt"
         "${GRAB_STAGE_DIR}/licenses/openssl.txt"
@@ -312,19 +286,19 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/licenses/openssl.txt")
     add_custom_command(OUTPUT ${GRAB_STAGED}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}/licenses"
-        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "$<TARGET_FILE:grab-gui>" "${GRAB_RCLONE_EXE}"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:grab>" "$<TARGET_FILE:grab-gui>"
                 ${GRAB_EXTRA_FILES} "${GRAB_STAGE_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy ${GRAB_LICENSES} "${GRAB_STAGE_DIR}/licenses"
         # docs/doc.md keeps its folder, so the README's link to it works in the zip too.
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GRAB_STAGE_DIR}/docs"
         COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/docs/doc.md" "${GRAB_STAGE_DIR}/docs"
-        DEPENDS grab grab-gui "${GRAB_RCLONE_EXE}" ${GRAB_LICENSES}
+        DEPENDS grab grab-gui ${GRAB_LICENSES}
                 "${CMAKE_CURRENT_SOURCE_DIR}/docs/doc.md" ${GRAB_EXTRA_FILES}
         COMMENT "Staging release files"
         VERBATIM)
     add_custom_command(OUTPUT "${GRAB_ZIP}"
         COMMAND ${CMAKE_COMMAND} -E tar cf "${GRAB_ZIP}" --format=zip --
-                grab.exe grab-gui.exe rclone.exe licenses/rclone.txt licenses/libssh2.txt
+                grab.exe grab-gui.exe licenses/rclone.txt licenses/libssh2.txt
                 licenses/openssl.txt grab.conf.example README.md docs/doc.md LICENSE
         WORKING_DIRECTORY "${GRAB_STAGE_DIR}"
         DEPENDS ${GRAB_STAGED}
@@ -343,15 +317,12 @@ if(WIN32)
                     "dist: Inno Setup (ISCC.exe) not found, installer skipped; zip written to ${GRAB_DIST_DIR}"
             VERBATIM)
     endif()
-    endif() # GRAB_BUNDLE_RCLONE and GRAB_BUILD_GUI
+    endif() # GRAB_BUILD_GUI
 endif()
 
 # The programs a release ships next to grab.exe. `grab update` completes a portable folder
 # that lacks one (a v0.2.0 updater only extracted grab.exe).
 set(GRAB_RELEASE_PROGRAMS grab.exe)
-if(WIN32 AND GRAB_BUNDLE_RCLONE)
-    list(APPEND GRAB_RELEASE_PROGRAMS rclone.exe)
-endif()
 if(WIN32 AND GRAB_BUILD_GUI)
     list(APPEND GRAB_RELEASE_PROGRAMS grab-gui.exe)
 endif()

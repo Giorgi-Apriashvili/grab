@@ -137,10 +137,13 @@ command; install 0.2.0 once from the Releases page.
 The window offers the same update: see [GUI](#gui) → Updates.
 
 From 0.20 or earlier to 0.21: grab 0.20 and before shipped `rclone.exe` beside `grab.exe`. 0.21
-removes that copy, its own (it goes by the file's exact size and SHA-256, so an `rclone.exe` of
-your own in the same folder stays), when it is updated or first starts. Since the installer put
-that folder on your PATH, `rclone` in a terminal ran grab's copy: if you used it, install rclone
-yourself. A folder download 0.20 ran through rclone and that was cut short may have left
+removes that copy at the first start after the update has finished, and the installer at every
+install; a copy that is running then is renamed to `rclone.exe.grab-old` and deleted at a later
+start. It goes by the file's exact size and SHA-256: only rclone 1.75.1 exactly as grab shipped
+it is removed, so a copy of that same official 1.75.1 build in grab's folder is removed too, at
+every start; any other `rclone.exe` stays. Since the installer put that folder on your PATH,
+`rclone` in a terminal ran grab's copy: if you used it, install rclone yourself, in another
+folder on your PATH, not in grab's. A folder download 0.20 ran through rclone and that was cut short may have left
 `*.partial` files in its folder; they can be deleted.
 
 Portable copies of 0.2.0: that version's updater replaces only `grab.exe`. Afterwards grab

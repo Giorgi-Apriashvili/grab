@@ -1,15 +1,9 @@
 #include "local_name.hpp"
-#include "process.hpp"
 #include "rclone_encoding.hpp"
-#include "test_tools.hpp"
-#include "util.hpp"
 
 #include <doctest/doctest.h>
 
-#include <filesystem>
 #include <string>
-#include <system_error>
-#include <vector>
 
 using namespace grab;
 namespace enc = grab::rclone_enc;
@@ -39,12 +33,12 @@ TEST_CASE("rclone's Windows encoding, as lib/encoder does it") {
 }
 
 TEST_CASE("rclone's mapping of a server name agrees with grab's local names") {
-    // Except the cases G24 is about ('／', '␡', names that are exactly '．'), and device names,
-    // which grab handles itself.
+    // rclone's FromStandardName(windows, name), what 0.19 wrote. Except the cases G24 is about ('／',
+    // '␡', names that are exactly '．'), and device names, which grab handles itself.
     for (const std::string raw : {"Mission: Impossible (1996)", "a*b?c<d>e|f\"g\\h.txt", "trail.", "trail ",
                                   "x\x01y\x1Fz", "already\uFF1Acolon", "q\u201By", "caf\xE9.mp3", "\u2400nul",
                                   "plain", "ends\uFF0E", ".", ".."}) {
-        CHECK_MESSAGE(enc::from_standard_name(raw) == local::name(raw), raw);
+        CHECK_MESSAGE(enc::encode(enc::decode(raw, enc::standard), enc::windows) == local::name(raw), raw);
     }
 }
 
@@ -68,66 +62,3 @@ TEST_CASE("grab's form of server paths: rclone's Standard one, and bytes that ar
     CHECK(local::name(enc::from_raw_name("caf\xE9.mp3")) == local::name("caf\xE9.mp3"));
     CHECK(local::name("caf\xE9.mp3") == "caf‛E9.mp3");
 }
-
-TEST_CASE("a local name goes to rclone in the form that comes back as itself (G80)") {
-    for (const std::string raw : {"Mission: Impossible (1996)", "a*b?c", "trail.", "trail ", "x\x01y", "already\uFF1Acolon",
-                                  "q\u201By", "\u2400nul"}) {
-        const auto name = local::name(raw);
-        CHECK(enc::from_standard_name(enc::to_standard_name(name)) == name);
-    }
-    CHECK(enc::to_standard_name("Mission\uFF1A Impossible (1996)") == "Mission: Impossible (1996)");
-    CHECK(enc::to_standard_name("plain") == "plain");
-#ifdef _WIN32
-    CHECK(enc::local_path(util::path_from_utf8("D:\\Shows\uFF1A 2024\\Mission\uFF1A Impossible (1996)")).value() ==
-          "D:\\Shows: 2024\\Mission: Impossible (1996)");
-    CHECK(enc::local_path(util::path_from_utf8("C:\\Users\\me\\Downloads")).value() == "C:\\Users\\me\\Downloads");
-    // A share's name is part of the volume, which rclone leaves alone.
-    CHECK(enc::local_path(util::path_from_utf8("\\\\nas\\media\\a\uFF1Ab")).value() == "\\\\nas\\media\\a:b");
-    // A ‛ before an ordinary character: rclone always writes "‛‛", so no form gives "a‛b".
-    const auto refused = enc::local_path(util::path_from_utf8("D:\\a\u201Bb\\x"));
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().find("a\u201Bb") != std::string::npos);
-    // A byte that isn't UTF-8 can't be on a command line.
-    CHECK_FALSE(enc::local_path(util::path_from_utf8("D:\\caf\u201BE9")).has_value());
-    // A server's "a\b" is grab's "a＼b", whose Standard form "a\b" a Windows path would split.
-    CHECK_FALSE(enc::local_path(util::path_from_utf8("D:\\x\\" + local::name("back\\slash"))).has_value());
-#endif
-}
-
-#ifdef _WIN32
-TEST_CASE("rclone creates exactly grab's folder names from what grab tells it (G80)") {
-    namespace fs = std::filesystem;
-    const auto rclone = test::test_rclone();
-    if (!rclone) {
-        MESSAGE(test::no_test_rclone << "; skipped");
-        return;
-    }
-    std::error_code ec;
-    const auto base = fs::temp_directory_path() / "grab-test-rclone-names";
-    fs::remove_all(base, ec);
-    // The base itself has a name rclone would re-encode, as a Save-to folder grab created can.
-    const auto dest = base / util::path_from_utf8(local::name("Shows: 2024"));
-    fs::create_directories(dest);
-    proc::RunOptions quiet;
-    quiet.detached = true;
-    quiet.environment.without_prefix = {"RCLONE_"}; // none of the user's own rclone settings
-    for (const std::string raw : {"Mission: Impossible (1996)", "a*b?c<d>e|f\"g", "trail.", "trail ", "trail.\uFF0E",
-                                  "already\uFF1Acolon", "q\u201By", "ctl\x01x"}) {
-        const auto want = dest / util::path_from_utf8(local::name(raw));
-        const auto told = enc::local_path(want);
-        REQUIRE_MESSAGE(told.has_value(), raw);
-        const auto ran = proc::run_capture(std::vector<std::string>{util::path_to_utf8(*rclone), "mkdir", *told}, quiet);
-        REQUIRE(ran.has_value());
-        CHECK_MESSAGE(ran->exit_code == 0, ran->err);
-        CHECK_MESSAGE(fs::is_directory(want, ec), raw);
-    }
-    // Nothing anywhere else: one folder per name, all inside grab's Save-to folder.
-    std::size_t made = 0;
-    for (const auto& e : fs::directory_iterator(dest, ec)) made += e.is_directory() ? 1 : 0;
-    CHECK(made == 8);
-    std::size_t top = 0;
-    for (const auto& e : fs::directory_iterator(base, ec)) top += e.is_directory() ? 1 : 0;
-    CHECK(top == 1);
-    fs::remove_all(base, ec);
-}
-#endif

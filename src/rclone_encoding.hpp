@@ -2,15 +2,11 @@
 
 // rclone's name encoding (lib/encoder, v1.75.1), for the two encodings that matter to grab:
 // Standard, the form rclone's own paths are in, and the Windows local backend's ("OS"). rclone
-// writes a local name as windows.Encode(standard.Decode(name)), and that applies to every part of
-// a local path it is given on its command line too, not only to the names it copies (review G80,
-// 2026-10-21): handed "D:\x\Mission： Impossible", it wrote into "Mission‛： Impossible". So a
-// local path grab hands to rclone goes in the Standard form of each part (local_path).
+// wrote a local name as windows.Encode(standard.Decode(name)); grab's local names
+// (local_name.hpp) keep that form, so files land where grab 0.19 and before put them.
 
 #include <cstddef>
 #include <cstdint>
-#include <expected>
-#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -40,12 +36,13 @@ inline constexpr Mask windows = slash | dot | colon | question | double_quote | 
 // Whether `s` is UTF-8 throughout (as Go's utf8 package sees it).
 [[nodiscard]] bool valid_utf8(std::string_view s);
 
-// `s` in upper case as Go's strings.ToUpper makes it, which is how rclone names a remote's
-// environment variables (RCLONE_CONFIG_<NAME>_<KEY>, secrets::env_name): every letter by its simple
-// upper-case mapping in the tables of the Go that rclone 1.75.1 is built with (Go 1.26, Unicode
-// 15.0.0: 'ß' stays, 'ǅ' becomes 'Ǆ', Georgian Mkhedruli becomes Mtavruli), a byte that isn't UTF-8
-// U+FFFD. Windows matches variable names ignoring case by an older table of its own, without
-// Georgian, 'ſ', 'ı', 'µ', 'ς' and others (RCLONE-REPLACEMENT.md, phase 7).
+// `s` in upper case as Go's strings.ToUpper makes it, which is how rclone named a remote's
+// environment variables (RCLONE_CONFIG_<NAME>_<KEY>); server names that differ only by it count as
+// the same (server_conf.cpp's same_ignoring_case): every letter by its simple upper-case mapping
+// in the tables of the Go that rclone 1.75.1 is built with (Go 1.26, Unicode 15.0.0: 'ß' stays,
+// 'ǅ' becomes 'Ǆ', Georgian Mkhedruli becomes Mtavruli), a byte that isn't UTF-8 U+FFFD. Windows
+// matches variable names ignoring case by an older table of its own, without Georgian, 'ſ', 'ı',
+// 'µ', 'ς' and others (RCLONE-REPLACEMENT.md, phase 7).
 [[nodiscard]] std::string go_upper(std::string_view s);
 
 // rclone's MultiEncoder.Encode and .Decode for `mask`.
@@ -68,16 +65,5 @@ inline constexpr Mask grab_path = standard | invalid_utf8;
 // that isn't blank, at most `max` bytes of it with "…" after a cut, with control characters, DEL
 // and bytes that aren't UTF-8 as symbols and ‛XX. "" when there is none.
 [[nodiscard]] std::string shown_line(std::string_view text, std::size_t max = 100);
-
-// rclone's FromStandardName(windows, name): what rclone writes on Windows for `name`.
-[[nodiscard]] std::string from_standard_name(std::string_view name);
-// rclone's ToStandardName(windows, name): the Standard form of a Windows name.
-[[nodiscard]] std::string to_standard_name(std::string_view name);
-
-// `p` as rclone's command line must say it so that rclone uses exactly `p` (on Windows each part
-// after the drive or share in its Standard form; elsewhere `p` as is). Fails for a part rclone
-// can't be told as it is, rather than letting rclone write somewhere else: "a＼b" (its Standard
-// form "a\b" is two parts), a ‛ before an ordinary character ("a‛b"), a byte that isn't UTF-8.
-[[nodiscard]] std::expected<std::string, std::string> local_path(const std::filesystem::path& p);
 
 } // namespace grab::rclone_enc
