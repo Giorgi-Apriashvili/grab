@@ -199,10 +199,12 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 }
 
 /* results ------------------------------------------------------------------------------- */
+/* No minimum of its own: the splitter keeps it 4 rows tall, unless a small window with a banner
+   leaves no room for that (app.js, splitLimits). */
 .results-wrap {
   position: relative;
   flex: 1;
-  min-height: 120px;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   margin: 0 14px;
@@ -471,10 +473,38 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* downloads ----------------------------------------------------------------------------- */
-.downloads {
+/* the splitter above Downloads ------------------------------------------------------------ */
+/* A 6 px band centred on the panel's top border, which is its line; the band lights up under the
+   pointer, while dragged and with the keyboard's focus. */
+.split {
+  position: relative;
+  z-index: 2;
   flex: none;
-  max-height: 38%;
+  height: 6px;
+  margin: 0 14px -3px;
+  cursor: row-resize;
+  outline: none;
+  touch-action: none;
+}
+.split::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 8px;
+  right: 8px;
+  height: 3px;
+  border-radius: 2px;
+}
+.split:hover::after, .split.dragging::after { background: var(--sel-line); }
+.split:focus-visible::after { background: var(--accent); }
+html.split-drag, html.split-drag * { cursor: row-resize !important; }
+
+/* downloads ----------------------------------------------------------------------------- */
+/* Its height comes from the splitter (app.js sets --dl-h), not from its rows: rows coming and
+   going never resize the panes. */
+.downloads {
+  flex: 0 0 var(--dl-h, 45%);
+  min-height: 0;
   display: flex;
   flex-direction: column;
   margin: 0 14px 12px;
@@ -570,7 +600,7 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
 .q-cactions { display: flex; gap: 4px; }
 .q-cactions button { height: 20px; padding: 0 7px; font-size: 11px; }
 .q-note { color: var(--muted); }
-.queue { overflow-y: auto; }
+.queue { flex: 1; min-height: 0; overflow-y: auto; }
 .q-item { padding: 7px 12px 8px; border-bottom: 1px solid var(--line); }
 .q-item:last-child { border-bottom: 0; }
 .q-top { display: flex; align-items: center; gap: 10px; }

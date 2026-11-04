@@ -6,6 +6,7 @@
 #include "json.hpp"
 #include "schedule.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -47,11 +48,45 @@ inline constexpr int max_parallel = 8;
 inline constexpr double min_limit_mibps = schedule::min_mibps;
 inline constexpr double max_limit_mibps = schedule::max_mibps;
 
+// The splitter between Browse (or Settings) and Downloads keeps the Downloads panel's share of
+// the height they and the splitter take (DOWNLOADS-UI.md 4.1), so it survives resizing,
+// maximizing and DPI changes; the page also keeps both panes their minimum heights.
+inline constexpr double split_min = 0.15;
+inline constexpr double split_max = 0.85;
+inline constexpr double split_default = 0.45; // the page's, while gui.json has none
+// A share as kept: a number, clamped to split_min..split_max; nullopt for anything else.
+[[nodiscard]] std::optional<double> split_from_json(const json::Value& v);
+
+// The Downloads table's columns, as the page names them (DOWNLOADS-UI.md 5.1): the ones that
+// sort, and whose width can be dragged; the ≡ handle and the two action slots do neither.
+inline constexpr std::array<std::string_view, 7> download_columns = {"name", "status", "progress", "size",
+                                                                     "speed", "eta", "priority"};
+inline constexpr int min_column_px = 24;
+inline constexpr int max_column_px = 4000;
+
+// How the Downloads table shows its rows: the sort chosen with a column header and the widths
+// dragged by hand, in CSS px; the page applies each column's own minimum.
+struct DownloadsView {
+    std::optional<SortOrder> sort;     // absent: the default order (no then_key)
+    std::map<std::string, int> widths; // column -> px; absent: the column's default
+    bool operator==(const DownloadsView&) const = default;
+};
+// {"sort":{"key":"size","dir":"desc"},"widths":{"name":320}}: a sort on another key or
+// direction is dropped, and so are widths of unknown columns or not numbers; the others are
+// clamped to min_column_px..max_column_px. Anything but an object is the default view.
+[[nodiscard]] DownloadsView downloads_view_from_json(const json::Value& v);
+[[nodiscard]] json::Value downloads_view_to_json(const DownloadsView& v);
+
 struct GuiState {
     std::optional<WindowPlacement> window;
+    // The window layout this file was last saved with (window_size::layout); 0 before grab 0.22,
+    // whose smaller windows grow once to the new default size.
+    int layout = 0;
     std::string last_remote;
     std::map<std::string, std::string> destinations; // remote -> last destination folder
     std::optional<SortOrder> sort;                   // absent: the default order
+    std::optional<double> split;                     // the Downloads panel's share; absent: split_default
+    DownloadsView downloads;
     int parallel = 4;                               // downloads at once, min_parallel..max_parallel
     // remote -> connection budget learned from refusals, as grab 0.17 and older saved it here; read
     // only, to carry it over to limits.json (learned_limits_path), and no longer written.

@@ -783,6 +783,14 @@ void App::on_message(const std::string& text) {
             if (sort->kind == Value::Kind::null) state_.sort.reset();
             else if (auto order = sort_from_json(*sort)) state_.sort = std::move(order);
         }
+        // The splitter above Downloads, as the panel's share: null for the default; anything
+        // else that isn't a number changes nothing.
+        if (const Value* split = msg->find("split")) {
+            if (split->kind == Value::Kind::null) state_.split.reset();
+            else if (auto share = split_from_json(*split)) state_.split = share;
+        }
+        // The Downloads table's sort and column widths, as a whole.
+        if (const Value* view = msg->find("downloads")) state_.downloads = downloads_view_from_json(*view);
         save_state();
     } else if (type == "search") {
         start_search(*msg);
@@ -985,6 +993,9 @@ void App::send_init() {
     init.set("remotes", std::move(remotes));
     init.set("remote", str(selected));
     if (state_.sort) init.set("sort", sort_to_json(*state_.sort));
+    // The page takes these from its first init only: init comes again after every server change.
+    if (state_.split) init.set("split", num(*state_.split));
+    if (state_.downloads != DownloadsView{}) init.set("downloads", downloads_view_to_json(state_.downloads));
     Value dests = Value::make_object();
     for (const auto& [remote, path] : state_.destinations) dests.set(remote, str(path));
     init.set("destinations", std::move(dests));

@@ -6,6 +6,7 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -89,6 +90,43 @@ json::Value sort_to_json(const SortOrder& s) {
     return v;
 }
 
+std::optional<double> split_from_json(const json::Value& v) {
+    if (v.kind != json::Value::Kind::number) return std::nullopt;
+    return std::clamp(v.number, split_min, split_max);
+}
+
+DownloadsView downloads_view_from_json(const json::Value& v) {
+    DownloadsView view;
+    if (v.kind != json::Value::Kind::object) return view;
+    const auto known = [](std::string_view column) { return std::ranges::contains(download_columns, column); };
+    if (const auto* sort = v.find("sort"); sort != nullptr) {
+        auto key = sort->string_of("key");
+        auto dir = sort->string_of("dir");
+        if (key && known(*key) && (dir == "asc" || dir == "desc")) {
+            view.sort = SortOrder{std::move(*key), std::move(*dir)};
+        }
+    }
+    if (const auto* widths = v.find("widths"); widths != nullptr && widths->kind == json::Value::Kind::object) {
+        for (std::size_t i = 0; i < widths->keys.size(); ++i) {
+            const auto& px = widths->items[i];
+            if (!known(widths->keys[i]) || px.kind != json::Value::Kind::number) continue;
+            // Clamped before the conversion: a huge number doesn't fit an int.
+            view.widths[widths->keys[i]] = static_cast<int>(std::lround(std::clamp(
+                px.number, static_cast<double>(min_column_px), static_cast<double>(max_column_px))));
+        }
+    }
+    return view;
+}
+
+json::Value downloads_view_to_json(const DownloadsView& v) {
+    json::Value out = json::Value::make_object();
+    out.set("sort", v.sort ? sort_to_json(SortOrder{v.sort->key, v.sort->dir}) : json::Value{});
+    json::Value widths = json::Value::make_object();
+    for (const auto& [column, px] : v.widths) widths.set(column, json::Value::make_number(px));
+    out.set("widths", std::move(widths));
+    return out;
+}
+
 namespace {
 
 GuiState gui_state_from(const json::Value* doc) {
@@ -112,8 +150,14 @@ GuiState gui_state_from(const json::Value* doc) {
             s.window = p;
         }
     }
+    if (const auto* l = doc->find("layout"); l != nullptr && l->kind == json::Value::Kind::number && l->number >= 0 &&
+                                             l->number <= 1000 && l->number == std::floor(l->number)) {
+        s.layout = static_cast<int>(l->number);
+    }
     s.last_remote = doc->string_of("lastRemote").value_or("");
     if (const auto* sort = doc->find("sort")) s.sort = sort_from_json(*sort);
+    if (const auto* split = doc->find("split")) s.split = split_from_json(*split);
+    if (const auto* view = doc->find("downloads")) s.downloads = downloads_view_from_json(*view);
     if (const auto* d = doc->find("destinations"); d != nullptr && d->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < d->keys.size(); ++i) {
             if (d->items[i].kind == json::Value::Kind::string && !d->items[i].str.empty()) {
@@ -202,11 +246,14 @@ std::string gui_state_to_json(const GuiState& state) {
         w.set("maximized", Value::make_bool(state.window->maximized));
         root.set("window", std::move(w));
     }
+    if (state.layout > 0) root.set("layout", Value::make_number(state.layout));
     root.set("lastRemote", Value::make_string(state.last_remote));
     Value dest = Value::make_object();
     for (const auto& [remote, path] : state.destinations) dest.set(remote, Value::make_string(path));
     root.set("destinations", std::move(dest));
     if (state.sort) root.set("sort", sort_to_json(*state.sort));
+    if (state.split) root.set("split", Value::make_number(*state.split));
+    if (state.downloads != DownloadsView{}) root.set("downloads", downloads_view_to_json(state.downloads));
     root.set("parallel", Value::make_number(state.parallel));
     root.set("verifyDownloads", Value::make_bool(state.verify_downloads));
     root.set("limitOn", Value::make_bool(state.limit_on));

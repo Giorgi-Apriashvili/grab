@@ -197,11 +197,28 @@ installed exe has no VC redistributable dependency.
 Explorer: pick a server, click through its folders or search them, select rows (click,
 Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the download queue with
 live progress. It reads the same grab.conf and remembers the last server, the destination per
-server and the rows' sort in `%APPDATA%\grab\gui.json`. Should that file ever be damaged, the
-window starts with the defaults, keeps the old file as `gui.json.bad-<date>-<time>` and says
-so; the command line, which follows Verify downloads and the speed schedule from it, says so
-too and goes on without them.
+server, the rows' sort, the window's place and size and the splitter's place in
+`%APPDATA%\grab\gui.json`. Should that file ever be damaged, the window starts with the
+defaults, keeps the old file as `gui.json.bad-<date>-<time>` and says so; the command line,
+which follows Verify downloads and the speed schedule from it, says so too and goes on without
+them.
 
+- **The window** first opens at 1280×860 (at 100% scale) in the middle of the main screen, at
+  most 92% of its free area each way, and afterwards where you left it; it can't be made
+  smaller than 760×600 (or the screen's work area, if smaller). A window an earlier grab saved
+  smaller (its default was 1100×720) grows once to the new size: width and height each on their
+  own, never shrinking, staying on the screen, maximized kept. gui.json then notes `"layout": 2`, and it never grows again.
+- **The splitter** between the list above (Browse, or Settings) and Downloads shares their
+  height: drag it up or down. With the keyboard, Tab to it, then ↑ / ↓ move it 16 pixels, Page
+  Up / Page Down a tenth of the height and Home / End to the ends; a double-click or Enter goes
+  back to the default, Downloads taking 45%.
+  - It is kept in gui.json as Downloads' share of the height (`"split"`, 0.15 to 0.85), so it
+    holds when the window is resized or maximized, and in Browse and Settings alike.
+  - The list above keeps at least 4 rows, and Downloads its bar and room for 3 rows. In a small
+    window with a banner showing, Downloads gives way first, down to room for 1 row.
+  - Downloads takes its height from the splitter, not from its rows, so rows coming and going
+    never move it. While the queue is empty, Downloads and the splitter are hidden; they come
+    back where they were.
 - **Folders:** the address bar shows where you are (`Box.Guest › movies › georgian.movies`),
   with ↑ (Backspace) to go up and ⟳ to list the folder from the server again.
   - Folders open instantly from the server's saved file list (see [File lists](#file-lists)),
@@ -1213,6 +1230,7 @@ src/browse.*    browse mode: a server's folders from its file list, deeper ones 
 src/file_list.* saved file lists: fetch, search, freshness, the .list files
 src/secrets.*   0.19's 'secrets' store, read by the import; rclone's obscured form
 src/ui_origin.* what the window may show and whose messages count (exact addresses)
+src/window_size.* the window's default size, and the one-time growth of one an older grab saved
 src/ssh.*       grab's own SSH connections (libssh2): host keys, login, SFTP channels, commands
 src/sftp.*      grab's own SFTP client: pipelined reads with exact bounds, listings, stat
 src/ssh_pool.*  a server's connections kept open and lent to downloads, searches and Browse

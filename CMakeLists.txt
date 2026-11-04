@@ -73,6 +73,7 @@ add_library(grab_core STATIC
     src/local_name.cpp
     src/rclone_encoding.cpp
     src/ui_origin.cpp
+    src/window_size.cpp
     src/sftp.cpp
     src/ssh.cpp
     src/ssh_pool.cpp
@@ -207,7 +208,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
     target_link_libraries(grab-gui PRIVATE
         grab_core
         ${webview2_SOURCE_DIR}/build/native/${GRAB_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib
-        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32)
+        shlwapi ole32 oleaut32 shell32 dwmapi version advapi32 user32 shcore)
     install(TARGETS grab-gui RUNTIME DESTINATION bin)
 endif()
 install(FILES grab.conf.example DESTINATION .)

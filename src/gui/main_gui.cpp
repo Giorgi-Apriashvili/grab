@@ -9,12 +9,14 @@
 #include "update.hpp"
 #include "util.hpp"
 #include "webview.hpp"
+#include "window_size.hpp"
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
 #include <dwmapi.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <shellscalingapi.h>
 #include <windowsx.h>
 
 #include <chrono>
@@ -275,8 +277,19 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     }
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
-        const UINT dpi = GetDpiForWindow(hwnd);
-        info->ptMinTrackSize = {MulDiv(760, static_cast<int>(dpi), 96), MulDiv(480, static_cast<int>(dpi), 96)};
+        const int dpi = static_cast<int>(GetDpiForWindow(hwnd));
+        // Never more than the work area of the window's monitor: Windows holds even a maximized
+        // window to this minimum, which would put its bottom under the taskbar on a small screen.
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        int work_w = 0;
+        int work_h = 0;
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            work_w = monitor.rcWork.right - monitor.rcWork.left;
+            work_h = monitor.rcWork.bottom - monitor.rcWork.top;
+        }
+        info->ptMinTrackSize = {window_size::min_px(window_size::min_width, dpi, work_w),
+                                window_size::min_px(window_size::min_height, dpi, work_h)};
         return 0;
     }
     case WM_SETFOCUS:
@@ -336,18 +349,63 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-// Restores the saved placement if it is still on a connected monitor.
-void place_window(HWND hwnd, const GuiState& state, int& show) {
-    if (!state.window) return;
-    const auto& w = *state.window;
-    RECT r{w.x, w.y, w.x + w.width, w.y + w.height};
-    if (MonitorFromRect(&r, MONITOR_DEFAULTTONULL) == nullptr) return;
-    WINDOWPLACEMENT wp{};
-    wp.length = sizeof(wp);
-    wp.rcNormalPosition = r;
-    wp.showCmd = SW_HIDE;
-    SetWindowPlacement(hwnd, &wp);
-    if (w.maximized) show = SW_SHOWMAXIMIZED;
+// A monitor's work area and DPI, for the window's size (window_size.hpp).
+struct MonitorArea {
+    window_size::Area work;
+    int dpi = 96;
+};
+
+MonitorArea monitor_area(HMONITOR monitor) {
+    MonitorArea out;
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (monitor != nullptr && GetMonitorInfoW(monitor, &info)) {
+        out.work = {info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom};
+    }
+    UINT x = 0;
+    UINT y = 0;
+    const bool known = monitor != nullptr && SUCCEEDED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &x, &y));
+    out.dpi = static_cast<int>(known ? x : GetDpiForSystem());
+    return out;
+}
+
+// Restores the saved placement if it is still on a connected monitor. A window an earlier grab
+// saved smaller than today's default grows once (window_size::grown_once). Returns whether
+// gui.json's layout changed, to be saved: from now on the window keeps the size it is given.
+bool place_window(HWND hwnd, GuiState& state, int& show) {
+    if (state.window) {
+        const auto& w = *state.window;
+        RECT r{w.x, w.y, w.x + w.width, w.y + w.height};
+        if (MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr) {
+            WINDOWPLACEMENT wp{};
+            wp.length = sizeof(wp);
+            wp.rcNormalPosition = r;
+            wp.showCmd = SW_HIDE;
+            SetWindowPlacement(hwnd, &wp);
+            if (w.maximized) show = SW_SHOWMAXIMIZED;
+            // Grown in screen coordinates (rcNormalPosition's are the workspace's), on the
+            // monitor it is now on, at that monitor's DPI.
+            RECT now{};
+            if (state.layout < window_size::layout && GetWindowRect(hwnd, &now)) {
+                const auto area = monitor_area(MonitorFromRect(&now, MONITOR_DEFAULTTONEAREST));
+                const WindowPlacement before{now.left, now.top, now.right - now.left, now.bottom - now.top,
+                                             w.maximized};
+                const auto grown = window_size::grown_once(before, state.layout, area.work, area.dpi);
+                if (grown != before && SetWindowPos(hwnd, nullptr, grown.x, grown.y, grown.width, grown.height,
+                                                    SWP_NOZORDER | SWP_NOACTIVATE)) {
+                    // Saved at once with the layout, so a window that doesn't close normally keeps it.
+                    if (GetWindowPlacement(hwnd, &wp)) {
+                        const RECT& n = wp.rcNormalPosition;
+                        state.window =
+                            WindowPlacement{n.left, n.top, n.right - n.left, n.bottom - n.top, before.maximized};
+                    }
+                }
+            }
+        }
+    }
+    if (state.layout >= window_size::layout) return false;
+    state.layout = window_size::layout;
+    return true;
 }
 
 // Whether `p` (the process --restart names) is the old window that started this one, before it is
@@ -449,10 +507,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     RegisterClassExW(&wc);
 
     g.wm_close_for_update = RegisterWindowMessageW(update::gui_close_request);
-    const UINT dpi = GetDpiForSystem();
-    g.hwnd = CreateWindowExW(0, window_class, L"grab", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                             MulDiv(1100, static_cast<int>(dpi), 96), MulDiv(720, static_cast<int>(dpi), 96),
-                             nullptr, nullptr, instance, nullptr);
+    // Without a saved place (or with one on a monitor gone since), the window opens at the
+    // default size in the middle of the primary monitor's work area.
+    const auto primary = monitor_area(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
+    const auto initial = window_size::default_window(primary.work, primary.dpi);
+    g.hwnd = CreateWindowExW(0, window_class, L"grab", WS_OVERLAPPEDWINDOW, initial.x, initial.y, initial.width,
+                             initial.height, nullptr, nullptr, instance, nullptr);
     if (g.hwnd == nullptr) return 1;
     if (published != nullptr) *published = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(g.hwnd));
 
@@ -478,7 +538,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     g.app = std::make_unique<gui::App>(std::move(host), default_grab_config_path(),
                                        state_dir(default_grab_config_path()) / "gui.json");
 
-    place_window(g.hwnd, g.app->state(), show);
+    if (place_window(g.hwnd, g.app->state(), show)) g.app->save_state();
     apply_theme(g.hwnd);
     ShowWindow(g.hwnd, show);
     UpdateWindow(g.hwnd);

@@ -29,6 +29,10 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.last_update_check = 1760000000;
     s.latest_version = "0.7.0";
     s.latest_page = "https://github.com/Giorgi-Apriashvili/grab/releases/tag/v0.7.0";
+    s.layout = 2;
+    s.split = 0.3125;
+    s.downloads.sort = SortOrder{"progress", "desc"};
+    s.downloads.widths = {{"name", 320}, {"status", 200}};
 
     CHECK(parse_gui_state(gui_state_to_json(s)) == s);
     CHECK(parse_gui_state("{}").update_check); // on unless switched off
@@ -141,6 +145,91 @@ TEST_CASE("a Size sort keeps the sort before it, which orders the folders") {
     // Only a Size sort has one.
     CHECK(parse_gui_state(R"({"sort":{"key":"name","dir":"asc","then":{"key":"modified","dir":"asc"}}})").sort ==
           SortOrder{"name", "asc"});
+}
+
+TEST_CASE("the Downloads splitter's share is kept within 0.15..0.85, and absent for the default") {
+    // gui.json from grab 0.21 and older: no split, no layout, no downloads view.
+    const auto old = parse_gui_state(R"({"window":{"x":1,"y":2,"width":1100,"height":720},"lastRemote":"Main"})");
+    CHECK_FALSE(old.split.has_value());
+    CHECK(old.layout == 0);
+    CHECK(old.downloads == DownloadsView{});
+    const auto text = gui_state_to_json(GuiState{});
+    CHECK(text.find("\"split\"") == std::string::npos);
+    CHECK(text.find("\"layout\"") == std::string::npos);
+    CHECK(text.find("\"downloads\"") == std::string::npos);
+
+    CHECK(parse_gui_state(R"({"split":0.45})").split == 0.45);
+    CHECK(parse_gui_state(R"({"split":0.15})").split == split_min);
+    CHECK(parse_gui_state(R"({"split":0.85})").split == split_max);
+    CHECK(parse_gui_state(R"({"split":0.05})").split == split_min); // clamped
+    CHECK(parse_gui_state(R"({"split":-3})").split == split_min);
+    CHECK(parse_gui_state(R"({"split":1})").split == split_max);
+    CHECK(parse_gui_state(R"({"split":1e300})").split == split_max);
+    CHECK_FALSE(parse_gui_state(R"({"split":"0.5"})").split.has_value()); // not a number: the default
+    CHECK_FALSE(parse_gui_state(R"({"split":null})").split.has_value());
+    CHECK_FALSE(parse_gui_state(R"({"split":[0.5]})").split.has_value());
+    GuiState s;
+    s.split = 0.6180339887498949; // as the page computes it, kept exactly
+    CHECK(parse_gui_state(gui_state_to_json(s)).split == s.split);
+
+    // As the page sends it in "prefs".
+    const auto msg = json::parse(R"({"type":"prefs","split":0.9})");
+    REQUIRE(msg.has_value());
+    CHECK(split_from_json(*msg->find("split")) == split_max);
+    CHECK_FALSE(split_from_json(json::Value{}).has_value()); // null: back to the default
+}
+
+TEST_CASE("the window layout is a small whole number; anything else is an old file's") {
+    CHECK(parse_gui_state(R"({"layout":2})").layout == 2);
+    CHECK(parse_gui_state(R"({"layout":7})").layout == 7); // a later grab's: kept, never grown again
+    CHECK(parse_gui_state(R"({"layout":"2"})").layout == 0);
+    CHECK(parse_gui_state(R"({"layout":2.5})").layout == 0);
+    CHECK(parse_gui_state(R"({"layout":-1})").layout == 0);
+    CHECK(parse_gui_state(R"({"layout":1e300})").layout == 0);
+    GuiState s;
+    s.layout = 2;
+    CHECK(gui_state_to_json(s).find(R"("layout":2)") != std::string::npos);
+    CHECK(parse_gui_state(gui_state_to_json(s)).layout == 2);
+}
+
+TEST_CASE("the Downloads table's sort and column widths are kept when valid") {
+    CHECK(downloads_view_from_json(json::Value{}) == DownloadsView{});
+    const auto view = [](const char* text) {
+        const auto doc = json::parse(text);
+        REQUIRE(doc.has_value());
+        return downloads_view_from_json(*doc);
+    };
+    for (const auto column : download_columns) {
+        for (const char* dir : {"asc", "desc"}) {
+            DownloadsView v;
+            v.sort = SortOrder{std::string(column), dir};
+            v.widths = {{std::string(column), 150}};
+            CHECK(downloads_view_from_json(downloads_view_to_json(v)) == v);
+        }
+    }
+    CHECK(view(R"({"sort":{"key":"eta","dir":"asc"}})").sort == SortOrder{"eta", "asc"});
+    CHECK_FALSE(view(R"({"sort":{"key":"modified","dir":"asc"}})").sort.has_value()); // Browse's, not here
+    CHECK_FALSE(view(R"({"sort":{"key":"actions","dir":"asc"}})").sort.has_value());
+    CHECK_FALSE(view(R"({"sort":{"key":"size","dir":"up"}})").sort.has_value());
+    CHECK_FALSE(view(R"({"sort":null})").sort.has_value());
+    CHECK_FALSE(view(R"({"sort":"size"})").sort.has_value());
+    // No `then` here: files and downloads both have sizes.
+    CHECK(view(R"({"sort":{"key":"size","dir":"desc","then":{"key":"name","dir":"asc"}}})").sort ==
+          SortOrder{"size", "desc"});
+    // Unknown columns and non-numbers are dropped; widths are whole px within 24..4000.
+    CHECK(view(R"({"widths":{"name":320.4,"status":5,"size":99999,"speed":"80","handle":44,"actions":120}})").widths ==
+          std::map<std::string, int>{{"name", 320}, {"size", max_column_px}, {"status", min_column_px}});
+    CHECK(view(R"({"widths":{"eta":-1e300}})").widths == std::map<std::string, int>{{"eta", min_column_px}});
+    CHECK(view(R"({"widths":[1,2]})").widths.empty());
+    CHECK(view("[]") == DownloadsView{});
+
+    // In gui.json: written only when set, with "sort":null for the default order.
+    GuiState s;
+    s.downloads.widths = {{"progress", 112}};
+    const auto text = gui_state_to_json(s);
+    CHECK(text.find(R"("downloads":{"sort":null,"widths":{"progress":112}})") != std::string::npos);
+    CHECK(parse_gui_state(text).downloads == s.downloads);
+    CHECK(parse_gui_state(R"({"downloads":"wide"})").downloads == DownloadsView{});
 }
 
 TEST_CASE("queue order: move an item before another, or to the end") {

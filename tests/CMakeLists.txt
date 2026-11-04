@@ -50,6 +50,7 @@ add_executable(grab_tests
     test_passwords.cpp
     test_server_conf.cpp
     test_ui_origin.cpp
+    test_window_size.cpp
     test_update.cpp
     test_ssh.cpp
     test_sftp.cpp

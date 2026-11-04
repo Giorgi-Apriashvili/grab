@@ -43,6 +43,7 @@ const state = {
   searchStarted: 0,
   lastQuery: '',
   queue: [],
+  downloadsView: null,   // gui.json's sort and column widths for the Downloads table, or null
   parallel: 4,
   limitOn: false,        // the limit that applies now: own setting, speed schedule or a change
   limitMiBps: 5,
@@ -2290,7 +2291,11 @@ function renderTree(el, q) {
 
 function renderQueue() {
   const panel = $('#downloads');
+  // Hidden with an empty queue, the splitter too; back at the saved split.
+  const shown = !panel.hidden;
   panel.hidden = state.queue.length === 0;
+  $('#split').hidden = panel.hidden;
+  if (!shown && !panel.hidden) applySplit();
   const box = $('#queue');
   const seen = new Set();
   let prevEl = null;
@@ -2397,6 +2402,163 @@ function renderQueue() {
   renderTotalSpeed();
 }
 
+// ---- the splitter between the view above (Browse or Settings) and Downloads ---------------------
+
+// The Downloads panel's share of H, the height the view above, the splitter and the panel take
+// together: what gui.json keeps (0.15–0.85, 0.45 by default), the same in Browse and Settings,
+// so it survives resizing, maximizing and DPI changes. The panel's height follows from it, within
+// limits applied again on every resize: Downloads keeps its head, the table's header row and 3
+// rows; the view above its fixed parts and 4 rows of its list. When both don't fit (a small window
+// with a banner), Downloads gives way first, down to 1 row, then the list above shrinks.
+const SPLIT = { def: 0.45, min: 0.15, max: 0.85 };
+const DL_HEAD_ROW = 26; // the Downloads table's header row and rows (DOWNLOADS-UI.md 5.1)
+const DL_ROW = 28;
+const LIST_MIN = 4 * ROW;
+// `share` as last set (by gui.json, a drag, a key or a reset) and `saved` as last sent; `px` the
+// panel's height now; `drag` while the mouse holds the splitter; `loaded` once the first init
+// set it.
+const split = { share: SPLIT.def, saved: SPLIT.def, px: 0, drag: null, loaded: false, keyTimer: 0 };
+
+// The height of `box`'s parts that don't stretch: its shown, in-flow children but `list`, and of
+// the one holding `list` only its own borders, padding and other children.
+function fixedHeight(box, list) {
+  let sum = 0;
+  for (const el of box.children) {
+    if (el === list) continue;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.position === 'absolute' || cs.position === 'fixed') continue;
+    sum += parseFloat(cs.marginTop) + parseFloat(cs.marginBottom);
+    if (el.contains(list)) {
+      sum += parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth) + parseFloat(cs.paddingTop) +
+        parseFloat(cs.paddingBottom) + fixedHeight(el, list);
+    } else {
+      sum += el.getBoundingClientRect().height;
+    }
+  }
+  return sum;
+}
+
+// H and the panel's least and greatest height now, in px.
+function splitLimits() {
+  const view = settings.open ? $('#settings-view') : $('#search-view');
+  const list = settings.open ? $('#settings-view .settings-body') : $('#results');
+  const bar = $('#split');
+  const panel = $('#downloads');
+  const H = document.body.clientHeight - view.getBoundingClientRect().top - $('.bar.status').getBoundingClientRect().height;
+  const bs = getComputedStyle(bar);
+  const ps = getComputedStyle(panel);
+  const around = bar.getBoundingClientRect().height + parseFloat(bs.marginTop) + parseFloat(bs.marginBottom) +
+    parseFloat(ps.marginTop) + parseFloat(ps.marginBottom);
+  const room = H - around - fixedHeight(view, list) - LIST_MIN; // the most Downloads may take
+  const head = $('.downloads-head').getBoundingClientRect().height + parseFloat(ps.borderTopWidth) +
+    parseFloat(ps.borderBottomWidth) + DL_HEAD_ROW;
+  let lo = room >= head + 3 * DL_ROW ? head + 3 * DL_ROW : Math.max(head + DL_ROW, room);
+  let hi = Math.max(lo, room);
+  lo = Math.ceil(Math.max(lo, Math.min(SPLIT.min * H, hi)));
+  hi = Math.max(lo, Math.floor(Math.min(hi, Math.max(SPLIT.max * H, lo))));
+  return { H, lo, hi };
+}
+
+// Sets the panel's height to `px` within `lim`; returns the height set.
+function setSplitPx(px, lim) {
+  px = Math.min(lim.hi, Math.max(lim.lo, Math.round(px)));
+  if (px !== split.px) {
+    split.px = px;
+    $('#downloads').style.setProperty('--dl-h', `${px}px`);
+  }
+  // Its value is the view above's share, in %, as the splitter's own pane.
+  const bar = $('#split');
+  const pct = (h) => String(Math.round(100 * (1 - h / lim.H)));
+  bar.setAttribute('aria-valuenow', pct(px));
+  bar.setAttribute('aria-valuemin', pct(lim.hi));
+  bar.setAttribute('aria-valuemax', pct(lim.lo));
+  return px;
+}
+
+function applySplit() {
+  if ($('#downloads').hidden) return;
+  const lim = splitLimits();
+  setSplitPx(split.share * lim.H, lim);
+}
+
+// A share from the panel's height now, kept for gui.json once the mouse or the keys let go.
+function takeSplit(px, lim) {
+  split.share = Math.round((10000 * px) / lim.H) / 10000;
+}
+
+function saveSplit() {
+  if (split.share === split.saved) return;
+  split.saved = split.share;
+  send({ type: 'prefs', split: split.share });
+}
+
+function resetSplit() {
+  clearTimeout(split.keyTimer);
+  split.share = SPLIT.def;
+  applySplit();
+  saveSplit();
+}
+
+{
+  const bar = $('#split');
+  // The mouse leaves the focus where it was (the arrow keys go on moving in Browse); Tab reaches it.
+  bar.addEventListener('mousedown', (ev) => ev.preventDefault());
+  bar.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0 || split.drag) return;
+    split.drag = { id: ev.pointerId, y: ev.clientY, px: split.px, lim: splitLimits() };
+    bar.setPointerCapture(ev.pointerId);
+    bar.classList.add('dragging');
+    document.documentElement.classList.add('split-drag');
+  });
+  bar.addEventListener('pointermove', (ev) => {
+    const d = split.drag;
+    if (!d || ev.pointerId !== d.id) return;
+    takeSplit(setSplitPx(d.px - (ev.clientY - d.y), d.lim), d.lim);
+  });
+  const endDrag = (ev) => {
+    const d = split.drag;
+    if (!d || ev.pointerId !== d.id) return;
+    split.drag = null;
+    bar.classList.remove('dragging');
+    document.documentElement.classList.remove('split-drag');
+    saveSplit();
+  };
+  bar.addEventListener('pointerup', endDrag);
+  bar.addEventListener('pointercancel', endDrag);
+  bar.addEventListener('lostpointercapture', endDrag);
+  bar.addEventListener('dblclick', resetSplit);
+  // ↑/↓ move it 16 px, PgUp/PgDn a tenth of H, Home/End to the ends (Home: the list above at its
+  // smallest); Enter goes back to the default.
+  bar.addEventListener('keydown', (ev) => {
+    if (ev.altKey || ev.ctrlKey || ev.metaKey || split.drag) return;
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      resetSplit();
+      return;
+    }
+    const lim = splitLimits();
+    const page = Math.round(lim.H / 10);
+    const to = { ArrowUp: split.px + 16, ArrowDown: split.px - 16, PageUp: split.px + page, PageDown: split.px - page,
+      Home: lim.hi, End: lim.lo }[ev.key];
+    if (to === undefined) return;
+    ev.preventDefault();
+    takeSplit(setSplitPx(to, lim), lim);
+    clearTimeout(split.keyTimer);
+    split.keyTimer = setTimeout(saveSplit, 500); // once the keys stop
+  });
+  // Again whenever the window, a banner or the list above changes size (a banner inside a view
+  // shrinks only the list): in the next frame, so the change it makes isn't reported back within
+  // this one. The limits don't depend on the list's own height, so this settles in one round.
+  let frame = 0;
+  const observer = new ResizeObserver(() => {
+    if (!frame) frame = requestAnimationFrame(() => { frame = 0; if (!split.drag) applySplit(); });
+  });
+  for (const el of [document.body, $('#search-view'), $('#settings-view'), $('#results'),
+                    $('#settings-view .settings-body')]) observer.observe(el);
+  // Browse draws only the rows in view: a taller list needs more of them.
+  new ResizeObserver(() => scheduleRows()).observe($('#results'));
+}
+
 // ---- status bar: total speed and the speed limit -------------------------------------------
 
 function renderTotalSpeed() {
@@ -2501,6 +2663,16 @@ function onInit(msg) {
   if (!state.recentLoaded) {
     state.recent = Array.isArray(msg.recent) ? msg.recent : [];
     state.recentLoaded = true;
+  }
+  // The splitter and the Downloads table's view from the first init only: init comes again after
+  // every server change, which must not move the panes back.
+  if (!split.loaded) {
+    split.loaded = true;
+    if (typeof msg.split === 'number' && isFinite(msg.split)) {
+      split.share = split.saved = Math.min(SPLIT.max, Math.max(SPLIT.min, msg.split));
+    }
+    state.downloadsView = msg.downloads || null; // its sort and column widths, for the table
+    applySplit();
   }
   // Sent again after every server change; folders typed here but not used yet win.
   state.destinations = { ...msg.destinations, ...state.destinations };
