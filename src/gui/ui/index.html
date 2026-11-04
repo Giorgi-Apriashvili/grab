@@ -277,6 +277,7 @@
   <div class="downloads-head">
     <span class="title">Downloads</span>
     <span id="dl-summary" class="muted" aria-live="polite"></span>
+    <span id="dl-note" class="dl-note" role="status" hidden></span>
     <span class="spacer"></span>
     <span class="stepper" title="How many files download at the same time (1–8); each file of a folder counts">
       <span class="label">At once</span>
@@ -289,22 +290,25 @@
     <button id="clear-finished" type="button" class="subtle">Clear finished</button>
   </div>
   <!-- The table (DOWNLOADS-UI.md 5): a header row over a body that holds only the rows in view
-       (app.js). Right-click a row for its menu; drag a download by its ≡ to change the order. -->
-  <div id="queue" class="queue">
-    <div class="dl-head dl-grid" role="row">
-      <span class="c-handle"></span>
-      <span class="c-name" role="columnheader">Name</span>
-      <span class="c-status" role="columnheader">Status</span>
-      <span class="c-progress" role="columnheader">Progress</span>
-      <span class="c-size num" role="columnheader">Size</span>
-      <span class="c-speed num" role="columnheader">Speed</span>
-      <span class="c-eta num" role="columnheader">ETA</span>
-      <span class="c-prio" role="columnheader">Priority</span>
-      <span class="c-actions"></span>
+       (app.js). A treegrid with one Tab stop for its rows: the focus stays on #queue and
+       aria-activedescendant names the cursor row. Click a title to sort, drag the line at its
+       right edge to resize; right-click a row for its menu; drag a download by its ≡ to change
+       the order. -->
+  <div id="queue" class="queue" role="treegrid" tabindex="0" aria-label="Downloads" aria-multiselectable="true">
+    <div class="dl-head dl-grid" role="row" aria-rowindex="1">
+      <span class="c-handle" role="columnheader" aria-label="Order"></span>
+      <span class="c-name" role="columnheader"><button type="button" class="sort" data-sort="name" title="Sort by name"><span class="lbl">Name</span><span class="arrow" aria-hidden="true"></span></button><span class="dl-resize" data-col="name" aria-hidden="true"></span></span>
+      <span class="c-status" role="columnheader"><button type="button" class="sort" data-sort="status" title="Sort by status: running, queued, paused, failed, cancelled, skipped, done"><span class="lbl">Status</span><span class="arrow" aria-hidden="true"></span></button><span class="dl-resize" data-col="status" aria-hidden="true"></span></span>
+      <span class="c-progress" role="columnheader"><button type="button" class="sort" data-sort="progress" title="Sort by progress"><span class="lbl">Progress</span><span class="arrow" aria-hidden="true"></span></button><span class="dl-resize" data-col="progress" aria-hidden="true"></span></span>
+      <span class="c-size num" role="columnheader"><button type="button" class="sort" data-sort="size" title="Sort by size"><span class="lbl">Size</span><span class="arrow" aria-hidden="true"></span></button><span class="dl-resize" data-col="size" aria-hidden="true"></span></span>
+      <span class="c-speed num" role="columnheader"><button type="button" class="sort" data-sort="speed" title="Sort by speed"><span class="lbl">Speed</span><span class="arrow" aria-hidden="true"></span></button><span class="dl-resize" data-col="speed" aria-hidden="true"></span></span>
+      <span class="c-eta num" role="columnheader"><button type="button" class="sort" data-sort="eta" title="Sort by time left"><span class="lbl">ETA</span><span class="arrow" aria-hidden="true"></span></button><span class="dl-resize" data-col="eta" aria-hidden="true"></span></span>
+      <span class="c-prio" role="columnheader"><button type="button" class="sort" data-sort="priority" title="Sort by bandwidth priority"><span class="lbl">Priority</span><span class="arrow" aria-hidden="true"></span></button></span>
+      <span class="c-actions" role="columnheader" aria-label="Actions"></span>
     </div>
-    <div id="dl-body" class="dl-body" tabindex="0" aria-label="Downloads">
-      <div id="dl-spacer"></div>
-      <div id="dl-drop" class="dl-drop" hidden></div>
+    <div id="dl-body" class="dl-body" role="rowgroup" tabindex="-1">
+      <div id="dl-spacer" aria-hidden="true"></div>
+      <div id="dl-drop" class="dl-drop" aria-hidden="true" hidden></div>
     </div>
   </div>
 </section>

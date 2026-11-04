@@ -43,7 +43,6 @@ const state = {
   searchStarted: 0,
   lastQuery: '',
   queue: [],
-  downloadsView: null,   // gui.json's sort and column widths for the Downloads table, or null
   parallel: 4,
   limitOn: false,        // the limit that applies now: own setting, speed schedule or a change
   limitMiBps: 5,
@@ -2211,7 +2210,8 @@ function fmtClock(sec) {
 }
 
 // The rows (rebuilt only when their structure changes), the elements showing them, the narrow
-// step, the selection (row keys: downloads, or files of one folder) and a drag by the ≡ handle.
+// step, the selection (row keys: downloads, or files of one folder), the keyboard's cursor, a drag
+// by the ≡ handle and the column widths dragged by hand.
 const dl = {
   rows: [],              // { kind: 'dl' | 'file' | 'msg', key, id, path, what, sub, scope }
   index: new Map(),      // row key -> its index in rows
@@ -2221,13 +2221,30 @@ const dl = {
   pool: [],              // every row element made
   bound: new Map(),      // row key -> the element showing it
   step: 0,
+  need: DL_NEED,         // the panel width each step needs, with the widths below
   frame: 0,
   sel: new Set(),
   anchor: '',
+  // The cursor row's key ('' before the first click or key), and its download and index, where
+  // it goes when its row goes (a folded folder's file goes to the folder).
+  cursor: '',
+  cursorId: 0,
+  cursorAt: 0,
   drag: null,
   follow: null,          // a download moved from the menu or the keys: { id, order } until it moved
+  widths: {},            // column -> px dragged by hand (gui.json downloads.widths); absent: DL_W
+  resize: null,          // while a title's edge is dragged
+  keyAt: 0,              // when the table last had a key (performance.now())
 };
 const folderOpen = new Map(); // folder id -> expanded, once the user toggled it
+
+// A row as the selection counts it: a message row stands for its download; and its level, which a
+// selection keeps to: downloads ('d'), or the files of one folder.
+const selKey = (r) => (r.kind === 'msg' ? `d${r.id}` : r.key);
+const scopeOf = (r) => (r.kind === 'file' ? r.scope : 'd');
+
+// The table keeps the keyboard focus (one Tab stop, 5.8): a row's button never holds it.
+function dlFocus() { $('#queue').focus({ preventScroll: true }); }
 
 // Open while the folder is active, folded when it is finished, unless the user toggled it.
 function folderIsOpen(q) {
@@ -2247,7 +2264,7 @@ function dlMessages(q) {
 
 function dlRowsOf() {
   const rows = [];
-  for (const q of state.queue) {
+  for (const q of dlOrdered()) {
     rows.push({ kind: 'dl', key: `d${q.id}`, id: q.id, scope: 'd' });
     for (const what of dlMessages(q)) rows.push({ kind: 'msg', key: `m${q.id}:${what}`, id: q.id, what });
     if (!q.files || !folderIsOpen(q)) continue;
@@ -2271,6 +2288,23 @@ function buildDlRows() {
   dl.index = new Map(rows.map((r, i) => [r.key, i]));
   for (const key of dl.sel) if (!dl.index.has(key)) dl.sel.delete(key);
   if (!dl.index.has(dl.anchor)) dl.anchor = '';
+  // A cursor row that went (a folded folder's file, a cleared download) goes to its download, or
+  // else to the row now where it was.
+  if (dl.cursor && !dl.index.has(dl.cursor)) {
+    const up = dl.index.get(`d${dl.cursorId}`);
+    const i = up !== undefined ? up : Math.min(dl.cursorAt, rows.length - 1);
+    if (i >= 0) setDlCursor(rows[i]); else dl.cursor = '';
+  } else if (dl.cursor) {
+    dl.cursorAt = dl.index.get(dl.cursor);
+  }
+  $('#queue').setAttribute('aria-rowcount', String(rows.length + 1)); // and the header row
+}
+
+// Where the keyboard's cursor is (5.8); the selection is left as it is.
+function setDlCursor(r) {
+  dl.cursor = r.key;
+  dl.cursorId = r.id;
+  dl.cursorAt = dl.index.get(r.key) ?? 0;
 }
 
 // What a progress bar and its percent show: full (done, or being verified), a part, or '-' while
@@ -2427,20 +2461,26 @@ function msgView(q, r) {
   }
 }
 
+// A row element of the pool: a treegrid row (5.8) with an id of its own, which
+// aria-activedescendant names while it shows the cursor row.
 function newDlRow() {
   const el = document.createElement('div');
-  el.innerHTML = '<span class="c-handle"><span class="dl-grip" title="Drag to change the order">≡</span>' +
+  el.id = `dl-r${dl.pool.length}`;
+  el.setAttribute('role', 'row');
+  el.innerHTML = '<span class="c-handle" role="gridcell"><span class="dl-grip">≡</span>' +
     '<button type="button" class="dl-toggle" tabindex="-1" data-act="toggle"></button></span>' +
-    '<span class="c-name"><span class="dl-ico"></span><span class="dl-text"></span><span class="dl-dest"></span></span>' +
-    '<span class="c-status"><span class="dl-word"></span><span class="dl-count"></span><span class="dl-mark"></span></span>' +
-    '<span class="c-progress"><span class="dl-bar"><i></i></span><span class="dl-pct"></span></span>' +
-    '<span class="c-size"></span><span class="c-speed"></span><span class="c-eta"></span>' +
-    '<span class="c-prio"><select class="dl-prio" tabindex="-1" aria-label="Bandwidth priority" ' +
+    '<span class="c-name" role="gridcell"><span class="dl-ico"></span><span class="dl-text"></span><span class="dl-dest"></span></span>' +
+    '<span class="c-status" role="gridcell"><span class="dl-word"></span><span class="dl-count"></span><span class="dl-mark"></span></span>' +
+    '<span class="c-progress" role="gridcell"><span class="dl-bar"><i></i></span><span class="dl-pct"></span></span>' +
+    '<span class="c-size" role="gridcell"></span><span class="c-speed" role="gridcell"></span><span class="c-eta" role="gridcell"></span>' +
+    '<span class="c-prio" role="gridcell"><select class="dl-prio" tabindex="-1" aria-label="Bandwidth priority" ' +
     'title="Bandwidth priority: how running downloads share the speed">' +
     PRIORITIES.map(([p, label]) => `<option value="${p}">${label}</option>`).join('') + '</select></span>' +
-    '<span class="c-actions"><span class="dl-slot"></span><span class="dl-slot"></span></span><span class="c-msg"></span>';
+    '<span class="c-actions" role="gridcell"><span class="dl-slot"></span><span class="dl-slot"></span></span>' +
+    '<span class="c-msg" role="gridcell"></span>';
   const one = (sel) => el.querySelector(sel);
   el.c = {
+    grip: one('.dl-grip'),
     toggle: one('.dl-toggle'), name: one('.c-name'), ico: one('.dl-ico'), text: one('.dl-text'), dest: one('.dl-dest'),
     status: one('.c-status'), word: one('.dl-word'), count: one('.dl-count'), mark: one('.dl-mark'),
     bar: one('.dl-bar > i'), pct: one('.dl-pct'), size: one('.c-size'), speed: one('.c-speed'), eta: one('.c-eta'),
@@ -2478,13 +2518,25 @@ function paintDlRow(el, r, i) {
   put(el, 'key', r.key, (k) => { el.dataset.key = k; });
   const view = r.kind === 'dl' ? dlView(q) : r.kind === 'file' ? fileView(q, child) : msgView(q, r);
   const d = dl.drag;
-  const cls = `dl-row dl-grid k-${r.kind} ${view.cls}${dl.sel.has(r.kind === 'msg' ? `d${r.id}` : r.key) ? ' sel' : ''}` +
+  const selected = dl.sel.has(selKey(r));
+  const cls = `dl-row dl-grid k-${r.kind} ${view.cls}${selected ? ' sel' : ''}${r.key === dl.cursor ? ' cursor' : ''}` +
     `${d && d.moved && d.key === r.key ? ' dragging' : ''}`;
   put(el, 'cls', cls, (v) => { el.className = v; });
+  // The treegrid's row (5.8): its place counting the header row, downloads at level 1 and what is
+  // under them at 2, a folder's ▸/▾ and whether it is selected (a message row: its download).
+  put(el, 'rowIndex', i + 2, (v) => el.setAttribute('aria-rowindex', String(v)));
+  put(el, 'level', r.kind === 'dl' ? 1 : 2, (v) => el.setAttribute('aria-level', String(v)));
+  put(el, 'selected', selected, (v) => el.setAttribute('aria-selected', String(v)));
+  put(el, 'expanded', r.kind === 'dl' && q.files ? String(folderIsOpen(q)) : '', (v) => {
+    if (v) el.setAttribute('aria-expanded', v); else el.removeAttribute('aria-expanded');
+  });
   if (r.kind === 'msg') {
     put(el, 'msg', view.msg, (t) => { c.msg.textContent = bidiVisible(t); c.msg.title = bidiVisible(t); });
     return; // its other cells are hidden
   }
+  // The ≡ drags in the queue order only (5.6).
+  put(el, 'grip', dlSort.key ? `Dragging works in the queue order: ${dlQueueOrderHint()}` : 'Drag to change the order',
+    (t) => { c.grip.title = t; });
   put(el, 'toggle', view.toggle, (t) => {
     c.toggle.textContent = t;
     c.toggle.style.visibility = t ? '' : 'hidden';
@@ -2516,64 +2568,77 @@ function paintDlRow(el, r, i) {
   });
   if (view.prio && document.activeElement !== c.prio && c.prio.value !== view.prio) c.prio.value = view.prio;
   view.slots.forEach((s, k) => put(el, `slot${k}`, s ? s.join('|') : '', () => {
-    if (c.slots[k].contains(document.activeElement)) $('#dl-body').focus({ preventScroll: true });
+    if (c.slots[k].contains(document.activeElement)) dlFocus();
     c.slots[k].innerHTML = slotHtml(s);
   }));
 }
 
 // Binds the rows in view (and DL_OVER more each side) to elements: one already showing a row
-// keeps it, so a row that only moves keeps its element; the others come from the pool. A pinned
-// element (the row being dragged) stays with its row out of view too.
+// keeps it, so a row that only moves keeps its element; the others come from the pool. Two rows
+// keep their element out of view too: the cursor row, so aria-activedescendant never names an
+// element recycled for another row (5.8), and a pinned one (the row being dragged).
 function renderDlBody() {
   const body = $('#dl-body');
   if ($('#downloads').hidden) return;
   const n = dl.rows.length;
   $('#dl-spacer').style.height = `${n * DL_ROW}px`;
   const first = Math.max(0, Math.floor(body.scrollTop / DL_ROW) - DL_OVER);
-  const last = Math.min(n, first + DL_POOL - 1, Math.ceil((body.scrollTop + body.clientHeight) / DL_ROW) + DL_OVER);
+  const last = Math.min(n, first + DL_POOL - 2, Math.ceil((body.scrollTop + body.clientHeight) / DL_ROW) + DL_OVER);
   const want = new Set();
   for (let i = first; i < last; ++i) want.add(dl.rows[i].key);
+  if (dl.index.has(dl.cursor)) want.add(dl.cursor);
+  for (const el of dl.pool) if (el.pinned && dl.index.has(el.dlKey)) want.add(el.dlKey);
   const free = [];
   for (const el of dl.pool) {
-    if (el.dlKey && (want.has(el.dlKey) || (el.pinned && dl.index.has(el.dlKey)))) continue;
+    if (el.dlKey && want.has(el.dlKey)) continue;
     if (el.dlKey) dl.bound.delete(el.dlKey);
-    if (el.contains(document.activeElement)) body.focus({ preventScroll: true }); // keys never act on a recycled row (5.8)
+    if (el.contains(document.activeElement)) dlFocus(); // keys never act on a recycled row (5.8)
     el.dlKey = '';
     // One element per data-key: a freed one loses its key, written again when it shows a row.
     if (el.v.key !== undefined) { delete el.v.key; delete el.dataset.key; }
     free.push(el);
   }
-  for (let i = first; i < last; ++i) {
-    const r = dl.rows[i];
-    let el = dl.bound.get(r.key);
+  for (const key of want) {
+    let el = dl.bound.get(key);
     if (!el) {
       el = free.pop() || newDlRow();
-      el.dlKey = r.key;
-      dl.bound.set(r.key, el);
+      el.dlKey = key;
+      dl.bound.set(key, el);
     }
-    paintDlRow(el, r, i);
-  }
-  for (const el of dl.pool) {
-    if (el.pinned && el.dlKey && !want.has(el.dlKey)) paintDlRow(el, dl.rows[dl.index.get(el.dlKey)], dl.index.get(el.dlKey));
+    const i = dl.index.get(key);
+    paintDlRow(el, dl.rows[i], i);
   }
   for (const el of free) put(el, 'hidden', true, (h) => { el.hidden = h; });
+  const grid = $('#queue');
+  const cur = dl.bound.get(dl.cursor);
+  if (!cur) grid.removeAttribute('aria-activedescendant');
+  else if (grid.getAttribute('aria-activedescendant') !== cur.id) grid.setAttribute('aria-activedescendant', cur.id);
 }
 
 function scheduleDl() {
   if (!dl.frame) dl.frame = requestAnimationFrame(() => { dl.frame = 0; renderDlBody(); });
 }
 
-// The narrow step and the head's summary, from the panel's width.
+// The narrow step and the head's summary, from the panel's width (and the widths dragged by hand,
+// a setting: never the data). Not while a title's edge is dragged: a column appearing or going
+// then would move the edge away from the pointer.
 function updateDlStep() {
   const panel = $('#downloads');
   const width = $('#dl-body').clientWidth;
-  if (panel.hidden || !width) return;
-  let step = DL_NEED.findIndex((need) => width >= need);
+  if (panel.hidden || !width || dl.resize) return;
+  let step = dl.need.findIndex((need) => width >= need);
   if (step < 0) step = DL_COMPACT;
   if (panel.dataset.step !== String(step)) {
     dl.step = step;
     panel.dataset.step = String(step);
-    scheduleDl(); // compact sizes and the Status tooltip's priority follow it
+    // A title's edge drags while a column shown follows it; compact columns keep their widths.
+    const cols = dlResizable();
+    for (const h of document.querySelectorAll('.dl-head .dl-resize')) {
+      const k = cols.indexOf(h.dataset.col);
+      h.hidden = k < 0 || k === cols.length - 1;
+    }
+    renderDlSortHead(); // a sorted column hidden or shown again: Name's title shows its sort
+    scheduleDl(); // compact sizes, the Status tooltip's priority and the grips' tooltip follow it
   }
   panel.classList.toggle('narrow-head', panel.clientWidth < DL_HEAD_NARROW);
 }
@@ -2591,13 +2656,395 @@ function dlKeepInView(i) {
   else if (top + DL_ROW > body.scrollTop + body.clientHeight) body.scrollTop = top + DL_ROW - body.clientHeight;
 }
 
+// ---- sorting the downloads (5.6) and the column widths (5.7) ---------------------------------
+//
+// A click on a title sorts the downloads by that column, a second click the other way, a third
+// goes back to the queue order (the default), as in Browse. Ties keep the queue order. A folder's
+// files stay under it in the order they come (sorting them comes with every file listed, chunk C).
+// gui.json keeps the sort and the widths (downloads.sort, downloads.widths) through "prefs".
+
+// The first click's direction: names A to Z, what runs first (DL_STATUS_RANK), the most done, the
+// largest, the fastest, the least time left, High first.
+const DL_SORT_FIRST = { name: 'asc', status: 'asc', progress: 'desc', size: 'desc', speed: 'desc', eta: 'asc', priority: 'desc' };
+const DL_STATUS_RANK = { running: 0, queued: 1, paused: 2, failed: 3, cancelled: 4, skipped: 5, done: 6 };
+const PRIORITY_RANK = { high: 3, normal: 2, low: 1 };
+const DL_RESORT_MS = 1000; // a new order from changed values comes at most once a second
+const DL_KEY_HOLD_MS = 2000; // and not this soon after a key in the table (the cursor's row stays put)
+const DL_COL_LABEL = { name: 'Name', status: 'Status', progress: 'Progress', size: 'Size', speed: 'Speed', eta: 'ETA', priority: 'Priority' };
+
+// The sort: `key` the column ('' for the queue order) and `dir`. Sorted, `order` holds the
+// download ids as shown; `at` when a new order last came; `pending` while one waits (a dot by the
+// arrow); `over` while the pointer is over the table; `force` makes the next order come at once
+// (a click, gui.json).
+const dlSort = { key: '', dir: 'asc', order: null, at: 0, pending: false, over: false, force: false, timer: 0 };
+
+// Fetching: running, past listing and checking and not yet verifying (when a speed and a time
+// left show).
+const dlFetching = (q) => q.status === 'running' && !PHASE_WORD[q.phase];
+
+// What a download sorts by on `key`, as its row shows it; null when it shows none (a size not
+// known yet, no speed while not fetching, no priority once finished): those go last both ways.
+function dlSortValue(q, key) {
+  switch (key) {
+    case 'name': return asciiLower(q.name);
+    case 'status': return DL_STATUS_RANK[q.status] ?? Object.keys(DL_STATUS_RANK).length;
+    case 'progress':
+      if (q.status === 'done' || (q.status === 'running' && q.phase === 'verifying')) return 1;
+      return q.total > 0 ? Math.min(1, q.bytes / q.total) : null;
+    case 'size': return q.total > 0 ? q.total : null;
+    case 'speed': return dlFetching(q) && q.speed > 0 ? q.speed : null;
+    case 'eta': return dlFetching(q) && Number.isFinite(q.eta) && q.eta >= 0 ? q.eta : null;
+    default: return UNFINISHED.includes(q.status) ? PRIORITY_RANK[q.priority] || PRIORITY_RANK.normal : null;
+  }
+}
+
+// Compares two of { q, v (dlSortValue), ord (place in the queue) } for the sort: names naturally
+// ("file 9" before "file 10"), numbers by value; no value last both ways; ties in queue order.
+function dlCompare(key, dir) {
+  const desc = dir === 'desc';
+  return (x, y) => {
+    if (x.v === null || y.v === null) return x.v === y.v ? x.ord - y.ord : x.v === null ? 1 : -1;
+    const c = key === 'name' ? naturalCompare(x.q.name, y.q.name, x.v, y.v) : x.v - y.v;
+    if (c) return desc ? -c : c;
+    return x.ord - y.ord;
+  };
+}
+
+// The downloads in the order shown.
+function dlOrdered() {
+  return dlSort.order ? dlSort.order.map((id) => dl.byId.get(id)).filter(Boolean) : state.queue;
+}
+
+const sameIds = (a, b) => a.length === b.length && a.every((id, i) => id === b[i]);
+
+// Sets the order shown from state.queue; returns whether it changed. The queue order follows the
+// queue. Sorted, a click or gui.json's sort comes at once, and so does a download added or removed:
+// it goes in its place, the others stay as they are. A new order from changed values (a status, the
+// bytes, the speed, a priority, a size once known) waits: at most once a second, and not while the
+// pointer is over the table, a menu is open or a drag runs, so a row never moves under the mouse
+// (5.6). The title's dot says one waits; it comes when the pointer leaves.
+function updateDlOrder() {
+  clearTimeout(dlSort.timer);
+  dlSort.timer = 0;
+  const shown = dlSort.order;
+  if (!dlSort.key) {
+    dlSort.order = null;
+    setDlPending(false);
+    return shown !== null;
+  }
+  const cmp = dlCompare(dlSort.key, dlSort.dir);
+  const items = state.queue.map((q, ord) => ({ id: q.id, q, ord, v: dlSortValue(q, dlSort.key) }));
+  const want = items.slice().sort(cmp).map((x) => x.id);
+  const now = performance.now();
+  if (!shown || dlSort.force) {
+    dlSort.force = false;
+    dlSort.order = want;
+    dlSort.at = now;
+    setDlPending(false);
+    return !shown || !sameIds(shown, want);
+  }
+  // The rows shown stay; new downloads go before the first one they sort ahead of.
+  const byId = new Map(items.map((x) => [x.id, x]));
+  const kept = shown.filter((id) => byId.has(id));
+  const known = new Set(kept);
+  const fresh = items.filter((x) => !known.has(x.id)).sort(cmp);
+  let order = kept;
+  if (fresh.length) {
+    order = [];
+    let k = 0;
+    for (const id of kept) {
+      while (k < fresh.length && cmp(fresh[k], byId.get(id)) < 0) order.push(fresh[k++].id);
+      order.push(id);
+    }
+    while (k < fresh.length) order.push(fresh[k++].id);
+  }
+  const changed = !sameIds(order, shown);
+  if (sameIds(order, want)) {
+    dlSort.order = want;
+    setDlPending(false);
+    return changed;
+  }
+  const wait = dlSort.at + DL_RESORT_MS - now;
+  if (wait <= 0 && !dlResortHeld()) {
+    dlSort.order = want;
+    dlSort.at = now;
+    setDlPending(false);
+    return true;
+  }
+  dlSort.order = order;
+  setDlPending(true);
+  dlSort.timer = setTimeout(dlRecheck, Math.max(wait, 250));
+  return changed;
+}
+
+// Whatever keeps a new order waiting besides the once-a-second rule. The pointer counts by its
+// events and by :hover, which also catches it over the table once a menu above the table closes;
+// the keys count for a while after the last one, so the cursor's row doesn't run off while the
+// keys walk the rows.
+function dlResortHeld() {
+  return dlSort.over || $('#queue').matches(':hover') || !$('#menu').hidden || !!dl.drag || !!dl.resize ||
+    (document.activeElement === $('#queue') && performance.now() - dl.keyAt < DL_KEY_HOLD_MS);
+}
+
+// Again, for an order that waits: its second passed, the pointer left, a menu closed.
+function dlRecheck() {
+  dlSort.timer = 0;
+  if (!dlSort.pending || $('#downloads').hidden) return;
+  if (updateDlOrder()) {
+    buildDlRows();
+    renderDlBody();
+  }
+}
+
+function setDlPending(on) {
+  if (dlSort.pending === on) return;
+  dlSort.pending = on;
+  renderDlSortHead();
+}
+
+// The sorted column when the narrow step hides it (compact hides what step 3 does), else ''.
+function dlSortHidden() {
+  const hides = DL_HIDES[Math.min(dl.step, DL_HIDES.length - 1)];
+  return dlSort.key && hides.includes(dlSort.key) ? dlSort.key : '';
+}
+
+// How to get back to the queue order, for the moves' note and the grip's tooltip.
+function dlQueueOrderHint() {
+  const col = DL_COL_LABEL[dlSort.key];
+  return dlSortHidden() ? `sorted by ${col}, whose column is hidden: click Name’s title, or right-click the titles → Queue order`
+    : `click the ${col} title until its arrow goes`;
+}
+
+// The titles: the arrow (and aria-sort) on the sorted one, the dot while a new order waits; the
+// ≡ grips dimmed while sorted. When the narrow step hides the sorted column, Name's title shows
+// the arrow and the column ("Name · by Speed"), and a click on it goes back to the queue order.
+function renderDlSortHead() {
+  $('#downloads').classList.toggle('sorted', !!dlSort.key);
+  const hidden = dlSortHidden();
+  const mark = hidden ? 'name' : dlSort.key;
+  for (const b of document.querySelectorAll('.dl-head [data-sort]')) {
+    const on = !!mark && b.dataset.sort === mark;
+    const cell = b.parentElement;
+    const lbl = b.querySelector('.lbl');
+    if (b.dataset.tip === undefined) b.dataset.tip = b.title;
+    if (lbl.dataset.text === undefined) lbl.dataset.text = lbl.textContent;
+    if (on) {
+      b.dataset.dir = dlSort.dir;
+      cell.setAttribute('aria-sort', hidden ? 'other' : dlSort.dir === 'asc' ? 'ascending' : 'descending');
+    } else {
+      delete b.dataset.dir;
+      cell.removeAttribute('aria-sort');
+    }
+    const text = on && hidden ? `${lbl.dataset.text} · by ${DL_COL_LABEL[hidden]}` : lbl.dataset.text;
+    if (lbl.textContent !== text) lbl.textContent = text;
+    b.querySelector('.arrow').textContent = on ? (dlSort.dir === 'asc' ? '▴' : '▾') : '';
+    b.toggleAttribute('data-pending', on && dlSort.pending);
+    const tip = on && hidden ? `Sorted by ${DL_COL_LABEL[hidden]} (its column is hidden): click for the queue order` : b.dataset.tip;
+    b.title = on && dlSort.pending ? `${tip}\nA new order waits until the pointer leaves the table` : tip;
+  }
+}
+
+// A click on a title: its first direction, then the other, then the queue order; the cursor row
+// stays in view. Name's title showing a hidden column's sort goes back to the queue order.
+function clickDlSort(key) {
+  if (key === 'name' && dlSortHidden()) {
+    dlSort.key = '';
+  } else if (dlSort.key !== key) {
+    dlSort.key = key;
+    dlSort.dir = DL_SORT_FIRST[key];
+  } else if (dlSort.dir === DL_SORT_FIRST[key]) {
+    dlSort.dir = dlSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    dlSort.key = '';
+  }
+  applyDlSort();
+}
+
+// The sort just set, shown at once and kept in gui.json.
+function applyDlSort() {
+  dlSort.force = true;
+  updateDlOrder();
+  renderDlSortHead();
+  buildDlRows();
+  if (dl.index.has(dl.cursor)) dlKeepInView(dl.index.get(dl.cursor));
+  renderDlBody();
+  saveDlView();
+}
+
+// gui.json's downloads view, as "prefs" sends it whole: the sort (null for the queue order) and
+// the widths dragged by hand.
+function saveDlView() {
+  send({ type: 'prefs', downloads: { sort: dlSort.key ? { key: dlSort.key, dir: dlSort.dir } : null, widths: { ...dl.widths } } });
+}
+
+// The columns whose title's right edge drags, in order, each with its least width. Name stretches:
+// it has no width of its own, only its least, and its edge trades with Status's width.
+const DL_COLS = ['name', 'status', 'progress', 'size', 'speed', 'eta', 'priority'];
+// The least widths hold the fixed formats: Status its word ("Downloading", "Queued #123") beside
+// the count's 74 px and the mark's 16, Size a pair ("1023.9 MiB / 1023.9 GiB"), Speed
+// "1023.9 KiB/s", ETA "99:59:59", Progress the bar's 16 px and the percent.
+const DL_MIN_W = { name: DL_W.name, status: 174, progress: 64, size: 124, speed: 66, eta: 44, priority: 64 };
+const DL_MAX_W = 4000; // gui_state's max_column_px
+
+function dlWidth(col) { return dl.widths[col] ?? DL_W[col]; }
+
+// The columns shown now that a drag can resize; none in compact columns, which keep their own.
+function dlResizable() {
+  return dl.step === DL_COMPACT ? [] : DL_COLS.filter((c) => !DL_HIDES[dl.step].includes(c));
+}
+
+// The panel width each narrow step needs (DL_NEED with the widths dragged by hand).
+function dlNeeds() {
+  return DL_HIDES.map((hide) => {
+    const shown = Object.keys(DL_W).filter((k) => !hide.includes(k)).map(dlWidth);
+    return 2 * DL_PAD + shown.reduce((a, b) => a + b, 0) + DL_GAP * (shown.length - 1);
+  });
+}
+
+function setDlWidth(col, px) {
+  px = Math.round(px);
+  if (px === DL_W[col]) delete dl.widths[col];
+  else dl.widths[col] = px;
+}
+
+// The widths onto the panel (app.css --u-<column>), and the narrow steps from them.
+function applyDlWidths(steps = true) {
+  const panel = $('#downloads');
+  for (const col of DL_COLS) {
+    if (col === 'name') continue;
+    if (dl.widths[col] !== undefined) panel.style.setProperty(`--u-${col}`, `${dl.widths[col]}px`);
+    else panel.style.removeProperty(`--u-${col}`);
+  }
+  dl.need = dlNeeds();
+  if (steps) updateDlStep();
+}
+
+// A drag of `col`'s right edge from where it started (5.7): `col` follows the pointer and the next
+// column shown gives or takes the room, so nothing else moves (Name's edge: Status gives or takes
+// it). Neither gets under its least width.
+function startDlResize(h, x, pointerId) {
+  const cols = dlResizable();
+  const col = h.dataset.col;
+  const next = cols[cols.indexOf(col) + 1];
+  if (!cols.includes(col) || !next) return false;
+  const a0 = col === 'name' ? $('.dl-head .c-name').getBoundingClientRect().width : dlWidth(col);
+  dl.resize = { pointerId, h, col, next, x0: x, a0, b0: dlWidth(next), moved: false };
+  h.classList.add('dragging');
+  document.documentElement.classList.add('dl-resizing');
+  return true;
+}
+
+function moveDlResize(x) {
+  const z = dl.resize;
+  const lo = Math.ceil(DL_MIN_W[z.col] - z.a0);
+  const hi = Math.floor(z.b0 - DL_MIN_W[z.next]);
+  const d = lo > hi ? 0 : Math.min(hi, Math.max(lo, Math.round(x - z.x0)));
+  if (z.col !== 'name') setDlWidth(z.col, z.a0 + d);
+  setDlWidth(z.next, z.b0 - d);
+  if (d) z.moved = true;
+  applyDlWidths(false);
+}
+
+function endDlResize() {
+  const z = dl.resize;
+  if (!z) return;
+  dl.resize = null;
+  z.h.classList.remove('dragging');
+  document.documentElement.classList.remove('dl-resizing');
+  applyDlWidths();
+  if (z.moved) saveDlView();
+  dlRecheck();
+}
+
+// A double-click on the edge: the columns its drag resizes get their default widths again.
+function resetDlWidths(col) {
+  const cols = dlResizable();
+  const next = cols[cols.indexOf(col) + 1];
+  if (!cols.includes(col) || !next) return;
+  const before = JSON.stringify(dl.widths);
+  delete dl.widths[col];
+  delete dl.widths[next];
+  applyDlWidths();
+  if (JSON.stringify(dl.widths) !== before) saveDlView();
+}
+
+// The titles' menu: every column at its default width. It works at every step, compact too,
+// where no edge shows to double-click.
+function resetAllDlWidths() {
+  if (!Object.keys(dl.widths).length) return;
+  dl.widths = {};
+  applyDlWidths();
+  saveDlView();
+}
+
+// gui.json's downloads view from the first init: a sort on a known column and direction, widths of
+// known columns, each kept within its least and DL_MAX_W; anything else is the default.
+function applyDlView(v) {
+  const s = v && typeof v === 'object' ? v.sort : null;
+  if (s && typeof s === 'object' && Object.hasOwn(DL_SORT_FIRST, s.key) && (s.dir === 'asc' || s.dir === 'desc')) {
+    dlSort.key = s.key;
+    dlSort.dir = s.dir;
+  }
+  const w = v && typeof v === 'object' ? v.widths : null;
+  if (w && typeof w === 'object') {
+    for (const col of DL_COLS) {
+      if (col === 'name' || typeof w[col] !== 'number' || !Number.isFinite(w[col])) continue;
+      setDlWidth(col, Math.min(DL_MAX_W, Math.max(DL_MIN_W[col], w[col])));
+    }
+  }
+  dlSort.force = true;
+  renderDlSortHead();
+  applyDlWidths();
+  renderQueue();
+}
+
+{
+  const head = $('.dl-head');
+  // The mouse leaves the focus where it was (the keys go on in the table); Tab reaches the titles,
+  // and Enter or Space clicks them.
+  head.addEventListener('mousedown', (ev) => ev.preventDefault());
+  head.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button[data-sort]');
+    if (b) clickDlSort(b.dataset.sort);
+  });
+  head.addEventListener('pointerdown', (ev) => {
+    const h = ev.target.closest('.dl-resize');
+    if (!h || ev.button !== 0 || dl.resize || dl.drag) return;
+    ev.preventDefault();
+    closeMenu();
+    if (startDlResize(h, ev.clientX, ev.pointerId)) h.setPointerCapture(ev.pointerId);
+  });
+  head.addEventListener('pointermove', (ev) => {
+    if (dl.resize && ev.pointerId === dl.resize.pointerId) moveDlResize(ev.clientX);
+  });
+  const end = (ev) => { if (dl.resize && ev.pointerId === dl.resize.pointerId) endDlResize(); };
+  head.addEventListener('pointerup', end);
+  head.addEventListener('pointercancel', end);
+  head.addEventListener('lostpointercapture', end);
+  head.addEventListener('dblclick', (ev) => {
+    const h = ev.target.closest('.dl-resize');
+    if (h) resetDlWidths(h.dataset.col);
+  });
+  // A right-click on the titles (or the menu key on one): back to the queue order, even when the
+  // sorted column is hidden, and the default widths, even in compact columns.
+  head.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    let [x, y] = [ev.clientX, ev.clientY];
+    if (!x && !y) { const box = ev.target.getBoundingClientRect(); [x, y] = [box.left, box.bottom]; } // from the keys
+    showMenu(x, y, [
+      { label: 'Queue order', disabled: !dlSort.key, act: () => { dlSort.key = ''; applyDlSort(); } },
+      { label: 'Reset column widths', disabled: !Object.keys(dl.widths).length, act: resetAllDlWidths },
+    ]);
+  });
+}
+
 // ---- selection, menus, moves and the confirmation ------------------------------------------
 
 // A click selects a row, Ctrl+click toggles one, Shift+click extends from the last one clicked,
 // within one scope: downloads, or the files of one folder. A message row stands for its download.
 function selectDl(r, { toggle = false, extend = false } = {}) {
-  const key = r.kind === 'msg' ? `d${r.id}` : r.key;
-  const scope = r.kind === 'file' ? r.scope : 'd';
+  const key = selKey(r);
+  const scope = scopeOf(r);
   const anchor = dl.anchor && dl.rows[dl.index.get(dl.anchor)];
   const same = anchor && anchor.scope === scope;
   if (extend && same) {
@@ -2616,6 +3063,67 @@ function selectDl(r, { toggle = false, extend = false } = {}) {
 // The selected rows in the table's order: downloads, or files of one folder.
 function selectedDl() {
   return [...dl.sel].map((k) => dl.index.get(k)).filter((i) => i !== undefined).sort((a, b) => a - b).map((i) => dl.rows[i]);
+}
+
+// The keyboard's cursor to row `i` (5.8), kept in view: the row alone becomes the selection; with
+// `extend` (Shift) the rows of the anchor's level from the anchor to it; with `keep` (Ctrl) the
+// selection stays. The cursor goes through every row; a message row selects its download.
+function moveDlCursor(i, { extend = false, keep = false } = {}) {
+  const n = dl.rows.length;
+  if (!n) return;
+  i = Math.max(0, Math.min(n - 1, i));
+  const from = dl.rows[dl.index.get(dl.cursor)];
+  const r = dl.rows[i];
+  setDlCursor(r);
+  if (extend) {
+    if (!dl.index.has(dl.anchor)) dl.anchor = selKey(from || r);
+    const a = dl.index.get(dl.anchor);
+    const scope = scopeOf(dl.rows[a]);
+    const [lo, hi] = a < i ? [a, i] : [i, a];
+    dl.sel = new Set(dl.rows.slice(lo, hi + 1).filter((x) => scopeOf(x) === scope).map(selKey));
+  } else if (!keep) {
+    dl.sel = new Set([selKey(r)]);
+    dl.anchor = selKey(r);
+  }
+  dlKeepInView(i);
+  renderDlBody();
+}
+
+// Ctrl+A: every row of the cursor row's level, all downloads or all files of its folder.
+function selectDlLevel() {
+  const r = dl.rows[dl.index.get(dl.cursor)] || dl.rows[0];
+  if (!r) return;
+  const scope = scopeOf(r);
+  dl.sel = new Set(dl.rows.filter((x) => scopeOf(x) === scope).map(selKey));
+  const anchor = dl.rows[dl.index.get(dl.anchor)];
+  if (!anchor || scopeOf(anchor) !== scope) dl.anchor = selKey(r);
+  renderDlBody();
+}
+
+// → on a folded folder opens it, on an open one goes to its first file; ← folds an open folder,
+// or from a row under a download goes up to it.
+function dlRight(r) {
+  const q = dl.byId.get(r.id);
+  if (r.kind !== 'dl' || !q || !q.files) return;
+  if (!folderIsOpen(q)) {
+    setFolderOpen(q, true);
+    return;
+  }
+  for (let k = dl.index.get(r.key) + 1; k < dl.rows.length && dl.rows[k].kind !== 'dl'; ++k) {
+    if (dl.rows[k].kind === 'file') { moveDlCursor(k); return; }
+  }
+}
+
+function dlLeft(r) {
+  const q = dl.byId.get(r.id);
+  if (r.kind !== 'dl') moveDlCursor(dl.index.get(`d${r.id}`));
+  else if (q && q.files && folderIsOpen(q)) setFolderOpen(q, false);
+}
+
+function setFolderOpen(q, open) {
+  folderOpen.set(q.id, open);
+  buildDlRows();
+  renderDlBody();
 }
 
 function waiting(q) { return q.status === 'queued' || q.status === 'paused'; }
@@ -2710,11 +3218,12 @@ function downloadsMenu(qs) {
         act: () => cancelling.forEach((q) => { if (q.priority !== p) send({ type: 'setPriority', id: q.id, priority: p }); }) });
     }
   }
-  // A waiting download moves in the queue (decision 4); Alt+↑/↓ does the first two.
+  // A waiting download moves in the queue (decision 4); Alt+↑/↓ does the first two. Only in the
+  // queue order: sorted by a column, the rows don't show it (5.9).
   if (one && waiting(one)) {
     items.push('-');
     for (const [how, label, key] of [['up', 'Move up', 'Alt+↑'], ['down', 'Move down', 'Alt+↓'], ['top', 'Move to top'], ['bottom', 'Move to bottom']]) {
-      items.push({ label, key, disabled: moveTarget(one.id, how) === undefined, act: () => moveDownload(one.id, how) });
+      items.push({ label, key, disabled: !!dlSort.key || moveTarget(one.id, how) === undefined, act: () => moveDownload(one.id, how) });
     }
   }
   items.push('-');
@@ -2762,9 +3271,7 @@ function dlAct(r, act) {
   const q = dl.byId.get(r.id);
   if (!q) return;
   if (act === 'toggle') {
-    folderOpen.set(q.id, !folderIsOpen(q));
-    buildDlRows();
-    renderDlBody();
+    setFolderOpen(q, !folderIsOpen(q));
   } else if (r.kind === 'file') {
     const type = { pause: 'pauseChild', resume: 'resumeChild', skip: 'skipChild' }[act];
     if (type) send({ type, id: q.id, path: r.path });
@@ -2839,20 +3346,21 @@ function endDrag(drop) {
     if (!r || (ev.button !== 0 && ev.button !== 2)) return;
     // A row's button acts on its click but never takes the focus: the table keeps it (one tab
     // stop, 5.8), so Delete and Alt+arrows go on working and no key lands on a recycled row.
-    if (ev.target.closest('button')) { ev.preventDefault(); body.focus({ preventScroll: true }); return; }
-    if (ev.target.closest('select, .dl-grip')) return; // the priority opens; the grip drags
+    if (ev.target.closest('button')) { ev.preventDefault(); dlFocus(); return; }
+    // The priority opens; the grip drags (in the queue order; sorted, it is part of the row).
+    if (ev.target.closest('select') || (ev.target.closest('.dl-grip') && !dlSort.key)) return;
     ev.preventDefault();
-    body.focus({ preventScroll: true });
-    const key = r.kind === 'msg' ? `d${r.id}` : r.key;
+    setDlCursor(r); // first: taking the focus would otherwise put the cursor on a row in view
+    dlFocus();
     // Right-click: a row outside the selection becomes the selection; inside, it stays.
-    if (ev.button === 2) { if (!dl.sel.has(key)) selectDl(r); return; }
+    if (ev.button === 2) { if (!dl.sel.has(selKey(r))) selectDl(r); else renderDlBody(); return; }
     selectDl(r, { toggle: ev.ctrlKey, extend: ev.shiftKey });
   });
   body.addEventListener('contextmenu', (ev) => {
     const r = rowOfEl(ev.target.closest('.dl-row'));
     if (!r) return;
     ev.preventDefault();
-    if (!dl.sel.has(r.kind === 'msg' ? `d${r.id}` : r.key)) selectDl(r); // on a button or the priority
+    if (!dl.sel.has(selKey(r))) selectDl(r); // on a button or the priority
     const items = dlMenu();
     if (items.length) showMenu(ev.clientX, ev.clientY, items);
   });
@@ -2865,36 +3373,88 @@ function endDrag(drop) {
     if (!ev.target.matches('.dl-prio')) return;
     const r = rowOfEl(ev.target.closest('.dl-row'));
     if (r && r.kind === 'dl') send({ type: 'setPriority', id: r.id, priority: ev.target.value });
-    body.focus({ preventScroll: true }); // back to the table: its element may show another row later
+    dlFocus(); // back to the table: its element may show another row later
   });
-  body.addEventListener('keydown', (ev) => {
-    if (ev.target !== body) return; // a row's button or priority keeps its own keys
+
+  // The body scrolls but is no Tab stop of its own (tabindex -1: a scroller without one would be
+  // one); a click on its empty part or its scrollbar gives the focus to the table.
+  body.addEventListener('focus', dlFocus);
+  const grid = $('#queue');
+  // Tabbed to without a cursor: the selection's first row, or the first row in view. Drawn in the
+  // next frame: the focus can come from inside renderDlBody (a recycled row's button).
+  grid.addEventListener('focus', () => {
+    if (dl.index.has(dl.cursor) || !dl.rows.length) return;
+    const sel = selectedDl()[0];
+    const i = sel ? dl.index.get(sel.key) : Math.min(dl.rows.length - 1, Math.ceil(body.scrollTop / DL_ROW));
+    setDlCursor(dl.rows[i]);
+    scheduleDl();
+  });
+  // The keys (5.8): the cursor goes through the rows, Shift extends the selection, Ctrl moves the
+  // cursor alone, Ctrl+Space toggles its row; → and ← open and fold folders; Enter shows a
+  // finished download; Delete cancels or skips; Alt+↑/↓ moves a waiting download; Shift+F10 or
+  // the menu key opens the menu. Space is left free (Browse plays with it).
+  grid.addEventListener('keydown', (ev) => {
+    if (ev.target !== grid || modal) return; // a title's button keeps its own keys
+    if (!['Shift', 'Control', 'Alt', 'Meta'].includes(ev.key)) dl.keyAt = performance.now(); // holds a new order
+    const n = dl.rows.length;
+    const at = dl.index.get(dl.cursor);
+    const r = at === undefined ? null : dl.rows[at];
+    const page = Math.max(1, Math.floor(body.clientHeight / DL_ROW) - 1);
+    const move = { ArrowDown: 1, ArrowUp: -1, PageDown: page, PageUp: -page }[ev.key];
     if (ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowUp' || ev.key === 'ArrowDown')) {
       ev.preventDefault();
       ev.stopPropagation();
       const rows = selectedDl();
       const q = rows.length === 1 && rows[0].kind === 'dl' ? dl.byId.get(rows[0].id) : null;
-      if (q && waiting(q)) moveDownload(q.id, ev.key === 'ArrowUp' ? 'up' : 'down');
-    } else if (ev.key === 'Delete' && !ev.altKey && !ev.ctrlKey) {
+      if (!q || !waiting(q)) return;
+      if (dlSort.key) dlNote(`Moves follow the queue order: ${dlQueueOrderHint()}.`);
+      else moveDownload(q.id, ev.key === 'ArrowUp' ? 'up' : 'down');
+    } else if (ev.altKey || ev.metaKey) {
+      // not the table's
+    } else if (move !== undefined && n) {
+      ev.preventDefault();
+      moveDlCursor(at === undefined ? 0 : at + move, { extend: ev.shiftKey, keep: ev.ctrlKey && !ev.shiftKey });
+    } else if ((ev.key === 'Home' || ev.key === 'End') && n) {
+      ev.preventDefault();
+      moveDlCursor(ev.key === 'Home' ? 0 : n - 1, { extend: ev.shiftKey, keep: ev.ctrlKey && !ev.shiftKey });
+    } else if ((ev.key === 'ArrowRight' || ev.key === 'ArrowLeft') && !ev.ctrlKey && !ev.shiftKey) {
+      ev.preventDefault();
+      if (r) (ev.key === 'ArrowRight' ? dlRight : dlLeft)(r);
+    } else if (ev.key === ' ') {
+      ev.preventDefault(); // nothing scrolls
+      if (ev.ctrlKey && r) selectDl(r, { toggle: true });
+    } else if ((ev.key === 'a' || ev.key === 'A') && ev.ctrlKey && !ev.shiftKey) {
+      ev.preventDefault();
+      selectDlLevel();
+    } else if (ev.key === 'Enter' && !ev.ctrlKey && !ev.shiftKey) {
+      ev.preventDefault();
+      const q = r && r.kind === 'dl' ? dl.byId.get(r.id) : null;
+      if (q && (q.status === 'done' || q.status === 'skipped')) send({ type: 'openFolder', id: q.id });
+    } else if (ev.key === 'Delete' && !ev.ctrlKey) {
       ev.preventDefault();
       deleteSelection();
     } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
       ev.preventDefault();
+      if (!dl.sel.size && r) selectDl(r); // nothing selected: the cursor row
       const rows = selectedDl();
       if (!rows.length) return;
-      const i = dl.index.get(rows[0].key);
-      dlKeepInView(i);
+      // At the cursor row when it is selected, else at the first selected one.
+      const key = r && dl.sel.has(selKey(r)) ? r.key : rows[0].key;
+      dlKeepInView(dl.index.get(key));
       renderDlBody();
-      const r = dl.bound.get(rows[0].key).getBoundingClientRect();
-      showMenu(r.left + 40, r.bottom, dlMenu());
+      const box = dl.bound.get(key).getBoundingClientRect();
+      showMenu(box.left + 40, box.bottom, dlMenu());
     }
   });
+  // A new order waiting for the pointer to leave the table comes once it has (5.6).
+  grid.addEventListener('pointerenter', () => { dlSort.over = true; });
+  grid.addEventListener('pointerleave', () => { dlSort.over = false; dlRecheck(); });
 
   body.addEventListener('pointerdown', (ev) => {
     const grip = ev.target.closest('.dl-grip');
     const el = grip && grip.closest('.dl-row');
     const r = rowOfEl(el);
-    if (!r || r.kind !== 'dl' || ev.button !== 0 || dl.drag) return;
+    if (!r || r.kind !== 'dl' || ev.button !== 0 || dl.drag || dlSort.key) return;
     ev.preventDefault();
     closeMenu();
     grip.setPointerCapture(ev.pointerId);
@@ -2919,6 +3479,24 @@ function endDrag(drop) {
   body.addEventListener('lostpointercapture', (ev) => { if (dl.drag && ev.pointerId === dl.drag.pointerId) endDrag(false); });
 }
 
+// A short note in the Downloads head, in place of the summary for `ms` (also in a narrow head).
+// Not the footer's flash: Settings or a running activity can hide that while the table has the keys.
+let dlNoteTimer = 0;
+function dlNote(text, ms = 6000) {
+  const note = $('#dl-note');
+  clearTimeout(dlNoteTimer);
+  note.hidden = false;
+  note.textContent = text;
+  note.title = text;
+  $('#downloads').classList.add('noting');
+  dlNoteTimer = setTimeout(() => {
+    note.hidden = true;
+    note.textContent = '';
+    note.title = '';
+    $('#downloads').classList.remove('noting');
+  }, ms);
+}
+
 function renderQueue() {
   const panel = $('#downloads');
   // Hidden with an empty queue, the splitter too; back at the saved split.
@@ -2929,6 +3507,7 @@ function renderQueue() {
   dl.byId = new Map(state.queue.map((q) => [q.id, q]));
   dl.kids = new Map(state.queue.filter((q) => q.children).map((q) => [q.id, new Map(q.children.map((c) => [c.path, c]))]));
   for (const id of folderOpen.keys()) if (!dl.byId.has(id)) folderOpen.delete(id);
+  updateDlOrder();
   buildDlRows();
   if (!panel.hidden) {
     updateDlStep();
@@ -3232,8 +3811,8 @@ function onInit(msg) {
     if (typeof msg.split === 'number' && isFinite(msg.split)) {
       split.share = split.saved = Math.min(SPLIT.max, Math.max(SPLIT.min, msg.split));
     }
-    state.downloadsView = msg.downloads || null; // its sort and column widths, for the table
     applySplit();
+    applyDlView(msg.downloads); // its sort and column widths
   }
   // Sent again after every server change; folders typed here but not used yet win.
   state.destinations = { ...msg.destinations, ...state.destinations };
@@ -3746,8 +4325,10 @@ function submitForm() {
 // ---- modal -------------------------------------------------------------------------------
 
 let modal = null; // { onOk, onCancel }
+let modalReturn = null; // where the focus goes back to (the Downloads table after Delete's question)
 
 function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [] }) {
+  if (!$('#modal').contains(document.activeElement)) modalReturn = document.activeElement;
   modal = { onOk, onCancel };
   $('#modal-title').textContent = bidiVisible(title);
   $('#modal-body').innerHTML = html;
@@ -3766,6 +4347,7 @@ function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, o
       if (!modal) return;
       modal = null;
       $('#modal').hidden = true;
+      returnFromModal();
       x.act();
     });
     okBtn.before(b);
@@ -3779,7 +4361,16 @@ function closeModal(accepted) {
   const m = modal;
   modal = null;
   $('#modal').hidden = true;
+  returnFromModal();
   if (accepted) m.onOk && m.onOk(); else m.onCancel && m.onCancel();
+}
+
+// The focus back where it was before the dialog, as a menu does; first, so what the dialog's
+// choice does (another dialog, a field to fill) can take it.
+function returnFromModal() {
+  const el = modalReturn;
+  modalReturn = null;
+  if (el && el !== document.body && el.isConnected) el.focus({ preventScroll: true });
 }
 
 function onHostKeys(msg) {

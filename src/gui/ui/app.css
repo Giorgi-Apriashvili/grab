@@ -562,19 +562,21 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 /* the Downloads table (DOWNLOADS-UI.md 5) ------------------------------------------------- */
 /* One grid template for the header row and every row, from these widths; Name is the only column
    that stretches. app.js (DL_W) has the same numbers for the narrow steps (5.2), set on the panel
-   as data-step by its width: 1 hides ETA, 2 Speed too, 3 Priority too, 4 makes the rest compact. */
+   as data-step by its width: 1 hides ETA, 2 Speed too, 3 Priority too, 4 makes the rest compact.
+   A width dragged by hand comes as --u-<column> on the panel (app.js, gui.json downloads.widths);
+   compact columns keep their own. The bar takes the Progress column but its percent. */
 .downloads {
   --w-handle: 44px;
   --w-name: 160px;
-  --w-status: 180px;
-  --w-progress: 112px;
-  --w-size: 156px;
-  --w-speed: 84px;
-  --w-eta: 64px;
-  --w-prio: 84px;
+  --w-status: var(--u-status, 180px);
+  --w-progress: var(--u-progress, 112px);
+  --w-size: var(--u-size, 156px);
+  --w-speed: var(--u-speed, 84px);
+  --w-eta: var(--u-eta, 64px);
+  --w-prio: var(--u-priority, 84px);
   --w-actions: 132px;
   --w-slot: 60px;
-  --w-bar: 64px;
+  --w-bar: calc(var(--w-progress) - 48px);
   --dl-cols: var(--w-handle) minmax(var(--w-name), 1fr) var(--w-status) var(--w-progress) var(--w-size) var(--w-speed)
     var(--w-eta) var(--w-prio) var(--w-actions);
 }
@@ -596,6 +598,9 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .downloads[data-step="4"] .dl-count { display: none; }
 /* Below about 900 px the head's summary goes into the title's tooltip. */
 .downloads.narrow-head #dl-summary { display: none; }
+/* A note from the table's keys (app.js dlNote) shows in the summary's place, narrow head or not. */
+.dl-note { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; }
+.dl-note[hidden], .downloads.noting #dl-summary { display: none; }
 #pause-all { min-width: 90px; } /* "Pause all" and "Resume all" take the same room */
 
 .queue { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -606,6 +611,8 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   align-items: center;
   padding: 0 8px;
 }
+/* The table: one Tab stop, its focus on #queue (aria-activedescendant names the cursor row). */
+.queue { outline: none; }
 /* The header row keeps the body's scrollbar space too, so it stays over the columns. */
 .dl-head {
   flex: none;
@@ -617,8 +624,42 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   overflow: hidden;
   scrollbar-gutter: stable;
 }
-.dl-head > span { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
-.dl-head .num { text-align: right; }
+/* Not clipped (the rows' cells are): the resize line at the right edge reaches into the gap. */
+.dl-head > span { position: relative; display: flex; align-items: center; min-width: 0; height: 100%; overflow: visible; font-size: 12px; }
+/* Each title sorts (5.6): text, not a button's look; the arrow on the sorted one, before the word
+   in the right-aligned number columns so the word stays over the numbers. A dot by the arrow: a
+   new order waits for the pointer to leave the table. */
+.dl-head .sort {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+.dl-head .sort .lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dl-head .num .sort { justify-content: flex-end; }
+.dl-head .num .sort .arrow { order: -1; }
+.dl-head .sort:hover:not(:disabled) { background: none; color: var(--text); }
+.dl-head .sort[data-dir] { color: var(--text); font-weight: 600; }
+.dl-head .sort .arrow { flex: none; font-size: 11px; }
+.dl-head .sort .arrow:empty { display: none; }
+.dl-head .sort[data-pending] .arrow::after { content: "\2022"; margin-left: 1px; color: var(--accent); }
+.dl-head .sort:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+/* The line at a title's right edge resizes it (5.7), the next column giving or taking the room:
+   drag it, double-click for the defaults. It sits over the gap between the two columns. */
+.dl-resize { position: absolute; z-index: 2; top: 0; bottom: 0; right: -9px; width: 10px; cursor: col-resize; touch-action: none; }
+.dl-resize::after { content: ""; position: absolute; top: 6px; bottom: 6px; left: 4px; width: 1px; background: var(--line); }
+.dl-resize:hover::after, .dl-resize.dragging::after { top: 2px; bottom: 2px; background: var(--accent); }
+.dl-resize[hidden] { display: none; }
+html.dl-resizing, html.dl-resizing * { cursor: col-resize !important; }
 .dl-body { position: relative; flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; outline: none; scrollbar-gutter: stable; }
 #dl-spacer { width: 1px; }
 /* Pooled rows at absolute places (app.js translates them); each a fixed 28 px. */
@@ -635,7 +676,9 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .dl-row > span { min-width: 0; }
 .dl-row:hover { background: var(--hover); }
 .dl-row.sel { background: var(--sel); }
-.dl-body:focus-visible .dl-row.sel { box-shadow: inset 2px 0 0 var(--accent); }
+/* The keyboard's cursor row, as in Browse: a bar, and a frame while the table has the focus. */
+.dl-row.cursor { box-shadow: inset 2px 0 0 var(--accent); }
+.queue:focus .dl-row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
 .dl-row.dragging { opacity: 0.5; }
 .dl-drop { position: absolute; z-index: 3; top: -1px; left: 0; right: 0; height: 2px; background: var(--accent); pointer-events: none; }
 
@@ -644,6 +687,8 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .dl-grip { flex: none; width: 16px; color: var(--muted); font-size: 14px; line-height: 1; text-align: center; cursor: grab; touch-action: none; }
 .dl-grip:hover { color: var(--text); }
 .k-file .dl-grip { visibility: hidden; }
+/* Sorted by a column, the queue order isn't what shows: the grip is dimmed and doesn't drag. */
+.downloads.sorted .dl-grip, .downloads.sorted .dl-grip:hover { color: var(--muted); opacity: 0.35; cursor: default; }
 html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .dl-toggle {
   flex: none;
@@ -680,7 +725,7 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .dl-mark.warn { color: var(--warn); }
 
 .c-progress { display: flex; align-items: center; gap: 6px; }
-.dl-bar { flex: none; width: var(--w-bar); height: 4px; overflow: hidden; border-radius: 2px; background: var(--bar-bg); }
+.dl-bar { flex: 0 1 var(--w-bar); min-width: 16px; height: 4px; overflow: hidden; border-radius: 2px; background: var(--bar-bg); }
 .dl-bar > i { display: block; height: 100%; background: var(--bar); transform: scaleX(0); transform-origin: left; }
 .st-paused .dl-bar > i, .st-failed .dl-bar > i, .st-cancelled .dl-bar > i, .w-muted .dl-bar > i { background: var(--muted); }
 .st-done .dl-bar > i { background: var(--ok); }

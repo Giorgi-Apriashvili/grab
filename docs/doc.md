@@ -197,8 +197,8 @@ installed exe has no VC redistributable dependency.
 Explorer: pick a server, click through its folders or search them, select rows (click,
 Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the download queue with
 live progress. It reads the same grab.conf and remembers the last server, the destination per
-server, the rows' sort, the window's place and size and the splitter's place in
-`%APPDATA%\grab\gui.json`. Should that file ever be damaged, the window starts with the
+server, the rows' sort, the window's place and size, the splitter's place and the Downloads
+table's sort and column widths in `%APPDATA%\grab\gui.json`. Should that file ever be damaged, the window starts with the
 defaults, keeps the old file as `gui.json.bad-<date>-<time>` and says so; the command line,
 which follows Verify downloads and the speed schedule from it, says so too and goes on without
 them.
@@ -410,11 +410,12 @@ them.
     Save to stays), Open folder location (search results), Copy path (the server path) and Copy
     name. With several rows selected, they act on all of them.
   - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move up, Move down, Move to top
-    and Move to bottom (waiting downloads), Show in folder, Copy path (where it lands on this PC)
-    and Copy error (failed ones). A file inside a folder download has Pause, Resume, Skip, Copy
-    path and Copy error. With several selected, each entry acts on those it applies to.
+    and Move to bottom (waiting downloads, in the queue order), Show in folder, Copy path (where
+    it lands on this PC) and Copy error (failed ones). A file inside a folder download has Pause,
+    Resume, Skip, Copy path and Copy error. With several selected, each entry acts on those it
+    applies to.
   - Shift+F10 or the menu key opens the menu for the row under the cursor, or in Downloads for
-    the selected rows.
+    the selected rows (the cursor's row when none is selected).
 - **The Downloads table** has a row per download and fixed columns: Name (with where it goes),
   Status, Progress, Size, Speed, ETA, Priority and two buttons. Numbers keep one format ("85.7
   MiB / 8.0 GiB", "12.3 MiB/s", "5:12", a whole percent) and every column keeps its width, so
@@ -436,13 +437,46 @@ them.
     holds the whole text, and Copy error is in the download's menu.
   - Click a row to select it, Ctrl+click to add one, Shift+click for a range: downloads, or files
     of one folder. The right-click menu and Delete act on the selection: Delete cancels downloads
-    or skips files. The table is one Tab stop: a row's buttons and priority don't keep the
-    keyboard, so after a click Delete and Alt+↑ / Alt+↓ go on acting on the selection.
+    or skips files. The rows are one Tab stop: a row's buttons and priority don't keep the
+    keyboard, so after a click the keys below go on acting on the table.
+  - **Keys** (Tab to the table, or click a row): ↑ / ↓, Page Up / Page Down and Home / End move
+    the cursor (a bar on its row) and select that row; with Shift they select from the last row
+    picked to the cursor, keeping to downloads or to one folder's files; with Ctrl they move the
+    cursor alone, and Ctrl+Space adds or drops the cursor's row. Ctrl+A selects every download,
+    or every file of the cursor's folder. → opens a folder, or on an open one goes to its first
+    file; ← folds it, or from a file goes up to its folder. Enter shows a finished download in
+    its folder; Delete cancels or skips the selection; Alt+↑ / Alt+↓ move a waiting download;
+    Shift+F10 or the menu key opens the menu. Space does nothing here (in Browse it plays). Screen
+    readers get the table as a tree grid, the cursor's row as the active one.
   - **Cancel or Skip that would delete partly downloaded files asks first** when it acts on
     several rows from the menu, and always from Delete. A row's own button acts at once.
+  - **Sorting:** click a column title to sort the downloads by it: Name A→Z, Status with what
+    runs first (then queued, paused, failed, cancelled, skipped, done), Progress most done first,
+    Size largest first, Speed fastest first, ETA least time left first, Priority High first. The
+    second click reverses it; the third goes back to the queue order. Ties keep the queue order,
+    and rows with nothing in that column (no size yet, no speed while not downloading) go last
+    both ways. A folder's files stay under it, in their order. Tab reaches the titles too, and
+    Enter or Space clicks them.
+    - Rows never move under the mouse: when changing numbers (status, progress, speed, time
+      left, a priority) call for a new order, it comes at most once a second, and waits while
+      the pointer is over the table, a menu is open, a drag runs or a key was pressed in the
+      table in the last 2 seconds. A dot by the title's arrow
+      says one is waiting; it comes as soon as the pointer leaves. A download added or removed
+      takes its place at once, without moving the others.
+    - While sorted, the ≡ handles are dimmed and the moves wait: they follow the queue order.
+    - When a narrow window hides the sorted column, Name's title shows the sort ("Name · by
+      Speed ▾"); a click on it goes back to the queue order. Right-click the titles for Queue
+      order and Reset column widths (which also works in compact columns).
+  - **Column widths:** drag the line at a column title's right edge: that column follows the
+    mouse and the next one gives or takes the room, so nothing else moves (Name's line trades
+    with Status; Name takes whatever width the others leave). Each column keeps a least width
+    that still holds its longest value (Name 160 pixels). A double-click on the line gives both
+    columns their default widths.
+  - The sort and the widths are kept in gui.json (`"downloads": {"sort": ..., "widths": ...}`).
   - In a narrow window ETA hides first, then Speed, then Priority (still in the menu and the
     status's tooltip), then the rest goes compact: icon buttons, and sizes without "of" (it's in
-    the tooltip).
+    the tooltip). Compact columns keep their own widths; widened columns make the steps come
+    sooner.
 - **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4, is how many
   files download at the same time, all downloads together. Each file of a folder counts (each
   one of 2 MiB and more; smaller ones go beside them, see Folders): at 1
@@ -472,8 +506,9 @@ them.
 - **Queue order:** the list order is the order in which waiting downloads start ("Queued #1" is
   next). Drag a download by its ≡ handle (dropped among a folder's files, it goes after that
   folder), or right-click a waiting one for Move up, Move down, Move to top and Move to bottom;
-  Alt+↑ / Alt+↓ move the selected one. The order is kept across restarts. (The ↑ ↓ ⤒ buttons
-  on the rows, up to 0.21, gave way to these.)
+  Alt+↑ / Alt+↓ move the selected one. These work while the table shows the queue order (no
+  column sorted). The order is kept across restarts. (The ↑ ↓ ⤒ buttons on the rows, up to
+  0.21, gave way to these.)
 - **Bandwidth priority** (High / Normal / Low on each download) decides how running downloads
   share, weighted 4 : 2 : 1. Low always keeps moving, and unused share is lent to the others.
   - Downloads from the same server split its connections by weight. On a Storage Box, where

@@ -232,6 +232,31 @@ TEST_CASE("the Downloads table's sort and column widths are kept when valid") {
     CHECK(parse_gui_state(R"({"downloads":"wide"})").downloads == DownloadsView{});
 }
 
+TEST_CASE("the Downloads table's view as the page sends it in prefs, whole each time") {
+    const auto from = [](const char* text) {
+        const auto msg = json::parse(text);
+        REQUIRE(msg.has_value());
+        const auto* view = msg->find("downloads");
+        REQUIRE(view != nullptr);
+        return downloads_view_from_json(*view);
+    };
+    // A sort clicked and two widths dragged (a column's edge trades with the next one's).
+    const auto dragged = from(R"({"type":"prefs","downloads":{"sort":{"key":"status","dir":"asc"},)"
+                              R"("widths":{"status":210,"progress":82}}})");
+    CHECK(dragged.sort == SortOrder{"status", "asc"});
+    CHECK(dragged.widths == std::map<std::string, int>{{"progress", 82}, {"status", 210}});
+    // Back to the queue order and the default widths: both are dropped, and gui.json loses the key.
+    const auto reset = from(R"({"type":"prefs","downloads":{"sort":null,"widths":{}}})");
+    CHECK(reset == DownloadsView{});
+    GuiState s;
+    s.downloads = reset;
+    CHECK(gui_state_to_json(s).find("\"downloads\"") == std::string::npos);
+    // The page keeps each column's own least width (Status 120): smaller ones from a hand-edited
+    // file stay here, within min_column_px, for the page to raise.
+    CHECK(from(R"({"downloads":{"sort":null,"widths":{"status":30}}})").widths ==
+          std::map<std::string, int>{{"status", 30}});
+}
+
 TEST_CASE("queue order: move an item before another, or to the end") {
     std::vector<int> ids{1, 2, 3, 4};
     CHECK(move_before(ids, 4, 1)); // to the top
