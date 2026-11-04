@@ -122,6 +122,9 @@ struct Outcome {
 // error>", then what verification found of the files that came (`checked`, Checked::summary;
 // empty when none ran), since a failed row shows only this.
 [[nodiscard]] std::string failed_text(const Outcome& o, std::string_view checked = {});
+// The folders below it the walk couldn't read (Tree::unreadable), for the row's message: "1 folder
+// couldn't be read: a/b: permission denied", or the first of several and ", ..."; "" for none.
+[[nodiscard]] std::string unreadable_text(const std::vector<std::string>& unreadable);
 
 // Where a file of the folder goes (dir: the folder's local directory): its server name made
 // safe, or its Keep-both name.

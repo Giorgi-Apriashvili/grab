@@ -24,6 +24,13 @@ TEST_CASE("a big folder shows its active files and the first few queued") {
     CHECK(folder::visible({State::done, State::skipped}, 5).empty());
 }
 
+TEST_CASE("a folder's row says which folders below it couldn't be read") {
+    CHECK(folder::unreadable_text({}).empty());
+    CHECK(folder::unreadable_text({"a/b: permission denied"}) == "1 folder couldn't be read: a/b: permission denied");
+    CHECK(folder::unreadable_text({"a: permission denied", "b/c: no such file", "d: permission denied"}) ==
+          "3 folders couldn't be read: a: permission denied, ...");
+}
+
 TEST_CASE("a folder's files survive a restart in queue.json") {
     SavedDownload d{"hetzner", "folder", "/home/x/Limits", "Limits", "E:\\Learn", 597330609,
                     {{"a.mp4", 100, "2023-05-06T15:18:12+04:00", "done", true, true}, // fetched and verified

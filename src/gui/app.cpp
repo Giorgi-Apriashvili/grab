@@ -33,7 +33,9 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -74,6 +76,12 @@ Value num(double n) { return Value::make_number(n); }
 const char* status_name(int s) {
     constexpr const char* names[] = {"queued", "running", "paused", "done", "failed", "cancelled", "skipped"}; // Status order
     return names[s];
+}
+
+// A running download's phase for the page; nullptr for none (it is fetching).
+const char* phase_name(int p) {
+    constexpr std::array<const char*, 4> names = {nullptr, "listing", "checking", "verifying"}; // Phase order
+    return names[static_cast<std::size_t>(p)];
 }
 
 Mode mode_of(const Value& msg) { return msg.string_of("mode") == "folder" ? Mode::folder : Mode::file; }
@@ -2322,6 +2330,7 @@ void App::resolve_existing(int id, existing::Choice choice) {
             item->asked.clear();
             item->asked_count = 0;
             item->note.clear();
+            item->waiting.clear();
             item->status = Status::queued;
         }
     }
@@ -2359,6 +2368,7 @@ void App::resume_items(int id) {
             if ((id == 0 || item->id == id) && item->status == Status::paused && (id != 0 || item->asked.empty())) {
                 item->status = Status::queued;
                 item->note.clear();
+                item->waiting.clear();
                 folder::resume_paused(item->tree); // a folder's Resume covers its files paused one by one too
             }
         }
@@ -2421,6 +2431,8 @@ void App::requeue(Item& item) const {
     const bool cancelled = item.status == Status::cancelled;
     item.status = Status::queued;
     item.error.clear();
+    item.note.clear(); // the last run's, which a retried, then paused row showed again
+    item.waiting.clear();
     if (item.mode == Mode::folder) {
         folder::retry_files(item.tree, cancelled); // after a cancel, everything not finished
     } else if (!fetch::saved_progress(item_target(item), item.path, {}, rclone_remote_of(item.remote))) {
@@ -2695,6 +2707,9 @@ void App::worker_loop(std::stop_token stop) {
             item->stop = std::stop_source{};
             item->stop_reason = StopReason::none;
             item->error.clear();
+            item->check = verify::Mark::none;
+            // A folder is listed first (once), then checked again on every run before its files.
+            if (item->mode == Mode::folder) item->phase = item->tree.listed ? Phase::checking : Phase::listing;
         }
         save_queue();
         post_queue();
@@ -2751,6 +2766,7 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     item->eta.reset();
     item->connections = 0;
     item->current.clear();
+    item->phase = Phase::none;
     if (item->status == Status::cancelled && item->mode == Mode::file && !twin_of(*item)) {
         fetch::discard(item_target(*item), item->path, {}, rclone_remote_of(item->remote));
     }
@@ -2880,7 +2896,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         item->speed = 0;
         item->eta.reset();
         item->connections = 0;
-        item->note = "A different file of that name is already there. Resume to choose: replace it, keep both, or skip.";
+        item->waiting = "A different file of that name is already there. Resume to choose: replace it, keep both, or skip.";
         return;
     }
     if (result.outcome == fetch::Outcome::failed) return set(Status::failed, result.error, result.note);
@@ -2892,7 +2908,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
             check = verify_downloads_ && (!result.present || item->verify_pending);
             if (check) {
                 item->verify_pending = true;
-                item->verifying = true;
+                item->phase = Phase::verifying;
                 item->speed = 0;
                 item->eta.reset();
                 item->connections = 0;
@@ -2907,7 +2923,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                                           item_stop);
         {
             std::lock_guard lock(mutex_);
-            item->verifying = false;
+            item->phase = Phase::none;
             if (!item_stop.stop_requested()) item->verify_pending = false;
         }
         if (!item_stop.stop_requested()) {
@@ -2923,6 +2939,10 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                                                ? std::format("The downloaded copy {}, so it was deleted. Retry downloads it again.",
                                                              verify::summary(checked))
                                                : "The downloaded copy is gone. Retry downloads it again.");
+            }
+            {
+                std::lock_guard lock(mutex_);
+                item->check = verify::mark(checked);
             }
             return set(Status::done, {}, verify::summary(checked));
         }
@@ -3059,6 +3079,11 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     job.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
 
     if (auto listed = folder::list(job, item->tree, mutex_, item_stop); !listed) return fail(listed.error());
+    {
+        std::lock_guard lock(mutex_);
+        item->phase = Phase::checking;
+    }
+    post_queue();
     // Files already complete on disk (an earlier run, or downloaded before) are not fetched
     // again; big ones with a partial file continue from it.
     folder::mark_existing(job, item->tree, mutex_);
@@ -3084,7 +3109,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             item->asked = std::move(asked);
             item->asked_count = found.size();
             item->status = Status::paused;
-            item->note = std::format("{} already here differ{} from the server's. Resume to choose: replace, keep both, or skip.",
+            item->waiting = std::format("{} already here differ{} from the server's. Resume to choose: replace, keep both, or skip.",
                                      found.size() == 1 ? "1 file" : std::format("{} files", found.size()),
                                      found.size() == 1 ? "s" : "");
             return;
@@ -3114,9 +3139,13 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             folder_totals(*item);
             item->status = Status::paused;
             item->space_ok = true;
-            item->note = text + ". Free some space and Resume, or Resume to download anyway.";
+            item->waiting = text + ". Free some space and Resume, or Resume to download anyway.";
             return;
         }
+    }
+    {
+        std::lock_guard lock(mutex_);
+        item->phase = Phase::none; // fetching: the first file's start shows it
     }
     folder::run(job, item->tree, mutex_, item_stop);
 
@@ -3129,7 +3158,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             any = std::ranges::any_of(item->tree.files, [](const folder::File& f) {
                 return f.status == folder::State::done && f.fetched && !f.verified;
             });
-            item->verifying = any;
+            if (any) item->phase = Phase::verifying;
             item->verify_done = 0;
             item->verify_total = 0;
         }
@@ -3138,7 +3167,8 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             const auto checked = folder::verify_files(job, item->tree, mutex_, verify_request(*ctx, item, job.pool), item_stop);
             {
                 std::lock_guard lock(mutex_);
-                item->verifying = false;
+                item->phase = Phase::none;
+                if (checked.files > 0 && !item_stop.stop_requested()) item->check = verify::mark(checked.report);
             }
             if (checked.files > 0 && !item_stop.stop_requested()) checked_note = checked.summary();
         }
@@ -3159,12 +3189,8 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             item->status = o.waiting > 0 ? Status::paused : Status::done;
             if (!checked_note.empty()) item->note = checked_note;
         }
-        // Folders inside it the server wouldn't list: the rest came, and the row says what's missing.
-        if (const auto& u = item->tree.unreadable; !u.empty() && !item_stop.stop_requested()) {
-            const auto missing = std::format("{} couldn't be read: {}{}", u.size() == 1 ? "1 folder" : std::format("{} folders", u.size()),
-                                             u.front(), u.size() > 1 ? ", ..." : "");
-            item->note = item->note.empty() ? missing : item->note + ". " + missing;
-        }
+        // Folders inside it the server wouldn't list: the rest comes, and the row's message says
+        // what's missing (queue_snapshot, "unreadable").
     }
     if (cancelled) {
         std::lock_guard lock(mutex_);
@@ -3193,10 +3219,14 @@ json::Value App::queue_snapshot() const {
         v.set("current", str(i->current));
         v.set("error", str(i->error));
         v.set("note", str(i->note));
+        if (!i->waiting.empty()) v.set("waiting", str(i->waiting)); // why it waits paused: a message row
         v.set("connections", num(i->connections));
-        if (i->verifying) v.set("verifying", Value::make_bool(true));
-        // A folder's files checked so far: "Verifying the checksums… 12 of 40".
-        if (i->verifying && i->mode == Mode::folder && i->verify_total > 0) {
+        // Listing, checking or verifying, while running (DOWNLOADS-UI.md 5.3), and the ✓ or ⚠ after a check.
+        const char* phase = i->status == Status::running ? phase_name(static_cast<int>(i->phase)) : nullptr;
+        if (phase != nullptr) v.set("phase", str(phase));
+        if (i->check != verify::Mark::none) v.set("check", str(i->check == verify::Mark::ok ? "ok" : "warn"));
+        // A folder's files checked so far: "Verifying 12/40".
+        if (i->phase == Phase::verifying && i->mode == Mode::folder && i->verify_total > 0) {
             Value checked = Value::make_object();
             checked.set("done", num(static_cast<double>(i->verify_done)));
             checked.set("total", num(static_cast<double>(i->verify_total)));
@@ -3225,6 +3255,8 @@ json::Value App::queue_snapshot() const {
             files.set("failed", count(folder::State::failed));
             files.set("skipped", count(folder::State::skipped));
             v.set("files", std::move(files));
+            // Folders inside it the server wouldn't list, for a message row under it.
+            if (!i->tree.unreadable.empty()) v.set("unreadable", str(folder::unreadable_text(i->tree.unreadable)));
             constexpr std::size_t queued_shown = 20;
             Value children = Value::make_array();
             for (const auto k : folder::visible(states, queued_shown)) {

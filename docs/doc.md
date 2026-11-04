@@ -409,10 +409,40 @@ them.
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
     Save to stays), Open folder location (search results), Copy path (the server path) and Copy
     name. With several rows selected, they act on all of them.
-  - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move to top, Show in folder and
-    Copy path (where it lands on this PC). A file inside a folder download has Pause, Resume,
-    Skip and Copy path.
-  - Shift+F10 or the menu key opens the menu for the row under the cursor.
+  - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move up, Move down, Move to top
+    and Move to bottom (waiting downloads), Show in folder, Copy path (where it lands on this PC)
+    and Copy error (failed ones). A file inside a folder download has Pause, Resume, Skip, Copy
+    path and Copy error. With several selected, each entry acts on those it applies to.
+  - Shift+F10 or the menu key opens the menu for the row under the cursor, or in Downloads for
+    the selected rows.
+- **The Downloads table** has a row per download and fixed columns: Name (with where it goes),
+  Status, Progress, Size, Speed, ETA, Priority and two buttons. Numbers keep one format ("85.7
+  MiB / 8.0 GiB", "12.3 MiB/s", "5:12", a whole percent) and every column keeps its width, so
+  nothing on a row moves while it downloads.
+  - **Status** says what a row does: Queued #2 (its place among the waiting downloads), Listing (a
+    folder being walked), Checking (the files already there, the question about different ones
+    and the free space), Downloading, Verifying, Paused, Done, Failed, Cancelled or Skipped. A
+    folder adds its files done of all ("84/5965"). A ✓ marks a download verified against the
+    server's checksums, a ⚠ one that couldn't be. Hovering the status says the rest in words:
+    files done, skipped and failed, the speed, the time left, the connections, notes such as
+    "already there, nothing fetched" and the verify summary.
+  - A file of a folder has its own status, or its folder's, greyed: Paused while the folder is
+    paused, Stopped when the folder failed, Cancelled with the folder.
+  - **The two buttons** stay in the same places on every row: Pause or Resume (Retry, or Resume
+    from what came, after a failure; Show in folder once done) and Cancel; on a file of a folder,
+    Pause or Resume and Skip. One that doesn't apply leaves its place empty.
+  - **What needs you** gets a line of its own under the download: a failure's error, the question
+    about files already there, the free-space pause, folders the server wouldn't list. Its tooltip
+    holds the whole text, and Copy error is in the download's menu.
+  - Click a row to select it, Ctrl+click to add one, Shift+click for a range: downloads, or files
+    of one folder. The right-click menu and Delete act on the selection: Delete cancels downloads
+    or skips files. The table is one Tab stop: a row's buttons and priority don't keep the
+    keyboard, so after a click Delete and Alt+↑ / Alt+↓ go on acting on the selection.
+  - **Cancel or Skip that would delete partly downloaded files asks first** when it acts on
+    several rows from the menu, and always from Delete. A row's own button acts at once.
+  - In a narrow window ETA hides first, then Speed, then Priority (still in the menu and the
+    status's tooltip), then the rest goes compact: icon buttons, and sizes without "of" (it's in
+    the tooltip).
 - **Downloads** run several at a time: "At once" in the Downloads bar, 1–8, default 4, is how many
   files download at the same time, all downloads together. Each file of a folder counts (each
   one of 2 MiB and more; smaller ones go beside them, see Folders): at 1
@@ -439,9 +469,11 @@ them.
     copy, is not fetched again ("already there, nothing fetched").
   - When a stream runs out of work, it splits the busiest remaining range, so the end of a
     file doesn't trickle in over one connection.
-- **Queue order:** the list order is the order in which waiting downloads start. Drag a row
-  by its ≡ handle, or use ↑ / ↓ / ⤒ on waiting rows ("Queued · #1" is next). The order is kept
-  across restarts.
+- **Queue order:** the list order is the order in which waiting downloads start ("Queued #1" is
+  next). Drag a download by its ≡ handle (dropped among a folder's files, it goes after that
+  folder), or right-click a waiting one for Move up, Move down, Move to top and Move to bottom;
+  Alt+↑ / Alt+↓ move the selected one. The order is kept across restarts. (The ↑ ↓ ⤒ buttons
+  on the rows, up to 0.21, gave way to these.)
 - **Bandwidth priority** (High / Normal / Low on each download) decides how running downloads
   share, weighted 4 : 2 : 1. Low always keeps moving, and unused share is lent to the others.
   - Downloads from the same server split its connections by weight. On a Storage Box, where
@@ -459,8 +491,9 @@ them.
     really follows the limit.
 - **Verify downloads** (Settings → Downloads, off by default): after each download, the server
   computes an MD5 checksum of its copy (`md5sum`, run through grab's own SSH connection) while
-  grab computes yours, and the two are compared. The row shows "Verifying the checksum…" (a
-  folder: "Verifying the checksums… 12 of 40"), then "checksum verified (MD5)".
+  grab computes yours, and the two are compared. The row reads Verifying (a folder counts the
+  files checked: "12/40"), then Done with a ✓, its status's tooltip saying "checksum verified
+  (MD5)".
   - Both sides read the file once more, at the same time: about 2 seconds per GB in tests (an
     858 MiB file from a VPS took 1.8 s, a 15-file, 352 MiB folder 1.1 s; `rclone check` took 3.0
     and 4.1 s).
@@ -471,11 +504,11 @@ them.
     folder, only the files that differ are deleted and fetched again. grab deletes a copy only
     after one more look shows that neither side changed since the download: a file changed on
     the server since, or your copy changed since (a player writing its tags, say), is kept and
-    marked "not verified: the server's copy changed since the download" (or "your copy").
+    marked ⚠, "not verified: the server's copy changed since the download" (or "your copy").
   - grab logs in with its own client for it (the server's host key pinned; Trust… once for a
     server set up outside grab). A server it can't log in
     to, one without `md5sum` (Windows, an SFTP-only account), a name the server's shell can't be
-    given, or a server that takes too long leaves the download done and the copy kept, marked
+    given, or a server that takes too long leaves the download done and the copy kept, marked ⚠
     "not verified" and why. The server's Test says "checksums: md5sum", or why not.
   - Files that were already there are not checked, since nothing was downloaded.
   - The `grab` command follows the same setting (see [Usage](#usage)).
@@ -491,8 +524,10 @@ them.
   - The `grab` command follows the same schedule (see [Usage](#usage)). Each program caps its
     own downloads.
   - At each change, downloads keep their connections and just follow the new speed.
-- **Folders** are listed once and shown as a tree under their row, collapsible with ▸/▾.
-  - Finished files fold into a "N done" line, and a long queue shows its next 20 files.
+- **Folders** are listed once and their files shown as rows under the folder's row, folded or
+  opened with ▸/▾ (open while the folder runs, folded once it is done).
+  - Finished files show as one "N done" line, and a long queue as its next 20 files and "…N more
+    queued".
   - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
     files.
   - Files of 2 MiB and more take the resumable path above, as many at a time as At once allows,

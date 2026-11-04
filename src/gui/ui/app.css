@@ -16,6 +16,7 @@
   --bar-bg: #e4e8ef;
   --input: #ffffff;
   --folder: #d29b1f;
+  --warn: #b26a00;
   /* File-type icons */
   --f-video: #7c5ccf;
   --f-audio: #dd7a32;
@@ -48,6 +49,7 @@
     --bar-bg: #333841;
     --input: #1f2226;
     --folder: #e3b341;
+    --warn: #f0b429;
     --f-video: #a48cf0;
     --f-audio: #f0a060;
     --f-image: #4cc28a;
@@ -278,7 +280,7 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .results:focus #rows .row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
 .name, .dir, .modified { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* A right-to-left name keeps to its own box: it can't reorder what's around it (review G51). */
-.name, .dir, .q-name, .q-cname, #viewer-name { unicode-bidi: isolate; }
+.name, .dir, .dl-text, .dl-dest, .c-msg, #viewer-name { unicode-bidi: isolate; }
 .row .ico { width: 16px; height: 16px; margin-right: 7px; vertical-align: -3px; fill: var(--folder); }
 svg.ico.f-video { fill: var(--f-video); }
 svg.ico.f-audio { fill: var(--f-audio); }
@@ -291,10 +293,6 @@ svg.ico.f-disc { fill: var(--f-disc); }
 svg.ico.f-file { fill: var(--f-file); }
 svg.ico .fold { fill: var(--panel); opacity: .5; }
 svg.ico .mark { fill: var(--panel); }
-.q-ico, .q-cico { display: flex; flex: none; }
-.q-ico { margin-right: -4px; }
-.q-cico { margin-right: -2px; }
-.q-ico .ico, .q-cico .ico { width: 16px; height: 16px; fill: var(--folder); }
 .row .go { color: inherit; cursor: pointer; }
 .row .go:hover { color: var(--accent); text-decoration: underline; }
 
@@ -526,7 +524,6 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .stepper .label { margin-right: 2px; }
 .stepper button { width: 24px; padding: 0; font-size: 14px; line-height: 1; }
 .stepper #parallel { min-width: 14px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
-.st-paused .q-bar > div { background: var(--muted); }
 
 /* status bar: total speed and the speed limit */
 .bar.status { flex: none; padding: 4px 14px 8px; font-size: 12px; }
@@ -562,19 +559,94 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .switch input:focus-visible + .track { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
 .limited { color: var(--accent); }
 
-/* queue order and bandwidth priority */
-.q-handle { color: var(--muted); cursor: grab; padding: 0 2px; font-size: 14px; line-height: 1; user-select: none; flex: none; }
-.q-handle:hover { color: var(--text); }
-.q-item.dragging { opacity: 0.5; }
-.q-item.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
-.q-item.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
-.q-prio { height: 22px; padding: 0 4px; font-size: 11px; border-radius: 5px; flex: none; }
-.q-prio.prio-high { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); font-weight: 600; }
-.q-prio.prio-low { color: var(--muted); }
-.q-actions .q-move { width: 24px; padding: 0; }
+/* the Downloads table (DOWNLOADS-UI.md 5) ------------------------------------------------- */
+/* One grid template for the header row and every row, from these widths; Name is the only column
+   that stretches. app.js (DL_W) has the same numbers for the narrow steps (5.2), set on the panel
+   as data-step by its width: 1 hides ETA, 2 Speed too, 3 Priority too, 4 makes the rest compact. */
+.downloads {
+  --w-handle: 44px;
+  --w-name: 160px;
+  --w-status: 180px;
+  --w-progress: 112px;
+  --w-size: 156px;
+  --w-speed: 84px;
+  --w-eta: 64px;
+  --w-prio: 84px;
+  --w-actions: 132px;
+  --w-slot: 60px;
+  --w-bar: 64px;
+  --dl-cols: var(--w-handle) minmax(var(--w-name), 1fr) var(--w-status) var(--w-progress) var(--w-size) var(--w-speed)
+    var(--w-eta) var(--w-prio) var(--w-actions);
+}
+.downloads[data-step="1"] {
+  --dl-cols: var(--w-handle) minmax(var(--w-name), 1fr) var(--w-status) var(--w-progress) var(--w-size) var(--w-speed)
+    var(--w-prio) var(--w-actions);
+}
+.downloads[data-step="2"] {
+  --dl-cols: var(--w-handle) minmax(var(--w-name), 1fr) var(--w-status) var(--w-progress) var(--w-size) var(--w-prio)
+    var(--w-actions);
+}
+.downloads[data-step="3"], .downloads[data-step="4"] {
+  --dl-cols: var(--w-handle) minmax(var(--w-name), 1fr) var(--w-status) var(--w-progress) var(--w-size) var(--w-actions);
+}
+.downloads[data-step="4"] { --w-status: 120px; --w-progress: 76px; --w-size: 84px; --w-actions: 64px; --w-slot: 30px; --w-bar: 32px; }
+.downloads:is([data-step="1"], [data-step="2"], [data-step="3"], [data-step="4"]) .c-eta,
+.downloads:is([data-step="2"], [data-step="3"], [data-step="4"]) .c-speed,
+.downloads:is([data-step="3"], [data-step="4"]) .c-prio,
+.downloads[data-step="4"] .dl-count { display: none; }
+/* Below about 900 px the head's summary goes into the title's tooltip. */
+.downloads.narrow-head #dl-summary { display: none; }
+#pause-all { min-width: 90px; } /* "Pause all" and "Resume all" take the same room */
 
-/* a folder's files, as a tree under its row */
-.q-toggle {
+.queue { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.dl-grid {
+  display: grid;
+  grid-template-columns: var(--dl-cols);
+  column-gap: 8px;
+  align-items: center;
+  padding: 0 8px;
+}
+/* The header row keeps the body's scrollbar space too, so it stays over the columns. */
+.dl-head {
+  flex: none;
+  height: 26px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  scrollbar-gutter: stable;
+}
+.dl-head > span { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.dl-head .num { text-align: right; }
+.dl-body { position: relative; flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; outline: none; scrollbar-gutter: stable; }
+#dl-spacer { width: 1px; }
+/* Pooled rows at absolute places (app.js translates them); each a fixed 28 px. */
+.dl-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  contain: strict;
+  font-size: 12px;
+  cursor: default;
+}
+.dl-row > span { min-width: 0; }
+.dl-row:hover { background: var(--hover); }
+.dl-row.sel { background: var(--sel); }
+.dl-body:focus-visible .dl-row.sel { box-shadow: inset 2px 0 0 var(--accent); }
+.dl-row.dragging { opacity: 0.5; }
+.dl-drop { position: absolute; z-index: 3; top: -1px; left: 0; right: 0; height: 2px; background: var(--accent); pointer-events: none; }
+
+/* ≡ to drag a download, ▸/▾ to fold a folder's files */
+.c-handle { display: flex; align-items: center; gap: 4px; }
+.dl-grip { flex: none; width: 16px; color: var(--muted); font-size: 14px; line-height: 1; text-align: center; cursor: grab; touch-action: none; }
+.dl-grip:hover { color: var(--text); }
+.k-file .dl-grip { visibility: hidden; }
+html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
+.dl-toggle {
+  flex: none;
   width: 22px;
   height: 22px;
   padding: 0;
@@ -584,37 +656,65 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   color: var(--text);
   font-size: 12px;
   line-height: 1;
-  flex: none;
 }
-.q-toggle:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.q-tree { margin-top: 6px; font-size: 12px; }
-.q-child { display: flex; align-items: center; gap: 8px; min-height: 24px; padding-left: 4px; }
-.q-branch { color: var(--muted); font-family: "Cascadia Mono", Consolas, monospace; white-space: pre; }
-.q-cname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
-.q-summary .q-cname { color: var(--muted); }
-.q-cbar { width: 70px; height: 3px; background: var(--bar-bg); border-radius: 2px; overflow: hidden; flex: none; }
-.q-cbar > span { display: block; height: 100%; width: 0; background: var(--bar); transition: width 0.25s linear; }
-.cst-paused .q-cbar > span { background: var(--muted); }
-.q-cmeta { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
-.cst-failed .q-cmeta { color: var(--danger); }
-.q-cactions { display: flex; gap: 4px; }
-.q-cactions button { height: 20px; padding: 0 7px; font-size: 11px; }
-.q-note { color: var(--muted); }
-.queue { flex: 1; min-height: 0; overflow-y: auto; }
-.q-item { padding: 7px 12px 8px; border-bottom: 1px solid var(--line); }
-.q-item:last-child { border-bottom: 0; }
-.q-top { display: flex; align-items: center; gap: 10px; }
-.q-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.q-meta { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.q-actions { display: flex; gap: 4px; }
-.q-actions button { height: 24px; padding: 0 8px; font-size: 12px; }
-.q-bar { height: 4px; margin-top: 6px; background: var(--bar-bg); border-radius: 2px; overflow: hidden; }
-.q-bar > div { height: 100%; width: 0; background: var(--bar); transition: width 0.25s linear; }
-.q-sub { margin-top: 4px; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
-.st-done .q-bar > div { background: var(--ok); }
-.st-failed .q-bar > div, .st-cancelled .q-bar > div { background: var(--muted); }
-.st-failed .q-sub { color: var(--danger); white-space: normal; }
-.st-queued .q-bar > div { width: 0 !important; }
+.dl-toggle:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+
+.c-name { display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; font-size: 13px; }
+.k-file .c-name { padding-left: 20px; font-size: 12px; }
+.dl-ico { display: flex; flex: none; }
+.dl-ico .ico { width: 16px; height: 16px; fill: var(--folder); }
+.dl-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* The destination takes only the space the name leaves (a base of 0 never takes a fraction of a
+   pixel from the name, which showed a short name's ellipsis). */
+.dl-dest { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+
+/* Status: the word, a folder's done/total files and a marker (✓ verified, ⚠ not), each in its own
+   fixed place. */
+.c-status { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.dl-word { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dl-word.muted { color: var(--muted); }
+.dl-word.bad { color: var(--danger); }
+.dl-count { flex: none; width: 74px; overflow: hidden; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dl-mark { flex: none; width: 16px; text-align: center; }
+.dl-mark.ok { color: var(--ok); }
+.dl-mark.warn { color: var(--warn); }
+
+.c-progress { display: flex; align-items: center; gap: 6px; }
+.dl-bar { flex: none; width: var(--w-bar); height: 4px; overflow: hidden; border-radius: 2px; background: var(--bar-bg); }
+.dl-bar > i { display: block; height: 100%; background: var(--bar); transform: scaleX(0); transform-origin: left; }
+.st-paused .dl-bar > i, .st-failed .dl-bar > i, .st-cancelled .dl-bar > i, .w-muted .dl-bar > i { background: var(--muted); }
+.st-done .dl-bar > i { background: var(--ok); }
+.st-uploading .dl-bar > i { background: var(--bar); } /* reserved: nothing uploads yet */
+.dl-pct { flex: none; width: 36px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.c-size, .c-speed, .c-eta {
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dl-prio { width: 100%; height: 22px; padding: 0 4px; font-size: 11px; border-radius: 5px; }
+.dl-prio.prio-high { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); font-weight: 600; }
+.dl-prio.prio-low { color: var(--muted); }
+
+/* Two action slots in the same places on every row; an empty one keeps its room. Compact columns
+   show the icons, with the word as the tooltip. */
+.c-actions { display: flex; gap: 4px; }
+.dl-slot { flex: none; width: var(--w-slot); height: 22px; }
+.dl-slot > button { display: flex; align-items: center; justify-content: center; width: 100%; height: 22px; padding: 0 4px; font-size: 12px; }
+.dl-slot svg { display: none; flex: none; width: 13px; height: 13px; }
+.downloads[data-step="4"] .dl-slot svg { display: block; }
+.downloads[data-step="4"] .dl-slot span { display: none; }
+
+/* Message rows: one line under their download, in full in the tooltip. */
+.k-msg > span:not(.c-msg), .k-dl > .c-msg, .k-file > .c-msg { display: none; }
+.c-msg { grid-column: 2 / -1; overflow: hidden; padding-left: 22px; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.m-sub .c-msg { padding-left: 42px; }
+.m-note .c-msg { color: var(--text); }
+.m-error .c-msg { color: var(--danger); }
+.m-warn .c-msg { color: var(--warn); }
 
 /* file lists ------------------------------------------------------------------------------ */
 .list-status { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -702,8 +802,7 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .server-status { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; }
 .good { color: var(--ok); }
 .bad { color: var(--danger); }
-.warn { color: #b26a00; }
-@media (prefers-color-scheme: dark) { .warn { color: #f0b429; } }
+.warn { color: var(--warn); }
 .server-status .detail { color: var(--muted); user-select: text; }
 .settings-empty { padding: 40px 20px; text-align: center; color: var(--muted); }
 .settings-empty button { margin-top: 12px; }

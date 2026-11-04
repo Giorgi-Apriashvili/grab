@@ -90,6 +90,11 @@ struct Report {
 // verified (MD5)", or why not ("not verified: the server can't compute checksums (...)").
 [[nodiscard]] std::string summary(const Report& r, bool folder = false);
 
+// The queue row's marker beside its status (DOWNLOADS-UI.md 5.3): ok (✓) when every file checked
+// matches, warn (⚠) when any could not be checked, differs or is gone, none when nothing was checked.
+enum class Mark { none, ok, warn };
+[[nodiscard]] Mark mark(const Report& r);
+
 // The copy's look after a differing sum (exposed for tests): whether its size and time are what
 // the download left (`size`, and `modtime` within 2 s, as FAT keeps times).
 [[nodiscard]] bool copy_unchanged(const std::filesystem::path& local, std::uint64_t size, std::string_view modtime);

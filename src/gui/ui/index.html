@@ -276,7 +276,7 @@
 <section id="downloads" class="downloads" hidden>
   <div class="downloads-head">
     <span class="title">Downloads</span>
-    <span id="dl-summary" class="muted"></span>
+    <span id="dl-summary" class="muted" aria-live="polite"></span>
     <span class="spacer"></span>
     <span class="stepper" title="How many files download at the same time (1–8); each file of a folder counts">
       <span class="label">At once</span>
@@ -288,7 +288,25 @@
     <button id="cancel-all" type="button" class="subtle">Cancel all</button>
     <button id="clear-finished" type="button" class="subtle">Clear finished</button>
   </div>
-  <div id="queue" class="queue"></div>
+  <!-- The table (DOWNLOADS-UI.md 5): a header row over a body that holds only the rows in view
+       (app.js). Right-click a row for its menu; drag a download by its ≡ to change the order. -->
+  <div id="queue" class="queue">
+    <div class="dl-head dl-grid" role="row">
+      <span class="c-handle"></span>
+      <span class="c-name" role="columnheader">Name</span>
+      <span class="c-status" role="columnheader">Status</span>
+      <span class="c-progress" role="columnheader">Progress</span>
+      <span class="c-size num" role="columnheader">Size</span>
+      <span class="c-speed num" role="columnheader">Speed</span>
+      <span class="c-eta num" role="columnheader">ETA</span>
+      <span class="c-prio" role="columnheader">Priority</span>
+      <span class="c-actions"></span>
+    </div>
+    <div id="dl-body" class="dl-body" tabindex="0" aria-label="Downloads">
+      <div id="dl-spacer"></div>
+      <div id="dl-drop" class="dl-drop" hidden></div>
+    </div>
+  </div>
 </section>
 
 <footer class="bar status">

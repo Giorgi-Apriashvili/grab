@@ -625,6 +625,13 @@ std::string failed_text(const Outcome& o, std::string_view checked) {
     return text;
 }
 
+std::string unreadable_text(const std::vector<std::string>& unreadable) {
+    if (unreadable.empty()) return {};
+    const std::size_t n = unreadable.size();
+    return std::format("{} couldn't be read: {}{}", n == 1 ? "1 folder" : std::format("{} folders", n),
+                       unreadable.front(), n > 1 ? ", ..." : "");
+}
+
 fs::path target_of(const fs::path& dir, const File& f) {
     return dir / (f.local.empty() ? local::relative(f.path) : f.local);
 }

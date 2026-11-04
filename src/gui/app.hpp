@@ -17,6 +17,7 @@
 #include "ssh_pool.hpp"
 #include "ssh_read.hpp"
 #include "update.hpp"
+#include "verify.hpp"
 #include "webview.hpp"
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
@@ -211,6 +212,10 @@ private:
         bool moved = false; // an edit to another user, host or port
     };
     enum class Status { queued, running, paused, done, failed, cancelled, skipped };
+    // What a running download does besides fetching, for its Status (DOWNLOADS-UI.md 5.3): a
+    // folder is listed, then checked (files already here, the question about different ones, the
+    // free space); a finished download is checked against the server's checksums.
+    enum class Phase { none, listing, checking, verifying };
     // Why a running download is being stopped.
     enum class StopReason { none, pause, cancel };
     // A file already there that a download would replace, for the question.
@@ -237,6 +242,9 @@ private:
         std::string current;
         std::string error;
         std::string note;
+        // Why it waits paused for the user (the question about files already there, or the free
+        // space): its own message row. The note is plain information for the Status tooltip.
+        std::string waiting;
         std::stop_source stop;
         StopReason stop_reason = StopReason::none;
         // Bandwidth priority as a weight: high 4, normal 2, low 1. Atomic: running streams
@@ -245,13 +253,16 @@ private:
         // Running or queued when an update decided to restart grab-gui: saved to continue by
         // itself afterwards (it may be paused by the shutdown before the last save).
         bool resume_mark = false;
-        // Being checked against the server's checksum; a file whose check was stopped (paused)
-        // is checked when it resumes, although it is complete on disk.
-        bool verifying = false;
+        // While running: listing or checking (folders), or verifying, which is checking against
+        // the server's checksum; a file whose check was stopped (paused) is checked when it
+        // resumes, although it is complete on disk.
+        Phase phase = Phase::none;
         bool verify_pending = false;
         // A folder being checked: its files with their result so far, of how many.
         std::size_t verify_done = 0;
         std::size_t verify_total = 0;
+        // What the last check found, for the row's ✓ or ⚠ (verify::mark).
+        verify::Mark check = verify::Mark::none;
         // The free-space check is done: "Download anyway" was chosen, or Resume after the check
         // paused it (a folder too big for the drive once listed).
         bool space_ok = false;

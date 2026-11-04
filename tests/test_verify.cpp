@@ -458,6 +458,22 @@ TEST_CASE("verify: what the row and the command say") {
     CHECK(verify::summary(none) == "not verified: the server can't compute checksums (shell_type = cmd in grab.conf)");
 }
 
+TEST_CASE("verify: the row's marker: a check mark only when every file matched") {
+    using R = verify::Result;
+    CHECK(verify::mark(verify::Report{}) == verify::Mark::none); // nothing checked
+    verify::Report r;
+    r.files.assign(3, R{Verdict::same, {}});
+    CHECK(verify::mark(r) == verify::Mark::ok);
+    r.files[1] = R{Verdict::unchecked, "the server's copy changed since the download"};
+    CHECK(verify::mark(r) == verify::Mark::warn);
+    r.files[1] = R{Verdict::differs, {}};
+    CHECK(verify::mark(r) == verify::Mark::warn);
+    r.files[1] = R{Verdict::missing, {}};
+    CHECK(verify::mark(r) == verify::Mark::warn);
+    r.files.assign(1, R{Verdict::unchecked, "the server took too long"});
+    CHECK(verify::mark(r) == verify::Mark::warn); // "not verified: ..."
+}
+
 TEST_CASE("verify: a folder whose files failed still says what was verified: the row after the failure, the command before") {
     Check c("failed-folder");
     folder::Job job;

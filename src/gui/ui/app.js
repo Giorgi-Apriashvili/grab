@@ -2038,56 +2038,6 @@ function localPath(q, child) {
   return `${base}\\${c && c.local ? c.local : child.replace(/\//g, '\\')}`;
 }
 
-// A download: pause, resume or retry, cancel, priority, move to the top, show it, copy its path.
-function queueMenu(q) {
-  const items = [];
-  const active = ['queued', 'running', 'paused'].includes(q.status);
-  if (q.status === 'queued' || q.status === 'running') items.push({ label: 'Pause', act: () => send({ type: 'pauseItem', id: q.id }) });
-  if (q.status === 'paused') items.push({ label: 'Resume', act: () => resumeItem(q) });
-  if (q.status === 'failed' || q.status === 'cancelled') {
-    items.push({ label: q.status === 'failed' && q.bytes > 0 ? 'Resume' : 'Retry', act: () => send({ type: 'retryItem', id: q.id }) });
-  }
-  if (active || q.status === 'failed') items.push({ label: 'Cancel', act: () => send({ type: 'cancelItem', id: q.id }) });
-  if (active || q.status === 'failed') {
-    items.push('-', { heading: 'Priority' });
-    for (const [p, label] of [['high', 'High'], ['normal', 'Normal'], ['low', 'Low']]) {
-      items.push({ label, checked: q.priority === p, act: () => send({ type: 'setPriority', id: q.id, priority: p }) });
-    }
-  }
-  if (q.status === 'queued' || q.status === 'paused') {
-    const first = state.queue[0] && state.queue[0].id === q.id;
-    items.push('-', { label: 'Move to top', disabled: first, act: () => send({ type: 'moveItem', id: q.id, before: state.queue[0].id }) });
-  }
-  items.push('-');
-  items.push({ label: 'Show in folder', act: () => send({ type: 'openFolder', id: q.id }) });
-  items.push({ label: 'Copy path', act: () => copyText([localPath(q)]) });
-  return items;
-}
-
-// A file of a folder download: its own pause, resume and skip, and its path.
-function childMenu(q, path) {
-  const c = (q.children || []).find((x) => x.path === path);
-  const items = [];
-  if (c) {
-    const act = (type) => () => send({ type, id: q.id, path });
-    if (c.status === 'paused') items.push({ label: 'Resume', act: act('resumeChild') });
-    else if (c.status !== 'failed') items.push({ label: 'Pause', act: act('pauseChild') });
-    items.push({ label: 'Skip', act: act('skipChild') }, '-');
-  }
-  items.push({ label: 'Copy path', act: () => copyText([localPath(q, path)]) });
-  return items;
-}
-
-$('#queue').addEventListener('contextmenu', (ev) => {
-  const el = ev.target.closest('.q-item');
-  if (!el) return;
-  const q = state.queue.find((x) => x.id === Number(el.dataset.id));
-  if (!q) return;
-  ev.preventDefault();
-  const child = ev.target.closest('.q-child[data-path]');
-  showMenu(ev.clientX, ev.clientY, child ? childMenu(q, child.dataset.path) : queueMenu(q));
-});
-
 // ---- downloads ---------------------------------------------------------------------------
 
 // To the Save-to folder, or with `to` (Download to...) to that folder this once.
@@ -2192,101 +2142,781 @@ function resumeItem(q) {
   else send({ type: 'resumeItem', id: q.id });
 }
 
-const queueEls = new Map(); // id -> element; updated in place so buttons don't flicker
+// ---- the Downloads table (DOWNLOADS-UI.md 5): a header row over a virtual body ---------------
+//
+// A row per download, its message rows under it (5.5) and, under an open folder, its files: the
+// backend sends a folder's running, paused and failed files and its next 20 queued ones, with
+// "84 done" and "…N more queued" as message rows (until every file is listed, DOWNLOADS-UI.md
+// chunk C). Every row is 28 px. Only the rows in view, and 10 more each side, have an element,
+// from a pool reused as the list scrolls. Columns have fixed widths and numbers fixed formats, and
+// a cell is written only when its value changes: nothing moves while downloading, and a button
+// under the mouse stays the same button.
+
+const DL_POOL = 150; // row elements at most
+const DL_OVER = 10;  // rows drawn beyond the view on each side
+// The columns in CSS px, as app.css's .downloads --w-* (keep in sync), with .dl-grid's gap and its
+// padding each side. Narrow panels hide ETA, then Speed, then Priority, then go compact (5.2):
+// steps 0-3 by the body's width alone, never the data, so the layout can't flicker as values
+// change. Compact columns need 604 px, which the smallest window's panel has.
+const DL_W = { handle: 44, name: 160, status: 180, progress: 112, size: 156, speed: 84, eta: 64, priority: 84, actions: 132 };
+const DL_GAP = 8;
+const DL_PAD = 8;
+const DL_HIDES = [[], ['eta'], ['eta', 'speed'], ['eta', 'speed', 'priority']];
+const DL_NEED = DL_HIDES.map((hide) => {
+  const shown = Object.entries(DL_W).filter(([k]) => !hide.includes(k)).map(([, px]) => px);
+  return 2 * DL_PAD + shown.reduce((a, b) => a + b, 0) + DL_GAP * (shown.length - 1);
+});
+const DL_COMPACT = DL_HIDES.length; // the last step
+const DL_HEAD_NARROW = 900;         // px of panel: the head's summary moves into the title's tooltip
+
+// The status words (5.3). 'Uploading' is reserved: the backend never sends it yet.
+const DL_WORD = { queued: 'Queued', running: 'Downloading', paused: 'Paused', done: 'Done', failed: 'Failed',
+  cancelled: 'Cancelled', skipped: 'Skipped', uploading: 'Uploading' };
+const PHASE_WORD = { listing: 'Listing', checking: 'Checking', verifying: 'Verifying' };
+const PHASE_TIP = { listing: 'Listing the folder on the server', verifying: 'Verifying against the server’s checksums',
+  checking: 'Checking the files already here and the free space' };
+const PRIORITIES = [['high', 'High'], ['normal', 'Normal'], ['low', 'Low']];
+const prioLabel = (p) => (PRIORITIES.find(([k]) => k === p) || PRIORITIES[1])[1];
+const UNFINISHED = ['queued', 'running', 'paused', 'failed']; // what Cancel, the priority and the moves apply to
+const startedBytes = (q) => UNFINISHED.includes(q.status) && q.bytes > 0;
+
+// The action slots' icons, shown instead of the words in compact columns.
+const slotSvg = (body, stroke) => `<svg viewBox="0 0 16 16" aria-hidden="true"${stroke
+  ? ' fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"'
+  : ' fill="currentColor"'}>${body}</svg>`;
+const SLOT_ICONS = {
+  pause: slotSvg('<path d="M4.5 3h2.5v10H4.5zM9 3h2.5v10H9z"/>'),
+  resume: slotSvg('<path d="M5 2.8v10.4L13 8z"/>'),
+  retry: slotSvg('<path d="M12.8 8.6a4.8 4.8 0 1 1-1.4-4"/><path d="M12 1.8v3h-3"/>', true),
+  cancel: slotSvg('<path d="M4 4l8 8M12 4l-8 8"/>', true),
+  show: slotSvg('<path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.4H13c.7 0 1.2.5 1.2 1.2v6.2c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z"/>', true),
+  skip: slotSvg('<path d="M3 3v10l7-5z"/><path d="M11 3h2v10h-2z"/>'),
+};
+
+// The fixed formats (5.1): sizes with 1 decimal, a whole percent rounded down (99.6 shows 99%),
+// a speed, and a time left as a clock.
+function fmtSizePair(done, total) { return `${fmtSize(done)} / ${fmtSize(total)}`; }
+// A file count that fits the Status cell's fixed 74 px: from 100,000 in thousands, rounded down so
+// the done side never reaches the total early. The tooltip has the exact numbers.
+function fmtCount(n) { return n < 100000 ? String(n) : `${Math.floor(n / 1000)}k`; }
+function fmtPct(done, total) { return `${Math.min(100, Math.floor((100 * done) / total))}%`; }
+function fmtSpeed(bytesPerSec) { return `${fmtSize(Math.round(bytesPerSec))}/s`; }
+function fmtClock(sec) {
+  if (sec == null || !isFinite(sec) || sec < 0) return '';
+  sec = Math.round(sec);
+  if (sec >= 100 * 3600) return '>99 h';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor(sec / 60) % 60;
+  return h ? `${h}:${pad2(m)}:${pad2(sec % 60)}` : `${m}:${pad2(sec % 60)}`;
+}
+
+// The rows (rebuilt only when their structure changes), the elements showing them, the narrow
+// step, the selection (row keys: downloads, or files of one folder) and a drag by the ≡ handle.
+const dl = {
+  rows: [],              // { kind: 'dl' | 'file' | 'msg', key, id, path, what, sub, scope }
+  index: new Map(),      // row key -> its index in rows
+  shape: '',             // the rows' keys: a new one means the structure changed
+  byId: new Map(),       // download id -> its item in state.queue
+  kids: new Map(),       // folder id -> its files sent, by path
+  pool: [],              // every row element made
+  bound: new Map(),      // row key -> the element showing it
+  step: 0,
+  frame: 0,
+  sel: new Set(),
+  anchor: '',
+  drag: null,
+  follow: null,          // a download moved from the menu or the keys: { id, order } until it moved
+};
 const folderOpen = new Map(); // folder id -> expanded, once the user toggled it
 
-// A folder download's files under its row:
-//   |--- 28 done · 2 skipped
-//   |--- Lecture 13.mp4   40% ...   [Pause][Skip]
-//   |--- …8 more queued
 // Open while the folder is active, folded when it is finished, unless the user toggled it.
-function renderTree(el, q) {
-  const toggle = el.querySelector('.q-toggle');
-  const tree = el.querySelector('.q-tree');
-  if (!q.files) {
-    toggle.hidden = true;
-    tree.hidden = true;
-    return;
+function folderIsOpen(q) {
+  return folderOpen.has(q.id) ? folderOpen.get(q.id) : !['done', 'cancelled'].includes(q.status);
+}
+
+// The message rows under a download (5.5): what needs the user, ellipsized, in full in the
+// tooltip. Plain information (already there, the verify summary) goes in the Status tooltip.
+function dlMessages(q) {
+  const out = [];
+  if (q.status === 'failed' && q.error) out.push('error');
+  // Why it waits paused: the question about different files already there, or the free space.
+  if (q.status === 'paused' && q.waiting) out.push('note');
+  if (q.unreadable) out.push('unreadable');
+  return out;
+}
+
+function dlRowsOf() {
+  const rows = [];
+  for (const q of state.queue) {
+    rows.push({ kind: 'dl', key: `d${q.id}`, id: q.id, scope: 'd' });
+    for (const what of dlMessages(q)) rows.push({ kind: 'msg', key: `m${q.id}:${what}`, id: q.id, what });
+    if (!q.files || !folderIsOpen(q)) continue;
+    if (q.files.done || q.files.skipped) rows.push({ kind: 'msg', key: `m${q.id}:done`, id: q.id, what: 'done', sub: true });
+    for (const c of q.children || []) {
+      rows.push({ kind: 'file', key: `f${q.id}/${c.path}`, id: q.id, path: c.path, scope: `f${q.id}` });
+    }
+    if (q.moreQueued) rows.push({ kind: 'msg', key: `m${q.id}:more`, id: q.id, what: 'more', sub: true });
   }
-  const open = folderOpen.has(q.id) ? folderOpen.get(q.id) : !['done', 'cancelled'].includes(q.status);
-  toggle.hidden = false;
-  toggle.textContent = open ? '▾' : '▸';
-  toggle.title = open ? 'Hide files' : 'Show files';
-  tree.hidden = !open;
-  if (!open) return;
+  return rows;
+}
 
-  const finished = [];
-  if (q.files.done) finished.push(`${q.files.done} done`);
-  if (q.files.skipped) finished.push(`${q.files.skipped} skipped`);
-  const rows = new Map([...tree.querySelectorAll('.q-child')].map((r) => [r.dataset.key, r]));
-  const wanted = [];
-  if (finished.length) wanted.push({ key: ':done', text: finished.join(' · ') });
-  for (const c of q.children) wanted.push({ key: c.path, child: c });
-  if (q.moreQueued) wanted.push({ key: ':more', text: `…${q.moreQueued} more queued` });
+// The rows again, when their structure changed: a download added, removed or moved, a folder
+// opened or folded, a file or message row coming or going. Byte ticks leave them as they are.
+function buildDlRows() {
+  const rows = dlRowsOf();
+  const shape = rows.map((r) => r.key).join('\0');
+  if (shape === dl.shape) return;
+  dl.shape = shape;
+  dl.rows = rows;
+  dl.index = new Map(rows.map((r, i) => [r.key, i]));
+  for (const key of dl.sel) if (!dl.index.has(key)) dl.sel.delete(key);
+  if (!dl.index.has(dl.anchor)) dl.anchor = '';
+}
 
-  let prev = null;
-  for (const w of wanted) {
-    let row = rows.get(w.key);
-    if (!row) {
-      row = document.createElement('div');
-      row.dataset.key = w.key;
-      row.innerHTML = '<span class="q-branch">|---</span><span class="q-cico"></span><span class="q-cname"></span>' +
-        '<span class="q-cbar"><span></span></span><span class="q-cmeta"></span><span class="q-cactions"></span>';
-    }
-    rows.delete(w.key);
-    // Keep the order of `wanted` without re-creating rows (a row being clicked must survive).
-    const at = prev ? prev.nextSibling : tree.firstChild;
-    if (row !== at) tree.insertBefore(row, at);
-    prev = row;
-    if (!w.child) {
-      row.className = 'q-child q-summary';
-      row.querySelector('.q-cico').hidden = true;
-      row.querySelector('.q-cname').textContent = bidiVisible(w.text);
-      row.querySelector('.q-cmeta').textContent = '';
-      row.querySelector('.q-cbar').hidden = true;
-      row.querySelector('.q-cactions').innerHTML = '';
-      continue;
-    }
-    const c = w.child;
-    row.className = `q-child cst-${c.status}`;
-    row.dataset.path = c.path;
-    const icon = row.querySelector('.q-cico');
-    icon.hidden = false;
-    setIcon(icon, c.path, false);
-    const name = row.querySelector('.q-cname');
+// What a progress bar and its percent show: full (done, or being verified), a part, or '-' while
+// the size isn't known.
+function progressOf(bytes, total, full) {
+  if (full) return { frac: 1, pct: '100%' };
+  if (!(total > 0)) return { frac: 0, pct: '-' };
+  return { frac: Math.min(1, bytes / total), pct: fmtPct(bytes, total) };
+}
+
+// "85.7 MiB / 8.0 GiB" while partial, else the total; compact columns: the total, the pair in the
+// tooltip.
+function sizeOf(bytes, total, full) {
+  if (!(total > 0)) return { size: bytes > 0 ? fmtSize(bytes) : '', sizeTip: '' };
+  const partial = !full && bytes > 0 && bytes < total;
+  if (dl.step === DL_COMPACT) return { size: fmtSize(total), sizeTip: partial ? `${fmtSize(bytes)} of ${fmtSize(total)}` : '' };
+  return { size: partial ? fmtSizePair(bytes, total) : fmtSize(total), sizeTip: '' };
+}
+
+// The two action slots (5.4): [act, label, tooltip] or null, which keeps its place.
+function dlSlots(q) {
+  const cancel = ['cancel', 'Cancel', 'Cancel the download'];
+  switch (q.status) {
+    case 'queued': case 'running': return [['pause', 'Pause'], cancel];
+    case 'paused': return [['resume', 'Resume'], cancel];
+    case 'failed': return [q.bytes > 0 ? ['retry', 'Resume', 'Resume from what was downloaded'] : ['retry', 'Retry'], cancel];
+    case 'cancelled': return [['retry', 'Retry'], null];
+    case 'done': case 'skipped': return [['show', 'Show', 'Show in folder'], null];
+    default: return [null, null];
+  }
+}
+
+function dlView(q) {
+  const st = q.status;
+  const phase = st === 'running' && PHASE_WORD[q.phase] ? q.phase : '';
+  const fetching = st === 'running' && !phase;
+  const f = q.files;
+  let word = phase ? PHASE_WORD[phase] : DL_WORD[st] || st;
+  if (st === 'queued' && q.position) word = `Queued #${q.position}`;
+  const tip = [phase ? PHASE_TIP[phase] : st === 'queued' && q.position ? `Queued: #${q.position} to start` : word];
+  let count = '';
+  if (phase === 'verifying' && q.verified) {
+    count = `${fmtCount(q.verified.done)}/${fmtCount(q.verified.total)}`;
+    tip[0] += `: ${q.verified.done} of ${q.verified.total} files`;
+  } else if (f) {
+    count = `${fmtCount(f.done)}/${fmtCount(f.total - f.skipped)}`;
+  }
+  if (f) {
+    const more = [['skipped', f.skipped], ['failed', f.failed], ['paused', f.paused]].filter(([, n]) => n > 0);
+    tip.push([`${f.done} of ${f.total - f.skipped} files done`, ...more.map(([w, n]) => `${n} ${w}`)].join(' · '));
+  }
+  if (fetching) {
+    const parts = [];
+    if (q.speed > 0) parts.push(fmtSpeed(q.speed));
+    if (fmtEta(q.eta)) parts.push(fmtEta(q.eta));
+    if (q.connections > 0) parts.push(`${q.connections} connection${q.connections === 1 ? '' : 's'}`);
+    if (parts.length) tip.push(parts.join(' · '));
+  }
+  if (q.note) tip.push(q.note);
+  if (dl.step >= 3 && UNFINISHED.includes(st)) tip.push(`Priority: ${prioLabel(q.priority)}`); // its column is hidden
+  const full = st === 'done' || phase === 'verifying';
+  const mark = q.check === 'ok' ? '✓' : q.check === 'warn' ? '⚠︎' : '';
+  return {
+    cls: `st-${st}`,
+    grip: true,
+    toggle: q.files ? (folderIsOpen(q) ? '▾' : '▸') : '',
+    icon: [q.name, q.mode === 'folder'],
+    text: q.mode === 'folder' ? `${q.name}/` : q.name,
+    dest: `→ ${q.dest}`,
+    nameTip: `${q.remote}:${q.path}\n→ ${q.local || q.dest}`,
+    word,
+    wordCls: st === 'failed' ? 'bad' : '',
+    statusTip: tip.join('\n'),
+    count,
+    mark,
+    markCls: q.check || '',
+    markTip: mark ? q.note || q.error || (q.check === 'ok' ? 'Verified' : 'Not verified') : '',
+    ...progressOf(q.bytes, q.total, full),
+    ...sizeOf(q.bytes, q.total, full),
+    speed: fetching && q.speed > 0 ? fmtSpeed(q.speed) : '',
+    speedTip: fetching && q.connections > 0 ? `${q.connections} connection${q.connections === 1 ? '' : 's'}` : '',
+    eta: fetching ? fmtClock(q.eta) : '',
+    etaTip: fetching ? fmtEta(q.eta) : '',
+    prio: UNFINISHED.includes(st) ? q.priority : '',
+    slots: dlSlots(q),
+  };
+}
+
+// A file's status follows its folder's (5.3): queued under a paused folder it is Paused (it read
+// "Queued" before), under a failed one Stopped, and unfinished under a cancelled one Cancelled,
+// all muted, the tooltip saying why.
+function fileStatus(q, c) {
+  if (c.status === 'done') return { word: 'Done' };
+  if (c.status === 'skipped') return { word: 'Skipped' };
+  if (q.status === 'cancelled') return { word: 'Cancelled', muted: true, why: 'The folder was cancelled', over: true };
+  if (c.status === 'running') return { word: 'Downloading' };
+  if (c.status === 'paused') return { word: 'Paused' };
+  if (c.status === 'failed') return { word: 'Failed', bad: true, why: c.error || 'Failed' };
+  if (q.status === 'paused') return { word: 'Paused', muted: true, why: 'The folder is paused', withFolder: true };
+  if (q.status === 'failed') return { word: 'Stopped', muted: true, why: `The folder stopped: ${q.error}`, withFolder: true };
+  return { word: 'Queued' };
+}
+
+function fileSlots(c, s) {
+  // A finished file's Show and a failed file's Retry come with every file listed (chunk C).
+  if (s.over || c.status === 'done' || c.status === 'skipped') return [null, null];
+  const skip = ['skip', 'Skip', 'Skip this file'];
+  if (c.status === 'paused') return [['resume', 'Resume'], skip];
+  if (c.status === 'failed' || s.withFolder) return [null, skip];
+  return [['pause', 'Pause'], skip];
+}
+
+function fileView(q, c) {
+  const s = fileStatus(q, c);
+  const running = c.status === 'running' && !s.over;
+  const tip = [s.why || s.word];
+  if (running && (c.speed > 0 || fmtEta(c.eta))) tip.push([c.speed > 0 ? fmtSpeed(c.speed) : '', fmtEta(c.eta)].filter(Boolean).join(' · '));
+  const full = c.status === 'done';
+  return {
+    cls: `st-${c.status}${s.muted ? ' w-muted' : ''}`,
+    grip: false,
+    toggle: '',
+    icon: [c.path, false],
     // Saved under a name grab gave it: Keep both, or another file of the folder has its own.
-    name.textContent = bidiVisible(c.savedAs ? `${c.path}  → ${c.savedAs}` : c.path);
-    name.title = bidiVisible(c.savedAs ? `${c.path}\nSaved as ${c.savedAs}: a file with its name on Windows is there or in the folder`
-      : c.path);
-    const bar = row.querySelector('.q-cbar');
-    bar.hidden = !(c.status === 'running' || c.status === 'paused' || c.bytes > 0);
-    bar.firstChild.style.width = `${c.size ? Math.min(100, (100 * c.bytes) / c.size) : 0}%`;
-    let meta;
-    if (c.status === 'running') {
-      meta = c.size ? `${fmtSize(c.bytes)} of ${fmtSize(c.size)}` : fmtSize(c.bytes);
-      if (c.speed > 0) meta += ` · ${fmtSize(c.speed)}/s`;
-      const eta = fmtEta(c.eta);
-      if (eta) meta += ` · ${eta}`;
-    } else if (c.status === 'paused') {
-      meta = `Paused · ${fmtSize(c.bytes)} of ${fmtSize(c.size)}`;
-    } else if (c.status === 'failed') {
-      meta = `Failed: ${c.error || 'error'}`;
-    } else {
-      meta = `Queued · ${fmtSize(c.size)}`;
+    text: c.savedAs ? `${c.path} → ${c.savedAs}` : c.path,
+    dest: '',
+    nameTip: c.savedAs ? `${c.path}\nSaved as ${c.savedAs}: a file with its name on Windows is there or in the folder` : c.path,
+    word: s.word,
+    wordCls: s.bad ? 'bad' : s.muted ? 'muted' : '',
+    statusTip: tip.join('\n'),
+    count: '',
+    mark: '',
+    markCls: '',
+    markTip: '',
+    ...progressOf(c.bytes, c.size, full),
+    ...sizeOf(c.bytes, c.size, full),
+    speed: running && c.speed > 0 ? fmtSpeed(c.speed) : '',
+    speedTip: '',
+    eta: running ? fmtClock(c.eta) : '',
+    etaTip: running ? fmtEta(c.eta) : '',
+    prio: '', // a file's own priority comes with chunk D
+    slots: fileSlots(c, s),
+  };
+}
+
+function msgView(q, r) {
+  const f = q.files || {};
+  switch (r.what) {
+    case 'error': return { msg: q.error, cls: 'm-error' };
+    case 'note': return { msg: q.waiting, cls: 'm-note' };
+    case 'unreadable': return { msg: q.unreadable, cls: 'm-warn' };
+    case 'done': return { msg: [f.done ? `${f.done} done` : '', f.skipped ? `${f.skipped} skipped` : ''].filter(Boolean).join(' · '), cls: 'm-sub' };
+    default: return { msg: `…${q.moreQueued} more queued`, cls: 'm-sub' };
+  }
+}
+
+function newDlRow() {
+  const el = document.createElement('div');
+  el.innerHTML = '<span class="c-handle"><span class="dl-grip" title="Drag to change the order">≡</span>' +
+    '<button type="button" class="dl-toggle" tabindex="-1" data-act="toggle"></button></span>' +
+    '<span class="c-name"><span class="dl-ico"></span><span class="dl-text"></span><span class="dl-dest"></span></span>' +
+    '<span class="c-status"><span class="dl-word"></span><span class="dl-count"></span><span class="dl-mark"></span></span>' +
+    '<span class="c-progress"><span class="dl-bar"><i></i></span><span class="dl-pct"></span></span>' +
+    '<span class="c-size"></span><span class="c-speed"></span><span class="c-eta"></span>' +
+    '<span class="c-prio"><select class="dl-prio" tabindex="-1" aria-label="Bandwidth priority" ' +
+    'title="Bandwidth priority: how running downloads share the speed">' +
+    PRIORITIES.map(([p, label]) => `<option value="${p}">${label}</option>`).join('') + '</select></span>' +
+    '<span class="c-actions"><span class="dl-slot"></span><span class="dl-slot"></span></span><span class="c-msg"></span>';
+  const one = (sel) => el.querySelector(sel);
+  el.c = {
+    toggle: one('.dl-toggle'), name: one('.c-name'), ico: one('.dl-ico'), text: one('.dl-text'), dest: one('.dl-dest'),
+    status: one('.c-status'), word: one('.dl-word'), count: one('.dl-count'), mark: one('.dl-mark'),
+    bar: one('.dl-bar > i'), pct: one('.dl-pct'), size: one('.c-size'), speed: one('.c-speed'), eta: one('.c-eta'),
+    prio: one('.dl-prio'), slots: [...el.querySelectorAll('.dl-slot')], msg: one('.c-msg'),
+  };
+  el.v = {};       // each cell's value as last written
+  el.dlKey = '';   // the row it shows
+  el.pinned = false;
+  $('#dl-body').append(el);
+  dl.pool.push(el);
+  return el;
+}
+
+// Writes a cell only when its value changed (6.1): a node rewritten on every tick loses a click
+// on a button under the mouse (the double-click bug of 2026-10-16).
+function put(el, key, value, write) {
+  if (el.v[key] === value) return;
+  el.v[key] = value;
+  write(value);
+}
+
+function slotHtml(s) {
+  if (!s) return '';
+  const [act, label, tip = label] = s;
+  return `<button type="button" tabindex="-1" data-act="${act}" title="${tip}" aria-label="${tip}">${SLOT_ICONS[act]}<span>${label}</span></button>`;
+}
+
+function paintDlRow(el, r, i) {
+  const q = dl.byId.get(r.id);
+  const child = r.kind === 'file' ? dl.kids.get(r.id)?.get(r.path) : null;
+  if (!q || (r.kind === 'file' && !child)) return;
+  const c = el.c;
+  put(el, 'hidden', false, (h) => { el.hidden = h; });
+  put(el, 'y', i, (y) => { el.style.transform = `translateY(${y * DL_ROW}px)`; });
+  put(el, 'key', r.key, (k) => { el.dataset.key = k; });
+  const view = r.kind === 'dl' ? dlView(q) : r.kind === 'file' ? fileView(q, child) : msgView(q, r);
+  const d = dl.drag;
+  const cls = `dl-row dl-grid k-${r.kind} ${view.cls}${dl.sel.has(r.kind === 'msg' ? `d${r.id}` : r.key) ? ' sel' : ''}` +
+    `${d && d.moved && d.key === r.key ? ' dragging' : ''}`;
+  put(el, 'cls', cls, (v) => { el.className = v; });
+  if (r.kind === 'msg') {
+    put(el, 'msg', view.msg, (t) => { c.msg.textContent = bidiVisible(t); c.msg.title = bidiVisible(t); });
+    return; // its other cells are hidden
+  }
+  put(el, 'toggle', view.toggle, (t) => {
+    c.toggle.textContent = t;
+    c.toggle.style.visibility = t ? '' : 'hidden';
+    c.toggle.title = t === '▾' ? 'Hide files' : 'Show files';
+    c.toggle.setAttribute('aria-expanded', String(t === '▾'));
+  });
+  setIcon(c.ico, view.icon[0], view.icon[1]);
+  put(el, 'text', view.text, (t) => { c.text.textContent = bidiVisible(t); });
+  put(el, 'dest', view.dest, (t) => { c.dest.textContent = bidiVisible(t); });
+  put(el, 'nameTip', view.nameTip, (t) => { c.name.title = bidiVisible(t); });
+  put(el, 'word', view.word, (t) => { c.word.textContent = t; });
+  put(el, 'wordCls', view.wordCls, (v) => { c.word.className = `dl-word ${v}`; });
+  put(el, 'statusTip', view.statusTip, (t) => { c.status.title = bidiVisible(t); });
+  put(el, 'count', view.count, (t) => { c.count.textContent = t; });
+  put(el, 'mark', view.mark, (t) => { c.mark.textContent = t; });
+  put(el, 'markCls', view.markCls, (v) => { c.mark.className = `dl-mark ${v}`; });
+  put(el, 'markTip', view.markTip, (t) => { c.mark.title = bidiVisible(t); });
+  put(el, 'frac', view.frac, (f) => { c.bar.style.transform = `scaleX(${f})`; });
+  put(el, 'pct', view.pct, (t) => { c.pct.textContent = t; });
+  put(el, 'size', view.size, (t) => { c.size.textContent = t; });
+  put(el, 'sizeTip', view.sizeTip, (t) => { c.size.title = t; });
+  put(el, 'speed', view.speed, (t) => { c.speed.textContent = t; });
+  put(el, 'speedTip', view.speedTip, (t) => { c.speed.title = t; });
+  put(el, 'eta', view.eta, (t) => { c.eta.textContent = t; });
+  put(el, 'etaTip', view.etaTip, (t) => { c.eta.title = t; });
+  put(el, 'prio', view.prio, (p) => {
+    c.prio.style.visibility = p ? '' : 'hidden';
+    c.prio.className = `dl-prio prio-${p || 'normal'}`;
+  });
+  if (view.prio && document.activeElement !== c.prio && c.prio.value !== view.prio) c.prio.value = view.prio;
+  view.slots.forEach((s, k) => put(el, `slot${k}`, s ? s.join('|') : '', () => {
+    if (c.slots[k].contains(document.activeElement)) $('#dl-body').focus({ preventScroll: true });
+    c.slots[k].innerHTML = slotHtml(s);
+  }));
+}
+
+// Binds the rows in view (and DL_OVER more each side) to elements: one already showing a row
+// keeps it, so a row that only moves keeps its element; the others come from the pool. A pinned
+// element (the row being dragged) stays with its row out of view too.
+function renderDlBody() {
+  const body = $('#dl-body');
+  if ($('#downloads').hidden) return;
+  const n = dl.rows.length;
+  $('#dl-spacer').style.height = `${n * DL_ROW}px`;
+  const first = Math.max(0, Math.floor(body.scrollTop / DL_ROW) - DL_OVER);
+  const last = Math.min(n, first + DL_POOL - 1, Math.ceil((body.scrollTop + body.clientHeight) / DL_ROW) + DL_OVER);
+  const want = new Set();
+  for (let i = first; i < last; ++i) want.add(dl.rows[i].key);
+  const free = [];
+  for (const el of dl.pool) {
+    if (el.dlKey && (want.has(el.dlKey) || (el.pinned && dl.index.has(el.dlKey)))) continue;
+    if (el.dlKey) dl.bound.delete(el.dlKey);
+    if (el.contains(document.activeElement)) body.focus({ preventScroll: true }); // keys never act on a recycled row (5.8)
+    el.dlKey = '';
+    // One element per data-key: a freed one loses its key, written again when it shows a row.
+    if (el.v.key !== undefined) { delete el.v.key; delete el.dataset.key; }
+    free.push(el);
+  }
+  for (let i = first; i < last; ++i) {
+    const r = dl.rows[i];
+    let el = dl.bound.get(r.key);
+    if (!el) {
+      el = free.pop() || newDlRow();
+      el.dlKey = r.key;
+      dl.bound.set(r.key, el);
     }
-    row.querySelector('.q-cmeta').textContent = meta;
-    row.querySelector('.q-cmeta').title = c.status === 'failed' ? bidiVisible(c.error) : '';
-    const actions = c.status === 'paused' ? [['cresume', 'Resume'], ['cskip', 'Skip']]
-      : c.status === 'failed' ? [['cskip', 'Skip']]
-        : [['cpause', 'Pause'], ['cskip', 'Skip']];
-    const key = actions.map((a) => a[0]).join(',');
-    const box = row.querySelector('.q-cactions');
-    if (box.dataset.key !== key) {
-      box.dataset.key = key;
-      box.innerHTML = actions.map(([act, label]) => `<button type="button" data-act="${act}">${label}</button>`).join('');
+    paintDlRow(el, r, i);
+  }
+  for (const el of dl.pool) {
+    if (el.pinned && el.dlKey && !want.has(el.dlKey)) paintDlRow(el, dl.rows[dl.index.get(el.dlKey)], dl.index.get(el.dlKey));
+  }
+  for (const el of free) put(el, 'hidden', true, (h) => { el.hidden = h; });
+}
+
+function scheduleDl() {
+  if (!dl.frame) dl.frame = requestAnimationFrame(() => { dl.frame = 0; renderDlBody(); });
+}
+
+// The narrow step and the head's summary, from the panel's width.
+function updateDlStep() {
+  const panel = $('#downloads');
+  const width = $('#dl-body').clientWidth;
+  if (panel.hidden || !width) return;
+  let step = DL_NEED.findIndex((need) => width >= need);
+  if (step < 0) step = DL_COMPACT;
+  if (panel.dataset.step !== String(step)) {
+    dl.step = step;
+    panel.dataset.step = String(step);
+    scheduleDl(); // compact sizes and the Status tooltip's priority follow it
+  }
+  panel.classList.toggle('narrow-head', panel.clientWidth < DL_HEAD_NARROW);
+}
+
+function rowOfEl(el) {
+  const i = el ? dl.index.get(el.dlKey) : undefined;
+  return i === undefined ? null : dl.rows[i];
+}
+
+// Scrolls the body just enough to show row `i`.
+function dlKeepInView(i) {
+  const body = $('#dl-body');
+  const top = i * DL_ROW;
+  if (top < body.scrollTop) body.scrollTop = top;
+  else if (top + DL_ROW > body.scrollTop + body.clientHeight) body.scrollTop = top + DL_ROW - body.clientHeight;
+}
+
+// ---- selection, menus, moves and the confirmation ------------------------------------------
+
+// A click selects a row, Ctrl+click toggles one, Shift+click extends from the last one clicked,
+// within one scope: downloads, or the files of one folder. A message row stands for its download.
+function selectDl(r, { toggle = false, extend = false } = {}) {
+  const key = r.kind === 'msg' ? `d${r.id}` : r.key;
+  const scope = r.kind === 'file' ? r.scope : 'd';
+  const anchor = dl.anchor && dl.rows[dl.index.get(dl.anchor)];
+  const same = anchor && anchor.scope === scope;
+  if (extend && same) {
+    const [a, b] = [dl.index.get(dl.anchor), dl.index.get(key)].sort((x, y) => x - y);
+    dl.sel = new Set(dl.rows.slice(a, b + 1).filter((x) => x.scope === scope).map((x) => x.key));
+  } else if (toggle && same) {
+    if (dl.sel.has(key)) dl.sel.delete(key); else dl.sel.add(key);
+    dl.anchor = key;
+  } else {
+    dl.sel = new Set([key]);
+    dl.anchor = key;
+  }
+  renderDlBody();
+}
+
+// The selected rows in the table's order: downloads, or files of one folder.
+function selectedDl() {
+  return [...dl.sel].map((k) => dl.index.get(k)).filter((i) => i !== undefined).sort((a, b) => a - b).map((i) => dl.rows[i]);
+}
+
+function waiting(q) { return q.status === 'queued' || q.status === 'paused'; }
+
+// Where a move puts a download: the `before` of moveItem (0 = the end), or undefined when it can't
+// go that way.
+function moveTarget(id, how) {
+  const ids = state.queue.map((q) => q.id);
+  const at = ids.indexOf(id);
+  const last = ids.length - 1;
+  if (at < 0) return undefined;
+  if (how === 'up' || how === 'top') return at > 0 ? (how === 'top' ? ids[0] : ids[at - 1]) : undefined;
+  if (at >= last) return undefined;
+  return how === 'down' && at + 2 <= last ? ids[at + 2] : 0;
+}
+
+function moveDownload(id, how) {
+  const before = moveTarget(id, how);
+  if (before === undefined) return;
+  dl.follow = { id, order: state.queue.map((q) => q.id).join() }; // kept in view once it moved
+  send({ type: 'moveItem', id, before });
+}
+
+// Cancel or Skip that deletes partly downloaded files asks first (5.8): Delete, and the menu on
+// more than one row (`ask`). A row's own button acts at once.
+function confirmDelete(ask, started, title, what, ok, go) {
+  if (!ask || !started) { go(); return; }
+  showModal({
+    title,
+    html: `<p>${what}, and their partly downloaded files are deleted.</p>`,
+    ok,
+    danger: true,
+    cancel: 'Keep downloading',
+    onOk: go,
+  });
+}
+
+function cancelDownloads(qs, ask) {
+  const list = qs.filter((q) => UNFINISHED.includes(q.status));
+  if (!list.length) return;
+  const one = list.length === 1;
+  confirmDelete(ask, list.some(startedBytes), one ? `Cancel “${list[0].name}”?` : `Cancel ${list.length} downloads?`,
+    `${one ? 'It stops' : 'They stop'} (files a folder finished are kept)`, one ? 'Cancel download' : `Cancel ${list.length}`,
+    () => list.forEach((q) => send({ type: 'cancelItem', id: q.id })));
+}
+
+function skipFiles(q, cs, ask) {
+  const list = cs.filter((c) => c.status !== 'done' && c.status !== 'skipped' && q.status !== 'cancelled');
+  if (!list.length) return;
+  const one = list.length === 1;
+  confirmDelete(ask, list.some((c) => c.bytes > 0), one ? `Skip “${list[0].path}”?` : `Skip ${list.length} files?`,
+    `${one ? 'It isn’t' : 'They aren’t'} downloaded`, one ? 'Skip file' : `Skip ${list.length}`,
+    () => list.forEach((c) => send({ type: 'skipChild', id: q.id, path: c.path })));
+}
+
+// Delete: cancels the selected downloads or skips the selected files, asking first when that
+// deletes partly downloaded files.
+function deleteSelection() {
+  const rows = selectedDl();
+  if (!rows.length) return;
+  if (rows[0].kind === 'file') {
+    const q = dl.byId.get(rows[0].id);
+    skipFiles(q, rows.map((r) => dl.kids.get(r.id)?.get(r.path)).filter(Boolean), true);
+  } else {
+    cancelDownloads(rows.map((r) => dl.byId.get(r.id)).filter(Boolean), true);
+  }
+}
+
+// Downloads: pause, resume or retry, cancel, priority, the moves (one waiting download), show it,
+// copy its path or its error. With several selected, each entry acts on the ones it applies to.
+function downloadsMenu(qs) {
+  const n = qs.length;
+  const one = n === 1 ? qs[0] : null;
+  const counted = (label, list) => (n > 1 ? `${label} ${list.length}` : label);
+  const items = [];
+  const pausing = qs.filter((q) => q.status === 'queued' || q.status === 'running');
+  // Several: those without the question about files already there (its own Resume asks it).
+  const resuming = one ? qs.filter((q) => q.status === 'paused') : qs.filter((q) => q.status === 'paused' && !q.ask);
+  const retrying = qs.filter((q) => q.status === 'failed' || q.status === 'cancelled');
+  const cancelling = qs.filter((q) => UNFINISHED.includes(q.status));
+  if (pausing.length) items.push({ label: counted('Pause', pausing), act: () => pausing.forEach((q) => send({ type: 'pauseItem', id: q.id })) });
+  if (resuming.length) items.push({ label: counted('Resume', resuming), act: () => resuming.forEach(resumeItem) });
+  if (retrying.length) {
+    items.push({ label: one ? (one.status === 'failed' && one.bytes > 0 ? 'Resume' : 'Retry') : `Retry ${retrying.length}`,
+      act: () => retrying.forEach((q) => send({ type: 'retryItem', id: q.id })) });
+  }
+  if (cancelling.length) items.push({ label: counted('Cancel', cancelling), key: 'Delete', act: () => cancelDownloads(cancelling, n > 1) });
+  if (cancelling.length) {
+    items.push('-', { heading: 'Priority' });
+    for (const [p, label] of PRIORITIES) {
+      items.push({ label, checked: cancelling.every((q) => q.priority === p),
+        act: () => cancelling.forEach((q) => { if (q.priority !== p) send({ type: 'setPriority', id: q.id, priority: p }); }) });
     }
   }
-  for (const row of rows.values()) row.remove();
+  // A waiting download moves in the queue (decision 4); Alt+↑/↓ does the first two.
+  if (one && waiting(one)) {
+    items.push('-');
+    for (const [how, label, key] of [['up', 'Move up', 'Alt+↑'], ['down', 'Move down', 'Alt+↓'], ['top', 'Move to top'], ['bottom', 'Move to bottom']]) {
+      items.push({ label, key, disabled: moveTarget(one.id, how) === undefined, act: () => moveDownload(one.id, how) });
+    }
+  }
+  items.push('-');
+  items.push({ label: 'Show in folder', act: () => send({ type: 'openFolder', id: qs[0].id }) });
+  items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(qs.map((q) => localPath(q))) });
+  const errors = qs.filter((q) => q.status === 'failed' && q.error);
+  if (errors.length) items.push({ label: errors.length > 1 ? `Copy ${errors.length} errors` : 'Copy error', act: () => copyText(errors.map((q) => q.error)) });
+  return items;
+}
+
+// Files of a folder download: their own pause, resume and skip, their paths and errors.
+function filesMenu(q, cs) {
+  const n = cs.length;
+  const counted = (label, list) => (n > 1 ? `${label} ${list.length}` : label);
+  const slots = cs.map((c) => fileSlots(c, fileStatus(q, c)).filter(Boolean).map((s) => s[0]));
+  const pausing = cs.filter((c, k) => slots[k].includes('pause'));
+  const resuming = cs.filter((c, k) => slots[k].includes('resume'));
+  const skipping = cs.filter((c, k) => slots[k].includes('skip'));
+  const items = [];
+  if (pausing.length) items.push({ label: counted('Pause', pausing), act: () => pausing.forEach((c) => send({ type: 'pauseChild', id: q.id, path: c.path })) });
+  if (resuming.length) items.push({ label: counted('Resume', resuming), act: () => resuming.forEach((c) => send({ type: 'resumeChild', id: q.id, path: c.path })) });
+  if (skipping.length) items.push({ label: counted('Skip', skipping), key: 'Delete', act: () => skipFiles(q, skipping, n > 1) });
+  items.push('-');
+  items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(cs.map((c) => localPath(q, c.path))) });
+  const errors = cs.filter((c) => c.status === 'failed' && c.error);
+  if (errors.length) {
+    items.push({ label: errors.length > 1 ? `Copy ${errors.length} errors` : 'Copy error',
+      act: () => copyText(errors.map((c) => (n > 1 ? `${c.path}: ${c.error}` : c.error))) });
+  }
+  return items;
+}
+
+function dlMenu() {
+  const rows = selectedDl();
+  if (!rows.length) return [];
+  if (rows[0].kind === 'file') {
+    const q = dl.byId.get(rows[0].id);
+    return q ? filesMenu(q, rows.map((r) => dl.kids.get(r.id)?.get(r.path)).filter(Boolean)) : [];
+  }
+  return downloadsMenu(rows.map((r) => dl.byId.get(r.id)).filter(Boolean));
+}
+
+// A row's buttons: the folder's ▸/▾ and the two slots.
+function dlAct(r, act) {
+  const q = dl.byId.get(r.id);
+  if (!q) return;
+  if (act === 'toggle') {
+    folderOpen.set(q.id, !folderIsOpen(q));
+    buildDlRows();
+    renderDlBody();
+  } else if (r.kind === 'file') {
+    const type = { pause: 'pauseChild', resume: 'resumeChild', skip: 'skipChild' }[act];
+    if (type) send({ type, id: q.id, path: r.path });
+  } else if (act === 'resume') {
+    resumeItem(q);
+  } else {
+    const type = { pause: 'pauseItem', retry: 'retryItem', cancel: 'cancelItem', show: 'openFolder' }[act];
+    if (type) send({ type, id: q.id });
+  }
+}
+
+// ---- dragging a download by its ≡ handle (5.9) -----------------------------------------------
+// With pointer capture: the rows under it are recycled as the body scrolls, which an HTML5 drag
+// wouldn't survive. The drop goes before the next download row after the drop point, so a point
+// among an open folder's files is after that folder.
+
+function dragTarget() {
+  const d = dl.drag;
+  const body = $('#dl-body');
+  const r = body.getBoundingClientRect();
+  const y = Math.min(Math.max(d.y, r.top), r.bottom) - r.top + body.scrollTop;
+  const n = dl.rows.length;
+  let k = Math.max(0, Math.min(n, Math.round(y / DL_ROW))); // the gap above row k
+  while (k < n && dl.rows[k].kind !== 'dl') ++k;
+  const before = k < n ? dl.rows[k].id : 0;
+  const ids = state.queue.map((q) => q.id);
+  const at = ids.indexOf(d.id);
+  const next = at >= 0 && at + 1 < ids.length ? ids[at + 1] : 0;
+  d.before = at < 0 || before === d.id || before === next ? undefined : before; // undefined: it stays
+  const mark = $('#dl-drop');
+  mark.hidden = d.before === undefined;
+  mark.style.transform = `translateY(${k * DL_ROW}px)`;
+}
+
+// Near the body's top or bottom edge the list scrolls, faster the closer the pointer.
+function dragScroll() {
+  const d = dl.drag;
+  if (!d) return;
+  const body = $('#dl-body');
+  const r = body.getBoundingClientRect();
+  const step = d.y < r.top + DL_ROW ? -Math.min(20, Math.ceil((r.top + DL_ROW - d.y) / 3))
+    : d.y > r.bottom - DL_ROW ? Math.min(20, Math.ceil((d.y - r.bottom + DL_ROW) / 3)) : 0;
+  const before = body.scrollTop;
+  if (step) body.scrollTop += step;
+  if (!step || body.scrollTop === before) { d.scroll = 0; return; }
+  renderDlBody();
+  dragTarget();
+  d.scroll = requestAnimationFrame(dragScroll);
+}
+
+function endDrag(drop) {
+  const d = dl.drag;
+  if (!d) return;
+  dl.drag = null;
+  cancelAnimationFrame(d.scroll);
+  d.el.pinned = false;
+  document.documentElement.classList.remove('dl-dragging');
+  $('#dl-drop').hidden = true;
+  if (drop && d.moved && d.before !== undefined) send({ type: 'moveItem', id: d.id, before: d.before });
+  renderDlBody();
+}
+
+{
+  const body = $('#dl-body');
+  body.addEventListener('scroll', scheduleDl, { passive: true });
+  const observer = new ResizeObserver(() => { updateDlStep(); scheduleDl(); });
+  observer.observe(body);
+  observer.observe($('#downloads'));
+
+  body.addEventListener('mousedown', (ev) => {
+    const r = rowOfEl(ev.target.closest('.dl-row'));
+    if (!r || (ev.button !== 0 && ev.button !== 2)) return;
+    // A row's button acts on its click but never takes the focus: the table keeps it (one tab
+    // stop, 5.8), so Delete and Alt+arrows go on working and no key lands on a recycled row.
+    if (ev.target.closest('button')) { ev.preventDefault(); body.focus({ preventScroll: true }); return; }
+    if (ev.target.closest('select, .dl-grip')) return; // the priority opens; the grip drags
+    ev.preventDefault();
+    body.focus({ preventScroll: true });
+    const key = r.kind === 'msg' ? `d${r.id}` : r.key;
+    // Right-click: a row outside the selection becomes the selection; inside, it stays.
+    if (ev.button === 2) { if (!dl.sel.has(key)) selectDl(r); return; }
+    selectDl(r, { toggle: ev.ctrlKey, extend: ev.shiftKey });
+  });
+  body.addEventListener('contextmenu', (ev) => {
+    const r = rowOfEl(ev.target.closest('.dl-row'));
+    if (!r) return;
+    ev.preventDefault();
+    if (!dl.sel.has(r.kind === 'msg' ? `d${r.id}` : r.key)) selectDl(r); // on a button or the priority
+    const items = dlMenu();
+    if (items.length) showMenu(ev.clientX, ev.clientY, items);
+  });
+  body.addEventListener('click', (ev) => {
+    const btn = ev.target.closest('button[data-act]');
+    const r = btn && rowOfEl(btn.closest('.dl-row'));
+    if (r) dlAct(r, btn.dataset.act);
+  });
+  body.addEventListener('change', (ev) => {
+    if (!ev.target.matches('.dl-prio')) return;
+    const r = rowOfEl(ev.target.closest('.dl-row'));
+    if (r && r.kind === 'dl') send({ type: 'setPriority', id: r.id, priority: ev.target.value });
+    body.focus({ preventScroll: true }); // back to the table: its element may show another row later
+  });
+  body.addEventListener('keydown', (ev) => {
+    if (ev.target !== body) return; // a row's button or priority keeps its own keys
+    if (ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowUp' || ev.key === 'ArrowDown')) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const rows = selectedDl();
+      const q = rows.length === 1 && rows[0].kind === 'dl' ? dl.byId.get(rows[0].id) : null;
+      if (q && waiting(q)) moveDownload(q.id, ev.key === 'ArrowUp' ? 'up' : 'down');
+    } else if (ev.key === 'Delete' && !ev.altKey && !ev.ctrlKey) {
+      ev.preventDefault();
+      deleteSelection();
+    } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
+      ev.preventDefault();
+      const rows = selectedDl();
+      if (!rows.length) return;
+      const i = dl.index.get(rows[0].key);
+      dlKeepInView(i);
+      renderDlBody();
+      const r = dl.bound.get(rows[0].key).getBoundingClientRect();
+      showMenu(r.left + 40, r.bottom, dlMenu());
+    }
+  });
+
+  body.addEventListener('pointerdown', (ev) => {
+    const grip = ev.target.closest('.dl-grip');
+    const el = grip && grip.closest('.dl-row');
+    const r = rowOfEl(el);
+    if (!r || r.kind !== 'dl' || ev.button !== 0 || dl.drag) return;
+    ev.preventDefault();
+    closeMenu();
+    grip.setPointerCapture(ev.pointerId);
+    el.pinned = true;
+    dl.drag = { id: r.id, key: r.key, pointerId: ev.pointerId, el, y0: ev.clientY, y: ev.clientY, moved: false, before: undefined, scroll: 0 };
+  });
+  body.addEventListener('pointermove', (ev) => {
+    const d = dl.drag;
+    if (!d || ev.pointerId !== d.pointerId) return;
+    d.y = ev.clientY;
+    if (!d.moved) {
+      if (Math.abs(d.y - d.y0) < 4) return;
+      d.moved = true;
+      document.documentElement.classList.add('dl-dragging');
+      renderDlBody();
+    }
+    dragTarget();
+    if (!d.scroll) dragScroll();
+  });
+  body.addEventListener('pointerup', (ev) => { if (dl.drag && ev.pointerId === dl.drag.pointerId) endDrag(true); });
+  body.addEventListener('pointercancel', (ev) => { if (dl.drag && ev.pointerId === dl.drag.pointerId) endDrag(false); });
+  body.addEventListener('lostpointercapture', (ev) => { if (dl.drag && ev.pointerId === dl.drag.pointerId) endDrag(false); });
 }
 
 function renderQueue() {
@@ -2296,90 +2926,19 @@ function renderQueue() {
   panel.hidden = state.queue.length === 0;
   $('#split').hidden = panel.hidden;
   if (!shown && !panel.hidden) applySplit();
-  const box = $('#queue');
-  const seen = new Set();
-  let prevEl = null;
-  for (const q of state.queue) {
-    seen.add(q.id);
-    let el = queueEls.get(q.id);
-    if (!el) {
-      el = document.createElement('div');
-      el.innerHTML = '<div class="q-top"><span class="q-handle" title="Drag to change the order">≡</span>' +
-        '<button type="button" class="q-toggle" data-act="toggle" hidden></button>' +
-        '<span class="q-ico"></span><span class="q-name"></span>' +
-        '<select class="q-prio" title="Bandwidth priority: how running downloads share the speed" aria-label="Bandwidth priority">' +
-        '<option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select>' +
-        '<span class="q-meta"></span><span class="q-actions"></span></div>' +
-        '<div class="q-bar"><div></div></div><div class="q-sub"></div><div class="q-tree" hidden></div>';
-      el.dataset.id = q.id;
-      queueEls.set(q.id, el);
+  dl.byId = new Map(state.queue.map((q) => [q.id, q]));
+  dl.kids = new Map(state.queue.filter((q) => q.children).map((q) => [q.id, new Map(q.children.map((c) => [c.path, c]))]));
+  for (const id of folderOpen.keys()) if (!dl.byId.has(id)) folderOpen.delete(id);
+  buildDlRows();
+  if (!panel.hidden) {
+    updateDlStep();
+    renderDlBody();
+    if (dl.drag && dl.drag.moved) dragTarget(); // rows may have come or gone under the pointer
+    const f = dl.follow;
+    if (f && state.queue.map((q) => q.id).join() !== f.order) {
+      dl.follow = null;
+      if (dl.index.has(`d${f.id}`)) { dlKeepInView(dl.index.get(`d${f.id}`)); renderDlBody(); }
     }
-    // Rows follow the queue order; moved in place, not re-created (a row may be mid-click).
-    const at = prevEl ? prevEl.nextSibling : box.firstChild;
-    if (el !== at) box.insertBefore(el, at);
-    prevEl = el;
-    el.className = `q-item st-${q.status}`;
-    const active = ['queued', 'running', 'paused'].includes(q.status);
-    const prio = el.querySelector('.q-prio');
-    prio.hidden = !active;
-    prio.className = `q-prio prio-${q.priority}`;
-    if (document.activeElement !== prio) prio.value = q.priority;
-    setIcon(el.querySelector('.q-ico'), q.name, q.mode === 'folder');
-    el.querySelector('.q-name').textContent = bidiVisible(q.mode === 'folder' ? `${q.name}/` : q.name);
-    el.querySelector('.q-name').title = bidiVisible(`${q.remote}:${q.path}`);
-    const pct = q.total ? Math.min(100, (100 * q.bytes) / q.total) : 0;
-    el.querySelector('.q-bar > div').style.width = `${q.status === 'done' || q.verifying ? 100 : pct}%`;
-    const sizes = q.total ? `${fmtSize(q.bytes)} of ${fmtSize(q.total)}` : fmtSize(q.bytes);
-    // A listed folder counts its files: "12 of 40 files · 2.1 of 5.6 GiB".
-    const files = q.files ? `${q.files.done} of ${q.files.total - q.files.skipped} files · ` : '';
-    let meta = '';
-    if (q.status === 'running' && q.verifying) {
-      // A folder counts its files as their results come: "Verifying the checksums… 12 of 40".
-      const checked = q.verified ? ` ${q.verified.done} of ${q.verified.total}` : '';
-      meta = q.mode === 'folder' ? `${files}Verifying the checksums…${checked}` : 'Verifying the checksum…';
-    } else if (q.status === 'running') {
-      meta = files + sizes;
-      if (q.speed > 0) meta += ` · ${fmtSize(q.speed)}/s`;
-      const eta = fmtEta(q.eta);
-      if (eta) meta += ` · ${eta}`;
-      if (q.connections > 0) meta += ` · ${q.connections} connection${q.connections === 1 ? '' : 's'}`;
-    } else if (q.status === 'queued') {
-      meta = `Queued · #${q.position}${q.bytes > 0 ? ` · ${files}${sizes}` : ''}`;
-    } else if (q.status === 'paused') {
-      meta = `Paused · ${files}${sizes}`;
-    } else if (q.status === 'done' && q.files) {
-      meta = `Done · ${q.files.done} files · ${fmtSize(q.total)}${q.files.skipped ? ` · ${q.files.skipped} skipped` : ''}`;
-    } else {
-      meta = { queued: 'Queued', done: q.total ? `Done · ${fmtSize(q.total)}` : 'Done', failed: 'Failed', cancelled: 'Cancelled' }[q.status];
-    }
-    el.querySelector('.q-meta').textContent = meta;
-    // Waiting rows can be moved in the queue: up, down, to the top.
-    const move = [['up', '↑', 'Move up'], ['down', '↓', 'Move down'], ['top', '⤒', 'Move to the top']];
-    const actions = {
-      queued: [...move, ['pause', 'Pause'], ['cancel', 'Cancel']],
-      running: [['pause', 'Pause'], ['cancel', 'Cancel']],
-      paused: [...move, ['resume', 'Resume'], ['cancel', 'Cancel']],
-      done: [['open', 'Show in folder']],
-      failed: [['retry', q.bytes > 0 ? 'Resume' : 'Retry'], ['cancel', 'Cancel']],
-      cancelled: [['retry', 'Retry']],
-    }[q.status];
-    const actionKey = actions.map((a) => a.join(':')).join(',');
-    const actionBox = el.querySelector('.q-actions');
-    if (actionBox.dataset.key !== actionKey) {
-      actionBox.dataset.key = actionKey;
-      actionBox.innerHTML = actions.map(([act, label, title]) =>
-        `<button type="button" data-act="${act}"${title ? ` class="q-move" title="${title}" aria-label="${title}"` : ''}>${label}</button>`).join('');
-    }
-    const sub = el.querySelector('.q-sub');
-    // A paused download's reason (the free-space check) comes first; the whole line shows on hover.
-    sub.textContent = bidiVisible(q.status === 'failed' && q.error ? q.error
-      : q.note && q.status === 'paused' ? `${q.note} · → ${q.dest}`
-        : q.note ? `→ ${q.dest} · ${q.note}` : `→ ${q.dest}`);
-    sub.title = sub.textContent;
-    renderTree(el, q);
-  }
-  for (const [id, el] of queueEls) {
-    if (!seen.has(id)) { el.remove(); queueEls.delete(id); folderOpen.delete(id); }
   }
   const count = (st) => state.queue.filter((q) => q.status === st).length;
   const running = count('running');
@@ -2389,7 +2948,9 @@ function renderQueue() {
   if (running) parts.push(`${running} running`);
   if (queued) parts.push(`${queued} queued`);
   if (paused) parts.push(`${paused} paused`);
-  $('#dl-summary').textContent = parts.join(' · ');
+  const summary = parts.join(' · ');
+  if ($('#dl-summary').textContent !== summary) $('#dl-summary').textContent = summary; // announced when it changes
+  $('#downloads .title').title = summary; // a narrow panel shows it only here
   // Pause all while anything runs or waits; otherwise Resume all for paused ones.
   const pauseAll = $('#pause-all');
   const resuming = running + queued === 0 && paused > 0;
@@ -2804,7 +3365,7 @@ const DAY_LABELS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 const MAX_RULES = 20; // schedule::max_rules
 
-function fmtSpeed(mibps) { return `${fmtLimit(mibps)} MiB/s`; }
+function fmtMiBps(mibps) { return `${fmtLimit(mibps)} MiB/s`; }
 
 // "18", "1830", "18:30" or "8:30" as "HH:MM"; "24:00" only where `allow24`. null if not a time.
 function parseTime(text, allow24) {
@@ -2845,9 +3406,9 @@ function renderScheduleNow() {
   const el = $('#schedule-now');
   const until = l.until ? ` until ${l.until}` : '';
   if (!state.schedule.length) el.textContent = '';
-  else if (l.source === 'schedule') el.textContent = `Now: ${fmtSpeed(l.mibps)}${l.until ? until : ', all week'}`;
-  else if (l.source === 'change') el.textContent = `Now: ${l.on ? fmtSpeed(l.mibps) : 'no limit'} (your change)${until}`;
-  else if (l.until && l.nextMiBps) el.textContent = `No scheduled limit now; next: ${l.until} at ${fmtSpeed(l.nextMiBps)}`;
+  else if (l.source === 'schedule') el.textContent = `Now: ${fmtMiBps(l.mibps)}${l.until ? until : ', all week'}`;
+  else if (l.source === 'change') el.textContent = `Now: ${l.on ? fmtMiBps(l.mibps) : 'no limit'} (your change)${until}`;
+  else if (l.until && l.nextMiBps) el.textContent = `No scheduled limit now; next: ${l.until} at ${fmtMiBps(l.nextMiBps)}`;
   else el.textContent = 'No scheduled limit now';
 }
 
@@ -3625,93 +4186,6 @@ $('#limit-value').addEventListener('keydown', (ev) => {
 });
 $('#parallel-down').addEventListener('click', () => setParallel(state.parallel - 1));
 $('#parallel-up').addEventListener('click', () => setParallel(state.parallel + 1));
-
-$('#queue').addEventListener('click', (ev) => {
-  const btn = ev.target.closest('button[data-act]');
-  if (!btn) return;
-  const id = Number(btn.closest('.q-item').dataset.id);
-  const act = btn.dataset.act;
-  if (act === 'toggle') {
-    folderOpen.set(id, btn.textContent !== '▾');
-    renderQueue();
-    return;
-  }
-  const child = btn.closest('.q-child');
-  if (child) {
-    const type = { cpause: 'pauseChild', cresume: 'resumeChild', cskip: 'skipChild' }[act];
-    send({ type, id, path: child.dataset.path });
-    return;
-  }
-  if (act === 'up' || act === 'down' || act === 'top') {
-    const idx = state.queue.findIndex((q) => q.id === id);
-    const ids = state.queue.map((q) => q.id);
-    const before = act === 'top' ? ids[0]
-      : act === 'up' ? ids[idx - 1]
-        : (idx + 2 < ids.length ? ids[idx + 2] : 0); // down: before the one after next, or the end
-    if (before !== undefined && before !== id && !(act === 'down' && idx === ids.length - 1)) {
-      send({ type: 'moveItem', id, before });
-    }
-    return;
-  }
-  if (act === 'resume') {
-    const q = state.queue.find((x) => x.id === id);
-    if (q) resumeItem(q);
-    return;
-  }
-  const type = { cancel: 'cancelItem', retry: 'retryItem', open: 'openFolder', pause: 'pauseItem' }[act];
-  send({ type, id });
-});
-
-$('#queue').addEventListener('change', (ev) => {
-  if (!ev.target.matches('.q-prio')) return;
-  const id = Number(ev.target.closest('.q-item').dataset.id);
-  send({ type: 'setPriority', id, priority: ev.target.value });
-});
-
-// Drag a row by its ≡ handle to change the queue order.
-let dragId = 0;
-function clearDropMarks() {
-  for (const el of document.querySelectorAll('.drop-before, .drop-after')) el.classList.remove('drop-before', 'drop-after');
-}
-$('#queue').addEventListener('mousedown', (ev) => {
-  const handle = ev.target.closest('.q-handle');
-  if (handle) handle.closest('.q-item').draggable = true;
-});
-$('#queue').addEventListener('dragstart', (ev) => {
-  const item = ev.target.closest('.q-item');
-  if (!item || !item.draggable) return;
-  dragId = Number(item.dataset.id);
-  item.classList.add('dragging');
-  ev.dataTransfer.effectAllowed = 'move';
-  ev.dataTransfer.setData('text/plain', String(dragId));
-});
-$('#queue').addEventListener('dragover', (ev) => {
-  const item = ev.target.closest('.q-item');
-  if (!dragId || !item) return;
-  ev.preventDefault();
-  clearDropMarks();
-  const r = item.getBoundingClientRect();
-  item.classList.add(ev.clientY < r.top + r.height / 2 ? 'drop-before' : 'drop-after');
-});
-$('#queue').addEventListener('drop', (ev) => {
-  const item = ev.target.closest('.q-item');
-  if (!dragId || !item) return;
-  ev.preventDefault();
-  const r = item.getBoundingClientRect();
-  let before = Number(item.dataset.id);
-  if (ev.clientY >= r.top + r.height / 2) {
-    const next = item.nextElementSibling;
-    before = next ? Number(next.dataset.id) : 0;
-  }
-  if (before !== dragId) send({ type: 'moveItem', id: dragId, before });
-  clearDropMarks();
-});
-$('#queue').addEventListener('dragend', (ev) => {
-  const item = ev.target.closest('.q-item');
-  if (item) { item.draggable = false; item.classList.remove('dragging'); }
-  dragId = 0;
-  clearDropMarks();
-});
 
 $('#empty').addEventListener('click', (ev) => {
   if (ev.target.closest('[data-act="add-server"]')) openSettings(true);

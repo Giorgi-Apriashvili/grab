@@ -274,6 +274,11 @@ Report file(Request base, File copy, std::stop_token stop) {
     return run(base, std::move(stop));
 }
 
+Mark mark(const Report& r) {
+    if (r.files.empty()) return Mark::none;
+    return r.count(Verdict::same) == r.files.size() ? Mark::ok : Mark::warn;
+}
+
 std::string summary(const Report& r, bool folder) {
     const std::size_t n = r.files.size();
     // Why the unchecked ones weren't verified: the reason they share, else the first one's.
