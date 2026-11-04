@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.28)
 include(cmake/vcpkg.cmake) # OpenSSL on Windows; sets the toolchain, so before project()
 
 project(grab
-    VERSION 0.20.1
+    VERSION 0.21.0
     DESCRIPTION "Grab a file or folder from a Linux server by name, over grab's own SSH/SFTP client"
     LANGUAGES CXX)
 
