@@ -201,8 +201,8 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 }
 
 /* results ------------------------------------------------------------------------------- */
-/* No minimum of its own: the splitter keeps it 4 rows tall, unless a small window with a banner
-   leaves no room for that (app.js, splitLimits). */
+/* No minimum of its own: the split with Downloads keeps it 4 rows tall, unless a small window with
+   a banner leaves no room for that (app.js, splitLimits). */
 .results-wrap {
   position: relative;
   flex: 1;
@@ -471,36 +471,11 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* the splitter above Downloads ------------------------------------------------------------ */
-/* A 6 px band centred on the panel's top border, which is its line; the band lights up under the
-   pointer, while dragged and with the keyboard's focus. */
-.split {
-  position: relative;
-  z-index: 2;
-  flex: none;
-  height: 6px;
-  margin: 0 14px -3px;
-  cursor: row-resize;
-  outline: none;
-  touch-action: none;
-}
-.split::after {
-  content: "";
-  position: absolute;
-  top: 2px;
-  left: 8px;
-  right: 8px;
-  height: 3px;
-  border-radius: 2px;
-}
-.split:hover::after, .split.dragging::after { background: var(--sel-line); }
-.split:focus-visible::after { background: var(--accent); }
-html.split-drag, html.split-drag * { cursor: row-resize !important; }
-
 /* downloads ----------------------------------------------------------------------------- */
-/* Its height comes from the splitter (app.js sets --dl-h), not from its rows: rows coming and
-   going never resize the panes. */
+/* Its height comes from the split (app.js sets --dl-h), not from its rows: rows coming and going
+   never resize the panes. */
 .downloads {
+  position: relative;
   flex: 0 0 var(--dl-h, 45%);
   min-height: 0;
   display: flex;
@@ -515,7 +490,7 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 8px 6px 12px;
+  padding: 10px 8px 6px 12px; /* the top 10 px: the grip's strip, clear of the controls */
   border-bottom: 1px solid var(--line);
 }
 .downloads-head .title { font-weight: 600; }
@@ -524,6 +499,40 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .stepper .label { margin-right: 2px; }
 .stepper button { width: 24px; padding: 0; font-size: 14px; line-height: 1; }
 .stepper #parallel { min-width: 14px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* The split with the view above: a grip centred on the panel's top edge, inside its border and
+   far from its rounded corners, a 40 x 4 px bar in the middle of the head's top padding (its press
+   area that padding's 10 px, 56 px wide), 3 px from the border and from the controls below. Out
+   of the flow, so the head and the rows never move for it; it takes the accent under the pointer,
+   with the keyboard's focus and while the split is dragged. The head's free space (the head
+   itself, its title, its spacer) drags it too, with the same cursor; its controls and texts keep
+   theirs (app.js, splitZone). */
+.split-grip {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 50%;
+  width: 56px;
+  height: 10px;
+  margin-left: -28px;
+  cursor: row-resize;
+  outline: none;
+  touch-action: none;
+}
+.split-grip::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 8px;
+  right: 8px;
+  height: 4px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--muted) 45%, transparent);
+}
+.split-grip:hover::after, .split-grip:focus-visible::after, .split-grip.dragging::after { background: var(--accent); }
+.downloads-head { cursor: row-resize; touch-action: none; }
+:where(.downloads-head > :not(.title, .spacer)) { cursor: auto; } /* buttons keep their own */
+html.split-drag, html.split-drag * { cursor: row-resize !important; }
 
 /* status bar: total speed and the speed limit */
 .bar.status { flex: none; padding: 4px 14px 8px; font-size: 12px; }

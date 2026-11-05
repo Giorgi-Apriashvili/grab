@@ -48,9 +48,10 @@ inline constexpr int max_parallel = 8;
 inline constexpr double min_limit_mibps = schedule::min_mibps;
 inline constexpr double max_limit_mibps = schedule::max_mibps;
 
-// The splitter between Browse (or Settings) and Downloads keeps the Downloads panel's share of
-// the height they and the splitter take (DOWNLOADS-UI.md 4.1), so it survives resizing,
-// maximizing and DPI changes; the page also keeps both panes their minimum heights.
+// The split between Browse (or Settings) and Downloads keeps the Downloads panel's share of the
+// height the two take (DOWNLOADS-UI.md 4.1; the grip in the panel's head moves it), so it
+// survives resizing, maximizing and DPI changes; the page also keeps both panes their minimum
+// heights.
 inline constexpr double split_min = 0.15;
 inline constexpr double split_max = 0.85;
 inline constexpr double split_default = 0.45; // the page's, while gui.json has none

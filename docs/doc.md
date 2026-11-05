@@ -203,7 +203,7 @@ installed exe has no VC redistributable dependency.
 Explorer: pick a server, click through its folders or search them, select rows (click,
 Shift/Ctrl-click, arrows, Ctrl+A), choose where to save, and follow the download queue with
 live progress. It reads the same grab.conf and remembers the last server, the destination per
-server, the rows' sort, the window's place and size, the splitter's place and the Downloads
+server, the rows' sort, the window's place and size, the height Downloads takes and the Downloads
 table's sort and column widths in `%APPDATA%\grab\gui.json`. Should that file ever be damaged, the window starts with the
 defaults, keeps the old file as `gui.json.bad-<date>-<time>` and says so; the command line,
 which follows Verify downloads and the speed schedule from it, says so too and goes on without
@@ -214,17 +214,20 @@ them.
   smaller than 760×600 (or the screen's work area, if smaller). A window an earlier grab saved
   smaller (its default was 1100×720) grows once to the new size: width and height each on their
   own, never shrinking, staying on the screen, maximized kept. gui.json then notes `"layout": 2`, and it never grows again.
-- **The splitter** between the list above (Browse, or Settings) and Downloads shares their
-  height: drag it up or down. With the keyboard, Tab to it, then ↑ / ↓ move it 16 pixels, Page
-  Up / Page Down a tenth of the height and Home / End to the ends; a double-click or Enter goes
-  back to the default, Downloads taking 45%.
+- **Resizing Browse and Downloads:** the list above (Browse, or Settings) and Downloads share
+  the window's height. Drag the grip in the middle of the Downloads panel's top edge up or down,
+  or the free space of the panel's title bar (around the title "Downloads", not its buttons or
+  texts), as you'd drag a window by its title bar; a click there does nothing, and a
+  double-click on either goes back to the default, Downloads taking 45%. With the keyboard, Tab
+  to the grip (it comes just before the Downloads controls and the table), then ↑ / ↓ move it 16
+  pixels, Page Up / Page Down a tenth of the height and Home / End to the ends; Enter goes back
+  to the default.
   - It is kept in gui.json as Downloads' share of the height (`"split"`, 0.15 to 0.85), so it
     holds when the window is resized or maximized, and in Browse and Settings alike.
   - The list above keeps at least 4 rows, and Downloads its bar and room for 3 rows. In a small
     window with a banner showing, Downloads gives way first, down to room for 1 row.
-  - Downloads takes its height from the splitter, not from its rows, so rows coming and going
-    never move it. While the queue is empty, Downloads and the splitter are hidden; they come
-    back where they were.
+  - Downloads takes its height from that share, not from its rows, so rows coming and going
+    never move it. While the queue is empty, Downloads is hidden; it comes back where it was.
 - **Folders:** the address bar shows where you are (`Box.Guest › movies › georgian.movies`),
   with ↑ (Backspace) to go up and ⟳ to list the folder from the server again.
   - Folders open instantly from the server's saved file list (see [File lists](#file-lists)),

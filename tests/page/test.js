@@ -1,8 +1,9 @@
 'use strict';
-// Page-logic checks for the Downloads table (chunks B1, B2, C, D, G and H: the table, sorting, column
-// widths, keys and the treegrid ARIA, every file of a folder by subscription, the filter, Go to
-// running, the performance numbers, a file's priority in its folder, the status bar's total and its
-// graph, Waiting files, opening finished files), run in headless Edge by run_page_test.ps1.
+// Page-logic checks for the Downloads table (chunks B1, B2, C, D, G, H and I: the table, sorting,
+// column widths, keys and the treegrid ARIA, every file of a folder by subscription, the filter, Go
+// to running, the performance numbers, a file's priority in its folder, the status bar's total and
+// its graph, Waiting files, opening finished files, the split's grip and the head's free space), run
+// in headless Edge by run_page_test.ps1.
 const out = [];
 let failed = 0;
 function check(name, got, want) {
@@ -1278,6 +1279,238 @@ try {
   folderOpen.clear();
   state.queue = [];
   renderQueue();
+
+  // ---- I: the split moves by the grip on the panel's top edge and by the head's free space ----
+  {
+    const grip = $('#split-grip');
+    const dhead = $('.downloads-head');
+    const title = dhead.querySelector('.title');
+    const spacer = dhead.querySelector('.spacer');
+    const flexWas = panel.style.flex;
+    panel.style.flex = ''; // the panel's height from the split again (--dl-h), as in the window
+    panel.style.width = '';
+    panel.style.height = '';
+    state.queue = [];
+    renderQueue();
+    check('I: hidden with an empty queue, the grip with it', [panel.hidden, grip.getClientRects().length], [true, 0]);
+    state.queue = [file(60, { status: 'running', bytes: 5, total: 100, speed: 9, eta: 5 }), file(61), file(62, { status: 'paused', bytes: 5, total: 100 })];
+    renderQueue();
+    clearTimeout(split.keyTimer);
+    split.share = split.saved = SPLIT.def;
+    applySplit();
+    await frame();
+    updateDlStep();
+    renderDlBody();
+    const H = () => splitLimits().H;
+    check('I: no band of its own any more', document.getElementById('split'), null);
+    check('I: the grip is the separator, in the panel', [grip.parentElement === panel, grip.getAttribute('role'), grip.getAttribute('aria-orientation'),
+      grip.tabIndex, grip.getAttribute('aria-label'), grip.getClientRects().length > 0], [true, 'separator', 'horizontal', 0, 'Resize the list and Downloads', true]);
+    const stops = [...panel.querySelectorAll('button, select, [tabindex]')].filter((e) => e.tabIndex >= 0 && !e.disabled && e.getClientRects().length);
+    check('I: Tab reaches the grip first, before the head\'s controls and the table', [stops[0] === grip, stops.indexOf($('#queue')) > stops.indexOf(grip)], [true, true]);
+    check('I: the panel takes 45% of H', [Math.abs(split.px - Math.round(SPLIT.def * H())) <= 1, Math.round(panel.getBoundingClientRect().height)], [true, split.px]);
+    const pct = (h) => String(Math.round(100 * (1 - h / H())));
+    const aria = () => [grip.getAttribute('aria-valuenow'), grip.getAttribute('aria-valuemin'), grip.getAttribute('aria-valuemax')];
+    check('I: its values as chunk A\'s (the view above\'s share, in %)', aria(), [pct(split.px), pct(splitLimits().hi), pct(splitLimits().lo)]);
+
+    // Where it sits: a 40 x 4 px bar centred on the top edge, inside the border, clear of the
+    // rounded corners, over no control; at the narrow steps too.
+    const place = {};
+    for (const w of [716, 900, 1250, 0]) {
+      panel.style.width = w ? `${w}px` : '';
+      updateDlStep();
+      const p = panel.getBoundingClientRect();
+      const ps = getComputedStyle(panel);
+      const g = grip.getBoundingClientRect();
+      const after = getComputedStyle(grip, '::after');
+      const bar = { x: g.left + parseFloat(after.left), y: g.top + parseFloat(after.top), w: parseFloat(after.width), h: parseFloat(after.height) };
+      const radius = parseFloat(ps.borderTopLeftRadius);
+      const inner = p.top + parseFloat(ps.borderTopWidth);
+      const controls = [...dhead.children].filter((c) => !c.matches('.title, .spacer') && c.getClientRects().length);
+      const over = controls.filter((c) => { const r = c.getBoundingClientRect(); return r.top < g.bottom && r.bottom > g.top && r.left < g.right && r.right > g.left; });
+      place[w || 'full'] = [[bar.w, bar.h], Math.abs(bar.x + bar.w / 2 - (p.left + p.width / 2)) <= 0.5, bar.y >= inner && g.top >= inner,
+        bar.x >= p.left + radius + 8 && bar.x + bar.w <= p.right - radius - 8, over.map((c) => c.id || c.className),
+        Math.round(dhead.getBoundingClientRect().height)];
+    }
+    out.push(`INFO grip: ${JSON.stringify(place)}`);
+    check('I: a 40 x 4 px bar, centred, inside the border, clear of the corners, over no control (716, 900, 1250, full)',
+      Object.values(place).map((v) => v.slice(0, 5)), Object.values(place).map(() => [[40, 4], true, true, true, []]));
+
+    // Nothing in the head or the rows moves when the grip shows, lights up or takes the focus.
+    const rect = (n) => { const r = n.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].map((v) => Math.round(v * 100) / 100); };
+    const look = () => JSON.stringify([dhead, ...dhead.children, $('.dl-head'), ...document.querySelectorAll('.dl-row[data-key]')].map(rect));
+    const plain = look();
+    grip.style.display = 'none';
+    const without = look();
+    grip.style.display = '';
+    grip.classList.add('dragging');
+    const lit = look();
+    grip.classList.remove('dragging');
+    grip.focus();
+    const focused = look();
+    grip.blur();
+    check('I: no layout shift for the grip (hidden, lit, focused)', [without === plain, lit === plain, focused === plain], [true, true, true]);
+
+    // Pointer input, as the mouse gives it; the events go to `el` itself (with a real mouse the
+    // press captures it, so the moves and the release come to it too).
+    const ptr = (el, type, y) => el.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: 'mouse', isPrimary: true, bubbles: true, cancelable: true,
+      clientX: 10, clientY: y, button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1 }));
+    const drag = (el, dy, steps = 10) => {
+      const y = 300;
+      ptr(el, 'pointerdown', y);
+      for (let k = 1; k <= steps; ++k) ptr(el, 'pointermove', y + Math.round((dy * k) / steps));
+      ptr(el, 'pointerup', y + dy);
+    };
+    const prefsSplit = () => sent.filter((m) => m.type === 'prefs' && 'split' in m).map((m) => m.split);
+    // Each head child's place within the panel, and the head's height: a drag moves the panel's
+    // edge, never anything in the head.
+    const inHead = () => { const p = panel.getBoundingClientRect(); return JSON.stringify([dhead, ...dhead.children].filter((n) => n.getClientRects().length).map((n) => { const r = n.getBoundingClientRect(); return [r.x - p.x, r.y - p.y, r.width, r.height].map((v) => Math.round(v * 100) / 100); })); };
+    const headBefore = inHead();
+    sent.length = 0;
+    let px0 = split.px;
+    ptr(grip, 'pointerdown', 300);
+    ptr(grip, 'pointermove', 290);
+    check('I: while dragged the grip is lit and the cursor row-resize everywhere',
+      [grip.classList.contains('dragging'), document.documentElement.classList.contains('split-drag'), getComputedStyle($('#pause-all')).cursor], [true, true, 'row-resize']);
+    ptr(grip, 'pointerup', 290);
+    check('I: a drag up on the grip grows Downloads by the dragged px, saved on release', [split.px - px0, prefsSplit(), grip.classList.contains('dragging'),
+      document.documentElement.classList.contains('split-drag')], [10, [split.share], false, false]);
+    check('I: the share saved is the height over H', split.share, Math.round((10000 * split.px) / H()) / 10000);
+    sent.length = 0;
+    px0 = split.px;
+    drag(grip, -60);
+    check('I: a 10-step drag on the grip follows the pointer', [split.px - px0, prefsSplit().length], [60, 1]);
+    for (const [name, el] of [['the head', dhead], ['its title', title], ['its spacer', spacer]]) {
+      sent.length = 0;
+      px0 = split.px;
+      drag(el, 40);
+      check(`I: a drag down on ${name} shrinks Downloads by the dragged px, saved once`, [split.px - px0, prefsSplit().length], [-40, 1]);
+    }
+    check('I: nothing in the head moved with the drags', inHead(), headBefore);
+    check('I: the aria values follow', aria(), [pct(split.px), pct(splitLimits().hi), pct(splitLimits().lo)]);
+
+    // Not from a control or a text of the head: it does what it does, the split stays.
+    const notZones = ['#dl-show', '.dl-show', '.dl-show .label', '#dl-go', '.stepper', '.stepper .label', '#parallel', '#parallel-down', '#parallel-up',
+      '#pause-all', '#cancel-all', '#clear-finished', '#dl-summary', '#dl-note'];
+    const moved = [];
+    for (const sel of notZones) {
+      sent.length = 0;
+      px0 = split.px;
+      drag($(sel), -50);
+      if (split.px !== px0 || prefsSplit().length || split.drag) moved.push(sel);
+      split.drag = null;
+    }
+    check('I: no drag from a control or a text of the head', moved, []);
+    const md = (el) => { const e = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 }); el.dispatchEvent(e); return e.defaultPrevented; };
+    check('I: a press keeps the focus where it was on the grip and the free space only',
+      [md(grip), md(dhead), md(title), md(spacer), md($('#pause-all')), md($('#dl-show')), md($('#dl-summary')), md($('#parallel-up'))],
+      [true, true, true, true, false, false, false, false]);
+    const cur = (el) => getComputedStyle(el).cursor;
+    check('I: the row-resize cursor over the grip and the free space, not over the controls',
+      [[grip, dhead, title, spacer].map(cur), ['#pause-all', '#dl-go', '#parallel-up', '#dl-show', '.stepper', '#dl-summary'].map((s) => cur($(s)) === 'row-resize')],
+      [['row-resize', 'row-resize', 'row-resize', 'row-resize'], [false, false, false, false, false, false]]);
+    check('I: buttons keep their pointer', [cur($('#pause-all')), cur($('#parallel-up'))], ['pointer', 'pointer']);
+
+    // A click without moving (or under the 3 px slop) changes nothing and saves nothing.
+    for (const [name, el] of [['the grip', grip], ['the head', dhead], ['the title', title]]) {
+      sent.length = 0;
+      px0 = split.px;
+      const share = split.share;
+      ptr(el, 'pointerdown', 300);
+      ptr(el, 'pointermove', 302);
+      ptr(el, 'pointerup', 302);
+      check(`I: a click on ${name} does nothing`, [split.px, split.share, prefsSplit(), split.drag, grip.classList.contains('dragging')], [px0, share, [], null, false]);
+    }
+
+    // The limits: a drag past either end stops there, within 0.15..0.85 of H.
+    const lim = splitLimits();
+    drag(grip, -5000);
+    check('I: up to the top limit', split.px, lim.hi);
+    drag(dhead, 5000);
+    check('I: down to the bottom limit', split.px, lim.lo);
+    check('I: the limits keep the share within 0.15..0.85', [lim.hi <= Math.floor(SPLIT.max * lim.H), lim.lo >= Math.ceil(SPLIT.min * lim.H) || lim.lo === lim.hi], [true, true]);
+
+    // Double-click: the grip and the free space go back to 45%, a control doesn't, nor the second
+    // click of a drag that just ended, nor one whose first press was on a control (the second
+    // drifting a pixel or two off it onto the free space). Each press as the mouse gives it.
+    const press = (el) => { ptr(el, 'pointerdown', 300); ptr(el, 'pointerup', 300); };
+    const dblOnly = (el) => el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, button: 0, detail: 2 }));
+    const dbl = (el, first = el) => { press(first); press(el); dblOnly(el); };
+    const resets = [];
+    for (const el of [grip, dhead, title, spacer, $('#pause-all'), $('#dl-summary'), $('.stepper')]) {
+      drag(grip, -50);
+      split.movedAt = -1e9;
+      sent.length = 0;
+      dbl(el);
+      resets.push(split.share === SPLIT.def && prefsSplit().length === 1);
+    }
+    check('I: a double-click resets on the grip and the free space only', resets, [true, true, true, true, false, false, false]);
+    const resetAfter = [];
+    for (const first of [$('#pause-all'), $('.dl-head .sort'), dhead]) {
+      drag(grip, -50);
+      split.movedAt = -1e9;
+      sent.length = 0;
+      dbl(dhead, first);
+      resetAfter.push(split.share === SPLIT.def && prefsSplit().length === 1);
+    }
+    check('I: no reset when the first press was on Pause all or a sort title, a reset after two on the head', resetAfter, [false, false, true]);
+    drag(grip, -50);
+    const share1 = split.share;
+    dbl(dhead);
+    check('I: not right after a drag', split.share, share1);
+    split.movedAt = -1e9;
+
+    // A size change during a press (a banner shows while the button is held) takes effect at the
+    // release: the observer waits for the press, the release applies the limits.
+    drag(grip, -5000);
+    const banner = $('#update-banner');
+    ptr(dhead, 'pointerdown', 300);
+    banner.hidden = false;
+    banner.textContent = 'A newer grab is out.';
+    await frame();
+    await frame();
+    ptr(dhead, 'pointerup', 300);
+    check('I: a banner shown during a press: the top limit and the list\'s least height at the release',
+      [split.px, $('#results').getBoundingClientRect().height >= LIST_MIN - 0.5], [splitLimits().hi, true]);
+    banner.hidden = true;
+    banner.textContent = '';
+    await frame();
+    await frame();
+
+    // Keys on the grip, as chunk A's: arrows 16 px, PgUp/PgDn a tenth of H, Home/End the ends,
+    // Enter the default; saved 500 ms after the last key.
+    const gripKey = (k) => grip.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    resetSplit();
+    sent.length = 0;
+    px0 = split.px;
+    const page = Math.round(H() / 10);
+    const steps = [];
+    for (const k of ['ArrowUp', 'ArrowDown', 'ArrowDown', 'PageUp', 'PageDown']) { gripKey(k); steps.push(split.px - px0); }
+    check('I: arrows 16 px, PgUp/PgDn a tenth of H', steps, [16, 0, -16, page - 16, -16]);
+    gripKey('Home');
+    const atHome = split.px;
+    gripKey('End');
+    check('I: Home and End go to the ends', [atHome, split.px], [splitLimits().hi, splitLimits().lo]);
+    check('I: keys save once they stop', prefsSplit(), []);
+    await new Promise((r) => setTimeout(r, 650));
+    check('I: ... 500 ms after the last key', prefsSplit(), [split.share]);
+    gripKey('Enter');
+    check('I: Enter goes back to 45%', [split.share, prefsSplit().slice(-1)[0], Math.abs(split.px - Math.round(SPLIT.def * H())) <= 1], [SPLIT.def, SPLIT.def, true]);
+
+    // The saved share gives the same height back (gui.json at the next start).
+    drag(grip, -70);
+    const saved = prefsSplit().slice(-1)[0];
+    const pxSaved = split.px;
+    split.share = split.saved = SPLIT.def;
+    applySplit();
+    split.share = split.saved = saved;
+    applySplit();
+    check('I: the saved share gives the dragged height back', Math.abs(split.px - pxSaved) <= 1, true);
+    resetSplit();
+    sent.length = 0;
+    state.queue = [];
+    renderQueue();
+    panel.style.flex = flexWas;
+  }
 
   panel.style.width = '1250px';
   state.queue = [

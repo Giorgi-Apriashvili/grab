@@ -814,8 +814,8 @@ void App::on_message(const std::string& text) {
             if (sort->kind == Value::Kind::null) state_.sort.reset();
             else if (auto order = sort_from_json(*sort)) state_.sort = std::move(order);
         }
-        // The splitter above Downloads, as the panel's share: null for the default; anything
-        // else that isn't a number changes nothing.
+        // The split between the list and Downloads, as the panel's share: null for the default;
+        // anything else that isn't a number changes nothing.
         if (const Value* split = msg->find("split")) {
             if (split->kind == Value::Kind::null) state_.split.reset();
             else if (auto share = split_from_json(*split)) state_.split = share;

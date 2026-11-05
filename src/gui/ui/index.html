@@ -267,13 +267,13 @@
   </div>
 </div>
 
-<!-- Shares the height between the view above (its value, in %) and Downloads: drag it, or ↑ ↓
-     PgUp PgDn Home End; a double-click or Enter goes back to the default. -->
-<div id="split" class="split" role="separator" tabindex="0" aria-orientation="horizontal"
-     aria-label="Resize the list and Downloads" aria-controls="search-view settings-view"
-     title="Drag to resize the list and Downloads; double-click for the default" hidden></div>
-
 <section id="downloads" class="downloads" hidden>
+  <!-- The grip on the panel's top edge shares the height between the view above (its value, in %)
+       and Downloads: drag it, or the head's free space; Tab to it for ↑ ↓ PgUp PgDn Home End; a
+       double-click (on either) or Enter goes back to the default. -->
+  <div id="split-grip" class="split-grip" role="separator" tabindex="0" aria-orientation="horizontal"
+       aria-label="Resize the list and Downloads" aria-controls="search-view settings-view"
+       title="Drag to resize the list and Downloads; double-click for the default"></div>
   <div class="downloads-head">
     <span class="title">Downloads</span>
     <span id="dl-summary" class="muted" aria-live="polite"></span>
