@@ -415,13 +415,15 @@ them.
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
     Save to stays), Open folder location (search results), Copy path (the server path) and Copy
     name. With several rows selected, they act on all of them.
-  - **On a download:** Pause, Resume or Retry, Cancel, Priority, Set all files to High / Normal /
-    Low (a listed folder: its unfinished files' own priority), Move up, Move down, Move to top
-    and Move to bottom (waiting downloads, in the queue order), Show in folder, Copy path (where
-    it lands on this PC) and Copy error (failed ones). A file inside a folder download has Pause,
-    Resume, Retry (failed ones), Skip, Priority (unfinished ones), Show in folder, Copy path (where
-    it lands, under the name grab saved it as) and Copy error. With several selected, each entry
-    acts on those it applies to, all at once (Show in folder shows the first).
+  - **On a download:** Open (a finished file download: the file in its app) or Open folder (a
+    finished folder download: its folder in Explorer), Pause, Resume or Retry, Cancel, Priority,
+    Set all files to High / Normal / Low (a listed folder: its unfinished files' own priority),
+    Move up, Move down, Move to top and Move to bottom (waiting downloads, in the queue order),
+    Show in folder, Copy path (where it lands on this PC) and Copy error (failed ones). A file
+    inside a folder download has Open (once it is done), Pause, Resume, Retry (failed ones), Skip,
+    Priority (unfinished ones), Show in folder, Copy path (where it lands, under the name grab
+    saved it as) and Copy error. With several selected, each entry acts on those it applies to,
+    all at once (Show in folder shows the first); Open and Open folder are there for one row only.
   - Shift+F10 or the menu key opens the menu for the row under the cursor, or in Downloads for
     the selected rows (the cursor's row when none is selected).
 - **The Downloads table** has a row per download and fixed columns: Name (with where it goes),
@@ -470,13 +472,28 @@ them.
     of one folder. The right-click menu and Delete act on the selection: Delete cancels downloads
     or skips files. The rows are one Tab stop: a row's buttons and priority don't keep the
     keyboard, so after a click the keys below go on acting on the table.
+  - **Double-click a finished file to open it** in the app Windows uses for it, as in Explorer: a
+    file download, or a file of a folder download once it is done. Open in its menu and Ctrl+Enter
+    do the same. Nothing else opens: a double-click on a row still downloading, queued, paused,
+    failed, cancelled or skipped (a file Skip kept too), or on a folder download's own row, only
+    selects it (a finished folder's menu has Open folder). grab opens the file it wrote, where it
+    wrote it (under a Keep both name too); one moved, deleted or changed since isn't opened, and
+    the Downloads head says so.
+    - **A program asks first.** A file Windows would run rather than show (a program, a script or
+      an installer: .exe, .bat, .cmd, .msi, .ps1, .vbs, .js, .jar, .reg, shortcuts such as .lnk
+      and .url, and anything PATHEXT lists or Windows itself calls unsafe, or whose "open" runs
+      it through a script host such as Python) opens only after "Run <name>? It came from
+      <server>." with Run and Cancel; Cancel has the focus and Esc cancels. grab marks no
+      download as coming from the internet, so Windows' own warning wouldn't come. Documents,
+      pictures, media and archives open at once.
   - **Keys** (Tab to the table, or click a row): ↑ / ↓, Page Up / Page Down and Home / End move
     the cursor (a bar on its row) and select that row; with Shift they select from the last row
     picked to the cursor, keeping to downloads or to one folder's files; with Ctrl they move the
     cursor alone, and Ctrl+Space adds or drops the cursor's row. Ctrl+A selects every download,
     or every file of the cursor's folder. → opens a folder, or on an open one goes to its first
     file; ← folds it, or from a file goes up to its folder. Enter shows a finished download or file in
-    its folder; Delete cancels or skips the selection; Alt+↑ / Alt+↓ move a waiting download;
+    its folder; Ctrl+Enter opens it (a file in its app, a folder download's folder in Explorer);
+    Delete cancels or skips the selection; Alt+↑ / Alt+↓ move a waiting download;
     Shift+F10 or the menu key opens the menu. Space does nothing here (in Browse it plays). Screen
     readers get the table as a tree grid, the cursor's row as the active one.
   - **Cancel or Skip that would delete partly downloaded files asks first** when it acts on

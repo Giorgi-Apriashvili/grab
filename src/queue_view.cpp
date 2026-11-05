@@ -59,6 +59,12 @@ fs::path target_of(const fs::path& dir, const Names& names, std::size_t i) {
     return dir / local::relative(names.path.at(i));
 }
 
+std::optional<open_file::Finished> finished_file(const fs::path& dir, const Names& names,
+                                                 const std::vector<folder::File>& files, std::size_t i) {
+    if (i >= files.size() || i >= names.path.size() || files[i].status != State::done) return std::nullopt;
+    return open_file::Finished{.path = target_of(dir, names, i), .size = files[i].bytes}; // done: its bytes as fetched
+}
+
 namespace {
 
 // A file's state as the page shows it: a running big file that reads on no connection

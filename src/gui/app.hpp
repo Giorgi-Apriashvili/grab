@@ -8,6 +8,7 @@
 #include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "open_file.hpp"
 #include "play_stream.hpp"
 #include "preview_jobs.hpp"
 #include "queue_view.hpp"
@@ -281,6 +282,10 @@ private:
         // folder was listed; ask = not answered (it then waits paused with the question).
         existing::Choice existing = existing::Choice::ask;
         std::filesystem::path local_name; // a file's Keep-both name, instead of the server's
+        // A done file download: the server's copy it left (fetched, already there, or a copy an
+        // earlier Keep both kept) and its size, which Open opens. Unset otherwise, and when Skip
+        // kept the user's own file there.
+        std::optional<open_file::Finished> finished;
         // Waiting for that answer: some of the files concerned, and how many there are.
         std::vector<Asked> asked;
         std::size_t asked_count = 0;
@@ -420,6 +425,18 @@ private:
     // A file of a folder download in Explorer, "showFile" {id, gen, index}.
     void show_file(int id, int gen, std::size_t index);
     void show_in_explorer(const std::filesystem::path& target) const; // selected, or its folder when it's gone
+    // A finished file in its default app (DOWNLOADS-UI.md, chunk H): "openFile" {id} for a file
+    // download, {id, gen, index} for a file of a folder download, on the UI thread. The file is
+    // found from the queue's own state, never from the page: only a done one that is still as grab
+    // wrote it opens, and the Downloads head says why another doesn't. One that Windows would run
+    // as a program opens only with `run` (the page's "Run" to its question, "openAsk"): without
+    // it the page is asked.
+    void open_finished(int id, int gen, std::optional<std::size_t> index, bool run);
+    // A finished folder download's own folder in Explorer, "openDir" {id} ("openFolder" shows a
+    // download selected in the folder it went to).
+    void open_dir(int id);
+    // A short note in the Downloads head (the page's dlNote): why a file didn't open.
+    void post_downloads_note(const std::string& text) const;
     void clear_finished();
     void set_parallel(int n);
     // Queue order (`before` = another item's id, 0 = the end) and bandwidth priority.

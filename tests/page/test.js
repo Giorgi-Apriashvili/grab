@@ -1,8 +1,8 @@
 'use strict';
-// Page-logic checks for the Downloads table (chunks B1, B2, C, D and G: the table, sorting, column
+// Page-logic checks for the Downloads table (chunks B1, B2, C, D, G and H: the table, sorting, column
 // widths, keys and the treegrid ARIA, every file of a folder by subscription, the filter, Go to
 // running, the performance numbers, a file's priority in its folder, the status bar's total and its
-// graph, Waiting files), run in headless Edge by run_page_test.ps1.
+// graph, Waiting files, opening finished files), run in headless Edge by run_page_test.ps1.
 const out = [];
 let failed = 0;
 function check(name, got, want) {
@@ -973,6 +973,181 @@ try {
   check('G: not while the folder is paused', dlView(folder({ status: 'paused', files: counts({ held: 2 }) })).statusTip.includes('small files'), false);
   delta(97, [[0, FS.running, 1048576, 2097152, 23, 2]]);
   check('G: reading: Downloading, with its speed', [v97(0).word, v97(0).speed], ['Downloading', '2.0 MiB/s']);
+  folderOpen.clear();
+
+  // ---- H: opening finished files (DOWNLOADS-UI.md, chunk H) ----------------------------------------
+  // A double-click, the menu's Open and Ctrl+Enter open a finished file in its app, by the row's id
+  // (and its folder's generation and index); nothing unfinished opens. A finished folder download's
+  // menu has Open folder; a double-click on a folder's row does what a click does. A program is
+  // asked about first: Run or Cancel, the focus on Cancel, Esc cancels.
+  dlSort.key = '';
+  showDlOrder();
+  clearSel();
+  dl.cursor = '';
+  const openKids = [
+    { path: 'notes.txt', size: 5, status: 'done', bytes: 5 },
+    { path: 'photo.jpg', size: 9, status: 'running', bytes: 3 },
+    { path: 'run.bat', size: 7, status: 'done', bytes: 7 },
+    { path: 'gone.bin', size: 9, status: 'failed', bytes: 0, error: 'permission denied' },
+    { path: 'big.bin', size: 9, status: 'queued', bytes: 0 },
+    { path: 'skip.bin', size: 9, status: 'skipped', bytes: 0 },
+  ];
+  state.queue = [
+    folder({ id: 70, gen: 5, files: counts({ total: 6, queued: 1, running: 1, done: 2, failed: 1, skipped: 1 }) }),
+    file(71, { status: 'done', total: 5, bytes: 5 }),
+    file(72, { status: 'running', total: 50, bytes: 5 }),
+    folder({ id: 73, gen: 2, status: 'done', expanded: false, files: counts({ total: 1, queued: 0, done: 1 }) }),
+    file(74, { status: 'failed', total: 5, bytes: 0, error: 'boom' }),
+    file(75, { status: 'cancelled' }),
+    file(76, { status: 'skipped', total: 5, bytes: 0 }),
+  ];
+  renderQueue();
+  onFiles({ type: 'files', id: 70, gen: 5, from: 0, total: 6, rows: openKids.map(kidRow) });
+  // A press, its release and click, as the mouse makes them; `detail` is the click count.
+  const press = (target, detail, mods = {}) => {
+    const r = target.getBoundingClientRect();
+    const at = { bubbles: true, cancelable: true, button: 0, detail, clientX: r.x + 4, clientY: r.y + 4, ...mods };
+    target.dispatchEvent(new MouseEvent('mousedown', at));
+    target.dispatchEvent(new MouseEvent('mouseup', at));
+    target.dispatchEvent(new MouseEvent('click', at));
+  };
+  const dblclick = (k, sel = '.dl-text', mods = {}) => {
+    const target = el(k).querySelector(sel);
+    press(target, 1, mods);
+    press(target, 2, mods);
+  };
+  const opens = () => sent.filter((m) => m.type === 'openFile' || m.type === 'openDir').map((m) => JSON.stringify(m));
+  const openFile70 = (index) => JSON.stringify({ type: 'openFile', id: 70, gen: 5, index });
+  check('H: the rows', keys(), ['d70', 'f70:0', 'f70:1', 'f70:2', 'f70:3', 'f70:4', 'f70:5', 'd71', 'd72', 'd73', 'd74', 'm74:error', 'd75', 'd76']);
+  sent.length = 0;
+  dblclick('f70:0');
+  check('H: a double-click opens a finished file of a folder, by its index', opens(), [openFile70(0)]);
+  check('H: and selects it, as a click', selKeys(), ['f70:0']);
+  sent.length = 0;
+  dblclick('d71');
+  check('H: a finished file download, by its id', opens(), [JSON.stringify({ type: 'openFile', id: 71 })]);
+  sent.length = 0;
+  for (const k of ['f70:1', 'f70:3', 'f70:4', 'f70:5', 'd70', 'd72', 'd73', 'd74', 'd75', 'd76']) dblclick(k);
+  check('H: nothing else opens: running, failed, queued, skipped, cancelled, a folder (finished too)', opens(), []);
+  check('H: a double-click there is a click', selKeys(), ['d76']);
+  sent.length = 0;
+  dblclick('f70:0', '.dl-text', { ctrlKey: true });
+  dblclick('f70:0', '.dl-text', { shiftKey: true });
+  check('H: not with Ctrl or Shift (they select)', opens(), []);
+  sent.length = 0;
+  dblclick('f70:0', '[data-act="show"]');
+  check('H: on a row\'s button, its button acts', [opens(), sent.filter((m) => m.type === 'showFile').length], [[], 2]);
+  // A single click opens nothing.
+  sent.length = 0;
+  press(el('f70:2').querySelector('.dl-text'), 1);
+  check('H: a click opens nothing', opens(), []);
+
+  // The menu: Open first on one finished file, with its key; Open folder on a finished folder.
+  const labels = () => dlMenu().filter((m) => m.label).map((m) => m.label);
+  selectDl(rowOf('f70:0'));
+  check('H: a finished file\'s menu: Open first', [labels()[0], dlMenu()[0].key, labels().includes('Show in folder')], ['Open', 'Ctrl+Enter', true]);
+  sent.length = 0;
+  dlMenu()[0].act();
+  check('H: Open opens it', opens(), [openFile70(0)]);
+  for (const k of ['f70:1', 'f70:3', 'f70:4', 'f70:5']) {
+    selectDl(rowOf(k));
+    check(`H: no Open on an unfinished file (${k})`, labels().includes('Open'), false);
+  }
+  selectDl(rowOf('f70:0'));
+  selectDl(rowOf('f70:2'), { extend: true });
+  check('H: no Open with several selected', labels().includes('Open'), false);
+  selectDl(rowOf('d71'));
+  check('H: a finished file download: Open first', [labels()[0], dlMenu()[0].key], ['Open', 'Ctrl+Enter']);
+  sent.length = 0;
+  dlMenu()[0].act();
+  check('H: by its id', opens(), [JSON.stringify({ type: 'openFile', id: 71 })]);
+  selectDl(rowOf('d73'));
+  check('H: a finished folder download: Open folder first', labels()[0], 'Open folder');
+  sent.length = 0;
+  dlMenu()[0].act();
+  check('H: its folder in Explorer', opens(), [JSON.stringify({ type: 'openDir', id: 73 })]);
+  for (const k of ['d70', 'd72', 'd74', 'd75', 'd76']) {
+    selectDl(rowOf(k));
+    check(`H: no Open on an unfinished download (${k})`, labels().filter((l) => l.startsWith('Open')), []);
+  }
+  selectDl(rowOf('d71'));
+  selectDl(rowOf('d73'), { extend: true });
+  check('H: no Open with several downloads selected', labels().filter((l) => l.startsWith('Open')), []);
+
+  // The keys: Ctrl+Enter opens the cursor's finished row; Enter still shows it in its folder; the
+  // menu key's menu has Open.
+  clearSel();
+  grid.focus();
+  setDlCursor(rowOf('f70:0'));
+  sent.length = 0;
+  key('Enter', { ctrlKey: true });
+  check('H: Ctrl+Enter opens the cursor\'s finished file', opens(), [openFile70(0)]);
+  sent.length = 0;
+  key('Enter');
+  check('H: Enter still shows it in its folder', sent.map((m) => `${m.type}:${m.index}`), ['showFile:0']);
+  sent.length = 0;
+  for (const k of ['f70:1', 'f70:3', 'd72', 'd74']) {
+    setDlCursor(rowOf(k));
+    key('Enter', { ctrlKey: true });
+  }
+  check('H: Ctrl+Enter on unfinished rows: nothing', sent.length, 0);
+  setDlCursor(rowOf('d73'));
+  key('Enter', { ctrlKey: true });
+  check('H: Ctrl+Enter on a finished folder opens its folder', opens(), [JSON.stringify({ type: 'openDir', id: 73 })]);
+  clearSel();
+  setDlCursor(rowOf('f70:2'));
+  key('ContextMenu');
+  const firstItem = () => $('#menu').querySelector('button .text').textContent;
+  check('H: the menu key: Open first', [$('#menu').hidden, firstItem()], [false, 'Open']);
+  closeMenu();
+  clearSel();
+  setDlCursor(rowOf('f70:1'));
+  key('F10', { shiftKey: true });
+  check('H: Shift+F10 on an unfinished file: no Open', [$('#menu').hidden, [...$('#menu').querySelectorAll('button .text')].some((t) => t.textContent === 'Open')], [false, false]);
+  closeMenu();
+
+  // A program is asked about first (the backend's 'openAsk'): Run or Cancel, the focus on Cancel.
+  const ask70 = { type: 'openAsk', id: 70, gen: 5, index: 2, name: 'run.bat', server: 'Main' };
+  sent.length = 0;
+  onOpenAsk(ask70);
+  check('H: the question', [$('#modal').hidden, $('#modal-title').textContent, $('#modal-body').textContent, $('#modal-ok').textContent,
+    $('#modal-cancel').textContent], [false, 'Run “run.bat”?', 'It came from Main.', 'Run', 'Cancel']);
+  check('H: the focus on Cancel', document.activeElement === $('#modal-cancel'), true);
+  key('Enter', { ctrlKey: true }); // the table's keys wait while it is open
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  check('H: Esc cancels: nothing runs', [$('#modal').hidden, sent.length], [true, 0]);
+  onOpenAsk(ask70);
+  $('#modal-cancel').click();
+  check('H: Cancel: nothing runs', [$('#modal').hidden, sent.length], [true, 0]);
+  onOpenAsk(ask70);
+  $('#modal-ok').click();
+  check('H: Run: the same row again, to run', sent.map((m) => JSON.stringify(m)), [JSON.stringify({ type: 'openFile', id: 70, gen: 5, index: 2, run: true })]);
+  sent.length = 0;
+  onOpenAsk({ type: 'openAsk', id: 71, name: 'setup.exe', server: 'Box' });
+  check('H: a file download\'s question', $('#modal-body').textContent, 'It came from Box.');
+  $('#modal-ok').click();
+  check('H: run by its id', sent.map((m) => JSON.stringify(m)), [JSON.stringify({ type: 'openFile', id: 71, run: true })]);
+  onOpenAsk({ type: 'openAsk', id: 71, name: 'invoice‮fdp.exe', server: '<b>x</b>' });
+  check('H: a name that would read backwards shows its mark; the server is text',
+    [$('#modal-title').textContent, $('#modal-body').textContent], ['Run “invoice⟨U+202E⟩fdp.exe”?', 'It came from <b>x</b>.']);
+  closeModal(false);
+  showModal({ title: 'Another question', html: '', ok: 'OK' });
+  onOpenAsk(ask70);
+  check('H: never over another question', $('#modal-title').textContent, 'Another question');
+  closeModal(false);
+  // A file download Skip ended by keeping the user's own file: done, but grab wrote nothing there.
+  state.queue.push(file(77, { status: 'done', total: 5, bytes: 0, note: 'skipped: your file is kept', kept: true }));
+  renderQueue();
+  sent.length = 0;
+  dblclick('d77');
+  selectDl(rowOf('d77'));
+  check('H: a file Skip kept: no Open, a double-click sends nothing', [labels().filter((l) => l.startsWith('Open')), opens()], [[], []]);
+  grid.focus();
+  setDlCursor(rowOf('d77'));
+  key('Enter', { ctrlKey: true });
+  check('H: nor Ctrl+Enter', opens(), []);
+  clearSel();
+  dl.cursor = '';
   folderOpen.clear();
 
   // ---- C: performance (DOWNLOADS-UI.md 14, C) ----------------------------------------------------

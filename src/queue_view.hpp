@@ -11,6 +11,7 @@
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "json.hpp"
+#include "open_file.hpp"
 
 #include <array>
 #include <cstddef>
@@ -41,6 +42,11 @@ struct Names {
 [[nodiscard]] fetch::Reserved reserved_names(const std::filesystem::path& dir, const Names& names);
 // Where file `i` lands (folder::target_of).
 [[nodiscard]] std::filesystem::path target_of(const std::filesystem::path& dir, const Names& names, std::size_t i);
+// File `i` to open from the page (open_file.hpp), under the caller's lock: where it landed and its
+// bytes, once it is done; nullopt while it isn't, or for an index outside the folder. `names` is
+// the files' current generation (Item::names).
+[[nodiscard]] std::optional<open_file::Finished> finished_file(const std::filesystem::path& dir, const Names& names,
+                                                               const std::vector<folder::File>& files, std::size_t i);
 
 // The page's status code for a running big file that waits for a connection while the folder's
 // small files hold them (folder::Tree::small_connections): "Waiting" (DOWNLOADS-UI.md, chunk G),

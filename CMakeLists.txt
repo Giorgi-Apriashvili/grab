@@ -86,14 +86,16 @@ add_library(grab_core STATIC
     src/guard.cpp
     src/notices.cpp
     src/queue_view.cpp
+    src/open_file.cpp
     src/speed.cpp)
 
 target_include_directories(grab_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # bcrypt: SHA-256 for verifying `grab update` downloads (Windows CNG, part of the OS).
 # crypt32: DPAPI, which encrypts the saved file lists for the current user.
 # ws2_32: Play's local HTTP server (play_stream.cpp).
+# shlwapi: a file type's "open" command and Windows' list of unsafe types (open_file.cpp).
 target_link_libraries(grab_core PUBLIC $<$<PLATFORM_ID:Windows>:bcrypt> $<$<PLATFORM_ID:Windows>:crypt32>
-                                       $<$<PLATFORM_ID:Windows>:ws2_32>)
+                                       $<$<PLATFORM_ID:Windows>:ws2_32> $<$<PLATFORM_ID:Windows>:shlwapi>)
 target_compile_features(grab_core PUBLIC cxx_std_23)
 target_compile_definitions(grab_core PUBLIC
     GRAB_VERSION="${PROJECT_VERSION}"

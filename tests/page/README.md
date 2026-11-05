@@ -3,8 +3,9 @@
 `test.js` checks the window's page (`src/gui/ui`: `index.html`, `app.js`, `app.css`) on its own,
 with no grab-gui and no server: the Downloads table (fixed columns, sorting, column widths, the
 keys and the treegrid ARIA), every file of a folder download, the filter and Go to running, a
-file's priority in its folder, the status bar's total speed and its graph, Waiting files, and
-timing budgets for 10,000 and 177,191 files. It stubs what the host would send and records what
+file's priority in its folder, the status bar's total speed and its graph, Waiting files, opening
+finished files (double-click, Open, Ctrl+Enter, the question before a program runs), and timing
+budgets for 10,000 and 177,191 files. It stubs what the host would send and records what
 the page sends back.
 
 `run_page_test.ps1` copies the page into a scratch folder with `test.js` loaded after `app.js`

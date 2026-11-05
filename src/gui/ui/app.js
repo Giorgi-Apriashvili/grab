@@ -3,14 +3,14 @@
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, suggest, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
-//                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, setExpanded, resolveExisting, play,
-//                 previewCancel,
+//                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, openFile, openDir, setExpanded,
+//                 resolveExisting, play, previewCancel,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
-//                 files, fileDelta, error, update, spaceShort, existing,
-//                 updateChecked, limit,
+//                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
+//                 updateChecked, limit, played,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -3745,6 +3745,10 @@ function downloadsMenu(qs) {
   const resuming = one ? qs.filter((q) => q.status === 'paused') : qs.filter((q) => q.status === 'paused' && !q.ask);
   const retrying = qs.filter((q) => q.status === 'failed' || q.status === 'cancelled');
   const cancelling = qs.filter((q) => UNFINISHED.includes(q.status));
+  // One finished download opens (chunk H): a file in its app, a folder in Explorer.
+  if (one && dlOpenKind({ kind: 'dl', id: one.id })) {
+    items.push({ label: one.mode === 'folder' ? 'Open folder' : 'Open', key: 'Ctrl+Enter', act: () => dlOpen({ kind: 'dl', id: one.id }) }, '-');
+  }
   if (pausing.length) items.push({ label: counted('Pause', pausing), act: () => pausing.forEach((q) => send({ type: 'pauseItem', id: q.id })) });
   if (resuming.length) items.push({ label: counted('Resume', resuming), act: () => resuming.forEach(resumeItem) });
   if (retrying.length) {
@@ -3794,6 +3798,10 @@ function filesMenu(q, st, list) {
     for (const slot of fileActs(q, st, i)) if (slot && by[slot[0]]) by[slot[0]].push(i);
   }
   const items = [];
+  // One finished file opens in its app (chunk H); double-click and Ctrl+Enter do the same.
+  if (n === 1 && st.status[list[0]] === FS.done) {
+    items.push({ label: 'Open', key: 'Ctrl+Enter', act: () => dlOpen({ kind: 'file', id: q.id, index: list[0] }) }, '-');
+  }
   if (by.pause.length) items.push({ label: counted('Pause', by.pause), act: () => fileAction(q, st, 'pause', by.pause) });
   if (by.resume.length) items.push({ label: counted('Resume', by.resume), act: () => fileAction(q, st, 'resume', by.resume) });
   if (by.retry.length) items.push({ label: counted('Retry', by.retry), act: () => fileAction(q, st, 'retry', by.retry) });
@@ -3823,6 +3831,46 @@ function dlMenu() {
   if (files) return filesMenu(files.q, files.st, files.list);
   const rows = selectedDl();
   return rows.length ? downloadsMenu(rows.map((r) => dl.byId.get(r.id)).filter(Boolean)) : [];
+}
+
+// What Open does on a row (DOWNLOADS-UI.md, chunk H), only once it is finished: 'file' opens a
+// file download's file or a folder's file in its app, 'folder' a folder download's folder in
+// Explorer; '' for anything else (unfinished, failed, cancelled, skipped, a message row).
+function dlOpenKind(r) {
+  const q = r && dl.byId.get(r.id);
+  if (!q) return '';
+  if (r.kind === 'file') {
+    const st = dl.stores.get(r.id);
+    return st && st.status[r.index] === FS.done ? 'file' : '';
+  }
+  if (r.kind !== 'dl' || q.status !== 'done') return '';
+  if (q.kept) return ''; // Skip kept the user's own file: grab downloaded nothing to open
+  return q.mode === 'folder' ? 'folder' : 'file';
+}
+
+// Opens a finished row (dlOpenKind). The backend finds the file from its own state, by the row's
+// id (and a folder's generation and index), asks first for a program (openAsk) and says in the
+// head when the file is gone or changed (downloadsNote). Whether it did anything.
+function dlOpen(r) {
+  const kind = dlOpenKind(r);
+  if (kind === 'folder') send({ type: 'openDir', id: r.id });
+  else if (kind === 'file' && r.kind === 'file') send({ type: 'openFile', id: r.id, gen: dl.stores.get(r.id).gen, index: r.index });
+  else if (kind === 'file') send({ type: 'openFile', id: r.id });
+  return kind !== '';
+}
+
+// The backend's question before a downloaded program, script, installer or shortcut runs: Run or
+// Cancel, the focus on Cancel, Esc cancels.
+function onOpenAsk(msg) {
+  if (modal) return; // another question is open: this one isn't asked over it
+  showModal({
+    title: `Run “${msg.name}”?`,
+    html: `<p>It came from ${esc(msg.server)}.</p>`,
+    ok: 'Run',
+    danger: true,
+    // The same file again, by the same row; the backend runs it only if it is still finished.
+    onOk: () => send({ type: 'openFile', id: msg.id, ...(msg.index === undefined ? {} : { gen: msg.gen, index: msg.index }), run: true }),
+  });
 }
 
 // A row's buttons: the folder's ▸/▾ and the two slots.
@@ -3924,6 +3972,9 @@ function endDrag(drop) {
     // Right-click: a row outside the selection becomes the selection; inside, it stays.
     if (ev.button === 2) { if (!isSel(r)) selectDl(r); else renderDlBody(); return; }
     selectDl(r, { toggle: ev.ctrlKey, extend: ev.shiftKey });
+    // A double-click opens a finished file (chunk H), by the second press's click count, as in
+    // Browse; a folder's row and an unfinished one do nothing more than a click.
+    if (ev.button === 0 && ev.detail === 2 && !ev.ctrlKey && !ev.shiftKey && dlOpenKind(r) === 'file') dlOpen(r);
   });
   body.addEventListener('contextmenu', (ev) => {
     const r = rowOfEl(ev.target.closest('.dl-row'));
@@ -3964,8 +4015,9 @@ function endDrag(drop) {
   });
   // The keys (5.8): the cursor goes through the rows, Shift extends the selection, Ctrl moves the
   // cursor alone, Ctrl+Space toggles its row; → and ← open and fold folders; Enter shows a
-  // finished download; Delete cancels or skips; Alt+↑/↓ moves a waiting download; Shift+F10 or
-  // the menu key opens the menu. Space is left free (Browse plays with it).
+  // finished download, Ctrl+Enter opens it (chunk H); Delete cancels or skips; Alt+↑/↓ moves a
+  // waiting download; Shift+F10 or the menu key opens the menu. Space is left free (Browse plays
+  // with it).
   grid.addEventListener('keydown', (ev) => {
     if (ev.target !== grid || modal) return; // a title's button keeps its own keys
     if (!['Shift', 'Control', 'Alt', 'Meta'].includes(ev.key)) dl.keyAt = performance.now(); // holds a new order
@@ -4005,6 +4057,9 @@ function endDrag(drop) {
       const st = r && r.kind === 'file' ? dl.stores.get(r.id) : null;
       if (q && (q.status === 'done' || q.status === 'skipped')) send({ type: 'openFolder', id: q.id });
       else if (st && st.status[r.index] === FS.done) send({ type: 'showFile', id: r.id, gen: st.gen, index: r.index });
+    } else if (ev.key === 'Enter' && ev.ctrlKey && !ev.shiftKey) {
+      ev.preventDefault();
+      if (r) dlOpen(r); // the cursor's row, once finished
     } else if (ev.key === 'Delete' && !ev.ctrlKey) {
       ev.preventDefault();
       deleteSelection();
@@ -5151,6 +5206,8 @@ if (webview) {
       case 'files': onFiles(msg); break;
       case 'fileDelta': onFileDelta(msg); break;
       case 'speed': onSpeed(msg); break;
+      case 'openAsk': onOpenAsk(msg); break;
+      case 'downloadsNote': dlNote(msg.text); break;
       case 'update': state.update = msg; renderUpdate(); break;
       case 'updateChecked': onUpdateChecked(msg); break;
       case 'limit': onLimit(msg); break;

@@ -33,6 +33,7 @@ add_executable(grab_tests
     test_fetch.cpp
     test_folder.cpp
     test_queue_view.cpp
+    test_open_file.cpp
     test_speed.cpp
     test_rate.cpp
     test_progress_line.cpp

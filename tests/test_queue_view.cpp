@@ -2,6 +2,7 @@
 #include "folder_job.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "open_file.hpp"
 #include "queue_view.hpp"
 #include "util.hpp"
 
@@ -64,6 +65,29 @@ TEST_CASE("a folder's names for the page: paths, sizes, and the local name where
     CHECK(from_names(dir / "sub" / "A.BIN"));
     CHECK(from_names(dir / "E01 (2).MKV"));
     CHECK_FALSE(from_names(dir / "e01.mkv.grabpart"));
+}
+
+TEST_CASE("a folder's file to open: where it landed and its bytes, once it is done") {
+    auto t = sample();
+    const auto n = queue_view::names_of(t.files);
+    const auto dir = std::filesystem::path("D") / "f";
+    t.files[0].status = State::running;
+    t.files[0].bytes = 50;
+    t.files[1].status = State::failed;
+    t.files[2].status = State::done;
+    t.files[2].bytes = folder::small_limit;
+    t.files[3].status = State::done;
+    t.files[3].bytes = 400;
+    using open_file::Finished;
+    CHECK(queue_view::finished_file(dir, n, t.files, 2) == Finished{.path = dir / "e01 (2).mkv", .size = folder::small_limit}); // its Keep-both name
+    CHECK(queue_view::finished_file(dir, n, t.files, 3) == Finished{.path = dir / "CON_.txt", .size = 400}); // its safe name
+    CHECK_FALSE(queue_view::finished_file(dir, n, t.files, 0).has_value()); // still downloading
+    CHECK_FALSE(queue_view::finished_file(dir, n, t.files, 1).has_value()); // failed
+    CHECK_FALSE(queue_view::finished_file(dir, n, t.files, 4).has_value()); // not a file of it
+    for (const auto s : {State::queued, State::paused, State::skipped}) {
+        t.files[3].status = s;
+        CHECK_FALSE(queue_view::finished_file(dir, n, t.files, 3).has_value());
+    }
 }
 
 TEST_CASE("one pass over a folder's files counts its totals and finds the rows that changed") {

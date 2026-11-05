@@ -12,6 +12,7 @@
 #include "listing.hpp"
 #include "local_name.hpp"
 #include "notices.hpp"
+#include "open_file.hpp"
 #include "play_server.hpp"
 #include "preview.hpp"
 #include "process.hpp"
@@ -889,6 +890,19 @@ void App::on_message(const std::string& text) {
         const int gen = int_of(*msg, "gen", -1);
         const int index = int_of(*msg, "index", -1);
         if (index >= 0) host_.defer([this, id, gen, index] { show_file(id, gen, static_cast<std::size_t>(index)); });
+    } else if (type == "openFile") {
+        // Not from inside WebView2's event handler: Windows' own dialogs (Open with) run their
+        // own message loop.
+        const int id = int_of(*msg, "id", -1);
+        const int gen = int_of(*msg, "gen", -1);
+        const int index = int_of(*msg, "index", -1);
+        const bool run = bool_of(*msg, "run");
+        host_.defer([this, id, gen, index, run] {
+            open_finished(id, gen, index >= 0 ? std::optional<std::size_t>(index) : std::nullopt, run);
+        });
+    } else if (type == "openDir") {
+        const int id = int_of(*msg, "id", -1);
+        host_.defer([this, id] { open_dir(id); });
     } else if (type == "setExpanded") {
         // The user's ▸/▾ on a folder, kept in queue.json.
         const int id = int_of(*msg, "id", -1);
@@ -2586,6 +2600,101 @@ void App::show_file(int id, int gen, std::size_t index) {
     if (!target.empty()) show_in_explorer(target);
 }
 
+void App::open_finished(int id, int gen, std::optional<std::size_t> index, bool run) {
+    std::optional<open_file::Finished> done;
+    std::string server;
+    std::filesystem::path kept_own; // a file download done by Skip: the user's own file, kept
+    {
+        std::lock_guard lock(mutex_);
+        const auto it = std::ranges::find(items_, id, [](const auto& i) { return i->id; });
+        if (it == items_.end()) return;
+        const Item& item = **it;
+        server = item.remote;
+        if (index) {
+            // A file of a folder download, of the generation the page shows.
+            if (item.mode == Mode::folder && item.gen == gen && item.names) {
+                done = queue_view::finished_file(folder::local_dir(item.dest, item.path), *item.names, item.tree.files,
+                                                 *index);
+            }
+        } else if (item.mode == Mode::file && item.status == Status::done) {
+            done = item.finished;
+            if (!done) kept_own = item_target(item);
+        }
+    }
+    if (!kept_own.empty()) {
+        return post_downloads_note(std::format("{} wasn't downloaded: Skip kept your own file there.",
+                                               util::path_to_utf8(kept_own.filename())));
+    }
+    if (!done) return; // not finished: the page offers Open on finished rows only
+    const auto name = util::path_to_utf8(done->path.filename());
+    switch (open_file::check(*done)) {
+    case open_file::Found::ok:
+        break;
+    case open_file::Found::gone:
+        return post_downloads_note(std::format("{} isn't there any more: it was moved or deleted.", name));
+    case open_file::Found::changed:
+        return post_downloads_note(std::format("{} changed since grab downloaded it: open it from its folder.", name));
+    }
+    // A program, script, installer or shortcut runs: the page asks first (Run / Cancel).
+    if (!run && open_file::runs_program(done->path)) {
+        Value v = Value::make_object();
+        v.set("type", str("openAsk"));
+        v.set("id", num(id));
+        if (index) {
+            v.set("gen", num(gen));
+            v.set("index", num(static_cast<double>(*index)));
+        }
+        v.set("name", str(name));
+        v.set("server", str(server));
+        return post(v);
+    }
+    const std::wstring file = done->path.wstring();
+    const std::wstring folder = done->path.parent_path().wstring();
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.hwnd = host_.hwnd; // Windows' own dialogs (Open with, its errors) belong to the window
+    info.lpVerb = L"open";
+    info.lpFile = file.c_str();
+    info.lpDirectory = folder.c_str(); // a program starts in its own folder, as from Explorer
+    info.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&info)) {
+        const DWORD code = GetLastError();
+        // Cancelled: the user closed Windows' Open with.
+        if (code != ERROR_CANCELLED) post_downloads_note(std::format("Couldn't open {}: {}", name, util::error_message(code)));
+    }
+}
+
+void App::open_dir(int id) {
+    std::filesystem::path dir;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& item : items_) {
+            if (item->id == id && item->mode == Mode::folder && item->status == Status::done) {
+                dir = folder::local_dir(item->dest, item->path);
+            }
+        }
+    }
+    if (dir.empty()) return;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return post_downloads_note(
+            std::format("{} isn't there any more: it was moved or deleted.", util::path_to_utf8(dir.filename())));
+    }
+    // Explorer on the folder; the Windows folder's, never an explorer.exe in the current folder
+    // (G3), and never anything the folder's name could make Windows run.
+    const auto explorer = proc::find_program("explorer");
+    if (!explorer) return;
+    const std::wstring args = L"\"" + dir.wstring() + L"\"";
+    ShellExecuteW(host_.hwnd, L"open", explorer->c_str(), args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void App::post_downloads_note(const std::string& text) const {
+    Value v = Value::make_object();
+    v.set("type", str("downloadsNote"));
+    v.set("text", str(text));
+    post(v);
+}
+
 void App::set_limit(bool on, double mibps) {
     if (!(mibps >= min_limit_mibps && mibps <= max_limit_mibps)) mibps = state_.limit_mibps; // also NaN
     const auto now = schedule::local_now();
@@ -2937,7 +3046,13 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         std::lock_guard lock(mutex_);
         d.target = item_target(*item);
         choice = item->existing;
+        item->finished.reset();
     }
+    // Done with the server's copy at `at` (`size` bytes): Open opens it.
+    auto done_at = [&](const std::filesystem::path& at, std::uint64_t size) {
+        std::lock_guard lock(mutex_);
+        item->finished = open_file::Finished{.path = at, .size = size};
+    };
     d.replace = choice == existing::Choice::replace;
     d.limiter = &limiter_;
     d.weight = &item->weight;
@@ -2965,6 +3080,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     if (result.outcome == fetch::Outcome::exists && choice == existing::Choice::keep_both) {
         // A copy an earlier Keep both kept that already is the server's file (review G112).
         if (const auto kept = existing::kept_copy(d.target, result.size, util::parse_rfc3339(result.modtime))) {
+            done_at(*kept, result.size);
             return set(Status::done, {}, std::format("already there as {}, nothing fetched", util::path_to_utf8(kept->filename())));
         }
         const auto second = existing::second_copy(d.target);
@@ -3012,7 +3128,10 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                 item->connections = 0;
             }
         }
-        if (!check) return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
+        if (!check) {
+            done_at(d.target, result.size);
+            return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
+        }
         dirty_ = true;
         // Against the server's file as this download fetched it: its size and time.
         const auto checked = verify::file(verify_request(*ctx, item, d.pool),
@@ -3042,6 +3161,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                 std::lock_guard lock(mutex_);
                 item->check = verify::mark(checked);
             }
+            done_at(d.target, result.size);
             return set(Status::done, {}, verify::summary(checked));
         }
     }
@@ -3373,6 +3493,8 @@ json::Value App::queue_item(const Item& i, int position) const {
     v.set("current", str(i.current));
     v.set("error", str(i.error));
     v.set("note", str(i.note));
+    // A file download Skip ended by keeping the user's own file: done, but nothing of grab's to open.
+    if (i.mode == Mode::file && i.status == Status::done && !i.finished) v.set("kept", Value::make_bool(true));
     if (!i.waiting.empty()) v.set("waiting", str(i.waiting)); // why it waits paused: a message row
     v.set("connections", num(i.connections));
     // Listing, checking or verifying, while running (DOWNLOADS-UI.md 5.3), and the ✓ or ⚠ after a check.
