@@ -85,6 +85,26 @@ endif()
 
 add_test(NAME grab_tests COMMAND grab_tests)
 
+# The window's page logic (src/gui/ui) in a headless Microsoft Edge: tests/page/run_page_test.ps1
+# with PowerShell 7 (see tests/page/README.md). It builds nothing. Label "page": `ctest -L page`
+# runs it alone, `-LE page` leaves it out. Skipped, not failed, without pwsh (found here) or Edge
+# (the script exits 77). RUN_SERIAL: its timing checks want the machine to themselves.
+if(WIN32)
+    find_program(GRAB_PWSH NAMES pwsh DOC "PowerShell 7, for the page-logic test (tests/page)")
+    if(GRAB_PWSH)
+        add_test(NAME page-logic
+            COMMAND "${GRAB_PWSH}" -NoLogo -NoProfile -NonInteractive
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/page/run_page_test.ps1")
+        set_tests_properties(page-logic PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+        message(STATUS "page-logic test: PowerShell 7 (pwsh) not found; CTest will skip it")
+        add_test(NAME page-logic COMMAND "${CMAKE_COMMAND}" -E echo
+            "page-logic: SKIPPED: PowerShell 7 (pwsh) was not found when the build was configured")
+        set_tests_properties(page-logic PROPERTIES SKIP_REGULAR_EXPRESSION "page-logic: SKIPPED")
+    endif()
+    set_tests_properties(page-logic PROPERTIES LABELS page TIMEOUT 300 RUN_SERIAL TRUE)
+endif()
+
 # rclone for the tests only (Windows): what grab is compared with, the rclone 1.75.1 grab 0.20 and
 # earlier bundled (the same zip and SHA-256). The import's reader and reveal (test_rclone_env.cpp),
 # the key logins against `rclone serve sftp` (test_ssh_keys.cpp) and the live

@@ -90,6 +90,12 @@ The tests compare grab with rclone 1.75.1, which the configure downloads (checks
 into `build\<preset>\test-tools` for them alone; it is never installed or packed. Configured
 with `-DGRAB_TEST_TOOLS=OFF`, the build leaves it out and those tests are skipped.
 
+The window's page logic (the Downloads table) has tests of its own in `tests/page`: they open the
+page in a headless Microsoft Edge with PowerShell 7 and build nothing
+(`pwsh -File tests/page/run_page_test.ps1`, or `ctest --preset clang-cl-debug -L page`; `-LE page`
+leaves them out). CTest skips them when Edge or pwsh is missing; see
+[tests/page/README.md](../tests/page/README.md).
+
 In VS Code the CMake Tools extension picks up `CMakePresets.json`; clangd reads
 `build/clang-cl-debug/compile_commands.json`; `launch.json` has a CodeLLDB dry-run config.
 
@@ -1381,12 +1387,14 @@ cmake/vcpkg*    OpenSSL from vcpkg; cmake/vcpkg-ports/openssl pins 3.5 LTS
 src/gui/        grab-gui: WebView2 host, tray, settings backend, ui/ (HTML, CSS, JS)
 installer/      Inno Setup script           tools/         make_icon.py (src/gui/grab.ico)
 tests/          doctest unit tests (doctest and the tests' rclone fetched by CMake)
+tests/page/     the window's page logic in a headless Edge (run_page_test.ps1, test.js)
 ```
 
 ## Releasing
 
 GitHub Actions ([build.yml](../.github/workflows/build.yml)) builds and tests every push and pull
-request with MSVC and clang-cl. Pushing a version tag additionally runs the `dist` target, which
+request with MSVC and clang-cl; the clang-cl job also runs the page-logic tests (`tests/page`) in
+the runner's Edge. Pushing a version tag additionally runs the `dist` target, which
 packs the portable zip and compiles the Inno Setup installer from
 [installer/grab.iss.in](../installer/grab.iss.in), writes `SHA256SUMS.txt` for both, and attaches
 all three to a GitHub Release. `grab update` depends on that checksum file.

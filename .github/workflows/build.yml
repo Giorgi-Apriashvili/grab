@@ -35,6 +35,7 @@ jobs:
 
       - name: Put LLVM on PATH
         if: matrix.preset == 'clang-cl-release'
+        timeout-minutes: 10
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
 
@@ -62,7 +63,16 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
 
       - name: Test
-        run: ctest --preset ${{ matrix.preset }} --output-on-failure
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure -LE page
+
+      # The window's page logic (tests/page) in the runner's own Edge and PowerShell 7, about 10 s.
+      # It builds nothing, so one job runs it, the shorter one; run directly rather than through
+      # CTest, so a runner without Edge fails here (exit 77) instead of skipping it.
+      - name: Page-logic tests
+        if: matrix.preset == 'clang-cl-release'
+        timeout-minutes: 10
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File tests/page/run_page_test.ps1
 
       # Inno Setup 6 is preinstalled on the Windows runner image, so dist yields both files.
       - name: Package (portable zip + Inno Setup installer)
