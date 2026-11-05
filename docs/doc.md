@@ -409,16 +409,18 @@ them.
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
     Save to stays), Open folder location (search results), Copy path (the server path) and Copy
     name. With several rows selected, they act on all of them.
-  - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move up, Move down, Move to top
+  - **On a download:** Pause, Resume or Retry, Cancel, Priority, Set all files to High / Normal /
+    Low (a listed folder: its unfinished files' own priority), Move up, Move down, Move to top
     and Move to bottom (waiting downloads, in the queue order), Show in folder, Copy path (where
     it lands on this PC) and Copy error (failed ones). A file inside a folder download has Pause,
-    Resume, Retry (failed ones), Skip, Show in folder, Copy path (where it lands, under the name
-    grab saved it as) and Copy error. With several selected, each entry acts on those it applies
-    to, all at once (Show in folder shows the first).
+    Resume, Retry (failed ones), Skip, Priority (unfinished ones), Show in folder, Copy path (where
+    it lands, under the name grab saved it as) and Copy error. With several selected, each entry
+    acts on those it applies to, all at once (Show in folder shows the first).
   - Shift+F10 or the menu key opens the menu for the row under the cursor, or in Downloads for
     the selected rows (the cursor's row when none is selected).
 - **The Downloads table** has a row per download and fixed columns: Name (with where it goes),
-  Status, Progress, Size, Speed, ETA, Priority and two buttons. Numbers keep one format ("85.7
+  Status, Progress, Size, Speed, ETA, Priority (on unfinished downloads and on the unfinished
+  files of a folder) and two buttons. Numbers keep one format ("85.7
   MiB / 8.0 GiB", "12.3 MiB/s", "5:12", a whole percent) and every column keeps its width, so
   nothing on a row moves while it downloads.
   - **Status** says what a row does: Queued #2 (its place among the waiting downloads), Listing (a
@@ -429,7 +431,9 @@ them.
     files done, skipped and failed, the speed, the time left, the connections, notes such as
     "already there, nothing fetched" and the verify summary.
   - A file of a folder has its own status, or its folder's, greyed: Paused while the folder is
-    paused, Stopped when the folder failed, Cancelled with the folder.
+    paused, Stopped when the folder failed, Cancelled with the folder. A big file that waits for
+    a connection (the folder's small files or other downloads hold them) says Queued until it
+    downloads.
   - **The two buttons** stay in the same places on every row: Pause or Resume (Retry, or Resume
     from what came, after a failure; Show in folder once done) and Cancel; on a file of a folder,
     Pause or Resume and Skip, Retry and Skip after a failure, and Show in folder once done. One
@@ -458,7 +462,8 @@ them.
     second click reverses it; the third goes back to the queue order. Ties keep the queue order,
     and rows with nothing in that column (no size yet, no speed while not downloading) go last
     both ways. A folder's files are sorted the same way under it, ties in their folder order;
-    unsorted, they are in the order they start. Tab reaches the titles too, and
+    unsorted, they are in the order they start (High first, then Normal, then Low, each in folder
+    order; see Bandwidth priority). Tab reaches the titles too, and
     Enter or Space clicks them.
     - Rows never move under the mouse: when changing numbers (status, progress, speed, time
       left, a priority) call for a new order, it comes at most once a second, and waits while
@@ -530,6 +535,25 @@ them.
     3.0 vs 0.8 of 4 MiB/s).
   - With no limit, downloads from *different* servers compete on your line directly.
     Priority then acts only through their connection counts.
+  - **Each file of a folder has a priority of its own** (Normal unless set): the Priority column
+    on its row, Priority in the menu for the selected files, or Set all files to High / Normal /
+    Low in the folder's menu. Finished files keep theirs.
+    - A folder's files have no queue order of their own, so here priority also decides which
+      start first: High, then Normal, then Low, each in folder order. It applies at once: a
+      queued file moves in that order, a running one is never restarted.
+    - It orders the small files (under 2 MiB) and the big ones separately, and neither waits for
+      the other: a Normal small file still starts while a High big file waits for an At once
+      place. At once still counts the big files; priority only decides which take its places.
+    - Running big files split the folder's connections (those its small files don't hold)
+      4 : 2 : 1, at least one each, and under a speed limit the folder's part of it too. With
+      fewer connections than running big files, the higher priorities get them and the others
+      wait (shown Queued), so a Low file doesn't download while a High one waits. Small files
+      come too quickly for a speed of their own: for them priority is the order only.
+    - The folder's own priority still sets its share against other downloads; its files split
+      that share among themselves, so a folder with High files inside gets no more than before.
+    - Kept in queue.json (`"priority"` on a file, only when not Normal); grab 0.21 doesn't know
+      it and reads every file as Normal. The `grab` command downloads every file at Normal, in
+      folder order, as before.
 - **Speed limit:** the bar below the downloads shows the total speed. On its right, "Limit
   speed" caps all downloads together, in MiB/s; the switch keeps the value, and both are
   remembered.
@@ -579,9 +603,9 @@ them.
     help in a big folder (see the Downloads table).
   - The window keeps up with folders of 177,000 files: their rows are made only as they show, the
     list comes once in pieces, then only the files that changed, four times a second.
-  - Each file can be paused, resumed, retried after a failure or skipped. The folder's own
-    buttons act on all of its
-    files.
+  - Each file can be paused, resumed, retried after a failure or skipped, and has a priority of
+    its own (which files start first; see Bandwidth priority). The folder's own buttons act on
+    all of its files.
   - Files of 2 MiB and more take the resumable path above, as many at a time as At once allows,
     their pieces spread over the server's connections.
   - Smaller files go beside them on every free connection, many at a time (up to 32 files and 8
@@ -590,8 +614,8 @@ them.
     flight.
   - The tree and each file's state survive closing grab, the failed files with their error:
     they show Failed until the folder runs again, which tries them again (grab 0.21 and earlier
-    read such a list with those files queued). Files already complete on disk are not fetched
-    again.
+    read such a list with those files queued). Each file's priority survives too. Files already
+    complete on disk are not fetched again.
 - **Connections per server:** every download from a server shares that server's connection
   budget.
   - The budget is 14 for Hetzner Storage Boxes and 12 elsewhere. Set it per server in

@@ -962,7 +962,13 @@ Result run(const Download& d, Connections& connections, const std::function<void
                         asking = false;
                         break;
                     }
-                    if (d.limiter != nullptr && !d.limiter->acquire(n, token, d.id, weight())) break;
+                    // A folder's file works out its weight under the folder's lock: only while a
+                    // limit is on.
+                    if (d.limiter != nullptr && d.limiter->rate() > 0 &&
+                        !d.limiter->acquire(n, token, rate::flow_of(d.id, d.member),
+                                            d.flow_weight ? d.flow_weight() : static_cast<double>(weight()))) {
+                        break;
+                    }
                     send(next, static_cast<std::uint32_t>(n));
                     next += n;
                 }
@@ -1038,7 +1044,21 @@ Result run(const Download& d, Connections& connections, const std::function<void
             if (d.on_command) {
                 d.on_command({"sftp", "read", src.path, "--offset", std::to_string(offset), "--count", std::to_string(count)});
             }
-            sftp_range(i, offset, a);
+            {
+                // Reading on its connection for as long as sftp_range goes (Download::on_reading).
+                struct Reading {
+                    const Download& d;
+                    explicit Reading(const Download& dl) : d(dl) {
+                        if (d.on_reading) d.on_reading(+1);
+                    }
+                    ~Reading() {
+                        if (d.on_reading) d.on_reading(-1);
+                    }
+                    Reading(const Reading&) = delete;
+                    Reading& operator=(const Reading&) = delete;
+                } reading(d);
+                sftp_range(i, offset, a);
+            }
             const bool refused = a.failure == budget::Failure::refused && !token.stop_requested();
             if (refused) connections.refused(d.server);
             if (!a.yielded) connections.release(d.server, d.id, 1, a.worked);

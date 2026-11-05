@@ -78,13 +78,13 @@ void TokenBucket::debit(std::uint64_t n, Clock::time_point now) {
 
 // ---- fair queue ------------------------------------------------------------------------------
 
-FairQueue::Ticket FairQueue::add(int flow, std::uint64_t n, int weight) {
+FairQueue::Ticket FairQueue::add(std::uint64_t flow, std::uint64_t n, double weight) {
     auto& finish = finish_[flow];
     Ticket t;
     t.start = std::max(vtime_, finish);
     t.seq = seq_++;
     t.flow = flow;
-    finish = t.start + static_cast<double>(n) / static_cast<double>(std::max(weight, 1));
+    finish = t.start + static_cast<double>(n) / (weight > 0 && std::isfinite(weight) ? weight : 1.0);
     pending_.insert(t);
     return t;
 }
@@ -119,7 +119,7 @@ std::uint64_t RateLimiter::generation() {
     return generation_;
 }
 
-bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop, int flow, int weight) {
+bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop, std::uint64_t flow, double weight) {
     std::unique_lock lock(mutex_);
     while (n > 0) {
         if (stop.stop_requested()) return false;

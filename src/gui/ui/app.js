@@ -3,7 +3,8 @@
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, suggest, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
-//                 watchFiles, unwatchFiles, fileAction, showFile, setExpanded, resolveExisting, play, previewCancel,
+//                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, setExpanded, resolveExisting, play,
+//                 previewCancel,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
@@ -2287,6 +2288,7 @@ function folderIsOpen(q) {
 const FILE_STATES = ['queued', 'running', 'paused', 'done', 'failed', 'skipped'];
 const FS = { queued: 0, running: 1, paused: 2, done: 3, failed: 4, skipped: 5 };
 const PRIORITY_OF_WEIGHT = { 4: 'high', 2: 'normal', 1: 'low' };
+const WEIGHT_OF_PRIORITY = { high: 4, normal: 2, low: 1 };
 // Above this many files a folder is sorted by a live column (Status, Progress, Speed, ETA) only
 // when its title is clicked: its arrow is hollow, "the order from your click" (5.6).
 const DL_LIVE_FILES = 5000;
@@ -2823,6 +2825,7 @@ function dlView(q) {
     eta: fetching ? fmtClock(q.eta) : '',
     etaTip: fetching ? fmtEta(q.eta) : '',
     prio: UNFINISHED.includes(st) ? q.priority : '',
+    prioTip: 'Bandwidth priority: how running downloads share the speed',
     slots: dlSlots(q),
   };
 }
@@ -2855,12 +2858,20 @@ function fileSlots(c, s) {
   }
 }
 
+// Whether file `i` has a priority to set (DOWNLOADS-UI.md 7): unfinished, its folder not cancelled.
+function fileHasPrio(q, st, i) {
+  const s = st.status[i];
+  return q.status !== 'cancelled' && s !== FS.done && s !== FS.skipped;
+}
+
 function fileView(q, st, i) {
   const c = fileOf(st, i);
   const s = fileStatus(q, c);
   const running = c.status === 'running' && !s.over;
   const tip = [s.why || s.word];
   if (running && (c.speed > 0 || fmtEta(c.eta))) tip.push([c.speed > 0 ? fmtSpeed(c.speed) : '', fmtEta(c.eta)].filter(Boolean).join(' · '));
+  const prio = fileHasPrio(q, st, i) ? c.priority : '';
+  if (dl.step >= 3 && prio) tip.push(`Priority: ${prioLabel(prio)}`); // its column is hidden
   const full = c.status === 'done';
   const total = full ? c.bytes || c.size : c.size; // done: as fetched
   // Saved under another name: one grab gave it (Keep both, or another file of the folder has its
@@ -2888,7 +2899,9 @@ function fileView(q, st, i) {
     speedTip: '',
     eta: running ? fmtClock(c.eta) : '',
     etaTip: running ? fmtEta(c.eta) : '',
-    prio: '', // a file's own priority comes with chunk D
+    prio,
+    prioTip: 'Priority in the folder: higher ones start first, and running files of 2 MiB and more share ' +
+      'the folder’s connections and speed by it',
     slots: fileSlots(c, s),
   };
 }
@@ -2918,8 +2931,7 @@ function newDlRow() {
     '<span class="c-status" role="gridcell"><span class="dl-word"></span><span class="dl-count"></span><span class="dl-mark"></span></span>' +
     '<span class="c-progress" role="gridcell"><span class="dl-bar"><i></i></span><span class="dl-pct"></span></span>' +
     '<span class="c-size" role="gridcell"></span><span class="c-speed" role="gridcell"></span><span class="c-eta" role="gridcell"></span>' +
-    '<span class="c-prio" role="gridcell"><select class="dl-prio" tabindex="-1" aria-label="Bandwidth priority" ' +
-    'title="Bandwidth priority: how running downloads share the speed">' +
+    '<span class="c-prio" role="gridcell"><select class="dl-prio" tabindex="-1" aria-label="Priority">' +
     PRIORITIES.map(([p, label]) => `<option value="${p}">${label}</option>`).join('') + '</select></span>' +
     '<span class="c-actions" role="gridcell"><span class="dl-slot"></span><span class="dl-slot"></span></span>' +
     '<span class="c-msg" role="gridcell"></span>';
@@ -3011,6 +3023,7 @@ function paintDlRow(el, r, i) {
     c.prio.style.visibility = p ? '' : 'hidden';
     c.prio.className = `dl-prio prio-${p || 'normal'}`;
   });
+  put(el, 'prioTip', view.prioTip, (t) => { c.prio.title = t; });
   if (view.prio && document.activeElement !== c.prio && c.prio.value !== view.prio) c.prio.value = view.prio;
   view.slots.forEach((s, k) => put(el, `slot${k}`, s ? s.join('|') : '', () => {
     if (c.slots[k].contains(document.activeElement)) dlFocus();
@@ -3683,6 +3696,13 @@ function fileAction(q, st, act, list) {
   send({ type: 'fileAction', id: q.id, gen: st.gen, act, ranges: rangesOf(list) });
 }
 
+// Their priority in the folder (DOWNLOADS-UI.md 7), those it changes, in one "setFilePriority".
+function setFilePriority(q, st, list, priority) {
+  const w = WEIGHT_OF_PRIORITY[priority];
+  const changing = list.filter((i) => fileHasPrio(q, st, i) && st.prio[i] !== w);
+  if (w && changing.length) send({ type: 'setFilePriority', id: q.id, gen: st.gen, ranges: rangesOf(changing), priority });
+}
+
 function skipFiles(q, st, list, ask) {
   const skipping = list.filter((i) => fileActs(q, st, i)[1]?.[0] === 'skip');
   if (!skipping.length) return;
@@ -3730,6 +3750,15 @@ function downloadsMenu(qs) {
         act: () => cancelling.forEach((q) => { if (q.priority !== p) send({ type: 'setPriority', id: q.id, priority: p }); }) });
     }
   }
+  // A listed folder's files, all at once (DOWNLOADS-UI.md 7): finished ones keep theirs.
+  const folders = cancelling.filter((q) => q.mode === 'folder' && q.files && q.files.total > 0 && q.gen);
+  if (folders.length) {
+    items.push('-');
+    for (const [p, label] of PRIORITIES) {
+      items.push({ label: `Set all files to ${label}`,
+        act: () => folders.forEach((q) => send({ type: 'setFilePriority', id: q.id, gen: q.gen, ranges: [[0, q.files.total - 1]], priority: p })) });
+    }
+  }
   // A waiting download moves in the queue (decision 4); Alt+↑/↓ does the first two. Only in the
   // queue order: sorted by a column, the rows don't show it (5.9).
   if (one && waiting(one)) {
@@ -3760,6 +3789,15 @@ function filesMenu(q, st, list) {
   if (by.resume.length) items.push({ label: counted('Resume', by.resume), act: () => fileAction(q, st, 'resume', by.resume) });
   if (by.retry.length) items.push({ label: counted('Retry', by.retry), act: () => fileAction(q, st, 'retry', by.retry) });
   if (by.skip.length) items.push({ label: counted('Skip', by.skip), key: 'Delete', act: () => skipFiles(q, st, by.skip, n > 1) });
+  // Their priority in the folder: the unfinished ones (DOWNLOADS-UI.md 7).
+  const prioritizing = list.filter((i) => fileHasPrio(q, st, i));
+  if (prioritizing.length) {
+    items.push('-', { heading: 'Priority' });
+    for (const [p, label] of PRIORITIES) {
+      items.push({ label, checked: prioritizing.every((i) => st.prio[i] === WEIGHT_OF_PRIORITY[p]),
+        act: () => setFilePriority(q, st, prioritizing, p) });
+    }
+  }
   if (items.length) items.push('-');
   items.push({ label: 'Show in folder', act: () => send({ type: 'showFile', id: q.id, gen: st.gen, index: list[0] }) });
   items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(list.map((i) => localPath(q, st, i))) });
@@ -3895,6 +3933,11 @@ function endDrag(drop) {
     if (!ev.target.matches('.dl-prio')) return;
     const r = rowOfEl(ev.target.closest('.dl-row'));
     if (r && r.kind === 'dl') send({ type: 'setPriority', id: r.id, priority: ev.target.value });
+    if (r && r.kind === 'file') {
+      const q = dl.byId.get(r.id);
+      const st = dl.stores.get(r.id);
+      if (q && st) setFilePriority(q, st, [r.index], ev.target.value);
+    }
     dlFocus(); // back to the table: its element may show another row later
   });
 

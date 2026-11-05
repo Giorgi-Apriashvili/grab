@@ -58,13 +58,22 @@ fs::path target_of(const fs::path& dir, const Names& names, std::size_t i) {
     return dir / local::relative(names.path.at(i));
 }
 
+namespace {
+
+// A file's state as the page shows it: a running big file that reads on no connection
+// (File::waiting) is queued, as it isn't downloading.
+State shown(const folder::File& f) { return f.status == State::running && f.waiting ? State::queued : f.status; }
+
+} // namespace
+
 Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow) {
     Pass p;
     if (shadow != nullptr && shadow->size() != files.size()) shadow = nullptr; // another generation's
     auto& t = p.totals;
     for (std::size_t i = 0; i < files.size(); ++i) {
         const auto& f = files[i];
-        ++p.counts[static_cast<std::size_t>(f.status)];
+        const State status = shown(f);
+        ++p.counts[static_cast<std::size_t>(status)];
         if (f.status != State::skipped) { // as folder::totals counts
             ++t.files;
             t.total += f.size;
@@ -78,12 +87,12 @@ Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow) {
         }
         if (shadow == nullptr) continue;
         auto& s = (*shadow)[i];
-        const bool running = f.status == State::running;
+        const bool running = status == State::running;
         Shadow now{.bytes = f.bytes,
                    .speed = running ? static_cast<float>(f.speed) : 0.0F,
                    .error = 0,
-                   .status = f.status,
-                   .weight = 2,
+                   .status = status,
+                   .weight = static_cast<std::uint8_t>(f.weight),
                    .verified = f.verified};
         // Hashed on every pass: a file queued again can fail with another error between two passes.
         if (f.status == State::failed) now.error = error_id(f.error);
@@ -106,7 +115,12 @@ Snapshot snapshot(const std::vector<folder::File>& files) {
     snap.rows.reserve(files.size());
     for (std::size_t i = 0; i < files.size(); ++i) {
         const auto& f = files[i];
-        Shadow s{.bytes = f.bytes, .speed = 0, .error = 0, .status = f.status, .weight = 2, .verified = f.verified};
+        Shadow s{.bytes = f.bytes,
+                 .speed = 0,
+                 .error = 0,
+                 .status = shown(f),
+                 .weight = static_cast<std::uint8_t>(f.weight),
+                 .verified = f.verified};
         if (f.status == State::failed) {
             s.error = error_id(f.error);
             snap.errors.emplace(i, f.error);

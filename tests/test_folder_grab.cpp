@@ -17,14 +17,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <stop_token>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,6 +54,17 @@ struct Tree {
     std::size_t readdir_batch = 3;          // names per READDIR answer
     std::atomic<int> sftp_fails{0};         // the next this many logins can't start SFTP
     std::atomic<bool> no_sftp_server{false}; // the server refuses SFTP on every login
+    std::chrono::milliseconds delay{0};     // every session's pause before each read, as a network's
+    std::size_t slice = 0;                  // every session's most bytes per read (0: all there are)
+    // Every OPEN and every READ (its path and length) as the sessions got them, when they did.
+    using Clock = std::chrono::steady_clock;
+    std::vector<std::pair<std::string, Clock::time_point>> opens;
+    struct Asked {
+        std::string path;
+        std::uint32_t length = 0;
+        Clock::time_point at;
+    };
+    std::vector<Asked> asks;
 
     struct Session : ssh::Session {
         explicit Session(Tree& t) : tree(t), no_sftp(t.sftp_fails-- > 0), client(server) {
@@ -58,6 +74,16 @@ struct Tree {
             server.readdir_size = t.readdir_size;
             server.denied = t.denied;
             server.readdir_batch = t.readdir_batch;
+            server.delay = t.delay;
+            server.slice = t.slice;
+            server.on_open = [&t](const std::string& path) {
+                std::lock_guard lock(t.mutex);
+                t.opens.emplace_back(path, Clock::now());
+            };
+            server.on_read = [&t](const std::string& path, std::uint32_t length) {
+                std::lock_guard lock(t.mutex);
+                t.asks.push_back(Asked{path, length, Clock::now()});
+            };
             client.start();
             server.broken_after = t.break_first_after.exchange(0);
         }
@@ -109,6 +135,17 @@ struct Tree {
         for (auto [off, len] : reads) n += len;
         return n;
     }
+    // The files' names in the order they were first opened, of those under `prefix`.
+    std::vector<std::string> started(std::string_view prefix) {
+        std::lock_guard lock(mutex);
+        std::vector<std::string> out;
+        for (const auto& [path, at] : opens) {
+            if (!path.starts_with(prefix)) continue;
+            auto name = path.substr(path.rfind('/') + 1);
+            if (std::ranges::find(out, name) == out.end()) out.push_back(std::move(name));
+        }
+        return out;
+    }
 };
 
 struct Run {
@@ -142,6 +179,12 @@ struct Run {
     Run(const Run&) = delete;
     Run& operator=(const Run&) = delete;
     fs::path local(const std::string& rel) const { return dest / "data" / local::relative(rel); }
+    // A listed file's index by its path in the folder, under the lock or before run().
+    std::size_t index(std::string_view path) const {
+        const auto it = std::ranges::find(tree.files, path, &folder::File::path);
+        REQUIRE_MESSAGE(it != tree.files.end(), path);
+        return static_cast<std::size_t>(it - tree.files.begin());
+    }
 };
 
 } // namespace
@@ -586,4 +629,338 @@ TEST_CASE("ssh walk: no entry without a name to save it under (G15); odd names i
     auto w = ssh::walk(*pool, "/data", ssh::WalkOptions{.connections = 1, .folders = true}, {});
     REQUIRE_MESSAGE(w, w.error_or(""));
     CHECK(paths_of(*w) == std::vector<std::string>{rclone_enc::from_raw_name("a/b"), "caf‛E9.txt"});
+}
+
+// ---- a file's priority in its folder (DOWNLOADS-UI.md 7 and 14, D) -------------------------------
+
+TEST_CASE("grab engine folders: High files start first, then Normal, then Low, of the small and of the big") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 12; ++i) t.file(std::format("/data/s{:02}.bin", i), test::pattern(1000 + i));
+    for (int i = 0; i < 6; ++i) t.file(std::format("/data/t{:02}.bin", i), test::pattern((2u << 20) + i));
+    // One connection and one big file at a time: each kind's files start one after another.
+    Run r(t.pool(1), "priority-order", 1, 1);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    // High on late files, Low on early ones.
+    for (const char* p : {"s00.bin", "s01.bin", "s02.bin", "t00.bin", "t01.bin"}) REQUIRE(folder::set_priority(r.tree, r.index(p), 1));
+    for (const char* p : {"s09.bin", "s10.bin", "s11.bin", "t04.bin", "t05.bin"}) REQUIRE(folder::set_priority(r.tree, r.index(p), 4));
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    CHECK(t.started("/data/s") == std::vector<std::string>{"s09.bin", "s10.bin", "s11.bin", "s03.bin", "s04.bin", "s05.bin",
+                                                           "s06.bin", "s07.bin", "s08.bin", "s00.bin", "s01.bin", "s02.bin"});
+    CHECK(t.started("/data/t") == std::vector<std::string>{"t04.bin", "t05.bin", "t02.bin", "t03.bin", "t00.bin", "t01.bin"});
+}
+
+TEST_CASE("grab engine folders: small files don't wait for High big files waiting for At once") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 500; ++i) t.file(std::format("/data/s{:03}.bin", i), test::pattern(2000 + i % 7));
+    for (int i = 0; i < 3; ++i) t.file(std::format("/data/t{}.bin", i), test::pattern((3u << 20) + i));
+    Run r(t.pool(4), "small-beside-high", 4, 1);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    std::vector<std::size_t> big;
+    for (int i = 0; i < 3; ++i) {
+        big.push_back(r.index(std::format("t{}.bin", i)));
+        REQUIRE(folder::set_priority(r.tree, big.back(), 4));
+    }
+    std::optional<Tree::Clock::time_point> first_big_done;
+    r.job.on_event = [&](folder::Event) {
+        std::lock_guard lock(r.m);
+        if (!first_big_done &&
+            std::ranges::any_of(big, [&](std::size_t k) { return r.tree.files[k].status == folder::State::done; })) {
+            first_big_done = Tree::Clock::now();
+        }
+    };
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    REQUIRE(first_big_done.has_value());
+    std::optional<Tree::Clock::time_point> first_small;
+    {
+        std::lock_guard lock(t.mutex);
+        const auto it = std::ranges::find_if(t.opens, [](const auto& o) { return o.first.starts_with("/data/s"); });
+        if (it != t.opens.end()) first_small = it->second;
+    }
+    REQUIRE(first_small.has_value());
+    // The small files started at once, not once the High ones had their places.
+    CHECK(*first_small < *first_big_done);
+}
+
+TEST_CASE("grab engine folders: a priority changed mid-run moves the files still queued") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 80; ++i) t.file(std::format("/data/s{:02}.bin", i), test::pattern(3000 + i));
+    for (int i = 0; i < 4; ++i) t.file(std::format("/data/t{}.bin", i), test::pattern((2u << 20) + 4096 * i));
+    // One connection and one big file at a time, as above.
+    Run r(t.pool(1), "priority-mid-run", 1, 1);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    const auto s40 = r.index("s40.bin");
+    const auto s79 = r.index("s79.bin");
+    const auto t0 = r.index("t0.bin");
+    const auto t3 = r.index("t3.bin");
+    std::size_t opens_then = 0;
+    bool small_moved = false;
+    bool big_moved = false;
+    r.job.on_event = [&](folder::Event) {
+        std::lock_guard lock(r.m);
+        // The first small file landed, 31 more on their way: the last one goes first now, s40 last.
+        if (!small_moved && std::ranges::any_of(r.tree.files, [](const folder::File& f) {
+                return !f.big && f.status == folder::State::done;
+            })) {
+            small_moved = true;
+            folder::set_priority(r.tree, s79, 4);
+            folder::set_priority(r.tree, s40, 1);
+            std::lock_guard opens(t.mutex);
+            opens_then = t.opens.size();
+        }
+        // The first big file started: the last one comes next.
+        if (!big_moved && r.tree.files[t0].status == folder::State::running) {
+            big_moved = true;
+            folder::set_priority(r.tree, t3, 4);
+        }
+    };
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    REQUIRE(small_moved);
+    REQUIRE(big_moved);
+    {
+        std::lock_guard lock(t.mutex);
+        REQUIRE(opens_then < t.opens.size());
+        CHECK(t.opens[opens_then].first == "/data/s79.bin");
+    }
+    const auto small_order = t.started("/data/s");
+    REQUIRE(small_order.size() == 80);
+    CHECK(small_order.back() == "s40.bin");
+    CHECK(t.started("/data/t") == std::vector<std::string>{"t0.bin", "t3.bin", "t1.bin", "t2.bin"});
+}
+
+TEST_CASE("grab engine folders: files paused and resumed, failed and retried, or stopped mid-run all come") {
+    // Each queues a file again after the next file's cursors went past it (Tree::requeued).
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 80; ++i) t.file(std::format("/data/s{:02}.bin", i), test::pattern(3000 + i));
+    for (int i = 0; i < 4; ++i) t.file(std::format("/data/t{}.bin", i), test::pattern((2u << 20) + 4096 * i));
+    Run r(t.pool(2), "lose-none", 2, 1);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    std::vector<std::size_t> held; // paused, then resumed
+    for (int i = 75; i < 80; ++i) held.push_back(r.index(std::format("s{}.bin", i)));
+    held.push_back(r.index("t3.bin"));
+    const auto failing = r.index("s74.bin");
+    std::stop_source stop;
+    int stage = 0;
+    r.job.on_event = [&](folder::Event) {
+        std::lock_guard lock(r.m);
+        const auto done = std::ranges::count_if(r.tree.files, [](const folder::File& f) {
+            return !f.big && f.status == folder::State::done;
+        });
+        if (stage == 0 && done >= 3) {
+            stage = 1;
+            for (const auto k : held) folder::pause_file(r.tree, k);
+            auto& f = r.tree.files[failing]; // as if it failed
+            if (f.status == folder::State::queued) {
+                f.status = folder::State::failed;
+                f.error = "made up";
+            }
+        } else if (stage == 1 && done >= 40) {
+            stage = 2;
+            for (const auto k : held) folder::resume_file(r.tree, k);
+            folder::retry_file(r.tree, failing);
+        } else if (stage == 2 && done >= 60) {
+            stage = 3;
+            stop.request_stop(); // the folder's own stop
+        }
+    };
+    folder::run(r.job, r.tree, r.m, stop.get_token());
+    CHECK(stage == 3);
+    {
+        std::lock_guard lock(r.m);
+        CHECK(std::ranges::any_of(r.tree.files, [](const folder::File& f) { return f.status == folder::State::queued; }));
+        CHECK(std::ranges::none_of(r.tree.files, [](const folder::File& f) {
+            return f.status == folder::State::running || f.status == folder::State::paused || f.status == folder::State::failed;
+        }));
+    }
+    r.job.on_event = {};
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) {
+        CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+        CHECK_MESSAGE(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path), f.path);
+    }
+}
+
+TEST_CASE("grab engine folders: running big files split the folder's connections by priority") {
+    Tree t;
+    t.dir("/data");
+    t.file("/data/high.bin", test::pattern(16u << 20));
+    t.file("/data/low.bin", test::pattern(16u << 20));
+    // Every connection as fast as the others, and slower than the test's threads.
+    t.delay = std::chrono::milliseconds(2);
+    t.slice = std::size_t{64} * 1024;
+    Run r(t.pool(5), "connection-part", 5, 2);
+    // A limit far above what comes: each stream has one READ on its way at a time, so what the
+    // streams asked for follows what came.
+    rate::RateLimiter limiter;
+    limiter.set_rate(std::uint64_t{1} << 30);
+    r.job.limiter = &limiter;
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    REQUIRE(folder::set_priority(r.tree, r.index("high.bin"), 4));
+    REQUIRE(folder::set_priority(r.tree, r.index("low.bin"), 1));
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) {
+        CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+        CHECK_MESSAGE(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path), f.path);
+    }
+    // What Low had asked for when High asked for its last bytes: 4 of the 5 connections were High's.
+    std::uint64_t high = 0;
+    std::uint64_t low = 0;
+    std::uint64_t low_then = 0;
+    {
+        std::lock_guard lock(t.mutex);
+        for (const auto& a : t.asks) {
+            if (a.path == "/data/high.bin") {
+                high += a.length;
+                low_then = low;
+            } else if (a.path == "/data/low.bin") {
+                low += a.length;
+            }
+        }
+    }
+    REQUIRE(low_then > 0);
+    const double ratio = static_cast<double>(high) / static_cast<double>(low_then);
+    MESSAGE("High : Low = ", ratio);
+    CHECK(ratio > 4.0 * 0.85);
+    CHECK(ratio < 4.0 * 1.15);
+}
+
+namespace {
+
+// Bytes of READs asked for under `prefix` from 0.5 s to 3.5 s after `start`: each right after its
+// tokens, past the start.
+std::uint64_t asked_between(Tree& from, std::string_view prefix, Tree::Clock::time_point start) {
+    std::lock_guard lock(from.mutex);
+    std::uint64_t n = 0;
+    for (const auto& a : from.asks) {
+        const auto at = a.at - start;
+        if (a.path.starts_with(prefix) && at >= std::chrono::milliseconds(500) && at < std::chrono::milliseconds(3500)) {
+            n += a.length;
+        }
+    }
+    return n;
+}
+
+// Runs `r`'s listed normal folder (on `t`) for 3.5 s under 4 MiB/s, beside a normal single
+// download of `other`'s /x/single.bin from server `server` ("Other", budget 4, or the folder's
+// own); says the folder's share of what both asked for.
+double share_beside(Tree& t, Run& r, Tree& other, const std::string& server) {
+    rate::RateLimiter limiter;
+    limiter.set_rate(4u << 20);
+    r.job.limiter = &limiter;
+    if (server == "Other") r.connections.configure("Other", 4);
+    fetch::Download d;
+    d.source = fetch::Source{.rclone_remote = server, .path = "/x/single.bin"};
+    d.server = server;
+    d.id = 8;
+    d.target = r.dest / "single.bin";
+    d.limiter = &limiter;
+    d.pool = other.pool(4);
+    std::stop_source stop;
+    auto single = fetch::Outcome::done;
+    const auto start = Tree::Clock::now();
+    {
+        std::jthread folder_run([&] { folder::run(r.job, r.tree, r.m, stop.get_token()); });
+        std::jthread single_run([&] { single = fetch::run(d, r.connections, {}, stop.get_token()).outcome; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+        stop.request_stop();
+    }
+    r.job.limiter = nullptr;
+    CHECK(single == fetch::Outcome::stopped);
+    const auto folder_bytes = asked_between(t, "/data/", start);
+    const auto single_bytes = asked_between(other, "/x/", start);
+    REQUIRE(folder_bytes + single_bytes > 0);
+    const double share = static_cast<double>(folder_bytes) / static_cast<double>(folder_bytes + single_bytes);
+    MESSAGE("folder ", folder_bytes, " B, single ", single_bytes, " B: the folder's share ", share);
+    return share;
+}
+
+} // namespace
+
+TEST_CASE("grab engine folders: under a speed limit a folder's files share its part, half beside another download") {
+    // A normal folder with a High and a Low big file and small files running at once, beside a
+    // normal single download from another server, under 4 MiB/s.
+    Tree t;
+    t.dir("/data");
+    t.file("/data/high.bin", test::pattern(8u << 20));
+    t.file("/data/low.bin", test::pattern(8u << 20));
+    for (int i = 0; i < 4; ++i) t.file(std::format("/data/s{}.bin", i), test::pattern((2u << 20) - 4096 - i));
+    Tree other;
+    other.dir("/x");
+    other.file("/x/single.bin", test::pattern(16u << 20));
+    Run r(t.pool(8), "limit-share", 8, 2);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    REQUIRE(folder::set_priority(r.tree, r.index("high.bin"), 4));
+    REQUIRE(folder::set_priority(r.tree, r.index("low.bin"), 1));
+    const auto start = Tree::Clock::now();
+    const double share = share_beside(t, r, other, "Other");
+    CHECK(share > 0.45);
+    CHECK(share < 0.55);
+    // Its small and big files all came meanwhile, the High one faster than the Low one.
+    const auto high = asked_between(t, "/data/high.bin", start);
+    const auto low = asked_between(t, "/data/low.bin", start);
+    CHECK(asked_between(t, "/data/s", start) > 0);
+    CHECK(low > 0);
+    CHECK(high >= 2 * low);
+}
+
+TEST_CASE("grab engine folders: files waiting for a connection don't lower the folder's share of a speed limit") {
+    // Running big files whose streams wait for a connection ask the limiter nothing: the files
+    // that read hold the folder's whole share, half beside a normal single download.
+    Tree other;
+    other.dir("/x");
+    other.file("/x/single.bin", test::pattern(16u << 20));
+    SUBCASE("3 big files, 2 connections: the single download from the same server takes the others") {
+        Tree t;
+        t.dir("/data");
+        for (int i = 0; i < 3; ++i) t.file(std::format("/data/b{}.bin", i), test::pattern((8u << 20) + 4096 * i));
+        Run r(t.pool(4), "limit-waiting-same", 4, 3);
+        { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+        REQUIRE(folder::set_priority(r.tree, r.index("b0.bin"), 4));
+        REQUIRE(folder::set_priority(r.tree, r.index("b2.bin"), 1));
+        const auto start = Tree::Clock::now();
+        const double share = share_beside(t, r, other, "Fake");
+        CHECK(share > 0.45);
+        CHECK(share < 0.55);
+        // The two connections are High's and Normal's: Low waits rather than read while High does.
+        const auto high = asked_between(t, "/data/b0.bin", start);
+        const auto low = asked_between(t, "/data/b2.bin", start);
+        MESSAGE("High ", high, " B, Low ", low, " B");
+        CHECK(high > 4 * low);
+    }
+    SUBCASE("many small files hold the connections; the big files wait") {
+        Tree t;
+        t.dir("/data");
+        for (int i = 0; i < 100; ++i) t.file(std::format("/data/s{:03}.bin", i), test::pattern((200u << 10) + i));
+        for (int i = 0; i < 2; ++i) t.file(std::format("/data/b{}.bin", i), test::pattern((8u << 20) + 4096 * i));
+        Run r(t.pool(4), "limit-waiting-small", 4, 2);
+        { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+        const double share = share_beside(t, r, other, "Other");
+        CHECK(share > 0.45);
+        CHECK(share < 0.55);
+    }
+    SUBCASE("At once 8 on 4 connections") {
+        Tree t;
+        t.dir("/data");
+        for (int i = 0; i < 8; ++i) t.file(std::format("/data/b{}.bin", i), test::pattern((4u << 20) + 4096 * i));
+        Run r(t.pool(4), "limit-waiting-8", 4, 8);
+        { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+        int waiting_seen = 0; // running big files shown waiting, at most at once
+        r.job.on_event = [&](folder::Event) {
+            std::lock_guard lock(r.m);
+            const auto n = std::ranges::count_if(r.tree.files, [](const folder::File& f) {
+                return f.status == folder::State::running && f.waiting;
+            });
+            waiting_seen = std::max(waiting_seen, static_cast<int>(n));
+        };
+        const double share = share_beside(t, r, other, "Other");
+        CHECK(share > 0.45);
+        CHECK(share < 0.55);
+        CHECK(waiting_seen >= 4); // 8 running, 4 connections
+    }
 }

@@ -295,10 +295,21 @@ struct Download {
     // Bandwidth priority (high 4, normal 2, low 1), read at each stream start and limiter
     // request, so a change applies while running. nullptr = normal.
     const std::atomic<int>* weight = nullptr;
+    // Its bytes' flow in the limiter: rate::flow_of(id, member). A folder's file is a member of
+    // the folder's share (member > 0), weighted by `flow_weight`, asked at each limiter request
+    // while a limit is on: its part of the folder's weight, by its priority among the folder's
+    // running files. Unset: member 0, `weight`.
+    std::uint32_t member = 0;
+    std::function<double()> flow_weight;
     // At most this many streams at once, asked as each starts and at each read: a folder's file
-    // gets an even part of the folder's connections beside its other files downloading. A stream
-    // over it gives its connection up and goes on later from its bytes. Unset: no cap.
+    // gets its part of the folder's connections beside its other files downloading (by their
+    // priorities; 0 while higher ones take all it has). A stream over it gives its connection up
+    // and goes on later from its bytes. Unset: no cap.
     std::function<int()> streams_cap;
+    // Told +1 as a stream starts reading on a connection it holds and -1 as it stops: a folder
+    // counts in the limiter only its files that read, and shows one that doesn't as waiting.
+    // Called from several threads.
+    std::function<void(int)> on_reading;
     // Sees each step before it is taken (`grab -v`: "sftp stat <path>", "sftp read <path> --offset
     // N --count M"); called from several threads.
     std::function<void(const std::vector<std::string>&)> on_command;

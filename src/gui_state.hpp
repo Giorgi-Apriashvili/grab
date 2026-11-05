@@ -136,6 +136,9 @@ struct SavedFile {
     bool verified = false; // checked against the server's checksum
     std::string local = {}; // Keep both: its second-copy name, relative to the folder
     std::string error = {}; // a failed file's
+    // Its priority in the folder: "high" | "normal" | "low", written only when not normal (since
+    // 0.22; grab 0.21 reads only the keys it knows, so its files are all normal there).
+    std::string priority = "normal";
     bool operator==(const SavedFile&) const = default;
 };
 

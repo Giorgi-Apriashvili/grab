@@ -5,7 +5,8 @@
 // fetched again. Files from small_limit up take grab's resumable ranged download (fetch::run) as
 // many at once as "At once" says, their pieces spread over the folder's connections; smaller ones
 // go beside them on every free connection, many in flight on each (RCLONE-REPLACEMENT.md, phase
-// 3). The whole folder is one user of its server's connection budget.
+// 3). Of each kind, files of a higher priority (File::weight) start first. The whole folder is one
+// user of its server's connection budget and one share of a speed limit.
 //
 // The caller owns the folder's state (Tree) and the mutex guarding it, so it can show the
 // files and act on single ones (pause, resume, skip) while the download runs.
@@ -17,6 +18,7 @@
 #include "rate.hpp"
 #include "verify.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -60,6 +63,15 @@ struct File {
     // Where it goes instead, relative to the folder ("e01 (2).mkv"): Keep both, or a name another
     // file of the folder has on Windows (settle_names).
     std::filesystem::path local = {};
+    // Its priority inside the folder (DOWNLOADS-UI.md 7): high 4, normal 2, low 1. Higher ones
+    // start first, among the small files and among the big ones; running big files split the
+    // folder's connections and its part of a speed limit by it. The grab command keeps every file
+    // normal: the folder's order.
+    int weight = 2;
+    // A running big file none of whose streams reads now: its size check, or waiting for a
+    // connection the folder's other files or another download hold. The window shows it queued,
+    // as it isn't downloading. Not saved.
+    bool waiting = false;
 };
 [[nodiscard]] File make_file(std::string path, std::uint64_t size, std::string modtime);
 // A file of a folder's files (sorted by path) whose name an earlier file or any folder of the
@@ -78,7 +90,33 @@ struct Tree {
     // Folders below the folder that the walk couldn't read ("a/b: permission denied"): the rest is
     // downloaded and these are said (review G55).
     std::vector<std::string> unreadable;
+    // Bumped wherever a file is queued again, or a file's priority or kind (File::big) changes: the
+    // next file's cursors (next_queued) then start over from the first file. A file queued again
+    // without it could be passed over, and the folder never end.
+    std::uint64_t requeued = 0;
+    // next_queued's cursors, by kind (small, big) and priority (high, normal, low): no queued file
+    // of that kind and priority is before one, since `requeued` was `cursors_at`.
+    std::array<std::array<std::size_t, 3>, 2> cursors{};
+    std::uint64_t cursors_at = ~std::uint64_t{0};
 };
+
+// One of the three priorities' weights (high 4, normal 2, low 1): the nearest for any other.
+[[nodiscard]] constexpr int priority_weight(int weight) { return weight >= 4 ? 4 : weight <= 1 ? 1 : 2; }
+// The next file to start of the small ones or of the big ones (`big`), under the caller's mutex:
+// the queued one of the highest priority, in folder order among those; nullopt when none is
+// queued. It stays queued: the caller starts it under the same lock. Amortized O(1): cursors that
+// only move forward until a file is queued again (Tree::requeued).
+[[nodiscard]] std::optional<std::size_t> next_queued(Tree& tree, bool big);
+// An unfinished file's priority (by its index), under the caller's mutex: queued ones move in the
+// start order, a running one gets its new share at its next reads. Whether it changed anything.
+bool set_priority(Tree& tree, std::size_t index, int weight);
+// The running big files' parts of the folder's connections its small files don't hold (`free`), by
+// their priorities (`weights`, in the same order): free × w / Σw, the connections left over one
+// each by the largest remainders (ties: the higher priority, then the earlier file), so the parts
+// add up to `free`; each at least 1, so every file keeps going. With fewer connections than files,
+// 1 each for the highest priorities (the earlier file first) and 0 for the others, which wait; with
+// none free, 1 each: the server's budget decides.
+[[nodiscard]] std::vector<int> connection_parts(int free, std::span<const int> weights);
 
 struct Totals {
     std::uint64_t bytes = 0; // finished files plus the progress of the others
@@ -91,7 +129,8 @@ struct Totals {
 [[nodiscard]] Totals totals(const Tree& tree);
 
 // Actions on single files, by their index in Tree::files (the page's rows), under the caller's
-// mutex. Each says whether it changed anything; an index past the files does nothing.
+// mutex. Each says whether it changed anything; an index past the files does nothing. Those that
+// queue a file again bump Tree::requeued.
 bool pause_file(Tree& tree, std::size_t index);
 bool resume_file(Tree& tree, std::size_t index); // a file paused by itself
 void resume_paused(Tree& tree);                  // every paused file
@@ -161,8 +200,10 @@ struct Job {
     std::function<int()> files_at_once;
     rate::RateLimiter* limiter = nullptr;      // nullptr: unlimited
     std::string server;                   // grab.conf section: the connection pool
-    int id = 0;                           // the folder's id in the pool
-    const std::atomic<int>* weight = nullptr; // bandwidth priority; nullptr = normal
+    int id = 0;                           // the folder's id in the pool and the limiter
+    // The folder's bandwidth priority against other downloads (its files share it by their own,
+    // File::weight); nullptr = normal.
+    const std::atomic<int>* weight = nullptr;
     std::string remote_path;
     std::filesystem::path dest; // DEST: files land in DEST\<folder name>\...
     // The local folder's name instead of the server's, e.g. "Season 1 (2)" when another pick of

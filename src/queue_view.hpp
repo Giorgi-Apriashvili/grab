@@ -48,7 +48,7 @@ struct Shadow {
     float speed = 0;
     std::uint32_t error = 0; // a hash of a failed file's error; 0 without one
     folder::State status = folder::State::queued;
-    std::uint8_t weight = 2; // bandwidth priority, high 4, normal 2, low 1 (all normal until chunk D)
+    std::uint8_t weight = 2; // its priority in the folder (File::weight): high 4, normal 2, low 1
     bool verified = false;
 };
 

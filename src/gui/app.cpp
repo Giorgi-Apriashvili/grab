@@ -878,6 +878,8 @@ void App::on_message(const std::string& text) {
         watches_.erase(int_of(*msg, "id", -1));
     } else if (type == "fileAction") {
         file_action(*msg);
+    } else if (type == "setFilePriority") {
+        set_file_priority(*msg);
     } else if (type == "showFile") {
         const int id = int_of(*msg, "id", -1);
         const int gen = int_of(*msg, "gen", -1);
@@ -2542,6 +2544,32 @@ void App::file_action(const Value& msg) {
     flush();
 }
 
+// Files of a folder by index ranges, their priority inside it (DOWNLOADS-UI.md 7): queued ones
+// move in the start order, running ones get their new share at their next reads. One lock, one
+// save and one flush for the batch; finished files keep theirs.
+void App::set_file_priority(const Value& msg) {
+    const int id = int_of(msg, "id", -1);
+    const int gen = int_of(msg, "gen", -1);
+    const int weight = weight_of(msg.string_of("priority").value_or("normal"));
+    {
+        std::lock_guard lock(mutex_);
+        const auto it = std::ranges::find(items_, id, [](const auto& i) { return i->id; });
+        if (it == items_.end()) return;
+        Item& item = **it;
+        // The rows of another generation: the page gets the new ones and asks again.
+        if (item.gen != gen || !item.tree.listed || !item.names) return;
+        bool changed = false;
+        for (const auto k : queue_view::indices_of(msg.find("ranges"), item.tree.files.size())) {
+            changed = folder::set_priority(item.tree, k, weight) || changed;
+        }
+        if (!changed) return;
+        item.touched = true;
+    }
+    request_save();
+    dirty_ = true;
+    flush();
+}
+
 void App::show_file(int id, int gen, std::size_t index) {
     std::filesystem::path target;
     {
@@ -3381,6 +3409,7 @@ void App::restore_queue() {
                 }
                 c.fetched = f.fetched;
                 c.verified = f.verified;
+                c.weight = weight_of(f.priority);
                 if (!f.local.empty()) {
                     c.local = util::path_from_utf8(f.local);
                     c.big = true; // a second copy: grab writes it under that name
@@ -3415,6 +3444,7 @@ struct SavedFiles {
     std::vector<std::uint64_t> sizes;
     std::vector<folder::State> states;
     std::vector<std::uint8_t> flags; // 1: fetched, 2: verified (done files)
+    std::vector<std::uint8_t> weights; // priorities
     std::string times;
     std::vector<std::size_t> time_ends;
     std::vector<std::pair<std::size_t, std::string>> errors; // by index
@@ -3435,6 +3465,7 @@ SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_
     s.sizes.reserve(n);
     s.states.reserve(n);
     s.flags.reserve(n);
+    s.weights.reserve(n);
     s.time_ends.reserve(n);
     s.times.reserve(n * 25);
     for (std::size_t k = 0; k < n; ++k) {
@@ -3443,6 +3474,7 @@ SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_
         s.sizes.push_back(c.size);
         s.states.push_back(c.status);
         s.flags.push_back(static_cast<std::uint8_t>((done && c.fetched ? 1 : 0) | (done && c.verified ? 2 : 0)));
+        s.weights.push_back(static_cast<std::uint8_t>(c.weight));
         s.times += c.modtime;
         s.time_ends.push_back(s.times.size());
         if (c.status == folder::State::failed) s.errors.emplace_back(k, c.error);
@@ -3472,6 +3504,7 @@ std::vector<SavedFile> saved_files(const SavedFiles& s) {
         }
         f.fetched = (s.flags[k] & 1) != 0;
         f.verified = (s.flags[k] & 2) != 0;
+        f.priority = priority_name(s.weights[k]);
         if (s.names) {
             if (const auto it = s.names->local.find(k); it != s.names->local.end()) f.local = util::path_to_utf8(it->second);
         } else if (local != s.locals.end() && local->first == k) {
@@ -3977,16 +4010,15 @@ void App::add_fake_folder(std::size_t files) {
 }
 
 // GRAB_TEST_FAKE_FOLDER's download: every 100 ms 30 small files land (300 a second) and up to 8
-// big files move on at 4 MiB/s each, until all are done or it is stopped. Pause and Skip of a
-// file act as on a real one.
+// big files move on at 4 MiB/s each, until all are done or it is stopped, in the start order of a
+// real one (folder::next_queued: priority, then folder order). Pause, Resume, Skip and a file's
+// priority act as on a real one.
 void App::run_fake(Item& item, const std::stop_token& stop) {
     constexpr auto tick = std::chrono::milliseconds(100);
     constexpr double big_speed = 4.0 * 1024 * 1024;
     constexpr std::size_t landing = 30;
     constexpr std::size_t big_at_once = 8;
     std::vector<std::size_t> running; // big files
-    std::size_t small_at = 0;
-    std::size_t big_at = 0;
     std::mutex wait_m;
     std::condition_variable_any wait_cv;
     {
@@ -4017,24 +4049,26 @@ void App::run_fake(Item& item, const std::stop_token& stop) {
                 f.eta.reset();
                 return true;
             });
-            for (; big_at < files.size() && running.size() < big_at_once; ++big_at) {
-                auto& f = files[big_at];
-                if (!f.big || f.status != folder::State::queued) continue;
+            while (running.size() < big_at_once) {
+                const auto k = folder::next_queued(item.tree, true);
+                if (!k) break;
+                auto& f = files[*k];
                 f.status = folder::State::running;
                 f.stop = std::stop_source{};
                 f.stop_reason = folder::StopReason::none;
-                running.push_back(big_at);
+                running.push_back(*k);
             }
-            for (std::size_t landed = 0; small_at < files.size() && landed < landing; ++small_at) {
-                auto& f = files[small_at];
-                if (f.big || f.status != folder::State::queued) continue;
+            for (std::size_t landed = 0; landed < landing; ++landed) {
+                const auto k = folder::next_queued(item.tree, false);
+                if (!k) break;
+                auto& f = files[*k];
                 f.status = folder::State::done;
                 f.bytes = f.size;
                 f.fetched = true;
-                ++landed;
             }
             item.tree.files_at_once = static_cast<int>(running.size());
-            left = !running.empty() || small_at < files.size() || big_at < files.size();
+            left = !running.empty() || folder::next_queued(item.tree, false).has_value() ||
+                   folder::next_queued(item.tree, true).has_value();
         }
         item.touched = true;
         dirty_ = true;
@@ -4048,6 +4082,7 @@ void App::run_fake(Item& item, const std::stop_token& stop) {
         f.speed = 0;
         f.eta.reset();
     }
+    ++item.tree.requeued;
     item.tree.files_at_once = 0;
     if (stop.stop_requested()) item.status = item.stop_reason == StopReason::cancel ? Status::cancelled : Status::paused;
     else item.status = folder::outcome(item.tree).waiting > 0 ? Status::paused : Status::done;

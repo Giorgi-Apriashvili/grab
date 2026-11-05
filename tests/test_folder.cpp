@@ -6,8 +6,13 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <filesystem>
 #include <mutex>
+#include <numeric>
+#include <optional>
+#include <random>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -57,6 +62,178 @@ TEST_CASE("a folder's files survive a restart in queue.json") {
     REQUIRE(odd.size() == 1);
     REQUIRE(odd[0].files.size() == 1);
     CHECK(odd[0].files[0].state == "queued");
+}
+
+TEST_CASE("a folder's files keep their priorities in queue.json; an older one's are all normal") {
+    SavedDownload d{"Main", "folder", "/tmp/f", "f", "D:\\x", 900, {{"a", 100, "", "queued"}, {"b", 200, "", "paused"}, {"c", 300, "", "failed"}}};
+    d.files[0].priority = "high";
+    d.files[2].priority = "low";
+    d.files[2].error = "gone";
+    const auto text = queue_to_json({d});
+    CHECK(text.find(R"("path":"a","size":100,"modtime":"","state":"queued","priority":"high"})") != std::string::npos);
+    CHECK(text.find(R"("path":"b","size":200,"modtime":"","state":"paused"})") != std::string::npos); // normal: not written
+    const auto back = parse_queue(text);
+    REQUIRE(back.size() == 1);
+    CHECK(back[0] == d);
+    // grab 0.21's queue.json has none: every file is normal. Anything but high or low is normal too.
+    const auto old = parse_queue(R"([{"remote":"r","path":"/p","dest":"C:\\d","mode":"folder",)"
+                                 R"("files":[{"path":"x","state":"queued"},{"path":"y","priority":"urgent"},)"
+                                 R"({"path":"z","priority":4},{"path":"w","priority":"low"}]}])");
+    REQUIRE(old.size() == 1);
+    REQUIRE(old[0].files.size() == 4);
+    CHECK(old[0].files[0].priority == "normal");
+    CHECK(old[0].files[1].priority == "normal");
+    CHECK(old[0].files[2].priority == "normal");
+    CHECK(old[0].files[3].priority == "low");
+}
+
+namespace {
+
+// The next file to start as the plan defines it (DOWNLOADS-UI.md 7): the queued one of the kind of
+// the highest priority, the first in folder order among those.
+std::optional<std::size_t> brute_next(const folder::Tree& t, bool big) {
+    std::optional<std::size_t> best;
+    for (std::size_t i = 0; i < t.files.size(); ++i) {
+        const auto& f = t.files[i];
+        if (f.status != State::queued || f.big != big) continue;
+        if (!best || f.weight > t.files[*best].weight) best = i;
+    }
+    return best;
+}
+
+} // namespace
+
+TEST_CASE("a file's priority in its folder: unfinished files only, the start order follows it") {
+    folder::Tree t;
+    for (const char* p : {"a", "b", "c", "d", "e"}) t.files.push_back(folder::make_file(p, 10, ""));
+    t.files.push_back(folder::make_file("big1", folder::small_limit, ""));
+    t.files.push_back(folder::make_file("big2", folder::small_limit, ""));
+    t.files[3].status = State::done;
+    t.files[4].status = State::skipped;
+    CHECK(folder::next_queued(t, false) == 0); // all normal: folder order
+    CHECK(folder::next_queued(t, true) == 5);
+    const auto before = t.requeued;
+    CHECK(folder::set_priority(t, 2, 4));
+    CHECK(t.requeued != before); // the cursors start over
+    CHECK(t.files[2].weight == 4);
+    CHECK(folder::next_queued(t, false) == 2);
+    CHECK_FALSE(folder::set_priority(t, 2, 4)); // no change
+    CHECK_FALSE(folder::set_priority(t, 3, 4)); // done: keeps its own
+    CHECK_FALSE(folder::set_priority(t, 4, 1)); // skipped
+    CHECK_FALSE(folder::set_priority(t, 9, 1)); // no such file
+    CHECK(folder::set_priority(t, 0, 1));
+    CHECK(folder::set_priority(t, 6, 7)); // the nearest priority: high
+    CHECK(t.files[6].weight == 4);
+    CHECK(folder::next_queued(t, true) == 6);
+    // Taken: the next look steps over it; the Low one comes last.
+    t.files[2].status = State::running;
+    CHECK(folder::next_queued(t, false) == 1);
+    t.files[1].status = State::running;
+    CHECK(folder::next_queued(t, false) == 0);
+    t.files[0].status = State::running;
+    CHECK_FALSE(folder::next_queued(t, false).has_value());
+    // Put back by the folder's stop: found again.
+    t.files[2].status = State::queued;
+    ++t.requeued;
+    CHECK(folder::next_queued(t, false) == 2);
+    // A running file's priority changes too (its share at its next reads).
+    CHECK(folder::set_priority(t, 1, 1));
+    CHECK(folder::priority_weight(0) == 1);
+    CHECK(folder::priority_weight(3) == 2);
+    CHECK(folder::priority_weight(5) == 4);
+}
+
+TEST_CASE("the next file's cursors pick what a look at every file picks, through every change") {
+    // Random actions on a folder of small and big files of all priorities, each followed by a
+    // pick of both kinds, compared with brute_next. Requeues are the scheduler's (a folder's stop
+    // puts running files back, bumping Tree::requeued); the rest are folder's own functions.
+    const auto seed = std::random_device{}(); // other actions each run; a failure says its seed
+    std::mt19937 rng(seed);
+    for (int round = 0; round < 20; ++round) {
+        folder::Tree t;
+        const std::size_t n = 30 + rng() % 40;
+        for (std::size_t i = 0; i < n; ++i) {
+            t.files.push_back(folder::make_file("f" + std::to_string(i), rng() % 3 == 0 ? folder::small_limit : 100, ""));
+            t.files.back().weight = std::array{1, 2, 4}[rng() % 3];
+        }
+        const auto dir = std::filesystem::path("D") / "f";
+        for (int step = 0; step < 400; ++step) {
+            const std::size_t i = rng() % n;
+            auto& f = t.files[i];
+            switch (rng() % 10) {
+            case 0: // the scheduler starts the next one of a kind
+            case 1:
+                if (const auto k = folder::next_queued(t, rng() % 2 == 0)) t.files[*k].status = State::running;
+                break;
+            case 2: // a running one ends: done or failed
+                if (f.status == State::running) f.status = rng() % 4 == 0 ? State::failed : State::done;
+                break;
+            case 3: // the folder stopped: running ones are queued again
+                for (auto& g : t.files) {
+                    if (g.status == State::running) g.status = State::queued;
+                }
+                ++t.requeued;
+                break;
+            case 4: folder::pause_file(t, i); break;
+            case 5: folder::resume_file(t, i); break;
+            case 6: folder::retry_file(t, i); break;
+            case 7: folder::skip_file(t, dir, "/f", i); break;
+            case 8: folder::set_priority(t, i, std::array{1, 2, 4}[rng() % 3]); break;
+            default:
+                if (rng() % 2 == 0) folder::resume_paused(t);
+                else folder::retry_files(t, false);
+                break;
+            }
+            for (const bool big : {false, true}) {
+                REQUIRE_MESSAGE(folder::next_queued(t, big) == brute_next(t, big), "seed ", seed, " round ", round, " step ", step,
+                                " big ", big);
+            }
+        }
+    }
+}
+
+TEST_CASE("running big files' parts of the folder's connections add up to what it has free") {
+    using V = std::vector<int>;
+    auto parts = [](int free, V weights) { return folder::connection_parts(free, weights); };
+    auto sum = [](const V& v) { return std::accumulate(v.begin(), v.end(), 0); };
+    CHECK(parts(4, {2, 2}) == V{2, 2});
+    CHECK(parts(4, {4, 2}) == V{3, 1}); // High + Normal: none left idle (16/6 and 8/6 round to 2 + 1)
+    CHECK(parts(4, {2, 1}) == V{3, 1});
+    CHECK(parts(4, {1, 2}) == V{1, 3});
+    CHECK(parts(12, {4, 2, 1}) == V{7, 3, 2}); // 6.86, 3.43, 1.71
+    CHECK(sum(parts(12, {4, 2, 1})) == 12);
+    CHECK(parts(3, {2, 2}) == V{2, 1}); // equal remainders: the earlier file
+    CHECK(parts(5, {4, 1}) == V{4, 1});
+    CHECK(parts(6, {100, 100, 1}) == V{2, 3, 1}); // at least 1 each, taken from the biggest
+    CHECK(parts(3, {4, 2, 1}) == V{1, 1, 1});
+    // Fewer connections than files: the highest priorities read, the earlier file first; a Low
+    // file doesn't read while a High one waits.
+    CHECK(parts(2, {4, 2, 1}) == V{1, 1, 0});
+    CHECK(parts(2, {1, 2, 4}) == V{0, 1, 1});
+    CHECK(parts(1, {2, 4, 4}) == V{0, 1, 0});
+    CHECK(parts(2, {2, 2, 2}) == V{1, 1, 0});
+    // None free: 1 each, the server's budget decides.
+    CHECK(parts(0, {2}) == V{1});
+    CHECK(parts(-1, {2, 2}) == V{1, 1});
+    CHECK(parts(4, {0, 0}) == V{1, 1});
+    CHECK(parts(4, {}).empty());
+    // Any mix of priorities, as many connections as the budget may give: all used, each file at
+    // least 1 when there are enough, and never a lower priority's while a higher one has none.
+    for (int free = 1; free <= 16; ++free) {
+        for (int n = 1; n <= 8; ++n) {
+            V w;
+            for (int k = 0; k < n; ++k) w.push_back(std::array{4, 2, 1}[static_cast<std::size_t>((k * 7 + free) % 3)]);
+            const auto p = parts(free, w);
+            CHECK(sum(p) == free);
+            const int least = std::ranges::min(p);
+            CHECK((free >= n ? least >= 1 : least == 0));
+            for (std::size_t x = 0; x < p.size(); ++x) {
+                for (std::size_t y = 0; y < p.size(); ++y) {
+                    if (w[x] > w[y] && p[y] > 0) CHECK(p[x] > 0);
+                }
+            }
+        }
+    }
 }
 
 TEST_CASE("folder totals count finished and running files, not skipped ones") {

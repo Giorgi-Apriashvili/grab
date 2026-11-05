@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <stop_token>
 #include <thread>
 
@@ -109,7 +110,7 @@ TEST_CASE("fair queuing serves busy flows in proportion to their weights") {
     rate::FairQueue even;
     even.add(1, 100, 2);
     even.add(2, 100, 2);
-    int last = 0;
+    std::uint64_t last = 0;
     int switches = 0;
     for (int i = 0; i < 20; ++i) {
         const auto head = even.head();
@@ -119,6 +120,35 @@ TEST_CASE("fair queuing serves busy flows in proportion to their weights") {
         even.add(head.flow, 100, 2);
     }
     CHECK(switches >= 19);
+}
+
+TEST_CASE("a folder's files are flows whose weights add up to the folder's: its share stays") {
+    // A normal folder (2) with a High and a Low file running (2 × 4/5, 2 × 1/5) against a normal
+    // download (2), all busy.
+    const auto high = rate::flow_of(7, 1);
+    const auto low = rate::flow_of(7, 2);
+    const auto other = rate::flow_of(8);
+    CHECK(rate::flow_of(7) != rate::flow_of(7, 1));
+    CHECK(rate::flow_of(-5, 3) != rate::flow_of(5, 3)); // a listing's negative id is its own
+    CHECK(rate::flow_of(1, 0) == (std::uint64_t{1} << 32));
+    rate::FairQueue q;
+    const std::map<std::uint64_t, double> weight{{high, 2.0 * 4 / 5}, {low, 2.0 * 1 / 5}, {other, 2.0}};
+    for (const auto& [flow, w] : weight) q.add(flow, 64 * KiB, w);
+    std::map<std::uint64_t, int> served;
+    for (int i = 0; i < 1000; ++i) {
+        const auto head = q.head();
+        q.serve(head);
+        ++served[head.flow];
+        q.add(head.flow, 64 * KiB, weight.at(head.flow));
+    }
+    CHECK(static_cast<double>(served[high] + served[low]) / served[other] == doctest::Approx(1.0).epsilon(0.05));
+    CHECK(static_cast<double>(served[high]) / served[low] == doctest::Approx(4.0).epsilon(0.1));
+    // Weights below 1 are kept as they are; none or a negative one counts as 1.
+    rate::FairQueue tiny;
+    CHECK(tiny.add(1, 100, 0.25).start == 0);
+    CHECK(tiny.add(1, 100, 0.25).start == doctest::Approx(400));
+    CHECK(tiny.add(2, 100, -3).start == 0);
+    CHECK(tiny.add(2, 100, 0).start == doctest::Approx(100));
 }
 
 TEST_CASE("a flow that was idle gains no credit to burst with") {

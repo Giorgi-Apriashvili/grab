@@ -128,6 +128,31 @@ TEST_CASE("one pass over a folder's files counts its totals and finds the rows t
     REQUIRE(p.changed.size() == 1);
     CHECK(p.changed[0].now.speed == 0);
     CHECK_FALSE(p.changed[0].eta.has_value());
+    // A file's priority in the folder (chunk D) goes as its own change.
+    REQUIRE(folder::set_priority(t, 3, 4) == false); // skipped: keeps its own
+    REQUIRE(folder::set_priority(t, 1, 1));
+    p = queue_view::pass(t.files, &shadow);
+    REQUIRE(p.changed.size() == 1);
+    CHECK(p.changed[0].index == 1);
+    CHECK(p.changed[0].now.weight == 1);
+    CHECK(queue_view::snapshot(t.files).rows[1].weight == 1);
+
+    // A running big file that reads on no connection (waiting for one) shows queued, at no speed,
+    // and counts as queued; once it reads, running.
+    t.files[1].status = State::running;
+    t.files[1].speed = 25;
+    t.files[1].waiting = true;
+    p = queue_view::pass(t.files, &shadow);
+    REQUIRE(p.changed.size() == 1);
+    CHECK(p.changed[0].now.status == State::queued);
+    CHECK(p.changed[0].now.speed == 0);
+    CHECK(p.counts[static_cast<std::size_t>(State::running)] == 0);
+    CHECK(queue_view::snapshot(t.files).rows[1].status == State::queued);
+    t.files[1].waiting = false;
+    p = queue_view::pass(t.files, &shadow);
+    REQUIRE(p.changed.size() == 1);
+    CHECK(p.changed[0].now.status == State::running);
+    CHECK(p.changed[0].now.speed == 25);
 
     // Another generation's shadow (another count of files) is not compared; the totals still come.
     std::vector<queue_view::Shadow> other(2);
@@ -144,6 +169,7 @@ TEST_CASE("the page's file rows: \"files\" in chunks, \"fileDelta\" with only wh
     t.files[0].verified = true;
     t.files[2].status = State::failed;
     t.files[2].error = "gone \"away\"";
+    t.files[3].weight = 4; // High in the folder
     const auto names = queue_view::names_of(t.files);
     const auto snap = queue_view::snapshot(t.files);
 
@@ -159,7 +185,7 @@ TEST_CASE("the page's file rows: \"files\" in chunks, \"fileDelta\" with only wh
     CHECK(json::stringify(rows[0]) == R"(["sub/a.bin",100,3,100,2,null,null,1])");
     CHECK(json::stringify(rows[1]) == "[\"a:b.txt\",200,0,0,2,\"a\xEF\xBC\x9A" "b.txt\"]");
     CHECK(json::stringify(rows[2]) == R"(["e01.mkv",2097152,4,0,2,"e01 (2).mkv","gone \"away\"",0,1])");
-    CHECK(json::stringify(rows[3]) == R"(["CON.txt",400,0,0,2,"CON_.txt"])");
+    CHECK(json::stringify(rows[3]) == R"(["CON.txt",400,0,0,4,"CON_.txt"])");
 
     const auto chunk = parsed(queue_view::files_message(7, 3, 3, 2, names, snap)); // the last chunk
     CHECK(chunk.find("from")->number == 3);

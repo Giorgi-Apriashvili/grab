@@ -334,6 +334,7 @@ std::vector<SavedDownload> queue_from(const json::Value* doc) {
                 }
                 sf.local = f.string_of("local").value_or("");
                 if (sf.state == "failed") sf.error = f.string_of("error").value_or("");
+                if (auto p = f.string_of("priority"); p == "high" || p == "low") sf.priority = *p;
                 d.files.push_back(std::move(sf));
             }
         }
@@ -397,6 +398,7 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
                 if (f.verified) item += R"(,"verified":true)";
                 if (!f.local.empty()) item += R"(,"local":)" + json::quote(f.local);
                 if (f.state == "failed" && !f.error.empty()) item += R"(,"error":)" + json::quote(f.error);
+                if (f.priority == "high" || f.priority == "low") item += R"(,"priority":)" + json::quote(f.priority);
                 item += '}';
             }
             item += "]}";

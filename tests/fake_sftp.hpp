@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <span>
@@ -48,6 +49,8 @@ public:
 
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
     std::vector<std::string> opened;                            // the paths of each OPEN
+    std::function<void(const std::string&)> on_open;            // told each OPEN's path as it comes
+    std::function<void(const std::string&, std::uint32_t)> on_read; // told each READ's path and length
     std::size_t most_waiting = 0;                               // most requests answered in one batch
     std::uint64_t most_read_bytes = 0;                          // most bytes of DATA answered in one batch
 
@@ -207,6 +210,7 @@ private:
         case 11: { // OPENDIR
             std::string path = resolve(in.str());
             if (type == 3) opened.push_back(path);
+            if (type == 3 && on_open) on_open(path);
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (type == 3 ? !all_files().contains(path) : !dirs.contains(path)) return status(id, 2, "No such file");
             std::string b;
@@ -214,10 +218,12 @@ private:
             return reply(102, id, b);
         }
         case 5: { // READ
-            const std::string& content = all_files().at(handles_.at(in.str()).path);
+            const std::string& path = handles_.at(in.str()).path;
+            const std::string& content = all_files().at(path);
             std::uint64_t off = in.u64();
             std::uint32_t len = in.u32();
             reads.emplace_back(off, len);
+            if (on_read) on_read(path, len);
             if (off >= content.size()) return status(id, 1, "EOF");
             std::size_t n = std::min<std::uint64_t>({len, max_data, content.size() - off});
             std::string b;

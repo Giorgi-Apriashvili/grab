@@ -400,6 +400,9 @@ private:
     // pause|resume|retry|skip, ranges: [[from, to], ...]}, one lock, one save and one flush for
     // all of them. Rows of another generation change nothing.
     void file_action(const json::Value& msg);
+    // Their priority inside the folder, "setFilePriority" {id, gen, ranges, priority: high|normal|
+    // low}, the same way.
+    void set_file_priority(const json::Value& msg);
     // A file of a folder download in Explorer, "showFile" {id, gen, index}.
     void show_file(int id, int gen, std::size_t index);
     void show_in_explorer(const std::filesystem::path& target) const; // selected, or its folder when it's gone
