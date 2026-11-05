@@ -15,6 +15,7 @@
 #include "schedule.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
+#include "speed.hpp"
 #include "ssh_pool.hpp"
 #include "ssh_read.hpp"
 #include "update.hpp"
@@ -245,6 +246,7 @@ private:
         Status status = Status::queued;
         std::uint64_t bytes = 0;
         std::uint64_t total = 0;
+        // While it fetches (meter): what came over about the last 5 s, and its time left.
         double speed = 0;
         std::optional<double> eta;
         int connections = 0;
@@ -289,8 +291,20 @@ private:
         std::shared_ptr<const queue_view::Names> names;
         int gen = 0;
         std::array<std::size_t, 6> counts{}; // its files by folder::State, as the last pass counted
+        std::size_t held = 0;          // its big files waiting for its small files (queue_view::Pass)
+        std::size_t left_files = 0;    // its files still to come, and their bytes, as the last pass counted
+        std::uint64_t left_bytes = 0;
         // Its files changed since the last flush (a pass over them is due); set without mutex_.
         std::atomic<bool> touched{false};
+        // The payload bytes it received, every READ's reply (small and big files alike) counted as
+        // it comes: its speed and time left follow it (meter, speed.hpp). Any thread.
+        std::atomic<std::uint64_t> received{0};
+        // UI thread (flush), while it fetches: its speed, the pace its time left is learned from,
+        // and the time left as shown. `metered`: they hold something, dropped once it stops.
+        speed::Meter speed_meter;
+        speed::Pace pace;
+        speed::Countdown countdown;
+        bool metered = false;
         // The user's ▸/▾ in the Downloads table, kept in queue.json; unset: the default rule.
         std::optional<bool> expanded;
         // Restored with failed files: they are queued again when it runs, as a restart did.
@@ -501,6 +515,12 @@ private:
     // A download's row for the page; `position`: its place among the waiting ones (0: none).
     // Caller holds mutex_.
     [[nodiscard]] json::Value queue_item(const Item& item, int position) const;
+    // A download's speed and time left at a flush (`now`), from what it received (Item::received):
+    // a folder's time left from its pace in files and bytes (speed::Pace), a file's from its bytes
+    // and speed, both through a speed::Countdown. Only while it fetches (running, not listing,
+    // checking or verifying); after, they are dropped. Whether anything changed or may change at
+    // the next flush. Caller holds mutex_; UI thread.
+    static bool meter(Item& item, speed::Clock::time_point now);
     // The queue's messages to the page, from the UI thread only (a debug assert checks it).
     void post_ui(std::string text) const;
     // The page shows a folder's files (DOWNLOADS-UI.md 6.3): "watchFiles" {id} for each open
@@ -610,6 +630,12 @@ private:
     bool queue_changed_ = true;      // downloads came, went or moved: the next flush sends "queue"
     std::map<int, std::string> item_sent_; // each download's row as last sent
     int parallel_sent_ = 0;
+    bool metering_ = false; // a download fetches: every flush samples its meters
+    // Everything the downloads receive, together (each Item::received's bytes too): the status bar's
+    // total speed and its graph, sent as {"type":"speed","total"} when its shown value changes.
+    std::atomic<std::uint64_t> received_{0};
+    speed::Meter total_meter_;
+    std::optional<std::uint64_t> total_sent_;
     std::map<int, Watch> watches_; // the folders whose files the page shows, by id
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
     std::mutex save_mutex_;               // guards save_wanted_, save_now_, next_save_, next_urgent_save_

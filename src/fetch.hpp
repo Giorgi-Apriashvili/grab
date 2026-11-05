@@ -261,7 +261,7 @@ private:
 struct Progress {
     std::uint64_t bytes = 0; // on disk, including what earlier runs fetched
     std::uint64_t total = 0;
-    double speed = 0;        // bytes per second, recent average
+    double speed = 0;        // bytes per second that came, recent average (speed::Meter)
     std::optional<double> eta;
     int connections = 0;     // streams open right now
 };
@@ -306,10 +306,14 @@ struct Download {
     // priorities; 0 while higher ones take all it has). A stream over it gives its connection up
     // and goes on later from its bytes. Unset: no cap.
     std::function<int()> streams_cap;
-    // Told +1 as a stream starts reading on a connection it holds and -1 as it stops: a folder
+    // Told +1 as a stream starts reading on a connection it holds and -1 as it stops, with
+    // `all_in` once every byte of the file is in (it is being put in place, not waiting): a folder
     // counts in the limiter only its files that read, and shows one that doesn't as waiting.
     // Called from several threads.
-    std::function<void(int)> on_reading;
+    std::function<void(int delta, bool all_in)> on_reading;
+    // Told the bytes of each READ's reply as it comes, from the stream's thread: the window's
+    // speeds count what arrives where it arrives (speed.hpp).
+    std::function<void(std::uint64_t)> on_received;
     // Sees each step before it is taken (`grab -v`: "sftp stat <path>", "sftp read <path> --offset
     // N --count M"); called from several threads.
     std::function<void(const std::vector<std::string>&)> on_command;

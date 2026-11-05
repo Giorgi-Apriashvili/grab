@@ -63,19 +63,19 @@ constexpr std::uint32_t small_member = std::uint32_t{1} << 31;
 std::uint32_t big_member(std::size_t index) { return static_cast<std::uint32_t>(index) + 1; }
 
 // What the folder's running files share (DOWNLOADS-UI.md 7), under the caller's mutex. The
-// connections its small workers don't hold go to its running big files by their priorities
-// (connection_parts); under a speed limit, its part of the limit goes to those of its files that
-// read now, whose weights add up to the folder's own, so its share against other downloads stays
-// as it was, however many of its files run. A file that waits for a connection asks the limiter
-// nothing: counted, its part of the folder's weight would go unused.
+// connections its small workers don't hold (Tree::small_connections) go to its running big files
+// by their priorities (connection_parts); under a speed limit, its part of the limit goes to those
+// of its files that read now, whose weights add up to the folder's own, so its share against other
+// downloads stays as it was, however many of its files run. A file that waits for a connection
+// asks the limiter nothing: counted, its part of the folder's weight would go unused.
 struct Members {
     struct Big {
         std::size_t index = 0; // the file's
         int reading = 0;       // its streams reading now (fetch::Download::on_reading)
+        bool all_in = false;   // every byte of it is in: it no longer waits for anything
     };
     std::vector<Big> big;         // running big files, in the order they started
-    int small_workers = 0;        // small workers taking files under a speed limit
-    int small_connections = 0;    // the folder's connections its small workers hold
+    int small_workers = 0;        // small workers taking files: under a speed limit, members
 
     // The running big files' priorities, in the order of `big`.
     [[nodiscard]] std::vector<int> big_weights(const Tree& tree) const {
@@ -109,13 +109,17 @@ struct SmallRun {
 
 // Small files on one connection (run_small_grab): up to 32 in flight, each OPEN, then its READs
 // and an FSTAT (the size and time now, which may have changed since the listing), then CLOSE, all
-// pipelined; 8 MiB of READs in flight at most. Under a speed limit (`limited`) one file and one
-// READ at a time, its tokens taken before it as the folder's member `member` (Members), so the
-// replies are never left unread through a token wait. Files left half-way (a stop, a broken
-// connection) go back to the queue. The next file is the highest priority's (next_queued).
+// pipelined; 8 MiB of READs in flight at most. Under a speed limit (asked at each pass, as the
+// schedule may change it) as many files, but READs of an eighth of a second of the limit's worth
+// and at most a quarter second's in flight, each taking its tokens before it goes, as the folder's
+// member `member` (Members): the limiter bounds the rate, while the files and READs on their way
+// keep the connection busy over its round trip (one file and one READ at a time reached half of a
+// 1 MiB/s limit on Main, chunk F's L4). A reply may then wait unread through a token wait, at most
+// that quarter second's worth. Files left half-way (a stop, a broken connection) go back to the
+// queue. The next file is the highest priority's (next_queued).
 SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& members, std::uint32_t member,
-                  bool limited, sftp::Client& c, const fs::path& dir, const std::stop_token& stop) {
-    const std::size_t max_files = limited ? 1 : 32;
+                  sftp::Client& c, const fs::path& dir, const std::stop_token& stop) {
+    constexpr std::size_t max_files = 32;
     constexpr std::uint64_t max_bytes = std::uint64_t{8} << 20;
     const bool replace = job.existing == existing::Choice::replace;
     struct Slot {
@@ -184,6 +188,7 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
                 }
                 return;
             }
+            if (job.on_received) job.on_received(r->size());
             const std::uint64_t room = s.size > at ? std::min<std::uint64_t>(r->size(), s.size - at) : 0;
             std::memcpy(s.data.data() + at, r->data(), static_cast<std::size_t>(room));
             s.got += room;
@@ -309,17 +314,25 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
                 notify(job, Event::progress);
             }
             // READs for what the open files still lack; while Play on this server warms up or waits
-            // for bytes, no more than its depth's worth (fetch::Connections::urgent).
-            const std::uint64_t most = std::min(
+            // for bytes, no more than its depth's worth (fetch::Connections::urgent). Under a speed
+            // limit, smaller and fewer, as above.
+            const std::uint64_t rate = job.limiter != nullptr ? job.limiter->rate() : 0;
+            const std::uint64_t read_size =
+                rate > 0 ? std::clamp<std::uint64_t>(rate / 8, std::uint64_t{32} * 1024, sftp::max_read) : sftp::max_read;
+            std::uint64_t most = std::min(
                 max_bytes, std::uint64_t{sftp::max_read} *
                                static_cast<std::uint64_t>(job.connections->read_depth(job.server, fetch::grab_depth)));
+            if (rate > 0) most = std::min(most, std::max(rate / 4, 2 * read_size));
             for (auto& [id, s] : slots) {
                 while (s.opened && !s.error && !s.done && s.asked < s.size && !stop.stop_requested()) {
-                    const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(sftp::max_read, s.size - s.asked));
-                    if (limited ? reads_in_flight >= 1 : reads_in_flight > 0 && bytes_in_flight + n > most) break;
-                    if (limited && !job.limiter->acquire(n, stop, flow, flow_weight())) break;
+                    const auto n = static_cast<std::uint32_t>(std::min(read_size, s.size - s.asked));
+                    if (reads_in_flight > 0 && bytes_in_flight + n > most) break;
+                    if (rate > 0 && !job.limiter->acquire(n, stop, flow, flow_weight())) break;
                     send_read(id, s.asked, n);
                     s.asked += n;
+                    // Under a limit on its way at once, right after its tokens, not with the next
+                    // pump after more token waits: the network follows the limit evenly.
+                    if (rate > 0) c.flush();
                 }
             }
             if (stop.stop_requested()) break;
@@ -347,9 +360,11 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
     return run;
 }
 
-// The queued small files (under small_limit): as many workers as the server's budget, each holding one of the folder's connections while small files are left, many
-// files in flight on each (small_on). They don't count against At once; the folder's big files,
-// fetched beside them (run_big), do, and nothing of one kind waits for the other.
+// The queued small files (under small_limit): as many workers as the server's budget, each holding
+// one of the folder's connections while small files are left, many files in flight on each
+// (small_on). They don't count against At once; the folder's big files, started beside them
+// (run_big), do, and get the connections the small files leave: while the small files hold them
+// all, the big files that started wait (Tree::small_connections; the window says "Waiting").
 void run_small_grab(const Job& job, Tree& tree, std::mutex& m, Members& members, const std::stop_token& stop) {
     const auto dir = job_dir(job);
     auto any_queued = [&] {
@@ -390,19 +405,18 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, Members& members,
                 pause_for(std::min(std::chrono::seconds(1 << std::min(failures - 1, 4)), std::chrono::seconds(15)), stop);
                 continue;
             }
-            // Its connection is not the big files' to share; under a speed limit it is one of the
-            // folder's members in the limiter while it takes files (Members).
-            const bool limited = job.limiter != nullptr && job.limiter->rate() > 0;
+            // Its connection is not the big files' to share; under a speed limit (on now or later)
+            // it is one of the folder's members in the limiter while it takes files (Members).
             auto member = [&](int delta) {
                 std::lock_guard lock(m);
-                members.small_connections += delta;
-                if (limited) members.small_workers += delta;
+                tree.small_connections += delta;
+                members.small_workers += delta;
                 if (delta > 0) tree.connections = job.connections->active(job.server, job.id);
             };
             member(+1);
             SmallRun run;
             try {
-                run = small_on(job, tree, m, members, small_member | k, limited, (*lease)->sftp(), dir, stop);
+                run = small_on(job, tree, m, members, small_member | k, (*lease)->sftp(), dir, stop);
             } catch (const sftp::Unavailable& e) { // the server has no SFTP: no use trying again
                 member(-1);
                 lease.reset();
@@ -494,18 +508,22 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, Members& members, const 
                 const int share = job.connections->share(job.server, job.id); // without the lock
                 std::lock_guard lock(m);
                 const auto at = std::ranges::find(members.big, i, &Members::Big::index) - members.big.begin();
-                const auto parts = connection_parts(share - members.small_connections, members.big_weights(tree));
+                const auto parts = connection_parts(share - tree.small_connections, members.big_weights(tree));
                 return at < std::ssize(parts) ? parts[static_cast<std::size_t>(at)] : 1;
             };
             // Only a file that reads counts in the limiter's weights, and one that doesn't is
-            // shown waiting.
-            d.on_reading = [&, i](int delta) {
+            // shown waiting: before its first read, and when its streams lost their connections,
+            // but not once all its bytes are in (its last stream ending before it is put in place
+            // flashed it Queued just before Done).
+            d.on_reading = [&, i](int delta, bool all_in) {
                 std::lock_guard lock(m);
                 if (auto* b = members.find(i)) {
                     b->reading += delta;
-                    tree.files[i].waiting = b->reading <= 0;
+                    b->all_in = b->all_in || all_in;
+                    tree.files[i].waiting = b->reading <= 0 && !b->all_in;
                 }
             };
+            d.on_received = job.on_received;
             d.member = big_member(i);
             d.flow_weight = [&, i] {
                 std::lock_guard lock(m);
@@ -522,6 +540,10 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, Members& members, const 
                     f.bytes = p.bytes;
                     f.speed = p.speed;
                     f.eta = p.eta;
+                    if (p.total > 0 && p.bytes >= p.total) { // there already, or put in place: no wait
+                        f.waiting = false;
+                        if (auto* b = members.find(i)) b->all_in = true;
+                    }
                     tree.connections = p.connections;
                 }
                 notify(job, Event::progress);

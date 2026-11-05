@@ -21,6 +21,7 @@
 #include "rclone_import.hpp"
 #include "remote.hpp"
 #include "space.hpp"
+#include "speed.hpp"
 #include "ssh.hpp"
 #include "ssh_read.hpp"
 #include "update.hpp"
@@ -38,6 +39,7 @@
 #include <cassert>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <format>
@@ -776,9 +778,11 @@ void App::on_message(const std::string& text) {
     const std::string type = msg->string_of("type").value_or("");
 
     if (type == "init") {
-        // A page load: it asks again for the files of the folders it shows.
+        // A page load: it asks again for the files of the folders it shows, and gets the total
+        // speed at the next flush.
         page_ready_ = true;
         watches_.clear();
+        total_sent_.reset();
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
@@ -2937,6 +2941,11 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.replace = choice == existing::Choice::replace;
     d.limiter = &limiter_;
     d.weight = &item->weight;
+    // Its speed and time left, and the status bar's total, count the bytes as they come (flush).
+    d.on_received = [this, item](std::uint64_t n) {
+        item->received += n;
+        received_ += n;
+    };
     // Through grab's own SSH client, its connections kept open between files.
     auto target = engine::ssh_target(*ctx);
     if (!target) return set(Status::failed, target.error());
@@ -2947,11 +2956,9 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
                 std::lock_guard lock(mutex_);
                 item->bytes = p.bytes;
                 if (p.total > 0) item->total = p.total;
-                item->speed = p.speed;
-                item->eta = p.eta;
                 item->connections = p.connections;
             }
-            dirty_ = true; // the next flush sends it
+            dirty_ = true; // the next flush sends it, with its speed (meter)
         }, item_stop);
     };
     auto result = fetch_once();
@@ -3081,14 +3088,47 @@ verify::Request App::verify_request(const engine::Context& ctx, const std::share
 }
 
 queue_view::Pass App::refresh_folder(Item& item, std::vector<queue_view::Shadow>* shadow) {
-    auto p = queue_view::pass(item.tree.files, shadow);
+    auto p = queue_view::pass(item.tree.files, shadow, item.tree.small_connections > 0);
     item.bytes = p.totals.bytes;
     item.total = p.totals.total;
-    item.speed = p.totals.speed;
-    item.eta = p.totals.eta;
     item.connections = item.tree.connections;
     item.counts = p.counts;
+    item.held = p.held;
+    item.left_files = p.left_files;
+    item.left_bytes = p.left_bytes;
     return p;
+}
+
+bool App::meter(Item& item, speed::Clock::time_point now) {
+    if (item.status != Status::running || item.phase != Phase::none) {
+        if (!item.metered) return false;
+        // Stopped, or listing, checking or verifying: it starts over when it fetches again.
+        item.metered = false;
+        item.speed_meter = {};
+        item.pace = {};
+        item.countdown = {};
+        item.speed = 0;
+        item.eta.reset();
+        return true;
+    }
+    item.metered = true;
+    const std::uint64_t received = item.received.load();
+    item.speed_meter.sample(now, received);
+    item.speed = item.speed_meter.rate();
+    std::optional<double> left;
+    if (item.mode == Mode::folder) {
+        // Its files fetched (done or failed) and bytes come; its time left by both (speed::Pace).
+        const auto finished = item.counts[static_cast<std::size_t>(folder::State::done)] +
+                              item.counts[static_cast<std::size_t>(folder::State::failed)];
+        // From its first bytes, as its speed: the time spent connecting isn't its pace.
+        if (item.speed_meter.since()) item.pace.sample(now, finished, received);
+        left = item.pace.time_left(item.left_files, item.left_bytes, item.speed);
+    } else if (item.total > item.bytes) {
+        // A file: its bytes at its speed, after 5 s of them.
+        left = speed::file_left(item.speed_meter.since(), now, item.total - item.bytes, item.speed);
+    }
+    item.eta = item.countdown.next(now, left);
+    return true;
 }
 
 void App::new_names(Item& item) {
@@ -3163,6 +3203,11 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     job.remote_path = item->path;
     job.dest = item->dest;
     job.on_event = [this, item](folder::Event e) { folder_event(*item, e); };
+    // Its speed and time left, and the status bar's total, count the bytes as they come (flush).
+    job.on_received = [this, item](std::uint64_t n) {
+        item->received += n;
+        received_ += n;
+    };
     // Its files at once: what "At once" leaves of the files other downloads hold.
     job.files_at_once = [this, item] {
         std::lock_guard lock(mutex_);
@@ -3322,8 +3367,9 @@ json::Value App::queue_item(const Item& i, int position) const {
     if (!i.asked.empty()) v.set("ask", asked_json(i.asked, i.asked_count));
     v.set("bytes", num(static_cast<double>(i.bytes)));
     v.set("total", num(static_cast<double>(i.total)));
-    v.set("speed", num(i.speed));
-    v.set("eta", i.eta ? num(*i.eta) : Value{});
+    // As the row shows them (speed::shown, whole seconds): a change it wouldn't show isn't sent.
+    v.set("speed", num(static_cast<double>(speed::shown(i.speed))));
+    v.set("eta", i.eta ? num(std::round(*i.eta)) : Value{});
     v.set("current", str(i.current));
     v.set("error", str(i.error));
     v.set("note", str(i.note));
@@ -3354,6 +3400,8 @@ json::Value App::queue_item(const Item& i, int position) const {
         files.set("done", count(folder::State::done));
         files.set("failed", count(folder::State::failed));
         files.set("skipped", count(folder::State::skipped));
+        // Big files waiting for its small files, which hold its connections ("Waiting").
+        if (i.held > 0) files.set("held", num(static_cast<double>(i.held)));
         v.set("files", std::move(files));
         if (i.gen != 0) v.set("gen", num(i.gen));
         // Folders inside it the server wouldn't list, for a message row under it.
@@ -3776,8 +3824,19 @@ void App::post_ui(std::string text) const {
 
 void App::flush() {
     if (!page_ready_) return; // its init asks for everything
+    // What the downloads receive, all together: the status bar's total, when it would show another
+    // value (speed::shown).
+    // Nothing fetching (as of the last flush): 0 at once rather than the fading of the last bytes.
+    const auto now = speed::Clock::now();
+    if (metering_) total_meter_.sample(now, received_.load());
+    else total_meter_ = {};
+    if (const auto total = speed::shown(total_meter_.rate()); total != total_sent_) {
+        total_sent_ = total;
+        post_ui(std::format(R"({{"type":"speed","total":{}}})", total));
+    }
     const bool full = std::exchange(queue_changed_, false);
-    if (!dirty_.exchange(false) && !full) return;
+    // A download that fetches has a new speed and time left at every flush, events or not.
+    if (!dirty_.exchange(false) && !full && !metering_) return;
     struct Delta {
         int id = 0;
         int gen = 0;
@@ -3793,6 +3852,7 @@ void App::flush() {
         std::lock_guard lock(mutex_);
         const auto locked = std::chrono::steady_clock::now();
         int waiting = 0;
+        bool metering = false;
         for (const auto& i : items_) {
             const bool touched = i->touched.exchange(false);
             const auto w = watches_.find(i->id);
@@ -3808,8 +3868,10 @@ void App::flush() {
                 if (!p.changed.empty()) deltas.push_back({i->id, i->gen, std::move(p.changed)});
             }
             if (watch != nullptr && !watch->send && i->names && i->gen != 0 && watch->gen != i->gen) fresh.push_back(i->id);
+            metering = meter(*i, now) || metering; // after the pass: a folder's files left
             rows.emplace_back(i->id, queue_item(*i, i->status == Status::queued ? ++waiting : 0));
         }
+        metering_ = metering;
         parallel = parallel_;
         held = ms_since(locked);
     }
@@ -3873,7 +3935,7 @@ void App::start_files(int id) {
         if (!item.tree.listed || !item.names || item.gen == 0 || item.names->path.size() != item.tree.files.size()) return;
         send->names = item.names;
         send->gen = item.gen;
-        send->snap = queue_view::snapshot(item.tree.files);
+        send->snap = queue_view::snapshot(item.tree.files, item.tree.small_connections > 0);
         held = ms_since(locked);
     }
     if (test_logging()) test_log(std::format("first answer lock={:.2f}ms files={}", held, send->snap.rows.size()));
@@ -4012,7 +4074,7 @@ void App::add_fake_folder(std::size_t files) {
 // GRAB_TEST_FAKE_FOLDER's download: every 100 ms 30 small files land (300 a second) and up to 8
 // big files move on at 4 MiB/s each, until all are done or it is stopped, in the start order of a
 // real one (folder::next_queued: priority, then folder order). Pause, Resume, Skip and a file's
-// priority act as on a real one.
+// priority act as on a real one; the bytes count as received (its speed and the total).
 void App::run_fake(Item& item, const std::stop_token& stop) {
     constexpr auto tick = std::chrono::milliseconds(100);
     constexpr double big_speed = 4.0 * 1024 * 1024;
@@ -4039,7 +4101,10 @@ void App::run_fake(Item& item, const std::stop_token& stop) {
                     f.eta.reset();
                     return true;
                 }
-                f.bytes = std::min(f.size, f.bytes + static_cast<std::uint64_t>(big_speed / 10));
+                const auto moved = std::min(f.size - std::min(f.bytes, f.size), static_cast<std::uint64_t>(big_speed / 10));
+                f.bytes += moved;
+                item.received += moved;
+                received_ += moved;
                 f.speed = big_speed;
                 f.eta = static_cast<double>(f.size - f.bytes) / big_speed;
                 if (f.bytes < f.size) return false;
@@ -4063,6 +4128,8 @@ void App::run_fake(Item& item, const std::stop_token& stop) {
                 if (!k) break;
                 auto& f = files[*k];
                 f.status = folder::State::done;
+                item.received += f.size - std::min(f.bytes, f.size);
+                received_ += f.size - std::min(f.bytes, f.size);
                 f.bytes = f.size;
                 f.fetched = true;
             }

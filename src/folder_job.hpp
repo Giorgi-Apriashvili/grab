@@ -69,8 +69,8 @@ struct File {
     // normal: the folder's order.
     int weight = 2;
     // A running big file none of whose streams reads now: its size check, or waiting for a
-    // connection the folder's other files or another download hold. The window shows it queued,
-    // as it isn't downloading. Not saved.
+    // connection the folder's other files or another download hold; never once all its bytes are
+    // in. The window shows it waiting or queued, as it isn't downloading. Not saved.
     bool waiting = false;
 };
 [[nodiscard]] File make_file(std::string path, std::uint64_t size, std::string modtime);
@@ -87,6 +87,10 @@ struct Tree {
     std::vector<File> files;
     int connections = 0;   // open right now
     int files_at_once = 0; // its big files running
+    // The connections its small files' workers hold now: not the big files' to share. A running
+    // big file that waits for a connection meanwhile waits for the small files (the window says
+    // "Waiting").
+    int small_connections = 0;
     // Folders below the folder that the walk couldn't read ("a/b: permission denied"): the rest is
     // downloaded and these are said (review G55).
     std::vector<std::string> unreadable;
@@ -214,6 +218,9 @@ struct Job {
     existing::Choice existing = existing::Choice::ask;
     engine::CommandHook on_command; // sees each step before it is taken (the walk, a file's reads)
     std::function<void(Event)> on_event; // called without the mutex held
+    // Told the bytes of each READ's reply as it comes, small files' and big files' alike, from the
+    // thread that read it, without the mutex: the folder's speed is what arrives (speed.hpp).
+    std::function<void(std::uint64_t)> on_received;
     // The server's pool of grab's own SSH connections, which the folder is walked and fetched
     // through. Needed, and so is `connections`.
     std::shared_ptr<ssh::Pool> pool;

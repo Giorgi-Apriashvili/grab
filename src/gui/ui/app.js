@@ -45,6 +45,7 @@ const state = {
   lastQuery: '',
   queue: [],
   parallel: 4,
+  totalSpeed: 0,         // what all downloads receive now, bytes/s (the backend's 'speed')
   limitOn: false,        // the limit that applies now: own setting, speed schedule or a change
   limitMiBps: 5,
   limit: {},             // the backend's "limit" message: source, until, nextMiBps
@@ -2284,9 +2285,12 @@ function folderIsOpen(q) {
 // for what few files have (a local name, an error). `view` holds the indices shown, in order (the
 // filter, then the sort), `pos` each index's place in it (-1: not shown).
 
-// folder::State's order, as "files" and "fileDelta" send it.
-const FILE_STATES = ['queued', 'running', 'paused', 'done', 'failed', 'skipped'];
-const FS = { queued: 0, running: 1, paused: 2, done: 3, failed: 4, skipped: 5 };
+// folder::State's order, as "files" and "fileDelta" send it, then 'waiting': a big file that has
+// its place but waits for the folder's small files, which hold the connections (queue_view.hpp
+// held_code). The folder counts it as queued.
+const FILE_STATES = ['queued', 'running', 'paused', 'done', 'failed', 'skipped', 'waiting'];
+const FS = { queued: 0, running: 1, paused: 2, done: 3, failed: 4, skipped: 5, waiting: 6 };
+const WAIT_WHY = 'Waits for the folder’s small files: they use its connections; big files follow';
 const PRIORITY_OF_WEIGHT = { 4: 'high', 2: 'normal', 1: 'low' };
 const WEIGHT_OF_PRIORITY = { high: 4, normal: 2, low: 1 };
 // Above this many files a folder is sorted by a live column (Status, Progress, Speed, ETA) only
@@ -2338,7 +2342,7 @@ function fileMatches(st, i) {
 
 // What file `i` sorts by on `key`, as its row shows it; NaN when it shows none (those go last both
 // ways). Status by the file's own state.
-const FILE_RANK = [1, 0, 2, 6, 3, 5]; // by FILE_STATES: running first, as DL_STATUS_RANK
+const FILE_RANK = [1, 0, 2, 6, 3, 5, 0.5]; // by FILE_STATES: running first, as DL_STATUS_RANK; waiting next
 function fileSortValue(st, i, key) {
   const s = st.status[i];
   switch (key) {
@@ -2791,6 +2795,10 @@ function dlView(q) {
   if (f) {
     const more = [['skipped', f.skipped], ['failed', f.failed], ['paused', f.paused]].filter(([, n]) => n > 0);
     tip.push([`${f.done} of ${f.total - f.skipped} files done`, ...more.map(([w, n]) => `${n} ${w}`)].join(' · '));
+    // Big files that have their places but wait for its small files (Waiting on their rows).
+    if (st === 'running' && f.held > 0) {
+      tip.push(`${f.held === 1 ? 'A big file waits' : `${f.held} big files wait`}${WAIT_WHY.slice('Waits'.length)}`);
+    }
   }
   if (fetching) {
     const parts = [];
@@ -2838,6 +2846,7 @@ function fileStatus(q, c) {
   if (c.status === 'skipped') return { word: 'Skipped' };
   if (q.status === 'cancelled') return { word: 'Cancelled', muted: true, why: 'The folder was cancelled', over: true };
   if (c.status === 'running') return { word: 'Downloading' };
+  if (c.status === 'waiting') return { word: 'Waiting', muted: true, why: WAIT_WHY };
   if (c.status === 'paused') return { word: 'Paused' };
   if (c.status === 'failed') return { word: 'Failed', bad: true, why: c.error || 'Failed' };
   if (q.status === 'paused') return { word: 'Paused', muted: true, why: 'The folder is paused', withFolder: true };
@@ -4345,8 +4354,10 @@ function resetSplit() {
   new ResizeObserver(() => scheduleRows()).observe($('#results'));
 }
 
-// ---- status bar: total speed and the speed limit -------------------------------------------
+// ---- status bar: total speed, its last minute, and the speed limit ---------------------------
 
+// The total is what all downloads receive now, measured where the bytes arrive (the backend's
+// 'speed': a recent average over about 5 s), not the rows' speeds added up.
 function renderTotalSpeed() {
   const running = state.queue.filter((q) => q.status === 'running');
   const el = $('#total-speed');
@@ -4355,10 +4366,40 @@ function renderTotalSpeed() {
     el.classList.remove('limited');
     return;
   }
-  const speed = running.reduce((sum, q) => sum + (q.speed || 0), 0);
-  el.textContent = `↓ ${fmtSize(speed)}/s total · ${running.length} running${state.limitOn ? ' (limited)' : ''}`;
+  el.textContent = `↓ ${fmtSpeed(state.totalSpeed)} total · ${running.length} running${state.limitOn ? ' (limited)' : ''}`;
   el.classList.toggle('limited', state.limitOn);
 }
+
+function onSpeed(msg) {
+  state.totalSpeed = msg.total > 0 ? msg.total : 0;
+  renderTotalSpeed();
+}
+
+// The graph left of the total: the total once a second over the last minute, the newest on the
+// right, scaled to the minute's peak. Its size is fixed and it sits before the text, so nothing in
+// the status bar moves as the numbers change; with nothing received in the last minute it is
+// blank (its place kept).
+const SPEED_SAMPLES = 60;
+const speedHist = [];
+function sampleSpeed() {
+  if (speedHist.length >= SPEED_SAMPLES) speedHist.shift();
+  speedHist.push(state.totalSpeed);
+  drawSpeedGraph();
+}
+
+function drawSpeedGraph() {
+  const box = $('#speed-graph');
+  const peak = speedHist.reduce((m, v) => Math.max(m, v), 0);
+  box.classList.toggle('idle', !(peak > 0));
+  if (!(peak > 0)) return;
+  const from = SPEED_SAMPLES - speedHist.length;
+  const y = (v) => (15 - (14 * v) / peak).toFixed(1); // 1 px of room at the top
+  const line = speedHist.map((v, k) => `${k ? 'L' : 'M'}${from + k} ${y(v)}`).join('');
+  box.querySelector('.line').setAttribute('d', line);
+  box.querySelector('.area').setAttribute('d', `${line}L${SPEED_SAMPLES - 1} 16L${from} 16Z`);
+  box.title = `Total speed over the last minute (peak ${fmtSpeed(peak)})`;
+}
+setInterval(sampleSpeed, 1000);
 
 // The speed schedule's part in the status bar: why the limit is what it is, and until when.
 function renderLimitHint() {
@@ -5109,6 +5150,7 @@ if (webview) {
         break;
       case 'files': onFiles(msg); break;
       case 'fileDelta': onFileDelta(msg); break;
+      case 'speed': onSpeed(msg); break;
       case 'update': state.update = msg; renderUpdate(); break;
       case 'updateChecked': onUpdateChecked(msg); break;
       case 'limit': onLimit(msg); break;

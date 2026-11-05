@@ -154,6 +154,34 @@ TEST_CASE("one pass over a folder's files counts its totals and finds the rows t
     CHECK(p.changed[0].now.status == State::running);
     CHECK(p.changed[0].now.speed == 25);
 
+    // The same while the folder's small files hold its connections: it waits for them, "Waiting"
+    // on the page (held_code), still counted as queued; the folder counts it as held.
+    t.files[1].waiting = true;
+    p = queue_view::pass(t.files, &shadow, true);
+    REQUIRE(p.changed.size() == 1);
+    CHECK(p.changed[0].now.status == State::queued);
+    CHECK(p.changed[0].now.held);
+    CHECK(p.held == 1);
+    CHECK(p.counts[static_cast<std::size_t>(State::queued)] == 1);
+    CHECK(json::stringify(parsed(queue_view::file_delta_message(7, 3, p.changed)).find("rows")->items[0]) == "[1,6,80,0,null,1]");
+    const auto names = queue_view::names_of(t.files);
+    CHECK(json::stringify(parsed(queue_view::files_message(7, 3, 1, 1, names, queue_view::snapshot(t.files, true)))
+                              .find("rows")->items[0]) == "[\"a:b.txt\",200,6,80,1,\"a\xEF\xBC\x9A" "b.txt\"]");
+    CHECK(queue_view::snapshot(t.files, false).rows[1].held == false);
+    p = queue_view::pass(t.files, &shadow, false); // the small files are done: Queued again
+    REQUIRE(p.changed.size() == 1);
+    CHECK_FALSE(p.changed[0].now.held);
+    CHECK(p.held == 0);
+    t.files[1].waiting = false;
+    // A running big file's speed goes as the page writes it.
+    t.files[1].speed = 12.34 * 1048576;
+    p = queue_view::pass(t.files, &shadow);
+    REQUIRE(p.changed.size() == 1);
+    CHECK(p.changed[0].now.speed == static_cast<float>(12.3 * 1048576));
+    // The files still to come in this run, and their bytes: queued and running ones.
+    CHECK(p.left_files == 1);
+    CHECK(p.left_bytes == 200 - 80);
+
     // Another generation's shadow (another count of files) is not compared; the totals still come.
     std::vector<queue_view::Shadow> other(2);
     p = queue_view::pass(t.files, &other);

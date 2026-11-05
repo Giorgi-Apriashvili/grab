@@ -42,14 +42,20 @@ struct Names {
 // Where file `i` lands (folder::target_of).
 [[nodiscard]] std::filesystem::path target_of(const std::filesystem::path& dir, const Names& names, std::size_t i);
 
+// The page's status code for a running big file that waits for a connection while the folder's
+// small files hold them (folder::Tree::small_connections): "Waiting" (DOWNLOADS-UI.md, chunk G),
+// after folder::State's codes. It counts as queued, as any big file that doesn't read.
+inline constexpr int held_code = 6;
+
 // A file as the page last got it. Small: a 177,000-file folder's shadow is compared at every flush.
 struct Shadow {
     std::uint64_t bytes = 0;
-    float speed = 0;
+    float speed = 0;         // as the page writes it (speed::shown)
     std::uint32_t error = 0; // a hash of a failed file's error; 0 without one
     folder::State status = folder::State::queued;
     std::uint8_t weight = 2; // its priority in the folder (File::weight): high 4, normal 2, low 1
     bool verified = false;
+    bool held = false; // queued, as it waits for the folder's small files: sent as held_code
 };
 
 // A file that changed since its shadow, for "fileDelta".
@@ -61,13 +67,19 @@ struct Row {
 };
 
 // One pass over a folder's files: its totals and the files in each state (the folder's row), and
-// with `shadow` (one per file) the files changed since it, which it then holds.
+// with `shadow` (one per file) the files changed since it, which it then holds. `small_hold`: the
+// folder's small files hold connections now (Tree::small_connections), so a running big file that
+// waits for one waits for them (Shadow::held). The totals' speed and time left are unused: the
+// window measures a download's own (speed.hpp).
 struct Pass {
     folder::Totals totals;
     std::array<std::size_t, 6> counts{}; // by folder::State
+    std::size_t held = 0;          // big files waiting for the small files (counted as queued)
+    std::size_t left_files = 0;    // files still to come in this run: queued or running
+    std::uint64_t left_bytes = 0;  // and their bytes not here yet
     std::vector<Row> changed;
 };
-[[nodiscard]] Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow);
+[[nodiscard]] Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow, bool small_hold = false);
 
 // What the page is sent first: every file as it is now, with the errors of failed ones. Its speed
 // is 0, so a running file's comes with the first "fileDelta".
@@ -75,13 +87,13 @@ struct Snapshot {
     std::vector<Shadow> rows;
     std::unordered_map<std::size_t, std::string> errors;
 };
-[[nodiscard]] Snapshot snapshot(const std::vector<folder::File>& files);
+[[nodiscard]] Snapshot snapshot(const std::vector<folder::File>& files, bool small_hold = false);
 
 // A folder's rows from `from` (at most `count`) of all its files, as one "files" message:
 // {type, id, gen, from, total, rows: [[path, size, status, bytes, priority, local, error, verified,
-// named], ...]}. Status (folder::State) and priority (the weight) are numbers; the last four only
-// where set: local (Names::shown) and error a string or null, verified and named (grab gave it
-// that name: Keep both, or a name another file has on Windows) 1 or 0.
+// named], ...]}. Status (folder::State, or held_code) and priority (the weight) are numbers; the
+// last four only where set: local (Names::shown) and error a string or null, verified and named
+// (grab gave it that name: Keep both, or a name another file has on Windows) 1 or 0.
 [[nodiscard]] std::string files_message(int id, int gen, std::size_t from, std::size_t count, const Names& names,
                                         const Snapshot& snap);
 // The rows that changed: {type: "fileDelta", id, gen, rows: [[index, status, bytes, speed, eta,

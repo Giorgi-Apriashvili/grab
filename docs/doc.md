@@ -431,9 +431,28 @@ them.
     files done, skipped and failed, the speed, the time left, the connections, notes such as
     "already there, nothing fetched" and the verify summary.
   - A file of a folder has its own status, or its folder's, greyed: Paused while the folder is
-    paused, Stopped when the folder failed, Cancelled with the folder. A big file that waits for
-    a connection (the folder's small files or other downloads hold them) says Queued until it
-    downloads.
+    paused, Stopped when the folder failed, Cancelled with the folder. A big file that has its At
+    once place but waits for the folder's small files, which use the folder's connections while
+    they last, says Waiting, greyed ("waits for the folder's small files: they use its
+    connections; big files follow"), and the folder's status tooltip says so while it lasts. One
+    waiting for an At once place, for connections other downloads hold, or not reached yet, says
+    Queued.
+  - **Speed** is what actually arrived over about the last 5 seconds, counted as the bytes come
+    in, small files and big ones alike, so a folder of small files has a speed too; older bytes
+    fade out of it rather than drop out at once, so it doesn't jump, and it follows a real change
+    within a few seconds. It starts at the first bytes, so the time spent connecting doesn't
+    lower it. A running file of a folder that is 2 MiB or more shows its own; smaller
+    files land too fast for one, and finished rows show none.
+  - **ETA** is learned from the download's own progress over the last 20 seconds, in files as
+    well as bytes: time left ≈ files left × what each file costs besides its bytes (its round
+    trips) + bytes left ÷ the bandwidth. So a folder of thousands of small files, paced by round
+    trips more than by bandwidth, gets a time that holds; that pace is then scaled by the speed
+    now against the 20 seconds' average, so a change in the link's speed shows within seconds. It
+    shows after 5 seconds of bytes coming and is smoothed: it counts down and moves part of the
+    way towards each new estimate, so it doesn't jump, and it stays within half to twice the
+    estimate. A single file goes by its bytes left and its speed. While a folder's big files wait
+    behind its small ones, their bytes are reckoned at no more than the fastest second's, so the
+    time errs long, never short, and comes down once they run.
   - **The two buttons** stay in the same places on every row: Pause or Resume (Retry, or Resume
     from what came, after a failure; Show in folder once done) and Cancel; on a file of a folder,
     Pause or Resume and Skip, Retry and Skip after a failure, and Show in folder once done. One
@@ -541,9 +560,10 @@ them.
     - A folder's files have no queue order of their own, so here priority also decides which
       start first: High, then Normal, then Low, each in folder order. It applies at once: a
       queued file moves in that order, a running one is never restarted.
-    - It orders the small files (under 2 MiB) and the big ones separately, and neither waits for
-      the other: a Normal small file still starts while a High big file waits for an At once
-      place. At once still counts the big files; priority only decides which take its places.
+    - It orders the small files (under 2 MiB) and the big ones separately: a Normal small file
+      still starts while a High big file waits for an At once place. The small files use the
+      folder's connections while they last, so big files that have their places meanwhile say
+      Waiting. At once still counts the big files; priority only decides which take its places.
     - Running big files split the folder's connections (those its small files don't hold)
       4 : 2 : 1, at least one each, and under a speed limit the folder's part of it too. With
       fewer connections than running big files, the higher priorities get them and the others
@@ -554,12 +574,16 @@ them.
     - Kept in queue.json (`"priority"` on a file, only when not Normal); grab 0.21 doesn't know
       it and reads every file as Normal. The `grab` command downloads every file at Normal, in
       folder order, as before.
-- **Speed limit:** the bar below the downloads shows the total speed. On its right, "Limit
-  speed" caps all downloads together, in MiB/s; the switch keeps the value, and both are
-  remembered.
-  - Changes apply at once. Downloads are paced by a shared token bucket: while limited, grab's
-    client asks each connection for one read at a time, after taking its tokens, so the network
-    really follows the limit.
+- **Speed limit:** the bar below the downloads shows the total speed: everything grab receives,
+  all downloads together, measured the same way as a row's Speed ("↓ 12.3 MiB/s total · 2
+  running"). Left of it, a small graph shows that total over the last minute, one point a
+  second, scaled to the minute's peak (hover for the peak); it keeps its place, blank when
+  nothing came. Once no download is fetching the total reads 0 at once. On the bar's right, "Limit speed" caps all downloads together, in MiB/s; the
+  switch keeps the value, and both are remembered.
+  - Changes apply at once. Downloads are paced by a shared token bucket: while limited, every read
+    is asked for only after taking its tokens, so the network really follows the limit. A big
+    file's connections ask for one read at a time; a folder's small files keep several files and
+    up to a quarter second of the limit's reads on their way, so they reach the limit too.
 - **Verify downloads** (Settings → Downloads, off by default): after each download, the server
   computes an MD5 checksum of its copy (`md5sum`, run through grab's own SSH connection) while
   grab computes yours, and the two are compared. The row reads Verifying (a folder counts the
@@ -609,7 +633,8 @@ them.
   - Files of 2 MiB and more take the resumable path above, as many at a time as At once allows,
     their pieces spread over the server's connections.
   - Smaller files go beside them on every free connection, many at a time (up to 32 files and 8
-    MiB of reads in flight per connection), over connections already logged in, since a new SSH
+    MiB of reads in flight per connection; under a speed limit, a quarter second of the limit's
+    reads), over connections already logged in, since a new SSH
     login per small file would dominate. Pausing drops the progress of small files that were in
     flight.
   - The tree and each file's state survive closing grab, the failed files with their error:
@@ -1291,8 +1316,9 @@ instead (see [Notes about settings](#notes-about-settings)), except a bind left 
 
 The rest is grab's, with nothing to set:
 - **Reads:** 255 KiB at a time (the largest SFTP packet OpenSSH accepts), up to 64 in flight per
-  connection, each for exactly the bytes a range still needs. Under a speed limit, one at a time
-  and smaller, so the limit holds.
+  connection, each for exactly the bytes a range still needs. Under a speed limit smaller, each
+  after its tokens, so the limit holds: one at a time on a big file's connection, up to a quarter
+  second's worth on a connection of a folder's small files.
 - **Files at once:** "At once" in the window's Downloads bar (1–8, default 4), which the command
   follows too; a big file's pieces spread over the server's connections, small files of a folder
   go beside them (see [GUI](#gui)).

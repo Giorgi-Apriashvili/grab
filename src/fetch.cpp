@@ -3,6 +3,7 @@
 #include "json.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
+#include "speed.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
 #include "util.hpp"
@@ -11,7 +12,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <deque>
 #include <format>
 #include <limits>
 #include <map>
@@ -805,6 +805,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
 
     // Connections this file's streams hold, against Download::streams_cap.
     std::atomic<int> holding{0};
+    // Bytes of READ replies that came, as they came: its speed (speed::Meter).
+    std::atomic<std::uint64_t> received{0};
 
     // What one go at a range came to.
     struct Attempt {
@@ -921,6 +923,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
                         return;
                     }
                     const auto got = static_cast<std::uint32_t>(r->size());
+                    received += got;
+                    if (d.on_received) d.on_received(got);
                     if (got < n) send(at + got, n - got); // a short read: the rest at once, exactly
                     if (at != deliver) {
                         early.emplace(at, std::string(*r));
@@ -1045,19 +1049,25 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 d.on_command({"sftp", "read", src.path, "--offset", std::to_string(offset), "--count", std::to_string(count)});
             }
             {
-                // Reading on its connection for as long as sftp_range goes (Download::on_reading).
+                // Reading on its connection for as long as sftp_range goes (Download::on_reading),
+                // and whether every byte of the file was in as it stopped.
                 struct Reading {
                     const Download& d;
+                    bool all_in = false;
                     explicit Reading(const Download& dl) : d(dl) {
-                        if (d.on_reading) d.on_reading(+1);
+                        if (d.on_reading) d.on_reading(+1, false);
                     }
                     ~Reading() {
-                        if (d.on_reading) d.on_reading(-1);
+                        if (d.on_reading) d.on_reading(-1, all_in);
                     }
                     Reading(const Reading&) = delete;
                     Reading& operator=(const Reading&) = delete;
                 } reading(d);
                 sftp_range(i, offset, a);
+                if (d.on_reading) {
+                    std::lock_guard lock(m);
+                    reading.all_in = state.complete();
+                }
             }
             const bool refused = a.failure == budget::Failure::refused && !token.stop_requested();
             if (refused) connections.refused(d.server);
@@ -1117,8 +1127,10 @@ Result run(const Download& d, Connections& connections, const std::function<void
         });
     }
 
-    // Report progress and save state until the streams are done.
-    std::deque<std::pair<Clock::time_point, std::uint64_t>> samples;
+    // Report progress and save state until the streams are done. Its speed: the bytes that came,
+    // over about the last 5 s.
+    speed::Meter meter;
+    meter.sample(Clock::now(), 0);
     auto last_save = Clock::now();
     auto snapshot = [&] {
         std::lock_guard lock(m);
@@ -1149,13 +1161,11 @@ Result run(const Download& d, Connections& connections, const std::function<void
             std::lock_guard lock(m);
             bytes = state.bytes_done();
         }
-        samples.emplace_back(now, bytes);
-        while (samples.size() > 1 && now - samples.front().first > std::chrono::seconds(5)) samples.pop_front();
+        meter.sample(now, received.load());
         Progress p;
         p.bytes = bytes;
         p.total = state.size;
-        const auto span = std::chrono::duration<double>(now - samples.front().first).count();
-        if (span > 0.5) p.speed = static_cast<double>(bytes - samples.front().second) / span;
+        p.speed = meter.rate();
         if (p.speed > 0 && p.total > p.bytes) p.eta = static_cast<double>(p.total - p.bytes) / p.speed;
         p.connections = connections.active(d.server, d.id);
         if (on_progress) on_progress(p);

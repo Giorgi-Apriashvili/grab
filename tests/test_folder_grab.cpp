@@ -7,6 +7,7 @@
 #include "folder.hpp"
 #include "folder_job.hpp"
 #include "local_name.hpp"
+#include "queue_view.hpp"
 #include "rate.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
@@ -217,6 +218,8 @@ TEST_CASE("grab engine folders: small and big files over all connections, each b
     CHECK(r.tree.unreadable.empty());
     // Files from 2 MiB up take fetch::run (At once); the rest go beside them.
     for (const auto& f : r.tree.files) CHECK_MESSAGE(f.big == (f.size >= folder::small_limit), f.path);
+    std::atomic<std::uint64_t> received{0}; // every READ's reply, small files' and big files'
+    r.job.on_received = [&](std::uint64_t n) { received += n; };
     folder::run(r.job, r.tree, r.m, {});
     for (const auto& f : r.tree.files) {
         CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
@@ -229,6 +232,7 @@ TEST_CASE("grab engine folders: small and big files over all connections, each b
     r.job.pool.reset();
     pool.reset();
     CHECK(t.asked() == total); // no byte twice, none past an end
+    CHECK(received == total);  // and each counted once as it came, for the window's speeds
     CHECK(t.logins <= 4);
 }
 
@@ -963,4 +967,165 @@ TEST_CASE("grab engine folders: files waiting for a connection don't lower the f
         CHECK(share < 0.55);
         CHECK(waiting_seen >= 4); // 8 running, 4 connections
     }
+}
+
+TEST_CASE("grab engine folders: a big file waits before its first read, never once all its bytes are in") {
+    // Its last stream ending before the file was put in place left it waiting until the progress
+    // loop's next tick (up to a quarter second): the window showed Queued just before Done.
+    // Watched from beside: a wait after reading that lasts several looks is that.
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 4; ++i) t.file(std::format("/data/b{}.bin", i), test::pattern((3u << 20) + 4096 * i));
+    t.delay = std::chrono::milliseconds(1); // reading takes long enough to be seen
+    t.slice = std::size_t{64} * 1024;
+    Run r(t.pool(2), "no-flash", 2, 1);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    struct Seen {
+        bool waited_first = false; // waiting as it started, before any read
+        bool read = false;
+        int waits = 0;   // looks in a row finding it waiting since it read
+        int longest = 0; // the most of them
+    };
+    std::vector<Seen> seen(r.tree.files.size());
+    r.job.on_event = [&](folder::Event) {
+        std::lock_guard lock(r.m);
+        for (std::size_t k = 0; k < r.tree.files.size(); ++k) {
+            const auto& f = r.tree.files[k];
+            if (f.status == folder::State::running && f.waiting && f.bytes == 0) seen[k].waited_first = true;
+        }
+    };
+    {
+        std::jthread watch([&](const std::stop_token& st) {
+            while (!st.stop_requested()) {
+                {
+                    std::lock_guard lock(r.m);
+                    for (std::size_t k = 0; k < r.tree.files.size(); ++k) {
+                        const auto& f = r.tree.files[k];
+                        auto& s = seen[k];
+                        if (f.status != folder::State::running || !f.waiting) {
+                            if (f.status == folder::State::running) s.read = true;
+                            s.waits = 0;
+                        } else if (s.read) {
+                            s.longest = std::max(s.longest, ++s.waits);
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+        folder::run(r.job, r.tree, r.m, {});
+    }
+    for (std::size_t k = 0; k < seen.size(); ++k) {
+        const auto& f = r.tree.files[k];
+        CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+        CHECK_MESSAGE(seen[k].waited_first, f.path);
+        CHECK_MESSAGE(seen[k].read, f.path);
+        CHECK_MESSAGE(seen[k].longest < 3, f.path, ": waiting after its reads for ", seen[k].longest, " looks");
+        CHECK_FALSE(f.waiting);
+    }
+}
+
+TEST_CASE("grab engine folders: a big file whose connections the small files hold waits for them; one past At once is queued") {
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 400; ++i) t.file(std::format("/data/s{:03}.bin", i), test::pattern(20000 + i));
+    for (int i = 0; i < 3; ++i) t.file(std::format("/data/t{}.bin", i), test::pattern((3u << 20) + 4096 * i));
+    t.delay = std::chrono::milliseconds(1); // the small files take a while
+    Run r(t.pool(2), "held", 2, 1);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    std::size_t most_held = 0;
+    bool queued_held = false; // a big file not started shown waiting for the small files
+    bool held_after = false;  // one still held once no small file runs
+    r.job.on_event = [&](folder::Event) {
+        std::lock_guard lock(r.m);
+        const bool small_hold = r.tree.small_connections > 0;
+        const auto p = queue_view::pass(r.tree.files, nullptr, small_hold);
+        most_held = std::max(most_held, p.held);
+        const auto snap = queue_view::snapshot(r.tree.files, small_hold);
+        for (std::size_t k = 0; k < r.tree.files.size(); ++k) {
+            const auto& f = r.tree.files[k];
+            if (f.big && f.status == folder::State::queued && snap.rows[k].held) queued_held = true;
+        }
+        if (!small_hold && p.held > 0) held_after = true;
+    };
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    CHECK(most_held == 1); // At once 1: the big file that has its place, Waiting
+    CHECK_FALSE(queued_held); // the others, Queued
+    CHECK_FALSE(held_after);
+    CHECK(r.tree.small_connections == 0);
+}
+
+TEST_CASE("grab engine folders: small files reach a speed limit over the network's round trip") {
+    // One file and one READ at a time per connection under a limit left most of each round trip
+    // idle (half of 1 MiB/s on Main, chunk F's L4). Now many are on their way, each READ still sent
+    // right after its tokens: the limit, and no more.
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 300; ++i) t.file(std::format("/data/s{:03}.bin", i), test::pattern(16 * 1024 + i));
+    t.delay = std::chrono::milliseconds(20); // a round trip
+    Run r(t.pool(2), "small-limit", 2, 1);
+    rate::RateLimiter limiter;
+    limiter.set_rate(1u << 20);
+    r.job.limiter = &limiter;
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    std::stop_source stop;
+    const auto start = Tree::Clock::now();
+    {
+        std::jthread run([&] { folder::run(r.job, r.tree, r.m, stop.get_token()); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        stop.request_stop();
+    }
+    std::uint64_t asked = 0; // READs asked from 0.5 s to 2.5 s, past the bucket's first burst
+    {
+        std::lock_guard lock(t.mutex);
+        for (const auto& a : t.asks) {
+            const auto when = a.at - start;
+            if (when >= std::chrono::milliseconds(500) && when < std::chrono::milliseconds(2500)) asked += a.length;
+        }
+    }
+    const double mibps = static_cast<double>(asked) / 2.0 / (1 << 20);
+    MESSAGE("small files under 1 MiB/s: ", mibps, " MiB/s");
+    CHECK(mibps > 0.9);
+    CHECK(mibps < 1.1);
+}
+
+TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the small files at once") {
+    // The schedule can turn a limit on in the middle of a folder. The small-file workers read the
+    // rate at every pass and always count as the limiter's members, so they take tokens from then
+    // on rather than at their next turn (which can be the rest of the folder).
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 2000; ++i) t.file(std::format("/data/s{:04}.bin", i), test::pattern(16 * 1024 + i));
+    t.delay = std::chrono::milliseconds(20); // a round trip
+    Run r(t.pool(2), "small-limit-later", 2, 1);
+    rate::RateLimiter limiter; // unlimited at the start
+    r.job.limiter = &limiter;
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    std::stop_source stop;
+    const auto start = Tree::Clock::now();
+    Tree::Clock::time_point switched;
+    {
+        std::jthread run([&] { folder::run(r.job, r.tree, r.m, stop.get_token()); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        switched = Tree::Clock::now();
+        limiter.set_rate(1u << 20);
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        stop.request_stop();
+    }
+    std::uint64_t before = 0; // READs asked before the switch: it ran unlimited
+    std::uint64_t asked = 0;  // from 0.5 s to 2.5 s after it, past the bucket's first burst
+    {
+        std::lock_guard lock(t.mutex);
+        for (const auto& a : t.asks) {
+            if (a.at >= start && a.at < switched) before += a.length;
+            const auto when = a.at - switched;
+            if (when >= std::chrono::milliseconds(500) && when < std::chrono::milliseconds(2500)) asked += a.length;
+        }
+    }
+    const double mibps = static_cast<double>(asked) / 2.0 / (1 << 20);
+    MESSAGE("before the switch ", before, " bytes; after it ", mibps, " MiB/s");
+    CHECK(before > 0);
+    CHECK(mibps > 0.9);
+    CHECK(mibps < 1.1);
 }

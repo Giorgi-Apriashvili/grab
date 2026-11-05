@@ -1,6 +1,7 @@
 #include "queue_view.hpp"
 
 #include "local_name.hpp"
+#include "speed.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -24,7 +25,7 @@ std::uint32_t error_id(std::string_view error) {
     return static_cast<std::uint32_t>(std::hash<std::string_view>{}(error)) | 1U;
 }
 
-int state_code(State s) { return static_cast<int>(s); }
+int state_code(const Shadow& s) { return s.held ? held_code : static_cast<int>(s.status); }
 
 } // namespace
 
@@ -63,17 +64,25 @@ namespace {
 // A file's state as the page shows it: a running big file that reads on no connection
 // (File::waiting) is queued, as it isn't downloading.
 State shown(const folder::File& f) { return f.status == State::running && f.waiting ? State::queued : f.status; }
+// Whether it waits for the folder's small files (Shadow::held): they hold connections meanwhile.
+bool held(const folder::File& f, bool small_hold) { return small_hold && f.status == State::running && f.waiting; }
 
 } // namespace
 
-Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow) {
+Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow, bool small_hold) {
     Pass p;
     if (shadow != nullptr && shadow->size() != files.size()) shadow = nullptr; // another generation's
     auto& t = p.totals;
     for (std::size_t i = 0; i < files.size(); ++i) {
         const auto& f = files[i];
         const State status = shown(f);
+        const bool waits = held(f, small_hold);
         ++p.counts[static_cast<std::size_t>(status)];
+        if (waits) ++p.held;
+        if (f.status == State::queued || f.status == State::running) {
+            ++p.left_files;
+            p.left_bytes += f.size - std::min(f.bytes, f.size);
+        }
         if (f.status != State::skipped) { // as folder::totals counts
             ++t.files;
             t.total += f.size;
@@ -89,15 +98,16 @@ Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow) {
         auto& s = (*shadow)[i];
         const bool running = status == State::running;
         Shadow now{.bytes = f.bytes,
-                   .speed = running ? static_cast<float>(f.speed) : 0.0F,
+                   .speed = running ? static_cast<float>(speed::shown(f.speed)) : 0.0F,
                    .error = 0,
                    .status = status,
                    .weight = static_cast<std::uint8_t>(f.weight),
-                   .verified = f.verified};
+                   .verified = f.verified,
+                   .held = waits};
         // Hashed on every pass: a file queued again can fail with another error between two passes.
         if (f.status == State::failed) now.error = error_id(f.error);
         if (now.bytes == s.bytes && now.speed == s.speed && now.error == s.error && now.status == s.status &&
-            now.weight == s.weight && now.verified == s.verified) {
+            now.weight == s.weight && now.verified == s.verified && now.held == s.held) {
             continue;
         }
         s = now;
@@ -110,7 +120,7 @@ Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow) {
     return p;
 }
 
-Snapshot snapshot(const std::vector<folder::File>& files) {
+Snapshot snapshot(const std::vector<folder::File>& files, bool small_hold) {
     Snapshot snap;
     snap.rows.reserve(files.size());
     for (std::size_t i = 0; i < files.size(); ++i) {
@@ -120,7 +130,8 @@ Snapshot snapshot(const std::vector<folder::File>& files) {
                  .error = 0,
                  .status = shown(f),
                  .weight = static_cast<std::uint8_t>(f.weight),
-                 .verified = f.verified};
+                 .verified = f.verified,
+                 .held = held(f, small_hold)};
         if (f.status == State::failed) {
             s.error = error_id(f.error);
             snap.errors.emplace(i, f.error);
@@ -142,7 +153,7 @@ std::string files_message(int id, int gen, std::size_t from, std::size_t count, 
         if (i > from) out += ',';
         out += '[';
         out += json::quote(names.path[i]);
-        std::format_to(std::back_inserter(out), ",{},{},{},{}", names.size[i], state_code(s.status), s.bytes, s.weight);
+        std::format_to(std::back_inserter(out), ",{},{},{},{}", names.size[i], state_code(s), s.bytes, s.weight);
         // The optional cells, as far as the last one set.
         const auto shown = names.shown.find(i);
         const auto error = snap.errors.find(i);
@@ -166,7 +177,7 @@ std::string file_delta_message(int id, int gen, const std::vector<Row>& rows) {
         if (!first) out += ',';
         first = false;
         const auto& s = r.now;
-        std::format_to(std::back_inserter(out), "[{},{},{},{:.0f},", r.index, state_code(s.status), s.bytes, s.speed);
+        std::format_to(std::back_inserter(out), "[{},{},{},{:.0f},", r.index, state_code(s), s.bytes, s.speed);
         if (r.eta && std::isfinite(*r.eta)) std::format_to(std::back_inserter(out), "{:.0f}", *r.eta);
         else out += "null";
         std::format_to(std::back_inserter(out), ",{}", s.weight);
