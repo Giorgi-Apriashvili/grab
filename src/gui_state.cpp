@@ -312,6 +312,7 @@ std::vector<SavedDownload> queue_from(const json::Value* doc) {
         if (const auto* o = v.find("spaceOk"); o != nullptr && o->kind == json::Value::Kind::boolean) d.space_ok = o->boolean;
         if (auto e = v.string_of("existing"); e == "replace" || e == "both" || e == "skip") d.existing = *e;
         d.local_name = v.string_of("localName").value_or("");
+        if (const auto* e = v.find("expanded"); e != nullptr && e->kind == json::Value::Kind::boolean) d.expanded = e->boolean;
         if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
             d.total = static_cast<std::uint64_t>(t->number);
         }
@@ -326,12 +327,13 @@ std::vector<SavedDownload> queue_from(const json::Value* doc) {
                 }
                 sf.modtime = f.string_of("modtime").value_or("");
                 const auto state = f.string_of("state").value_or("queued");
-                sf.state = state == "paused" || state == "done" || state == "skipped" ? state : "queued";
+                sf.state = state == "paused" || state == "done" || state == "skipped" || state == "failed" ? state : "queued";
                 for (auto [key, flag] : {std::pair{"fetched", &sf.fetched}, std::pair{"verified", &sf.verified}}) {
                     const auto* b = f.find(key);
                     *flag = b != nullptr && b->kind == json::Value::Kind::boolean && b->boolean;
                 }
                 sf.local = f.string_of("local").value_or("");
+                if (sf.state == "failed") sf.error = f.string_of("error").value_or("");
                 d.files.push_back(std::move(sf));
             }
         }
@@ -373,24 +375,36 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
         if (d.space_ok) v.set("spaceOk", Value::make_bool(true));
         if (!d.existing.empty()) v.set("existing", Value::make_string(d.existing));
         if (!d.local_name.empty()) v.set("localName", Value::make_string(d.local_name));
-        if (!d.files.empty()) {
-            Value files = Value::make_array();
-            for (const auto& f : d.files) {
-                Value fv = Value::make_object();
-                fv.set("path", Value::make_string(f.path));
-                fv.set("size", Value::make_number(static_cast<double>(f.size)));
-                fv.set("modtime", Value::make_string(f.modtime));
-                fv.set("state", Value::make_string(f.state));
-                if (f.fetched) fv.set("fetched", Value::make_bool(true));
-                if (f.verified) fv.set("verified", Value::make_bool(true));
-                if (!f.local.empty()) fv.set("local", Value::make_string(f.local));
-                files.push(std::move(fv));
-            }
-            v.set("files", std::move(files));
-        }
+        if (d.expanded) v.set("expanded", Value::make_bool(*d.expanded));
         list.push(std::move(v));
     }
-    return json::stringify(list);
+    // A folder's files are written straight as text, after its other keys: a 177,000-file folder
+    // as JSON values would take far more memory and time than its text.
+    std::string out = "[";
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (k > 0) out += ',';
+        std::string item = json::stringify(list.items[k]);
+        if (!items[k].files.empty()) {
+            item.pop_back(); // its '}'
+            item += R"(,"files":[)";
+            bool first = true;
+            for (const auto& f : items[k].files) {
+                if (!first) item += ',';
+                first = false;
+                item += R"({"path":)" + json::quote(f.path) + R"(,"size":)" + std::to_string(f.size) +
+                        R"(,"modtime":)" + json::quote(f.modtime) + R"(,"state":)" + json::quote(f.state);
+                if (f.fetched) item += R"(,"fetched":true)";
+                if (f.verified) item += R"(,"verified":true)";
+                if (!f.local.empty()) item += R"(,"local":)" + json::quote(f.local);
+                if (f.state == "failed" && !f.error.empty()) item += R"(,"error":)" + json::quote(f.error);
+                item += '}';
+            }
+            item += "]}";
+        }
+        out += item;
+    }
+    out += ']';
+    return out;
 }
 
 std::filesystem::path learned_limits_path(const std::filesystem::path& grab_conf) {

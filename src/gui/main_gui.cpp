@@ -44,6 +44,7 @@ constexpr UINT wm_show = WM_APP + 3;      // from a second launch: bring the win
 constexpr UINT wm_quit = WM_APP + 4;      // App::Host::quit, once the call that asked has returned (G138)
 constexpr UINT_PTR timer_tray = 1;        // every second: the tray tooltip and the speed schedule
 constexpr UINT_PTR timer_exit = 2;        // fallback exit when a notification never reports back
+constexpr UINT_PTR timer_flush = 3;       // every 250 ms: the queue's changes to the page (App::flush)
 constexpr UINT id_show = 1;               // tray menu
 constexpr UINT id_quit = 2;
 
@@ -264,6 +265,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         if (wparam == timer_tray) {
             refresh_tray_tip();
             if (g.app) g.app->tick();
+        } else if (wparam == timer_flush) {
+            if (g.app) g.app->flush();
         } else if (wparam == timer_exit) {
             KillTimer(hwnd, timer_exit);
             if (may_exit_now()) quit(hwnd);
@@ -336,6 +339,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, timer_tray);
+        KillTimer(hwnd, timer_flush);
         KillTimer(hwnd, timer_exit);
         g.app.reset(); // joins the worker threads (told to stop by App::close) while the window still exists
         g.tray.remove();
@@ -555,6 +559,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     g.tip = L"grab";
     g.tray.add(g.hwnd, icon(SM_CXSMICON), icon(SM_CXICON), g.tip);
     SetTimer(g.hwnd, timer_tray, 1000, nullptr);
+    SetTimer(g.hwnd, timer_flush, 250, nullptr);
 
     gui::WebViewHost::Options options;
     // %LOCALAPPDATA% read as UTF-8 (G140): read in the ANSI code page, a profile folder such as

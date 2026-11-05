@@ -3,12 +3,12 @@
 //   to backend:   init, prefs, search, cancelSearch, refreshLists, browse, suggest, pickFolder, enqueue, cancelItem,
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
-//                 pauseChild, resumeChild, skipChild, resolveExisting, play, previewCancel,
+//                 watchFiles, unwatchFiles, fileAction, showFile, setExpanded, resolveExisting, play, previewCancel,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
-//   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, error, update,
-//                 spaceShort, existing,
+//   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
+//                 files, fileDelta, error, update, spaceShort, existing,
 //                 updateChecked, limit,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
@@ -2029,12 +2029,12 @@ $('#rows').addEventListener('contextmenu', (ev) => {
   if (items.length) showMenu(ev.clientX, ev.clientY, items);
 });
 
-// Where a download lands on this PC: DEST\<name>, and a folder's files below that.
-function localPath(q, child) {
+// Where a download lands on this PC: DEST\<name>, and a folder's file `i` below that (5.10): the
+// name grab saved it under when it isn't the server's.
+function localPath(q, st, i) {
   const base = q.local || `${q.dest.replace(/[\\/]+$/, '')}\\${q.name}`;
-  if (!child) return base;
-  const c = (q.children || []).find((x) => x.path === child);
-  return `${base}\\${c && c.local ? c.local : child.replace(/\//g, '\\')}`;
+  if (!st) return base;
+  return `${base}\\${st.local.get(i) || st.path[i].replace(/\//g, '\\')}`;
 }
 
 // ---- downloads ---------------------------------------------------------------------------
@@ -2143,13 +2143,13 @@ function resumeItem(q) {
 
 // ---- the Downloads table (DOWNLOADS-UI.md 5): a header row over a virtual body ---------------
 //
-// A row per download, its message rows under it (5.5) and, under an open folder, its files: the
-// backend sends a folder's running, paused and failed files and its next 20 queued ones, with
-// "84 done" and "…N more queued" as message rows (until every file is listed, DOWNLOADS-UI.md
-// chunk C). Every row is 28 px. Only the rows in view, and 10 more each side, have an element,
-// from a pool reused as the list scrolls. Columns have fixed widths and numbers fixed formats, and
-// a cell is written only when its value changes: nothing moves while downloading, and a button
-// under the mouse stays the same button.
+// A row per download, its message rows under it (5.5) and, under an open folder, every one of its
+// files, which stay when they are done (decision 2): they come by subscription (6.3), once in full
+// ("files", in chunks) and then the rows that changed ("fileDelta"), into a store of columns per
+// folder. Every row is 28 px. Only the rows in view, and 10 more each side, have an element, from
+// a pool reused as the list scrolls. Columns have fixed widths and numbers fixed formats, and a
+// cell is written only when its value changes: nothing moves while downloading, and a button under
+// the mouse stays the same button.
 
 const DL_POOL = 150; // row elements at most
 const DL_OVER = 10;  // rows drawn beyond the view on each side
@@ -2210,20 +2210,31 @@ function fmtClock(sec) {
 }
 
 // The rows (rebuilt only when their structure changes), the elements showing them, the narrow
-// step, the selection (row keys: downloads, or files of one folder), the keyboard's cursor, a drag
-// by the ≡ handle and the column widths dragged by hand.
+// step, the selection (downloads by row key, or files of one folder by index), the keyboard's
+// cursor, a drag by the ≡ handle and the column widths dragged by hand.
+//
+// The rows are entries (dl.top): a download, a message row, or an open folder's files as one block
+// that stands for the rows of its store's view, so a 177,000-file folder makes no row objects until
+// they show (dlRow). Row keys: 'd<id>' a download, 'm<id>:<what>' a message row, 'f<id>:<index>'
+// a file, by its index in the folder's listing (stable, also across restarts).
 const dl = {
-  rows: [],              // { kind: 'dl' | 'file' | 'msg', key, id, path, what, sub, scope }
-  index: new Map(),      // row key -> its index in rows
-  shape: '',             // the rows' keys: a new one means the structure changed
+  top: [],               // { kind: 'dl' | 'msg' | 'block', key, id, what, sub, scope, n }
+  starts: [],            // each entry's first row
+  n: 0,                  // rows in all
+  topIndex: new Map(),   // a download or message row's key -> its entry
+  blockAt: new Map(),    // folder id -> its block's entry
+  shape: '',             // the entries' keys and the blocks' views: a new one means the structure changed
   byId: new Map(),       // download id -> its item in state.queue
-  kids: new Map(),       // folder id -> its files sent, by path
+  stores: new Map(),     // folder id -> its files (newStore), while it is open
+  watching: new Set(),   // folders whose files the backend sends (watchFiles)
   pool: [],              // every row element made
   bound: new Map(),      // row key -> the element showing it
   step: 0,
   need: DL_NEED,         // the panel width each step needs, with the widths below
   frame: 0,
-  sel: new Set(),
+  filesFrame: 0,         // a frame asked for by "fileDelta"
+  sel: new Set(),        // downloads' keys (a message row stands for its download)
+  fsel: null,            // or files of one folder: { id, on: Uint8Array by index }
   anchor: '',
   // The cursor row's key ('' before the first click or key), and its download and index, where
   // it goes when its row goes (a folded folder's file goes to the folder).
@@ -2235,8 +2246,21 @@ const dl = {
   widths: {},            // column -> px dragged by hand (gui.json downloads.widths); absent: DL_W
   resize: null,          // while a title's edge is dragged
   keyAt: 0,              // when the table last had a key (performance.now())
+  show: 'all',           // decision 2's filter, for the session: 'all', 'unfinished' or 'failed'
+  lastRun: -1,           // the row 'Go to running' went to, and where the body was scrolled then
+  lastRunTop: -1,
+  goPending: 0,          // a folder 'Go to running' opened: the jump comes with its files
+  // The first row in view at the last paint (its entry's key, its download's, its row in the entry,
+  // its index, and how far the body is scrolled into it): rows coming or going above it don't
+  // move it (dlKeepView).
+  viewKey: '',
+  viewDl: '',
+  viewPos: 0,
+  viewAt: 0,
+  viewOff: 0,
+  moving: null,          // a download the user moved: { id, order } until the new order came
 };
-const folderOpen = new Map(); // folder id -> expanded, once the user toggled it
+const folderOpen = new Map(); // folder id -> expanded, as the user toggled it in this window
 
 // A row as the selection counts it: a message row stands for its download; and its level, which a
 // selection keeps to: downloads ('d'), or the files of one folder.
@@ -2246,9 +2270,257 @@ const scopeOf = (r) => (r.kind === 'file' ? r.scope : 'd');
 // The table keeps the keyboard focus (one Tab stop, 5.8): a row's button never holds it.
 function dlFocus() { $('#queue').focus({ preventScroll: true }); }
 
-// Open while the folder is active, folded when it is finished, unless the user toggled it.
+// Open while the folder is active, folded when it is finished, unless the user toggled it (kept in
+// queue.json: 'expanded').
 function folderIsOpen(q) {
-  return folderOpen.has(q.id) ? folderOpen.get(q.id) : !['done', 'cancelled'].includes(q.status);
+  if (folderOpen.has(q.id)) return folderOpen.get(q.id);
+  return typeof q.expanded === 'boolean' ? q.expanded : !['done', 'cancelled'].includes(q.status);
+}
+
+// ---- a folder's files (6.1, 6.3) ----------------------------------------------------------------
+//
+// A store of columns by the file's index: typed arrays for the numbers, arrays for the names, maps
+// for what few files have (a local name, an error). `view` holds the indices shown, in order (the
+// filter, then the sort), `pos` each index's place in it (-1: not shown).
+
+// folder::State's order, as "files" and "fileDelta" send it.
+const FILE_STATES = ['queued', 'running', 'paused', 'done', 'failed', 'skipped'];
+const FS = { queued: 0, running: 1, paused: 2, done: 3, failed: 4, skipped: 5 };
+const PRIORITY_OF_WEIGHT = { 4: 'high', 2: 'normal', 1: 'low' };
+// Above this many files a folder is sorted by a live column (Status, Progress, Speed, ETA) only
+// when its title is clicked: its arrow is hollow, "the order from your click" (5.6).
+const DL_LIVE_FILES = 5000;
+const DL_LIVE_COLS = new Set(['status', 'progress', 'speed', 'eta', 'priority']);
+
+function newStore(id, gen, total) {
+  return {
+    id, gen, total, loaded: 0,
+    path: new Array(total), local: new Map(), named: new Set(), errors: new Map(),
+    size: new Float64Array(total), bytes: new Float64Array(total),
+    speed: new Float32Array(total), eta: new Float32Array(total).fill(NaN),
+    status: new Uint8Array(total), prio: new Uint8Array(total).fill(2), verified: new Uint8Array(total),
+    mixed: false,          // priorities differ: the default order isn't the folder order
+    mixedChanged: false,   // a priority changed since the view was made
+    keys: null,            // lowercased paths, made for the first sort by name
+    order: null,           // every file in the order of the sort (the view before the filter)
+    view: new Int32Array(0), pos: new Int32Array(total).fill(-1), viewVer: 0,
+    at: 0,                 // when the view last changed from the data
+    changed: false,        // data came since the view was last made
+  };
+}
+
+// File `i` as one object, for a row's cells and tooltips.
+function fileOf(st, i) {
+  return {
+    path: st.path[i] || '', local: st.local.get(i) || '', named: st.named.has(i), status: FILE_STATES[st.status[i]] || 'queued',
+    bytes: st.bytes[i], size: st.size[i], speed: st.speed[i], eta: Number.isNaN(st.eta[i]) ? null : st.eta[i],
+    error: st.errors.get(i) || '', verified: !!st.verified[i], priority: PRIORITY_OF_WEIGHT[st.prio[i]] || 'normal',
+  };
+}
+
+// A file's size: as listed, or once done as fetched (its bytes).
+const fileSize = (st, i) => (st.status[i] === FS.done ? st.bytes[i] || st.size[i] : st.size[i]);
+
+// The filter (decision 2): what a download or a file must be to show. Unfinished is what still
+// comes (queued, running, paused, failed); Failed the failed ones, and folders with failed files.
+function dlMatches(q) {
+  if (dl.show === 'all') return true;
+  if (dl.show === 'failed') return q.status === 'failed' || !!(q.files && q.files.failed > 0);
+  return UNFINISHED.includes(q.status);
+}
+function fileMatches(st, i) {
+  if (dl.show === 'all') return true;
+  const s = st.status[i];
+  return dl.show === 'failed' ? s === FS.failed : s !== FS.done && s !== FS.skipped;
+}
+
+// What file `i` sorts by on `key`, as its row shows it; NaN when it shows none (those go last both
+// ways). Status by the file's own state.
+const FILE_RANK = [1, 0, 2, 6, 3, 5]; // by FILE_STATES: running first, as DL_STATUS_RANK
+function fileSortValue(st, i, key) {
+  const s = st.status[i];
+  switch (key) {
+    case 'status': return FILE_RANK[s];
+    case 'progress':
+      if (s === FS.done) return 1;
+      return st.size[i] > 0 ? Math.min(1, st.bytes[i] / st.size[i]) : NaN;
+    case 'size': { const n = fileSize(st, i); return n > 0 ? n : NaN; }
+    case 'speed': return s === FS.running && st.speed[i] > 0 ? st.speed[i] : NaN;
+    case 'eta': return s === FS.running && st.eta[i] >= 0 ? st.eta[i] : NaN;
+    case 'priority': return s === FS.done || s === FS.skipped ? NaN : st.prio[i];
+    default: return NaN;
+  }
+}
+
+// The loaded files in order: the default order is the start order (priority first, then folder
+// order); a sort keeps ties in it. Names compare naturally on keys made once per file. While the
+// list still comes (`sorted` false) the default order: sorting 177,000 rows at every chunk would
+// take far longer than the list.
+function fileOrder(st, sorted = true) {
+  const n = st.loaded;
+  let order = new Array(n);
+  for (let i = 0; i < n; ++i) order[i] = i;
+  if (st.mixed) order.sort((a, b) => st.prio[b] - st.prio[a] || a - b);
+  const key = dlSort.key;
+  if (!key || !sorted) return order;
+  const rank = new Int32Array(n);
+  order.forEach((i, k) => { rank[i] = k; });
+  const desc = dlSort.dir === 'desc';
+  if (key === 'name') {
+    if (!st.keys || st.keys.length < n) st.keys = Array.from({ length: n }, (_, i) => asciiLower(st.path[i] || ''));
+    const keys = st.keys;
+    order = order.sort((a, b) => {
+      const c = naturalCompare(st.path[a], st.path[b], keys[a], keys[b]);
+      return c ? (desc ? -c : c) : rank[a] - rank[b];
+    });
+    return order;
+  }
+  const v = new Float64Array(n);
+  for (let i = 0; i < n; ++i) v[i] = fileSortValue(st, i, key);
+  return order.sort((a, b) => {
+    const x = v[a];
+    const y = v[b];
+    const xn = Number.isNaN(x);
+    const yn = Number.isNaN(y);
+    if (xn || yn) return xn === yn ? rank[a] - rank[b] : xn ? 1 : -1;
+    const c = x - y;
+    return c ? (desc ? -c : c) : rank[a] - rank[b];
+  });
+}
+
+// The view from `order`: the files that pass the filter, and each index's place.
+function setFileView(st, order) {
+  const view = new Int32Array(order.length);
+  let k = 0;
+  for (const i of order) if (fileMatches(st, i)) view[k++] = i;
+  const next = view.subarray(0, k);
+  if (next.length === st.view.length && next.every((i, p) => st.view[p] === i)) return false;
+  st.pos.fill(-1);
+  next.forEach((i, p) => { st.pos[i] = p; });
+  st.view = next;
+  st.viewVer++;
+  return true;
+}
+
+// The view again: at once for a click, the filter, rows arriving (`force`); from changed data (a
+// live sort, rows leaving under the filter) at most once a second and not while dlResortHeld, as
+// the downloads (5.6). A folder of more than DL_LIVE_FILES files keeps the order of the click and
+// only lets rows leave. Returns whether the rows changed.
+const liveSort = (st) => !!dlSort.key && DL_LIVE_COLS.has(dlSort.key) && st.total <= DL_LIVE_FILES;
+
+function updateFileView(st, force) {
+  const now = performance.now();
+  if (!force) {
+    if (!st.changed) return false;
+    if (!liveSort(st) && dl.show === 'all' && !st.mixedChanged) { st.changed = false; return false; }
+    const wait = st.at + DL_RESORT_MS - now;
+    if (wait > 0 || dlResortHeld()) {
+      setDlPending(dlSort.pendingDl);
+      dlRecheckIn(Math.max(wait, 250));
+      return false;
+    }
+  }
+  const complete = st.loaded >= st.total;
+  if (force || !st.order || !complete || liveSort(st) || st.mixedChanged) st.order = fileOrder(st, complete);
+  // else the click's order stays (a big folder): only the filter moves rows
+  st.changed = false;
+  st.mixedChanged = false;
+  st.at = now;
+  return setFileView(st, st.order);
+}
+
+// Whether a file view waits for its second or for the pointer (the title's dot).
+const filesPending = () => [...dl.stores.values()].some((st) => st.changed && st.order &&
+  (liveSort(st) || dl.show !== 'all' || st.mixedChanged));
+
+// The backend's 'files': a chunk of a folder's rows, [path, size, status, bytes, priority, local,
+// error, verified, named], the first from 0. A chunk not following the last asks for all again.
+function onFiles(msg) {
+  if (!dl.watching.has(msg.id)) return; // folded since
+  let st = dl.stores.get(msg.id);
+  if (msg.from === 0) {
+    st = newStore(msg.id, msg.gen, msg.total);
+    dl.stores.set(msg.id, st);
+    if (dl.fsel && dl.fsel.id === msg.id) dl.fsel = null;
+    renderDlSortHead(); // a big folder: the arrow of a live sort goes hollow
+  } else if (!st || st.gen !== msg.gen || st.loaded !== msg.from) {
+    send({ type: 'watchFiles', id: msg.id });
+    return;
+  }
+  const rows = msg.rows;
+  for (let k = 0; k < rows.length; ++k) {
+    const r = rows[k];
+    const i = msg.from + k;
+    if (i >= st.total) break;
+    st.path[i] = r[0];
+    st.size[i] = r[1];
+    st.status[i] = r[2];
+    st.bytes[i] = r[3];
+    st.prio[i] = r[4];
+    if (r[4] !== 2) st.mixed = true;
+    if (r[5] != null) st.local.set(i, r[5]);
+    if (r[6] != null) st.errors.set(i, r[6]);
+    if (r[7]) st.verified[i] = 1;
+    if (r[8]) st.named.add(i);
+  }
+  st.loaded = Math.min(st.total, msg.from + rows.length);
+  st.keys = null;
+  updateFileView(st, true);
+  buildDlRows();
+  renderDlBody();
+  if (dl.goPending === msg.id && st.loaded === st.total) { dl.goPending = 0; goToRunning(); }
+}
+
+// The backend's 'fileDelta': the rows that changed since the last flush, [index, status, bytes,
+// speed, eta, priority, error, verified]. Drawn in the next frame, with the others of this flush.
+function onFileDelta(msg) {
+  const st = dl.stores.get(msg.id);
+  if (!st || st.gen !== msg.gen) return; // another generation: its 'files' come
+  for (const r of msg.rows) {
+    const i = r[0];
+    if (!(i >= 0 && i < st.total)) continue;
+    st.status[i] = r[1];
+    st.bytes[i] = r[2];
+    st.speed[i] = r[3];
+    st.eta[i] = r[4] == null ? NaN : r[4];
+    if (st.prio[i] !== r[5]) {
+      st.prio[i] = r[5];
+      st.mixed = true;
+      st.mixedChanged = true;
+    }
+    if (r[6] != null) st.errors.set(i, r[6]); else st.errors.delete(i);
+    st.verified[i] = r[7] ? 1 : 0;
+  }
+  st.changed = true;
+  if (!dl.filesFrame) dl.filesFrame = requestAnimationFrame(refreshFiles);
+}
+
+// Changed data in the stores: the views that follow it, and the rows in view.
+function refreshFiles() {
+  dl.filesFrame = 0;
+  let moved = false;
+  for (const st of dl.stores.values()) moved = updateFileView(st, false) || moved;
+  if (moved) buildDlRows();
+  if (!filesPending() && !dlSort.pendingDl) setDlPending(false);
+  renderDlBody();
+}
+
+// The backend sends the files of each open, listed folder (watchFiles), and stops for a folded one
+// (unwatchFiles), whose store goes: a 177,000-file folder holds tens of MB.
+function syncWatches() {
+  for (const q of state.queue) {
+    if (!q.files || !folderIsOpen(q) || dl.watching.has(q.id)) continue;
+    dl.watching.add(q.id);
+    send({ type: 'watchFiles', id: q.id });
+  }
+  for (const id of [...dl.watching]) {
+    const q = dl.byId.get(id);
+    if (q && q.files && folderIsOpen(q)) continue;
+    dl.watching.delete(id);
+    if (dl.stores.delete(id)) renderDlSortHead();
+    if (dl.fsel && dl.fsel.id === id) dl.fsel = null;
+    if (q) send({ type: 'unwatchFiles', id });
+  }
 }
 
 // The message rows under a download (5.5): what needs the user, ellipsized, in full in the
@@ -2262,49 +2534,211 @@ function dlMessages(q) {
   return out;
 }
 
-function dlRowsOf() {
-  const rows = [];
+// The entries: each download (in the order shown), its message rows, and an open folder's files
+// as one block: a "Loading" row while its list comes, then the rows of its store's view.
+function dlEntriesOf() {
+  const top = [];
   for (const q of dlOrdered()) {
-    rows.push({ kind: 'dl', key: `d${q.id}`, id: q.id, scope: 'd' });
-    for (const what of dlMessages(q)) rows.push({ kind: 'msg', key: `m${q.id}:${what}`, id: q.id, what });
+    top.push({ kind: 'dl', key: `d${q.id}`, id: q.id, scope: 'd' });
+    for (const what of dlMessages(q)) top.push({ kind: 'msg', key: `m${q.id}:${what}`, id: q.id, what });
     if (!q.files || !folderIsOpen(q)) continue;
-    if (q.files.done || q.files.skipped) rows.push({ kind: 'msg', key: `m${q.id}:done`, id: q.id, what: 'done', sub: true });
-    for (const c of q.children || []) {
-      rows.push({ kind: 'file', key: `f${q.id}/${c.path}`, id: q.id, path: c.path, scope: `f${q.id}` });
-    }
-    if (q.moreQueued) rows.push({ kind: 'msg', key: `m${q.id}:more`, id: q.id, what: 'more', sub: true });
+    const st = dl.stores.get(q.id);
+    if (!st || st.loaded < st.total) top.push({ kind: 'msg', key: `m${q.id}:loading`, id: q.id, what: 'loading', sub: true });
+    if (st && st.view.length) top.push({ kind: 'block', key: `b${q.id}`, id: q.id, n: st.view.length });
   }
-  return rows;
+  return top;
 }
 
 // The rows again, when their structure changed: a download added, removed or moved, a folder
-// opened or folded, a file or message row coming or going. Byte ticks leave them as they are.
+// opened or folded, a message row coming or going, a folder's view sorted, filtered or grown.
+// Byte ticks leave them as they are. Returns whether they changed.
 function buildDlRows() {
-  const rows = dlRowsOf();
-  const shape = rows.map((r) => r.key).join('\0');
-  if (shape === dl.shape) return;
+  const top = dlEntriesOf();
+  const shape = top.map((e) => (e.kind === 'block' ? `${e.key}:${dl.stores.get(e.id).viewVer}` : e.key)).join('\0');
+  if (shape === dl.shape) return false;
   dl.shape = shape;
-  dl.rows = rows;
-  dl.index = new Map(rows.map((r, i) => [r.key, i]));
-  for (const key of dl.sel) if (!dl.index.has(key)) dl.sel.delete(key);
-  if (!dl.index.has(dl.anchor)) dl.anchor = '';
-  // A cursor row that went (a folded folder's file, a cleared download) goes to its download, or
-  // else to the row now where it was.
-  if (dl.cursor && !dl.index.has(dl.cursor)) {
-    const up = dl.index.get(`d${dl.cursorId}`);
-    const i = up !== undefined ? up : Math.min(dl.cursorAt, rows.length - 1);
-    if (i >= 0) setDlCursor(rows[i]); else dl.cursor = '';
+  dl.top = top;
+  dl.starts = new Array(top.length);
+  dl.topIndex = new Map();
+  dl.blockAt = new Map();
+  let n = 0;
+  top.forEach((e, k) => {
+    dl.starts[k] = n;
+    if (e.kind === 'block') dl.blockAt.set(e.id, k); else dl.topIndex.set(e.key, k);
+    n += e.kind === 'block' ? e.n : 1;
+  });
+  dl.n = n;
+  for (const key of dl.sel) if (!dl.topIndex.has(key)) dl.sel.delete(key);
+  if (dl.fsel && !dl.blockAt.has(dl.fsel.id)) dl.fsel = null;
+  if (dlIndexOf(dl.anchor) === undefined) dl.anchor = '';
+  // A cursor row that went (a folded folder's file, one the filter took, a cleared download) goes
+  // to its download, or else to the row now where it was.
+  if (dl.cursor && dlIndexOf(dl.cursor) === undefined) {
+    const up = dlIndexOf(`d${dl.cursorId}`);
+    const i = up !== undefined ? up : Math.min(dl.cursorAt, n - 1);
+    if (i >= 0) setDlCursor(dlRow(i)); else dl.cursor = '';
   } else if (dl.cursor) {
-    dl.cursorAt = dl.index.get(dl.cursor);
+    dl.cursorAt = dlIndexOf(dl.cursor);
   }
-  $('#queue').setAttribute('aria-rowcount', String(rows.length + 1)); // and the header row
+  $('#queue').setAttribute('aria-rowcount', String(n + 1)); // and the header row
+  dlKeepView();
+  return true;
+}
+
+// Rows that came or went above the ones in view by themselves (a folder's list growing, a finished
+// folder folding, rows the filter took) leave the view where it was: rows never move under the
+// mouse (12). The entry of the first row in view (a download, a message row, a folder's files)
+// stays where it was, at the same row of a folder's files, so a new order of those files shows in
+// place; when the entry went, its download's row comes to the top. What the user asked for
+// scrolls by itself (a sort or a filter set clears the anchor, Go to running, keeping a moved row
+// in view) and still wins.
+function dlKeepView() {
+  if (!dl.viewKey || $('#downloads').hidden) return;
+  const startOf = (key) => {
+    const k = key[0] === 'b' ? dl.blockAt.get(Number(key.slice(1))) : dl.topIndex.get(key);
+    return k === undefined ? undefined : [dl.starts[k], dl.top[k].kind === 'block' ? dl.top[k].n : 1];
+  };
+  let at = startOf(dl.viewKey);
+  if (at === undefined) {
+    at = startOf(dl.viewDl);
+    if (at === undefined) return;
+    dl.viewKey = dl.viewDl;
+    dl.viewPos = 0;
+    dl.viewOff = 0;
+  }
+  const i = at[0] + Math.min(dl.viewPos, at[1] - 1);
+  if (i === dl.viewAt) return;
+  dl.viewAt = i;
+  $('#dl-spacer').style.height = `${dl.n * DL_ROW}px`; // before the scroll, which it bounds
+  $('#dl-body').scrollTop = i * DL_ROW + dl.viewOff;
+}
+
+// The entry holding row `i` (a binary search over the entries' first rows).
+function dlEntryAt(i) {
+  let lo = 0;
+  let hi = dl.top.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (dl.starts[mid] <= i) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+// Row `i` of the table, or undefined past its ends. A file's row is made as it is asked for.
+function dlRow(i) {
+  if (!(i >= 0 && i < dl.n)) return undefined;
+  const k = dlEntryAt(i);
+  const e = dl.top[k];
+  if (e.kind !== 'block') return e;
+  const index = dl.stores.get(e.id).view[i - dl.starts[k]];
+  return { kind: 'file', key: `f${e.id}:${index}`, id: e.id, index, scope: `f${e.id}` };
+}
+
+// The row index of a row key, or undefined when no row has it now.
+function dlIndexOf(key) {
+  if (!key) return undefined;
+  if (key[0] === 'f') {
+    const colon = key.indexOf(':');
+    const id = Number(key.slice(1, colon));
+    const index = Number(key.slice(colon + 1));
+    const k = dl.blockAt.get(id);
+    const st = dl.stores.get(id);
+    if (k === undefined || !st || !(index >= 0 && index < st.total)) return undefined;
+    const p = st.pos[index];
+    return p >= 0 ? dl.starts[k] + p : undefined;
+  }
+  const k = dl.topIndex.get(key);
+  return k === undefined ? undefined : dl.starts[k];
 }
 
 // Where the keyboard's cursor is (5.8); the selection is left as it is.
 function setDlCursor(r) {
   dl.cursor = r.key;
   dl.cursorId = r.id;
-  dl.cursorAt = dl.index.get(r.key) ?? 0;
+  dl.cursorAt = dlIndexOf(r.key) ?? 0;
+}
+
+// ---- the selection (5.8): downloads by key, or files of one folder by index -------------------
+
+function isSel(r) {
+  if (r.kind === 'file') return !!(dl.fsel && dl.fsel.id === r.id && dl.fsel.on[r.index]);
+  return dl.sel.has(selKey(r));
+}
+const hasSel = () => dl.sel.size > 0 || !!(dl.fsel && dl.fsel.on.some((x) => x));
+function clearSel() {
+  dl.sel.clear();
+  dl.fsel = null;
+}
+// Adds a row to the selection, or drops it; a file of another folder than the selected ones (or
+// a download among files) starts the selection again, which keeps to one level.
+function markSel(r, on = true) {
+  if (r.kind === 'file') {
+    const st = dl.stores.get(r.id);
+    if (!st) return;
+    if (!dl.fsel || dl.fsel.id !== r.id) {
+      dl.sel.clear();
+      dl.fsel = { id: r.id, on: new Uint8Array(st.total) };
+    }
+    dl.fsel.on[r.index] = on ? 1 : 0;
+  } else {
+    dl.fsel = null;
+    if (on) dl.sel.add(selKey(r)); else dl.sel.delete(selKey(r));
+  }
+}
+// The rows from `a` to `b` of one level (`scope`) become the selection.
+function selectRows(a, b, scope) {
+  clearSel();
+  if (a > b) [a, b] = [b, a];
+  if (scope === 'd') {
+    for (let k = dlEntryAt(a); k < dl.top.length && dl.starts[k] <= b; ++k) {
+      const e = dl.top[k];
+      if (e.kind !== 'block' && dl.starts[k] >= a) dl.sel.add(selKey(e));
+    }
+    return;
+  }
+  const id = Number(scope.slice(1));
+  const k = dl.blockAt.get(id);
+  const st = dl.stores.get(id);
+  if (k === undefined || !st) return;
+  const start = dl.starts[k];
+  dl.fsel = { id, on: new Uint8Array(st.total) };
+  for (let i = Math.max(a, start); i <= Math.min(b, start + st.view.length - 1); ++i) dl.fsel.on[st.view[i - start]] = 1;
+}
+
+// The selected downloads' rows in the table's order.
+function selectedDl() {
+  return [...dl.sel].map(dlIndexOf).filter((i) => i !== undefined).sort((a, b) => a - b).map(dlRow);
+}
+
+// The selected files shown, in the table's order: { q, st, list: [index, ...] }, or null.
+function selectedFiles() {
+  const f = dl.fsel;
+  const st = f && dl.stores.get(f.id);
+  const q = f && dl.byId.get(f.id);
+  if (!st || !q) return null;
+  const list = [];
+  for (const i of st.view) if (f.on[i]) list.push(i);
+  return list.length ? { q, st, list } : null;
+}
+
+// The first selected row in the table's order, or undefined.
+function firstSelected() {
+  const files = selectedFiles();
+  if (files) return dlIndexOf(`f${files.q.id}:${files.list[0]}`);
+  const rows = selectedDl();
+  return rows.length ? dlIndexOf(rows[0].key) : undefined;
+}
+
+// File indices as the ranges "fileAction" takes: [[from, to], ...], `to` included.
+function rangesOf(list) {
+  const sorted = Int32Array.from(list).sort();
+  const out = [];
+  for (const i of sorted) {
+    const last = out[out.length - 1];
+    if (last && last[1] === i - 1) last[1] = i;
+    else if (!last || last[1] < i) out.push([i, i]);
+  }
+  return out;
 }
 
 // What a progress bar and its percent show: full (done, or being verified), a part, or '-' while
@@ -2368,7 +2802,7 @@ function dlView(q) {
   const full = st === 'done' || phase === 'verifying';
   const mark = q.check === 'ok' ? '✓' : q.check === 'warn' ? '⚠︎' : '';
   return {
-    cls: `st-${st}`,
+    cls: `st-${st}${dlMatches(q) ? '' : ' leave'}`, // dimmed while it waits to leave under the filter
     grip: true,
     toggle: q.files ? (folderIsOpen(q) ? '▾' : '▸') : '',
     icon: [q.name, q.mode === 'folder'],
@@ -2408,39 +2842,48 @@ function fileStatus(q, c) {
   return { word: 'Queued' };
 }
 
+// A file's two slots (5.4): Pause or Resume and Skip while it comes, Retry and Skip once failed,
+// Show once done; Skip alone while it waits with its folder; none once skipped or cancelled.
 function fileSlots(c, s) {
-  // A finished file's Show and a failed file's Retry come with every file listed (chunk C).
-  if (s.over || c.status === 'done' || c.status === 'skipped') return [null, null];
+  if (s.over || c.status === 'skipped') return [null, null];
   const skip = ['skip', 'Skip', 'Skip this file'];
-  if (c.status === 'paused') return [['resume', 'Resume'], skip];
-  if (c.status === 'failed' || s.withFolder) return [null, skip];
-  return [['pause', 'Pause'], skip];
+  switch (c.status) {
+    case 'done': return [['show', 'Show', 'Show in folder'], null];
+    case 'failed': return [['retry', 'Retry', 'Download this file again'], skip];
+    case 'paused': return [['resume', 'Resume'], skip];
+    default: return [s.withFolder ? null : ['pause', 'Pause'], skip];
+  }
 }
 
-function fileView(q, c) {
+function fileView(q, st, i) {
+  const c = fileOf(st, i);
   const s = fileStatus(q, c);
   const running = c.status === 'running' && !s.over;
   const tip = [s.why || s.word];
   if (running && (c.speed > 0 || fmtEta(c.eta))) tip.push([c.speed > 0 ? fmtSpeed(c.speed) : '', fmtEta(c.eta)].filter(Boolean).join(' · '));
   const full = c.status === 'done';
+  const total = full ? c.bytes || c.size : c.size; // done: as fetched
+  // Saved under another name: one grab gave it (Keep both, or another file of the folder has its
+  // name on Windows), shown after an arrow; or the server's name made safe for Windows.
+  const name = c.local.slice(c.local.lastIndexOf('\\') + 1);
   return {
-    cls: `st-${c.status}${s.muted ? ' w-muted' : ''}`,
+    cls: `st-${c.status}${s.muted ? ' w-muted' : ''}${fileMatches(st, i) ? '' : ' leave'}`,
     grip: false,
     toggle: '',
     icon: [c.path, false],
-    // Saved under a name grab gave it: Keep both, or another file of the folder has its own.
-    text: c.savedAs ? `${c.path} → ${c.savedAs}` : c.path,
+    text: c.named ? `${c.path} → ${name}` : c.path,
     dest: '',
-    nameTip: c.savedAs ? `${c.path}\nSaved as ${c.savedAs}: a file with its name on Windows is there or in the folder` : c.path,
+    nameTip: c.named ? `${c.path}\nSaved as ${name}: a file with its name on Windows is there or in the folder`
+      : c.local ? `${c.path}\nSaved as ${c.local}: Windows can’t take its name as it is` : c.path,
     word: s.word,
     wordCls: s.bad ? 'bad' : s.muted ? 'muted' : '',
     statusTip: tip.join('\n'),
     count: '',
-    mark: '',
-    markCls: '',
-    markTip: '',
-    ...progressOf(c.bytes, c.size, full),
-    ...sizeOf(c.bytes, c.size, full),
+    mark: c.verified ? '✓' : '',
+    markCls: c.verified ? 'ok' : '',
+    markTip: c.verified ? 'Verified against the server’s checksum' : '',
+    ...progressOf(c.bytes, total, full),
+    ...sizeOf(c.bytes, total, full),
     speed: running && c.speed > 0 ? fmtSpeed(c.speed) : '',
     speedTip: '',
     eta: running ? fmtClock(c.eta) : '',
@@ -2451,13 +2894,15 @@ function fileView(q, c) {
 }
 
 function msgView(q, r) {
-  const f = q.files || {};
   switch (r.what) {
     case 'error': return { msg: q.error, cls: 'm-error' };
     case 'note': return { msg: q.waiting, cls: 'm-note' };
     case 'unreadable': return { msg: q.unreadable, cls: 'm-warn' };
-    case 'done': return { msg: [f.done ? `${f.done} done` : '', f.skipped ? `${f.skipped} skipped` : ''].filter(Boolean).join(' · '), cls: 'm-sub' };
-    default: return { msg: `…${q.moreQueued} more queued`, cls: 'm-sub' };
+    default: { // the list of a folder's files on its way
+      const st = dl.stores.get(q.id);
+      const total = st ? st.total : q.files ? q.files.total : 0;
+      return { msg: `Loading the list of ${total.toLocaleString('en-US')} files…${st && st.loaded ? ` (${st.loaded.toLocaleString('en-US')})` : ''}`, cls: 'm-sub' };
+    }
   }
 }
 
@@ -2510,15 +2955,15 @@ function slotHtml(s) {
 
 function paintDlRow(el, r, i) {
   const q = dl.byId.get(r.id);
-  const child = r.kind === 'file' ? dl.kids.get(r.id)?.get(r.path) : null;
-  if (!q || (r.kind === 'file' && !child)) return;
+  const st = r.kind === 'file' ? dl.stores.get(r.id) : null;
+  if (!q || (r.kind === 'file' && !st)) return;
   const c = el.c;
   put(el, 'hidden', false, (h) => { el.hidden = h; });
   put(el, 'y', i, (y) => { el.style.transform = `translateY(${y * DL_ROW}px)`; });
   put(el, 'key', r.key, (k) => { el.dataset.key = k; });
-  const view = r.kind === 'dl' ? dlView(q) : r.kind === 'file' ? fileView(q, child) : msgView(q, r);
+  const view = r.kind === 'dl' ? dlView(q) : r.kind === 'file' ? fileView(q, st, r.index) : msgView(q, r);
   const d = dl.drag;
-  const selected = dl.sel.has(selKey(r));
+  const selected = isSel(r);
   const cls = `dl-row dl-grid k-${r.kind} ${view.cls}${selected ? ' sel' : ''}${r.key === dl.cursor ? ' cursor' : ''}` +
     `${d && d.moved && d.key === r.key ? ' dragging' : ''}`;
   put(el, 'cls', cls, (v) => { el.className = v; });
@@ -2580,14 +3025,31 @@ function paintDlRow(el, r, i) {
 function renderDlBody() {
   const body = $('#dl-body');
   if ($('#downloads').hidden) return;
-  const n = dl.rows.length;
+  const n = dl.n;
   $('#dl-spacer').style.height = `${n * DL_ROW}px`;
   const first = Math.max(0, Math.floor(body.scrollTop / DL_ROW) - DL_OVER);
   const last = Math.min(n, first + DL_POOL - 2, Math.ceil((body.scrollTop + body.clientHeight) / DL_ROW) + DL_OVER);
-  const want = new Set();
-  for (let i = first; i < last; ++i) want.add(dl.rows[i].key);
-  if (dl.index.has(dl.cursor)) want.add(dl.cursor);
-  for (const el of dl.pool) if (el.pinned && dl.index.has(el.dlKey)) want.add(el.dlKey);
+  const want = new Map(); // row key -> [row, index]
+  const keep = (i) => { const r = dlRow(i); if (r) want.set(r.key, [r, i]); };
+  for (let i = first; i < last; ++i) keep(i);
+  const viewAt = Math.floor(body.scrollTop / DL_ROW);
+  if (viewAt < n) {
+    const k = dlEntryAt(viewAt);
+    dl.viewKey = dl.top[k].key;
+    dl.viewDl = `d${dl.top[k].id}`;
+    dl.viewPos = viewAt - dl.starts[k];
+    dl.viewAt = viewAt;
+    dl.viewOff = body.scrollTop - viewAt * DL_ROW;
+  } else {
+    dl.viewKey = '';
+  }
+  const cursorAt = dlIndexOf(dl.cursor);
+  if (cursorAt !== undefined) keep(cursorAt);
+  for (const el of dl.pool) {
+    if (!el.pinned) continue;
+    const i = dlIndexOf(el.dlKey);
+    if (i !== undefined) keep(i);
+  }
   const free = [];
   for (const el of dl.pool) {
     if (el.dlKey && want.has(el.dlKey)) continue;
@@ -2598,15 +3060,14 @@ function renderDlBody() {
     if (el.v.key !== undefined) { delete el.v.key; delete el.dataset.key; }
     free.push(el);
   }
-  for (const key of want) {
+  for (const [key, [r, i]] of want) {
     let el = dl.bound.get(key);
     if (!el) {
       el = free.pop() || newDlRow();
       el.dlKey = key;
       dl.bound.set(key, el);
     }
-    const i = dl.index.get(key);
-    paintDlRow(el, dl.rows[i], i);
+    paintDlRow(el, r, i);
   }
   for (const el of free) put(el, 'hidden', true, (h) => { el.hidden = h; });
   const grid = $('#queue');
@@ -2644,8 +3105,8 @@ function updateDlStep() {
 }
 
 function rowOfEl(el) {
-  const i = el ? dl.index.get(el.dlKey) : undefined;
-  return i === undefined ? null : dl.rows[i];
+  const i = el ? dlIndexOf(el.dlKey) : undefined;
+  return i === undefined ? null : dlRow(i);
 }
 
 // Scrolls the body just enough to show row `i`.
@@ -2660,8 +3121,9 @@ function dlKeepInView(i) {
 //
 // A click on a title sorts the downloads by that column, a second click the other way, a third
 // goes back to the queue order (the default), as in Browse. Ties keep the queue order. A folder's
-// files stay under it in the order they come (sorting them comes with every file listed, chunk C).
-// gui.json keeps the sort and the widths (downloads.sort, downloads.widths) through "prefs".
+// files are sorted the same way under it (updateFileView), ties in their start order. gui.json
+// keeps the sort and the widths (downloads.sort, downloads.widths) through "prefs". The filter
+// (Show) is for the session.
 
 // The first click's direction: names A to Z, what runs first (DL_STATUS_RANK), the most done, the
 // largest, the fastest, the least time left, High first.
@@ -2672,11 +3134,12 @@ const DL_RESORT_MS = 1000; // a new order from changed values comes at most once
 const DL_KEY_HOLD_MS = 2000; // and not this soon after a key in the table (the cursor's row stays put)
 const DL_COL_LABEL = { name: 'Name', status: 'Status', progress: 'Progress', size: 'Size', speed: 'Speed', eta: 'ETA', priority: 'Priority' };
 
-// The sort: `key` the column ('' for the queue order) and `dir`. Sorted, `order` holds the
-// download ids as shown; `at` when a new order last came; `pending` while one waits (a dot by the
-// arrow); `over` while the pointer is over the table; `force` makes the next order come at once
-// (a click, gui.json).
-const dlSort = { key: '', dir: 'asc', order: null, at: 0, pending: false, over: false, force: false, timer: 0 };
+// The sort: `key` the column ('' for the queue order) and `dir`. Sorted or filtered, `order` holds
+// the download ids as shown; `at` when a new order last came; `pending` while one waits (a dot by
+// the arrow), `pendingDl` while the downloads' own does; `over` while the pointer is over the
+// table; `force` makes the next order come at once (a click, the filter, gui.json); `timer` and
+// `due` the next look at a waiting one.
+const dlSort = { key: '', dir: 'asc', order: null, at: 0, pending: false, pendingDl: false, over: false, force: false, timer: 0, due: 0 };
 
 // Fetching: running, past listing and checking and not yet verifying (when a speed and a time
 // left show).
@@ -2715,26 +3178,35 @@ function dlOrdered() {
   return dlSort.order ? dlSort.order.map((id) => dl.byId.get(id)).filter(Boolean) : state.queue;
 }
 
+// A look at what waits (dlRecheck) in `ms`, unless one comes sooner already.
+function dlRecheckIn(ms) {
+  const due = performance.now() + ms;
+  if (dlSort.timer && dlSort.due <= due) return;
+  clearTimeout(dlSort.timer);
+  dlSort.due = due;
+  dlSort.timer = setTimeout(dlRecheck, ms);
+}
+
 const sameIds = (a, b) => a.length === b.length && a.every((id, i) => id === b[i]);
 
 // Sets the order shown from state.queue; returns whether it changed. The queue order follows the
-// queue. Sorted, a click or gui.json's sort comes at once, and so does a download added or removed:
-// it goes in its place, the others stay as they are. A new order from changed values (a status, the
-// bytes, the speed, a priority, a size once known) waits: at most once a second, and not while the
-// pointer is over the table, a menu is open or a drag runs, so a row never moves under the mouse
-// (5.6). The title's dot says one waits; it comes when the pointer leaves.
+// queue. Sorted or filtered, a click, the filter or gui.json's sort comes at once, and so does a
+// download added or removed: it goes in its place, the others stay as they are. A new order from
+// changed values (a status, the bytes, the speed, a priority, a size once known, a download the
+// filter no longer shows) waits: at most once a second, and not while the pointer is over the
+// table, a menu is open or a drag runs, so a row never moves under the mouse (5.6). The title's dot
+// says one waits; it comes when the pointer leaves. A row waiting to leave is dimmed.
 function updateDlOrder() {
-  clearTimeout(dlSort.timer);
-  dlSort.timer = 0;
   const shown = dlSort.order;
-  if (!dlSort.key) {
+  if (!dlSort.key && dl.show === 'all') {
     dlSort.order = null;
+    dlSort.force = false;
     setDlPending(false);
     return shown !== null;
   }
-  const cmp = dlCompare(dlSort.key, dlSort.dir);
-  const items = state.queue.map((q, ord) => ({ id: q.id, q, ord, v: dlSortValue(q, dlSort.key) }));
-  const want = items.slice().sort(cmp).map((x) => x.id);
+  const cmp = dlSort.key ? dlCompare(dlSort.key, dlSort.dir) : (x, y) => x.ord - y.ord;
+  const items = state.queue.map((q, ord) => ({ id: q.id, q, ord, v: dlSort.key ? dlSortValue(q, dlSort.key) : 0 }));
+  const want = items.filter((x) => dlMatches(x.q)).sort(cmp).map((x) => x.id);
   const now = performance.now();
   if (!shown || dlSort.force) {
     dlSort.force = false;
@@ -2743,13 +3215,17 @@ function updateDlOrder() {
     setDlPending(false);
     return !shown || !sameIds(shown, want);
   }
-  // The rows shown stay; new downloads go before the first one they sort ahead of.
+  // The rows shown stay; new downloads the filter shows go before the first one they sort ahead of.
   const byId = new Map(items.map((x) => [x.id, x]));
   const kept = shown.filter((id) => byId.has(id));
   const known = new Set(kept);
-  const fresh = items.filter((x) => !known.has(x.id)).sort(cmp);
+  const fresh = items.filter((x) => !known.has(x.id) && dlMatches(x.q)).sort(cmp);
   let order = kept;
-  if (fresh.length) {
+  if (!dlSort.key) {
+    // Queue order changes only by the user's moves, adds and removes: those show at once, and only
+    // rows that stopped matching the filter wait.
+    order = items.filter((x) => known.has(x.id) || dlMatches(x.q)).map((x) => x.id);
+  } else if (fresh.length) {
     order = [];
     let k = 0;
     for (const id of kept) {
@@ -2773,7 +3249,7 @@ function updateDlOrder() {
   }
   dlSort.order = order;
   setDlPending(true);
-  dlSort.timer = setTimeout(dlRecheck, Math.max(wait, 250));
+  dlRecheckIn(Math.max(wait, 250));
   return changed;
 }
 
@@ -2786,19 +3262,27 @@ function dlResortHeld() {
     (document.activeElement === $('#queue') && performance.now() - dl.keyAt < DL_KEY_HOLD_MS);
 }
 
-// Again, for an order that waits: its second passed, the pointer left, a menu closed.
+// Again, for an order that waits (the downloads', a folder's files'): its second passed, the
+// pointer left, a menu closed.
 function dlRecheck() {
   dlSort.timer = 0;
   if (!dlSort.pending || $('#downloads').hidden) return;
-  if (updateDlOrder()) {
+  let moved = updateDlOrder();
+  for (const st of dl.stores.values()) moved = updateFileView(st, false) || moved;
+  setDlPending(dlSort.pendingDl);
+  if (moved) {
     buildDlRows();
     renderDlBody();
   }
 }
 
+// Whether the downloads' new order waits (`on`); the title's dot shows while it or a folder's
+// files' does.
 function setDlPending(on) {
-  if (dlSort.pending === on) return;
-  dlSort.pending = on;
+  dlSort.pendingDl = on;
+  const pending = on || filesPending();
+  if (dlSort.pending === pending) return;
+  dlSort.pending = pending;
   renderDlSortHead();
 }
 
@@ -2837,9 +3321,12 @@ function renderDlSortHead() {
     }
     const text = on && hidden ? `${lbl.dataset.text} · by ${DL_COL_LABEL[hidden]}` : lbl.dataset.text;
     if (lbl.textContent !== text) lbl.textContent = text;
-    b.querySelector('.arrow').textContent = on ? (dlSort.dir === 'asc' ? '▴' : '▾') : '';
+    // Hollow: a big folder shown keeps the order of the click (5.6).
+    const frozen = on && !hidden && DL_LIVE_COLS.has(dlSort.key) && [...dl.stores.values()].some((st) => st.total > DL_LIVE_FILES);
+    b.querySelector('.arrow').textContent = on ? (dlSort.dir === 'asc' ? (frozen ? '▵' : '▴') : (frozen ? '▿' : '▾')) : '';
     b.toggleAttribute('data-pending', on && dlSort.pending);
-    const tip = on && hidden ? `Sorted by ${DL_COL_LABEL[hidden]} (its column is hidden): click for the queue order` : b.dataset.tip;
+    let tip = on && hidden ? `Sorted by ${DL_COL_LABEL[hidden]} (its column is hidden): click for the queue order` : b.dataset.tip;
+    if (frozen) tip += `\nA folder of more than ${DL_LIVE_FILES.toLocaleString('en-US')} files keeps the order of your click; it isn’t sorted again as the numbers change`;
     b.title = on && dlSort.pending ? `${tip}\nA new order waits until the pointer leaves the table` : tip;
   }
 }
@@ -2862,13 +3349,22 @@ function clickDlSort(key) {
 
 // The sort just set, shown at once and kept in gui.json.
 function applyDlSort() {
+  showDlOrder();
+  saveDlView();
+}
+
+// The order and the filter just set, shown at once: the downloads and every open folder's files.
+function showDlOrder() {
+  dl.viewKey = ''; // the user's new order shows from where the body is scrolled
   dlSort.force = true;
   updateDlOrder();
+  for (const st of dl.stores.values()) updateFileView(st, true);
+  setDlPending(false);
   renderDlSortHead();
   buildDlRows();
-  if (dl.index.has(dl.cursor)) dlKeepInView(dl.index.get(dl.cursor));
+  const cur = dlIndexOf(dl.cursor);
+  if (cur !== undefined) dlKeepInView(cur);
   renderDlBody();
-  saveDlView();
 }
 
 // gui.json's downloads view, as "prefs" sends it whole: the sort (null for the queue order) and
@@ -3045,58 +3541,61 @@ function applyDlView(v) {
 function selectDl(r, { toggle = false, extend = false } = {}) {
   const key = selKey(r);
   const scope = scopeOf(r);
-  const anchor = dl.anchor && dl.rows[dl.index.get(dl.anchor)];
-  const same = anchor && anchor.scope === scope;
+  const at = dlIndexOf(dl.anchor);
+  const anchor = at === undefined ? null : dlRow(at);
+  const same = anchor && scopeOf(anchor) === scope;
   if (extend && same) {
-    const [a, b] = [dl.index.get(dl.anchor), dl.index.get(key)].sort((x, y) => x - y);
-    dl.sel = new Set(dl.rows.slice(a, b + 1).filter((x) => x.scope === scope).map((x) => x.key));
+    selectRows(at, dlIndexOf(key), scope);
   } else if (toggle && same) {
-    if (dl.sel.has(key)) dl.sel.delete(key); else dl.sel.add(key);
+    markSel(r, !isSel(r));
     dl.anchor = key;
   } else {
-    dl.sel = new Set([key]);
+    clearSel();
+    markSel(r);
     dl.anchor = key;
   }
   renderDlBody();
-}
-
-// The selected rows in the table's order: downloads, or files of one folder.
-function selectedDl() {
-  return [...dl.sel].map((k) => dl.index.get(k)).filter((i) => i !== undefined).sort((a, b) => a - b).map((i) => dl.rows[i]);
 }
 
 // The keyboard's cursor to row `i` (5.8), kept in view: the row alone becomes the selection; with
 // `extend` (Shift) the rows of the anchor's level from the anchor to it; with `keep` (Ctrl) the
 // selection stays. The cursor goes through every row; a message row selects its download.
 function moveDlCursor(i, { extend = false, keep = false } = {}) {
-  const n = dl.rows.length;
+  const n = dl.n;
   if (!n) return;
   i = Math.max(0, Math.min(n - 1, i));
-  const from = dl.rows[dl.index.get(dl.cursor)];
-  const r = dl.rows[i];
+  const at = dlIndexOf(dl.cursor);
+  const from = at === undefined ? null : dlRow(at);
+  const r = dlRow(i);
   setDlCursor(r);
   if (extend) {
-    if (!dl.index.has(dl.anchor)) dl.anchor = selKey(from || r);
-    const a = dl.index.get(dl.anchor);
-    const scope = scopeOf(dl.rows[a]);
-    const [lo, hi] = a < i ? [a, i] : [i, a];
-    dl.sel = new Set(dl.rows.slice(lo, hi + 1).filter((x) => scopeOf(x) === scope).map(selKey));
+    if (dlIndexOf(dl.anchor) === undefined) dl.anchor = selKey(from || r);
+    const a = dlIndexOf(dl.anchor);
+    selectRows(a, i, scopeOf(dlRow(a)));
   } else if (!keep) {
-    dl.sel = new Set([selKey(r)]);
+    clearSel();
+    markSel(r);
     dl.anchor = selKey(r);
   }
   dlKeepInView(i);
   renderDlBody();
 }
 
-// Ctrl+A: every row of the cursor row's level, all downloads or all files of its folder.
+// Ctrl+A: every row of the cursor row's level, all downloads or all files of its folder (those
+// the filter shows).
 function selectDlLevel() {
-  const r = dl.rows[dl.index.get(dl.cursor)] || dl.rows[0];
+  const at = dlIndexOf(dl.cursor);
+  const r = dlRow(at === undefined ? 0 : at);
   if (!r) return;
   const scope = scopeOf(r);
-  dl.sel = new Set(dl.rows.filter((x) => scopeOf(x) === scope).map(selKey));
-  const anchor = dl.rows[dl.index.get(dl.anchor)];
-  if (!anchor || scopeOf(anchor) !== scope) dl.anchor = selKey(r);
+  if (scope === 'd') {
+    selectRows(0, dl.n - 1, 'd');
+  } else {
+    const k = dl.blockAt.get(r.id);
+    selectRows(dl.starts[k], dl.starts[k] + dl.top[k].n - 1, scope);
+  }
+  const anchor = dlIndexOf(dl.anchor);
+  if (anchor === undefined || scopeOf(dlRow(anchor)) !== scope) dl.anchor = selKey(r);
   renderDlBody();
 }
 
@@ -3109,19 +3608,21 @@ function dlRight(r) {
     setFolderOpen(q, true);
     return;
   }
-  for (let k = dl.index.get(r.key) + 1; k < dl.rows.length && dl.rows[k].kind !== 'dl'; ++k) {
-    if (dl.rows[k].kind === 'file') { moveDlCursor(k); return; }
-  }
+  const k = dl.blockAt.get(q.id);
+  if (k !== undefined) moveDlCursor(dl.starts[k]);
 }
 
 function dlLeft(r) {
   const q = dl.byId.get(r.id);
-  if (r.kind !== 'dl') moveDlCursor(dl.index.get(`d${r.id}`));
+  if (r.kind !== 'dl') moveDlCursor(dlIndexOf(`d${r.id}`));
   else if (q && q.files && folderIsOpen(q)) setFolderOpen(q, false);
 }
 
+// A folder's ▸/▾ by the user: kept in queue.json, and its files asked for or let go.
 function setFolderOpen(q, open) {
   folderOpen.set(q.id, open);
+  send({ type: 'setExpanded', id: q.id, open });
+  syncWatches();
   buildDlRows();
   renderDlBody();
 }
@@ -3144,6 +3645,7 @@ function moveDownload(id, how) {
   const before = moveTarget(id, how);
   if (before === undefined) return;
   dl.follow = { id, order: state.queue.map((q) => q.id).join() }; // kept in view once it moved
+  dl.moving = { id, order: dl.follow.order };
   send({ type: 'moveItem', id, before });
 }
 
@@ -3170,26 +3672,36 @@ function cancelDownloads(qs, ask) {
     () => list.forEach((q) => send({ type: 'cancelItem', id: q.id })));
 }
 
-function skipFiles(q, cs, ask) {
-  const list = cs.filter((c) => c.status !== 'done' && c.status !== 'skipped' && q.status !== 'cancelled');
-  if (!list.length) return;
-  const one = list.length === 1;
-  confirmDelete(ask, list.some((c) => c.bytes > 0), one ? `Skip “${list[0].path}”?` : `Skip ${list.length} files?`,
-    `${one ? 'It isn’t' : 'They aren’t'} downloaded`, one ? 'Skip file' : `Skip ${list.length}`,
-    () => list.forEach((c) => send({ type: 'skipChild', id: q.id, path: c.path })));
+// What a file's slots offer (fileSlots), from its state alone.
+function fileActs(q, st, i) {
+  const c = { status: FILE_STATES[st.status[i]] || 'queued', error: '' };
+  return fileSlots(c, fileStatus(q, c));
+}
+
+// Files of a folder, by index, in one "fileAction" (one save and one flush in the backend).
+function fileAction(q, st, act, list) {
+  send({ type: 'fileAction', id: q.id, gen: st.gen, act, ranges: rangesOf(list) });
+}
+
+function skipFiles(q, st, list, ask) {
+  const skipping = list.filter((i) => fileActs(q, st, i)[1]?.[0] === 'skip');
+  if (!skipping.length) return;
+  const one = skipping.length === 1;
+  confirmDelete(ask, skipping.some((i) => st.bytes[i] > 0), one ? `Skip “${st.path[skipping[0]]}”?` : `Skip ${skipping.length} files?`,
+    `${one ? 'It isn’t' : 'They aren’t'} downloaded`, one ? 'Skip file' : `Skip ${skipping.length}`,
+    () => fileAction(q, st, 'skip', skipping));
 }
 
 // Delete: cancels the selected downloads or skips the selected files, asking first when that
 // deletes partly downloaded files.
 function deleteSelection() {
-  const rows = selectedDl();
-  if (!rows.length) return;
-  if (rows[0].kind === 'file') {
-    const q = dl.byId.get(rows[0].id);
-    skipFiles(q, rows.map((r) => dl.kids.get(r.id)?.get(r.path)).filter(Boolean), true);
-  } else {
-    cancelDownloads(rows.map((r) => dl.byId.get(r.id)).filter(Boolean), true);
+  const files = selectedFiles();
+  if (files) {
+    skipFiles(files.q, files.st, files.list, true);
+    return;
   }
+  const rows = selectedDl();
+  if (rows.length) cancelDownloads(rows.map((r) => dl.byId.get(r.id)).filter(Boolean), true);
 }
 
 // Downloads: pause, resume or retry, cancel, priority, the moves (one waiting download), show it,
@@ -3234,36 +3746,36 @@ function downloadsMenu(qs) {
   return items;
 }
 
-// Files of a folder download: their own pause, resume and skip, their paths and errors.
-function filesMenu(q, cs) {
-  const n = cs.length;
-  const counted = (label, list) => (n > 1 ? `${label} ${list.length}` : label);
-  const slots = cs.map((c) => fileSlots(c, fileStatus(q, c)).filter(Boolean).map((s) => s[0]));
-  const pausing = cs.filter((c, k) => slots[k].includes('pause'));
-  const resuming = cs.filter((c, k) => slots[k].includes('resume'));
-  const skipping = cs.filter((c, k) => slots[k].includes('skip'));
+// Files of a folder download: their own pause, resume, retry and skip, Show in folder (the first
+// of them, 5.10), their paths and errors. Each entry acts on the files it applies to, at once.
+function filesMenu(q, st, list) {
+  const n = list.length;
+  const counted = (label, l) => (n > 1 ? `${label} ${l.length}` : label);
+  const by = { pause: [], resume: [], retry: [], skip: [] };
+  for (const i of list) {
+    for (const slot of fileActs(q, st, i)) if (slot && by[slot[0]]) by[slot[0]].push(i);
+  }
   const items = [];
-  if (pausing.length) items.push({ label: counted('Pause', pausing), act: () => pausing.forEach((c) => send({ type: 'pauseChild', id: q.id, path: c.path })) });
-  if (resuming.length) items.push({ label: counted('Resume', resuming), act: () => resuming.forEach((c) => send({ type: 'resumeChild', id: q.id, path: c.path })) });
-  if (skipping.length) items.push({ label: counted('Skip', skipping), key: 'Delete', act: () => skipFiles(q, skipping, n > 1) });
-  items.push('-');
-  items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(cs.map((c) => localPath(q, c.path))) });
-  const errors = cs.filter((c) => c.status === 'failed' && c.error);
+  if (by.pause.length) items.push({ label: counted('Pause', by.pause), act: () => fileAction(q, st, 'pause', by.pause) });
+  if (by.resume.length) items.push({ label: counted('Resume', by.resume), act: () => fileAction(q, st, 'resume', by.resume) });
+  if (by.retry.length) items.push({ label: counted('Retry', by.retry), act: () => fileAction(q, st, 'retry', by.retry) });
+  if (by.skip.length) items.push({ label: counted('Skip', by.skip), key: 'Delete', act: () => skipFiles(q, st, by.skip, n > 1) });
+  if (items.length) items.push('-');
+  items.push({ label: 'Show in folder', act: () => send({ type: 'showFile', id: q.id, gen: st.gen, index: list[0] }) });
+  items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(list.map((i) => localPath(q, st, i))) });
+  const errors = list.filter((i) => st.status[i] === FS.failed && st.errors.get(i));
   if (errors.length) {
     items.push({ label: errors.length > 1 ? `Copy ${errors.length} errors` : 'Copy error',
-      act: () => copyText(errors.map((c) => (n > 1 ? `${c.path}: ${c.error}` : c.error))) });
+      act: () => copyText(errors.map((i) => (n > 1 ? `${st.path[i]}: ${st.errors.get(i)}` : st.errors.get(i)))) });
   }
   return items;
 }
 
 function dlMenu() {
+  const files = selectedFiles();
+  if (files) return filesMenu(files.q, files.st, files.list);
   const rows = selectedDl();
-  if (!rows.length) return [];
-  if (rows[0].kind === 'file') {
-    const q = dl.byId.get(rows[0].id);
-    return q ? filesMenu(q, rows.map((r) => dl.kids.get(r.id)?.get(r.path)).filter(Boolean)) : [];
-  }
-  return downloadsMenu(rows.map((r) => dl.byId.get(r.id)).filter(Boolean));
+  return rows.length ? downloadsMenu(rows.map((r) => dl.byId.get(r.id)).filter(Boolean)) : [];
 }
 
 // A row's buttons: the folder's ▸/▾ and the two slots.
@@ -3273,8 +3785,10 @@ function dlAct(r, act) {
   if (act === 'toggle') {
     setFolderOpen(q, !folderIsOpen(q));
   } else if (r.kind === 'file') {
-    const type = { pause: 'pauseChild', resume: 'resumeChild', skip: 'skipChild' }[act];
-    if (type) send({ type, id: q.id, path: r.path });
+    const st = dl.stores.get(r.id);
+    if (!st) return;
+    if (act === 'show') send({ type: 'showFile', id: q.id, gen: st.gen, index: r.index });
+    else if (['pause', 'resume', 'retry', 'skip'].includes(act)) fileAction(q, st, act, [r.index]);
   } else if (act === 'resume') {
     resumeItem(q);
   } else {
@@ -3293,10 +3807,15 @@ function dragTarget() {
   const body = $('#dl-body');
   const r = body.getBoundingClientRect();
   const y = Math.min(Math.max(d.y, r.top), r.bottom) - r.top + body.scrollTop;
-  const n = dl.rows.length;
+  const n = dl.n;
   let k = Math.max(0, Math.min(n, Math.round(y / DL_ROW))); // the gap above row k
-  while (k < n && dl.rows[k].kind !== 'dl') ++k;
-  const before = k < n ? dl.rows[k].id : 0;
+  if (k < n) { // on to the next download row: past message rows and an open folder's files
+    let e = dlEntryAt(k);
+    if (dl.starts[e] < k) ++e;
+    while (e < dl.top.length && dl.top[e].kind !== 'dl') ++e;
+    k = e < dl.top.length ? dl.starts[e] : n;
+  }
+  const before = k < n ? dlRow(k).id : 0;
   const ids = state.queue.map((q) => q.id);
   const at = ids.indexOf(d.id);
   const next = at >= 0 && at + 1 < ids.length ? ids[at + 1] : 0;
@@ -3330,7 +3849,10 @@ function endDrag(drop) {
   d.el.pinned = false;
   document.documentElement.classList.remove('dl-dragging');
   $('#dl-drop').hidden = true;
-  if (drop && d.moved && d.before !== undefined) send({ type: 'moveItem', id: d.id, before: d.before });
+  if (drop && d.moved && d.before !== undefined) {
+    dl.moving = { id: d.id, order: state.queue.map((q) => q.id).join() };
+    send({ type: 'moveItem', id: d.id, before: d.before });
+  }
   renderDlBody();
 }
 
@@ -3353,14 +3875,14 @@ function endDrag(drop) {
     setDlCursor(r); // first: taking the focus would otherwise put the cursor on a row in view
     dlFocus();
     // Right-click: a row outside the selection becomes the selection; inside, it stays.
-    if (ev.button === 2) { if (!dl.sel.has(selKey(r))) selectDl(r); else renderDlBody(); return; }
+    if (ev.button === 2) { if (!isSel(r)) selectDl(r); else renderDlBody(); return; }
     selectDl(r, { toggle: ev.ctrlKey, extend: ev.shiftKey });
   });
   body.addEventListener('contextmenu', (ev) => {
     const r = rowOfEl(ev.target.closest('.dl-row'));
     if (!r) return;
     ev.preventDefault();
-    if (!dl.sel.has(selKey(r))) selectDl(r); // on a button or the priority
+    if (!isSel(r)) selectDl(r); // on a button or the priority
     const items = dlMenu();
     if (items.length) showMenu(ev.clientX, ev.clientY, items);
   });
@@ -3383,10 +3905,9 @@ function endDrag(drop) {
   // Tabbed to without a cursor: the selection's first row, or the first row in view. Drawn in the
   // next frame: the focus can come from inside renderDlBody (a recycled row's button).
   grid.addEventListener('focus', () => {
-    if (dl.index.has(dl.cursor) || !dl.rows.length) return;
-    const sel = selectedDl()[0];
-    const i = sel ? dl.index.get(sel.key) : Math.min(dl.rows.length - 1, Math.ceil(body.scrollTop / DL_ROW));
-    setDlCursor(dl.rows[i]);
+    if (dlIndexOf(dl.cursor) !== undefined || !dl.n) return;
+    const i = firstSelected() ?? Math.min(dl.n - 1, Math.ceil(body.scrollTop / DL_ROW));
+    setDlCursor(dlRow(i));
     scheduleDl();
   });
   // The keys (5.8): the cursor goes through the rows, Shift extends the selection, Ctrl moves the
@@ -3396,15 +3917,15 @@ function endDrag(drop) {
   grid.addEventListener('keydown', (ev) => {
     if (ev.target !== grid || modal) return; // a title's button keeps its own keys
     if (!['Shift', 'Control', 'Alt', 'Meta'].includes(ev.key)) dl.keyAt = performance.now(); // holds a new order
-    const n = dl.rows.length;
-    const at = dl.index.get(dl.cursor);
-    const r = at === undefined ? null : dl.rows[at];
+    const n = dl.n;
+    const at = dlIndexOf(dl.cursor);
+    const r = at === undefined ? null : dlRow(at);
     const page = Math.max(1, Math.floor(body.clientHeight / DL_ROW) - 1);
     const move = { ArrowDown: 1, ArrowUp: -1, PageDown: page, PageUp: -page }[ev.key];
     if (ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowUp' || ev.key === 'ArrowDown')) {
       ev.preventDefault();
       ev.stopPropagation();
-      const rows = selectedDl();
+      const rows = dl.fsel ? [] : selectedDl();
       const q = rows.length === 1 && rows[0].kind === 'dl' ? dl.byId.get(rows[0].id) : null;
       if (!q || !waiting(q)) return;
       if (dlSort.key) dlNote(`Moves follow the queue order: ${dlQueueOrderHint()}.`);
@@ -3429,18 +3950,20 @@ function endDrag(drop) {
     } else if (ev.key === 'Enter' && !ev.ctrlKey && !ev.shiftKey) {
       ev.preventDefault();
       const q = r && r.kind === 'dl' ? dl.byId.get(r.id) : null;
+      const st = r && r.kind === 'file' ? dl.stores.get(r.id) : null;
       if (q && (q.status === 'done' || q.status === 'skipped')) send({ type: 'openFolder', id: q.id });
+      else if (st && st.status[r.index] === FS.done) send({ type: 'showFile', id: r.id, gen: st.gen, index: r.index });
     } else if (ev.key === 'Delete' && !ev.ctrlKey) {
       ev.preventDefault();
       deleteSelection();
     } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
       ev.preventDefault();
-      if (!dl.sel.size && r) selectDl(r); // nothing selected: the cursor row
-      const rows = selectedDl();
-      if (!rows.length) return;
+      if (!hasSel() && r) selectDl(r); // nothing selected: the cursor row
+      const first = firstSelected();
+      if (first === undefined) return;
       // At the cursor row when it is selected, else at the first selected one.
-      const key = r && dl.sel.has(selKey(r)) ? r.key : rows[0].key;
-      dlKeepInView(dl.index.get(key));
+      const key = r && isSel(r) ? r.key : dlRow(first).key;
+      dlKeepInView(dlIndexOf(key));
       renderDlBody();
       const box = dl.bound.get(key).getBoundingClientRect();
       showMenu(box.left + 40, box.bottom, dlMenu());
@@ -3497,6 +4020,60 @@ function dlNote(text, ms = 6000) {
   }, ms);
 }
 
+// 'Go to running' (decision 2): the next row downloading now below the one it went to last (or
+// below the top of the view, once scrolled since), around to the first: a running file of an open
+// folder, or a running download that isn't one. A folded running folder opens, and the jump comes
+// once its files are in.
+function goToRunning() {
+  const body = $('#dl-body');
+  const from = body.scrollTop === dl.lastRunTop ? dl.lastRun : Math.floor(body.scrollTop / DL_ROW) - 1;
+  let first = -1;
+  let next = -1;
+  const consider = (i) => {
+    if (first < 0) first = i;
+    if (next < 0 && i > from) next = i;
+  };
+  let folded = null;
+  for (let k = 0; k < dl.top.length && next < 0; ++k) {
+    const e = dl.top[k];
+    if (e.kind === 'dl') {
+      const q = dl.byId.get(e.id);
+      if (!q || q.status !== 'running') continue;
+      if (!q.files) consider(dl.starts[k]);
+      else if (!folderIsOpen(q) && !folded) folded = q;
+    } else if (e.kind === 'block') {
+      const st = dl.stores.get(e.id);
+      for (let p = 0; p < st.view.length; ++p) {
+        if (st.status[st.view[p]] !== FS.running) continue;
+        consider(dl.starts[k] + p);
+        if (next >= 0) break;
+      }
+    }
+  }
+  const target = next >= 0 ? next : first;
+  if (target < 0) {
+    if (folded) {
+      dl.goPending = folded.id;
+      setFolderOpen(folded, true);
+    } else {
+      dlNote('Nothing is downloading now.', 3000);
+    }
+    return;
+  }
+  body.scrollTop = Math.max(0, (target - 1) * DL_ROW); // the second row in view
+  dl.lastRun = target;
+  dl.lastRunTop = body.scrollTop;
+  renderDlBody();
+}
+
+// Show: All / Unfinished / Failed (decision 2), for this session: rows that no longer pass dim and
+// leave at most once a second, never while the pointer is over the table.
+function setDlShow(show) {
+  dl.show = ['unfinished', 'failed'].includes(show) ? show : 'all';
+  $('#dl-show').value = dl.show;
+  showDlOrder();
+}
+
 function renderQueue() {
   const panel = $('#downloads');
   // Hidden with an empty queue, the splitter too; back at the saved split.
@@ -3505,9 +4082,15 @@ function renderQueue() {
   $('#split').hidden = panel.hidden;
   if (!shown && !panel.hidden) applySplit();
   dl.byId = new Map(state.queue.map((q) => [q.id, q]));
-  dl.kids = new Map(state.queue.filter((q) => q.children).map((q) => [q.id, new Map(q.children.map((c) => [c.path, c]))]));
   for (const id of folderOpen.keys()) if (!dl.byId.has(id)) folderOpen.delete(id);
+  syncWatches();
   updateDlOrder();
+  // A download the user moved that was the first in view: the view stays, the rows move.
+  const m = dl.moving;
+  if (m && state.queue.map((q) => q.id).join() !== m.order) {
+    dl.moving = null;
+    if (dl.viewDl === `d${m.id}`) dl.viewKey = '';
+  }
   buildDlRows();
   if (!panel.hidden) {
     updateDlStep();
@@ -3516,7 +4099,8 @@ function renderQueue() {
     const f = dl.follow;
     if (f && state.queue.map((q) => q.id).join() !== f.order) {
       dl.follow = null;
-      if (dl.index.has(`d${f.id}`)) { dlKeepInView(dl.index.get(`d${f.id}`)); renderDlBody(); }
+      const i = dlIndexOf(`d${f.id}`);
+      if (i !== undefined) { dlKeepInView(i); renderDlBody(); }
     }
   }
   const count = (st) => state.queue.filter((q) => q.status === st).length;
@@ -3538,8 +4122,27 @@ function renderQueue() {
   pauseAll.disabled = running + queued + paused === 0;
   $('#cancel-all').disabled = running + queued + paused + count('failed') === 0;
   $('#clear-finished').disabled = !state.queue.some((q) => ['done', 'failed', 'cancelled'].includes(q.status));
+  $('#dl-go').disabled = running === 0;
   renderParallel();
   renderTotalSpeed();
+}
+
+// The backend's 'queue': every download (they came, went or moved, or the page loaded).
+function onQueue(msg) {
+  state.queue = msg.items;
+  if (msg.parallel) state.parallel = msg.parallel;
+  renderQueue();
+}
+
+// The backend's 'queueDelta': only the downloads whose row changed, in their places.
+function onQueueDelta(msg) {
+  const at = new Map(state.queue.map((q, k) => [q.id, k]));
+  for (const item of msg.items) {
+    const k = at.get(item.id);
+    if (k !== undefined) state.queue[k] = item;
+  }
+  if (msg.parallel) state.parallel = msg.parallel;
+  renderQueue();
 }
 
 // ---- the splitter between the view above (Browse or Settings) and Downloads ---------------------
@@ -4454,11 +5057,15 @@ if (webview) {
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
       case 'queue':
-        state.queue = msg.items;
-        if (msg.parallel) state.parallel = msg.parallel;
-        renderQueue();
+        onQueue(msg);
         if (state.update.state === 'installed') renderUpdate();
         break;
+      case 'queueDelta':
+        onQueueDelta(msg);
+        if (state.update.state === 'installed') renderUpdate();
+        break;
+      case 'files': onFiles(msg); break;
+      case 'fileDelta': onFileDelta(msg); break;
       case 'update': state.update = msg; renderUpdate(); break;
       case 'updateChecked': onUpdateChecked(msg); break;
       case 'limit': onLimit(msg); break;
@@ -4762,6 +5369,8 @@ $('#download').addEventListener('click', () => download(selectedHits()));
 $('#choose-dest').addEventListener('click', () => send({ type: 'pickFolder', current: $('#dest').value.trim() }));
 $('#dest').addEventListener('change', (ev) => { state.destinations[state.remote] = ev.target.value.trim(); });
 $('#clear-finished').addEventListener('click', () => send({ type: 'clearFinished' }));
+$('#dl-show').addEventListener('change', (ev) => setDlShow(ev.target.value));
+$('#dl-go').addEventListener('click', goToRunning);
 $('#pause-all').addEventListener('click', (ev) => send({ type: ev.currentTarget.dataset.act || 'pauseAll' }));
 $('#cancel-all').addEventListener('click', cancelAll);
 $('#limit-on').addEventListener('change', (ev) => {

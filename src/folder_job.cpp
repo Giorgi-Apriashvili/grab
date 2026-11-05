@@ -542,26 +542,37 @@ Totals totals(const Tree& tree) {
     return t;
 }
 
-void pause_file(Tree& tree, const std::string& path) {
-    for (auto& f : tree.files) {
-        if (f.path != path) continue;
-        if (f.status == State::queued) {
-            f.status = State::paused;
-        } else if (f.status == State::running && f.big) {
-            f.stop_reason = StopReason::pause; // run_big marks it paused once stopped
-            f.stop.request_stop();
-        } else if (f.status == State::running) {
-            f.status = State::paused; // a small file: its worker drops it once its replies are in
-            f.speed = 0;
-            f.bytes = 0; // a small file is kept in memory until it's whole: it starts over on resume
-        }
+bool pause_file(Tree& tree, std::size_t index) {
+    if (index >= tree.files.size()) return false;
+    auto& f = tree.files[index];
+    if (f.status == State::queued) {
+        f.status = State::paused;
+    } else if (f.status == State::running && f.big) {
+        if (f.stop_reason != StopReason::none) return false;
+        f.stop_reason = StopReason::pause; // run_big marks it paused once stopped
+        f.stop.request_stop();
+    } else if (f.status == State::running) {
+        f.status = State::paused; // a small file: its worker drops it once its replies are in
+        f.speed = 0;
+        f.bytes = 0; // a small file is kept in memory until it's whole: it starts over on resume
+    } else {
+        return false;
     }
+    return true;
 }
 
-void resume_file(Tree& tree, const std::string& path) {
-    for (auto& f : tree.files) {
-        if (f.path == path && f.status == State::paused) f.status = State::queued;
-    }
+bool resume_file(Tree& tree, std::size_t index) {
+    if (index >= tree.files.size() || tree.files[index].status != State::paused) return false;
+    tree.files[index].status = State::queued;
+    return true;
+}
+
+bool retry_file(Tree& tree, std::size_t index) {
+    if (index >= tree.files.size() || tree.files[index].status != State::failed) return false;
+    auto& f = tree.files[index];
+    f.status = State::queued;
+    f.error.clear();
+    return true;
 }
 
 void resume_paused(Tree& tree) {
@@ -580,21 +591,26 @@ fetch::Reserved reserved_names(const fs::path& dir, const Tree& tree) {
     return [names](const fs::path& p) { return names->contains(local::key(p)); };
 }
 
-std::optional<Discard> skip_file(Tree& tree, const fs::path& dir, const std::string& remote_path, const std::string& path) {
+std::optional<Discard> skip_file(Tree& tree, const fs::path& dir, const std::string& remote_path, std::size_t index,
+                                 bool* skipped) {
+    if (skipped != nullptr) *skipped = false;
+    if (index >= tree.files.size()) return std::nullopt;
+    auto& f = tree.files[index];
     std::optional<Discard> discard;
-    for (auto& f : tree.files) {
-        if (f.path != path) continue;
-        if (f.status == State::queued || f.status == State::paused || f.status == State::failed) {
-            f.status = State::skipped;
-            if (f.big) discard = Discard{target_of(dir, f), child_remote_path(remote_path, f.path), reserved_names(dir, tree)};
-        } else if (f.status == State::running && f.big) {
-            f.stop_reason = StopReason::skip; // run_big discards its partial file
-            f.stop.request_stop();
-        } else if (f.status == State::running) {
-            f.status = State::skipped; // a small file: its worker drops it once its replies are in
-            f.speed = 0;
-        }
+    if (f.status == State::queued || f.status == State::paused || f.status == State::failed) {
+        f.status = State::skipped;
+        if (f.big) discard = Discard{target_of(dir, f), child_remote_path(remote_path, f.path), {}};
+    } else if (f.status == State::running && f.big) {
+        if (f.stop_reason == StopReason::skip) return std::nullopt;
+        f.stop_reason = StopReason::skip; // run_big discards its partial file
+        f.stop.request_stop();
+    } else if (f.status == State::running) {
+        f.status = State::skipped; // a small file: its worker drops it once its replies are in
+        f.speed = 0;
+    } else {
+        return std::nullopt;
     }
+    if (skipped != nullptr) *skipped = true;
     return discard;
 }
 

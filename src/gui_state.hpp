@@ -129,10 +129,13 @@ struct SavedFile {
     std::string path; // relative to the folder
     std::uint64_t size = 0;
     std::string modtime;
-    std::string state = "queued"; // "queued" | "paused" | "done" | "skipped"
+    // "queued" | "paused" | "done" | "skipped" | "failed" (since 0.22; grab 0.21 reads it as
+    // "queued", which retries the file, as a restart did then)
+    std::string state = "queued";
     bool fetched = false;  // done by the download, not found on disk already
     bool verified = false; // checked against the server's checksum
     std::string local = {}; // Keep both: its second-copy name, relative to the folder
+    std::string error = {}; // a failed file's
     bool operator==(const SavedFile&) const = default;
 };
 
@@ -154,6 +157,9 @@ struct SavedDownload {
     // A different file already there: "replace" | "both" | "skip", "" not answered (existing.hpp).
     std::string existing = {};
     std::string local_name = {}; // a file's Keep-both name
+    // A folder's files shown (true) or folded (false) by the user in the Downloads table; unset:
+    // open unless the folder is done or cancelled.
+    std::optional<bool> expanded = {};
     bool operator==(const SavedDownload&) const = default;
 };
 

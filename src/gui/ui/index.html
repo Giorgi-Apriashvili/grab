@@ -279,6 +279,16 @@
     <span id="dl-summary" class="muted" aria-live="polite"></span>
     <span id="dl-note" class="dl-note" role="status" hidden></span>
     <span class="spacer"></span>
+    <!-- For this session: finished rows stay in place under All (DOWNLOADS-UI.md decision 2). -->
+    <label class="dl-show" title="Which downloads and files the table shows, for this session">
+      <span class="label">Show</span>
+      <select id="dl-show">
+        <option value="all">All</option>
+        <option value="unfinished">Unfinished</option>
+        <option value="failed">Failed</option>
+      </select>
+    </label>
+    <button id="dl-go" type="button" class="subtle" title="Scroll to the next file downloading now" disabled><span class="wide">Go to running</span><span class="narrow">Running</span></button>
     <span class="stepper" title="How many files download at the same time (1–8); each file of a folder counts">
       <span class="label">At once</span>
       <button id="parallel-down" type="button" aria-label="Fewer at once">−</button>

@@ -16,14 +16,6 @@
 using namespace grab;
 using folder::State;
 
-TEST_CASE("a big folder shows its active files and the first few queued") {
-    const std::vector<State> states{State::done,   State::queued, State::running, State::queued, State::skipped,
-                                    State::queued, State::paused, State::failed,  State::queued};
-    CHECK(folder::visible(states, 2) == std::vector<std::size_t>{1, 2, 3, 6, 7});
-    CHECK(folder::visible(states, 10) == std::vector<std::size_t>{1, 2, 3, 5, 6, 7, 8});
-    CHECK(folder::visible({State::done, State::skipped}, 5).empty());
-}
-
 TEST_CASE("a folder's row says which folders below it couldn't be read") {
     CHECK(folder::unreadable_text({}).empty());
     CHECK(folder::unreadable_text({"a/b: permission denied"}) == "1 folder couldn't be read: a/b: permission denied");
@@ -39,10 +31,26 @@ TEST_CASE("a folder's files survive a restart in queue.json") {
                      {"b.mp4", 200, "", "paused"},
                      {"sub/c.mp4", 300, "", "skipped"},
                      {"d.mp4", 400, "", "queued"},
-                     {"g.mp4", 500, "", "queued", false, false, "g (2).mp4"}}}; // a second copy
+                     {"g.mp4", 500, "", "queued", false, false, "g (2).mp4"}, // a second copy
+                     {"h.mp4", 600, "", "failed", false, false, "", "permission denied"}}}; // kept with its error
+    d.expanded = false; // folded by the user
     const auto back = parse_queue(queue_to_json({d}));
     REQUIRE(back.size() == 1);
     CHECK(back[0] == d);
+    // grab 0.21's queue.json: no error, no expanded; the default rule then.
+    const auto old = parse_queue(R"([{"remote":"r","path":"/p","dest":"C:\\d","mode":"folder",)"
+                                 R"("files":[{"path":"x","state":"queued"}]}])");
+    REQUIRE(old.size() == 1);
+    CHECK_FALSE(old[0].expanded.has_value());
+    // An error goes with a failed file only.
+    const auto mixed = parse_queue(R"([{"remote":"r","path":"/p","dest":"C:\\d","mode":"folder","expanded":true,)"
+                                   R"("files":[{"path":"x","state":"done","error":"stale"},{"path":"y","state":"failed","error":"gone"}]}])");
+    REQUIRE(mixed.size() == 1);
+    CHECK(mixed[0].expanded == true);
+    REQUIRE(mixed[0].files.size() == 2);
+    CHECK(mixed[0].files[0].error.empty());
+    CHECK(mixed[0].files[1].state == "failed");
+    CHECK(mixed[0].files[1].error == "gone");
     // Unknown states read as queued; entries without a path are dropped.
     const auto odd = parse_queue(R"([{"remote":"r","path":"/p","dest":"C:\\d","mode":"folder",)"
                                  R"("files":[{"path":"x","state":"running"},{"state":"done"}]}])");
@@ -90,7 +98,7 @@ TEST_CASE("folder totals count finished and running files, not skipped ones") {
     CHECK(folder::local_dir(dest, "/srv/..") == dest / util::path_from_utf8("．．"));
 }
 
-TEST_CASE("single files of a folder: pause, resume, skip and retry") {
+TEST_CASE("single files of a folder by their index: pause, resume, skip and retry") {
     folder::Tree t;
     t.files.push_back(folder::make_file("waiting", 10, ""));
     t.files.push_back(folder::make_file("copying", 10, ""));
@@ -102,32 +110,46 @@ TEST_CASE("single files of a folder: pause, resume, skip and retry") {
     t.files[3].status = State::failed;
     t.files[3].error = "oops";
 
-    folder::pause_file(t, "waiting"); // queued: not taken
+    CHECK(folder::pause_file(t, 0)); // queued: not taken
     CHECK(t.files[0].status == State::paused);
-    folder::pause_file(t, "copying"); // a small file in flight: dropped once its replies are in
+    CHECK_FALSE(folder::pause_file(t, 0)); // paused already
+    CHECK(folder::pause_file(t, 1)); // a small file in flight: dropped once its replies are in
     CHECK(t.files[1].status == State::paused);
     CHECK(t.files[1].bytes == 0);
-    folder::pause_file(t, "big"); // its own stop; it is marked paused once stopped
+    CHECK(folder::pause_file(t, 2)); // its own stop; it is marked paused once stopped
     CHECK(t.files[2].status == State::running);
     CHECK(t.files[2].stop_reason == folder::StopReason::pause);
     CHECK(t.files[2].stop.stop_requested());
+    CHECK_FALSE(folder::pause_file(t, 2)); // asked already
+    CHECK_FALSE(folder::pause_file(t, 3)); // failed
+    CHECK_FALSE(folder::pause_file(t, 4)); // no such file
 
-    folder::resume_file(t, "waiting");
+    CHECK(folder::resume_file(t, 0));
     CHECK(t.files[0].status == State::queued);
+    CHECK_FALSE(folder::resume_file(t, 0));
+    CHECK_FALSE(folder::resume_file(t, 7));
     folder::resume_paused(t);
     CHECK(t.files[1].status == State::queued);
 
     const auto dir = std::filesystem::path("D") / "Limits";
-    const auto discard = folder::skip_file(t, dir, "/srv/Limits", "broken");
+    bool skipped = false;
+    const auto discard = folder::skip_file(t, dir, "/srv/Limits", 3, &skipped);
+    CHECK(skipped);
     CHECK(t.files[3].status == State::skipped);
     REQUIRE(discard.has_value());
-    CHECK(discard->target == dir / "broken");
-    CHECK(discard->remote_path == "/srv/Limits/broken");
-    REQUIRE(discard->reserved);
-    CHECK(discard->reserved(dir / "BIG")); // the folder's files, as Windows compares names
-    CHECK_FALSE(discard->reserved(dir / "broken.grabpart"));
-    CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", "big").has_value()); // running: stopped, then discarded
+    if (discard) {
+        CHECK(discard->target == dir / "broken");
+        CHECK(discard->remote_path == "/srv/Limits/broken");
+        CHECK_FALSE(discard->reserved); // a batch builds it once, outside the lock (queue_view::reserved_names)
+    }
+    CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", 2, &skipped).has_value()); // running: stopped, then discarded
+    CHECK(skipped);
     CHECK(t.files[2].stop_reason == folder::StopReason::skip);
+    CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", 2, &skipped).has_value()); // asked already
+    CHECK_FALSE(skipped);
+    CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", 3, &skipped).has_value()); // skipped already
+    CHECK_FALSE(skipped);
+    CHECK_FALSE(folder::skip_file(t, dir, "/srv/Limits", 9).has_value());
 
     t.files[1].status = State::failed;
     t.files[1].error = "x";
@@ -135,10 +157,15 @@ TEST_CASE("single files of a folder: pause, resume, skip and retry") {
     CHECK(o.failed == 1);
     CHECK(o.first_error == "copying: x");
     CHECK(o.waiting == 1); // "waiting" is queued
-    folder::retry_files(t, false);
+    CHECK(folder::retry_file(t, 1)); // the row's Retry
     CHECK(t.files[1].status == State::queued);
     CHECK(t.files[1].error.empty());
-    CHECK(t.files[3].status == State::skipped); // skipped files stay skipped
+    CHECK_FALSE(folder::retry_file(t, 1));
+    CHECK_FALSE(folder::retry_file(t, 3)); // skipped files stay skipped
+    t.files[1].status = State::failed;
+    folder::retry_files(t, false);
+    CHECK(t.files[1].status == State::queued);
+    CHECK(t.files[3].status == State::skipped);
     t.files[0].status = State::paused;
     folder::retry_files(t, true); // after a cancel: everything not done or skipped
     CHECK(t.files[0].status == State::queued);

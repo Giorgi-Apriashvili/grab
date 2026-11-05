@@ -40,7 +40,7 @@ connections, building and releasing) is in the full documentation,
   engine, laid out like Explorer: browse and search a server's folders, preview images, text
   files and PDFs, play videos and audio in your own player streamed from the server, and follow
   the downloads in a sortable table (status, progress, speed and time left for each download and
-  the files of a folder) with pause and resume, priorities, a speed limit and a speed schedule.
+  every file of a folder) with pause and resume, priorities, a speed limit and a speed schedule.
 
 ## Requirements
 

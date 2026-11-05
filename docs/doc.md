@@ -412,8 +412,9 @@ them.
   - **On a download:** Pause, Resume or Retry, Cancel, Priority, Move up, Move down, Move to top
     and Move to bottom (waiting downloads, in the queue order), Show in folder, Copy path (where
     it lands on this PC) and Copy error (failed ones). A file inside a folder download has Pause,
-    Resume, Skip, Copy path and Copy error. With several selected, each entry acts on those it
-    applies to.
+    Resume, Retry (failed ones), Skip, Show in folder, Copy path (where it lands, under the name
+    grab saved it as) and Copy error. With several selected, each entry acts on those it applies
+    to, all at once (Show in folder shows the first).
   - Shift+F10 or the menu key opens the menu for the row under the cursor, or in Downloads for
     the selected rows (the cursor's row when none is selected).
 - **The Downloads table** has a row per download and fixed columns: Name (with where it goes),
@@ -431,7 +432,8 @@ them.
     paused, Stopped when the folder failed, Cancelled with the folder.
   - **The two buttons** stay in the same places on every row: Pause or Resume (Retry, or Resume
     from what came, after a failure; Show in folder once done) and Cancel; on a file of a folder,
-    Pause or Resume and Skip. One that doesn't apply leaves its place empty.
+    Pause or Resume and Skip, Retry and Skip after a failure, and Show in folder once done. One
+    that doesn't apply leaves its place empty.
   - **What needs you** gets a line of its own under the download: a failure's error, the question
     about files already there, the free-space pause, folders the server wouldn't list. Its tooltip
     holds the whole text, and Copy error is in the download's menu.
@@ -444,7 +446,7 @@ them.
     picked to the cursor, keeping to downloads or to one folder's files; with Ctrl they move the
     cursor alone, and Ctrl+Space adds or drops the cursor's row. Ctrl+A selects every download,
     or every file of the cursor's folder. → opens a folder, or on an open one goes to its first
-    file; ← folds it, or from a file goes up to its folder. Enter shows a finished download in
+    file; ← folds it, or from a file goes up to its folder. Enter shows a finished download or file in
     its folder; Delete cancels or skips the selection; Alt+↑ / Alt+↓ move a waiting download;
     Shift+F10 or the menu key opens the menu. Space does nothing here (in Browse it plays). Screen
     readers get the table as a tree grid, the cursor's row as the active one.
@@ -455,7 +457,8 @@ them.
     Size largest first, Speed fastest first, ETA least time left first, Priority High first. The
     second click reverses it; the third goes back to the queue order. Ties keep the queue order,
     and rows with nothing in that column (no size yet, no speed while not downloading) go last
-    both ways. A folder's files stay under it, in their order. Tab reaches the titles too, and
+    both ways. A folder's files are sorted the same way under it, ties in their folder order;
+    unsorted, they are in the order they start. Tab reaches the titles too, and
     Enter or Space clicks them.
     - Rows never move under the mouse: when changing numbers (status, progress, speed, time
       left, a priority) call for a new order, it comes at most once a second, and waits while
@@ -467,12 +470,20 @@ them.
     - When a narrow window hides the sorted column, Name's title shows the sort ("Name · by
       Speed ▾"); a click on it goes back to the queue order. Right-click the titles for Queue
       order and Reset column widths (which also works in compact columns).
+    - A folder of more than 5,000 files is sorted by Status, Progress, Speed or ETA only when the
+      title is clicked: its arrow is hollow (▵ ▿), and its rows keep that order as the numbers
+      change. Click the title again for a new one.
   - **Column widths:** drag the line at a column title's right edge: that column follows the
     mouse and the next one gives or takes the room, so nothing else moves (Name's line trades
     with Status; Name takes whatever width the others leave). Each column keeps a least width
     that still holds its longest value (Name 160 pixels). A double-click on the line gives both
     columns their default widths.
   - The sort and the widths are kept in gui.json (`"downloads": {"sort": ..., "widths": ...}`).
+  - **Show** (All, Unfinished, Failed) in the Downloads bar picks what the table lists, for this
+    window: Unfinished leaves out what is done, skipped or cancelled, Failed shows failed
+    downloads and failed files with their folders. A row that no longer belongs dims and goes
+    within a second, never while the pointer is over the table. **Go to running** scrolls to the
+    next file downloading now (again: the one after it), opening a folded folder that runs.
   - In a narrow window ETA hides first, then Speed, then Priority (still in the menu and the
     status's tooltip), then the rest goes compact: icon buttons, and sizes without "of" (it's in
     the tooltip). Compact columns keep their own widths; widened columns make the steps come
@@ -496,7 +507,8 @@ them.
     being downloaded), it uses `<name>.2.grabpart` and so on, and leaves them alone. Cancelling
     deletes only grab's partial files.
   - This survives closing grab: unfinished downloads come back paused (the list is kept in
-    `%APPDATA%\grab\queue.json`). Should the list be damaged, the queue starts empty, the old
+    `%APPDATA%\grab\queue.json`, saved at most every 2 seconds while things change, soon after
+    a download ends, at once when grab closes; a very big list is saved less often). Should the list be damaged, the queue starts empty, the old
     file is kept as `queue.json.bad-<date>-<time>` and the window says so.
   - If the file changed on the server in the meantime, it starts over.
   - A file already in the destination, with the same size and not older than the server's
@@ -559,11 +571,16 @@ them.
   - The `grab` command follows the same schedule (see [Usage](#usage)). Each program caps its
     own downloads.
   - At each change, downloads keep their connections and just follow the new speed.
-- **Folders** are listed once and their files shown as rows under the folder's row, folded or
-  opened with ▸/▾ (open while the folder runs, folded once it is done).
-  - Finished files show as one "N done" line, and a long queue as its next 20 files and "…N more
-    queued".
-  - Each file can be paused, resumed or skipped. The folder's own buttons act on all of its
+- **Folders** are listed once and every one of their files shown as a row under the folder's row,
+  folded or opened with ▸/▾ (open while the folder runs, folded once it is done; your ▸/▾ is kept,
+  also across restarts).
+  - A file stays in its place when it is done (Done, with ✓ once verified), skipped or failed
+    (Failed, why in its tooltip and in Copy error); only its cells change. Show and Go to running
+    help in a big folder (see the Downloads table).
+  - The window keeps up with folders of 177,000 files: their rows are made only as they show, the
+    list comes once in pieces, then only the files that changed, four times a second.
+  - Each file can be paused, resumed, retried after a failure or skipped. The folder's own
+    buttons act on all of its
     files.
   - Files of 2 MiB and more take the resumable path above, as many at a time as At once allows,
     their pieces spread over the server's connections.
@@ -571,8 +588,10 @@ them.
     MiB of reads in flight per connection), over connections already logged in, since a new SSH
     login per small file would dominate. Pausing drops the progress of small files that were in
     flight.
-  - The tree and each file's state survive closing grab. Files already complete on disk are
-    not fetched again.
+  - The tree and each file's state survive closing grab, the failed files with their error:
+    they show Failed until the folder runs again, which tries them again (grab 0.21 and earlier
+    read such a list with those files queued). Files already complete on disk are not fetched
+    again.
 - **Connections per server:** every download from a server shares that server's connection
   budget.
   - The budget is 14 for Hetzner Storage Boxes and 12 elsewhere. Set it per server in

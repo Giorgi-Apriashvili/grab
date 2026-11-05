@@ -1,13 +1,11 @@
 #pragma once
 
-// Pieces of folder downloads that need no process or window: a file of the folder's listing, the
-// states of its files, and which of a big folder's files grab-gui's page is shown. The download
-// itself is in folder_job.hpp.
+// Pieces of folder downloads that need no process or window: a file of the folder's listing and
+// the states of its files. The download itself is in folder_job.hpp; what grab-gui's page is shown
+// of a folder's files, in queue_view.hpp.
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace grab::folder {
 
@@ -18,10 +16,7 @@ struct FolderFile {
     bool operator==(const FolderFile&) const = default;
 };
 
+// The order is the page's too: "files" and "fileDelta" send a state as its number (queue_view.hpp).
 enum class State { queued, running, paused, done, failed, skipped };
-
-// Which files of a folder the page lists, in folder order: every running, paused and failed
-// one, and the first `queued_limit` queued ones. Done and skipped files are only counted.
-[[nodiscard]] std::vector<std::size_t> visible(const std::vector<State>& states, std::size_t queued_limit);
 
 } // namespace grab::folder

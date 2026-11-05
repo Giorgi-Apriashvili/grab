@@ -10,6 +10,7 @@
 #include "json.hpp"
 #include "play_stream.hpp"
 #include "preview_jobs.hpp"
+#include "queue_view.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
 #include "server_ops.hpp"
@@ -22,6 +23,7 @@
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -90,6 +92,13 @@ public:
     void post_import_banner();
     // UI thread, every second: follows the speed schedule.
     void tick();
+    // UI thread, every 250 ms, and at once after the user's actions: what changed in the queue
+    // goes to the page (DOWNLOADS-UI.md 6.2). The downloads whole ("queue") when they came, went or
+    // moved, else those whose row changed ("queueDelta"); the files of the folders the page shows
+    // that changed ("fileDelta"), found in the same pass over a folder's files that counts its
+    // totals; and the files of a shown folder that was just listed ("files"). Workers only mark
+    // the queue as changed.
+    void flush();
     // The page's https://grab.ui/preview/<remote>/<path>[?size=N&modified=T][&ahead] requests (the
     // viewer's images, text and PDFs; each part percent-encoded; the row's size and time, for the
     // cache; ahead: a neighbour fetched before it's shown): read through grab's own connections to
@@ -274,6 +283,19 @@ private:
         std::vector<Asked> asked;
         std::size_t asked_count = 0;
         folder::Tree tree; // folders: their files once listed (under mutex_)
+        // A listed folder's file names, which the page's rows, queue.json and the actions by index
+        // read without the lock, and their generation, which the page's "files" and actions carry:
+        // new when the folder is listed or restored, or its files' local names change (Keep both).
+        std::shared_ptr<const queue_view::Names> names;
+        int gen = 0;
+        std::array<std::size_t, 6> counts{}; // its files by folder::State, as the last pass counted
+        // Its files changed since the last flush (a pass over them is due); set without mutex_.
+        std::atomic<bool> touched{false};
+        // The user's ▸/▾ in the Downloads table, kept in queue.json; unset: the default rule.
+        std::optional<bool> expanded;
+        // Restored with failed files: they are queued again when it runs, as a restart did.
+        bool retry_failed = false;
+        bool fake = false; // debug builds: GRAB_TEST_FAKE_FOLDER's folder, whose files advance by themselves
     };
 
     void post(const json::Value& message) const;
@@ -374,10 +396,13 @@ private:
     void resume_items(int id);
     void cancel_items(int id);
     void retry_item(int id);
-    // A file of a folder download.
-    void pause_child(int id, const std::string& path);
-    void resume_child(int id, const std::string& path);
-    void skip_child(int id, const std::string& path);
+    // Files of a folder download by their index (the page's rows): "fileAction" {id, gen, act:
+    // pause|resume|retry|skip, ranges: [[from, to], ...]}, one lock, one save and one flush for
+    // all of them. Rows of another generation change nothing.
+    void file_action(const json::Value& msg);
+    // A file of a folder download in Explorer, "showFile" {id, gen, index}.
+    void show_file(int id, int gen, std::size_t index);
+    void show_in_explorer(const std::filesystem::path& target) const; // selected, or its folder when it's gone
     void clear_finished();
     void set_parallel(int n);
     // Queue order (`before` = another item's id, 0 = the end) and bandwidth priority.
@@ -437,8 +462,13 @@ private:
     void run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop);
     void run_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
     void run_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
-    void folder_event(Item& item, folder::Event e); // a running folder's progress, for the page
-    void folder_totals(Item& item) const;          // caller holds mutex_
+    void folder_event(Item& item, folder::Event e); // a running folder's progress: marks it for the next flush
+    // A listed folder's totals and file counts from one pass over its files; with `shadow`, also
+    // its files changed since (queue_view::pass). Caller holds mutex_.
+    static queue_view::Pass refresh_folder(Item& item, std::vector<queue_view::Shadow>* shadow = nullptr);
+    // A new generation of a listed folder's names. Built without mutex_, on the worker that alone
+    // writes its files' paths and local names (the listing, Keep both).
+    void new_names(Item& item);
     // What a verification of `item`'s download needs: grab's own connections to its server (the
     // download's pool, else the server's from pools_), or why there are none; the budget and its
     // id; the row's "12 of 40" as files end.
@@ -465,10 +495,45 @@ private:
     // After a download from `server` ended done: with no refusal since `refusals_before`, a
     // learned limit goes up by one (budget::raised).
     void download_went_well(const std::string& server, std::uint64_t refusals_before);
-    [[nodiscard]] json::Value queue_snapshot() const; // caller holds mutex_
-    void post_queue();
+    // A download's row for the page; `position`: its place among the waiting ones (0: none).
+    // Caller holds mutex_.
+    [[nodiscard]] json::Value queue_item(const Item& item, int position) const;
+    // The queue's messages to the page, from the UI thread only (a debug assert checks it).
+    void post_ui(std::string text) const;
+    // The page shows a folder's files (DOWNLOADS-UI.md 6.3): "watchFiles" {id} for each open
+    // folder, "unwatchFiles" {id} when it is folded; the page's init drops every watch. A watched
+    // folder's files go in chunks of files_chunk rows, one per turn of the message loop, then the
+    // rows that changed at each flush.
+    struct FilesSend {
+        std::shared_ptr<const queue_view::Names> names;
+        queue_view::Snapshot snap;
+        int gen = 0;
+        std::size_t next = 0;
+    };
+    struct Watch {
+        int gen = 0; // the generation sent or being sent; 0: none yet
+        std::vector<queue_view::Shadow> shadow; // what the page has, once every chunk went
+        std::shared_ptr<FilesSend> send;        // while the chunks go: no deltas meanwhile
+        bool catch_up = false; // every chunk went: the next flush diffs it even if not running or touched
+    };
+    void watch_files(int id);
+    void start_files(int id);
+    void send_files_chunk(int id, const std::shared_ptr<FilesSend>& send);
     void restore_queue();
-    void save_queue() const; // any thread; unfinished items, for the next start
+    // queue.json now, from any thread: unfinished items. Under mutex_ it copies only compact data
+    // (each file's state in a few bytes, the names from Item::names); the text is made after.
+    void save_queue() const;
+    // queue.json soon, from any thread: at most once every queue_save_gap (longer after a slow
+    // save), on saver_. now (a download ended): without the queue_save_gap floor, still at most
+    // once every ten times the last save's duration. Closing and an update's restart save at once.
+    void request_save(bool now = false);
+    void run_saves(const std::stop_token& stop);
+    // Debug builds, GRAB_TEST_FLUSH_LOG=<file>: a line per flush, first answer and save (the
+    // lock held, rows, bytes), for the performance checks (DOWNLOADS-UI.md 14, C).
+    [[nodiscard]] static bool test_logging();
+    static void test_log(const std::string& line);
+    void add_fake_folder(std::size_t files); // debug builds: GRAB_TEST_FAKE_FOLDER=N
+    void run_fake(Item& item, const std::stop_token& stop);
     void report_save(std::string_view what, const std::expected<void, std::string>& saved,
                      std::atomic<bool>& failing) const;
     void set_aside(std::string_view what, const std::filesystem::path& p, const std::string& why,
@@ -526,17 +591,30 @@ private:
     std::atomic<bool> settings_busy_{false};
     std::jthread settings_thread_;
 
-    // Guards items_, next_id_, last_progress_post_, parallel_, learned_, defaults_. Worker threads
-    // read parallel_ here rather than state_, which belongs to the UI thread.
+    // Guards items_, next_id_, next_gen_, parallel_, learned_, defaults_. Worker threads read
+    // parallel_ here rather than state_, which belongs to the UI thread.
     mutable std::mutex mutex_;
     std::condition_variable_any wake_;
     std::vector<std::shared_ptr<Item>> items_;
     int next_id_ = 1;
+    int next_gen_ = 1;
     int parallel_ = 4;
     std::map<std::string, int> learned_;  // as limits.json had it when last read
     std::map<std::string, int> defaults_; // each server's default budget, by its host
-    std::chrono::steady_clock::time_point last_progress_post_{};
+    // The page's view, UI thread (dirty_ any thread): what flush() sends next.
+    DWORD ui_thread_ = 0;
+    std::atomic<bool> dirty_{false}; // something changed: set by workers, actions, folder events
+    bool queue_changed_ = true;      // downloads came, went or moved: the next flush sends "queue"
+    std::map<int, std::string> item_sent_; // each download's row as last sent
+    int parallel_sent_ = 0;
+    std::map<int, Watch> watches_; // the folders whose files the page shows, by id
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
+    std::mutex save_mutex_;               // guards save_wanted_, save_now_, next_save_, next_urgent_save_
+    std::condition_variable_any save_wake_;
+    bool save_wanted_ = false;
+    bool save_now_ = false; // the one wanted is urgent (request_save(true))
+    std::chrono::steady_clock::time_point next_save_{};
+    std::chrono::steady_clock::time_point next_urgent_save_{};
     mutable std::atomic<bool> queue_unsaved_{false}; // the last save of queue.json failed (shown once)
     mutable std::atomic<bool> state_unsaved_{false}; // the same for gui.json
     mutable std::atomic<bool> limits_unsaved_{false}; // and for limits.json
@@ -569,6 +647,21 @@ private:
     std::map<std::string, ViewerSeat> viewer_seats_; // by server
     std::vector<std::jthread> preview_workers_; // after the members their jobs use
 
+    // Skipped big files' partial downloads, deleted on discarder_: the names of where a folder's
+    // files land (queue_view::reserved_names) take long for a big folder, so not on the UI thread.
+    struct DiscardJob {
+        std::shared_ptr<const queue_view::Names> names;
+        std::filesystem::path dir;
+        std::string rclone_remote;
+        std::vector<folder::Discard> discard;
+    };
+    void run_discards(const std::stop_token& stop);
+    std::mutex discard_mutex_; // guards discard_jobs_
+    std::condition_variable_any discard_wake_;
+    std::deque<DiscardJob> discard_jobs_;
+    std::jthread discarder_; // what was asked for is done at its stop
+
+    std::jthread saver_; // ends after workers_: the saves they asked for are made, the last at its stop
     std::vector<std::jthread> workers_; // last member: stopped and joined first
 };
 

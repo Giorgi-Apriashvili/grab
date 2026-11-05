@@ -599,6 +599,11 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 /* Below about 900 px the head's summary goes into the title's tooltip. */
 .downloads.narrow-head #dl-summary { display: none; }
 /* A note from the table's keys (app.js dlNote) shows in the summary's place, narrow head or not. */
+.dl-show { display: inline-flex; flex: none; align-items: center; gap: 4px; font-size: 12px; }
+.dl-show select { width: 98px; height: 26px; font-size: 12px; }
+#dl-go { flex: none; }
+#dl-go .narrow, .downloads.narrow-head #dl-go .wide, .downloads.narrow-head .dl-show .label { display: none; }
+.downloads.narrow-head #dl-go .narrow { display: inline; }
 .dl-note { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; }
 .dl-note[hidden], .downloads.noting #dl-summary { display: none; }
 #pause-all { min-width: 90px; } /* "Pause all" and "Resume all" take the same room */
@@ -680,6 +685,7 @@ html.dl-resizing, html.dl-resizing * { cursor: col-resize !important; }
 .dl-row.cursor { box-shadow: inset 2px 0 0 var(--accent); }
 .queue:focus .dl-row.cursor { box-shadow: inset 2px 0 0 var(--accent), inset 0 0 0 1px var(--sel-line); }
 .dl-row.dragging { opacity: 0.5; }
+.dl-row.leave { opacity: 0.5; } /* no longer what Show shows: it leaves within a second */
 .dl-drop { position: absolute; z-index: 3; top: -1px; left: 0; right: 0; height: 2px; background: var(--accent); pointer-events: none; }
 
 /* ≡ to drag a download, ▸/▾ to fold a folder's files */

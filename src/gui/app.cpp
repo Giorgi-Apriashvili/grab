@@ -15,6 +15,7 @@
 #include "play_server.hpp"
 #include "preview.hpp"
 #include "process.hpp"
+#include "queue_view.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
 #include "rclone_import.hpp"
@@ -34,6 +35,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -68,7 +71,11 @@ std::optional<std::int64_t> seconds_to_ns(std::optional<std::int64_t> seconds) {
 
 using json::Value;
 
-constexpr auto progress_interval = std::chrono::milliseconds(250); // at most 4 updates a second
+// A folder's files go to the page in chunks of this many rows, one per turn of the message loop,
+// so the window keeps answering while a 177,000-file folder's list goes (DOWNLOADS-UI.md 6.3).
+constexpr std::size_t files_chunk = 5000;
+// queue.json is saved at most this often while downloads change it (DOWNLOADS-UI.md 6.5).
+constexpr auto queue_save_gap = std::chrono::seconds(2);
 
 Value str(std::string s) { return Value::make_string(std::move(s)); }
 Value num(double n) { return Value::make_number(n); }
@@ -112,9 +119,8 @@ void set_notes(Value& status, const std::vector<std::string>& notes) {
     status.set("notes", std::move(list));
 }
 
-const char* file_state_name(folder::State s) {
-    constexpr const char* names[] = {"queued", "running", "paused", "done", "failed", "skipped"}; // folder::State order
-    return names[static_cast<int>(s)];
+double ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
 }
 
 std::string known_folder(REFKNOWNFOLDERID id) {
@@ -166,7 +172,15 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
             util::remove_if_unused(e.path());
         }
     }
+    ui_thread_ = GetCurrentThreadId();
     restore_queue();
+#ifndef NDEBUG
+    // Tests: a synthetic folder of N files that advance by themselves, without a server or disk.
+    if (const auto fake = util::getenv_utf8("GRAB_TEST_FAKE_FOLDER")) {
+        std::size_t n = 0;
+        if (std::from_chars(fake->data(), fake->data() + fake->size(), n).ec == std::errc{} && n > 0) add_fake_folder(n);
+    }
+#endif
     lists_dir_ = file_list::dir_for(config_path_);
     prune_lists();
     // grab 0.19's servers move from rclone.conf into grab.conf once (rclone_import.hpp), here on
@@ -215,6 +229,8 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
             }
         });
     });
+    discarder_ = std::jthread([this](const std::stop_token& stop) { run_discards(stop); });
+    saver_ = std::jthread([this](const std::stop_token& stop) { run_saves(stop); });
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {
         workers_.emplace_back([this](std::stop_token stop) { worker_loop(std::move(stop)); });
@@ -760,7 +776,9 @@ void App::on_message(const std::string& text) {
     const std::string type = msg->string_of("type").value_or("");
 
     if (type == "init") {
+        // A page load: it asks again for the files of the folders it shows.
         page_ready_ = true;
+        watches_.clear();
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
@@ -854,12 +872,29 @@ void App::on_message(const std::string& text) {
         pause_items(0);
     } else if (type == "resumeAll") {
         resume_items(0);
-    } else if (type == "pauseChild" || type == "resumeChild" || type == "skipChild") {
+    } else if (type == "watchFiles") {
+        watch_files(int_of(*msg, "id", -1));
+    } else if (type == "unwatchFiles") {
+        watches_.erase(int_of(*msg, "id", -1));
+    } else if (type == "fileAction") {
+        file_action(*msg);
+    } else if (type == "showFile") {
         const int id = int_of(*msg, "id", -1);
-        const std::string path = msg->string_of("path").value_or("");
-        if (type == "pauseChild") pause_child(id, path);
-        else if (type == "resumeChild") resume_child(id, path);
-        else skip_child(id, path);
+        const int gen = int_of(*msg, "gen", -1);
+        const int index = int_of(*msg, "index", -1);
+        if (index >= 0) host_.defer([this, id, gen, index] { show_file(id, gen, static_cast<std::size_t>(index)); });
+    } else if (type == "setExpanded") {
+        // The user's ▸/▾ on a folder, kept in queue.json.
+        const int id = int_of(*msg, "id", -1);
+        const bool open = bool_of(*msg, "open");
+        {
+            std::lock_guard lock(mutex_);
+            for (auto& item : items_) {
+                if (item->id == id) item->expanded = open;
+            }
+        }
+        request_save();
+        dirty_ = true;
     } else if (type == "moveItem") {
         move_item(int_of(*msg, "id", -1), int_of(*msg, "before", 0));
     } else if (type == "setPriority") {
@@ -1013,7 +1048,8 @@ void App::send_init() {
     limit_posted_ = json::stringify(limit);
     init.set("limit", std::move(limit));
     post(init);
-    post_queue();
+    queue_changed_ = true;
+    flush();
 }
 
 void App::start_search(const Value& msg) {
@@ -2190,8 +2226,9 @@ void App::enqueue(const Value& msg) {
     }
     save_state();
     wake_.notify_all();
-    save_queue();
-    post_queue();
+    request_save();
+    queue_changed_ = true;
+    flush();
 }
 
 App::Needed App::needed_for(const Value& groups, const std::filesystem::path& dest) {
@@ -2258,8 +2295,9 @@ void App::pause_items(int id) {
             }
         }
     }
-    save_queue();
-    post_queue();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
 std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::filesystem::path& dest, std::size_t shown,
@@ -2335,8 +2373,9 @@ void App::resolve_existing(int id, existing::Choice choice) {
         }
     }
     wake_.notify_all();
-    save_queue();
-    post_queue();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
 Value App::asked_json(const std::vector<Asked>& asked, std::size_t count) {
@@ -2370,12 +2409,14 @@ void App::resume_items(int id) {
                 item->note.clear();
                 item->waiting.clear();
                 folder::resume_paused(item->tree); // a folder's Resume covers its files paused one by one too
+                item->touched = true;
             }
         }
     }
     wake_.notify_all();
-    save_queue();
-    post_queue();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
 void App::cancel_items(int id) {
@@ -2407,8 +2448,9 @@ void App::cancel_items(int id) {
         }
     }
     for (const auto& d : discard) fetch::discard(d.target, d.path, {}, rclone_remote_of(d.server));
-    save_queue();
-    post_queue();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
 void App::retry_item(int id) {
@@ -2421,8 +2463,9 @@ void App::retry_item(int id) {
         }
     }
     wake_.notify_all();
-    save_queue();
-    post_queue();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
 void App::requeue(Item& item) const {
@@ -2435,6 +2478,7 @@ void App::requeue(Item& item) const {
     item.waiting.clear();
     if (item.mode == Mode::folder) {
         folder::retry_files(item.tree, cancelled); // after a cancel, everything not finished
+        item.touched = true;
     } else if (!fetch::saved_progress(item_target(item), item.path, {}, rclone_remote_of(item.remote))) {
         item.bytes = 0;
     }
@@ -2442,52 +2486,72 @@ void App::requeue(Item& item) const {
     item.eta.reset();
 }
 
-void App::pause_child(int id, const std::string& path) {
+void App::file_action(const Value& msg) {
+    const int id = int_of(msg, "id", -1);
+    const int gen = int_of(msg, "gen", -1);
+    const std::string act = msg.string_of("act").value_or("");
+    if (act != "pause" && act != "resume" && act != "retry" && act != "skip") return;
+    std::vector<folder::Discard> discard; // skipped big files' partial downloads, deleted after unlocking
+    std::shared_ptr<const queue_view::Names> names;
+    std::filesystem::path dir;
+    std::string server;
+    bool wake = false;
     {
         std::lock_guard lock(mutex_);
-        for (auto& item : items_) {
-            if (item->id != id) continue;
-            folder::pause_file(item->tree, path);
-            folder_totals(*item);
-        }
-    }
-    save_queue();
-    post_queue();
-}
-
-void App::resume_child(int id, const std::string& path) {
-    {
-        std::lock_guard lock(mutex_);
-        for (auto& item : items_) {
-            if (item->id != id) continue;
-            folder::resume_file(item->tree, path);
-            // A folder that stopped waiting for this file runs again.
-            if (item->status != Status::running && item->status != Status::queued) {
-                item->status = Status::queued;
-                item->error.clear();
+        const auto it = std::ranges::find(items_, id, [](const auto& i) { return i->id; });
+        if (it == items_.end()) return;
+        Item& item = **it;
+        // The rows of another generation: the page gets the new ones and asks again.
+        if (item.gen != gen || !item.tree.listed || !item.names) return;
+        dir = folder::local_dir(item.dest, item.path);
+        bool changed = false;
+        for (const auto k : queue_view::indices_of(msg.find("ranges"), item.tree.files.size())) {
+            if (act == "pause") {
+                changed = folder::pause_file(item.tree, k) || changed;
+            } else if (act == "resume") {
+                changed = folder::resume_file(item.tree, k) || changed;
+            } else if (act == "retry") {
+                changed = folder::retry_file(item.tree, k) || changed;
+            } else {
+                bool skipped = false;
+                if (auto d = folder::skip_file(item.tree, dir, item.path, k, &skipped)) discard.push_back(std::move(*d));
+                changed = skipped || changed;
             }
         }
+        if (!changed) return;
+        item.touched = true;
+        // A folder that stopped (paused, failed) runs again for the files resumed or retried.
+        if ((act == "resume" || act == "retry") && item.status != Status::running && item.status != Status::queued) {
+            item.status = Status::queued;
+            item.error.clear();
+            wake = true;
+        }
+        names = item.names;
+        server = item.remote;
     }
-    wake_.notify_all();
-    save_queue();
-    post_queue();
+    if (!discard.empty()) {
+        {
+            std::lock_guard lock(discard_mutex_);
+            discard_jobs_.push_back({names, std::move(dir), rclone_remote_of(server), std::move(discard)});
+        }
+        discard_wake_.notify_all();
+    }
+    if (wake) wake_.notify_all();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
-void App::skip_child(int id, const std::string& path) {
-    std::optional<folder::Discard> discard;
-    std::string server;
+void App::show_file(int id, int gen, std::size_t index) {
+    std::filesystem::path target;
     {
         std::lock_guard lock(mutex_);
-        for (auto& item : items_) {
-            if (item->id != id) continue;
-            discard = folder::skip_file(item->tree, folder::local_dir(item->dest, item->path), item->path, path);
-            server = item->remote;
-            folder_totals(*item);
+        for (const auto& item : items_) {
+            if (item->id != id || item->gen != gen || !item->names || index >= item->names->path.size()) continue;
+            target = queue_view::target_of(folder::local_dir(item->dest, item->path), *item->names, index);
         }
     }
-    if (discard) fetch::discard(discard->target, discard->remote_path, discard->reserved, rclone_remote_of(server));
-    save_queue();
-    post_queue();
+    if (!target.empty()) show_in_explorer(target);
 }
 
 void App::set_limit(bool on, double mibps) {
@@ -2584,8 +2648,9 @@ void App::move_item(int id, int before) {
         }
         items_ = std::move(reordered);
     }
-    save_queue();
-    post_queue();
+    request_save();
+    queue_changed_ = true;
+    flush();
 }
 
 void App::set_priority(int id, int weight) {
@@ -2601,8 +2666,9 @@ void App::set_priority(int id, int weight) {
         }
     }
     if (running) connections_.set_weight(server, id, weight); // shares rebalance at the next reads
-    save_queue();
-    post_queue();
+    request_save();
+    dirty_ = true;
+    flush();
 }
 
 void App::set_parallel(int n) {
@@ -2614,6 +2680,7 @@ void App::set_parallel(int n) {
         parallel_ = n; // more: waiting workers start now; fewer: running ones finish first
     }
     wake_.notify_all();
+    dirty_ = true;
 }
 
 void App::clear_finished() {
@@ -2623,8 +2690,13 @@ void App::clear_finished() {
             return i->status == Status::done || i->status == Status::failed ||
                    i->status == Status::cancelled;
         });
+        std::erase_if(watches_, [&](const auto& w) {
+            return std::ranges::none_of(items_, [&](const auto& i) { return i->id == w.first; });
+        });
     }
-    post_queue();
+    request_save(); // failed ones were kept in queue.json
+    queue_changed_ = true;
+    flush();
 }
 
 void App::open_item_folder(int id) {
@@ -2635,7 +2707,10 @@ void App::open_item_folder(int id) {
             if (item->id == id) target = item_target(*item);
         }
     }
-    if (target.empty()) return;
+    if (!target.empty()) show_in_explorer(target);
+}
+
+void App::show_in_explorer(const std::filesystem::path& target) const {
     std::error_code ec;
     if (std::filesystem::exists(target, ec)) {
         // Open Explorer with the downloaded file or folder selected; the Windows folder's, never
@@ -2711,12 +2786,12 @@ void App::worker_loop(std::stop_token stop) {
             // A folder is listed first (once), then checked again on every run before its files.
             if (item->mode == Mode::folder) item->phase = item->tree.listed ? Phase::checking : Phase::listing;
         }
-        save_queue();
-        post_queue();
+        request_save();
+        dirty_ = true;
         run_item(item, stop);
         wake_.notify_all(); // a slot is free for the next queued download
-        save_queue();
-        post_queue();
+        request_save(true); // soon: a download ended
+        dirty_ = true;
 
         Status status{};
         std::string name;
@@ -2741,6 +2816,7 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     }
     // Closing the app stops the running download too; it is resumed on the next start.
     std::stop_callback on_app_stop(app_stop, [item] { item->stop.request_stop(); });
+    if (item->fake) return run_fake(*item, item_stop);
 
     std::error_code ec;
     std::filesystem::create_directories(item->dest, ec);
@@ -2808,19 +2884,6 @@ void App::download_went_well(const std::string& server, std::uint64_t refusals_b
     report_save("the learned connection limits", save_learned_limit(limits_path_, server, raised), limits_unsaved_);
 }
 
-// Progress for the page, at most every progress_interval across all downloads.
-namespace {
-template <class Update>
-bool update_item(std::mutex& m, std::chrono::steady_clock::time_point& last_post, Update&& update) {
-    std::lock_guard lock(m);
-    update();
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last_post < progress_interval) return false;
-    last_post = now;
-    return true;
-}
-} // namespace
-
 void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop) {
     auto set = [&](Status status, std::string error = {}, std::string note = {}) {
         std::lock_guard lock(mutex_);
@@ -2852,15 +2915,15 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
     d.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
     auto fetch_once = [&] {
         return fetch::run(d, connections_, [&](const fetch::Progress& p) {
-            if (update_item(mutex_, last_progress_post_, [&] {
-                    item->bytes = p.bytes;
-                    if (p.total > 0) item->total = p.total;
-                    item->speed = p.speed;
-                    item->eta = p.eta;
-                    item->connections = p.connections;
-                })) {
-                post_queue();
+            {
+                std::lock_guard lock(mutex_);
+                item->bytes = p.bytes;
+                if (p.total > 0) item->total = p.total;
+                item->speed = p.speed;
+                item->eta = p.eta;
+                item->connections = p.connections;
             }
+            dirty_ = true; // the next flush sends it
         }, item_stop);
     };
     auto result = fetch_once();
@@ -2915,7 +2978,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
             }
         }
         if (!check) return set(Status::done, {}, result.present ? "already there, nothing fetched" : result.note);
-        post_queue();
+        dirty_ = true;
         // Against the server's file as this download fetched it: its size and time.
         const auto checked = verify::file(verify_request(*ctx, item, d.pool),
                                           verify::File{.path = item->path, .local = d.target, .size = result.size,
@@ -2974,27 +3037,39 @@ verify::Request App::verify_request(const engine::Context& ctx, const std::share
     // A folder's "12 of 40", and its verified files saved now and then, so a crash keeps them.
     auto saved = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
     r.on_progress = [this, item, saved](std::size_t done, std::size_t total) {
-        if (update_item(mutex_, last_progress_post_, [&] {
-                item->verify_done = done;
-                item->verify_total = total;
-            })) {
-            post_queue();
+        {
+            std::lock_guard lock(mutex_);
+            item->verify_done = done;
+            item->verify_total = total;
         }
+        item->touched = true; // its files' ✓
+        dirty_ = true;
         if (const auto now = std::chrono::steady_clock::now(); item->mode == Mode::folder && now - *saved >= std::chrono::seconds(2)) {
             *saved = now;
-            save_queue();
+            request_save();
         }
     };
     return r;
 }
 
-void App::folder_totals(Item& item) const {
-    const auto t = folder::totals(item.tree);
-    item.bytes = t.bytes;
-    item.total = t.total;
-    item.speed = t.speed;
-    item.eta = t.eta;
+queue_view::Pass App::refresh_folder(Item& item, std::vector<queue_view::Shadow>* shadow) {
+    auto p = queue_view::pass(item.tree.files, shadow);
+    item.bytes = p.totals.bytes;
+    item.total = p.totals.total;
+    item.speed = p.totals.speed;
+    item.eta = p.totals.eta;
     item.connections = item.tree.connections;
+    item.counts = p.counts;
+    return p;
+}
+
+void App::new_names(Item& item) {
+    auto names = std::make_shared<const queue_view::Names>(queue_view::names_of(item.tree.files));
+    std::lock_guard lock(mutex_);
+    item.names = std::move(names);
+    item.gen = next_gen_++;
+    item.touched = true;
+    dirty_ = true;
 }
 
 void App::discard_folder_partials(const Item& item) const {
@@ -3028,19 +3103,11 @@ std::string App::rclone_remote_of(const std::string& server) const {
     return server;
 }
 
+// Without the lock: the next flush counts the folder's files, once for all the events since.
 void App::folder_event(Item& item, folder::Event e) {
-    bool post = e != folder::Event::progress;
-    {
-        std::lock_guard lock(mutex_);
-        folder_totals(item);
-        const auto now = std::chrono::steady_clock::now();
-        if (!post && now - last_progress_post_ >= progress_interval) {
-            post = true;
-            last_progress_post_ = now;
-        }
-    }
-    if (e == folder::Event::checkpoint) save_queue();
-    if (post) post_queue();
+    item.touched = true;
+    dirty_ = true;
+    if (e == folder::Event::checkpoint) request_save();
     // A file of it ended: the place may go to another download.
     if (e == folder::Event::changed) wake_.notify_all();
 }
@@ -3077,13 +3144,24 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     auto target = engine::ssh_target(*ctx);
     if (!target) return fail(target.error());
     job.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
+    {
+        // Failed files kept from before a restart are tried again, as a restart did up to 0.21.
+        std::lock_guard lock(mutex_);
+        if (std::exchange(item->retry_failed, false)) {
+            folder::retry_files(item->tree, false);
+            item->touched = true;
+        }
+    }
 
     if (auto listed = folder::list(job, item->tree, mutex_, item_stop); !listed) return fail(listed.error());
+    bool named = false;
     {
         std::lock_guard lock(mutex_);
         item->phase = Phase::checking;
+        named = item->names && item->names->path.size() == item->tree.files.size();
     }
-    post_queue();
+    if (!named) new_names(*item); // just listed: the page's rows come
+    dirty_ = true;
     // Files already complete on disk (an earlier run, or downloaded before) are not fetched
     // again; big ones with a partial file continue from it.
     folder::mark_existing(job, item->tree, mutex_);
@@ -3105,7 +3183,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
                                       existing::local_file(c.local).value_or(existing::Local{})});
             }
             std::lock_guard lock(mutex_);
-            folder_totals(*item);
+            refresh_folder(*item);
             item->asked = std::move(asked);
             item->asked_count = found.size();
             item->status = Status::paused;
@@ -3115,9 +3193,13 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             return;
         }
         if (!found.empty()) {
-            std::lock_guard lock(mutex_);
-            folder::apply(choice, found, folder::local_dir(item->dest, item->path), item->tree);
-            folder_totals(*item);
+            {
+                std::lock_guard lock(mutex_);
+                folder::apply(choice, found, folder::local_dir(item->dest, item->path), item->tree);
+                refresh_folder(*item);
+                item->touched = true;
+            }
+            if (choice == existing::Choice::keep_both) new_names(*item); // second-copy names
         }
         job.existing = choice;
     }
@@ -3136,7 +3218,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             auto text = space::shortage(space::drive_of(item->dest), needed, *free);
             text[0] = 'N';
             std::lock_guard lock(mutex_);
-            folder_totals(*item);
+            refresh_folder(*item);
             item->status = Status::paused;
             item->space_ok = true;
             item->waiting = text + ". Free some space and Resume, or Resume to download anyway.";
@@ -3163,7 +3245,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             item->verify_total = 0;
         }
         if (any) {
-            post_queue();
+            dirty_ = true;
             const auto checked = folder::verify_files(job, item->tree, mutex_, verify_request(*ctx, item, job.pool), item_stop);
             {
                 std::lock_guard lock(mutex_);
@@ -3177,7 +3259,8 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     bool cancelled = false;
     {
         std::lock_guard lock(mutex_);
-        folder_totals(*item);
+        refresh_folder(*item);
+        item->touched = true;
         if (item_stop.stop_requested()) {
             cancelled = item->stop_reason == StopReason::cancel;
             item->status = cancelled ? Status::cancelled : Status::paused;
@@ -3190,7 +3273,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             if (!checked_note.empty()) item->note = checked_note;
         }
         // Folders inside it the server wouldn't list: the rest comes, and the row's message says
-        // what's missing (queue_snapshot, "unreadable").
+        // what's missing (queue_item, "unreadable").
     }
     if (cancelled) {
         std::lock_guard lock(mutex_);
@@ -3198,93 +3281,58 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     }
 }
 
-json::Value App::queue_snapshot() const {
-    Value list = Value::make_array();
-    int waiting_position = 0;
-    for (const auto& i : items_) {
-        Value v = Value::make_object();
-        v.set("id", num(i->id));
-        v.set("remote", str(i->remote));
-        v.set("mode", str(i->mode == Mode::folder ? "folder" : "file"));
-        v.set("path", str(i->path));
-        v.set("name", str(i->name));
-        v.set("dest", str(util::path_to_utf8(i->dest)));
-        v.set("local", str(util::path_to_utf8(item_target(*i)))); // where it lands
-        v.set("status", str(status_name(static_cast<int>(i->status))));
-        if (!i->asked.empty()) v.set("ask", asked_json(i->asked, i->asked_count));
-        v.set("bytes", num(static_cast<double>(i->bytes)));
-        v.set("total", num(static_cast<double>(i->total)));
-        v.set("speed", num(i->speed));
-        v.set("eta", i->eta ? num(*i->eta) : Value{});
-        v.set("current", str(i->current));
-        v.set("error", str(i->error));
-        v.set("note", str(i->note));
-        if (!i->waiting.empty()) v.set("waiting", str(i->waiting)); // why it waits paused: a message row
-        v.set("connections", num(i->connections));
-        // Listing, checking or verifying, while running (DOWNLOADS-UI.md 5.3), and the ✓ or ⚠ after a check.
-        const char* phase = i->status == Status::running ? phase_name(static_cast<int>(i->phase)) : nullptr;
-        if (phase != nullptr) v.set("phase", str(phase));
-        if (i->check != verify::Mark::none) v.set("check", str(i->check == verify::Mark::ok ? "ok" : "warn"));
-        // A folder's files checked so far: "Verifying 12/40".
-        if (i->phase == Phase::verifying && i->mode == Mode::folder && i->verify_total > 0) {
-            Value checked = Value::make_object();
-            checked.set("done", num(static_cast<double>(i->verify_done)));
-            checked.set("total", num(static_cast<double>(i->verify_total)));
-            v.set("verified", std::move(checked));
-        }
-        v.set("priority", str(priority_name(i->weight.load())));
-        if (i->status == Status::queued) v.set("position", num(++waiting_position)); // "Queued · #2"
-        if (i->mode == Mode::folder && i->tree.listed) {
-            // Counts for the folder row, and a bounded list of files for the tree: every
-            // active one plus the next few queued, so a 5000-file folder stays cheap to send.
-            const auto& tree_files = i->tree.files;
-            std::vector<folder::State> states;
-            states.reserve(tree_files.size());
-            int counts[6] = {}; // by folder::State
-            for (const auto& c : tree_files) {
-                states.push_back(c.status);
-                ++counts[static_cast<int>(c.status)];
-            }
-            auto count = [&](folder::State s) { return num(counts[static_cast<int>(s)]); };
-            Value files = Value::make_object();
-            files.set("total", num(static_cast<double>(tree_files.size())));
-            files.set("queued", count(folder::State::queued));
-            files.set("running", count(folder::State::running));
-            files.set("paused", count(folder::State::paused));
-            files.set("done", count(folder::State::done));
-            files.set("failed", count(folder::State::failed));
-            files.set("skipped", count(folder::State::skipped));
-            v.set("files", std::move(files));
-            // Folders inside it the server wouldn't list, for a message row under it.
-            if (!i->tree.unreadable.empty()) v.set("unreadable", str(folder::unreadable_text(i->tree.unreadable)));
-            constexpr std::size_t queued_shown = 20;
-            Value children = Value::make_array();
-            for (const auto k : folder::visible(states, queued_shown)) {
-                const auto& c = tree_files[k];
-                Value cv = Value::make_object();
-                cv.set("path", str(c.path));
-                cv.set("local", str(util::path_to_utf8(c.local.empty() ? local::relative(c.path) : c.local)));
-                // A name grab gave it: Keep both, or another file of the folder has its own (G25).
-                if (!c.local.empty()) cv.set("savedAs", str(util::path_to_utf8(c.local.filename())));
-                cv.set("status", str(file_state_name(c.status)));
-                cv.set("bytes", num(static_cast<double>(c.bytes)));
-                cv.set("size", num(static_cast<double>(c.size)));
-                cv.set("speed", num(c.speed));
-                cv.set("eta", c.eta ? num(*c.eta) : Value{});
-                cv.set("error", str(c.error));
-                children.push(std::move(cv));
-            }
-            v.set("children", std::move(children));
-            const auto queued = static_cast<std::size_t>(counts[static_cast<int>(folder::State::queued)]);
-            v.set("moreQueued", num(static_cast<double>(queued > queued_shown ? queued - queued_shown : 0)));
-        }
-        list.push(std::move(v));
+json::Value App::queue_item(const Item& i, int position) const {
+    Value v = Value::make_object();
+    v.set("id", num(i.id));
+    v.set("remote", str(i.remote));
+    v.set("mode", str(i.mode == Mode::folder ? "folder" : "file"));
+    v.set("path", str(i.path));
+    v.set("name", str(i.name));
+    v.set("dest", str(util::path_to_utf8(i.dest)));
+    v.set("local", str(util::path_to_utf8(item_target(i)))); // where it lands
+    v.set("status", str(status_name(static_cast<int>(i.status))));
+    if (!i.asked.empty()) v.set("ask", asked_json(i.asked, i.asked_count));
+    v.set("bytes", num(static_cast<double>(i.bytes)));
+    v.set("total", num(static_cast<double>(i.total)));
+    v.set("speed", num(i.speed));
+    v.set("eta", i.eta ? num(*i.eta) : Value{});
+    v.set("current", str(i.current));
+    v.set("error", str(i.error));
+    v.set("note", str(i.note));
+    if (!i.waiting.empty()) v.set("waiting", str(i.waiting)); // why it waits paused: a message row
+    v.set("connections", num(i.connections));
+    // Listing, checking or verifying, while running (DOWNLOADS-UI.md 5.3), and the ✓ or ⚠ after a check.
+    const char* phase = i.status == Status::running ? phase_name(static_cast<int>(i.phase)) : nullptr;
+    if (phase != nullptr) v.set("phase", str(phase));
+    if (i.check != verify::Mark::none) v.set("check", str(i.check == verify::Mark::ok ? "ok" : "warn"));
+    // A folder's files checked so far: "Verifying 12/40".
+    if (i.phase == Phase::verifying && i.mode == Mode::folder && i.verify_total > 0) {
+        Value checked = Value::make_object();
+        checked.set("done", num(static_cast<double>(i.verify_done)));
+        checked.set("total", num(static_cast<double>(i.verify_total)));
+        v.set("verified", std::move(checked));
     }
-    Value msg = Value::make_object();
-    msg.set("type", str("queue"));
-    msg.set("items", std::move(list));
-    msg.set("parallel", num(parallel_));
-    return msg;
+    v.set("priority", str(priority_name(i.weight.load())));
+    if (position > 0) v.set("position", num(position)); // "Queued #2"
+    if (i.mode == Mode::folder && i.tree.listed) {
+        // Its files by state, for the folder's row, as the last pass over them counted; the files
+        // themselves come by "watchFiles", of generation `gen` (DOWNLOADS-UI.md 6.3).
+        auto count = [&](folder::State s) { return num(static_cast<double>(i.counts[static_cast<std::size_t>(s)])); };
+        Value files = Value::make_object();
+        files.set("total", num(static_cast<double>(i.tree.files.size())));
+        files.set("queued", count(folder::State::queued));
+        files.set("running", count(folder::State::running));
+        files.set("paused", count(folder::State::paused));
+        files.set("done", count(folder::State::done));
+        files.set("failed", count(folder::State::failed));
+        files.set("skipped", count(folder::State::skipped));
+        v.set("files", std::move(files));
+        if (i.gen != 0) v.set("gen", num(i.gen));
+        // Folders inside it the server wouldn't list, for a message row under it.
+        if (!i.tree.unreadable.empty()) v.set("unreadable", str(folder::unreadable_text(i.tree.unreadable)));
+    }
+    if (i.expanded) v.set("expanded", Value::make_bool(*i.expanded)); // the user's ▸/▾
+    return v;
 }
 
 // Unfinished downloads from the last run come back paused, with their progress.
@@ -3308,6 +3356,7 @@ void App::restore_queue() {
         item->space_ok = saved.space_ok;
         item->existing = existing::parse(saved.existing).value_or(existing::Choice::ask);
         item->local_name = util::path_from_utf8(saved.local_name);
+        item->expanded = saved.expanded;
         // Saved for an update's restart while running or queued: it goes on by itself.
         item->status = saved.resume ? Status::queued : Status::paused;
         item->weight = weight_of(saved.priority);
@@ -3323,7 +3372,13 @@ void App::restore_queue() {
                 c.status = f.state == "done"      ? folder::State::done
                            : f.state == "skipped" ? folder::State::skipped
                            : f.state == "paused"  ? folder::State::paused
+                           : f.state == "failed"  ? folder::State::failed
                                                   : folder::State::queued;
+                // A failed file shows with its error until the folder runs again (retry_failed).
+                if (c.status == folder::State::failed) {
+                    c.error = f.error;
+                    item->retry_failed = true;
+                }
                 c.fetched = f.fetched;
                 c.verified = f.verified;
                 if (!f.local.empty()) {
@@ -3340,19 +3395,107 @@ void App::restore_queue() {
                 item->tree.files.push_back(std::move(c));
             }
             item->tree.listed = true;
-            folder_totals(*item);
+            refresh_folder(*item);
+            item->names = std::make_shared<const queue_view::Names>(queue_view::names_of(item->tree.files));
+            item->gen = next_gen_++;
         }
         items_.push_back(std::move(item));
     }
 }
 
+namespace {
+
+// A folder's files as queue.json keeps them, copied under the queue's lock in a compact form: each
+// file's state and flags in two bytes and every time in one string; the names come from the
+// immutable queue_view::Names, copied here only for a folder listed a moment ago without them.
+struct SavedFiles {
+    std::shared_ptr<const queue_view::Names> names;
+    std::vector<std::string> paths;                                     // without names
+    std::vector<std::pair<std::size_t, std::filesystem::path>> locals; // without names, by index
+    std::vector<std::uint64_t> sizes;
+    std::vector<folder::State> states;
+    std::vector<std::uint8_t> flags; // 1: fetched, 2: verified (done files)
+    std::string times;
+    std::vector<std::size_t> time_ends;
+    std::vector<std::pair<std::size_t, std::string>> errors; // by index
+};
+
+SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_ptr<const queue_view::Names>& names) {
+    SavedFiles s;
+    const auto n = files.size();
+    if (names && names->path.size() == n) {
+        s.names = names;
+    } else {
+        s.paths.reserve(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            s.paths.push_back(files[k].path);
+            if (!files[k].local.empty()) s.locals.emplace_back(k, files[k].local);
+        }
+    }
+    s.sizes.reserve(n);
+    s.states.reserve(n);
+    s.flags.reserve(n);
+    s.time_ends.reserve(n);
+    s.times.reserve(n * 25);
+    for (std::size_t k = 0; k < n; ++k) {
+        const auto& c = files[k];
+        const bool done = c.status == folder::State::done;
+        s.sizes.push_back(c.size);
+        s.states.push_back(c.status);
+        s.flags.push_back(static_cast<std::uint8_t>((done && c.fetched ? 1 : 0) | (done && c.verified ? 2 : 0)));
+        s.times += c.modtime;
+        s.time_ends.push_back(s.times.size());
+        if (c.status == folder::State::failed) s.errors.emplace_back(k, c.error);
+    }
+    return s;
+}
+
+std::vector<SavedFile> saved_files(const SavedFiles& s) {
+    std::vector<SavedFile> out;
+    out.reserve(s.states.size());
+    std::size_t time_at = 0;
+    auto local = s.locals.begin(); // both by index
+    auto error = s.errors.begin();
+    for (std::size_t k = 0; k < s.states.size(); ++k) {
+        SavedFile f;
+        f.path = s.names ? s.names->path[k] : s.paths[k];
+        f.size = s.sizes[k];
+        f.modtime = s.times.substr(time_at, s.time_ends[k] - time_at);
+        time_at = s.time_ends[k];
+        switch (s.states[k]) {
+        case folder::State::done: f.state = "done"; break;
+        case folder::State::skipped: f.state = "skipped"; break;
+        case folder::State::paused: f.state = "paused"; break;
+        case folder::State::failed: f.state = "failed"; break;
+        case folder::State::queued:
+        case folder::State::running: f.state = "queued"; break; // a running one goes on from its partial file
+        }
+        f.fetched = (s.flags[k] & 1) != 0;
+        f.verified = (s.flags[k] & 2) != 0;
+        if (s.names) {
+            if (const auto it = s.names->local.find(k); it != s.names->local.end()) f.local = util::path_to_utf8(it->second);
+        } else if (local != s.locals.end() && local->first == k) {
+            f.local = util::path_to_utf8((local++)->second);
+        }
+        if (error != s.errors.end() && error->first == k) f.error = (error++)->second;
+        out.push_back(std::move(f));
+    }
+    return out;
+}
+
+} // namespace
+
 void App::save_queue() const {
     // The snapshot is taken under the file's lock too, so two savers can't write in the opposite
     // order of their snapshots and leave an older queue on disk (review G53).
     std::lock_guard file_lock(queue_file_mutex_);
+    const auto started = std::chrono::steady_clock::now();
     std::vector<SavedDownload> unfinished;
+    std::vector<SavedFiles> files; // by unfinished's index
+    double held = 0;
     {
         std::lock_guard lock(mutex_);
+        const auto locked = std::chrono::steady_clock::now();
         for (const auto& i : items_) {
             if (i->status == Status::done || i->status == Status::cancelled) continue;
             SavedDownload d{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path, i->name,
@@ -3361,24 +3504,21 @@ void App::save_queue() const {
             d.space_ok = i->space_ok;
             if (i->existing != existing::Choice::ask) d.existing = std::string(existing::name(i->existing));
             d.local_name = util::path_to_utf8(i->local_name);
-            for (const auto& c : i->tree.files) {
-                const char* state = c.status == folder::State::done      ? "done"
-                                    : c.status == folder::State::skipped ? "skipped"
-                                    : c.status == folder::State::paused  ? "paused"
-                                                                         : "queued"; // running and failed retry
-                const bool done = c.status == folder::State::done;
-                d.files.push_back(SavedFile{c.path, c.size, c.modtime, state, done && c.fetched, done && c.verified,
-                                            util::path_to_utf8(c.local)});
-            }
+            d.expanded = i->expanded;
+            files.push_back(copy_files(i->tree.files, i->names));
             unfinished.push_back(std::move(d));
         }
+        held = ms_since(locked);
     }
+    for (std::size_t k = 0; k < unfinished.size(); ++k) unfinished[k].files = saved_files(files[k]);
     std::error_code ec;
     if (unfinished.empty()) {
         std::filesystem::remove(queue_path_, ec);
         return;
     }
-    report_save("the download queue", util::write_file_atomic(queue_path_, queue_to_json(unfinished)), queue_unsaved_);
+    const auto text = queue_to_json(unfinished);
+    report_save("the download queue", util::write_file_atomic(queue_path_, text), queue_unsaved_);
+    if (test_logging()) test_log(std::format("save lock={:.2f}ms total={:.0f}ms bytes={}", held, ms_since(started), text.size()));
 }
 
 // ---- updates ------------------------------------------------------------------------------
@@ -3594,13 +3734,328 @@ void App::open_release_page() const {
     ShellExecuteW(host_.hwnd, L"open", util::to_wide(update_.page).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-void App::post_queue() {
-    std::string text;
+// ---- the page's view of the queue (DOWNLOADS-UI.md 6) -------------------------------------------
+
+void App::post_ui(std::string text) const {
+    assert(GetCurrentThreadId() == ui_thread_ && "the queue's messages go from the UI thread");
+    host_.post(std::move(text));
+}
+
+void App::flush() {
+    if (!page_ready_) return; // its init asks for everything
+    const bool full = std::exchange(queue_changed_, false);
+    if (!dirty_.exchange(false) && !full) return;
+    struct Delta {
+        int id = 0;
+        int gen = 0;
+        std::vector<queue_view::Row> rows;
+    };
+    std::vector<std::pair<int, Value>> rows;
+    std::vector<Delta> deltas;
+    std::vector<int> fresh; // shown folders with new names: their files go again
+    std::size_t passed = 0; // files gone over
+    int parallel = 0;
+    double held = 0;
     {
         std::lock_guard lock(mutex_);
-        text = json::stringify(queue_snapshot());
+        const auto locked = std::chrono::steady_clock::now();
+        int waiting = 0;
+        for (const auto& i : items_) {
+            const bool touched = i->touched.exchange(false);
+            const auto w = watches_.find(i->id);
+            Watch* watch = w == watches_.end() ? nullptr : &w->second;
+            // Changes made while its chunks went had no shadow to diff against: they go now.
+            const bool catch_up = watch != nullptr && !watch->send && std::exchange(watch->catch_up, false);
+            if (i->mode == Mode::folder && i->tree.listed &&
+                (full || touched || catch_up || i->status == Status::running)) {
+                // The folder's totals and counts, and the shown files that changed, in one pass.
+                const bool diff = watch != nullptr && !watch->send && watch->gen != 0 && watch->gen == i->gen;
+                auto p = refresh_folder(*i, diff ? &watch->shadow : nullptr);
+                passed += i->tree.files.size();
+                if (!p.changed.empty()) deltas.push_back({i->id, i->gen, std::move(p.changed)});
+            }
+            if (watch != nullptr && !watch->send && i->names && i->gen != 0 && watch->gen != i->gen) fresh.push_back(i->id);
+            rows.emplace_back(i->id, queue_item(*i, i->status == Status::queued ? ++waiting : 0));
+        }
+        parallel = parallel_;
+        held = ms_since(locked);
     }
-    host_.post(std::move(text));
+    // The downloads: all of them when they came, went or moved, else the rows that changed.
+    std::vector<std::pair<int, std::string>> texts;
+    texts.reserve(rows.size());
+    for (const auto& [id, v] : rows) texts.emplace_back(id, json::stringify(v));
+    const auto changed = queue_view::changed_items(item_sent_, texts);
+    std::size_t queue_bytes = 0;
+    if (full || !changed.empty() || parallel != parallel_sent_) {
+        std::string text = full ? R"({"type":"queue","items":[)" : R"({"type":"queueDelta","items":[)";
+        bool first = true;
+        auto add = [&](const std::string& t) {
+            if (!first) text += ',';
+            first = false;
+            text += t;
+        };
+        if (full) {
+            for (const auto& t : texts) add(t.second);
+        } else {
+            for (const auto k : changed) add(texts[k].second);
+        }
+        text += std::format(R"(],"parallel":{}}})", parallel);
+        parallel_sent_ = parallel;
+        queue_bytes = text.size();
+        post_ui(std::move(text));
+    }
+    std::size_t delta_rows = 0;
+    std::size_t delta_bytes = 0;
+    for (const auto& d : deltas) {
+        auto text = queue_view::file_delta_message(d.id, d.gen, d.rows);
+        delta_rows += d.rows.size();
+        delta_bytes += text.size();
+        post_ui(std::move(text));
+    }
+    for (const int id : fresh) start_files(id);
+    if (test_logging() && (queue_bytes > 0 || delta_bytes > 0)) {
+        test_log(std::format("flush lock={:.2f}ms files={} {}={}B fileDelta={} rows {}B", held, passed,
+                             full ? "queue" : "queueDelta", queue_bytes, delta_rows, delta_bytes));
+    }
+}
+
+void App::watch_files(int id) {
+    watches_[id] = Watch{}; // again after a fold or a reload: the whole list
+    start_files(id);
+}
+
+// The first answer: every file as it is now, copied in a compact form under the lock, then sent
+// in chunks. A folder not listed yet sends when it is (flush).
+void App::start_files(int id) {
+    const auto w = watches_.find(id);
+    if (w == watches_.end()) return;
+    auto send = std::make_shared<FilesSend>();
+    double held = 0;
+    {
+        std::lock_guard lock(mutex_);
+        const auto locked = std::chrono::steady_clock::now();
+        const auto it = std::ranges::find(items_, id, [](const auto& i) { return i->id; });
+        if (it == items_.end()) return;
+        const Item& item = **it;
+        if (!item.tree.listed || !item.names || item.gen == 0 || item.names->path.size() != item.tree.files.size()) return;
+        send->names = item.names;
+        send->gen = item.gen;
+        send->snap = queue_view::snapshot(item.tree.files);
+        held = ms_since(locked);
+    }
+    if (test_logging()) test_log(std::format("first answer lock={:.2f}ms files={}", held, send->snap.rows.size()));
+    w->second.gen = send->gen;
+    w->second.shadow.clear();
+    w->second.send = send;
+    send_files_chunk(id, send);
+}
+
+// One chunk, the next on the next turn of the message loop, so input keeps flowing; once all went,
+// the deltas go on from what was sent.
+void App::send_files_chunk(int id, const std::shared_ptr<FilesSend>& send) {
+    const auto w = watches_.find(id);
+    if (w == watches_.end() || w->second.send != send) return; // folded, reloaded or sent again since
+    post_ui(queue_view::files_message(id, send->gen, send->next, files_chunk, *send->names, send->snap));
+    send->next += files_chunk;
+    if (send->next < send->snap.rows.size()) {
+        host_.defer([this, id, send] { send_files_chunk(id, send); });
+        return;
+    }
+    w->second.shadow = std::move(send->snap.rows);
+    w->second.send.reset();
+    // The snapshot may be older than the files now (an action, a run's end, a new gen while the
+    // chunks went): the next flush compares them.
+    w->second.catch_up = true;
+    dirty_ = true;
+}
+
+// One batch of skips at a time. Where the folder's files land is worked out once for the batch,
+// so no partial download deleted takes one. A stop does what was asked for, then ends.
+void App::run_discards(const std::stop_token& stop) {
+    for (;;) {
+        DiscardJob job;
+        {
+            std::unique_lock lock(discard_mutex_);
+            discard_wake_.wait(lock, stop, [&] { return !discard_jobs_.empty(); });
+            if (discard_jobs_.empty()) return;
+            job = std::move(discard_jobs_.front());
+            discard_jobs_.pop_front();
+        }
+        const auto reserved = queue_view::reserved_names(job.dir, *job.names);
+        for (const auto& d : job.discard) fetch::discard(d.target, d.remote_path, reserved, job.rclone_remote);
+    }
+}
+
+void App::request_save(bool now) {
+    {
+        std::lock_guard lock(save_mutex_);
+        save_wanted_ = true;
+        save_now_ = save_now_ || now;
+    }
+    save_wake_.notify_all();
+}
+
+// The saver: a save asked for waits until queue_save_gap after the last one ended, or ten times
+// what that one took when that is longer (a 177,000-file folder's queue.json is about 20 MB). An
+// urgent one (a download ended) skips the queue_save_gap floor but keeps the ten times, so many
+// small downloads ending don't each write a big queue.json. A stop saves what was asked for at
+// once, then ends.
+void App::run_saves(const std::stop_token& stop) {
+    for (;;) {
+        {
+            std::unique_lock lock(save_mutex_);
+            save_wake_.wait(lock, stop, [&] { return save_wanted_; });
+            if (!save_wanted_) return;
+            // Woken again when an urgent request comes during the wait: its time is earlier.
+            while (!stop.stop_requested()) {
+                const auto at = save_now_ ? next_urgent_save_ : next_save_;
+                const bool urgent = save_now_;
+                if (save_wake_.wait_until(lock, stop, at, [&] { return save_now_ != urgent; })) continue;
+                break;
+            }
+            save_wanted_ = false;
+            save_now_ = false;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        save_queue();
+        const auto ended = std::chrono::steady_clock::now();
+        const auto took = ended - started;
+        std::lock_guard lock(save_mutex_);
+        next_save_ = ended + std::max<std::chrono::steady_clock::duration>(queue_save_gap, 10 * took);
+        next_urgent_save_ = ended + 10 * took;
+    }
+}
+
+bool App::test_logging() {
+#ifndef NDEBUG
+    static const bool on = !util::getenv_utf8("GRAB_TEST_FLUSH_LOG").value_or("").empty();
+    return on;
+#else
+    return false;
+#endif
+}
+
+void App::test_log([[maybe_unused]] const std::string& line) {
+#ifndef NDEBUG
+    static std::mutex m;
+    static const auto path = util::path_from_utf8(util::getenv_utf8("GRAB_TEST_FLUSH_LOG").value_or(""));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    std::lock_guard lock(m);
+    std::ofstream out(path, std::ios::app | std::ios::binary);
+    out << ms << ' ' << line << '\n';
+#endif
+}
+
+// Debug builds: a folder of `files` made-up files downloaded without a server or disk writes
+// (run_fake), for the window's performance checks (DOWNLOADS-UI.md 14, C). One in 25 is a big
+// file of 32 MiB, the others from 4 KiB to 1 MiB, a thousand to a folder. Saved in queue.json
+// like any folder, so its size and saves can be measured; after a restart it is an ordinary
+// paused folder of a server "test" that doesn't exist.
+void App::add_fake_folder(std::size_t files) {
+    auto item = std::make_shared<Item>();
+    item->id = next_id_++;
+    item->remote = "test";
+    item->mode = Mode::folder;
+    item->path = "/fake/synthetic";
+    item->name = "synthetic";
+    std::error_code ec;
+    item->dest = std::filesystem::temp_directory_path(ec);
+    item->fake = true;
+    item->space_ok = true;
+    item->tree.files.reserve(files);
+    for (std::size_t k = 0; k < files; ++k) {
+        const std::uint64_t size = k % 25 == 7 ? std::uint64_t{32} << 20 : 4096 + (k * 7919) % (std::uint64_t{1} << 20);
+        item->tree.files.push_back(folder::make_file(std::format("dir{:03}/file{:06}.bin", k / 1000, k), size, "2026-01-01T00:00:00Z"));
+    }
+    item->tree.listed = true;
+    refresh_folder(*item);
+    item->names = std::make_shared<const queue_view::Names>(queue_view::names_of(item->tree.files));
+    item->gen = next_gen_++;
+    items_.push_back(std::move(item));
+}
+
+// GRAB_TEST_FAKE_FOLDER's download: every 100 ms 30 small files land (300 a second) and up to 8
+// big files move on at 4 MiB/s each, until all are done or it is stopped. Pause and Skip of a
+// file act as on a real one.
+void App::run_fake(Item& item, const std::stop_token& stop) {
+    constexpr auto tick = std::chrono::milliseconds(100);
+    constexpr double big_speed = 4.0 * 1024 * 1024;
+    constexpr std::size_t landing = 30;
+    constexpr std::size_t big_at_once = 8;
+    std::vector<std::size_t> running; // big files
+    std::size_t small_at = 0;
+    std::size_t big_at = 0;
+    std::mutex wait_m;
+    std::condition_variable_any wait_cv;
+    {
+        std::lock_guard lock(mutex_);
+        item.phase = Phase::none;
+    }
+    for (bool left = true; left && !stop.stop_requested();) {
+        {
+            std::lock_guard lock(mutex_);
+            auto& files = item.tree.files;
+            std::erase_if(running, [&](std::size_t k) {
+                auto& f = files[k];
+                if (f.status != folder::State::running) return true;
+                if (f.stop_reason != folder::StopReason::none) { // paused or skipped
+                    f.status = f.stop_reason == folder::StopReason::pause ? folder::State::paused : folder::State::skipped;
+                    f.stop_reason = folder::StopReason::none;
+                    f.speed = 0;
+                    f.eta.reset();
+                    return true;
+                }
+                f.bytes = std::min(f.size, f.bytes + static_cast<std::uint64_t>(big_speed / 10));
+                f.speed = big_speed;
+                f.eta = static_cast<double>(f.size - f.bytes) / big_speed;
+                if (f.bytes < f.size) return false;
+                f.status = folder::State::done;
+                f.fetched = true;
+                f.speed = 0;
+                f.eta.reset();
+                return true;
+            });
+            for (; big_at < files.size() && running.size() < big_at_once; ++big_at) {
+                auto& f = files[big_at];
+                if (!f.big || f.status != folder::State::queued) continue;
+                f.status = folder::State::running;
+                f.stop = std::stop_source{};
+                f.stop_reason = folder::StopReason::none;
+                running.push_back(big_at);
+            }
+            for (std::size_t landed = 0; small_at < files.size() && landed < landing; ++small_at) {
+                auto& f = files[small_at];
+                if (f.big || f.status != folder::State::queued) continue;
+                f.status = folder::State::done;
+                f.bytes = f.size;
+                f.fetched = true;
+                ++landed;
+            }
+            item.tree.files_at_once = static_cast<int>(running.size());
+            left = !running.empty() || small_at < files.size() || big_at < files.size();
+        }
+        item.touched = true;
+        dirty_ = true;
+        std::unique_lock lock(wait_m);
+        wait_cv.wait_for(lock, stop, tick, [] { return false; });
+    }
+    std::lock_guard lock(mutex_);
+    for (auto& f : item.tree.files) {
+        if (f.status != folder::State::running) continue;
+        f.status = folder::State::queued;
+        f.speed = 0;
+        f.eta.reset();
+    }
+    item.tree.files_at_once = 0;
+    if (stop.stop_requested()) item.status = item.stop_reason == StopReason::cancel ? Status::cancelled : Status::paused;
+    else item.status = folder::outcome(item.tree).waiting > 0 ? Status::paused : Status::done;
+    refresh_folder(item);
+    item.speed = 0;
+    item.eta.reset();
+    item.touched = true;
+    dirty_ = true;
 }
 
 } // namespace grab::gui

@@ -90,10 +90,13 @@ struct Totals {
 };
 [[nodiscard]] Totals totals(const Tree& tree);
 
-// Actions on single files, under the caller's mutex.
-void pause_file(Tree& tree, const std::string& path);
-void resume_file(Tree& tree, const std::string& path);
-void resume_paused(Tree& tree); // every paused file
+// Actions on single files, by their index in Tree::files (the page's rows), under the caller's
+// mutex. Each says whether it changed anything; an index past the files does nothing.
+bool pause_file(Tree& tree, std::size_t index);
+bool resume_file(Tree& tree, std::size_t index); // a file paused by itself
+void resume_paused(Tree& tree);                  // every paused file
+// A failed file is queued again, its error gone.
+bool retry_file(Tree& tree, std::size_t index);
 // A big file's partial download to delete once the caller's mutex is released: fetch::discard
 // with these.
 struct Discard {
@@ -104,9 +107,11 @@ struct Discard {
 // Where the folder's files land (dir: its local directory), which no partial download may take.
 // Under the caller's mutex.
 [[nodiscard]] fetch::Reserved reserved_names(const std::filesystem::path& dir, const Tree& tree);
-// `remote_path`: the folder's. Returns the partial download to delete after unlocking, if any.
+// `remote_path`: the folder's. Returns the partial download to delete after unlocking, if any,
+// without its `reserved`: a batch of skips builds those once, outside the lock
+// (queue_view::reserved_names). `skipped`: whether it changed anything.
 std::optional<Discard> skip_file(Tree& tree, const std::filesystem::path& dir, const std::string& remote_path,
-                                 const std::string& path);
+                                 std::size_t index, bool* skipped = nullptr);
 // Failed files are queued again; with `all_unfinished` (after a cancel) every file not done or
 // skipped.
 void retry_files(Tree& tree, bool all_unfinished);
