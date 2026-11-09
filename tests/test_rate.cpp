@@ -4,10 +4,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <stop_token>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace grab;
 using namespace std::chrono_literals;
@@ -162,8 +165,8 @@ TEST_CASE("fair queuing serves busy flows in proportion to their weights") {
     CHECK(switches >= 19);
 }
 
-TEST_CASE("a folder's files are flows whose weights add up to the folder's: its share stays") {
-    // A normal folder (2) with a High and a Low file running (2 × 4/5, 2 × 1/5) against a normal
+TEST_CASE("a folder's files share its turns by their parts: its share stays") {
+    // A normal folder (2) with a High and a Low file running (parts 4 and 1) against a normal
     // download (2), all busy.
     const auto high = rate::flow_of(7, 1);
     const auto low = rate::flow_of(7, 2);
@@ -172,23 +175,76 @@ TEST_CASE("a folder's files are flows whose weights add up to the folder's: its 
     CHECK(rate::flow_of(-5, 3) != rate::flow_of(5, 3)); // a listing's negative id is its own
     CHECK(rate::flow_of(1, 0) == (std::uint64_t{1} << 32));
     rate::FairQueue q;
-    const std::map<std::uint64_t, double> weight{{high, 2.0 * 4 / 5}, {low, 2.0 * 1 / 5}, {other, 2.0}};
-    for (const auto& [flow, w] : weight) q.add(flow, 64 * KiB, w);
+    const std::map<std::uint64_t, double> part{{high, 4}, {low, 1}, {other, 0}};
+    for (const auto& [flow, p] : part) q.add(flow, 64 * KiB, 2, p);
     std::map<std::uint64_t, int> served;
     for (int i = 0; i < 1000; ++i) {
         const auto head = q.head();
         q.serve(head);
         ++served[head.flow];
-        q.add(head.flow, 64 * KiB, weight.at(head.flow));
+        q.add(head.flow, 64 * KiB, 2, part.at(head.flow));
     }
     CHECK(static_cast<double>(served[high] + served[low]) / served[other] == doctest::Approx(1.0).epsilon(0.05));
     CHECK(static_cast<double>(served[high]) / served[low] == doctest::Approx(4.0).epsilon(0.1));
+    // A folder's file alone takes all of the folder's turns, as many files do: no more.
+    rate::FairQueue alone;
+    alone.add(high, 64 * KiB, 2, 4);
+    alone.add(other, 64 * KiB, 2);
+    int folder_turns = 0;
+    for (int i = 0; i < 1000; ++i) {
+        const auto head = alone.head();
+        alone.serve(head);
+        folder_turns += head.flow == high ? 1 : 0;
+        alone.add(head.flow, 64 * KiB, 2, head.flow == high ? 4 : 0);
+    }
+    CHECK(folder_turns == doctest::Approx(500).epsilon(0.02));
     // Weights below 1 are kept as they are; none or a negative one counts as 1.
     rate::FairQueue tiny;
     CHECK(tiny.add(1, 100, 0.25).start == 0);
     CHECK(tiny.add(1, 100, 0.25).start == doctest::Approx(400));
     CHECK(tiny.add(2, 100, -3).start == 0);
     CHECK(tiny.add(2, 100, 0).start == doctest::Approx(100));
+}
+
+TEST_CASE("a folder's files starting one after another don't give it more than its share") {
+    // As in a folder beside a download under a limit that starts empty: the download's four streams
+    // put a request each in line at once, then the folder's files come one by one as they log in (a
+    // High one, a Normal one, two small workers), and every stream puts its next request in line as
+    // its last is served. With each file a flow of its own at its part of the folder's weight among
+    // those reading when it asked, the first file's requests kept the whole folder's weight beside
+    // the later ones' and the folder took 0.56 of the first 4 MiB (0.6 of a share test's first half
+    // second under load).
+    const auto single = rate::flow_of(8);
+    const std::vector<std::pair<std::uint64_t, double>> files{{rate::flow_of(7, 1), 4},
+                                                              {rate::flow_of(7, 2), 2},
+                                                              {rate::flow_of(7, 0x80000000), 2},
+                                                              {rate::flow_of(7, 0x80000001), 2}};
+    rate::FairQueue q;
+    for (int i = 0; i < 4; ++i) q.add(single, 64 * KiB, 2);
+    std::map<std::uint64_t, double> part{{single, 0}};
+    std::uint64_t folder = 0;
+    std::uint64_t all = 0;
+    double early = 0;
+    for (std::size_t i = 0; all < 32 * MiB; ++i) {
+        if (i % 2 == 0 && i / 2 < files.size()) { // one more file every other turn
+            const auto [flow, p] = files[i / 2];
+            part[flow] = p;
+            q.add(flow, 128 * KiB, 2, p);
+        }
+        const auto head = q.head();
+        q.serve(head);
+        all += head.n;
+        if (head.flow != single) folder += head.n;
+        q.add(head.flow, head.n, 2, part.at(head.flow));
+        if (early == 0 && all >= 4 * MiB) early = static_cast<double>(folder) / static_cast<double>(all);
+    }
+    const double late = static_cast<double>(folder) / static_cast<double>(all);
+    MESSAGE("the folder's share of the first 4 MiB ", early, ", of 32 MiB ", late);
+    // Plain bounds: Approx's epsilon is relative to 1 + the value, so 0.04 would let 0.56 through.
+    CHECK(early > 0.48);
+    CHECK(early < 0.52);
+    CHECK(late > 0.495);
+    CHECK(late < 0.505);
 }
 
 TEST_CASE("a request given up costs its flow nothing") {

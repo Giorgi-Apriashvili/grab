@@ -311,11 +311,11 @@ struct Download {
     // request, so a change applies while running. nullptr = normal.
     const std::atomic<int>* weight = nullptr;
     // Its bytes' flow in the limiter: rate::flow_of(id, member). A folder's file is a member of
-    // the folder's share (member > 0), weighted by `flow_weight`, asked at each limiter request
-    // while a limit is on: its part of the folder's weight, by its priority among the folder's
-    // running files. Unset: member 0, `weight`.
+    // the folder's share (member > 0, `weight` the folder's), taking `flow_part` of the folder's
+    // turns, asked at each limiter request while a limit is on: its priority, against the folder's
+    // other files reading. Unset: member 0, a download of its own.
     std::uint32_t member = 0;
-    std::function<double()> flow_weight;
+    std::function<double()> flow_part;
     // At most this many streams at once, asked as each starts and at each read: a folder's file
     // gets its part of the folder's connections beside its other files downloading (by their
     // priorities; 0 while higher ones take all it has). A stream over it gives its connection up
@@ -323,7 +323,8 @@ struct Download {
     std::function<int()> streams_cap;
     // Told +1 as a stream starts reading on a connection it holds and -1 as it stops, with
     // `all_in` once every byte of the file is in (it is being put in place, not waiting): a folder
-    // counts in the limiter only its files that read, and shows one that doesn't as waiting.
+    // shows a running file that doesn't read as waiting (the limiter sees only the files that ask
+    // it, FairQueue).
     // Called from several threads.
     std::function<void(int delta, bool all_in)> on_reading;
     // Told the bytes of each READ's reply as it comes, from the stream's thread: the window's

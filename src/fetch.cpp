@@ -1016,10 +1016,10 @@ Result run(const Download& d, Connections& connections, const std::function<void
                                 break;
                             }
                             if (in_flight > 0 && bytes_in_flight + n > most) break;
-                            // A folder's file works out its weight under the folder's lock.
+                            // A folder's file asks its part under the folder's lock.
                             place.n = n;
-                            place.ticket = d.limiter->enqueue(
-                                n, rate::flow_of(d.id, d.member), d.flow_weight ? d.flow_weight() : static_cast<double>(weight()));
+                            place.ticket = d.limiter->enqueue(n, rate::flow_of(d.id, d.member), static_cast<double>(weight()),
+                                                              d.flow_part ? d.flow_part() : 0);
                             if (place.ticket == 0) { // unlimited since: seen at the next look
                                 send(next, static_cast<std::uint32_t>(n));
                                 next += n;

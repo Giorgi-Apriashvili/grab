@@ -81,28 +81,63 @@ void TokenBucket::debit(std::uint64_t n, Clock::time_point now) {
 
 // ---- fair queue ------------------------------------------------------------------------------
 
-FairQueue::Ticket FairQueue::add(std::uint64_t flow, std::uint64_t n, double weight) {
-    auto& finish = finish_[flow];
+FairQueue::Ticket FairQueue::add(std::uint64_t flow, std::uint64_t n, double weight, double part) {
+    const auto valid = [](double w) { return w > 0 && std::isfinite(w) ? w : 1.0; };
+    const bool member = part != 0;
+    const std::uint64_t key = member ? flow & ~std::uint64_t{0xFFFFFFFF} : flow; // flow_of(id, 0)
+    Download& d = downloads_[key];
+    d.weight = valid(weight);
+    auto& finish = d.finish_of[flow];
     Ticket t;
-    t.start = std::max(vtime_, finish);
+    t.start = std::max(d.vtime, finish);
     t.seq = seq_++;
     t.flow = flow;
-    finish = t.start + static_cast<double>(n) / (weight > 0 && std::isfinite(weight) ? weight : 1.0);
+    t.n = n;
+    t.download = key;
+    // A download's own flow keeps its weight's tags (the same order, it being alone in it).
+    finish = t.start + static_cast<double>(n) / (member ? valid(part) : d.weight);
     t.finish = finish;
-    pending_.insert(t);
+    if (d.pending.empty()) { // its turn: where its last one finished, or now if it was idle
+        d.start = std::max(vtime_, d.finish);
+        d.order = t.seq;
+        line_.emplace(d.start, d.order, key);
+    }
+    d.pending.insert(t);
     return t;
 }
 
-void FairQueue::serve(const Ticket& t) {
-    pending_.erase(t);
-    vtime_ = std::max(vtime_, t.start);
-    // Flows that have fallen behind the virtual time carry no state worth keeping.
-    std::erase_if(finish_, [&](const auto& f) { return f.second <= vtime_; });
+const FairQueue::Ticket& FairQueue::head() const {
+    return *downloads_.at(std::get<2>(*line_.begin())).pending.begin();
 }
 
-void FairQueue::cancel(const Ticket& t) {
-    if (pending_.erase(t) == 0) return;
-    if (const auto it = finish_.find(t.flow); it != finish_.end() && it->second == t.finish) it->second = t.start;
+void FairQueue::serve(const Ticket& ticket) {
+    const Ticket t = ticket; // may be the head itself, gone below
+    const auto it = downloads_.find(t.download);
+    if (it == downloads_.end() || !it->second.pending.contains(t)) return;
+    Download& d = it->second;
+    line_.erase({d.start, d.order, t.download});
+    d.pending.erase(t);
+    vtime_ = std::max(vtime_, d.start);
+    d.finish = d.start + static_cast<double>(t.n) / d.weight;
+    d.vtime = std::max(d.vtime, t.start);
+    std::erase_if(d.finish_of, [&](const auto& f) { return f.second <= d.vtime; });
+    if (!d.pending.empty()) { // its next turn
+        d.start = d.finish;
+        line_.emplace(d.start, d.order, t.download);
+    }
+    // Downloads with nothing in line that have fallen behind the virtual time carry no state worth
+    // keeping.
+    std::erase_if(downloads_, [&](const auto& e) { return e.second.pending.empty() && e.second.finish <= vtime_; });
+}
+
+void FairQueue::cancel(const Ticket& ticket) {
+    const Ticket t = ticket;
+    const auto it = downloads_.find(t.download);
+    if (it == downloads_.end()) return;
+    Download& d = it->second;
+    if (d.pending.erase(t) == 0) return;
+    if (const auto f = d.finish_of.find(t.flow); f != d.finish_of.end() && f->second == t.finish) f->second = t.start;
+    if (d.pending.empty()) line_.erase({d.start, d.order, t.download}); // its turn unused
 }
 
 // ---- shared limiter --------------------------------------------------------------------------
@@ -167,8 +202,8 @@ std::optional<RateLimiter::Clock::duration> RateLimiter::serve() {
     return wait;
 }
 
-std::uint64_t RateLimiter::enqueue_locked(std::uint64_t n, std::uint64_t flow, double weight) {
-    const auto t = queue_.add(flow, n, weight);
+std::uint64_t RateLimiter::enqueue_locked(std::uint64_t n, std::uint64_t flow, double weight, double part) {
+    const auto t = queue_.add(flow, n, weight, part);
     pending_.emplace(t.seq + 1, Pending{.ticket = t, .n = n});
     return t.seq + 1;
 }
@@ -209,7 +244,7 @@ RateLimiter::Waited RateLimiter::wait_locked(std::unique_lock<std::mutex>& lock,
     }
 }
 
-bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop, std::uint64_t flow, double weight) {
+bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop, std::uint64_t flow, double weight, double part) {
     std::unique_lock lock(mutex_);
     while (n > 0) {
         if (stop.stop_requested()) return false;
@@ -217,7 +252,7 @@ bool RateLimiter::acquire(std::uint64_t n, std::stop_token stop, std::uint64_t f
         const auto piece = std::min<std::uint64_t>(n, static_cast<std::uint64_t>(bucket_.burst()));
         // In line by fair-queuing tag; served once at the head with its tokens there. Given up
         // for a lower rate, it asks again at that one.
-        const auto waited = wait_locked(lock, enqueue_locked(piece, flow, weight), stop, false);
+        const auto waited = wait_locked(lock, enqueue_locked(piece, flow, weight, part), stop, false);
         if (waited == Waited::stopped) return false;
         if (waited == Waited::served) n -= piece;
     }
@@ -229,10 +264,10 @@ void RateLimiter::debit(std::uint64_t n) {
     bucket_.debit(n, Clock::now());
 }
 
-std::uint64_t RateLimiter::enqueue(std::uint64_t n, std::uint64_t flow, double weight) {
+std::uint64_t RateLimiter::enqueue(std::uint64_t n, std::uint64_t flow, double weight, double part) {
     std::lock_guard lock(mutex_);
     if (bucket_.rate() == 0) return 0;
-    const auto ticket = enqueue_locked(n, flow, weight);
+    const auto ticket = enqueue_locked(n, flow, weight, part);
     serve(); // a bucket a new limit emptied fills from the first request
     return ticket;
 }
