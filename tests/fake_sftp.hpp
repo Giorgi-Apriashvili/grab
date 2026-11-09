@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <set>
 #include <span>
@@ -40,6 +41,7 @@ public:
     const std::map<std::string, std::string>* shared_files = nullptr; // instead of files: one copy for many sessions
     const std::map<std::string, std::uint32_t>* shared_mtimes = nullptr; // files' times instead of 1700000000
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
+    std::chrono::milliseconds latency{0};                   // each reply comes this long after its request (a round trip)
     int broken_after = 0;                                   // the stream breaks on this read (0: never)
     bool dropped = false;                                   // the server closed the connection: every read breaks
     bool break_on_close = false;                            // the connection breaks at a CLOSE, before its reply
@@ -69,15 +71,26 @@ public:
         if (broken_after > 0 && ++read_calls_ >= broken_after) throw sftp::Broken("fake server: the connection broke");
         if (dropped) throw sftp::Broken("fake server: the server closed the connection");
         if (out_.empty()) {
-            most_waiting = std::max(most_waiting, queue_.size());
+            // The replies due by now (all of them without a latency): the first waited for.
+            std::size_t due = queue_.size();
+            if (latency.count() > 0 && !queue_.empty()) {
+                std::this_thread::sleep_until(due_.front());
+                const auto now = std::chrono::steady_clock::now();
+                due = 0;
+                while (due < due_.size() && due_[due] <= now) ++due;
+            }
+            std::vector<std::string> batch(std::make_move_iterator(queue_.begin()),
+                                           std::make_move_iterator(queue_.begin() + static_cast<std::ptrdiff_t>(due)));
+            queue_.erase(queue_.begin(), queue_.begin() + static_cast<std::ptrdiff_t>(due));
+            due_.erase(due_.begin(), due_.begin() + static_cast<std::ptrdiff_t>(due));
+            most_waiting = std::max(most_waiting, batch.size());
             std::uint64_t data = 0;
-            for (const std::string& r : queue_) {
+            for (const std::string& r : batch) {
                 if (r.size() >= 13 && static_cast<std::uint8_t>(r[4]) == 103) data += r.size() - 13; // DATA: its bytes
             }
             most_read_bytes = std::max(most_read_bytes, data);
-            if (reverse) std::ranges::reverse(queue_);
-            for (const std::string& r : queue_) out_ += r;
-            queue_.clear();
+            if (reverse) std::ranges::reverse(batch);
+            for (const std::string& r : batch) out_ += r;
         }
         if (corrupt) out_ = std::string("\x40\x00\x00\x00", 4) + "x";
         if (out_.empty()) throw sftp::Broken("fake server: nothing to send");
@@ -124,13 +137,17 @@ private:
         u32(o, static_cast<std::uint32_t>(v.size()));
         o.append(v);
     }
+    void push(std::string r) {
+        queue_.push_back(std::move(r));
+        due_.push_back(std::chrono::steady_clock::now() + latency);
+    }
     void reply(std::uint8_t type, std::uint32_t id, const std::string& body) {
         std::string r;
         u32(r, static_cast<std::uint32_t>(1 + 4 + body.size()));
         u8(r, type);
         u32(r, id);
         r += body;
-        queue_.push_back(std::move(r));
+        push(std::move(r));
     }
     void status(std::uint32_t id, std::uint32_t code, std::string_view msg = "") {
         std::string b;
@@ -201,7 +218,7 @@ private:
             u32(r, static_cast<std::uint32_t>(1 + b.size()));
             u8(r, 2);
             r += b;
-            queue_.push_back(std::move(r));
+            push(std::move(r));
             return;
         }
         std::uint32_t id = in.u32();
@@ -292,6 +309,7 @@ private:
     };
     std::string in_, out_;
     std::vector<std::string> queue_;
+    std::vector<std::chrono::steady_clock::time_point> due_; // when each of queue_ may go (latency)
     std::map<std::string, OpenHandle> handles_;
     int next_handle_ = 1;
     int read_calls_ = 0;

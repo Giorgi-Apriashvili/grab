@@ -606,10 +606,30 @@ them.
   second, scaled to the minute's peak (hover for the peak); it keeps its place, blank when
   nothing came. Once no download is fetching the total reads 0 at once. On the bar's right, "Limit speed" caps all downloads together, in MiB/s; the
   switch keeps the value, and both are remembered.
-  - Changes apply at once. Downloads are paced by a shared token bucket: while limited, every read
-    is asked for only after taking its tokens, so the network really follows the limit. A big
-    file's connections ask for one read at a time; a folder's small files keep several files and
-    up to a quarter second of the limit's reads on their way, so they reach the limit too.
+  - A change applies within about a second, whether it comes from the switch, the MiB/s box or
+    the speed schedule (applied right as its minute begins): the downloads' real speed is at the new limit by then, and the speeds
+    shown follow it a moment later. A value typed in the box applies once you stop typing for a
+    moment (a lower one after a second and a half, so a value half-way through an edit doesn't
+    drop connections), or at once when you press Enter or leave the box; Escape goes back to the
+    value from before. One that
+    isn't a speed from 0.1 to 10000 MiB/s applies nothing, and the box says why.
+  - Downloads are paced by a shared token bucket: while limited, every read is asked for only
+    after taking its tokens, so the network really follows the limit. The connections keep up to a
+    quarter second of the limit's reads on their way between them (each at least two reads, an
+    eighth of a second of its part), and read its replies while the next read waits for its tokens, so the limit is reached
+    up to your line's speed, also by a single file on few connections.
+  - Reads already asked for can't be called back, and unlimited a connection has 16 MiB of them
+    on their way. So switching the limit on, or lowering it below what a connection has on its
+    way, drops that connection: the download goes on from its bytes over a new login, about a
+    second later (at most four logins at once, as always), and a folder's small files that were
+    on it are fetched again (they stay running meanwhile). What a connection keeps on its way
+    counts against the new limit.
+  - The speeds shown (the total, each row's, the graph) are an average over about 5 s; a new
+    limit starts them again, so they show the new speed within about a second and a half (after
+    a dropped connection's new login, a moment longer), an average over the last second for the
+    next few seconds.
+    Switching the limit off brings full speed back within a second, the first second a little
+    above it while the connections fill up again.
 - **Verify downloads** (Settings → Downloads, off by default): after each download, the server
   computes an MD5 checksum of its copy (`md5sum`, run through grab's own SSH connection) while
   grab computes yours, and the two are compared. The row reads Verifying (a folder counts the
@@ -1213,6 +1233,8 @@ grab config [-c PATH]
   - Without `--limit`, grab follows the window's [speed schedule](#gui), also mid-download:
     `grab: speed limited to 5 MiB/s until 24:00 by the speed schedule`, and a line at each
     change. `--limit RATE` replaces the schedule, and `--limit off` downloads without a limit.
+    A limit that starts or drops mid-download applies within about a second, as in the window:
+    connections with more on their way than it allows log in again.
   - Measured on a Storage Box: one 898 MiB file took 1:09 in byte ranges (`rclone cat`
     streams, before grab had its own client) and 1:50 with a plain `rclone copyto` (grab 0.19),
     minutes apart.
@@ -1342,9 +1364,11 @@ instead (see [Notes about settings](#notes-about-settings)), except a bind left 
 
 The rest is grab's, with nothing to set:
 - **Reads:** 255 KiB at a time (the largest SFTP packet OpenSSH accepts), up to 64 in flight per
-  connection, each for exactly the bytes a range still needs. Under a speed limit smaller, each
-  after its tokens, so the limit holds: one at a time on a big file's connection, up to a quarter
-  second's worth on a connection of a folder's small files.
+  connection, each for exactly the bytes a range still needs. Under a speed limit an eighth of a
+  second of the connection's part of the limit each, each after its tokens, so the limit holds,
+  with up to a quarter second's worth in flight across a download's connections (at least two
+  reads each); a limit switched on or lowered below what a connection has in flight (at least
+  two full reads) drops that connection, which logs in again.
 - **Files at once:** "At once" in the window's Downloads bar (1–8, default 4), which the command
   follows too; a big file's pieces spread over the server's connections, small files of a folder
   go beside them (see [GUI](#gui)).

@@ -545,6 +545,24 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .bar.status #total-speed { font-variant-numeric: tabular-nums; }
 .bar.status #limit-value { width: 64px; height: 26px; text-align: right; }
 .bar.status #limit-value:disabled { opacity: 0.5; }
+.bar.status #limit-value.bad { border-color: var(--danger); }
+/* Why a typed speed doesn't apply: above the box, out of the flow, so nothing in the bar moves. */
+.limit-box { position: relative; display: inline-flex; }
+.limit-why {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 5;
+  padding: 4px 8px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.18);
+  pointer-events: none;
+}
+.limit-why[hidden] { display: none; }
 .bar.status #limit-hint { height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); font-size: 12px; }
 .bar.status #limit-hint:hover { text-decoration: underline; background: none; }
 .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }

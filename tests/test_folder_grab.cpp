@@ -57,6 +57,7 @@ struct Tree {
     std::atomic<bool> no_sftp_server{false}; // the server refuses SFTP on every login
     std::chrono::milliseconds delay{0};     // every session's pause before each read, as a network's
     std::size_t slice = 0;                  // every session's most bytes per read (0: all there are)
+    std::chrono::milliseconds login_delay{0}; // each login takes this long
     // Every OPEN and every READ (its path and length) as the sessions got them, when they did.
     using Clock = std::chrono::steady_clock;
     std::vector<std::pair<std::string, Clock::time_point>> opens;
@@ -117,6 +118,7 @@ struct Tree {
         o.idle_timer = false;
         return std::make_shared<ssh::Pool>([this] {
             ++logins;
+            if (login_delay.count() > 0) std::this_thread::sleep_for(login_delay);
             return std::make_unique<Session>(*this);
         }, o);
     }
@@ -799,11 +801,10 @@ TEST_CASE("grab engine folders: running big files split the folder's connections
     t.delay = std::chrono::milliseconds(2);
     t.slice = std::size_t{64} * 1024;
     Run r(t.pool(5), "connection-part", 5, 2);
-    // A limit far above what comes: each stream has one READ on its way at a time, so what the
-    // streams asked for follows what came.
-    rate::RateLimiter limiter;
-    limiter.set_rate(std::uint64_t{1} << 30);
-    r.job.limiter = &limiter;
+    // Play's depth of 1 for good (no speed limit, which keeps a quarter second of it on its way
+    // since chunk J): each stream has one READ on its way at a time, so what the streams asked for
+    // follows what came.
+    r.connections.urgent("Fake", -100, 1);
     { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
     REQUIRE(folder::set_priority(r.tree, r.index("high.bin"), 4));
     REQUIRE(folder::set_priority(r.tree, r.index("low.bin"), 1));
@@ -1093,7 +1094,8 @@ TEST_CASE("grab engine folders: small files reach a speed limit over the network
 TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the small files at once") {
     // The schedule can turn a limit on in the middle of a folder. The small-file workers read the
     // rate at every pass and always count as the limiter's members, so they take tokens from then
-    // on rather than at their next turn (which can be the rest of the folder).
+    // on rather than at their next turn (which can be the rest of the folder); what they had on
+    // their way counts against it (or ends their turns: the next test).
     Tree t;
     t.dir("/data");
     for (int i = 0; i < 2000; ++i) t.file(std::format("/data/s{:04}.bin", i), test::pattern(16 * 1024 + i));
@@ -1101,6 +1103,12 @@ TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the sm
     Run r(t.pool(2), "small-limit-later", 2, 1);
     rate::RateLimiter limiter; // unlimited at the start
     r.job.limiter = &limiter;
+    std::mutex came_m;
+    std::vector<std::pair<Tree::Clock::time_point, std::uint64_t>> came; // every reply's bytes
+    r.job.on_received = [&](std::uint64_t n) {
+        std::lock_guard lock(came_m);
+        came.emplace_back(Tree::Clock::now(), n);
+    };
     { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
     std::stop_source stop;
     const auto start = Tree::Clock::now();
@@ -1123,9 +1131,138 @@ TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the sm
             if (when >= std::chrono::milliseconds(500) && when < std::chrono::milliseconds(2500)) asked += a.length;
         }
     }
+    std::uint64_t first = 0; // what came in the first half second after the switch
+    {
+        std::lock_guard lock(came_m);
+        for (const auto& [at, n] : came) {
+            if (at >= switched && at - switched < std::chrono::milliseconds(500)) first += n;
+        }
+    }
     const double mibps = static_cast<double>(asked) / 2.0 / (1 << 20);
-    MESSAGE("before the switch ", before, " bytes; after it ", mibps, " MiB/s");
+    MESSAGE("before the switch ", before, " bytes; in its first half second ", first, " bytes; after it ", mibps, " MiB/s");
     CHECK(before > 0);
     CHECK(mibps > 0.9);
     CHECK(mibps < 1.1);
+    CHECK(first <= (768u << 10)); // the limit's half second, and not what was on its way
+}
+
+TEST_CASE("grab engine folders: small files: a limit switched on below what a connection has on its way drops it; its files come whole over a new login") {
+    // Unlimited, a small-file connection has up to 8 MiB of READs on its way, which nothing calls
+    // back. The turn ends at once as a broken connection's does, the worker logs in again, and it
+    // stays one of the folder's small workers meanwhile (its big files would otherwise stop showing
+    // that they wait for them); its unfinished files stay running for its next turn, not Queued.
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 40; ++i) t.file(std::format("/data/m{:02}.bin", i), test::pattern((1u << 20) - 4096 * i));
+    t.slice = std::size_t{64} * 1024;
+    t.delay = std::chrono::milliseconds(4); // about 16 MiB/s a connection
+    t.login_delay = std::chrono::milliseconds(150);
+    Run r(t.pool(2), "small-limit-cut", 2, 1);
+    rate::RateLimiter limiter; // unlimited at the start
+    r.job.limiter = &limiter;
+    std::mutex came_m;
+    std::vector<std::pair<Tree::Clock::time_point, std::uint64_t>> came; // every reply's bytes
+    r.job.on_received = [&](std::uint64_t n) {
+        std::lock_guard lock(came_m);
+        came.emplace_back(Tree::Clock::now(), n);
+    };
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    auto came_total = [&] {
+        std::lock_guard lock(came_m);
+        std::uint64_t n = 0;
+        for (const auto& c : came) n += c.second;
+        return n;
+    };
+    Tree::Clock::time_point switched;
+    int logins_then = 0;
+    int fewest_workers = 2; // small workers, from the switch on for a second
+    std::vector<std::size_t> running_then; // files running at the switch
+    int queued_again = 0;                  // of them, seen Queued in that second
+    {
+        std::jthread run([&] { folder::run(r.job, r.tree, r.m, {}); });
+        for (int i = 0; i < 1000 && came_total() < (2u << 20); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        logins_then = t.logins.load();
+        {
+            std::lock_guard lock(r.m);
+            for (std::size_t i = 0; i < r.tree.files.size(); ++i) {
+                if (r.tree.files[i].status == folder::State::running) running_then.push_back(i);
+            }
+        }
+        switched = Tree::Clock::now();
+        limiter.set_rate(1u << 20);
+        while (Tree::Clock::now() - switched < std::chrono::seconds(1)) {
+            {
+                std::lock_guard lock(r.m);
+                fewest_workers = std::min(fewest_workers, r.tree.small_connections);
+                for (const std::size_t i : running_then) {
+                    if (r.tree.files[i].status == folder::State::queued) ++queued_again;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        limiter.set_rate(0); // the rest at full speed
+    }
+    std::uint64_t first = 0; // what came in the first half second after the switch
+    {
+        std::lock_guard lock(came_m);
+        for (const auto& [at, n] : came) {
+            if (at >= switched && at - switched < std::chrono::milliseconds(500)) first += n;
+        }
+    }
+    MESSAGE("in the first half second after the switch: ", first, " bytes");
+    for (const auto& f : r.tree.files) {
+        CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+        CHECK_MESSAGE(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path), f.path);
+    }
+    CHECK(t.logins.load() > logins_then); // dropped, logged in again: not a failure
+    CHECK(fewest_workers == 2);
+    CHECK(!running_then.empty());
+    CHECK(queued_again == 0);
+    // The limit's half second, less the login, and a READ each connection had come as it looked;
+    // not the 8 MiB each had on its way.
+    CHECK(first <= (5u << 18));
+}
+
+TEST_CASE("grab engine folders: a big file whose connections a new limit dropped doesn't show waiting while they log in again") {
+    // Its streams with more on their way than the limit allows end and log in again; meanwhile they
+    // still count as reading, as its file would show Queued (waiting) for that moment.
+    Tree t;
+    t.dir("/data");
+    t.file("/data/big.bin", test::pattern(48u << 20));
+    t.slice = std::size_t{64} * 1024;
+    t.delay = std::chrono::milliseconds(4); // about 16 MiB/s a connection
+    t.login_delay = std::chrono::milliseconds(150);
+    Run r(t.pool(2), "limit-cut-big", 2, 1);
+    rate::RateLimiter limiter; // unlimited at the start
+    r.job.limiter = &limiter;
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    int logins_then = 0;
+    bool waited = false;
+    {
+        std::jthread run([&] { folder::run(r.job, r.tree, r.m, {}); });
+        for (int i = 0; i < 1000; ++i) {
+            {
+                std::lock_guard lock(r.m);
+                if (r.tree.files[0].bytes >= (4u << 20)) break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        logins_then = t.logins.load();
+        const auto switched = Tree::Clock::now();
+        limiter.set_rate(2u << 20);
+        while (Tree::Clock::now() - switched < std::chrono::seconds(1)) {
+            {
+                std::lock_guard lock(r.m);
+                const auto& f = r.tree.files[0];
+                waited = waited || (f.status == folder::State::running && f.waiting);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        limiter.set_rate(0); // the rest at full speed
+    }
+    const auto& f = r.tree.files[0];
+    CHECK_MESSAGE(f.status == folder::State::done, f.error);
+    CHECK(util::read_file(r.local(f.path)) == t.files.at("/data/big.bin"));
+    CHECK(t.logins.load() > logins_then);
+    CHECK_FALSE(waited);
 }

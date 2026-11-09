@@ -214,7 +214,8 @@ private:
         for (;;) {
             {
                 std::unique_lock lock(sleep_m);
-                sleep.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+                // Just past each whole second, so a rule's minute applies within milliseconds.
+                sleep.wait_for(lock, stop, schedule::to_next_second(), [] { return false; });
             }
             if (stop.stop_requested()) return;
             const auto now = schedule::local_now();

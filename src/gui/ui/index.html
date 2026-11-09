@@ -332,7 +332,10 @@
     <span class="track" aria-hidden="true"></span>
     <span>Limit speed</span>
   </label>
-  <input id="limit-value" type="text" inputmode="decimal" class="num" aria-label="Speed limit in MiB/s">
+  <span class="limit-box">
+    <input id="limit-value" type="text" inputmode="decimal" class="num" aria-label="Speed limit in MiB/s" aria-describedby="limit-why">
+    <span id="limit-why" class="limit-why" role="status" hidden></span>
+  </span>
   <span class="muted">MiB/s</span>
   <button id="limit-hint" type="button" class="link" title="Speed schedule (Settings)" hidden></button>
 </footer>

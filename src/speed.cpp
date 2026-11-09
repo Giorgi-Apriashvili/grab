@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace grab::speed {
@@ -19,19 +20,41 @@ double seconds(Clock::duration d) { return std::chrono::duration<double>(d).coun
 void Meter::sample(Clock::time_point now, std::uint64_t total) {
     if (at_ && now <= *at_) return;
     const std::uint64_t came = at_ && total > total_ ? total - total_ : 0;
+    if (restarted_ && now - *restarted_ >= meter_full) {
+        restarted_.reset(); // its usual rules again
+        // Never shown, and nothing in its window since: it starts again at the next bytes.
+        if (std::exchange(holding_, false) && steps_.empty()) {
+            since_.reset();
+            rate_ = 0;
+        }
+    }
     if (!at_ || (steps_.empty() && came == 0)) { // no bytes yet: it starts from here
         at_ = now;
         total_ = total;
         return;
     }
-    if (steps_.empty()) since_ = *at_;
+    if (steps_.empty() && !since_) since_ = *at_;
     steps_.push_back(Step{.end = now, .took = now - *at_, .bytes = came});
     at_ = now;
     total_ = total;
-    // A step's age is its middle's: gone once that is meter_gone old.
+    if (holding_ && came == 0) {
+        // Restarted: the speed it had holds while the newest step brought nothing, and half a
+        // second without bytes (dropped streams logging in again) starts it again at the next.
+        Clock::duration gap{};
+        for (auto it = steps_.rbegin(); it != steps_.rend() && it->bytes == 0; ++it) gap += it->took;
+        if (gap >= meter_least) steps_.clear();
+        return;
+    }
+    // A step's age is its middle's: gone once that is meter_gone old (meter_settle just after a
+    // restart; the newest stays).
     auto age = [&](const Step& s) { return now - (s.end - s.took / 2); };
-    while (!steps_.empty() && age(steps_.front()) >= meter_gone) steps_.pop_front();
+    const Clock::duration window = restarted_ ? Clock::duration{meter_settle} : Clock::duration{meter_gone};
+    while (steps_.size() > 1 && age(steps_.front()) >= window) steps_.pop_front();
     if (std::ranges::all_of(steps_, [](const Step& s) { return s.bytes == 0; })) {
+        if (restarted_ && !holding_) { // nothing in its last second: 0, while the time left goes on
+            rate_ = 0;
+            return;
+        }
         steps_.clear(); // none in its window: it starts again at the next bytes
         since_.reset();
         rate_ = 0;
@@ -47,7 +70,20 @@ void Meter::sample(Clock::time_point now, std::uint64_t total) {
         time += w * seconds(s.took);
         span += seconds(s.took);
     }
-    rate_ = span >= seconds(meter_least) && time > 0 ? bytes / time : 0;
+    if (span >= seconds(meter_least) && time > 0) {
+        rate_ = bytes / time;
+        holding_ = false;
+    } else if (!holding_) {
+        rate_ = 0;
+    }
+}
+
+void Meter::restart(Clock::time_point now, std::uint64_t total) {
+    steps_.clear();
+    at_ = now;
+    total_ = total;
+    restarted_ = now;
+    holding_ = true;
 }
 
 void Pace::sample(Clock::time_point now, std::uint64_t files, std::uint64_t bytes) {

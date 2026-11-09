@@ -4534,16 +4534,89 @@ function sendLimit() {
   send({ type: 'setLimit', on: state.limitOn, mibps: state.limitMiBps });
 }
 
-// A new value from the box; anything that isn't a number from 0.1 to 10000 snaps back.
-function commitLimitValue() {
+// The MiB/s box (chunk J): a value applies LIMIT_TYPE_MS after typing stops, as well as on Enter
+// or leaving the box; Escape goes back to the value from before the edit. One that isn't a speed
+// from 0.1 to 10000 MiB/s applies nothing, and the box says why (red, a note above it) rather than
+// snapping back silently; leaving the box then puts the speed that applies back in it. A lower
+// value waits LIMIT_LOWER_MS instead: a lowering drops connections with more on their way than it
+// allows (they log in again), so a value that only exists half-way through an edit ('1' on the
+// way from 10 to 12) mustn't apply after a short pause.
+const LIMIT_TYPE_MS = 400;
+const LIMIT_LOWER_MS = 1500;
+const LIMIT_WHY_MS = 4000; // a refusal's note, once the box was left
+const limitEdit = { timer: 0, before: null, why: 0 };
+
+// The box's text as MiB/s: { mibps } or { why }.
+function limitValue(text) {
+  const t = text.trim();
+  const v = Number(t.replace(',', '.'));
+  if (!t) return { why: 'Type a speed in MiB/s, from 0.1 to 10000' };
+  if (!Number.isFinite(v)) return { why: `“${t.length > 12 ? `${t.slice(0, 12)}…` : t}” isn’t a number: type MiB/s, from 0.1 to 10000` };
+  if (v < 0.1) return { why: 'At least 0.1 MiB/s' };
+  if (v > 10000) return { why: 'At most 10000 MiB/s' };
+  return { mibps: v };
+}
+
+// Shows why the box's value doesn't apply (`why`), or nothing; `ms`: hidden again after that.
+function showLimitWhy(why, ms = 0) {
+  const note = $('#limit-why');
   const box = $('#limit-value');
-  const v = Number(box.value.trim().replace(',', '.'));
-  if (Number.isFinite(v) && v >= 0.1 && v <= 10000) {
-    const changed = Math.abs(v - state.limitMiBps) > 1e-9;
-    state.limitMiBps = v;
-    if (changed) sendLimit();
+  clearTimeout(limitEdit.why);
+  limitEdit.why = 0;
+  note.textContent = why || '';
+  note.hidden = !why;
+  box.classList.toggle('bad', !!why && document.activeElement === box);
+  box.setAttribute('aria-invalid', String(!!why && document.activeElement === box));
+  if (why && ms) limitEdit.why = setTimeout(() => showLimitWhy(''), ms);
+}
+
+// Applies the box's value when it is a speed (true), or says why not.
+function applyLimitValue(why = 0) {
+  const v = limitValue($('#limit-value').value);
+  if (v.why) {
+    showLimitWhy(v.why, why);
+    return false;
   }
+  showLimitWhy('');
+  const changed = Math.abs(v.mibps - state.limitMiBps) > 1e-9;
+  state.limitMiBps = v.mibps;
+  if (changed) sendLimit();
+  return true;
+}
+
+function onLimitTyped() {
+  clearTimeout(limitEdit.timer);
+  const v = limitValue($('#limit-value').value);
+  const lower = v.mibps !== undefined && state.limitOn && v.mibps < state.limitMiBps - 1e-9;
+  limitEdit.timer = setTimeout(() => {
+    limitEdit.timer = 0;
+    applyLimitValue();
+  }, lower ? LIMIT_LOWER_MS : LIMIT_TYPE_MS);
+}
+
+// Enter, or leaving the box: the value applies now; one that doesn't is said, and the speed that
+// applies goes back in the box.
+function commitLimitValue() {
+  clearTimeout(limitEdit.timer);
+  limitEdit.timer = 0;
+  const box = $('#limit-value');
+  const same = box.value.trim() === fmtLimit(state.limitMiBps);
+  if (!same) applyLimitValue(LIMIT_WHY_MS);
   box.value = fmtLimit(state.limitMiBps);
+  box.classList.remove('bad');
+  box.setAttribute('aria-invalid', 'false');
+}
+
+// Escape: the value from before the edit, applied again if typing had changed it.
+function cancelLimitEdit() {
+  clearTimeout(limitEdit.timer);
+  limitEdit.timer = 0;
+  if (limitEdit.before !== null && Math.abs(limitEdit.before - state.limitMiBps) > 1e-9) {
+    state.limitMiBps = limitEdit.before;
+    sendLimit();
+  }
+  showLimitWhy('');
+  $('#limit-value').value = fmtLimit(state.limitMiBps);
 }
 
 function renderParallel() {
@@ -5556,10 +5629,13 @@ $('#limit-on').addEventListener('change', (ev) => {
   sendLimit();
   if (state.limitOn) $('#limit-value').focus();
 });
+$('#limit-value').addEventListener('focus', () => { limitEdit.before = state.limitMiBps; });
+$('#limit-value').addEventListener('input', onLimitTyped);
 $('#limit-value').addEventListener('change', commitLimitValue);
+$('#limit-value').addEventListener('blur', commitLimitValue);
 $('#limit-value').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') { ev.preventDefault(); commitLimitValue(); ev.target.blur(); }
-  else if (ev.key === 'Escape') { ev.target.value = fmtLimit(state.limitMiBps); ev.target.blur(); }
+  else if (ev.key === 'Escape') { cancelLimitEdit(); ev.target.blur(); }
 });
 $('#parallel-down').addEventListener('click', () => setParallel(state.parallel - 1));
 $('#parallel-up').addEventListener('click', () => setParallel(state.parallel + 1));

@@ -5,6 +5,7 @@
 #include "gui_state.hpp"
 #include "preview_jobs.hpp"
 #include "process.hpp"
+#include "schedule.hpp"
 #include "tray.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -265,6 +266,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         if (wparam == timer_tray) {
             refresh_tray_tip();
             if (g.app) g.app->tick();
+            // Again just past the next whole second, so a speed schedule's minute applies at once.
+            SetTimer(hwnd, timer_tray, static_cast<UINT>(schedule::to_next_second().count()), nullptr);
         } else if (wparam == timer_flush) {
             if (g.app) g.app->flush();
         } else if (wparam == timer_exit) {

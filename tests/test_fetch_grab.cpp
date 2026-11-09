@@ -38,6 +38,7 @@ struct Fake {
     bool reverse = false;
     std::size_t slice = 0;
     std::chrono::milliseconds delay{0};
+    std::chrono::milliseconds latency{0}; // each reply this long after its request: a round trip
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
     std::size_t most_waiting = 0; // most requests a session answered in one batch: about its READs in flight
@@ -56,6 +57,7 @@ struct Fake {
             server.reverse = f.reverse;
             server.slice = f.slice;
             server.delay = f.delay;
+            server.latency = f.latency;
             client.start();
         }
         ~Session() override {
@@ -488,4 +490,170 @@ TEST_CASE("grab engine: a stream stepping aside with little on its way hands its
     pool.reset();
     CHECK(fake.asked() == content.size()); // what came while it stepped aside was written
     CHECK(fake.logins.load() == 2);        // and the download took its connection back from the pool
+}
+
+namespace {
+
+// Every READ reply's bytes as they came (Download::on_received), and when.
+struct Arrivals {
+    using Clock = std::chrono::steady_clock;
+    std::mutex m;
+    std::vector<std::pair<Clock::time_point, std::uint64_t>> got;
+    void add(std::uint64_t n) {
+        std::lock_guard lock(m);
+        got.emplace_back(Clock::now(), n);
+    }
+    std::uint64_t total() {
+        std::lock_guard lock(m);
+        std::uint64_t n = 0;
+        for (const auto& g : got) n += g.second;
+        return n;
+    }
+    // Bytes that came from `a` to `b` after `from`.
+    std::uint64_t between(Clock::time_point from, std::chrono::milliseconds a, std::chrono::milliseconds b) {
+        std::lock_guard lock(m);
+        std::uint64_t n = 0;
+        for (const auto& [at, bytes] : got) {
+            if (at - from >= a && at - from < b) n += bytes;
+        }
+        return n;
+    }
+    // MiB/s from the first reply to the last (the first's own bytes left out).
+    double mibps() {
+        std::lock_guard lock(m);
+        if (got.size() < 2) return 0;
+        std::uint64_t n = 0;
+        for (std::size_t k = 1; k < got.size(); ++k) n += got[k].second;
+        return static_cast<double>(n) / std::chrono::duration<double>(got.back().first - got.front().first).count() / (1 << 20);
+    }
+};
+
+} // namespace
+
+TEST_CASE("grab engine: under a speed limit a connection keeps several READs on their way, so it reaches a limit above one READ a round trip") {
+    // One READ at a time per connection under a limit reached only 255 KiB a round trip: about
+    // 2 MiB/s on Main (96 ms), whatever the limit. Here one connection over a 50 ms round trip:
+    // 5 MiB/s that way, against a limit of 8.
+    Fake fake;
+    const std::string content = test::pattern(8u << 20);
+    fake.files["/data/f.bin"] = content;
+    fake.latency = 50ms;
+    Dir dir("limit-reached");
+    auto pool = fake.pool(1);
+    fetch::Connections connections;
+    connections.configure("Fake", 1);
+    rate::RateLimiter limiter;
+    limiter.set_rate(8u << 20);
+    auto d = download(dir.path / "f.bin", pool);
+    d.limiter = &limiter;
+    Arrivals came;
+    d.on_received = [&](std::uint64_t n) { came.add(n); };
+    const auto r = fetch::run(d, connections, {}, {});
+    REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+    CHECK(util::read_file(dir.path / "f.bin") == content);
+    const double mibps = came.mibps();
+    MESSAGE("one connection under 8 MiB/s over a 50 ms round trip: ", mibps, " MiB/s");
+    CHECK(mibps > 8 * 0.9);
+    CHECK(mibps < 8 * 1.1);
+    d.pool.reset();
+    pool.reset();
+    for (auto [off, len] : fake.reads) CHECK(len <= 255u * 1024); // an eighth of a second's worth at most
+    CHECK(fake.logins.load() == 1);
+}
+
+TEST_CASE("grab engine: a limit switched on mid-download drops the connections with more on their way; it goes on over new logins at the limit") {
+    // Unlimited, a connection has up to 16 MiB of READs on its way, which nothing calls back: they
+    // kept coming at full speed for seconds after the switch (51-58 MiB over a 2 MiB/s limit with 4
+    // connections on Main).
+    Fake fake;
+    const std::string content = test::pattern(40u << 20);
+    fake.files["/data/f.bin"] = content;
+    fake.slice = 64u << 10;
+    fake.delay = 4ms; // about 16 MiB/s a connection
+    Dir dir("limit-on");
+    auto pool = fake.pool(2);
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+    rate::RateLimiter limiter; // unlimited at the start
+    auto d = download(dir.path / "f.bin", pool);
+    d.limiter = &limiter;
+    Arrivals came;
+    d.on_received = [&](std::uint64_t n) { came.add(n); };
+    fetch::Result r;
+    Arrivals::Clock::time_point switched;
+    int logins_then = 0;
+    {
+        std::jthread running([&] { r = fetch::run(d, connections, {}, {}); });
+        for (int i = 0; i < 500 && came.total() < (4u << 20); ++i) std::this_thread::sleep_for(10ms);
+        logins_then = fake.logins.load();
+        switched = Arrivals::Clock::now();
+        limiter.set_rate(2u << 20);
+        std::this_thread::sleep_for(2000ms);
+        limiter.set_rate(0); // the rest at full speed
+    }
+    REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+    CHECK(util::read_file(dir.path / "f.bin") == content);
+    CHECK(logins_then == 2);
+    CHECK(fake.logins.load() > 2); // dropped, and logged in again: not a failure
+    // At most what came as each connection looked (a READ each) plus the limit's half second.
+    const auto first = came.between(switched, 0ms, 500ms);
+    const double after = static_cast<double>(came.between(switched, 500ms, 2000ms)) / 1.5 / (1 << 20);
+    MESSAGE("in the first half second ", first, " bytes; then ", after, " MiB/s");
+    CHECK(first <= (1u << 20) + (768u << 10));
+    CHECK(after > 2 * 0.85);
+    CHECK(after < 2 * 1.15);
+}
+
+TEST_CASE("grab engine: a limit lowered below what a connection has on its way charges that to the new rate; the connection stays, the speed shows within a second and a half") {
+    // 8 -> 6 MiB/s on one connection over a 60 ms round trip: about half a MiB on its way (at most
+    // about 1 MiB), under the new allowance (1.5 MiB), so it stays; those bytes come at once, and
+    // count against the new rate, so the first second brings no more than the new limit's second.
+    Fake fake;
+    const std::string content = test::pattern(32u << 20);
+    fake.files["/data/f.bin"] = content;
+    fake.latency = 60ms;
+    Dir dir("limit-lower");
+    auto pool = fake.pool(1);
+    fetch::Connections connections;
+    connections.configure("Fake", 1);
+    rate::RateLimiter limiter;
+    limiter.set_rate(8u << 20);
+    auto d = download(dir.path / "f.bin", pool);
+    d.limiter = &limiter;
+    Arrivals came;
+    d.on_received = [&](std::uint64_t n) { came.add(n); };
+    std::mutex shown_m;
+    std::vector<std::pair<Arrivals::Clock::time_point, double>> shown; // Progress::speed
+    const auto on_progress = [&](const fetch::Progress& p) {
+        std::lock_guard lock(shown_m);
+        shown.emplace_back(Arrivals::Clock::now(), p.speed);
+    };
+    fetch::Result r;
+    Arrivals::Clock::time_point lowered;
+    {
+        std::jthread running([&] { r = fetch::run(d, connections, on_progress, {}); });
+        std::this_thread::sleep_for(2000ms);
+        lowered = Arrivals::Clock::now();
+        limiter.set_rate(6u << 20);
+        std::this_thread::sleep_for(1700ms);
+        limiter.set_rate(0);
+    }
+    REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
+    CHECK(util::read_file(dir.path / "f.bin") == content);
+    CHECK(fake.logins.load() == 1);
+    const double first = static_cast<double>(came.between(lowered, 0ms, 1000ms)) / (1 << 20);
+    const double later = static_cast<double>(came.between(lowered, 500ms, 1500ms)) / (1 << 20);
+    double shown_then = 0; // the shown speed 1.5 s after
+    {
+        std::lock_guard lock(shown_m);
+        for (const auto& [at, s] : shown) {
+            if (at - lowered <= 1500ms) shown_then = s / (1 << 20);
+        }
+    }
+    MESSAGE("the first second after 8 -> 6 MiB/s: ", first, " MiB; then ", later, " MiB/s; shown at 1.5 s: ", shown_then);
+    CHECK(first <= 6.0);
+    CHECK(later > 6 * 0.85);
+    CHECK(later < 6 * 1.15);
+    CHECK(shown_then > 6 * 0.85); // a 5 s average would still read about 7.4
+    CHECK(shown_then < 6 * 1.15);
 }

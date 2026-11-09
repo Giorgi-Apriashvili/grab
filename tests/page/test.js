@@ -947,6 +947,117 @@ try {
   check('G: none running', $('#total-speed').textContent, 'No downloads running');
   onSpeed({ type: 'speed', total: 3 * 1048576 }); // for the screenshots
 
+  // ---- J: the MiB/s box applies as you type (DOWNLOADS-UI.md, chunk J) -------------------------
+  {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const box = $('#limit-value');
+    const why = $('#limit-why');
+    const limits = () => sent.filter((m) => m.type === 'setLimit').map((m) => [m.on, m.mibps]);
+    const type = (text) => { box.value = text; box.dispatchEvent(new Event('input', { bubbles: true })); };
+    const key = (k) => box.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    check('J: a speed read from the box', [limitValue('2').mibps, limitValue(' 2,5 ').mibps, limitValue('10000').mibps], [2, 2.5, 10000]);
+    check('J: why one is refused', [limitValue('').why, limitValue('abc').why, limitValue('0.05').why, limitValue('20000').why, limitValue('800K').why],
+      ['Type a speed in MiB/s, from 0.1 to 10000', '“abc” isn’t a number: type MiB/s, from 0.1 to 10000', 'At least 0.1 MiB/s',
+        'At most 10000 MiB/s', '“800K” isn’t a number: type MiB/s, from 0.1 to 10000']);
+    state.limitOn = true;
+    state.limitMiBps = 1;
+    renderLimit();
+    box.focus();
+    sent.length = 0;
+    const barBefore = [boxOf('#limit-value'), boxOf('#limit-on'), boxOf('#total-speed')];
+    type('2');
+    check('J: typed: nothing sent yet', limits(), []);
+    await wait(250);
+    check('J: ... nor while typing may go on', limits(), []);
+    await wait(250);
+    check('J: applied 400 ms after typing stopped, the box kept as typed', [limits(), state.limitMiBps, box.value, document.activeElement === box],
+      [[[true, 2]], 2, '2', true]);
+    sent.length = 0;
+    type('1');
+    await wait(150);
+    type('12');
+    await wait(150);
+    check('J: typing on puts it off', limits(), []);
+    await wait(350);
+    check('J: one value, the last', limits(), [[true, 12]]);
+    sent.length = 0;
+    type('abc');
+    await wait(450);
+    check('J: a value that is not a speed applies nothing and says why', [limits(), state.limitMiBps, why.hidden, why.textContent,
+      box.classList.contains('bad'), box.getAttribute('aria-invalid')],
+    [[], 12, false, '“abc” isn’t a number: type MiB/s, from 0.1 to 10000', true, 'true']);
+    const barNote = [boxOf('#limit-value'), boxOf('#limit-on'), boxOf('#total-speed')];
+    check('J: the note moves nothing in the status bar', JSON.stringify(barNote) === JSON.stringify(barBefore), true);
+    const note = why.getBoundingClientRect();
+    check('J: the note above the box', note.bottom <= box.getBoundingClientRect().top, true);
+    type('12');
+    await wait(450);
+    check('J: a speed again: the note goes', [why.hidden, box.classList.contains('bad'), limits()], [true, false, []]);
+    type('0');
+    key('Enter');
+    check('J: Enter with one refused: the speed that applies back in the box, the note stays a while',
+      [limits(), box.value, why.hidden, why.textContent, box.classList.contains('bad'), document.activeElement === box],
+      [[], '12', false, 'At least 0.1 MiB/s', false, false]);
+    await wait(450);
+    check('J: ... and nothing applies later', limits(), []);
+    showLimitWhy('');
+    box.focus();
+    type('7');
+    key('Enter');
+    check('J: Enter applies at once', limits(), [[true, 7]]);
+    await wait(450);
+    check('J: ... once', limits(), [[true, 7]]);
+    sent.length = 0;
+    box.focus();
+    type('9');
+    await wait(450);
+    key('Escape');
+    check('J: Escape goes back to the value from before the edit, applied again', [limits(), state.limitMiBps, box.value],
+      [[[true, 9], [true, 7]], 7, '7']);
+    sent.length = 0;
+    box.focus();
+    type('4');
+    box.blur();
+    check('J: leaving the box applies at once', [limits(), box.value], [[[true, 4]], '4']);
+    await wait(450);
+    check('J: ... once', limits(), [[true, 4]]);
+    // A lower value waits longer: one half-way through an edit (10 to 12: Backspace, then '2')
+    // would drop connections.
+    state.limitMiBps = 10;
+    renderLimit();
+    box.focus();
+    sent.length = 0;
+    type('1');
+    await wait(500);
+    check('J: a lower value half-way through an edit: not sent after a short pause', limits(), []);
+    type('12');
+    await wait(450);
+    check('J: ... only the value typed in the end', limits(), [[true, 12]]);
+    sent.length = 0;
+    type('1');
+    await wait(1000);
+    type('15');
+    await wait(450);
+    check('J: select-all, 1, a pause, 5: only 15', limits(), [[true, 15]]);
+    sent.length = 0;
+    type('2');
+    await wait(1000);
+    check('J: a real lowering: not yet after a second', limits(), []);
+    await wait(600);
+    check('J: ... applied 1.5 s after typing stopped', limits(), [[true, 2]]);
+    sent.length = 0;
+    type('1');
+    key('Enter');
+    check('J: a lowering applies at once on Enter', limits(), [[true, 1]]);
+    await wait(1600);
+    check('J: ... once', limits(), [[true, 1]]);
+    sent.length = 0;
+    showLimitWhy('');
+    state.limitOn = false;
+    state.limitMiBps = 5;
+    renderLimit();
+  }
+
   // A big file that has its place but waits for the folder's small files: Waiting, muted, why in
   // its tooltip; it can be paused or skipped as a queued one; it sorts after running files.
   const waitKids = [{ path: 'big1.bin', size: 5e7, status: 'waiting', bytes: 0 }, { path: 'big2.bin', size: 6e7, status: 'queued', bytes: 0 },

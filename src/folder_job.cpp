@@ -104,6 +104,7 @@ struct SmallRun {
     std::size_t landed = 0;            // files put in place (or failed for their own reasons)
     bool worked = false;               // data came: the pool counts the connection as working
     bool yielded = false;              // handed its connection to another download, which released it
+    bool cut = false;                  // a limit switched on or lowered below what it had on its way
     std::optional<std::string> broken; // the connection broke: why
 };
 
@@ -114,11 +115,19 @@ struct SmallRun {
 // and at most a quarter second's in flight, each taking its tokens before it goes, as the folder's
 // member `member` (Members): the limiter bounds the rate, while the files and READs on their way
 // keep the connection busy over its round trip (one file and one READ at a time reached half of a
-// 1 MiB/s limit on Main, chunk F's L4). A reply may then wait unread through a token wait, at most
-// that quarter second's worth. Files left half-way (a stop, a broken connection) go back to the
-// queue. The next file is the highest priority's (next_queued).
+// 1 MiB/s limit on Main, chunk F's L4). The next READ keeps its place in the limiter's line while
+// the replies on their way are read (RateLimiter::enqueue, ready after each, as fetch's streams),
+// so none waits unread through token turns (with many workers sharing a limit, seconds). The limit
+// is looked at after each reply: switched on or lowered while more is on its way than it now
+// allows (8 MiB at full speed, which kept coming at full speed), the turn ends at once as a broken
+// connection's does (`cut`: its connection dropped, a new login), as fetch's streams do; less on
+// its way is charged to the new rate. Files left half-way by a stop or a broken connection go back
+// to the queue; by a cut, they stay running, `carried` to the worker's next turn, which takes them
+// first (they don't flash Queued while it logs in again). The next file is the highest priority's
+// (next_queued).
 SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& members, std::uint32_t member,
-                  sftp::Client& c, const fs::path& dir, const std::stop_token& stop) {
+                  sftp::Client& c, const fs::path& dir, const std::stop_token& stop,
+                  std::vector<std::size_t>& carried) {
     constexpr std::size_t max_files = 32;
     constexpr std::uint64_t max_bytes = std::uint64_t{8} << 20;
     const bool replace = job.existing == existing::Choice::replace;
@@ -147,6 +156,10 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
     SmallRun run;
     auto last_progress = std::chrono::steady_clock::now();
     const auto flow = rate::flow_of(job.id, member);
+    // The limit as this turn last saw it, looked at again at each pass (after each reply), and the
+    // next READ's place in the limiter's line while its tokens come; given up on every way out.
+    rate::RateLimiter::Setting seen = job.limiter != nullptr ? job.limiter->setting() : rate::RateLimiter::Setting{};
+    rate::Place place(job.limiter);
     // Its weight in the limiter now: the folder's or a file's priority may have changed, or files
     // started or ended.
     auto flow_weight = [&] {
@@ -165,6 +178,18 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
             f.bytes = 0;
             f.speed = 0;
             ++tree.requeued;
+        }
+    };
+    // Cut: the slots' files not landed yet start again on the next turn, still running.
+    auto carry = [&] {
+        std::lock_guard lock(m);
+        for (auto& [id, s] : slots) {
+            if (s.done) continue;
+            auto& f = tree.files[s.index];
+            if (f.status != State::running) continue;
+            f.bytes = 0;
+            f.speed = 0;
+            carried.push_back(s.index);
         }
     };
     std::function<void(int, std::uint64_t, std::uint32_t)> send_read = [&](int id, std::uint64_t at, std::uint32_t n) {
@@ -269,7 +294,13 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
                 std::string path;
                 {
                     std::lock_guard lock(m);
-                    const auto next = next_queued(tree, false);
+                    std::optional<std::size_t> next;
+                    while (!next && !carried.empty()) { // those a cut left first, unless paused or skipped since
+                        const std::size_t i = carried.front();
+                        carried.erase(carried.begin());
+                        if (tree.files[i].status == State::running) next = i;
+                    }
+                    if (!next) next = next_queued(tree, false);
                     if (!next) {
                         taking = false;
                         break;
@@ -313,29 +344,62 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, const Members& memb
                 });
                 notify(job, Event::progress);
             }
+            // A limit switched on or lowered since the last look (above).
+            if (job.limiter != nullptr) {
+                if (const auto now = job.limiter->setting(); now.generation != seen.generation) {
+                    place.drop(); // asked for at the old rate
+                    const bool tighter = now.rate > 0 && (seen.rate == 0 || now.rate < seen.rate);
+                    seen = now;
+                    if (tighter && bytes_in_flight > fetch::limited_keep(seen.rate, 1)) {
+                        carry();
+                        run.cut = true;
+                        return run;
+                    }
+                    if (tighter && bytes_in_flight > 0) job.limiter->debit(bytes_in_flight);
+                }
+            }
             // READs for what the open files still lack; while Play on this server warms up or waits
             // for bytes, no more than its depth's worth (fetch::Connections::urgent). Under a speed
             // limit, smaller and fewer, as above.
-            const std::uint64_t rate = job.limiter != nullptr ? job.limiter->rate() : 0;
-            const std::uint64_t read_size =
-                rate > 0 ? std::clamp<std::uint64_t>(rate / 8, std::uint64_t{32} * 1024, sftp::max_read) : sftp::max_read;
+            const std::uint64_t rate = seen.rate;
+            const std::uint64_t read_size = rate > 0 ? fetch::limited_read(rate, 1) : sftp::max_read;
             std::uint64_t most = std::min(
                 max_bytes, std::uint64_t{sftp::max_read} *
                                static_cast<std::uint64_t>(job.connections->read_depth(job.server, fetch::grab_depth)));
-            if (rate > 0) most = std::min(most, std::max(rate / 4, 2 * read_size));
-            for (auto& [id, s] : slots) {
+            if (rate > 0) most = std::min(most, fetch::limited_in_flight(rate, 1));
+            bool held = false;      // its next READ waits for tokens while replies are read
+            bool new_rate = false;  // waiting for them ended with a new rate: looked at first
+            for (auto it = slots.begin(); it != slots.end() && !held && !new_rate; ++it) {
+                auto& [id, s] = *it;
                 while (s.opened && !s.error && !s.done && s.asked < s.size && !stop.stop_requested()) {
                     const auto n = static_cast<std::uint32_t>(std::min(read_size, s.size - s.asked));
                     if (reads_in_flight > 0 && bytes_in_flight + n > most) break;
-                    if (rate > 0 && !job.limiter->acquire(n, stop, flow, flow_weight())) break;
+                    if (rate > 0) {
+                        // Its tokens are there now, or (with nothing on its way to read) it waits for
+                        // them; else replies are read meanwhile and it looks again after each.
+                        if (place.ticket == 0) place.ticket = job.limiter->enqueue(n, flow, flow_weight());
+                        if (place.ticket != 0 && !job.limiter->ready(place.ticket)) {
+                            if (c.pending() > 0) {
+                                held = true;
+                                break;
+                            }
+                            if (!job.limiter->wait(place.ticket, stop)) { // a new rate, or a stop: given up
+                                place.ticket = 0;
+                                new_rate = !stop.stop_requested();
+                                break;
+                            }
+                        }
+                        place.ticket = 0;
+                    }
                     send_read(id, s.asked, n);
                     s.asked += n;
                     // Under a limit on its way at once, right after its tokens, not with the next
-                    // pump after more token waits: the network follows the limit evenly.
+                    // pump: the network follows the limit evenly.
                     if (rate > 0) c.flush();
                 }
             }
             if (stop.stop_requested()) break;
+            if (new_rate) continue;
             // Files complete or failed: put in place; slots whose replies are all in go.
             for (auto it = slots.begin(); it != slots.end();) {
                 Slot& s = it->second;
@@ -384,8 +448,45 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, Members& members,
     };
     auto worker = [&](std::uint32_t k) {
         int failures = 0; // in a row, nothing landing
+        // Its connection is not the big files' to share; under a speed limit (on now or later)
+        // it is one of the folder's members in the limiter while it takes files (Members). A
+        // worker whose turn a new limit cut stays one while it logs in again: the folder's big
+        // files would take its place for that moment, and show they no longer wait for it.
+        auto member = [&](int delta) {
+            std::lock_guard lock(m);
+            tree.small_connections += delta;
+            members.small_workers += delta;
+            if (delta > 0) tree.connections = job.connections->active(job.server, job.id);
+        };
+        bool kept = false;
+        // Its files a cut left running for its next turn (small_on); back to the queue when there
+        // is none soon.
+        std::vector<std::size_t> carried;
+        auto requeue_carried = [&] {
+            if (carried.empty()) return;
+            {
+                std::lock_guard lock(m);
+                for (const std::size_t i : carried) {
+                    auto& f = tree.files[i];
+                    if (f.status != State::running) continue;
+                    f.status = State::queued;
+                    ++tree.requeued;
+                }
+            }
+            carried.clear();
+            notify(job, Event::changed);
+        };
+        struct Leave {
+            bool& kept;
+            decltype(member)& leave;
+            decltype(requeue_carried)& requeue;
+            ~Leave() {
+                requeue();
+                if (std::exchange(kept, false)) leave(-1);
+            }
+        } leave_at_end{.kept = kept, .leave = member, .requeue = requeue_carried};
         for (;;) {
-            if (stop.stop_requested() || !any_queued()) return;
+            if (stop.stop_requested() || (carried.empty() && !any_queued())) return;
             if (!job.connections->acquire(job.server, job.id, stop, false)) return;
             std::optional<ssh::Pool::Lease> lease;
             std::string why;
@@ -397,6 +498,8 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, Members& members,
                 kind = e.kind;
             }
             if (!lease) {
+                requeue_carried(); // another worker may take them meanwhile
+                if (std::exchange(kept, false)) member(-1);
                 if (!why.empty() && kind == budget::Failure::refused) job.connections->refused(job.server);
                 job.connections->release(job.server, job.id);
                 if (why.empty()) return; // stopped
@@ -405,19 +508,12 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, Members& members,
                 pause_for(std::min(std::chrono::seconds(1 << std::min(failures - 1, 4)), std::chrono::seconds(15)), stop);
                 continue;
             }
-            // Its connection is not the big files' to share; under a speed limit (on now or later)
-            // it is one of the folder's members in the limiter while it takes files (Members).
-            auto member = [&](int delta) {
-                std::lock_guard lock(m);
-                tree.small_connections += delta;
-                members.small_workers += delta;
-                if (delta > 0) tree.connections = job.connections->active(job.server, job.id);
-            };
-            member(+1);
+            if (!std::exchange(kept, false)) member(+1);
             SmallRun run;
             try {
-                run = small_on(job, tree, m, members, small_member | k, (*lease)->sftp(), dir, stop);
+                run = small_on(job, tree, m, members, small_member | k, (*lease)->sftp(), dir, stop, carried);
             } catch (const sftp::Unavailable& e) { // the server has no SFTP: no use trying again
+                requeue_carried();
                 member(-1);
                 lease.reset();
                 job.connections->release(job.server, job.id);
@@ -425,11 +521,17 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, Members& members,
             } catch (const sftp::Broken& e) {
                 run.broken = e.what(); // SFTP didn't start on it
             }
-            member(-1);
-            if (stop.stop_requested() || run.broken) lease->broken(); // replies still on their way
+            kept = run.cut && !stop.stop_requested();
+            if (!kept) {
+                requeue_carried(); // a stop, or SFTP didn't start on it: none taken
+                member(-1);
+            }
+            // Replies still on their way: dropped with the connection.
+            if (stop.stop_requested() || run.broken || run.cut) lease->broken();
             lease.reset();
             if (!run.yielded) job.connections->release(job.server, job.id, 1, run.worked);
             if (run.landed > 0) failures = 0;
+            if (run.cut) continue; // not a failure: its files go on over a new login
             if (run.broken && run.landed == 0 && ++failures > fetch::max_retries) return fail_queued(*run.broken);
             if (run.broken) pause_for(std::chrono::seconds(2), stop);
         }

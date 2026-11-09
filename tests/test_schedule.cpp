@@ -3,6 +3,7 @@
 
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <optional>
 #include <vector>
 
@@ -175,4 +176,14 @@ TEST_CASE("the local time of the week") {
     CHECK(now.second >= 0);
     CHECK(now.second < 60);
     CHECK(now.unix > 1'700'000'000);
+}
+
+TEST_CASE("schedule: a follower wakes just past the next whole second") {
+    const auto wait = schedule::to_next_second();
+    CHECK(wait > std::chrono::milliseconds(0));
+    CHECK(wait <= std::chrono::milliseconds(1010));
+    const auto woke = std::chrono::system_clock::now() + wait;
+    const auto into = std::chrono::duration_cast<std::chrono::milliseconds>(woke.time_since_epoch()) % std::chrono::seconds(1);
+    CHECK(into >= std::chrono::milliseconds(5)); // past the second, not just before it
+    CHECK(into <= std::chrono::milliseconds(60));
 }

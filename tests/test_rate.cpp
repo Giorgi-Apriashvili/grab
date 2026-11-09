@@ -54,6 +54,7 @@ TEST_CASE("an idle bucket allows only a short burst") {
     rate::TokenBucket b;
     auto t = Clock::time_point{} + 100s;
     b.set_rate(MiB, t);
+    CHECK(b.take(0, t) == Clock::duration::zero()); // the first request: it fills from here
     t += 60s; // a minute idle banks at most a quarter second
     CHECK(b.take(MiB / 4, t) == Clock::duration::zero());
     CHECK(b.take(1, t) > Clock::duration::zero());
@@ -63,8 +64,9 @@ TEST_CASE("bytes moved elsewhere slow the rest down, and unlimited never waits")
     rate::TokenBucket b;
     auto t = Clock::time_point{} + 100s;
     b.set_rate(MiB, t);
+    CHECK(b.take(0, t) == Clock::duration::zero());
     t += 1s;
-    b.debit(2 * MiB, t); // an rclone batch moved 2 MiB meanwhile
+    b.debit(2 * MiB, t); // a stream's READs on their way as the limit came: 2 MiB
     const auto wait = b.take(64 * KiB, t);
     CHECK(std::chrono::duration<double>(wait).count() == doctest::Approx(2.0 - 0.25 + 0.0625).epsilon(0.01));
     b.set_rate(0, t);
@@ -75,6 +77,7 @@ TEST_CASE("a request asked for before the rate was lowered still passes, and is 
     rate::TokenBucket b;
     auto t = Clock::time_point{} + 100s;
     b.set_rate(6 * MiB, t);
+    CHECK(b.take(0, t) == Clock::duration::zero());
     t += 1s;
     CHECK(b.take(MiB, t) == Clock::duration::zero());
     b.set_rate(3 * MiB / 2, t); // the burst is 384 KiB now, less than one 1 MiB pipe read
@@ -86,9 +89,46 @@ TEST_CASE("a request asked for before the rate was lowered still passes, and is 
         if (wait == Clock::duration::zero()) moved += MiB;
         else t += wait;
     }
-    // The first piece passes at once (a full bucket, the rest on debt); every further MiB waits
-    // until it is paid for at 1.5 MiB/s.
-    CHECK(std::chrono::duration<double>(t - start).count() == doctest::Approx(9.0 / 1.5).epsilon(0.01));
+    // The lowered limit starts empty: the first piece waits for a full bucket (a quarter second),
+    // the rest on debt; every further MiB waits until it is paid for at 1.5 MiB/s.
+    CHECK(std::chrono::duration<double>(t - start).count() == doctest::Approx(0.25 + 9.0 / 1.5).epsilon(0.01));
+}
+
+TEST_CASE("a limit switched on or lowered starts empty and fills only from the next request") {
+    rate::TokenBucket b;
+    auto t = Clock::time_point{} + 100s;
+    // Switched on: what came unlimited leaves no credit, and none builds up before streams ask
+    // (dropped ones log in again meanwhile), so the first piece waits its own time.
+    b.set_rate(2 * MiB, t);
+    t += 3s;
+    auto wait = b.take(256 * KiB, t);
+    CHECK(std::chrono::duration<double>(wait).count() == doctest::Approx(0.125).epsilon(0.01));
+    t += wait;
+    CHECK(b.take(256 * KiB, t) == Clock::duration::zero());
+    // Running at the limit, then idle long enough to fill (a quarter second's worth)...
+    t += 2s;
+    // ...lowered: empty again, and still not filling until asked.
+    b.set_rate(MiB, t);
+    t += 1s;
+    wait = b.take(128 * KiB, t);
+    CHECK(std::chrono::duration<double>(wait).count() == doctest::Approx(0.125).epsilon(0.01));
+    // A debt is kept through a lowering (bytes still owed), and forgiven by an unlimited spell.
+    b.debit(MiB, t);
+    b.set_rate(MiB / 2, t);
+    wait = b.take(64 * KiB, t);
+    CHECK(std::chrono::duration<double>(wait).count() == doctest::Approx(2.125).epsilon(0.01));
+    b.set_rate(0, t);
+    b.set_rate(MiB, t);
+    wait = b.take(128 * KiB, t);
+    CHECK(std::chrono::duration<double>(wait).count() == doctest::Approx(0.125).epsilon(0.01));
+    // Raised: what is in the bucket stays, and it goes on filling.
+    t += wait;
+    CHECK(b.take(128 * KiB, t) == Clock::duration::zero());
+    t += 1s; // full: a quarter second of 1 MiB/s
+    b.set_rate(2 * MiB, t);
+    CHECK(b.take(256 * KiB, t) == Clock::duration::zero());
+    t += 250ms;
+    CHECK(b.take(512 * KiB, t) == Clock::duration::zero());
 }
 
 TEST_CASE("fair queuing serves busy flows in proportion to their weights") {
@@ -149,6 +189,19 @@ TEST_CASE("a folder's files are flows whose weights add up to the folder's: its 
     CHECK(tiny.add(1, 100, 0.25).start == doctest::Approx(400));
     CHECK(tiny.add(2, 100, -3).start == 0);
     CHECK(tiny.add(2, 100, 0).start == doctest::Approx(100));
+}
+
+TEST_CASE("a request given up costs its flow nothing") {
+    rate::FairQueue q;
+    const auto a = q.add(1, 100, 1);
+    const auto b = q.add(1, 100, 1); // starts where a finishes
+    CHECK(b.start == doctest::Approx(100));
+    q.cancel(b); // the flow's last: its next starts where b would have
+    CHECK(q.add(1, 100, 1).start == doctest::Approx(100));
+    q.cancel(a); // not the last: the flow's place stays
+    CHECK(q.add(1, 100, 1).start == doctest::Approx(200));
+    q.cancel(a); // twice: nothing
+    CHECK(q.add(1, 100, 1).start == doctest::Approx(300));
 }
 
 TEST_CASE("a flow that was idle gains no credit to burst with") {
@@ -213,4 +266,87 @@ TEST_CASE("waiting streams go on when the limit is lifted, and stop when asked")
     stop.request_stop();
     stopped.join();
     CHECK_FALSE(result.load());
+}
+
+TEST_CASE("the same rate again changes nothing; a new one is seen by its generation") {
+    rate::RateLimiter limiter;
+    const auto first = limiter.setting();
+    CHECK(first.rate == 0);
+    limiter.set_rate(0); // the speed schedule sets the rate every second
+    CHECK(limiter.generation() == first.generation);
+    limiter.set_rate(2 * MiB);
+    const auto on = limiter.setting();
+    CHECK(on.rate == 2 * MiB);
+    CHECK(on.generation != first.generation);
+    limiter.set_rate(2 * MiB);
+    CHECK(limiter.generation() == on.generation);
+}
+
+TEST_CASE("a request waiting without blocking keeps its place in line and is served whoever looks") {
+    // A stream with replies on their way puts its next READ in line (enqueue) and reads them, looking
+    // after each (ready). Others in line behind it don't wait for it to look: whoever waits serves
+    // every request at the head whose tokens are there.
+    rate::RateLimiter limiter;
+    limiter.set_rate(MiB); // 128 KiB an eighth of a second, starting empty
+    std::stop_source never;
+    const auto start = Clock::now();
+    const auto mine = limiter.enqueue(128 * KiB, 1, 2);
+    REQUIRE(mine != 0);
+    CHECK_FALSE(limiter.ready(mine)); // no tokens yet
+    std::atomic<double> other_took{0};
+    {
+        // Another flow's request behind it, blocking: served after mine, at about a quarter second.
+        std::jthread other([&] {
+            CHECK(limiter.acquire(128 * KiB, never.get_token(), 2, 2));
+            other_took = std::chrono::duration<double>(Clock::now() - start).count();
+        });
+    }
+    CHECK(other_took.load() == doctest::Approx(0.25).epsilon(0.3));
+    CHECK(limiter.ready(mine));       // served meanwhile, on its behalf
+    CHECK_FALSE(limiter.ready(mine)); // and spent
+
+    // With nothing on its way, a stream waits for its turn: about an eighth of a second each.
+    const auto next = limiter.enqueue(128 * KiB, 1, 2);
+    const auto from = Clock::now();
+    CHECK(limiter.wait(next, never.get_token()));
+    CHECK(std::chrono::duration<double>(Clock::now() - from).count() == doctest::Approx(0.125).epsilon(0.3));
+}
+
+TEST_CASE("a waiting request is given up at a new rate or a stop, and goes at once when the limit is lifted") {
+    rate::RateLimiter limiter;
+    limiter.set_rate(64 * KiB); // a second per 64 KiB
+    std::stop_source never;
+    // A new rate: the wait ends (false) so its stream looks again, its ticket given up.
+    const auto t = limiter.enqueue(64 * KiB, 1, 2);
+    std::atomic<int> result{-1};
+    {
+        std::jthread waiter([&] { result = limiter.wait(t, never.get_token()) ? 1 : 0; });
+        std::this_thread::sleep_for(100ms);
+        CHECK(result.load() == -1);
+        limiter.set_rate(32 * KiB);
+    }
+    CHECK(result.load() == 0);
+    CHECK_FALSE(limiter.ready(t)); // gone
+    // A stop the same.
+    const auto s = limiter.enqueue(32 * KiB, 1, 2);
+    std::stop_source stop;
+    {
+        std::jthread waiter([&] { result = limiter.wait(s, stop.get_token()) ? 1 : 0; });
+        std::this_thread::sleep_for(100ms);
+        stop.request_stop();
+    }
+    CHECK(result.load() == 0);
+    // Lifted: everyone in line goes at once, and nothing is put in line any more.
+    const auto u = limiter.enqueue(32 * KiB, 1, 2);
+    CHECK_FALSE(limiter.ready(u));
+    limiter.set_rate(0);
+    CHECK(limiter.ready(u));
+    CHECK(limiter.enqueue(MiB, 1, 2) == 0);
+    // A ticket given up lets the next in line go: no one waits behind a stream that left.
+    limiter.set_rate(64 * KiB);
+    const auto gone = limiter.enqueue(64 * KiB, 1, 2);
+    const auto behind = limiter.enqueue(64 * KiB, 2, 2);
+    std::this_thread::sleep_for(1100ms); // tokens for one
+    limiter.cancel(gone);
+    CHECK(limiter.ready(behind));
 }

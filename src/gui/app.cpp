@@ -2753,6 +2753,14 @@ void App::update_limit() {
 void App::set_rate(std::uint64_t bytes_per_s) {
     if (bytes_per_s == limiter_.rate()) return;
     limiter_.set_rate(bytes_per_s); // the streams follow the new rate at once
+    // The speeds shown start again from the change, so the new limit shows within about a second
+    // rather than fading in over five (speed::Meter::restart); the times left go on.
+    const auto now = speed::Clock::now();
+    total_meter_.restart(now, received_.load());
+    std::lock_guard lock(mutex_);
+    for (const auto& i : items_) {
+        if (i->metered) i->speed_meter.restart(now, i->received.load());
+    }
 }
 
 // What the status bar and Settings show: the limit that applies and why, when the schedule

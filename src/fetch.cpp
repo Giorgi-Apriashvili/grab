@@ -41,6 +41,19 @@ std::uint64_t chunk_size_for(std::uint64_t size, int streams, std::uint64_t floo
     return std::clamp(per_stream, std::min(floor, max_chunk), max_chunk);
 }
 
+std::uint64_t limited_read(std::uint64_t rate, int streams) {
+    return std::clamp<std::uint64_t>(rate / 8 / static_cast<std::uint64_t>(std::max(streams, 1)),
+                                     std::uint64_t{32} * 1024, sftp::max_read);
+}
+
+std::uint64_t limited_in_flight(std::uint64_t rate, int streams) {
+    return std::max(2 * limited_read(rate, streams), rate / 4 / static_cast<std::uint64_t>(std::max(streams, 1)));
+}
+
+std::uint64_t limited_keep(std::uint64_t rate, int streams) {
+    return std::max(limited_in_flight(rate, streams), std::uint64_t{2} * sftp::max_read);
+}
+
 std::uint64_t State::bytes_done() const {
     std::uint64_t total = 0;
     for (const auto& r : ranges) total += r.done;
@@ -815,6 +828,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
         bool write_failed = false;
         bool yielded = false;      // gave the connection to another download mid-range
         bool gave_way = false;     // over its part of the folder's connections: one for another file
+        bool cut = false;          // a limit switched on or lowered below what it had on its way
         std::optional<budget::Failure> failure; // it ended in an error: refused, fatal or other
         std::string error;
     };
@@ -864,8 +878,20 @@ Result run(const Download& d, Connections& connections, const std::function<void
 
     // Range `i` from `offset` (its first byte not on disk): a connection borrowed from the pool,
     // READs of exact bounds pipelined (grab_depth in flight), each asked for up to the range's end
-    // as it is then (a split for an idle stream takes only bytes not asked for yet), the speed
-    // limit taken before each READ so the network follows it, data written in order.
+    // as it is then (a split for an idle stream takes only bytes not asked for yet), data written
+    // in order.
+    //
+    // Under a speed limit, READs of an eighth of a second of its part, limited_in_flight of them
+    // on their way, each sent right after its tokens so the network follows the limit. The next
+    // READ's place in the limiter's line is kept while the replies of those on their way are read
+    // (RateLimiter::enqueue, ready after each reply), so no reply waits unread through a token
+    // turn and the data is written as evenly as it comes; with nothing on its way, it waits.
+    //
+    // The limit is looked at after each reply. Switched on, or lowered, while the stream has more
+    // on its way than the new limit lets it keep (limited_keep; 16 MiB a connection at full speed,
+    // which came at full speed for seconds after the switch: nothing calls back a READ), the
+    // stream ends at once and its connection is dropped (`a.cut`); the range goes on from its bytes over a new login. With
+    // less on its way, that is charged to the new rate (RateLimiter::debit).
     auto sftp_range = [&](std::size_t i, std::uint64_t offset, Attempt& a) {
         std::optional<ssh::Pool::Lease> lease;
         try {
@@ -938,47 +964,89 @@ Result run(const Download& d, Connections& connections, const std::function<void
                     }
                 });
             };
-            // Under a speed limit, READs no bigger than an eighth of a second's worth, so data
-            // comes evenly; otherwise as big as servers take.
-            auto read_size = [&]() -> std::uint64_t {
-                const std::uint64_t rate = d.limiter != nullptr ? d.limiter->rate() : 0;
-                return rate == 0 ? sftp::max_read : std::clamp<std::uint64_t>(rate / 8, 32 * 1024, sftp::max_read);
+            // The next READ's length from `next`, up to `size` and the range's end as it is now (0:
+            // nothing left to ask for), its bytes this stream's from then on (asked_to).
+            auto next_length = [&](std::uint64_t size) -> std::uint64_t {
+                std::lock_guard lock(m);
+                const Range& r = state.ranges[i];
+                const std::uint64_t end = r.start + r.length;
+                if (next >= end) return 0;
+                const std::uint64_t n = std::min(size, end - next);
+                asked_to[i] = next + n;
+                return n;
             };
+            // The limit as this stream last saw it, and the next READ's place in the limiter's
+            // line while its tokens come; given up on every way out.
+            rate::RateLimiter::Setting seen = d.limiter != nullptr ? d.limiter->setting() : rate::RateLimiter::Setting{};
+            rate::Place place(d.limiter);
             for (;;) {
-                // Under a limit, one READ at a time: it waits for its tokens (its turn among the
-                // download's other streams), and a reply already here would otherwise wait unread
-                // through the next turns, arriving on time but written in bursts. One READ is an
-                // eighth of a second of the limit's worth, so a connection still carries it all.
-                // While Play on this server warms up or waits for bytes, its depth (urgent).
-                const int depth = d.limiter != nullptr && d.limiter->rate() > 0 ? 1 : connections.read_depth(d.server, grab_depth);
-                while (asking && in_flight < depth && !token.stop_requested()) {
-                    std::uint64_t n = 0;
-                    {
-                        std::lock_guard lock(m);
-                        const Range& r = state.ranges[i];
-                        const std::uint64_t end = r.start + r.length;
-                        if (next < end) {
-                            n = std::min(read_size(), end - next);
-                            asked_to[i] = next + n;
+                if (d.limiter != nullptr) {
+                    if (const auto now = d.limiter->setting(); now.generation != seen.generation) {
+                        place.drop(); // asked for at the old rate
+                        const bool tighter = now.rate > 0 && (seen.rate == 0 || now.rate < seen.rate);
+                        seen = now;
+                        if (tighter && bytes_in_flight > limited_keep(seen.rate, holding.load())) {
+                            a.cut = true;
+                            asking = false;
+                            break;
                         }
+                        if (tighter && bytes_in_flight > 0) d.limiter->debit(bytes_in_flight);
                     }
-                    if (n == 0) {
-                        asking = false;
-                        break;
-                    }
-                    // A folder's file works out its weight under the folder's lock: only while a
-                    // limit is on.
-                    if (d.limiter != nullptr && d.limiter->rate() > 0 &&
-                        !d.limiter->acquire(n, token, rate::flow_of(d.id, d.member),
-                                            d.flow_weight ? d.flow_weight() : static_cast<double>(weight()))) {
-                        break;
-                    }
-                    send(next, static_cast<std::uint32_t>(n));
-                    next += n;
                 }
-                if (token.stop_requested() || in_flight == 0 || (stepped_aside && bytes_in_flight > hand_over_max)) break;
-                c.pump();
+                // While Play on this server warms up or waits for bytes, its depth (urgent).
+                const int depth = connections.read_depth(d.server, grab_depth);
+                if (seen.rate == 0) {
+                    while (asking && in_flight < depth && !token.stop_requested()) {
+                        const std::uint64_t n = next_length(sftp::max_read);
+                        if (n == 0) {
+                            asking = false;
+                            break;
+                        }
+                        send(next, static_cast<std::uint32_t>(n));
+                        next += n;
+                    }
+                } else {
+                    const int streams = holding.load();
+                    const std::uint64_t most = limited_in_flight(seen.rate, streams);
+                    while (asking && in_flight < depth && !token.stop_requested()) {
+                        if (place.ticket == 0) {
+                            const std::uint64_t n = next_length(limited_read(seen.rate, streams));
+                            if (n == 0) {
+                                asking = false;
+                                break;
+                            }
+                            if (in_flight > 0 && bytes_in_flight + n > most) break;
+                            // A folder's file works out its weight under the folder's lock.
+                            place.n = n;
+                            place.ticket = d.limiter->enqueue(
+                                n, rate::flow_of(d.id, d.member), d.flow_weight ? d.flow_weight() : static_cast<double>(weight()));
+                            if (place.ticket == 0) { // unlimited since: seen at the next look
+                                send(next, static_cast<std::uint32_t>(n));
+                                next += n;
+                                continue;
+                            }
+                        }
+                        // Its tokens are there now, or (with nothing on its way to read) it waits for
+                        // them; else replies are read meanwhile and it looks again after each.
+                        if (!d.limiter->ready(place.ticket)) {
+                            if (in_flight > 0) break;
+                            const bool served = d.limiter->wait(place.ticket, token);
+                            if (!served) { // a new rate, or a stop: given up
+                                place.ticket = 0;
+                                break;
+                            }
+                        }
+                        place.ticket = 0;
+                        send(next, static_cast<std::uint32_t>(place.n));
+                        next += place.n;
+                        c.flush(); // on its way at once, right after its tokens
+                    }
+                }
+                if (token.stop_requested() || (in_flight == 0 && !asking) || (stepped_aside && bytes_in_flight > hand_over_max)) break;
+                if (in_flight > 0) c.pump();
+                // else: waiting for its tokens ended with a new rate, looked at on the next pass
             }
+            place.drop();
             if (token.stop_requested() || in_flight > 0) {
                 lease->broken(); // its replies still on the way: closed, not waited for
                 return;
@@ -1004,6 +1072,17 @@ Result run(const Download& d, Connections& connections, const std::function<void
     };
 
     auto stream = [&] {
+        // A stream dropped for a new limit (Attempt::cut) still counts as reading while it logs
+        // in again, as its file would show waiting for that moment (Download::on_reading): until
+        // its next range starts, or it waits or ends.
+        bool carried = false;
+        auto uncarry = [&] {
+            if (std::exchange(carried, false) && d.on_reading) d.on_reading(-1, false);
+        };
+        struct Uncarry {
+            decltype(uncarry)& f;
+            ~Uncarry() { f(); }
+        } uncarry_at_end{uncarry};
         for (;;) {
             // No more than its part of a folder's connections: a place under it is taken before the
             // connection, so its streams starting together can't all pass; else it waits.
@@ -1012,6 +1091,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
             while (h < cap && !holding.compare_exchange_weak(h, h + 1)) {
             }
             if (h >= cap) {
+                uncarry();
                 std::unique_lock lock(m);
                 wake.wait_until(lock, token, Clock::now() + std::chrono::milliseconds(250), [] { return false; });
                 if (token.stop_requested()) return;
@@ -1032,6 +1112,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 auto pick = token.stop_requested() ? std::nullopt : next_range(retry_at);
                 if (!pick) {
                     lock.unlock();
+                    uncarry();
                     connections.release(d.server, d.id);
                     --holding;
                     if (!retry_at || token.stop_requested()) return; // nothing left for this stream
@@ -1050,20 +1131,25 @@ Result run(const Download& d, Connections& connections, const std::function<void
             }
             {
                 // Reading on its connection for as long as sftp_range goes (Download::on_reading),
-                // and whether every byte of the file was in as it stopped.
+                // and whether every byte of the file was in as it stopped; one carried over from a
+                // cut is taken over, and a cut carries it on.
                 struct Reading {
                     const Download& d;
+                    bool& carried;
                     bool all_in = false;
-                    explicit Reading(const Download& dl) : d(dl) {
-                        if (d.on_reading) d.on_reading(+1, false);
+                    bool carry = false;
+                    Reading(const Download& dl, bool& c) : d(dl), carried(c) {
+                        if (!std::exchange(carried, false) && d.on_reading) d.on_reading(+1, false);
                     }
                     ~Reading() {
-                        if (d.on_reading) d.on_reading(-1, all_in);
+                        if (carry) carried = true;
+                        else if (d.on_reading) d.on_reading(-1, all_in);
                     }
                     Reading(const Reading&) = delete;
                     Reading& operator=(const Reading&) = delete;
-                } reading(d);
+                } reading(d, carried);
                 sftp_range(i, offset, a);
+                reading.carry = a.cut && !token.stop_requested();
                 if (d.on_reading) {
                     std::lock_guard lock(m);
                     reading.all_in = state.complete();
@@ -1084,7 +1170,9 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 inner.request_stop();
                 return;
             }
-            if (a.yielded || a.gave_way) continue; // not a failure; the range goes on from its bytes
+            if (a.got > 0) tries[i] = 0; // it made progress: only repeated failures in a row count
+            // Not a failure; the range goes on from its bytes (after a cut, over a new login).
+            if (a.yielded || a.gave_way || a.cut) continue;
             if (a.failure == budget::Failure::fatal) {
                 error = a.error;
                 inner.request_stop();
@@ -1103,7 +1191,6 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 not_before[i] = now + std::chrono::seconds(1); // also while others' data keeps coming
                 continue;
             }
-            if (a.got > 0) tries[i] = 0; // it made progress: only repeated failures in a row count
             if (++tries[i] > max_retries) {
                 error = a.error.empty() ? "the server sent less data than expected; was the file changed?" : a.error;
                 inner.request_stop();
@@ -1128,9 +1215,11 @@ Result run(const Download& d, Connections& connections, const std::function<void
     }
 
     // Report progress and save state until the streams are done. Its speed: the bytes that came,
-    // over about the last 5 s.
+    // over about the last 5 s, started again at a new limit so that shows within about a second
+    // (speed::Meter::restart).
     speed::Meter meter;
     meter.sample(Clock::now(), 0);
+    std::uint64_t limit_seen = d.limiter != nullptr ? d.limiter->generation() : 0;
     auto last_save = Clock::now();
     auto snapshot = [&] {
         std::lock_guard lock(m);
@@ -1160,6 +1249,12 @@ Result run(const Download& d, Connections& connections, const std::function<void
         {
             std::lock_guard lock(m);
             bytes = state.bytes_done();
+        }
+        if (d.limiter != nullptr) {
+            if (const auto g = d.limiter->generation(); g != limit_seen) {
+                limit_seen = g;
+                meter.restart(now, received.load());
+            }
         }
         meter.sample(now, received.load());
         Progress p;

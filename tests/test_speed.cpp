@@ -101,6 +101,145 @@ TEST_CASE("speed: a burst leaving the average fades out over two seconds instead
     CHECK(rates.back() == doctest::Approx(MiB).epsilon(0.001));
 }
 
+TEST_CASE("speed: restarted for a new limit, it shows the new speed within about a second, the old one until then") {
+    speed::Meter m;
+    speed::Meter plain; // the same bytes, never restarted
+    double t = 0;
+    double bytes = 0;
+    auto run = [&](double rate, double seconds) {
+        for (double end = t + seconds; t < end - 1e-9;) {
+            t += 0.25;
+            bytes += rate * 0.25;
+            m.sample(at(t), static_cast<std::uint64_t>(bytes));
+            plain.sample(at(t), static_cast<std::uint64_t>(bytes));
+        }
+    };
+    m.sample(at(0), 0);
+    plain.sample(at(0), 0);
+    run(11 * MiB, 10);
+    REQUIRE(m.rate() == doctest::Approx(11 * MiB).epsilon(0.001));
+    const auto since = m.since();
+    REQUIRE(since);
+    // Switched on at 2 MiB/s: the last replies before the connections drop, nothing for 0.75 s
+    // while they log in again, then 2 MiB/s.
+    m.restart(at(t), static_cast<std::uint64_t>(bytes));
+    run(1.2 * MiB, 0.25);
+    CHECK(m.rate() == doctest::Approx(11 * MiB).epsilon(0.001)); // held: neither the new speed yet nor 0
+    run(0, 0.75);
+    CHECK(m.rate() == doctest::Approx(11 * MiB).epsilon(0.001));
+    run(2 * MiB, 0.25);
+    CHECK(m.rate() == doctest::Approx(11 * MiB).epsilon(0.001));
+    run(2 * MiB, 0.25);
+    // 1.5 s after the switch: the new speed, what came before the drop left out; the 5 s average
+    // would still read about 7.
+    CHECK(m.rate() == doctest::Approx(2 * MiB).epsilon(0.001));
+    MESSAGE("never restarted: ", plain.rate() / MiB, " MiB/s");
+    CHECK(plain.rate() > 5 * MiB);
+    CHECK(m.since() == since); // the time left goes on
+    run(2 * MiB, 5);
+    CHECK(m.rate() == doctest::Approx(2 * MiB).epsilon(0.001));
+
+    // Raised to 6 MiB/s with no gap: shown after half a second.
+    m.restart(at(t), static_cast<std::uint64_t>(bytes));
+    run(6 * MiB, 0.25);
+    CHECK(m.rate() == doctest::Approx(2 * MiB).epsilon(0.001));
+    run(6 * MiB, 0.25);
+    CHECK(m.rate() == doctest::Approx(6 * MiB).epsilon(0.001));
+    run(6 * MiB, 5);
+
+    // Lowered to a trickle with gaps (a 32 KiB READ every half second): shown within a second too,
+    // then its usual rules (a gap counts).
+    m.restart(at(t), static_cast<std::uint64_t>(bytes));
+    auto step = [&](double got) {
+        t += 0.25;
+        bytes += got;
+        m.sample(at(t), static_cast<std::uint64_t>(bytes));
+    };
+    step(32 * KiB);
+    CHECK(m.rate() == doctest::Approx(6 * MiB).epsilon(0.001));
+    step(0);
+    CHECK(m.rate() == doctest::Approx(6 * MiB).epsilon(0.001));
+    step(32 * KiB);
+    CHECK(m.rate() == doctest::Approx(64 * KiB / 0.75).epsilon(0.001));
+    for (int k = 0; k < 12; ++k) {
+        step(0);
+        step(32 * KiB);
+    }
+    CHECK(m.rate() == doctest::Approx(64 * KiB).epsilon(0.05));
+}
+
+TEST_CASE("speed: restarted, with no bytes after it, it reads 0 again by meter_full") {
+    for (const double first : {0.0, 0.25}) { // nothing at all; or a quarter second (the gap rule's way)
+        CAPTURE(first);
+        speed::Meter m;
+        double t = 0;
+        double bytes = 0;
+        m.sample(at(0), 0);
+        for (; t < 10 - 1e-9;) {
+            t += 0.25;
+            bytes += 11 * MiB * 0.25;
+            m.sample(at(t), static_cast<std::uint64_t>(bytes));
+        }
+        REQUIRE(m.rate() == doctest::Approx(11 * MiB).epsilon(0.001));
+        const double restarted = t;
+        m.restart(at(t), static_cast<std::uint64_t>(bytes));
+        for (; t < restarted + first - 1e-9;) {
+            t += 0.25;
+            bytes += 2 * MiB * 0.25;
+            m.sample(at(t), static_cast<std::uint64_t>(bytes));
+        }
+        // Logging in again fails: the download waits out its backoff, still running.
+        for (; t < restarted + 3.75 - 1e-9;) {
+            t += 0.25;
+            m.sample(at(t), static_cast<std::uint64_t>(bytes));
+            CHECK(m.rate() == doctest::Approx(11 * MiB).epsilon(0.001)); // held, not 0 in between
+        }
+        for (; t < restarted + first + 5 - 1e-9;) {
+            t += 0.25;
+            m.sample(at(t), static_cast<std::uint64_t>(bytes));
+        }
+        CHECK(m.rate() == 0);
+        CHECK(!m.since());
+    }
+}
+
+TEST_CASE("speed: restarted, a first burst leaves the shown speed within about a second") {
+    speed::Meter m;
+    double t = 0;
+    double bytes = 0;
+    auto run = [&](double rate, double seconds) {
+        for (double end = t + seconds; t < end - 1e-9;) {
+            t += 0.25;
+            bytes += rate * 0.25;
+            m.sample(at(t), static_cast<std::uint64_t>(bytes));
+        }
+    };
+    m.sample(at(0), 0);
+    run(6 * MiB, 10);
+    // Lowered to 1 MiB/s: 1.5 MiB on its way comes in the first quarter second, then the debt
+    // it left holds the bytes back for a while, then 1 MiB/s.
+    m.restart(at(t), static_cast<std::uint64_t>(bytes));
+    const double changed = t;
+    run(6 * MiB, 0.25);
+    run(0.25 * MiB, 0.75);
+    run(1 * MiB, 1);
+    CHECK(t == doctest::Approx(changed + 2));
+    CHECK(m.rate() == doctest::Approx(1 * MiB).epsilon(0.001)); // the drain and the debt are out of its window
+    run(1 * MiB, 3);
+    CHECK(m.rate() == doctest::Approx(1 * MiB).epsilon(0.001));
+    // A connection gone quiet in its first seconds reads 0, its time left kept.
+    m.restart(at(t), static_cast<std::uint64_t>(bytes));
+    run(1 * MiB, 0.5);
+    REQUIRE(m.rate() == doctest::Approx(1 * MiB).epsilon(0.001));
+    run(0, 1.25);
+    CHECK(m.rate() == 0);
+    CHECK(m.since());
+    run(1 * MiB, 0.5);
+    CHECK(m.rate() == doctest::Approx(0.5 * MiB).epsilon(0.001)); // half of its last second
+    run(1 * MiB, 5);
+    CHECK(m.rate() == doctest::Approx(1 * MiB).epsilon(0.001));
+}
+
 TEST_CASE("speed: a counter that goes back counts nothing, and samples out of order are dropped") {
     speed::Meter m;
     m.sample(at(0), 1000);

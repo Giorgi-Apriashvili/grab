@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <ctime>
 #include <format>
@@ -170,6 +171,12 @@ Now local_now() {
     n.second = std::min(tm.tm_sec, 59);                                // 60 in a leap second
     n.unix = static_cast<std::int64_t>(t);
     return n;
+}
+
+std::chrono::milliseconds to_next_second() {
+    using namespace std::chrono;
+    const auto into = duration_cast<milliseconds>(system_clock::now().time_since_epoch()) % seconds(1);
+    return seconds(1) - into + milliseconds(10);
 }
 
 } // namespace grab::schedule

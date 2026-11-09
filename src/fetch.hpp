@@ -45,6 +45,21 @@ inline constexpr std::uint64_t min_split = std::uint64_t{4} << 20;
 inline constexpr std::uint64_t min_split_grab = std::uint64_t{1} << 20;
 // READs grab's engine keeps in flight per connection (a Storage Box connection's speed follows it).
 inline constexpr int grab_depth = 64;
+// Under a speed limit of `rate` bytes/s (> 0), on one of `streams` connections reading under it:
+// READs of an eighth of a second of its part (32 KiB up to the largest READ), so data comes evenly.
+[[nodiscard]] std::uint64_t limited_read(std::uint64_t rate, int streams);
+// ...and the most such a connection keeps on its way, each READ asked for after its tokens: a
+// quarter second of the limit between them, at least two READs, so a connection carries its part
+// over a round trip of up to a quarter second (one READ at a time reached only about 2 MiB/s per
+// connection on Main, whatever the limit). No more: connections that just logged in get their
+// replies late at first (TCP's slow start) while their READs go on being asked for, and what they
+// have on their way then comes all at once, above the limit.
+[[nodiscard]] std::uint64_t limited_in_flight(std::uint64_t rate, int streams);
+// A limit switched on or lowered while a connection has more than this on its way drops it (its
+// range goes on over a new login), as nothing can call back READs already asked for; with less, it
+// is charged to the new rate. At least two of the largest READs: a new login costs about a second
+// with nothing coming, more than that much costs at a lowered limit.
+[[nodiscard]] std::uint64_t limited_keep(std::uint64_t rate, int streams);
 // A stream stepping aside with at most this much on its way waits for it (and writes it) and hands
 // its connection to the pool, where Play or another download takes it without a login: about a
 // second on a Storage Box connection (1.3-2.5 MiB/s), less than its login (1.3-3.5 s). More is

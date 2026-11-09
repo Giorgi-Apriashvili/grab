@@ -3,10 +3,11 @@
 // The speed schedule: rules that cap the download speed at certain times of the week. They are
 // set in grab's window and followed by the window and the `grab` command. In the window, a
 // change of the speed limit made while a rule applies holds until the schedule's next change.
-// Pure, apart from local_now().
+// Pure, apart from local_now() and to_next_second().
 
 #include "json.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -94,5 +95,8 @@ struct Now {
     std::int64_t unix = 0;
 };
 [[nodiscard]] Now local_now();
+// How long until just past the next whole second of the clock local_now() reads: a follower that
+// wakes then sees a rule's minute begin within milliseconds, not up to a second late.
+[[nodiscard]] std::chrono::milliseconds to_next_second();
 
 } // namespace grab::schedule

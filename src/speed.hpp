@@ -22,6 +22,9 @@ inline constexpr std::chrono::milliseconds meter_full{4000};
 inline constexpr std::chrono::milliseconds meter_gone{6000};
 // No speed until the samples with bytes span this long.
 inline constexpr std::chrono::milliseconds meter_least{500};
+// For meter_full after a restart (Meter::restart), the speed is what came over about the last this
+// long, so it follows the new limit's first seconds closely.
+inline constexpr std::chrono::milliseconds meter_settle{1000};
 
 // The speed of a counter of bytes that came (it only goes up), sampled now and then. It starts at
 // the first bytes, and again once its window holds none: the time spent connecting, or paused,
@@ -30,6 +33,18 @@ class Meter {
 public:
     // The counter now. The first sample only starts the meter.
     void sample(Clock::time_point now, std::uint64_t total);
+    // A new speed limit applies (chunk J): the window starts again at `now` (the counter then
+    // `total`), so the new speed shows once the bytes after it span meter_least, about a second
+    // later, rather than fading in over meter_gone. Until then rate() stays what it was (no 0 in
+    // between), as it does while its newest sample brought nothing, and since() stays (the time
+    // left goes on). Half a second without bytes meanwhile starts it again at the next ones:
+    // streams dropped for the new limit log in again, and what came just before they dropped is
+    // not the new speed. Once it shows, until meter_full after the restart, it is the speed of
+    // about the last meter_settle (0 when nothing came in it): what came at first (replies already
+    // on their way, connections catching up after logging in again) leaves it within a second
+    // rather than weighing on it for five. Its usual rules again after that; if it never showed
+    // and no bytes came meanwhile, it starts again at the next ones (rate 0, no since()).
+    void restart(Clock::time_point now, std::uint64_t total);
     // Bytes per second, as of the last sample; 0 before meter_least of samples with bytes.
     [[nodiscard]] double rate() const { return rate_; }
     // When the bytes it measures started coming (the sample before the first of them); nullopt
@@ -45,6 +60,8 @@ private:
     std::deque<Step> steps_;
     std::optional<Clock::time_point> at_;
     std::optional<Clock::time_point> since_;
+    std::optional<Clock::time_point> restarted_; // then, up to meter_full ago
+    bool holding_ = false;                       // restarted, and the old rate shown until the new one shows
     std::uint64_t total_ = 0;
     double rate_ = 0;
 };
