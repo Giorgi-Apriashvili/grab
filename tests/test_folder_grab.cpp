@@ -1095,7 +1095,9 @@ TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the sm
     // The schedule can turn a limit on in the middle of a folder. The small-file workers read the
     // rate at every pass and always count as the limiter's members, so they take tokens from then
     // on rather than at their next turn (which can be the rest of the folder); what they had on
-    // their way counts against it (or ends their turns: the next test).
+    // their way counts against it (or ends their turns: the next test). Here how much a worker has
+    // on its way at the switch depends on the machine's timing, about fetch::limited_keep, so
+    // either can happen: a worker kept goes on at once and pays for it, one cut logs in again.
     Tree t;
     t.dir("/data");
     for (int i = 0; i < 2000; ++i) t.file(std::format("/data/s{:04}.bin", i), test::pattern(16 * 1024 + i));
@@ -1110,25 +1112,39 @@ TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the sm
         came.emplace_back(Tree::Clock::now(), n);
     };
     { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    auto came_total = [&] {
+        std::lock_guard lock(came_m);
+        std::uint64_t n = 0;
+        for (const auto& c : came) n += c.second;
+        return n;
+    };
+    constexpr std::uint64_t limit = 1u << 20;
     std::stop_source stop;
     const auto start = Tree::Clock::now();
     Tree::Clock::time_point switched;
+    int logins_then = 0;
     {
         std::jthread run([&] { folder::run(r.job, r.tree, r.m, stop.get_token()); });
+        // Both workers well under way (a busy machine's logins can take longer than half a second).
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        for (int i = 0; i < 2000 && came_total() < (1u << 20); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        logins_then = t.logins.load();
         switched = Tree::Clock::now();
-        limiter.set_rate(1u << 20);
-        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        limiter.set_rate(limit);
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
         stop.request_stop();
     }
+    const int cut = t.logins.load() - logins_then; // workers that logged in again
     std::uint64_t before = 0; // READs asked before the switch: it ran unlimited
-    std::uint64_t asked = 0;  // from 0.5 s to 2.5 s after it, past the bucket's first burst
+    // From 1.25 s to 3.25 s after it: a kept worker's debt (at most limited_keep a worker, a second
+    // at this limit) is paid by then, and a cut one has logged in again.
+    std::uint64_t asked = 0;
     {
         std::lock_guard lock(t.mutex);
         for (const auto& a : t.asks) {
             if (a.at >= start && a.at < switched) before += a.length;
             const auto when = a.at - switched;
-            if (when >= std::chrono::milliseconds(500) && when < std::chrono::milliseconds(2500)) asked += a.length;
+            if (when >= std::chrono::milliseconds(1250) && when < std::chrono::milliseconds(3250)) asked += a.length;
         }
     }
     std::uint64_t first = 0; // what came in the first half second after the switch
@@ -1139,11 +1155,14 @@ TEST_CASE("grab engine folders: a speed limit switched on mid-run reaches the sm
         }
     }
     const double mibps = static_cast<double>(asked) / 2.0 / (1 << 20);
-    MESSAGE("before the switch ", before, " bytes; in its first half second ", first, " bytes; after it ", mibps, " MiB/s");
+    MESSAGE("before the switch ", before, " bytes; in its first half second ", first, " bytes (", cut,
+            " cut); after it ", mibps, " MiB/s");
     CHECK(before > 0);
     CHECK(mibps > 0.9);
     CHECK(mibps < 1.1);
-    CHECK(first <= (768u << 10)); // the limit's half second, and not what was on its way
+    // What the two workers may keep on their way and nothing asked past it: the bucket starts empty
+    // and pays what they kept first. Unlimited, each has up to 8 MiB on its way.
+    CHECK(first <= 2 * fetch::limited_keep(limit, 1) + (64u << 10));
 }
 
 TEST_CASE("grab engine folders: small files: a limit switched on below what a connection has on its way drops it; its files come whole over a new login") {
