@@ -5735,7 +5735,12 @@ $('#limit-on').addEventListener('change', (ev) => {
   state.limitOn = ev.target.checked;
   renderLimit();
   sendLimit();
-  if (state.limitOn) $('#limit-value').focus();
+  // The box focused with its text selected, so a speed typed replaces the one shown (with the
+  // caret at its start, 6 typed over 8 made 68).
+  if (state.limitOn) {
+    $('#limit-value').focus();
+    $('#limit-value').select();
+  }
 });
 $('#limit-value').addEventListener('input', onLimitTyped);
 // The window losing focus (Alt+Tab, minimized) blurs the box too but leaves it the active element:

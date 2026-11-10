@@ -1124,6 +1124,7 @@ try {
     echo();
     check('K: "Limit set", the box flashing', badgeView(), [true, '✓ Limit set · 4 MiB/s', 'Speed limit set to 4 MiB/s', true, false]);
     check('K: ... the box focused by the switch', document.activeElement === box, true);
+    check('K: ... its text selected, so a speed typed replaces it', [box.value, box.selectionStart, box.selectionEnd], ['4', 0, 1]);
     type('6');
     check('K: typing then: the badge gives way to "Enter to set", nothing sent', [badgeView(), wrap.classList.contains('pending'), tip.hidden, limits()],
       [idle, true, false, [[false, 4], [true, 4]]]);
