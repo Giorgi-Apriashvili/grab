@@ -19,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -43,6 +44,9 @@ struct FakePool {
     std::map<int, int> breaks;                     // login -> the read on which its stream breaks
     std::optional<budget::Failure> login_fails;    // every login fails so
     std::atomic<int> closed{0};                    // logins up to this one the server has closed
+    // > 0: no session answers a READ until this many logins happened (a Play stream's connections
+    // all find work as they log in, however late their threads run on a busy machine); 20 s at most.
+    int reads_wait_for_logins = 0;
     bool shared = false; // the sessions read `files` itself, not a copy each (big files; not changed meanwhile)
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
@@ -71,6 +75,14 @@ struct FakePool {
             server.max_data = f.max_data;
             server.reverse = f.reverse;
             server.slice = f.slice;
+            if (f.reads_wait_for_logins > 0) {
+                server.on_read = [&f](const std::string&, std::uint32_t) {
+                    const auto until = std::chrono::steady_clock::now() + 20s;
+                    while (f.logins < f.reads_wait_for_logins && std::chrono::steady_clock::now() < until) {
+                        std::this_thread::sleep_for(1ms);
+                    }
+                };
+            }
             client.start();
         }
         ~Session() override {

@@ -4,6 +4,7 @@
 #include "fake_sftp.hpp"
 #include "fetch.hpp"
 #include "rate.hpp"
+#include "speed.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
@@ -12,11 +13,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stop_token>
 #include <string>
@@ -48,6 +51,8 @@ struct Fake {
     std::set<int> sftp_fails;          // the logins (from 1) that can't start SFTP
     int no_sftp_from = 0;              // from this login on, the server refuses SFTP (0: never)
     std::atomic<int> closed{0};        // logins up to this one the server has closed: their reads break
+    // Every READ's length, when a session's server got it.
+    std::vector<std::pair<std::chrono::steady_clock::time_point, std::uint32_t>> asks;
 
     struct Session : ssh::Session {
         Session(Fake& f, int n, bool fails, bool refuses)
@@ -58,6 +63,10 @@ struct Fake {
             server.slice = f.slice;
             server.delay = f.delay;
             server.latency = f.latency;
+            server.on_read = [&f](const std::string&, std::uint32_t n) {
+                std::lock_guard lock(f.mutex);
+                f.asks.emplace_back(std::chrono::steady_clock::now(), n);
+            };
             client.start();
         }
         ~Session() override {
@@ -605,11 +614,19 @@ TEST_CASE("grab engine: a limit switched on mid-download drops the connections w
 }
 
 TEST_CASE("grab engine: a limit lowered below what a connection has on its way charges that to the new rate; the connection stays, the speed shows within a second and a half") {
-    // 8 -> 6 MiB/s on one connection over a 60 ms round trip: about half a MiB on its way (at most
-    // about 1 MiB), under the new allowance (1.5 MiB), so it stays; those bytes come at once, and
-    // count against the new rate, so the first second brings no more than the new limit's second.
+    // About 2 -> 1 MiB/s on one connection over a 60 ms round trip: about a tenth of a MiB on its
+    // way, at most what the old limit lets a stream have (fetch::limited_in_flight, which a stream
+    // whose thread waited for the CPU fills at once with the tokens it missed), within what the new
+    // one lets it keep (fetch::limited_keep), so it stays; those bytes come at once, and what is
+    // still on its way when the stream looks at the limit (after a reply) counts against the new
+    // rate, so the first second brings no more than the new limit's second and what came before
+    // that look. (8 -> 6 MiB/s let it have 2 MiB and keep 1.5: on a busy machine it was dropped now
+    // and then.)
+    constexpr std::uint64_t before = 8 * sftp::max_read; // the most whose in flight is two READs
+    constexpr std::uint64_t after = std::uint64_t{1} << 20;
+    REQUIRE(fetch::limited_in_flight(before, 1) <= fetch::limited_keep(after, 1));
     Fake fake;
-    const std::string content = test::pattern(32u << 20);
+    const std::string content = test::pattern(16u << 20); // more than 4 s at 2 and 3.7 s at 1 MiB/s
     fake.files["/data/f.bin"] = content;
     fake.latency = 60ms;
     Dir dir("limit-lower");
@@ -617,43 +634,104 @@ TEST_CASE("grab engine: a limit lowered below what a connection has on its way c
     fetch::Connections connections;
     connections.configure("Fake", 1);
     rate::RateLimiter limiter;
-    limiter.set_rate(8u << 20);
+    limiter.set_rate(before);
     auto d = download(dir.path / "f.bin", pool);
     d.limiter = &limiter;
     Arrivals came;
     d.on_received = [&](std::uint64_t n) { came.add(n); };
     std::mutex shown_m;
-    std::vector<std::pair<Arrivals::Clock::time_point, double>> shown; // Progress::speed
+    struct Shown {
+        Arrivals::Clock::time_point at;
+        double speed = 0;       // Progress::speed, bytes per second
+        std::uint64_t came = 0; // the bytes that had come by then
+    };
+    std::vector<Shown> shown;
     const auto on_progress = [&](const fetch::Progress& p) {
+        const auto now = Arrivals::Clock::now();
+        const auto total = came.total();
         std::lock_guard lock(shown_m);
-        shown.emplace_back(Arrivals::Clock::now(), p.speed);
+        shown.push_back(Shown{.at = now, .speed = p.speed, .came = total});
     };
     fetch::Result r;
     Arrivals::Clock::time_point lowered;
+    Arrivals::Clock::time_point set; // set_rate returned
     {
         std::jthread running([&] { r = fetch::run(d, connections, on_progress, {}); });
-        std::this_thread::sleep_for(2000ms);
+        std::this_thread::sleep_for(4000ms); // so a 5 s average after the change would have the old rate in it
         lowered = Arrivals::Clock::now();
-        limiter.set_rate(6u << 20);
-        std::this_thread::sleep_for(1700ms);
+        limiter.set_rate(after);
+        set = Arrivals::Clock::now();
+        std::this_thread::sleep_for(3700ms);
         limiter.set_rate(0);
     }
     REQUIRE_MESSAGE(r.outcome == fetch::Outcome::done, r.error);
     CHECK(util::read_file(dir.path / "f.bin") == content);
     CHECK(fake.logins.load() == 1);
-    const double first = static_cast<double>(came.between(lowered, 0ms, 1000ms)) / (1 << 20);
-    const double later = static_cast<double>(came.between(lowered, 500ms, 1500ms)) / (1 << 20);
-    double shown_then = 0; // the shown speed 1.5 s after
+    constexpr double mib = 1 << 20;
+    const double first = static_cast<double>(came.between(lowered, 0ms, 1000ms)) / mib;
+    // The new rate: what the server was asked for from 0.5 s to 3.5 s after, each READ asked right
+    // after its tokens. Not what came in a second: on a busy machine a stream whose thread waited
+    // for the CPU reads the replies that waited meanwhile at once, and asks for the tokens it
+    // missed (up to the bucket's quarter second, TokenBucket::burst), so a second of what came held
+    // from 0.7 to 1.17 of the limit. Asked over 3 s, that quarter second and a READ
+    // (fetch::limited_read) are under 15 %.
+    double later = 0;
     {
-        std::lock_guard lock(shown_m);
-        for (const auto& [at, s] : shown) {
-            if (at - lowered <= 1500ms) shown_then = s / (1 << 20);
+        std::lock_guard lock(fake.mutex);
+        for (const auto& [at, n] : fake.asks) {
+            if (at - lowered >= 500ms && at - lowered < 3500ms) later += n;
         }
     }
-    MESSAGE("the first second after 8 -> 6 MiB/s: ", first, " MiB; then ", later, " MiB/s; shown at 1.5 s: ", shown_then);
-    CHECK(first <= 6.0);
-    CHECK(later > 6 * 0.85);
-    CHECK(later < 6 * 1.15);
-    CHECK(shown_then > 6 * 0.85); // a 5 s average would still read about 7.4
-    CHECK(shown_then < 6 * 1.15);
+    later /= 3.0 * mib;
+    // The speed shown 1.5 s after: the meter, restarted at the new limit (the progress loop's first
+    // look after it), shows what came since, over about its last second (speed::meter_settle), not
+    // a 5 s average with the old rate in it. Checked against a speed::Meter (its rules are
+    // test_speed's) fed what came at each of the loop's looks, restarted at the change, and against
+    // one not restarted. The loop's look at the limiter falls between its sample and its report, so
+    // the look that restarted is one from the first reported after the change began to the one
+    // after the first reported after it was set. Each look's count is taken here just after the
+    // meter's, so a reply that came in between counts in the next step instead: under 0.01 % apart
+    // idle and loaded, so within 3 %.
+    std::vector<Shown> looks;
+    {
+        std::lock_guard lock(shown_m);
+        looks = shown;
+    }
+    std::size_t newest = 0;
+    while (newest + 1 < looks.size() && looks[newest + 1].at - lowered <= 1500ms) ++newest;
+    const double shown_then = looks[newest].speed / mib;
+    const auto replay = [&](std::optional<std::size_t> restart_at) {
+        speed::Meter m;
+        for (std::size_t k = 0; k <= newest; ++k) {
+            if (k == restart_at) m.restart(looks[k].at, looks[k].came);
+            m.sample(looks[k].at, looks[k].came);
+        }
+        return m;
+    };
+    std::optional<std::size_t> restarted;
+    double came_since = 0; // what that meter shows
+    bool holding = true;
+    for (std::size_t k = 0; k <= newest; ++k) {
+        if (looks[k].at < lowered) continue;
+        const auto m = replay(k);
+        if (!restarted || std::abs(m.rate() / mib - shown_then) < std::abs(came_since - shown_then)) {
+            restarted = k;
+            came_since = m.rate() / mib;
+            holding = m.holding();
+        }
+        if (looks[k].at >= set && (k == 0 || looks[k - 1].at >= set)) break;
+    }
+    REQUIRE(restarted);
+    const double came_all = replay(std::nullopt).rate() / mib;
+    MESSAGE("the first second after ", static_cast<double>(before) / mib, " -> 1 MiB/s: ", first, " MiB; then ", later, " MiB/s; shown at 1.5 s: ", shown_then,
+            " (a meter restarted at look ", *restarted, ": ", came_since, ", not restarted: ", came_all, ")");
+    CHECK(first <= static_cast<double>(after + fetch::limited_in_flight(before, 1)) / mib);
+    CHECK(later > 1.0 * 0.85);
+    CHECK(later < 1.0 * 1.15);
+    CHECK_FALSE(holding); // the new speed shows
+    CHECK(shown_then > came_since * 0.97);
+    CHECK(shown_then < came_since * 1.03);
+    // And nearer that than the 5 s average a meter not restarted shows (about 1.7 here; under load
+    // the last second can come within 5 % of it, so not a fixed part of it).
+    CHECK(std::abs(shown_then - came_since) < std::abs(shown_then - came_all));
 }

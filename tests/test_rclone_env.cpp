@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <map>
 #include <optional>
 #include <string>
@@ -109,9 +110,18 @@ Ran run_rclone(const fs::path& rclone, const Scratch& scratch, std::vector<std::
     si.hStdError = err;
     PROCESS_INFORMATION pi{};
     Ran ran;
+    // A hang fails the test instead of stopping it, and says so; generous: on a busy machine rclone
+    // (a Go program, starting several threads) took 2 to 8 s for what takes 0.1 s, once 97 s,
+    // which a 60 s limit ended empty-handed (exit 1, no output).
+    constexpr DWORD limit_ms = 300'000;
+    bool timed_out = false;
     if (CreateProcessW(rclone.c_str(), cmdline.data(), nullptr, nullptr, TRUE,
                        CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env.data(), nullptr, &si, &pi)) {
-        if (WaitForSingleObject(pi.hProcess, 60000) != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+        if (WaitForSingleObject(pi.hProcess, limit_ms) != WAIT_OBJECT_0) {
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            timed_out = true;
+        }
         DWORD code = 0;
         GetExitCodeProcess(pi.hProcess, &code);
         ran.exit_code = static_cast<int>(code);
@@ -123,6 +133,7 @@ Ran run_rclone(const fs::path& rclone, const Scratch& scratch, std::vector<std::
     }
     ran.out = util::read_file(out_file).value_or("");
     ran.err = util::read_file(err_file).value_or("");
+    if (timed_out) ran.err += std::format("(the test stopped rclone: it ran over {} s)", limit_ms / 1000);
     return ran;
 }
 

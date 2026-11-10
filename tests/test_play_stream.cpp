@@ -576,6 +576,10 @@ TEST_CASE("play: an idle stream nobody waits behind keeps its connections until 
     o.housekeeping = 50ms;
     const std::uint64_t size = 30 * mib;
     Played t(size, o);
+    // The stream's 2 connections both log in during its warm part: no READ is answered before
+    // (on a busy machine one connection read it all before the others' threads ran, so they never
+    // logged in).
+    t.fake.reads_wait_for_logins = 2;
     const auto address = t.start(t.file());
     REQUIRE(address);
     const auto u = url_of(*address);
@@ -905,8 +909,12 @@ TEST_CASE("play: on slow connections a seek's first bytes come over several at o
     const std::uint64_t size = 256 * mib; // its 97 % is 3.7 MiB short of the warm part's last 4 MiB
     Played t(size, o, 14);
     t.fake.shared = true;
-    t.fake.slice = std::size_t{16} << 10;
-    t.fake.slow_all = 10ms; // about 1.6 MiB/s per connection, as a Storage Box's
+    // About 1.6 MiB/s per connection, as a Storage Box's, in 128 KiB 80 ms apart: a seek's 512 KiB
+    // piece is 4 of them. The seek waits for its slowest connection, whose thread on a busy machine
+    // waits for the CPU each time its bytes come: in 16 KiB 10 ms apart (32 of them) a seek took
+    // 3 s, not 0.5, and in 64 KiB (8) up to 1.6 s.
+    t.fake.slice = std::size_t{128} << 10;
+    t.fake.slow_all = 80ms;
     auto f = t.file(8);     // a Storage Box's counts (src/gui/app.cpp)
     f.ahead = 32 * mib;
     f.depth = 4;
@@ -945,6 +953,10 @@ TEST_CASE("play: an idle stream gives its connections back at once when a downlo
     o.free_after = 30s;
     o.housekeeping = 50ms;
     Played t(30 * mib, o, 2);
+    // The stream's 2 connections both log in during its warm part: no READ is answered before
+    // (on a busy machine one connection read it all before the others' threads ran, so they never
+    // logged in).
+    t.fake.reads_wait_for_logins = 2;
     const auto address = t.start(t.file(2));
     REQUIRE_MESSAGE(address, address.error());
     const auto u = url_of(*address);
@@ -982,6 +994,10 @@ TEST_CASE("play: an idle stream gives its connections back to a download that ho
     o.free_after = 30s;
     o.housekeeping = 50ms;
     Played t(30 * mib, o, 8);
+    // The stream's 2 connections both log in during its warm part: no READ is answered before
+    // (on a busy machine one connection read it all before the others' threads ran, so they never
+    // logged in).
+    t.fake.reads_wait_for_logins = 2;
     const auto address = t.start(t.file(2));
     REQUIRE_MESSAGE(address, address.error());
     const auto u = url_of(*address);
@@ -1006,6 +1022,10 @@ TEST_CASE("play: kept idle connections get keepalives; one whose link failed is 
     play::Server::Options o;
     o.keepalive = 200ms;
     Played t(40 * mib, o, 4);
+    // The stream's 2 connections both log in during its warm part: no READ is answered before
+    // (on a busy machine one connection read it all before the others' threads ran, so they never
+    // logged in).
+    t.fake.reads_wait_for_logins = 2;
     const auto address = t.start(t.file(2));
     REQUIRE_MESSAGE(address, address.error());
     const auto u = url_of(*address);
@@ -1025,6 +1045,10 @@ TEST_CASE("play: kept connections the server closed during a pause are replaced,
     play::Server::Options o;
     o.rested_after = 300ms;
     Played t(40 * mib, o, 4);
+    // The stream's 4 connections all 4 log in during its warm part: no READ is answered before
+    // (on a busy machine one connection read it all before the others' threads ran, so they never
+    // logged in).
+    t.fake.reads_wait_for_logins = 4;
     const auto address = t.start(t.file(4));
     REQUIRE_MESSAGE(address, address.error());
     const auto u = url_of(*address);

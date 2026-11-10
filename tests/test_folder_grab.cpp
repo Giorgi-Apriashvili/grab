@@ -16,12 +16,14 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -58,9 +60,12 @@ struct Tree {
     std::chrono::milliseconds delay{0};     // every session's pause before each read, as a network's
     std::size_t slice = 0;                  // every session's most bytes per read (0: all there are)
     std::chrono::milliseconds login_delay{0}; // each login takes this long
-    // Every OPEN and every READ (its path and length) as the sessions got them, when they did.
+    // Every session's STATs and LSTATs, before they are answered (set while no session runs).
+    std::function<void(const std::string&)> on_stat;
+    // Every OPEN, CLOSE and READ (its path and length) as the sessions got them, when they did.
     using Clock = std::chrono::steady_clock;
     std::vector<std::pair<std::string, Clock::time_point>> opens;
+    std::vector<std::pair<std::string, Clock::time_point>> closes;
     struct Asked {
         std::string path;
         std::uint32_t length = 0;
@@ -82,9 +87,16 @@ struct Tree {
                 std::lock_guard lock(t.mutex);
                 t.opens.emplace_back(path, Clock::now());
             };
+            server.on_close = [&t](const std::string& path) {
+                std::lock_guard lock(t.mutex);
+                t.closes.emplace_back(path, Clock::now());
+            };
             server.on_read = [&t](const std::string& path, std::uint32_t length) {
                 std::lock_guard lock(t.mutex);
                 t.asks.push_back(Asked{path, length, Clock::now()});
+            };
+            server.on_stat = [&t](const std::string& path) {
+                if (t.on_stat) t.on_stat(path);
             };
             client.start();
             server.broken_after = t.break_first_after.exchange(0);
@@ -795,15 +807,17 @@ TEST_CASE("grab engine folders: files paused and resumed, failed and retried, or
 TEST_CASE("grab engine folders: running big files split the folder's connections by priority") {
     Tree t;
     t.dir("/data");
-    t.file("/data/high.bin", test::pattern(16u << 20));
-    t.file("/data/low.bin", test::pattern(16u << 20));
-    // Every connection as fast as the others, and slower than the test's threads.
+    constexpr std::uint64_t each = std::uint64_t{16} << 20;
+    t.file("/data/high.bin", test::pattern(each));
+    t.file("/data/low.bin", test::pattern(each));
+    // A network slow enough that both files read for about a second.
     t.delay = std::chrono::milliseconds(2);
     t.slice = std::size_t{64} * 1024;
     Run r(t.pool(5), "connection-part", 5, 2);
     // Play's depth of 1 for good (no speed limit, which keeps a quarter second of it on its way
-    // since chunk J): each stream has one READ on its way at a time, so what the streams asked for
-    // follows what came.
+    // since chunk J): each stream has one READ on its way at a time, so one that gives its
+    // connection up waits for that READ and closes the file (with over hand_over_max on its way it
+    // would drop the connection with the file open, which the count below would miss).
     r.connections.urgent("Fake", -100, 1);
     { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
     REQUIRE(folder::set_priority(r.tree, r.index("high.bin"), 4));
@@ -813,26 +827,93 @@ TEST_CASE("grab engine folders: running big files split the folder's connections
         CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
         CHECK_MESSAGE(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path), f.path);
     }
-    // What Low had asked for when High asked for its last bytes: 4 of the 5 connections were High's.
-    std::uint64_t high = 0;
-    std::uint64_t low = 0;
-    std::uint64_t low_then = 0;
+    // What grab decides is how many of the folder's 5 connections each file reads on: High 4, Low
+    // 1. Counted from the server's OPENs and CLOSEs of the two files, not in bytes: how fast each
+    // connection goes is the scheduler's too, and on a busy machine a stream whose thread waited
+    // behind others for whole time slices read several times slower than the others (High : Low
+    // in bytes asked by High's end went from 1.0 to 8.0).
+    constexpr int high = 0;
+    constexpr int low = 1;
+    struct Change {
+        Tree::Clock::time_point at;
+        int file = high;
+        int delta = 0; // +1 an OPEN, -1 a CLOSE
+    };
+    std::vector<Change> changes;
+    // Until High had asked for all but 4 × (2 × min_split_grab + a READ) of its bytes, the busiest
+    // of its ranges had over 2 × min_split_grab not asked for yet (a READ each of its streams may
+    // have on its way to the server), which a stream that finished its own range splits off
+    // (fetch::split): High had work for all its 4 connections.
+    auto work_until = Tree::Clock::time_point::max();
     {
         std::lock_guard lock(t.mutex);
+        const auto add = [&changes](const auto& events, int delta) {
+            for (const auto& [path, at] : events) {
+                if (path == "/data/high.bin") changes.push_back(Change{.at = at, .file = high, .delta = delta});
+                if (path == "/data/low.bin") changes.push_back(Change{.at = at, .file = low, .delta = delta});
+            }
+        };
+        add(t.opens, +1);
+        add(t.closes, -1);
+        std::uint64_t asked = 0;
         for (const auto& a : t.asks) {
-            if (a.path == "/data/high.bin") {
-                high += a.length;
-                low_then = low;
-            } else if (a.path == "/data/low.bin") {
-                low += a.length;
+            if (a.path != "/data/high.bin") continue;
+            asked += a.length;
+            if (asked + 4 * (2 * fetch::min_split_grab + sftp::max_read) >= each) {
+                work_until = a.at;
+                break;
             }
         }
     }
-    REQUIRE(low_then > 0);
-    const double ratio = static_cast<double>(high) / static_cast<double>(low_then);
-    MESSAGE("High : Low = ", ratio);
-    CHECK(ratio > 4.0 * 0.85);
-    CHECK(ratio < 4.0 * 1.15);
+    std::ranges::sort(changes, [](const Change& x, const Change& y) { return x.at != y.at ? x.at < y.at : x.delta < y.delta; });
+    // Each file reads from its first OPEN to its last CLOSE; meanwhile the other's part is fixed.
+    std::array<Tree::Clock::time_point, 2> reads_from{Tree::Clock::time_point::max(), Tree::Clock::time_point::max()};
+    std::array<Tree::Clock::time_point, 2> reads_to{};
+    for (const auto& c : changes) {
+        reads_from[c.file] = std::min(reads_from[c.file], c.at);
+        reads_to[c.file] = std::max(reads_to[c.file], c.at);
+    }
+    // The most each held at once while the other read: never above its part, as the budget of 5
+    // and each file's cap hold. And from when High first held its 4 beside Low's 1 until it no
+    // longer had work for 4 (or Low's end), the connections High held on average: 4, but for a
+    // moment as one of its streams moves to a new range.
+    std::array<int, 2> held{0, 0};
+    std::array<int, 2> most{0, 0};
+    std::optional<Tree::Clock::time_point> full_since;
+    double high_time = 0; // connection-seconds
+    double low_time = 0;
+    Tree::Clock::time_point before{};
+    for (const auto& c : changes) {
+        if (full_since && before < std::min(work_until, reads_to[low])) {
+            const double s = std::chrono::duration<double>(std::min({c.at, work_until, reads_to[low]}) - before).count();
+            high_time += held[high] * s;
+            low_time += held[low] * s;
+        }
+        before = c.at;
+        held[c.file] += c.delta;
+        for (const int f : {high, low}) {
+            const int other = 1 - f;
+            if (c.at >= reads_from[other] && c.at < reads_to[other]) most[f] = std::max(most[f], held[f]);
+        }
+        if (!full_since && held[high] == 4 && held[low] == 1) full_since = c.at;
+    }
+    CHECK(held == std::array<int, 2>{0, 0}); // every OPEN was CLOSEd: the count is whole
+    MESSAGE("most at once beside the other: High ", most[high], ", Low ", most[low]);
+    CHECK(most[high] == 4);
+    CHECK(most[low] == 1);
+    REQUIRE(full_since);
+    const double window = std::chrono::duration<double>(std::min(work_until, reads_to[low]) - *full_since).count();
+    REQUIRE(window > 0);
+    // Each file's average connections over that window: High's 4 and Low's 1 (a Low that gave its
+    // connection up while High read would read 0 for a while, and the ratio alone would grow).
+    const double high_avg = high_time / window;
+    const double low_avg = low_time / window;
+    MESSAGE("connections on average while both read: High ", high_avg, ", Low ", low_avg, " (High : Low = ",
+            high_avg / low_avg, ")");
+    CHECK(high_avg > 4.0 * 0.85);
+    CHECK(high_avg <= 4.0); // never above most[high]
+    CHECK(low_avg > 1.0 * 0.85);
+    CHECK(low_avg <= 1.0);
 }
 
 namespace {
@@ -1034,6 +1115,18 @@ TEST_CASE("grab engine folders: a big file whose connections the small files hol
     t.delay = std::chrono::milliseconds(1); // the small files take a while
     Run r(t.pool(2), "held", 2, 1);
     { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    // The first big file's size check is answered only once a Waiting row was seen: the small files
+    // hold the folder's other connection meanwhile (the big file's STAT holds one), and it is shown
+    // waiting until a stream reads. On a busy machine the small files' workers could otherwise
+    // start after the big file read on a connection, and no big file ever waited for them. A big
+    // file never shown waiting still fails: the wait ends after 20 s, and most_held stays 0.
+    std::atomic<bool> first_big{true};
+    std::atomic<bool> seen_held{false};
+    t.on_stat = [&](const std::string& path) {
+        if (!path.starts_with("/data/t") || !first_big.exchange(false)) return;
+        const auto until = Tree::Clock::now() + std::chrono::seconds(20);
+        while (!seen_held.load() && Tree::Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
     std::size_t most_held = 0;
     bool queued_held = false; // a big file not started shown waiting for the small files
     bool held_after = false;  // one still held once no small file runs
@@ -1042,6 +1135,7 @@ TEST_CASE("grab engine folders: a big file whose connections the small files hol
         const bool small_hold = r.tree.small_connections > 0;
         const auto p = queue_view::pass(r.tree.files, nullptr, small_hold);
         most_held = std::max(most_held, p.held);
+        if (p.held > 0) seen_held = true;
         const auto snap = queue_view::snapshot(r.tree.files, small_hold);
         for (std::size_t k = 0; k < r.tree.files.size(); ++k) {
             const auto& f = r.tree.files[k];

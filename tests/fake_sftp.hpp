@@ -52,6 +52,8 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
     std::vector<std::string> opened;                            // the paths of each OPEN
     std::function<void(const std::string&)> on_open;            // told each OPEN's path as it comes
+    std::function<void(const std::string&)> on_close;           // told each CLOSE's path (a file's or folder's) as it comes
+    std::function<void(const std::string&)> on_stat;            // told each STAT's and LSTAT's path before it is answered
     std::function<void(const std::string&, std::uint32_t)> on_read; // told each READ's path and length
     std::size_t most_waiting = 0;                               // most requests answered in one batch
     std::uint64_t most_read_bytes = 0;                          // most bytes of DATA answered in one batch
@@ -247,13 +249,18 @@ private:
             str(b, std::string_view(content).substr(off, n));
             return reply(103, id, b);
         }
-        case 4: // CLOSE
-            handles_.erase(in.str());
+        case 4: { // CLOSE
+            const auto closed = handles_.find(in.str());
+            if (closed != handles_.end()) {
+                if (on_close) on_close(closed->second.path);
+                handles_.erase(closed);
+            }
             if (break_on_close) {
                 dropped = true;
                 return;
             }
             return status(id, 0);
+        }
         case 12: { // READDIR
             auto& h = handles_.at(in.str());
             const auto& names = dirs[h.path];
@@ -275,6 +282,7 @@ private:
         case 7: // LSTAT
         case 17: { // STAT
             std::string path = in.str();
+            if (on_stat) on_stat(path);
             std::string b;
             if (type == 7 && links.contains(path)) {
                 link_attrs(b);

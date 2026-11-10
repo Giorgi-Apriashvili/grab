@@ -2,10 +2,12 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <stop_token>
 #include <thread>
@@ -280,22 +282,48 @@ TEST_CASE("a flow that was idle gains no credit to burst with") {
 TEST_CASE("under a limit, a high download gets about four times a low one") {
     rate::RateLimiter limiter;
     limiter.set_rate(4 * MiB);
+    // Each flow keeps requests in line, as a stream keeps its next READ's place while it reads
+    // replies (enqueue, then wait), and whoever waits serves the head of the line: a flow whose
+    // thread waits for the CPU keeps its turns. One request at a time (acquire), a flow was out of
+    // line from each turn until its thread ran again, on a busy machine after whole time slices of
+    // other threads, and the other flow took its turns (High : Low from 0.2 to 1.5); so it was
+    // while a thread started, both put in line before either runs.
+    constexpr std::size_t in_line = 16; // a third of a second of High's turns
     std::stop_source stop;
-    std::atomic<std::uint64_t> bytes[3] = {};
+    std::array<std::uint64_t, 3> bytes{};
+    std::array<std::deque<std::uint64_t>, 3> lines; // each flow's tickets, oldest first: served in that order
+    const auto start = Clock::now();
+    for (std::size_t i = 0; i < in_line; ++i) {
+        lines[1].push_back(limiter.enqueue(64 * KiB, 1, 4));
+        lines[2].push_back(limiter.enqueue(64 * KiB, 2, 1));
+    }
     auto pump = [&](int flow, int weight) {
-        while (limiter.acquire(64 * KiB, stop.get_token(), flow, weight)) bytes[flow] += 64 * KiB;
+        auto& line = lines[flow];
+        // Until its next ticket is given up (the end, below) or the stop: those served before.
+        while (limiter.wait(line.front(), stop.get_token())) {
+            bytes[flow] += 64 * KiB;
+            line.pop_front();
+            line.push_back(limiter.enqueue(64 * KiB, flow, weight));
+        }
+        for (const auto ticket : line) limiter.cancel(ticket);
     };
+    double seconds = 0;
     {
         std::jthread high([&] { pump(1, 4); });
         std::jthread low([&] { pump(2, 1); });
         std::this_thread::sleep_for(1500ms);
+        // The end: a lower rate gives up every request not served yet and serves none for now, so
+        // what each flow counts is what was served by then, however late its thread runs.
+        limiter.set_rate(1);
+        seconds = std::chrono::duration<double>(Clock::now() - start).count();
         stop.request_stop();
     }
-    const double ratio = static_cast<double>(bytes[1].load()) / static_cast<double>(bytes[2].load());
+    const double ratio = static_cast<double>(bytes[1]) / static_cast<double>(bytes[2]);
+    MESSAGE("High : Low = ", ratio, " over ", seconds, " s");
     CHECK(ratio > 3.0);
     CHECK(ratio < 5.5);
     const double total_mib = static_cast<double>(bytes[1] + bytes[2]) / MiB;
-    CHECK(total_mib < 4 * 1.5 + 1.0); // the limit holds (plus the initial burst)
+    CHECK(total_mib < 4 * seconds + 1.0); // the limit holds (plus the initial burst)
 }
 
 TEST_CASE("waiting streams go on when the limit is lifted, and stop when asked") {
