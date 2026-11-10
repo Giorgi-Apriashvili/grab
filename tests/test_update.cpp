@@ -4,12 +4,15 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -611,6 +614,35 @@ TEST_CASE("an up-to-date grab update forgets this copy's failure, of a release s
     std::error_code ec;
     fs::remove(record.parent_path() / "last-update.log", ec);
 }
+
+TEST_CASE("an update check reads the release through curl's status line, and says why it couldn't") {
+    const Folder f("grab-test-update-check");
+    put(f.dir / "latest.json",
+        R"({"tag_name": "v0.0.1", "assets": [{"name": "SHA256SUMS.txt", "url": "https://api.github.com/repos/a/b/releases/assets/1",
+            "browser_download_url": "https://github.com/a/b/releases/download/v0.0.1/SHA256SUMS.txt"}]})");
+    std::string url = "file:///" + util::path_to_utf8(f.dir / "latest.json");
+    std::ranges::replace(url, '\\', '/');
+    SetEnvironmentVariableW(L"GRAB_UPDATE_API", util::to_wide(url).c_str());
+    struct Unset {
+        ~Unset() { SetEnvironmentVariableW(L"GRAB_UPDATE_API", nullptr); }
+    } unset;
+    std::vector<std::string> said;
+    const auto say = [&said](std::string_view line) { said.emplace_back(line); };
+    auto checked = update::check(true, {}, say);
+    REQUIRE_MESSAGE(checked.has_value(), checked.error_or(""));
+    CHECK(checked->release.tag == "v0.0.1");
+    REQUIRE(checked->release.assets.size() == 1);
+    CHECK(checked->release.assets[0].api.empty()); // not of the metadata's origin (a file)
+    CHECK(said.empty());
+
+    // A file that isn't there: curl's own failure (exit 37), which another try won't heal.
+    SetEnvironmentVariableW(L"GRAB_UPDATE_API", util::to_wide(url + ".missing").c_str());
+    checked = update::check(true, {}, say);
+    REQUIRE_FALSE(checked.has_value());
+    CHECK(checked.error() == "could not read the latest release: curl failed for the server (exit 37); get grab from " +
+                                 std::string(update::releases_page));
+    CHECK(said.empty());
+}
 #endif
 
 TEST_CASE("the release page is kept only when it is a github.com page") {
@@ -655,4 +687,323 @@ TEST_CASE("an update check is due once a day") {
     CHECK_FALSE(update::update_due(now - day + 60, now));
     CHECK_FALSE(update::update_due(now, now));
     CHECK(update::update_due(now + 3600, now)); // the clock went back
+}
+
+// ---- requests that survive a GitHub hiccup ---------------------------------------------------------
+
+namespace {
+
+constexpr std::string_view sums_url = "https://github.com/Giorgi-Apriashvili/grab/releases/download/v0.22.0/SHA256SUMS.txt";
+constexpr std::string_view sums_api = "https://api.github.com/repos/Giorgi-Apriashvili/grab/releases/assets/312345678";
+
+update::Attempt answer(int status) {
+    update::Attempt a;
+    a.status = status;
+    return a;
+}
+
+update::Attempt no_answer(int curl_exit) {
+    update::Attempt a;
+    a.curl_exit = curl_exit;
+    return a;
+}
+
+// fetch() against answers given in order, with what it asked for, waited and said.
+struct Script {
+    std::vector<update::Attempt> answers;
+    std::vector<std::pair<std::string, bool>> asked; // URL, through the API
+    std::vector<int> waited;                         // seconds
+    std::vector<std::string> said;
+    bool stop_at_wait = false;
+
+    std::vector<update::Attempt> run(const update::Fetch& f) {
+        return update::fetch(
+            f,
+            [this](const std::string& url, bool api) {
+                asked.emplace_back(url, api);
+                REQUIRE(asked.size() <= answers.size());
+                return answers[asked.size() - 1];
+            },
+            [this](std::chrono::seconds d) {
+                waited.push_back(static_cast<int>(d.count()));
+                return !stop_at_wait;
+            },
+            [this](std::string_view line) { said.emplace_back(line); });
+    }
+};
+
+update::Fetch sums_fetch(bool with_api = true) {
+    using namespace std::chrono_literals;
+    update::Fetch f;
+    f.what = "SHA256SUMS.txt";
+    f.url = sums_url;
+    if (with_api) f.api = sums_api;
+    f.stamp = 1'762'000'000'123;
+    f.waits = {0s, 1s, 3s, 6s};
+    f.api_waits = {0s, 3s};
+    return f;
+}
+
+constexpr std::string_view by_hand = "get grab-0.22.0-windows-x64.zip from https://github.com/x/y/releases/tag/v0.22.0";
+
+} // namespace
+
+TEST_CASE("an asset's API URL is kept only at the metadata's own origin, in GitHub's shape") {
+    const std::string api(update::default_api_url);
+    CHECK(update::is_api_asset_url(sums_api, api));
+    CHECK(update::is_api_asset_url("http://127.0.0.1:8765/repos/a/b/releases/assets/7",
+                                   "http://127.0.0.1:8765/repos/a/b/releases/latest"));
+    CHECK_FALSE(update::is_api_asset_url("http://127.0.0.1:8766/repos/a/b/releases/assets/7",
+                                         "http://127.0.0.1:8765/repos/a/b/releases/latest")); // another port
+    CHECK_FALSE(update::is_api_asset_url("http://api.github.com/repos/a/b/releases/assets/7", api)); // not https
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com.evil.example/repos/a/b/releases/assets/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://evil.example/repos/a/b/releases/assets/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/b/releases/assets/", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/b/releases/assets/7?x=1", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/b/releases/assets/7/x", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/b/releases/assets/7a", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/b/releases/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/../releases/assets/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a\"b/c/releases/assets/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a b/c/releases/assets/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos//c/releases/assets/7", api));
+    CHECK_FALSE(update::is_api_asset_url("https://api.github.com/repos/a/b/releases/assets/7\n", api));
+    CHECK_FALSE(update::is_api_asset_url(sums_api, "file:///C:/x/latest.json")); // no origin
+    CHECK_FALSE(update::is_api_asset_url(sums_api, ""));
+}
+
+TEST_CASE("release payload: each asset's API URL, when it is one") {
+    auto r = update::parse_release(R"({"tag_name": "v0.22.0", "assets": [
+        {"name": "SHA256SUMS.txt", "url": "https://api.github.com/repos/Giorgi-Apriashvili/grab/releases/assets/312345678",
+         "browser_download_url": "https://github.com/Giorgi-Apriashvili/grab/releases/download/v0.22.0/SHA256SUMS.txt"},
+        {"name": "grab-0.22.0-windows-x64.zip", "url": "https://evil.example/repos/a/b/releases/assets/1",
+         "browser_download_url": "https://github.com/Giorgi-Apriashvili/grab/releases/download/v0.22.0/grab-0.22.0-windows-x64.zip"},
+        {"name": "grab-0.22.0-windows-x64-setup.exe",
+         "browser_download_url": "https://github.com/Giorgi-Apriashvili/grab/releases/download/v0.22.0/grab-0.22.0-windows-x64-setup.exe"}
+    ]})");
+    REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+    REQUIRE(r->assets.size() == 3);
+    CHECK(r->assets[0].api == sums_api);
+    CHECK(r->assets[1].api.empty()); // another origin
+    CHECK(r->assets[2].api.empty()); // none
+    // A test server's metadata: its own origin counts.
+    auto local = update::parse_release(
+        R"({"tag_name": "v9.9.9", "assets": [{"name": "SHA256SUMS.txt", "url": "http://127.0.0.1:8765/repos/a/b/releases/assets/2",
+            "browser_download_url": "http://127.0.0.1:8765/download/SHA256SUMS.txt"}]})",
+        "http://127.0.0.1:8765/repos/a/b/releases/latest");
+    REQUIRE(local.has_value());
+    CHECK(local->assets.at(0).api == "http://127.0.0.1:8765/repos/a/b/releases/assets/2");
+}
+
+TEST_CASE("a fresh URL has a query of its own for each run and try") {
+    CHECK(update::fresh_url("https://h/x/SHA256SUMS.txt", 1762000000123, 2) ==
+          "https://h/x/SHA256SUMS.txt?grab=1762000000123-2");
+    CHECK(update::fresh_url("https://h/latest?per_page=1", 5, 3) == "https://h/latest?per_page=1&grab=5-3");
+    CHECK(update::fresh_url("https://h/x#top", 5, 4) == "https://h/x?grab=5-4#top");
+    CHECK(update::fresh_url("https://h/x", 5, 2) != update::fresh_url("https://h/x", 6, 2)); // another run
+}
+
+TEST_CASE("only what can heal is tried again: network failures and 5xx, 408, 429") {
+    CHECK(update::succeeded(answer(200)));
+    CHECK(update::succeeded(answer(206)));
+    CHECK(update::succeeded(answer(0))); // a file:// URL has no status
+    CHECK_FALSE(update::succeeded(answer(504)));
+    CHECK_FALSE(update::succeeded(answer(302))); // a redirect curl didn't follow
+    CHECK_FALSE(update::succeeded(no_answer(28)));
+
+    for (int status : {500, 502, 503, 504, 408, 429}) CHECK(update::worth_retrying(answer(status)));
+    for (int status : {200, 301, 400, 401, 403, 404, 410}) CHECK_FALSE(update::worth_retrying(answer(status)));
+    for (int code : {5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 92}) CHECK(update::worth_retrying(no_answer(code)));
+    for (int code : {2, 3, 23, 47, 60, 130}) CHECK_FALSE(update::worth_retrying(no_answer(code)));
+    auto limited = answer(429);
+    limited.limited = true;
+    CHECK_FALSE(update::worth_retrying(limited));
+    update::Attempt broken;
+    broken.error = "cannot find curl.exe in System32 or PATH";
+    CHECK_FALSE(update::worth_retrying(broken));
+}
+
+TEST_CASE("GitHub's rate limit is told by a 403 or 429 that says so") {
+    constexpr std::string_view github =
+        R"j({"message":"API rate limit exceeded for 1.2.3.4. (But here's the good news: Authenticated requests )j"
+        R"j(get a higher rate limit. Check out the documentation for more details.)"})j";
+    CHECK(update::rate_limited(0, 403, github));
+    CHECK(update::rate_limited(0, 429, github));
+    CHECK(update::rate_limited(0, 403, R"({"message":"You have exceeded a secondary rate limit."})"));
+    CHECK_FALSE(update::rate_limited(0, 403, R"({"message":"Resource not accessible"})"));
+    CHECK_FALSE(update::rate_limited(0, 504, github));
+    CHECK_FALSE(update::rate_limited(28, 0, ""));
+    CHECK_FALSE(update::rate_limited(28, 403, github));
+}
+
+TEST_CASE("what went wrong in plain words, with the host curl ended at") {
+    auto a = answer(504);
+    a.url = sums_url;
+    CHECK(update::describe(a) == "GitHub answered 504 (Gateway Time-out)");
+    CHECK(update::describe(answer(418)) == "GitHub answered 418");
+    auto timed_out = no_answer(28);
+    timed_out.url = sums_url;
+    CHECK(update::describe(timed_out) == "could not reach github.com (timed out)");
+    timed_out.host = "objects.githubusercontent.com"; // after the redirect
+    CHECK(update::describe(timed_out) == "could not reach objects.githubusercontent.com (timed out)");
+    auto refused = no_answer(7);
+    refused.url = "http://127.0.0.1:8765/x";
+    CHECK(update::describe(refused) == "could not reach 127.0.0.1:8765 (the connection failed)");
+    auto odd = no_answer(47);
+    odd.url = sums_url;
+    CHECK(update::describe(odd) == "curl failed for github.com (exit 47)");
+}
+
+TEST_CASE("fetch: a cached 504 is passed by fresh URLs, a growing while apart") {
+    Script s;
+    s.answers = {answer(504), answer(504), answer(200)};
+    const auto tries = s.run(sums_fetch());
+    REQUIRE(tries.size() == 3);
+    CHECK(update::succeeded(tries.back()));
+    using Asked = std::vector<std::pair<std::string, bool>>;
+    CHECK(s.asked == Asked{{std::string(sums_url), false},
+                           {std::string(sums_url) + "?grab=1762000000123-2", false},
+                           {std::string(sums_url) + "?grab=1762000000123-3", false}});
+    CHECK(tries[1].url == s.asked[1].first);
+    CHECK(s.waited == std::vector<int>{1, 3});
+    CHECK(s.said == std::vector<std::string>{
+                        "GitHub answered 504 (Gateway Time-out) for SHA256SUMS.txt; trying again in 1 s (try 2 of 6)",
+                        "GitHub answered 504 (Gateway Time-out) for SHA256SUMS.txt; trying again in 3 s (try 3 of 6)",
+                        "got SHA256SUMS.txt on try 3 of 6"});
+    // The window follows them: the failed tries show until one gets through; none is an error.
+    CHECK(update::phase_of(s.said[0]) == update::Phase::retrying);
+    CHECK(update::phase_of(s.said[1]) == update::Phase::retrying);
+    CHECK(update::phase_of(s.said[2]) == update::Phase::retried);
+}
+
+TEST_CASE("fetch: a good answer at once says nothing and waits for nothing") {
+    Script s;
+    s.answers = {answer(200)};
+    const auto tries = s.run(sums_fetch());
+    CHECK(tries.size() == 1);
+    CHECK(s.asked.at(0).first == sums_url); // the URL as it is: often a good answer cached
+    CHECK(s.waited.empty());
+    CHECK(s.said.empty());
+}
+
+TEST_CASE("fetch: when the browser URL keeps failing, the API URL brings the file") {
+    Script s;
+    s.answers = {answer(504), answer(504), no_answer(28), answer(502), answer(200)};
+    const auto tries = s.run(sums_fetch());
+    REQUIRE(tries.size() == 5);
+    CHECK(update::succeeded(tries.back()));
+    REQUIRE(s.asked.size() == 5);
+    CHECK(s.asked[4] == std::pair<std::string, bool>{std::string(sums_api) + "?grab=1762000000123-5", true});
+    for (std::size_t i = 0; i < 4; ++i) CHECK_FALSE(s.asked[i].second);
+    CHECK(s.waited == std::vector<int>{1, 3, 6}); // the API's first try at once
+    REQUIRE(s.said.size() == 5);
+    CHECK(s.said[2] == "could not reach github.com (timed out) for SHA256SUMS.txt; trying again in 6 s (try 4 of 6)");
+    CHECK(s.said[3] == "GitHub answered 502 (Bad Gateway) for SHA256SUMS.txt; trying GitHub's API instead (try 5 of 6)");
+    CHECK(s.said[4] == "got SHA256SUMS.txt through GitHub's API on try 5 of 6");
+    CHECK(update::phase_of(s.said[3]) == update::Phase::retrying);
+}
+
+TEST_CASE("fetch: a 404 goes to the API at once, and a second 404 ends it") {
+    Script s;
+    s.answers = {answer(404), answer(404)};
+    const auto tries = s.run(sums_fetch());
+    REQUIRE(tries.size() == 2);
+    CHECK(s.asked.at(1).second);
+    CHECK(s.waited.empty());
+    CHECK(s.said == std::vector<std::string>{
+                        "GitHub answered 404 (Not Found) for SHA256SUMS.txt; trying GitHub's API instead (try 2 of 3)"});
+    CHECK(update::fetch_error("could not download SHA256SUMS.txt", tries, by_hand) ==
+          "could not download SHA256SUMS.txt: GitHub answered 404 (Not Found) to every try; " + std::string(by_hand));
+}
+
+TEST_CASE("fetch: everything 504 is six tries, 13 s of waits, and says whose problem it is") {
+    Script s;
+    s.answers = std::vector<update::Attempt>(6, answer(504));
+    const auto tries = s.run(sums_fetch());
+    CHECK(tries.size() == 6);
+    CHECK(s.waited == std::vector<int>{1, 3, 6, 3});
+    CHECK(s.said.size() == 5); // the last failure has nothing after it
+    CHECK(s.said.back() == "GitHub answered 504 (Gateway Time-out) for SHA256SUMS.txt; trying again in 3 s (try 6 of 6)");
+    const auto error = update::fetch_error("could not download SHA256SUMS.txt", tries, by_hand);
+    CHECK(error == "could not download SHA256SUMS.txt: GitHub answered 504 (Gateway Time-out) to every try, a problem "
+                   "on GitHub's side; try again later, or " +
+                       std::string(by_hand));
+    CHECK(update::phase_of(std::string(update::text::error) + error) == update::Phase::failed);
+    // The fresh URLs are all different.
+    std::vector<std::string> urls;
+    for (const auto& [url, api] : s.asked) urls.push_back(url);
+    std::ranges::sort(urls);
+    CHECK(std::ranges::adjacent_find(urls) == urls.end());
+}
+
+TEST_CASE("fetch: the end says each different failure once, and what to do") {
+    Script s;
+    s.answers = {answer(504), answer(504), answer(504), answer(504), no_answer(6), no_answer(6)};
+    auto tries = s.run(sums_fetch());
+    REQUIRE(tries.size() == 6);
+    for (std::size_t i = 4; i < tries.size(); ++i) CHECK(tries[i].url.starts_with(sums_api));
+    CHECK(update::fetch_error("could not download SHA256SUMS.txt", tries, by_hand) ==
+          "could not download SHA256SUMS.txt: GitHub answered 504 (Gateway Time-out), then could not reach "
+          "api.github.com (its name could not be resolved), a problem on GitHub's side; try again later, or " +
+              std::string(by_hand));
+
+    Script offline;
+    offline.answers = std::vector<update::Attempt>(4, no_answer(7));
+    tries = offline.run(sums_fetch(false)); // no API URL: no fallback
+    CHECK(tries.size() == 4);
+    CHECK(offline.said.back() == "could not reach github.com (the connection failed) for SHA256SUMS.txt; trying again "
+                                 "in 6 s (try 4 of 4)");
+    CHECK(update::fetch_error("could not download SHA256SUMS.txt", tries, by_hand) ==
+          "could not download SHA256SUMS.txt: could not reach github.com (the connection failed) at every try; check "
+          "the internet connection and try again, or " +
+              std::string(by_hand));
+}
+
+TEST_CASE("fetch: curl missing, curl stopped or a stopped wait ends every try") {
+    Script missing;
+    update::Attempt broken;
+    broken.error = "cannot find curl.exe in System32 or PATH (curl ships with Windows 10 1803 and later)";
+    missing.answers = {broken};
+    auto tries = missing.run(sums_fetch());
+    CHECK(tries.size() == 1);
+    CHECK(missing.said.empty());
+    CHECK(update::fetch_error("could not download SHA256SUMS.txt", tries, by_hand) ==
+          "could not download SHA256SUMS.txt: " + broken.error);
+
+    Script ctrl_c;
+    ctrl_c.answers = {no_answer(130)}; // proc::exit_stopped
+    tries = ctrl_c.run(sums_fetch());
+    CHECK(tries.size() == 1);
+    CHECK(update::fetch_error("could not download SHA256SUMS.txt", tries, by_hand) ==
+          "could not download SHA256SUMS.txt: stopped");
+
+    Script stopped;
+    stopped.answers = {answer(503), answer(200)};
+    stopped.stop_at_wait = true;
+    tries = stopped.run(sums_fetch());
+    CHECK(tries.size() == 1);
+    CHECK(stopped.waited == std::vector<int>{1});
+}
+
+TEST_CASE("fetch: GitHub's rate limit is not tried again") {
+    Script s;
+    auto limited = answer(403);
+    limited.limited = true;
+    s.answers = {limited};
+    update::Fetch f = sums_fetch(false);
+    f.what = "the latest release";
+    const auto tries = s.run(f);
+    CHECK(tries.size() == 1);
+    CHECK(s.said.empty());
+}
+
+TEST_CASE("lines about tries map to the window's note, not to an error") {
+    using update::Phase;
+    CHECK(update::phase_of("could not reach api.github.com (timed out) for the latest release; trying again in 2 s "
+                           "(try 2 of 3)") == Phase::retrying);
+    CHECK(update::phase_of("got the latest release on try 2 of 3") == Phase::retried);
+    // A failure kept from an earlier run, repeated as a note, isn't a try of this one.
+    CHECK(update::phase_of("note: the update to 0.23.0 (2026-11-08) failed: could not download SHA256SUMS.txt: GitHub "
+                           "answered 504 (Gateway Time-out) to every try, a problem on GitHub's side; try again later, "
+                           "or get x from y; what it printed is in C:\\x\\last-update.log") == Phase::other);
 }

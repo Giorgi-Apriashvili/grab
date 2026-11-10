@@ -1623,6 +1623,25 @@ try {
     panel.style.flex = flexWas;
   }
 
+  // The update banner while `grab update` runs: a try GitHub failed shows in place of the step until
+  // one gets through (the backend then clears the note), as text.
+  {
+    const ub = $('#update-banner');
+    state.update = { state: 'running', version: '0.23.0', phase: 'downloading', note: '' };
+    renderUpdate();
+    check('update: the step while nothing failed', ub.textContent, 'Updating to 0.23.0: downloading…');
+    const note = 'GitHub answered 504 (Gateway Time-out) for SHA256SUMS.txt; trying again in 3 s (try 2 of 6)';
+    state.update = { ...state.update, note };
+    renderUpdate();
+    check('update: a failed try in place of the step', ub.textContent, `Updating to 0.23.0: ${note}`);
+    state.update = { ...state.update, note: '<img src=x>' };
+    renderUpdate();
+    check('update: the note is text', [ub.querySelector('img'), ub.textContent], [null, 'Updating to 0.23.0: <img src=x>']);
+    state.update = { state: '' };
+    renderUpdate();
+    check('update: no banner after', ub.hidden, true);
+  }
+
   panel.style.width = '1250px';
   state.queue = [
     folder({ id: 11, name: 'season', phase: '', files: { total: 304, queued: 290, running: 4, paused: 0, done: 8, failed: 1, skipped: 1 }, bytes: 31457280, total: 104857600 }),

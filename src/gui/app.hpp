@@ -478,6 +478,9 @@ private:
         std::string phase;   // while running: "checking", "downloading", "verified", "installing"
         std::string error;
         bool completing = false; // the same version, adding programs a portable folder lacks
+        // While running: the last failed try and what comes next, until one gets through. Its
+        // initializer lets a banner made from the fields before it leave it out.
+        std::string note{};
     };
     void maybe_check_updates(); // once, at the page's first init
     void start_update_check(bool manual);

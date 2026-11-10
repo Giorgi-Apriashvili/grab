@@ -3743,6 +3743,7 @@ void App::post_update() const {
     v.set("phase", str(update_.phase));
     v.set("error", str(update_.error));
     v.set("completing", Value::make_bool(update_.completing));
+    v.set("note", str(update_.note));
     post(v);
 }
 
@@ -3834,6 +3835,7 @@ void App::start_update() {
     update_.state = "running";
     update_.phase = "checking";
     update_.error.clear();
+    update_.note.clear();
     post_update();
 
     update_thread_ = std::jthread([this, child = std::move(*started), log](std::stop_token stop) mutable {
@@ -3872,7 +3874,12 @@ void App::start_update() {
 }
 
 void App::on_update_line(const std::string& line) {
-    switch (update::phase_of(line)) {
+    const auto phase = update::phase_of(line);
+    if (phase == update::Phase::failed || phase == update::Phase::other) return;
+    // A try GitHub failed shows ("GitHub answered 504 ...; trying again in 3 s (try 2 of 6)") until
+    // one gets through or the next step starts.
+    update_.note = phase == update::Phase::retrying ? line : std::string();
+    switch (phase) {
     case update::Phase::checking: update_.phase = "checking"; break;
     case update::Phase::downloading: update_.phase = "downloading"; break;
     case update::Phase::verified: update_.phase = "verified"; break;
@@ -3885,14 +3892,17 @@ void App::on_update_line(const std::string& line) {
         break;
     case update::Phase::done: update_.phase = "done"; break;
     case update::Phase::up_to_date: update_.phase = "up_to_date"; break;
+    case update::Phase::retrying:
+    case update::Phase::retried:
     case update::Phase::failed:
-    case update::Phase::other: return;
+    case update::Phase::other: break;
     }
     if (update_.state == "running") post_update();
 }
 
 void App::on_update_finished(int exit_code, const std::string& last_error) {
     if (resume_after_restart_) mark_for_restart(false); // still here: nothing to continue after
+    update_.note.clear();
     if (exit_code == 0 && update_.phase == "done") {
         update_.state = "installed"; // a portable swap, or an installer that left this window open
     } else if (exit_code == 0) {

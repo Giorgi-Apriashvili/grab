@@ -50,7 +50,7 @@ const state = {
   limitMiBps: 5,
   limit: {},             // the backend's "limit" message: source, until, nextMiBps
   schedule: [],          // speed schedule rules, as the backend keeps them
-  update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing
+  update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing, note
   lists: [],             // the last search's sources per server: age, live, refreshing, error, notes
   updateLater: false,    // "Later": hidden until grab starts again
   // Browse mode: the folder shown, and what it holds. `server` '' is All servers' own top (the
@@ -4720,7 +4720,9 @@ function renderUpdate() {
       `<button type="button" class="primary" data-act="update">${u.completing ? 'Add them' : 'Update'}</button>` +
       '<button type="button" class="subtle" data-act="later">Later</button>';
   } else if (u.state === 'running') {
-    b.innerHTML = `<span class="text"><span class="spinner"></span>Updating to ${v}: ${UPDATE_PHASE[u.phase] || 'starting…'}</span>`;
+    // A try GitHub failed says so ("GitHub answered 504 ...; trying again in 3 s (try 2 of 6)").
+    const step = u.note ? esc(u.note) : UPDATE_PHASE[u.phase] || 'starting…';
+    b.innerHTML = `<span class="text"><span class="spinner"></span>Updating to ${v}: ${step}</span>`;
   } else if (u.state === 'installed') {
     const active = state.queue.some((q) => q.status === 'running' || q.status === 'queued');
     b.innerHTML = `<span class="text">grab ${v} is installed. Restart grab to use it` +

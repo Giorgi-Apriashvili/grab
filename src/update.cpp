@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <print>
 
 #ifdef _WIN32
@@ -41,7 +43,7 @@ std::optional<Version> parse_version(std::string_view text) {
 
 std::string to_string(const Version& v) { return std::format("{}.{}.{}", v.major, v.minor, v.patch); }
 
-std::expected<Release, std::string> parse_release(std::string_view json_text) {
+std::expected<Release, std::string> parse_release(std::string_view json_text, std::string_view api) {
     auto doc = json::parse(json_text);
     if (!doc) return util::failf("release metadata: {}", doc.error());
     if (doc->kind != json::Value::Kind::object) return util::fail("release metadata is not an object");
@@ -65,7 +67,11 @@ std::expected<Release, std::string> parse_release(std::string_view json_text) {
         for (const auto& a : assets->items) {
             auto name = a.string_of("name");
             auto url = a.string_of("browser_download_url");
-            if (name && url) r.assets.push_back(Asset{std::move(*name), std::move(*url)});
+            if (!name || !url) continue;
+            auto api_asset = a.string_of("url");
+            if (api_asset && !is_api_asset_url(*api_asset, api)) api_asset.reset();
+            r.assets.push_back(
+                Asset{.name = std::move(*name), .url = std::move(*url), .api = std::move(api_asset).value_or("")});
         }
     }
     return r;
@@ -77,6 +83,54 @@ bool is_release_page(std::string_view url) {
     return url.starts_with(prefix) && url.size() > prefix.size() &&
            url.find_first_of(" \"'<>\\`") == std::string_view::npos &&
            std::ranges::none_of(url, [](char c) { return static_cast<unsigned char>(c) < 0x20; });
+}
+
+namespace {
+
+// "https://host[:port]" of an http or https `url`; empty for any other.
+std::string_view origin_of(std::string_view url) {
+    std::size_t start = 0;
+    if (url.starts_with("https://")) {
+        start = 8;
+    } else if (url.starts_with("http://")) {
+        start = 7;
+    } else {
+        return {};
+    }
+    const auto end = url.find_first_of("/?#", start);
+    if (end == start) return {};
+    return url.substr(0, end == std::string_view::npos ? url.size() : end);
+}
+
+// Takes one "<name>/" off the front of `path`: a GitHub owner or repository name.
+bool take_segment(std::string_view& path) {
+    const auto slash = path.find('/');
+    if (slash == 0 || slash == std::string_view::npos) return false;
+    const auto name = path.substr(0, slash);
+    if (name == "." || name == "..") return false;
+    const bool plain = std::ranges::all_of(name, [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+               c == '.';
+    });
+    if (!plain) return false;
+    path.remove_prefix(slash + 1);
+    return true;
+}
+
+} // namespace
+
+bool is_api_asset_url(std::string_view url, std::string_view api) {
+    const auto origin = origin_of(api);
+    if (origin.empty() || !url.starts_with(origin)) return false;
+    auto path = url.substr(origin.size());
+    constexpr std::string_view repos = "/repos/";
+    constexpr std::string_view assets = "releases/assets/";
+    if (!path.starts_with(repos)) return false;
+    path.remove_prefix(repos.size());
+    if (!take_segment(path) || !take_segment(path) || !path.starts_with(assets)) return false;
+    path.remove_prefix(assets.size());
+    // The asset's id, and nothing after it.
+    return !path.empty() && path.size() <= 20 && std::ranges::all_of(path, [](char c) { return c >= '0' && c <= '9'; });
 }
 
 const Asset* find_asset(const Release& release, std::string_view name) {
@@ -286,6 +340,176 @@ void clean_up_at_start() {
 
 std::string api_url() { return util::getenv_utf8("GRAB_UPDATE_API").value_or(std::string(default_api_url)); }
 
+namespace {
+
+// What curl's exit `code` means for a request that went wrong on the way; empty for another code.
+std::string_view curl_words(int code) {
+    switch (code) {
+    case 5: return "its proxy's name could not be resolved";
+    case 6: return "its name could not be resolved";
+    case 7: return "the connection failed";
+    case 16: return "an HTTP/2 error";
+    case 18: return "the transfer ended early";
+    case 28: return "timed out";
+    case 35: return "the secure connection failed";
+    case 52: return "it answered nothing";
+    case 55: return "sending failed";
+    case 56: return "the connection broke";
+    case 92: return "an HTTP/2 error";
+    case 60: return "its certificate could not be verified";
+    default: return {};
+    }
+}
+
+// Whether another try may get through after curl's exit `code` (the 2026-11-08 incident's
+// timeouts, a line that dropped for a moment); not a certificate that failed.
+bool curl_heals(int code) { return code != 60 && !curl_words(code).empty(); }
+
+bool server_trouble(int status) { return status >= 500 || status == 408 || status == 429; }
+
+// "504 (Gateway Time-out)", as GitHub words it; the number alone for one not listed.
+std::string status_words(int status) {
+    std::string_view reason;
+    switch (status) {
+    case 400: reason = "Bad Request"; break;
+    case 401: reason = "Unauthorized"; break;
+    case 403: reason = "Forbidden"; break;
+    case 404: reason = "Not Found"; break;
+    case 408: reason = "Request Timeout"; break;
+    case 410: reason = "Gone"; break;
+    case 429: reason = "Too Many Requests"; break;
+    case 500: reason = "Internal Server Error"; break;
+    case 502: reason = "Bad Gateway"; break;
+    case 503: reason = "Service Unavailable"; break;
+    case 504: reason = "Gateway Time-out"; break;
+    default: break;
+    }
+    return reason.empty() ? std::to_string(status) : std::format("{} ({})", status, reason);
+}
+
+// The host (and port) of an http or https `url`, or "the server" for another (a file:// URL).
+std::string host_of(std::string_view url) {
+    const auto origin = origin_of(url);
+    if (origin.empty()) return "the server";
+    return std::string(origin.substr(origin.find("://") + 3));
+}
+
+} // namespace
+
+bool succeeded(const Attempt& a) {
+    return a.error.empty() && a.curl_exit == 0 && (a.status == 0 || (a.status >= 200 && a.status < 300));
+}
+
+bool worth_retrying(const Attempt& a) {
+    if (!a.error.empty() || a.limited) return false;
+    if (a.curl_exit != 0) return curl_heals(a.curl_exit);
+    return server_trouble(a.status);
+}
+
+bool rate_limited(int curl_exit, int status, std::string_view body) {
+    return curl_exit == 0 && (status == 403 || status == 429) &&
+           util::to_lower(body).find("rate limit") != std::string::npos;
+}
+
+std::string describe(const Attempt& a) {
+    if (!a.error.empty()) return a.error;
+    if (a.curl_exit == proc::exit_stopped) return "stopped";
+    const std::string host = a.host.empty() ? host_of(a.url) : a.host;
+    if (a.curl_exit != 0) {
+        if (const auto words = curl_words(a.curl_exit); !words.empty()) {
+            return std::format("could not reach {} ({})", host, words);
+        }
+        return std::format("curl failed for {} (exit {})", host, a.curl_exit);
+    }
+    return "GitHub answered " + status_words(a.status);
+}
+
+std::string fresh_url(std::string_view url, std::int64_t stamp, int n) {
+    const auto hash = url.find('#');
+    const auto base = url.substr(0, hash);
+    std::string out(base);
+    out += base.find('?') == std::string_view::npos ? '?' : '&';
+    out += std::format("grab={}-{}", stamp, n);
+    if (hash != std::string_view::npos) out += url.substr(hash);
+    return out;
+}
+
+std::vector<Attempt> fetch(const Fetch& f, const TryFn& attempt, const WaitFn& wait, const SayFn& say) {
+    struct Leg {
+        const std::string* url;
+        const std::vector<std::chrono::seconds>* waits;
+        bool api;
+    };
+    std::vector<Leg> legs{{.url = &f.url, .waits = &f.waits, .api = false}};
+    if (!f.api.empty()) legs.push_back({.url = &f.api, .waits = &f.api_waits, .api = true});
+    std::size_t planned = 0; // the tries made and still to come, as far as is known now
+    for (const auto& leg : legs) planned += leg.waits->size();
+
+    std::vector<Attempt> tries;
+    for (std::size_t l = 0; l < legs.size(); ++l) {
+        const auto& waits = *legs[l].waits;
+        const bool api = legs[l].api;
+        for (std::size_t i = 0; i < waits.size(); ++i) {
+            if (waits[i] > std::chrono::seconds::zero() && wait && !wait(waits[i])) return tries;
+            const int n = static_cast<int>(tries.size()) + 1;
+            const std::string url = n == 1 ? *legs[l].url : fresh_url(*legs[l].url, f.stamp, n);
+            Attempt a = attempt(url, api);
+            a.url = url;
+            tries.push_back(a);
+            if (succeeded(a)) {
+                if (n > 1 && say) {
+                    say(std::format("{}{}{} on try {} of {}", text::retried, f.what, api ? " through GitHub's API" : "",
+                                    n, planned));
+                }
+                return tries;
+            }
+            if (!a.error.empty() || a.curl_exit == proc::exit_stopped) return tries;
+            const bool again = worth_retrying(a) && i + 1 < waits.size();
+            if (!again) planned -= waits.size() - i - 1; // that URL's other tries are dropped
+            // What comes next: another try of this URL, else the next URL's first, else nothing.
+            std::string next;
+            if (again) {
+                next = std::format("again in {} s", waits[i + 1].count());
+            } else if (l + 1 < legs.size() && !legs[l + 1].waits->empty()) {
+                const auto first = legs[l + 1].waits->front();
+                next = first > std::chrono::seconds::zero() ? std::format("GitHub's API in {} s", first.count())
+                                                            : std::string("GitHub's API instead");
+            }
+            if (!next.empty() && say) {
+                say(std::format("{} for {}{}{} (try {} of {})", describe(a), f.what, text::retrying, next, n + 1,
+                                planned));
+            }
+            if (!again) break;
+        }
+    }
+    return tries;
+}
+
+std::string fetch_error(std::string_view lead, const std::vector<Attempt>& tries, std::string_view by_hand) {
+    if (tries.empty()) return std::format("{}: nothing was tried; {}", lead, by_hand);
+    const auto& last = tries.back();
+    if (!last.error.empty()) return std::format("{}: {}", lead, last.error);
+    if (last.curl_exit == proc::exit_stopped) return std::format("{}: stopped", lead);
+    // Each different outcome once, in order: "GitHub answered 504 (Gateway Time-out), then could
+    // not reach api.github.com (timed out)".
+    std::vector<std::string> seen;
+    bool github = false;  // an answer that says GitHub has trouble
+    bool network = false; // a request that got no answer, or no whole one
+    for (const auto& t : tries) {
+        auto words = describe(t);
+        if (std::ranges::find(seen, words) == seen.end()) seen.push_back(std::move(words));
+        if (t.curl_exit == 0 && server_trouble(t.status)) github = true;
+        if (t.curl_exit != 0 && worth_retrying(t)) network = true;
+    }
+    std::string what = util::join(seen, ", then ");
+    if (seen.size() == 1 && tries.size() > 1) what += last.curl_exit == 0 ? " to every try" : " at every try";
+    if (github) return std::format("{}: {}, a problem on GitHub's side; try again later, or {}", lead, what, by_hand);
+    if (network) {
+        return std::format("{}: {}; check the internet connection and try again, or {}", lead, what, by_hand);
+    }
+    return std::format("{}: {}; {}", lead, what, by_hand);
+}
+
 bool update_due(std::int64_t last, std::int64_t now) {
     constexpr std::int64_t day = 24 * 60 * 60;
     return last <= 0 || now < last || now - last >= day;
@@ -416,6 +640,8 @@ Phase phase_of(std::string_view line) {
     if (line.starts_with(text::installing)) return Phase::installing;
     if (line.starts_with(text::updated) || line.starts_with(text::completed)) return Phase::done;
     if (line.find(text::up_to_date) != std::string_view::npos) return Phase::up_to_date;
+    if (line.starts_with(text::retried)) return Phase::retried;
+    if (line.find(text::retrying) != std::string_view::npos && line.ends_with(')')) return Phase::retrying;
     return Phase::other;
 }
 
@@ -438,8 +664,11 @@ struct Session {
     bool gui_unelevated = false;
     std::shared_ptr<void> gui_token;
 
+    // Flushed at once: grab-gui reads our stdout from a file while we run (a retry's note must show
+    // during the wait it tells of, not after it).
     void say(std::string_view line) {
         std::println("{}", line);
+        flush();
         log.append(line).push_back('\n');
     }
     void error(std::string_view msg) {
@@ -470,16 +699,88 @@ std::optional<std::string> installer_location() {
     return util::to_utf8(value);
 }
 
-// curl -fL <url> -o <file>, quiet unless `progress`.
-std::expected<void, std::string> download(const std::string& url, const std::filesystem::path& file,
-                                          bool progress) {
-    std::vector<std::string> argv{"curl", "-fL", progress ? "--progress-bar" : "-sS", "-o",
-                                  util::path_to_utf8(file), url};
+std::int64_t unix_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// Waits `d`, or less when `stop` is requested: false then.
+bool pause(std::chrono::seconds d, const std::stop_token& stop) {
+    std::mutex m;
+    std::condition_variable_any woken; // nothing notifies it: only the time or a stop ends the wait
+    std::unique_lock lock(m);
+    return !woken.wait_for(lock, stop, d, [&stop] { return stop.stop_requested(); });
+}
+
+// What curl's -w "%{http_code} %{url_effective}" printed: the last answer's status (000: none
+// came) and the host it ended at, after redirects.
+void take_write_out(std::string_view out, Attempt& a) {
+    out = util::trim(out);
+    const auto space = out.find(' ');
+    const auto code = out.substr(0, space);
+    int status = 0;
+    if (const auto [ptr, ec] = std::from_chars(code.data(), code.data() + code.size(), status);
+        ec == std::errc{} && ptr == code.data() + code.size()) {
+        a.status = status;
+    }
+    if (space != std::string_view::npos) {
+        if (const auto effective = util::trim(out.substr(space + 1)); !effective.empty()) a.host = host_of(effective);
+    }
+}
+
+// What curl writes to stdout after each try (take_write_out). Like every flag grab passes it, it is
+// in curl 7.55, as old as Windows 10 1803's curl.exe.
+constexpr std::string_view write_out = "%{http_code} %{url_effective}";
+constexpr std::string_view no_curl = " (curl ships with Windows 10 1803 and later)";
+
+// One try at a download: curl -L <url> -o <file>, quiet unless `progress`, the answer's status
+// kept from stdout while its progress bar and errors go to stderr as before. Not -f: an answer
+// 4xx or 5xx is told by its status. `api`: the API asset URL, which answers with the bytes (a
+// redirect to them) when asked for application/octet-stream. The file is deleted first, so what a
+// failed try left is never read; a stall (under 1 KiB/s for a minute) ends the try.
+Attempt download_try(const std::string& url, bool api, const std::filesystem::path& file, bool progress) {
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    std::vector<std::string> argv{"curl", "-L", progress ? "--progress-bar" : "-sS", "--connect-timeout", "30",
+                                  "--speed-limit", "1024", "--speed-time", "60", "-w", std::string(write_out),
+                                  "-o", util::path_to_utf8(file)};
+    if (api) {
+        argv.emplace_back("-H");
+        argv.emplace_back("Accept: application/octet-stream");
+    }
+    argv.push_back(url);
     flush();
-    auto code = proc::run_inherit(argv);
-    if (!code) return util::fail(code.error());
-    if (*code != 0) return util::failf("download of {} failed (curl exit {})", url, *code);
-    return {};
+    Attempt a;
+    const auto ran = proc::run_capture(argv);
+    if (!ran) {
+        a.error = ran.error() + std::string(no_curl);
+        return a;
+    }
+    a.curl_exit = ran->exit_code;
+    take_write_out(ran->out, a);
+    return a;
+}
+
+// Downloads `asset` to `file`: its browser URL four times (at most 10 s of waits), then its API URL
+// twice (3 s), each failed try said. The error names the file, what went wrong and what to do
+// (`by_hand`).
+std::expected<void, std::string> download(const Asset& asset, const std::filesystem::path& file, bool progress,
+                                          std::string_view by_hand, Session& s) {
+    using namespace std::chrono_literals;
+    Fetch f;
+    f.what = asset.name;
+    f.url = asset.url;
+    f.api = asset.api;
+    f.stamp = unix_ms();
+    f.waits = {0s, 1s, 3s, 6s};
+    f.api_waits = {0s, 3s};
+    const auto tries = fetch(
+        f, [&](const std::string& url, bool api) { return download_try(url, api, file, progress); },
+        [](std::chrono::seconds d) { return pause(d, {}); }, [&s](std::string_view line) { s.say(line); });
+    if (!tries.empty() && succeeded(tries.back())) return {};
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    return util::fail(fetch_error("could not download " + asset.name, tries, by_hand));
 }
 
 // Moves the running exe aside so its path can be written. Returns the backup path.
@@ -657,25 +958,60 @@ std::optional<std::string> incomplete_folder_note() {
 #endif
 }
 
-std::expected<Check, std::string> check(bool detached, std::stop_token stop) {
+std::expected<Check, std::string> check(bool detached, std::stop_token stop, const SayFn& say) {
 #ifndef _WIN32
     (void)detached;
     (void)stop;
+    (void)say;
     return util::fail("updates are only available on Windows");
 #else
+    using namespace std::chrono_literals;
     Check c;
     c.current = parse_version(GRAB_VERSION).value_or(Version{});
     const std::string api = api_url();
-    proc::RunOptions run;
-    run.detached = detached;
-    run.stop = std::move(stop);
-    auto meta = proc::run_capture(std::vector<std::string>{"curl", "-fsSL", "--connect-timeout", "15", "--max-time", "60",
-                                                           "-H", "Accept: application/vnd.github+json", api},
-                                  run);
-    if (run.stop.stop_requested()) return util::fail("stopped");
-    if (!meta) return util::failf("{} (curl ships with Windows 10 1803 and later)", meta.error());
-    if (meta->exit_code != 0) return util::failf("could not fetch {} (curl exit {})", api, meta->exit_code);
-    auto release = parse_release(meta->out);
+    // After the body on stdout: -w's status and URL behind a mark, the last one there (curl's -w
+    // knows only \n, \r and \t as escapes).
+    constexpr std::string_view mark = "\ngrab-status:";
+    std::string body; // the last answer's
+    const auto attempt = [&](const std::string& url, bool) {
+        proc::RunOptions run;
+        run.detached = detached;
+        run.stop = stop;
+        const auto meta =
+            proc::run_capture(std::vector<std::string>{"curl", "-sSL", "--connect-timeout", "15", "--max-time", "60", "-H",
+                                                       "Accept: application/vnd.github+json", "-w",
+                                                       "\\ngrab-status:" + std::string(write_out), url},
+                              run);
+        Attempt a;
+        if (!meta) {
+            a.error = meta.error() + std::string(no_curl);
+            return a;
+        }
+        a.curl_exit = meta->exit_code;
+        const auto at = meta->out.rfind(mark);
+        body = meta->out.substr(0, at);
+        if (at != std::string::npos) take_write_out(std::string_view(meta->out).substr(at + mark.size()), a);
+        a.limited = rate_limited(a.curl_exit, a.status, body);
+        return a;
+    };
+    Fetch f;
+    f.what = "the latest release";
+    f.url = api;
+    f.stamp = unix_ms();
+    // grab-gui's check at its start tries less: it stays silent, and the next start tries again.
+    f.waits = detached ? std::vector{0s, 3s} : std::vector{0s, 2s, 5s};
+    const auto tries = fetch(f, attempt, [&stop](std::chrono::seconds d) { return pause(d, stop); }, say);
+    if (stop.stop_requested()) return util::fail("stopped");
+    constexpr std::string_view lead = "could not read the latest release";
+    if (tries.empty() || !succeeded(tries.back())) {
+        if (!tries.empty() && tries.back().limited) {
+            return util::failf("{}: GitHub's hourly limit for checks without an account was reached; try again later "
+                               "(it resets within the hour)",
+                               lead);
+        }
+        return util::fail(fetch_error(lead, tries, std::format("get grab from {}", releases_page)));
+    }
+    auto release = parse_release(body, api);
     if (!release) return util::fail(release.error());
     c.release = std::move(*release);
 
@@ -714,7 +1050,7 @@ int update_once(bool check_only, Session& s) {
             return exit_update_failed;
         }
     }
-    auto checked = check();
+    auto checked = check(false, {}, [&s](std::string_view line) { s.say(line); });
     if (!checked) {
         s.error(checked.error());
         return exit_update_failed;
@@ -788,11 +1124,14 @@ int update_once(bool check_only, Session& s) {
     s.say(std::format("{}{} ({} install)", text::downloading, name, via_installer ? "installer" : "portable"));
     const auto sums_file = tmp / std::string(sums_asset_name);
     const auto payload = tmp / util::path_from_utf8(name); // the release's name, UTF-8 (G140)
-    if (auto r = download(sums->url, sums_file, false); !r) {
+    // What to do when GitHub doesn't give a file.
+    const std::string by_hand =
+        std::format("get {} from {}", name, release->page.empty() ? std::string(releases_page) : release->page);
+    if (auto r = download(*sums, sums_file, false, by_hand, s); !r) {
         s.error(r.error());
         return exit_update_failed;
     }
-    if (auto r = download(asset->url, payload, true); !r) {
+    if (auto r = download(*asset, payload, true, by_hand, s); !r) {
         s.error(r.error());
         return exit_update_failed;
     }

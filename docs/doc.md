@@ -131,7 +131,11 @@ grab update           # download, verify and install it over this copy
 
 `grab update` reads the latest GitHub release and, when it is newer, downloads the matching
 asset and checks it against the release's `SHA256SUMS.txt`. It refuses anything that doesn't
-match. Nothing is changed before that check passes. A copy installed with the setup exe is
+match. Nothing is changed before that check passes. When GitHub fails a request (a 5xx answer, a
+timeout, a dropped connection), `grab update` says so and tries again a few times, seconds apart,
+each time at a fresh URL that GitHub's cache hasn't seen, and then downloads the file through
+GitHub's API instead; when nothing gets through, the error says what GitHub answered and where to
+download the release by hand. A copy installed with the setup exe is
 upgraded by running the new installer silently, so Add/Remove Programs shows the new version.
 An open grab window of that copy is closed by `grab update` itself before the installer runs:
 the window saves its downloads first, and running ones stop with their partial files kept and go
@@ -721,11 +725,12 @@ them.
   - Which connections, how long grab waits for a server, and the local address to connect from
     are set per server: see [Connections](#connections).
 
-- **Updates:** once a day, when the window opens, grab asks GitHub for the latest release (one
-  request; a failure stays silent). A newer one shows a banner: `grab 0.7.0 is available ·
-  What's new · Update · Later`.
+- **Updates:** once a day, when the window opens, grab asks GitHub for the latest release (a
+  second time a few seconds later when GitHub fails; a failure stays silent). A newer one shows a
+  banner: `grab 0.7.0 is available · What's new · Update · Later`.
   - Update runs `grab update` (the same SHA-256 check) and the banner follows it:
-    downloading, verifying, installing.
+    downloading, verifying, installing. While GitHub fails a request, the banner says what it
+    answered and which try comes next.
   - An installed copy: `grab update` closes the window, the installer runs, and the window opens
     again, the new version or, when the update failed, the old one with `Update failed: <why> ·
     Try again · Close`. That banner comes back each time the window opens until you close it. A

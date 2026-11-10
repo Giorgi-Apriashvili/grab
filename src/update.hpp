@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -38,9 +39,14 @@ struct Version {
 [[nodiscard]] std::optional<Version> parse_version(std::string_view text);
 [[nodiscard]] std::string to_string(const Version& v);
 
+// Where grab is downloaded by hand: named when `grab update` can't, unless the release has its own
+// page.
+inline constexpr std::string_view releases_page = "https://github.com/Giorgi-Apriashvili/grab/releases";
+
 struct Asset {
     std::string name;
-    std::string url;
+    std::string url; // browser_download_url
+    std::string api; // its API URL ("url"), only when is_api_asset_url(): the fallback download
 };
 
 struct Release {
@@ -50,10 +56,17 @@ struct Release {
     std::string page; // the release's web page (html_url), only when is_release_page()
 };
 
-// A GitHub `releases/latest` JSON payload.
-[[nodiscard]] std::expected<Release, std::string> parse_release(std::string_view json_text);
+// A GitHub `releases/latest` JSON payload, fetched from `api` (an asset's API URL is kept only when
+// it is of that origin).
+[[nodiscard]] std::expected<Release, std::string> parse_release(std::string_view json_text,
+                                                                std::string_view api = default_api_url);
 // Whether `url` is a page on github.com, the only kind grab-gui opens for "What's new".
 [[nodiscard]] bool is_release_page(std::string_view url);
+// Whether `url` (an asset's "url" in the release metadata) is an API asset URL at the origin
+// (scheme, host and port) of `api`, the metadata's own URL, so a GRAB_UPDATE_API test server's
+// count too: <origin>/repos/<owner>/<repo>/releases/assets/<digits>, nothing else (no query, no
+// quotes, spaces or control bytes).
+[[nodiscard]] bool is_api_asset_url(std::string_view url, std::string_view api);
 [[nodiscard]] const Asset* find_asset(const Release& release, std::string_view name);
 
 enum class InstallMode {
@@ -230,6 +243,65 @@ private:
 // GRAB_UPDATE_API, else default_api_url.
 [[nodiscard]] std::string api_url();
 
+// ---- requests that survive a GitHub hiccup -------------------------------------------------------
+// On 2026-11-08 GitHub's edge answered 504 for releases/download URLs and kept that answer for each
+// URL for minutes, so every Try again failed at once, while the same file through the API came in
+// half a second (grab-plans TODO.md, Updates). So each request is tried a few times, every try
+// after the first at a URL no cache has seen (fresh_url), and a release file then through its API
+// URL. The SHA-256 check stays the only trust in what comes.
+
+// How one curl run ended.
+struct Attempt {
+    int curl_exit = 0;    // curl's exit code: 0 when an answer came, whatever its status
+    int status = 0;       // the last answer's HTTP status (after redirects); 0: none came, or a file:// URL
+    bool limited = false; // GitHub's rate limit refused it: never tried again
+    std::string error;    // curl couldn't run at all: why (nothing more is tried)
+    std::string url;      // the URL tried (fetch sets it)
+    std::string host;     // where curl ended up, after redirects, when it said; else url's host
+};
+// Whether it brought the file: an answer with a 2xx status (or a file:// URL's, which has none).
+[[nodiscard]] bool succeeded(const Attempt& a);
+// Whether another try may heal it: a network failure (no name, no connection, a failed TLS
+// handshake, a transfer cut short or stalled, an empty reply) or an answer 5xx, 408 or 429. Not
+// 403, 404, 410 and the like, nor GitHub's rate limit, nor a curl stopped (proc::exit_stopped).
+[[nodiscard]] bool worth_retrying(const Attempt& a);
+// Whether an answer is GitHub's limit for requests without an account (60 an hour from one
+// address): a 403 or 429 whose body says "rate limit". Another try now won't help.
+[[nodiscard]] bool rate_limited(int curl_exit, int status, std::string_view body);
+// What went wrong, in plain words: "GitHub answered 504 (Gateway Time-out)", "could not reach
+// github.com (timed out)".
+[[nodiscard]] std::string describe(const Attempt& a);
+// `url` with "grab=<stamp>-<n>" in its query: a URL no cache has an answer for, unique to the run
+// (`stamp`, Unix milliseconds) and to the try (`n`).
+[[nodiscard]] std::string fresh_url(std::string_view url, std::int64_t stamp, int n);
+
+// One file to fetch, and how often.
+struct Fetch {
+    std::string what;       // in the lines: "SHA256SUMS.txt", "the latest release"
+    std::string url;        // tried first, the first time as it is
+    std::string api;        // then this, the file's API URL (empty: no such fallback)
+    std::int64_t stamp = 0; // the run's, in each fresh_url
+    std::vector<std::chrono::seconds> waits;     // before each try of `url`: so also how many
+    std::vector<std::chrono::seconds> api_waits; // before each try of `api`
+};
+// One try: curl for `url`; `api` true for the API URL, asked for the file's bytes.
+using TryFn = std::function<Attempt(const std::string& url, bool api)>;
+// Waits that long; false when it was stopped meanwhile.
+using WaitFn = std::function<bool(std::chrono::seconds)>;
+using SayFn = std::function<void(std::string_view)>;
+// Tries `f.url`, then `f.api`, as their waits say: the very first try at the URL as it is (often a
+// good answer cached), every later one at a fresh_url. A failure another try can't heal
+// (worth_retrying) ends that URL's tries; curl not running, or stopped, ends them all. A failure
+// with a try after it is said (`say`, may be empty) with what comes next ("GitHub answered 504
+// (Gateway Time-out) for SHA256SUMS.txt; trying again in 3 s (try 2 of 6)"), and so is a success
+// after failures. Returns each try's outcome in order; the last is the success when there is one.
+[[nodiscard]] std::vector<Attempt> fetch(const Fetch& f, const TryFn& attempt, const WaitFn& wait, const SayFn& say);
+// The error after tries that brought nothing (fetch): `lead`, what went wrong at each and what to
+// do: "could not download SHA256SUMS.txt: GitHub answered 504 (Gateway Time-out) to every try, a
+// problem on GitHub's side; try again later, or <by_hand>".
+[[nodiscard]] std::string fetch_error(std::string_view lead, const std::vector<Attempt>& tries,
+                                      std::string_view by_hand);
+
 // What `grab update` and grab-gui know after asking for the latest release.
 struct Check {
     Version current; // this build
@@ -239,9 +311,12 @@ struct Check {
     // A newer release, or this one completing a portable folder (needs_install).
     [[nodiscard]] bool available() const { return needs_install(current, release.version, !missing.empty()); }
 };
-// Asks api_url() for the latest release (curl). `detached`: curl runs without a console window,
-// for grab-gui, which can also `stop` it. Windows only.
-[[nodiscard]] std::expected<Check, std::string> check(bool detached = false, std::stop_token stop = {});
+// Asks api_url() for the latest release (curl), trying again as fetch() does after a network
+// failure or an answer 5xx, 408 or 429, with each failed try said through `say`. `detached`: curl
+// runs without a console window, for grab-gui's check, which tries fewer times and can `stop` it.
+// Windows only.
+[[nodiscard]] std::expected<Check, std::string> check(bool detached = false, std::stop_token stop = {},
+                                                      const SayFn& say = {});
 
 // grab-gui checks at most once a day: whether a check last made at `last` (Unix seconds, 0 =
 // never) is due at `now`. A clock that went backwards makes it due.
@@ -258,9 +333,13 @@ inline constexpr std::string_view updated = "updated grab ";
 inline constexpr std::string_view completed = "completed grab ";
 inline constexpr std::string_view up_to_date = " is up to date";         // "grab X.Y.Z is up to date ..."
 inline constexpr std::string_view error = "grab: error: ";
+// "<what went wrong> for <file>; trying again in 3 s (try 2 of 6)" (fetch)
+inline constexpr std::string_view retrying = "; trying ";
+// "got <file> on try 3 of 6", after failed tries (fetch)
+inline constexpr std::string_view retried = "got ";
 } // namespace text
 
-enum class Phase { other, checking, downloading, verified, installing, done, up_to_date, failed };
+enum class Phase { other, checking, downloading, verified, installing, done, up_to_date, failed, retrying, retried };
 // Which step a line of `grab update` output reports.
 [[nodiscard]] Phase phase_of(std::string_view line);
 
