@@ -49,7 +49,7 @@ struct Names {
                                                                const std::vector<folder::File>& files, std::size_t i);
 
 // The page's status code for a running big file that waits for a connection while the folder's
-// small files hold them (folder::Tree::small_connections): "Waiting" (DOWNLOADS-UI.md, chunk G),
+// small files claim them (folder::Tree::small_claim): "Waiting" (DOWNLOADS-UI.md, chunk G),
 // after folder::State's codes. It counts as queued, as any big file that doesn't read.
 inline constexpr int held_code = 6;
 
@@ -74,8 +74,8 @@ struct Row {
 
 // One pass over a folder's files: its totals and the files in each state (the folder's row), and
 // with `shadow` (one per file) the files changed since it, which it then holds. `small_hold`: the
-// folder's small files hold connections now (Tree::small_connections), so a running big file that
-// waits for one waits for them (Shadow::held). The totals' speed and time left are unused: the
+// folder's small files claim connections now (Tree::small_claim), whether they hold them yet or
+// not, so a running big file that waits for one waits for them (Shadow::held). The totals' speed and time left are unused: the
 // window measures a download's own (speed.hpp).
 struct Pass {
     folder::Totals totals;

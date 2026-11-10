@@ -212,9 +212,10 @@ TEST_CASE("running big files' parts of the folder's connections add up to what i
     CHECK(parts(2, {1, 2, 4}) == V{0, 1, 1});
     CHECK(parts(1, {2, 4, 4}) == V{0, 1, 0});
     CHECK(parts(2, {2, 2, 2}) == V{1, 1, 0});
-    // None free: 1 each, the server's budget decides.
-    CHECK(parts(0, {2}) == V{1});
-    CHECK(parts(-1, {2, 2}) == V{1, 1});
+    // None free (the small files claim them all): 0 each, all wait.
+    CHECK(parts(0, {2}) == V{0});
+    CHECK(parts(-4, {4, 2}) == V{0, 0});
+    // No weights: 1 each, the server's budget decides.
     CHECK(parts(4, {0, 0}) == V{1, 1});
     CHECK(parts(4, {}).empty());
     // Any mix of priorities, as many connections as the budget may give: all used, each file at

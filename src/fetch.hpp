@@ -318,8 +318,8 @@ struct Download {
     std::function<double()> flow_part;
     // At most this many streams at once, asked as each starts and at each read: a folder's file
     // gets its part of the folder's connections beside its other files downloading (by their
-    // priorities; 0 while higher ones take all it has). A stream over it gives its connection up
-    // and goes on later from its bytes. Unset: no cap.
+    // priorities; 0 while higher ones, or the folder's small files, take all it has). A stream over
+    // it gives its connection up and goes on later from its bytes. Unset: no cap.
     std::function<int()> streams_cap;
     // Told +1 as a stream starts reading on a connection it holds and -1 as it stops, with
     // `all_in` once every byte of the file is in (it is being put in place, not waiting): a folder

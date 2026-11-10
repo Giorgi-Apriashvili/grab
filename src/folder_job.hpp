@@ -87,10 +87,14 @@ struct Tree {
     std::vector<File> files;
     int connections = 0;   // open right now
     int files_at_once = 0; // its big files running
-    // The connections its small files' workers hold now: not the big files' to share. A running
-    // big file that waits for a connection meanwhile waits for the small files (the window says
-    // "Waiting").
+    // The connections its small files' workers hold now.
     int small_connections = 0;
+    // Its small files' workers still at work, each claiming one of the folder's connections whether
+    // it holds one now, waits for one, logs in again or waits after a broken connection: counted
+    // from before the big files start (folder::run) until each finds no small file left. The big
+    // files share only the connections the claim leaves, so a running big file that waits for a
+    // connection meanwhile waits for the small files (the window says "Waiting").
+    int small_claim = 0;
     // Folders below the folder that the walk couldn't read ("a/b: permission denied"): the rest is
     // downloaded and these are said (review G55).
     std::vector<std::string> unreadable;
@@ -114,12 +118,12 @@ struct Tree {
 // An unfinished file's priority (by its index), under the caller's mutex: queued ones move in the
 // start order, a running one gets its new share at its next reads. Whether it changed anything.
 bool set_priority(Tree& tree, std::size_t index, int weight);
-// The running big files' parts of the folder's connections its small files don't hold (`free`), by
-// their priorities (`weights`, in the same order): free × w / Σw, the connections left over one
+// The running big files' parts of the folder's connections its small files don't claim (`free`),
+// by their priorities (`weights`, in the same order): free × w / Σw, the connections left over one
 // each by the largest remainders (ties: the higher priority, then the earlier file), so the parts
 // add up to `free`; each at least 1, so every file keeps going. With fewer connections than files,
 // 1 each for the highest priorities (the earlier file first) and 0 for the others, which wait; with
-// none free, 1 each: the server's budget decides.
+// none free (the small files claim them all), 0 each: they all wait.
 [[nodiscard]] std::vector<int> connection_parts(int free, std::span<const int> weights);
 
 struct Totals {
@@ -221,6 +225,9 @@ struct Job {
     // Told the bytes of each READ's reply as it comes, small files' and big files' alike, from the
     // thread that read it, without the mutex: the folder's speed is what arrives (speed.hpp).
     std::function<void(std::uint64_t)> on_received;
+    // Tests: called on the small files' thread before their workers start, which a busy machine
+    // may start late.
+    std::function<void()> on_small_start;
     // The server's pool of grab's own SSH connections, which the folder is walked and fetched
     // through. Needed, and so is `connections`.
     std::shared_ptr<ssh::Pool> pool;

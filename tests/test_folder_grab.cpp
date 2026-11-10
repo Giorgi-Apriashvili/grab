@@ -810,10 +810,25 @@ TEST_CASE("grab engine folders: running big files split the folder's connections
     constexpr std::uint64_t each = std::uint64_t{16} << 20;
     t.file("/data/high.bin", test::pattern(each));
     t.file("/data/low.bin", test::pattern(each));
+    // Also after the folder's small files: the big files start while the small files claim every
+    // connection (their first ranges cut for one stream), and split the connections once the small
+    // files are done. Low must not get a second one meanwhile (High : Low fell from 3 to 1.5 in a
+    // window run on Main with 4 connections: TCP's, but checked here).
+    // There only the most each holds is checked: as the small files' workers end one by one, High
+    // gets its connections first and may run out of work for 4 before Low has its 1, so the window
+    // the averages below need can be empty on a busy machine.
+    std::string name = "connection-part";
+    bool after_small = false;
+    SUBCASE("alone") {}
+    SUBCASE("after the small files") {
+        for (int i = 0; i < 100; ++i) t.file(std::format("/data/s{:03}.bin", i), test::pattern(20000 + i));
+        name += "-small";
+        after_small = true;
+    }
     // A network slow enough that both files read for about a second.
     t.delay = std::chrono::milliseconds(2);
     t.slice = std::size_t{64} * 1024;
-    Run r(t.pool(5), "connection-part", 5, 2);
+    Run r(t.pool(5), name, 5, 2);
     // Play's depth of 1 for good (no speed limit, which keeps a quarter second of it on its way
     // since chunk J): each stream has one READ on its way at a time, so one that gives its
     // connection up waits for that READ and closes the file (with over hand_over_max on its way it
@@ -901,6 +916,7 @@ TEST_CASE("grab engine folders: running big files split the folder's connections
     MESSAGE("most at once beside the other: High ", most[high], ", Low ", most[low]);
     CHECK(most[high] == 4);
     CHECK(most[low] == 1);
+    if (after_small) return;
     REQUIRE(full_since);
     const double window = std::chrono::duration<double>(std::min(work_until, reads_to[low]) - *full_since).count();
     REQUIRE(window > 0);
@@ -911,9 +927,9 @@ TEST_CASE("grab engine folders: running big files split the folder's connections
     MESSAGE("connections on average while both read: High ", high_avg, ", Low ", low_avg, " (High : Low = ",
             high_avg / low_avg, ")");
     CHECK(high_avg > 4.0 * 0.85);
-    CHECK(high_avg <= 4.0); // never above most[high]
+    CHECK(high_avg <= 4.0 + 1e-9); // never above most[high] (but for the sums' rounding)
     CHECK(low_avg > 1.0 * 0.85);
-    CHECK(low_avg <= 1.0);
+    CHECK(low_avg <= 1.0 + 1e-9);
 }
 
 namespace {
@@ -1132,7 +1148,7 @@ TEST_CASE("grab engine folders: a big file whose connections the small files hol
     bool held_after = false;  // one still held once no small file runs
     r.job.on_event = [&](folder::Event) {
         std::lock_guard lock(r.m);
-        const bool small_hold = r.tree.small_connections > 0;
+        const bool small_hold = r.tree.small_claim > 0;
         const auto p = queue_view::pass(r.tree.files, nullptr, small_hold);
         most_held = std::max(most_held, p.held);
         if (p.held > 0) seen_held = true;
@@ -1149,6 +1165,64 @@ TEST_CASE("grab engine folders: a big file whose connections the small files hol
     CHECK_FALSE(queued_held); // the others, Queued
     CHECK_FALSE(held_after);
     CHECK(r.tree.small_connections == 0);
+    CHECK(r.tree.small_claim == 0);
+}
+
+TEST_CASE("grab engine folders: small files whose thread starts late still take the connections first") {
+    // The big files start beside the small files' thread. When that thread ran late (a busy
+    // machine), the big files' streams took every connection and kept each until its range ended:
+    // no small file came for seconds (until the big files were done: a stream whose range ended
+    // took a connection again before a waiting small worker did).
+    Tree t;
+    t.dir("/data");
+    for (int i = 0; i < 200; ++i) t.file(std::format("/data/s{:03}.bin", i), test::pattern(20000 + i));
+    for (int i = 0; i < 2; ++i) t.file(std::format("/data/b{}.bin", i), test::pattern((4u << 20) + 4096 * i));
+    t.delay = std::chrono::milliseconds(4); // a slow network: the big files read for seconds
+    t.slice = std::size_t{16} * 1024;
+    Run r(t.pool(4), "late-small", 4, 2);
+    { auto listed = folder::list(r.job, r.tree, r.m, {}); REQUIRE_MESSAGE(listed, listed.error_or("")); }
+    auto big_asked = [&t] {
+        std::lock_guard lock(t.mutex);
+        return std::ranges::any_of(t.asks, [](const Tree::Asked& a) { return a.path.starts_with("/data/b"); });
+    };
+    // The small files' workers start once a big file asked for data, half a second at most.
+    // Meanwhile no small file holds a connection, but the big files that started wait for the
+    // small files all the same, and the window says so (the rule app.cpp keeps).
+    Tree::Clock::time_point small_start{};
+    std::size_t held_before = 0;
+    int small_held_before = -1;
+    r.job.on_small_start = [&] {
+        const auto until = Tree::Clock::now() + std::chrono::milliseconds(500);
+        while (!big_asked() && Tree::Clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        small_start = Tree::Clock::now();
+        std::lock_guard lock(r.m);
+        held_before = queue_view::pass(r.tree.files, nullptr, r.tree.small_claim > 0).held;
+        small_held_before = r.tree.small_connections;
+    };
+    folder::run(r.job, r.tree, r.m, {});
+    for (const auto& f : r.tree.files) {
+        CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+        CHECK_MESSAGE(util::read_file(r.local(f.path)) == t.files.at("/data/" + f.path), f.path);
+    }
+    // The first small file's OPEN, and what the big files asked for before it.
+    std::optional<Tree::Clock::time_point> first_small;
+    std::uint64_t big_before = 0;
+    {
+        std::lock_guard lock(t.mutex);
+        const auto it = std::ranges::find_if(t.opens, [](const auto& o) { return o.first.starts_with("/data/s"); });
+        if (it != t.opens.end()) first_small = it->second;
+        for (const auto& a : t.asks) {
+            if (first_small && a.path.starts_with("/data/b") && a.at < *first_small) big_before += a.length;
+        }
+    }
+    REQUIRE(first_small);
+    const auto after = std::chrono::duration<double>(*first_small - small_start).count();
+    MESSAGE("first small file ", after, " s after its workers started; the big files asked ", big_before, " B before it");
+    CHECK(big_before == 0); // the small files' claim held from the start
+    CHECK(after < 0.5);
+    CHECK(small_held_before == 0);
+    CHECK(held_before == 2); // At once 2: both big files say Waiting, not Queued
+    CHECK(r.tree.small_claim == 0);
 }
 
 TEST_CASE("grab engine folders: small files reach a speed limit over the network's round trip") {

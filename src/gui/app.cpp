@@ -3228,7 +3228,7 @@ verify::Request App::verify_request(const engine::Context& ctx, const std::share
 }
 
 queue_view::Pass App::refresh_folder(Item& item, std::vector<queue_view::Shadow>* shadow) {
-    auto p = queue_view::pass(item.tree.files, shadow, item.tree.small_connections > 0);
+    auto p = queue_view::pass(item.tree.files, shadow, item.tree.small_claim > 0);
     item.bytes = p.totals.bytes;
     item.total = p.totals.total;
     item.connections = item.tree.connections;
@@ -4097,7 +4097,7 @@ void App::start_files(int id) {
         if (!item.tree.listed || !item.names || item.gen == 0 || item.names->path.size() != item.tree.files.size()) return;
         send->names = item.names;
         send->gen = item.gen;
-        send->snap = queue_view::snapshot(item.tree.files, item.tree.small_connections > 0);
+        send->snap = queue_view::snapshot(item.tree.files, item.tree.small_claim > 0);
         held = ms_since(locked);
     }
     if (test_logging()) test_log(std::format("first answer lock={:.2f}ms files={}", held, send->snap.rows.size()));

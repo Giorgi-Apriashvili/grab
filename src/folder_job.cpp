@@ -63,12 +63,15 @@ constexpr std::uint32_t small_member = std::uint32_t{1} << 31;
 std::uint32_t big_member(std::size_t index) { return static_cast<std::uint32_t>(index) + 1; }
 
 // What the folder's running files share (DOWNLOADS-UI.md 7), under the caller's mutex. The
-// connections its small workers don't hold (Tree::small_connections) go to its running big files
-// by their priorities (connection_parts). Under a speed limit the folder is one download in the
-// limiter, at its own weight, and its files that read take its turns by their priorities
-// (rate::FairQueue's parts), so its share against other downloads stays as it was, however many of
-// its files run and whenever they start. A file that waits for a connection asks the limiter
-// nothing, so those that read take all of the folder's turns.
+// connections its small workers don't claim (Tree::small_claim) go to its running big files by
+// their priorities (connection_parts). The claim counts from before the big files start, not from
+// when a worker holds a connection: counting only those held let big files started first take
+// every connection when the small files' thread ran late (a busy machine), and keep each until its
+// range ended. Under a speed limit the folder is one download in the limiter, at its own weight,
+// and its files that read take its turns by their priorities (rate::FairQueue's parts), so its
+// share against other downloads stays as it was, however many of its files run and whenever they
+// start. A file that waits for a connection asks the limiter nothing, so those that read take all
+// of the folder's turns.
 struct Members {
     struct Big {
         std::size_t index = 0; // the file's
@@ -410,12 +413,15 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, std::uint32_t membe
     return run;
 }
 
-// The queued small files (under small_limit): as many workers as the server's budget, each holding
-// one of the folder's connections while small files are left, many files in flight on each
-// (small_on). They don't count against At once; the folder's big files, started beside them
-// (run_big), do, and get the connections the small files leave: while the small files hold them
-// all, the big files that started wait (Tree::small_connections; the window says "Waiting").
-void run_small_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_token& stop) {
+// The queued small files (under small_limit): `workers` of them (the server's budget), each
+// holding one of the folder's connections while small files are left, many files in flight on
+// each (small_on). They don't count against At once; the folder's big files, started beside them
+// (run_big), do, and get the connections the small files leave: each worker's claim
+// (Tree::small_claim) counts from before the big files start (the caller sets it) until it finds no
+// small file left, so however late this thread runs, the big files wait while the small files
+// claim them all (the window says "Waiting" while the claim lasts), and take them as the workers
+// end.
+void run_small_grab(const Job& job, Tree& tree, std::mutex& m, int workers, const std::stop_token& stop) {
     const auto dir = job_dir(job);
     auto any_queued = [&] {
         std::lock_guard lock(m);
@@ -434,13 +440,19 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_t
     };
     auto worker = [&](std::uint32_t k) {
         int failures = 0; // in a row, nothing landing
-        // Its connection is not the big files' to share while it takes files (Members). A worker
-        // whose turn a new limit cut keeps it while it logs in again: the folder's big files would
-        // take its place for that moment, and show they no longer wait for it.
+        // The connection it holds (Tree::small_connections); its claim on one (Tree::small_claim)
+        // holds the big files back. A worker whose turn a new limit cut keeps counting while it
+        // logs in again, so the folder's count of its small files' connections doesn't dip for
+        // that moment.
         auto member = [&](int delta) {
             std::lock_guard lock(m);
             tree.small_connections += delta;
             if (delta > 0) tree.connections = job.connections->active(job.server, job.id);
+        };
+        // Its claim ends with it: the big files take its connection at their next look.
+        auto unclaim = [&] {
+            std::lock_guard lock(m);
+            --tree.small_claim;
         };
         bool kept = false;
         // Its files a cut left running for its next turn (small_on); back to the queue when there
@@ -464,11 +476,13 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_t
             bool& kept;
             decltype(member)& leave;
             decltype(requeue_carried)& requeue;
+            decltype(unclaim)& unclaim;
             ~Leave() {
                 requeue();
                 if (std::exchange(kept, false)) leave(-1);
+                unclaim();
             }
-        } leave_at_end{.kept = kept, .leave = member, .requeue = requeue_carried};
+        } leave_at_end{.kept = kept, .leave = member, .requeue = requeue_carried, .unclaim = unclaim};
         for (;;) {
             if (stop.stop_requested() || (carried.empty() && !any_queued())) return;
             if (!job.connections->acquire(job.server, job.id, stop, false)) return;
@@ -520,10 +534,9 @@ void run_small_grab(const Job& job, Tree& tree, std::mutex& m, const std::stop_t
             if (run.broken) pause_for(std::chrono::seconds(2), stop);
         }
     };
-    std::vector<std::jthread> workers;
-    for (int k = 0; k < std::max(1, job.connections->budget(job.server)); ++k) {
-        workers.emplace_back(worker, static_cast<std::uint32_t>(k));
-    }
+    if (job.on_small_start) job.on_small_start();
+    std::vector<std::jthread> threads;
+    for (int k = 0; k < workers; ++k) threads.emplace_back(worker, static_cast<std::uint32_t>(k));
 }
 
 // The queued big files, each resumable like a single-file download, as many at a time as the
@@ -589,12 +602,13 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, Members& members, const 
             // Its part of the folder's connections and of its share of a speed limit, by its
             // priority among the folder's running files: one that starts later gets its part
             // instead of waiting for the first ones to end, and a priority changed meanwhile
-            // counts at the next reads.
+            // counts at the next reads. Of the connections the small files' workers don't claim
+            // (Tree::small_claim): none while they claim the whole share, more as they end.
             d.streams_cap = [&, i] {
                 const int share = job.connections->share(job.server, job.id); // without the lock
                 std::lock_guard lock(m);
                 const auto at = std::ranges::find(members.big, i, &Members::Big::index) - members.big.begin();
-                const auto parts = connection_parts(share - tree.small_connections, members.big_weights(tree));
+                const auto parts = connection_parts(share - tree.small_claim, members.big_weights(tree));
                 return at < std::ssize(parts) ? parts[static_cast<std::size_t>(at)] : 1;
             };
             // Only a file that reads takes the folder's turns, and one that doesn't is
@@ -680,10 +694,11 @@ void run_big(const Job& job, Tree& tree, std::mutex& m, Members& members, const 
 
 std::vector<int> connection_parts(int free, std::span<const int> weights) {
     const auto n = weights.size();
+    if (free <= 0) return std::vector<int>(n, 0); // the small files claim them all: the big files wait
     std::vector<int> parts(n, 1);
     std::int64_t all = 0;
     for (const int w : weights) all += std::max(0, w);
-    if (free <= 0 || all <= 0) return parts; // the server's budget decides
+    if (all <= 0) return parts; // the server's budget decides
     if (std::cmp_less(free, n)) {
         // Fewer than the files: one each for the highest priorities (the earlier file first); the
         // others wait, rather than a Low file reading while a High one waits.
@@ -1115,7 +1130,16 @@ void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
         Members members; // the files running in this pass
         {
             std::jthread small_files;
-            if (small_left) small_files = std::jthread([&] { run_small_grab(job, tree, m, stop); });
+            if (small_left) {
+                // The small files' claim holds before the big files start, however late their
+                // thread runs.
+                const int workers = std::max(1, job.connections->budget(job.server));
+                {
+                    std::lock_guard lock(m);
+                    tree.small_claim = workers;
+                }
+                small_files = std::jthread([&, workers] { run_small_grab(job, tree, m, workers, stop); });
+            }
             if (big_left) run_big(job, tree, m, members, stop);
         }
         notify(job, Event::checkpoint);

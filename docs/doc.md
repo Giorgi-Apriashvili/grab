@@ -601,7 +601,7 @@ them.
       still starts while a High big file waits for an At once place. The small files use the
       folder's connections while they last, so big files that have their places meanwhile say
       Waiting. At once still counts the big files; priority only decides which take its places.
-    - Running big files split the folder's connections (those its small files don't hold)
+    - Running big files split the folder's connections (those its small files leave)
       4 : 2 : 1, at least one each, and under a speed limit the folder's part of it too. With
       fewer connections than running big files, the higher priorities get them and the others
       wait (shown Queued), so a Low file doesn't download while a High one waits. Small files
