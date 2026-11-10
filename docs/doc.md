@@ -1207,6 +1207,10 @@ grab config [-c PATH]
   connection. Picks run one after another, each with the whole budget.
   - Progress is one line, redrawn in place:
     `412.0 MiB / 898.0 MiB  45%  18.0 MiB/s  14 conns  ETA 0:26` (folders add `4/13 files`).
+    A folder's speed and ETA are measured as the window's are: the bytes that came over about
+    the last 5 seconds, its small files' as well as its big ones', and the time left from its
+    pace in files and bytes, so a folder of small files has both too. A new limit shows in the
+    speed within about a second.
     When stderr is not a console (a log file, a script), only the start and end lines appear.
   - Free space is checked before fetching: the files picked together, and each folder right
     after it's listed. If it won't fit, grab stops with `grab: error: not enough free space on

@@ -8,6 +8,7 @@
 #include "local_name.hpp"
 #include "process.hpp"
 #include "progress_line.hpp"
+#include "queue_view.hpp"
 #include "quote.hpp"
 #include "rate.hpp"
 #include "remote.hpp"
@@ -308,6 +309,70 @@ private:
     std::jthread thread_; // last: stops and joins first
 };
 
+// The live line while a folder's files download: its files, bytes and connections, and the speed
+// and time left of the bytes that come (`received`, progress::FolderMeter), redrawn every 250 ms,
+// also while none come.
+class FolderLine {
+public:
+    FolderLine(LiveLine& line, const folder::Tree& tree, std::mutex& m, rate::RateLimiter& limiter,
+               const std::atomic<std::uint64_t>& received)
+        : line_(line), tree_(tree), m_(m), limiter_(limiter), received_(received) {
+        draw();
+        thread_ = std::jthread([this](const std::stop_token& stop) {
+            std::mutex sleep_m;
+            std::condition_variable_any sleep;
+            for (auto next = Clock::now();;) {
+                // A draw held up (a console in QuickEdit selection blocks writes) isn't caught up on.
+                next = std::max(next + std::chrono::milliseconds(250), Clock::now());
+                {
+                    std::unique_lock lock(sleep_m);
+                    sleep.wait_until(lock, stop, next, [] { return false; });
+                }
+                if (stop.stop_requested()) return;
+                draw();
+            }
+        });
+    }
+    FolderLine(const FolderLine&) = delete;
+    FolderLine& operator=(const FolderLine&) = delete;
+    ~FolderLine() = default;
+
+private:
+    void draw() {
+        queue_view::Pass p;
+        int conns = 0;
+        {
+            std::scoped_lock lock(m_);
+            p = queue_view::pass(tree_.files, nullptr);
+            conns = tree_.connections;
+        }
+        const auto finished = p.counts[static_cast<std::size_t>(folder::State::done)] +
+                              p.counts[static_cast<std::size_t>(folder::State::failed)];
+        meter_.sample(Clock::now(), {.received = received_.load(),
+                                     .finished = finished,
+                                     .left_files = p.left_files,
+                                     .left_bytes = p.left_bytes,
+                                     .limit_changes = limiter_.generation()});
+        const auto& t = p.totals;
+        line_.show(progress::line({.bytes = t.bytes,
+                                   .total = t.total,
+                                   .speed = meter_.speed(),
+                                   .eta = meter_.eta(),
+                                   .connections = conns,
+                                   .files_done = t.files_done,
+                                   .files = t.files}),
+                   true);
+    }
+
+    LiveLine& line_;
+    const folder::Tree& tree_;
+    std::mutex& m_; // tree_
+    rate::RateLimiter& limiter_;
+    const std::atomic<std::uint64_t>& received_;
+    progress::FolderMeter meter_; // draw()'s: the constructor's, then the thread's
+    std::jthread thread_;         // last: stops and joins first
+};
+
 // What a verification of download `id` needs from the session.
 verify::Request verify_request(const Session& s, int id) {
     verify::Request r;
@@ -483,7 +548,13 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
     job.files_at_once = [&s] { return s.files_at_once; }; // the window's "At once"
     job.on_command = s.trace;
     job.pool = s.pool;
-    job.on_event = [&](folder::Event) {
+    // Its speed and time left count the bytes as they come (FolderLine).
+    std::atomic<std::uint64_t> received{0};
+    job.on_received = [&received](std::uint64_t n) { received += n; };
+
+    // The folder's files and bytes between the listing and the fetching (the local checks can take
+    // seconds on a big folder); the speed and time left come with FolderLine.
+    const auto show_totals = [&] {
         folder::Totals t;
         int conns = 0;
         {
@@ -491,7 +562,14 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
             t = folder::totals(tree);
             conns = tree.connections;
         }
-        s.line.show(progress::line({t.bytes, t.total, t.speed, t.eta, conns, t.files_done, t.files}));
+        s.line.show(progress::line({.bytes = t.bytes,
+                                    .total = t.total,
+                                    .speed = 0,
+                                    .eta = std::nullopt,
+                                    .connections = conns,
+                                    .files_done = t.files_done,
+                                    .files = t.files}),
+                    true);
     };
 
     const auto start = Clock::now();
@@ -516,7 +594,9 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
                                        f.path, util::path_to_utf8(f.local.filename())));
         }
     }
+    show_totals(); // after the notes: message() erases the line
     folder::mark_existing(job, tree, m);
+    show_totals(); // the files already here, while the conflicts and the free space are checked
     // Different files already where some of the folder's go: the answer first, for this folder's
     // files as listed here, not one given for another pick (review G105).
     job.existing = s.for_rest->value_or(existing::Choice::ask);
@@ -553,7 +633,10 @@ int fetch_folder(const Session& s, const std::string& path, int id, const std::f
         std::println(stderr, "grab: error: {}", space::shortage(space::drive_of(s.dest), needed, *free));
         return exit_download_failed;
     }
-    folder::run(job, tree, m, s.stop);
+    {
+        const FolderLine shown(s.line, tree, m, s.limiter, received);
+        folder::run(job, tree, m, s.stop);
+    }
     // --verify: what this run fetched, against the server's checksums. Copies that differ are
     // deleted and count as failed below.
     std::string checked_text;

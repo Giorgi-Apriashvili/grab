@@ -35,6 +35,16 @@ std::string line(const Status& s) {
     return out;
 }
 
+void FolderMeter::sample(speed::Clock::time_point now, const Counts& c) {
+    if (limit_changes_ && *limit_changes_ != c.limit_changes) meter_.restart(now, c.received);
+    limit_changes_ = c.limit_changes;
+    meter_.sample(now, c.received);
+    speed_ = meter_.rate();
+    // From its first bytes, as its speed: the time spent connecting isn't its pace.
+    if (meter_.since()) pace_.sample(now, c.finished, c.received);
+    eta_ = countdown_.next(now, pace_.time_left(c.left_files, c.left_bytes, speed_));
+}
+
 std::string done(std::uint64_t total, std::uint64_t fetched, double seconds, std::optional<std::size_t> files) {
     std::string out = "done: ";
     if (files) out += std::format("{} file{}, ", *files, *files == 1 ? "" : "s");

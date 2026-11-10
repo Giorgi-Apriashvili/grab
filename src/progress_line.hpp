@@ -1,8 +1,10 @@
 #pragma once
 
 // The text of the grab command's download progress: one line redrawn in place while a file or
-// folder downloads, and the line that replaces it at the end. Pure formatting; the console
-// handling is in main.cpp.
+// folder downloads, and the line that replaces it at the end, with a folder's speed and time left
+// on it (FolderMeter). Pure; the console handling is in cli_download.cpp.
+
+#include "speed.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +31,38 @@ struct Status {
 // "4/13 files  212.0 MiB / 597.0 MiB  36%  11.2 MiB/s  12 conns  ETA 0:34"; the file count only
 // for folders, speed and ETA once known.
 [[nodiscard]] std::string line(const Status& s);
+
+// A folder's speed and time left on its line, measured as the window measures a download's
+// (App::meter, speed.hpp): the speed is the recent average of the bytes that came, its small
+// files' and big files' alike (the small ones have no speed of their own), and the time left comes
+// from its pace in files and bytes, counted down. Fed at each redraw, every 250 ms; with the time
+// passed in.
+class FolderMeter {
+public:
+    struct Counts {
+        std::uint64_t received = 0;   // bytes come so far (folder::Job::on_received)
+        std::uint64_t finished = 0;   // files fetched so far, done or failed
+        std::uint64_t left_files = 0; // files still to come: queued or running
+        std::uint64_t left_bytes = 0; // and their bytes not here yet
+        // How many times the speed limit changed (rate::RateLimiter::generation): a change starts
+        // the speed again from it, so a new limit shows within about a second rather than fading
+        // in over five (speed::Meter::restart); the time left goes on.
+        std::uint64_t limit_changes = 0;
+    };
+    void sample(speed::Clock::time_point now, const Counts& c);
+    // Bytes per second; 0 until the bytes have come for about half a second.
+    [[nodiscard]] double speed() const { return speed_; }
+    // Seconds; nullopt until the bytes have come for 5 s, or while none come.
+    [[nodiscard]] std::optional<double> eta() const { return eta_; }
+
+private:
+    speed::Meter meter_;
+    speed::Pace pace_;
+    speed::Countdown countdown_;
+    std::optional<std::uint64_t> limit_changes_;
+    double speed_ = 0;
+    std::optional<double> eta_;
+};
 
 // The end of a finished download. `fetched` is what this run downloaded, which is less than
 // `total` when it continued an earlier run or a folder's files were already there.
