@@ -444,10 +444,13 @@ private:
     void set_priority(int id, int weight);
     // The global download speed limit (UI thread): the user's own setting, the speed schedule,
     // or a change made while the schedule limits the speed, which holds until its next change.
-    void set_limit(bool on, double mibps);
+    // `token`: the page's set (setLimit), answered by the "limit" message that carries it.
+    void set_limit(bool on, double mibps, int token = 0);
     void set_schedule(const json::Value& rules);
     [[nodiscard]] schedule::Applied current_limit(const schedule::Now& now) const;
-    void update_limit(); // applies what holds now and tells the page about any change
+    // Applies what holds now and tells the page about any change; with a set's `token`, always,
+    // the token in the message.
+    void update_limit(int token = 0);
     void set_rate(std::uint64_t bytes_per_s);
     [[nodiscard]] json::Value limit_message(const schedule::Now& now) const;
     // The folder picker. Its answer ("folderPicked") carries `purpose` back: "dest" for Save to,

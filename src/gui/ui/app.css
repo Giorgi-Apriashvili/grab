@@ -543,15 +543,24 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .speed-graph .line { fill: none; stroke: var(--accent); stroke-width: 1.25; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .speed-graph .area { fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: none; }
 .bar.status #total-speed { font-variant-numeric: tabular-nums; }
-.bar.status #limit-value { width: 64px; height: 26px; text-align: right; }
+.bar.status #limit-value {
+  width: 64px;
+  height: 26px;
+  text-align: right;
+  transition: border-color 0.3s, background-color 0.3s, box-shadow 0.3s;
+}
 .bar.status #limit-value:disabled { opacity: 0.5; }
 .bar.status #limit-value.bad { border-color: var(--danger); }
-/* Why a typed speed doesn't apply: above the box, out of the flow, so nothing in the bar moves. */
+/* "· 12 MiB/s limit", right after the total as if one text (the bar's gap is 10px). */
+#total-limit { margin-left: -6px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* The MiB/s box (app.js, "the MiB/s box"). What floats above it (why a typed speed doesn't set,
+   "Enter to set", the badge saying it was set) is out of the flow, so nothing in the bar moves,
+   and right-aligned with the box, so it never reaches the window's right edge. */
 .limit-box { position: relative; display: inline-flex; }
-.limit-why {
+.limit-why, .limit-tip, .limit-badge {
   position: absolute;
   right: 0;
-  bottom: calc(100% + 6px);
+  bottom: calc(100% + 7px);
   z-index: 5;
   padding: 4px 8px;
   border: 1px solid var(--danger);
@@ -562,7 +571,102 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   box-shadow: 0 2px 8px rgb(0 0 0 / 0.18);
   pointer-events: none;
 }
-.limit-why[hidden] { display: none; }
+.limit-why[hidden], .limit-tip[hidden] { display: none; }
+/* Typed and not set yet: a dashed amber box, "Enter to set" above it. */
+.bar.status .limit-box.pending #limit-value {
+  border-style: dashed;
+  border-color: var(--warn);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 22%, transparent);
+}
+.limit-tip { border-color: color-mix(in srgb, var(--warn) 70%, var(--line)); color: var(--muted); }
+.limit-tip kbd {
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+/* Set (the backend said so): the box flashes green, a ring goes out from it, a check mark pops in
+   at its left (its value is right-aligned), for as long as the badge shows. */
+.limit-check {
+  position: absolute;
+  left: 7px;
+  top: 50%;
+  color: var(--ok);
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0;
+  transform: translateY(-50%) scale(0.4);
+  transition: opacity 0.3s, transform 0.3s;
+  pointer-events: none;
+}
+.limit-box::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 6px;
+  pointer-events: none;
+}
+.bar.status .limit-box.set #limit-value {
+  border-color: var(--ok);
+  background-color: color-mix(in srgb, var(--ok) 12%, var(--input));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 30%, transparent);
+  animation: limit-flash 0.6s ease-out;
+}
+.limit-box.set::after { animation: limit-ring 0.9s ease-out; }
+.limit-box.set .limit-check { opacity: 1; transform: translateY(-50%); animation: limit-check 0.35s cubic-bezier(0.2, 1.6, 0.4, 1); }
+@keyframes limit-flash { from { background-color: color-mix(in srgb, var(--ok) 38%, var(--input)); } }
+@keyframes limit-ring {
+  from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent); }
+  to { box-shadow: 0 0 0 11px color-mix(in srgb, var(--ok) 0%, transparent); }
+}
+@keyframes limit-check { from { opacity: 0; transform: translateY(-50%) scale(0.4); } }
+/* The badge: "✓ Limit set · 12 MiB/s" (or "Limit off", neutral) with a pointer down to the box;
+   always there for screen readers (a live region, empty when idle), seen only while .show. */
+.limit-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, var(--panel));
+  font-weight: 600;
+  opacity: 0;
+}
+.limit-badge.show { opacity: 1; animation: limit-badge-in 0.22s cubic-bezier(0.2, 1.3, 0.4, 1); }
+.limit-badge.out { opacity: 0; transform: translateY(-4px); transition: opacity 0.25s, transform 0.25s; }
+.limit-badge .mark { color: var(--ok); }
+.limit-badge.off { border-color: var(--line); background: var(--panel); color: var(--muted); }
+.limit-badge::after { /* the pointer, at the box's middle */
+  content: "";
+  position: absolute;
+  right: 27px;
+  bottom: -5px;
+  width: 8px;
+  height: 8px;
+  background: inherit;
+  border: solid var(--ok);
+  border-width: 0 1px 1px 0;
+  transform: rotate(45deg);
+}
+.limit-badge.off::after { border-color: var(--line); }
+@keyframes limit-badge-in { from { opacity: 0; transform: translateY(5px) scale(0.94); } }
+@media (prefers-reduced-motion: reduce) {
+  .bar.status #limit-value, .limit-check { transition: none; }
+  .bar.status .limit-box.set #limit-value, .limit-box.set::after, .limit-box.set .limit-check,
+  .limit-badge.show { animation: none; }
+  .limit-badge.out { transform: none; transition: none; }
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 .bar.status #limit-hint { height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); font-size: 12px; }
 .bar.status #limit-hint:hover { text-decoration: underline; background: none; }
 .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }

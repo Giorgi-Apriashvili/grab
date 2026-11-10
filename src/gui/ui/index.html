@@ -326,15 +326,19 @@
 <footer class="bar status">
   <span id="speed-graph" class="speed-graph idle" aria-hidden="true"><svg viewBox="0 0 59 16" preserveAspectRatio="none"><path class="area"/><path class="line"/></svg></span>
   <span id="total-speed" class="muted">No downloads running</span>
+  <span id="total-limit" class="limited" hidden></span>
   <span class="spacer"></span>
   <label class="switch" title="Cap the combined speed of all downloads">
     <input id="limit-on" type="checkbox" role="switch">
     <span class="track" aria-hidden="true"></span>
     <span>Limit speed</span>
   </label>
-  <span class="limit-box">
-    <input id="limit-value" type="text" inputmode="decimal" class="num" aria-label="Speed limit in MiB/s" aria-describedby="limit-why">
+  <span id="limit-box" class="limit-box">
+    <input id="limit-value" type="text" inputmode="decimal" class="num" aria-label="Speed limit in MiB/s" aria-describedby="limit-why limit-tip">
+    <span class="limit-check" aria-hidden="true">✓</span>
     <span id="limit-why" class="limit-why" role="status" hidden></span>
+    <span id="limit-tip" class="limit-tip" hidden><kbd>Enter</kbd> to set</span>
+    <span id="limit-badge" class="limit-badge" role="status" aria-live="polite"><span class="shown" aria-hidden="true"></span><span class="said sr-only"></span></span>
   </span>
   <span class="muted">MiB/s</span>
   <button id="limit-hint" type="button" class="link" title="Speed schedule (Settings)" hidden></button>

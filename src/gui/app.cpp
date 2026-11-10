@@ -922,7 +922,8 @@ void App::on_message(const std::string& text) {
     } else if (type == "setLimit") {
         const Value* mibps = msg->find("mibps");
         set_limit(bool_of(*msg, "on"),
-                  mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps);
+                  mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps,
+                  int_of(*msg, "token"));
     } else if (type == "setRecent") {
         if (const Value* items = msg->find("items")) save_recent(recent_path_, *items);
     } else if (type == "setVerify") {
@@ -2695,7 +2696,7 @@ void App::post_downloads_note(const std::string& text) const {
     post(v);
 }
 
-void App::set_limit(bool on, double mibps) {
+void App::set_limit(bool on, double mibps, int token) {
     if (!(mibps >= min_limit_mibps && mibps <= max_limit_mibps)) mibps = state_.limit_mibps; // also NaN
     const auto now = schedule::local_now();
     const auto scheduled = schedule::limit_at(state_.speed_schedule, now.minute);
@@ -2714,7 +2715,7 @@ void App::set_limit(bool on, double mibps) {
         state_.limit_change = schedule::Override{wanted, *scheduled, until};
     }
     save_state();
-    update_limit();
+    update_limit(token);
 }
 
 void App::set_schedule(const Value& rules) {
@@ -2734,7 +2735,7 @@ schedule::Applied App::current_limit(const schedule::Now& now) const {
                            state_.limit_change, now.unix);
 }
 
-void App::update_limit() {
+void App::update_limit(int token) {
     const auto now = schedule::local_now();
     if (state_.limit_change &&
         !schedule::holds(*state_.limit_change, schedule::limit_at(state_.speed_schedule, now.minute), now.unix)) {
@@ -2744,10 +2745,13 @@ void App::update_limit() {
     const auto applied = current_limit(now);
     set_rate(applied.limit.on ? schedule::bytes_per_s(applied.limit.mibps) : 0);
     Value message = limit_message(now);
-    if (auto text = json::stringify(message); text != limit_posted_) {
-        limit_posted_ = std::move(text);
-        post(message);
-    }
+    auto text = json::stringify(message);
+    if (text == limit_posted_ && token == 0) return;
+    limit_posted_ = std::move(text);
+    // The answer to the page's set: sent even when nothing changed (the same value set again), so
+    // the page confirms it only once it applies, and only with what applies.
+    if (token != 0) message.set("token", num(token));
+    post(message);
 }
 
 void App::set_rate(std::uint64_t bytes_per_s) {

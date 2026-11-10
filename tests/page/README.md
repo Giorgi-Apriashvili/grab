@@ -3,12 +3,13 @@
 `test.js` checks the window's page (`src/gui/ui`: `index.html`, `app.js`, `app.css`) on its own,
 with no grab-gui and no server: the Downloads table (fixed columns, sorting, column widths, the
 keys and the treegrid ARIA), every file of a folder download, the filter and Go to running, a
-file's priority in its folder, the status bar's total speed and its graph, Waiting files, opening
-finished files (double-click, Open, Ctrl+Enter, the question before a program runs), resizing
-Browse and Downloads (the grip on the panel's top edge and the head's free space: drags, clicks,
-keys, double-clicks, limits, nothing in the head moving), and timing budgets for 10,000 and
-177,191 files. It stubs what the host would send and records what
-the page sends back.
+file's priority in its folder, the status bar's total speed and its graph, the speed limit's
+MiB/s box (typing sets nothing; Enter or leaving it sets, confirmed by the backend's answer: the
+pending look, the badge), Waiting files, opening finished files (double-click, Open, Ctrl+Enter,
+the question before a program runs), resizing Browse and Downloads (the grip on the panel's top
+edge and the head's free space: drags, clicks, keys, double-clicks, limits, nothing in the head
+moving), and timing budgets for 10,000 and 177,191 files. It stubs what the host would send and
+records what the page sends back.
 
 `run_page_test.ps1` copies the page into a scratch folder with `test.js` loaded after `app.js`
 (and the Content-Security-Policy meta removed: its `script-src 'self'` does not cover a `file://`

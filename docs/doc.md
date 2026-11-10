@@ -606,17 +606,26 @@ them.
       folder order, as before.
 - **Speed limit:** the bar below the downloads shows the total speed: everything grab receives,
   all downloads together, measured the same way as a row's Speed ("↓ 12.3 MiB/s total · 2
-  running"). Left of it, a small graph shows that total over the last minute, one point a
+  running"), and while a limit is on, the limit after it ("· 12 MiB/s limit"), running or not.
+  Left of it, a small graph shows that total over the last minute, one point a
   second, scaled to the minute's peak (hover for the peak); it keeps its place, blank when
   nothing came. Once no download is fetching the total reads 0 at once. On the bar's right, "Limit speed" caps all downloads together, in MiB/s; the
   switch keeps the value, and both are remembered.
   - A change applies within about a second, whether it comes from the switch, the MiB/s box or
     the speed schedule (applied right as its minute begins): the downloads' real speed is at the new limit by then, and the speeds
-    shown follow it a moment later. A value typed in the box applies once you stop typing for a
-    moment (a lower one after a second and a half, so a value half-way through an edit doesn't
-    drop connections), or at once when you press Enter or leave the box; Escape goes back to the
-    value from before. One that
-    isn't a speed from 0.1 to 10000 MiB/s applies nothing, and the box says why.
+    shown follow it a moment later.
+  - Typing in the MiB/s box sets nothing: press Enter, or leave the box (click elsewhere, Tab),
+    to set the value; Escape puts back the limit that applies and sets nothing. While the box
+    holds a value you typed that isn't set yet, it has a dashed amber border and says "Enter to
+    set" above it. One that isn't a speed from 0.1 to 10000 MiB/s sets nothing: the box turns
+    red and says why, and leaving it puts back the limit that applies.
+  - Once grab has applied a limit, the box flashes green with a check mark and a badge above it
+    says so ("✓ Limit set · 12 MiB/s"), fading after about two seconds; screen readers hear
+    "Speed limit set to 12 MiB/s". Enter on the value that already applies sets it again and
+    says so too; leaving the box unchanged says nothing. The switch confirms the same way
+    ("Limit off" when switched off). Changes made by the speed schedule show its own note
+    instead ("Scheduled until 24:00"). With reduced motion on in Windows, the badge shows
+    without moving.
   - Downloads are paced by a shared token bucket: while limited, every read is asked for only
     after taking its tokens, so the network really follows the limit. The connections keep up to a
     quarter second of the limit's reads on their way between them (each at least two reads, an
