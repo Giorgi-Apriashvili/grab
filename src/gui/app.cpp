@@ -3755,13 +3755,13 @@ void App::maybe_check_updates() {
     // started it) is shown until it is dismissed: "Update failed: <why>" with Try again.
     // This copy's (grab.exe and grab-gui.exe share a folder), not another copy's sharing %LOCALAPPDATA%.
     if (auto failed = update::pending_failure(update::result_path(), current, util::self_exe_path().parent_path())) {
-        update_ = UpdateBanner{"failed", failed->to, {}, {}, failed->error, false};
+        update_ = UpdateBanner{"failed", failed->to, {}, {}, failed->error, false, {}};
         if (update_.error.empty()) update_.error = std::format("grab update exited with code {}", failed->exit_code);
         post_update();
     } else if (auto seen = update::parse_version(state_.latest_version); seen && *seen > current) {
         // A newer release an earlier check found shows at once, without asking GitHub again.
         update_ = UpdateBanner{"available", update::to_string(*seen),
-                               update::is_release_page(state_.latest_page) ? state_.latest_page : "", {}, {}, false};
+                               update::is_release_page(state_.latest_page) ? state_.latest_page : "", {}, {}, false, {}};
         post_update();
     }
     if (state_.update_check && update::update_due(state_.last_update_check, unix_now())) start_update_check(false);
@@ -3798,7 +3798,7 @@ void App::on_update_checked(const std::expected<update::Check, std::string>& res
     // A failure stays until it is dismissed; its Try again installs the latest release anyway.
     if (update_.state != "running" && update_.state != "installed" && update_.state != "failed") {
         if (c.available()) {
-            update_ = UpdateBanner{"available", latest, c.release.page, {}, {}, c.release.version == c.current};
+            update_ = UpdateBanner{"available", latest, c.release.page, {}, {}, c.release.version == c.current, {}};
         } else if (update_.state == "available") {
             update_ = {};
         }
