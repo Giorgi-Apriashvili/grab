@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -94,7 +95,8 @@ struct Folder {
     }
     [[nodiscard]] bool done() const { return next >= sizes.size(); }
     // The counts the line is fed: its bytes come, files finished, and what is left of both.
-    [[nodiscard]] progress::FolderMeter::Counts counts(std::uint64_t limit_changes = 0) const {
+    // `limit`: the limit then, bytes/s (0: none).
+    [[nodiscard]] progress::FolderMeter::Counts counts(std::uint64_t limit_changes = 0, std::uint64_t limit = 0) const {
         double b = 0;
         for (std::size_t k = next; k < sizes.size(); ++k) b += sizes[k];
         if (!done()) b -= into / work(next) * sizes[next];
@@ -102,7 +104,14 @@ struct Folder {
                 .finished = files,
                 .left_files = sizes.size() - next,
                 .left_bytes = static_cast<std::uint64_t>(std::max(0.0, b)),
-                .limit_changes = limit_changes};
+                .limit_changes = limit_changes,
+                .limit = limit};
+    }
+    // A new speed (a limit set, raised or off): the file being fetched keeps the share of it done.
+    void set_bandwidth(double b) {
+        const double share = done() ? 0 : into / work(next);
+        bandwidth = b;
+        if (!done()) into = share * work(next);
     }
     // 250 ms of fetching.
     void tick() {
@@ -234,4 +243,103 @@ TEST_CASE("a folder's line: a new speed limit shows within about a second, its t
         // Bytes alone now (no file finished in the window), at the new speed.
         CHECK(m.eta().value_or(0) == doctest::Approx(f.left()).epsilon(0.15));
     }
+}
+
+TEST_CASE("a folder's line: after a new limit, set, raised or off, its time left follows within seconds, with no dip") {
+    // Small files and two big ones (the live check's tree), 15 s at 15 MiB/s, then the schedule's
+    // 2 MiB/s (its time left fell from 275 s to 92 s in 13 s: the pace's window mixed the two
+    // speeds), raised to 8 MiB/s, then off (the line's 20 MiB/s). From 3 s after each change the
+    // time shown is within 15 % of the real one, and it never falls faster than the time passing
+    // beyond a little smoothing.
+    Noise noise;
+    Folder f{.sizes = {}, .per_file = 0.004, .bandwidth = 15.0 * MiB};
+    for (int k = 0; k < 150; ++k) f.sizes.push_back((1 + 199 * noise.next()) * 1024);
+    f.sizes.push_back(300.0 * MiB);
+    f.sizes.push_back(300.0 * MiB);
+    progress::FolderMeter m;
+    m.sample(at(0), f.counts());
+    while (f.t < 15) {
+        f.tick();
+        m.sample(at(f.t), f.counts());
+    }
+    REQUIRE(m.eta().has_value());
+    struct Change {
+        double bandwidth;
+        double seconds;
+        std::uint64_t limit; // bytes/s, 0: none
+    };
+    std::uint64_t changes = 0;
+    for (const auto& change : {Change{.bandwidth = 2.0 * MiB, .seconds = 25, .limit = 2 * MiB},
+                               Change{.bandwidth = 8.0 * MiB, .seconds = 15, .limit = 8 * MiB},
+                               Change{.bandwidth = 20.0 * MiB, .seconds = 15, .limit = 0}}) {
+        const double mibps = change.bandwidth / MiB;
+        CAPTURE(mibps);
+        const bool slower = change.bandwidth < f.bandwidth;
+        f.set_bandwidth(change.bandwidth);
+        ++changes;
+        const double from = f.t;
+        double last = m.eta().value_or(0);
+        double worst_off = 0;
+        double worst_fall = 0;
+        while (f.t < from + change.seconds && !f.done()) {
+            f.tick();
+            m.sample(at(f.t), f.counts(changes, change.limit));
+            REQUIRE(m.eta().has_value());
+            const double shown = m.eta().value_or(0);
+            const double real = f.left();
+            if (real < 5) break; // its last seconds: a share of them is no measure
+            if (f.t - from >= 3) worst_off = std::max(worst_off, std::abs(shown / real - 1));
+            if (f.t - from >= 3 || slower) worst_fall = std::max(worst_fall, (last - shown - 0.25) / real);
+            last = shown;
+        }
+        MESSAGE(mibps, " MiB/s: at worst ", worst_off * 100, " % off from 3 s after, fell ", worst_fall * 100,
+                " % of the time left in a tick beyond the time passing");
+        CHECK(worst_off < 0.15);
+        CHECK(worst_fall < 0.01);
+    }
+}
+
+TEST_CASE("a folder's line: a limit below its speed shows in its time left at once, though the first speed measured is off") {
+    // The live check's: 13.7 MiB/s, then the schedule's 2 MiB/s. The replies on their way come at
+    // once, the limiter pauses for them, then lets its bucket's burst through: the first speed
+    // measured after the change was 11 % low, and the time left 12 % long, falling back over 5 s.
+    // From the limit, it is right from the change.
+    const double size = 1000.0 * MiB;
+    std::vector<double> came{0};
+    double got = 0;
+    double t = 0;
+    while (got < size) {
+        t += 0.25;
+        double rate = 13.7 * MiB;
+        if (t > 15) rate = t <= 15.25 ? 24.0 * MiB : t <= 17 ? 0 : t <= 18 ? 1.5 * MiB : 2.0 * MiB;
+        got = std::min(size, got + 0.25 * rate);
+        came.push_back(got);
+    }
+    const double end = t;
+    progress::FolderMeter m;
+    double worst_off = 0;
+    double worst_fall = 0;
+    std::optional<double> last;
+    for (std::size_t k = 0; k < came.size(); ++k) {
+        const double now = 0.25 * static_cast<double>(k);
+        const bool limited = now > 15;
+        const auto received = static_cast<std::uint64_t>(came[k]);
+        m.sample(at(now), {.received = received,
+                           .finished = 0,
+                           .left_files = 1,
+                           .left_bytes = static_cast<std::uint64_t>(size) - received,
+                           .limit_changes = limited ? 1U : 0U,
+                           .limit = limited ? 2 * MiB : 0});
+        if (!limited) continue;
+        REQUIRE(m.eta().has_value());
+        const double real = end - now;
+        if (real < 5) break;
+        const double shown = m.eta().value_or(0);
+        worst_off = std::max(worst_off, std::abs(shown / real - 1));
+        if (last) worst_fall = std::max(worst_fall, (*last - shown - 0.25) / real);
+        last = shown;
+    }
+    MESSAGE("at worst ", worst_off * 100, " % off from the change, fell ", worst_fall * 100, " % in a tick beyond the time passing");
+    CHECK(worst_off < 0.05);
+    CHECK(worst_fall < 0.01);
 }

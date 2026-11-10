@@ -44,9 +44,19 @@ public:
     // on their way, connections catching up after logging in again) leaves it within a second
     // rather than weighing on it for five. Its usual rules again after that; if it never showed
     // and no bytes came meanwhile, it starts again at the next ones (rate 0, no since()).
-    void restart(Clock::time_point now, std::uint64_t total);
+    // `limit`: the new limit in bytes per second (0: none), for ahead().
+    void restart(Clock::time_point now, std::uint64_t total, double limit = 0);
     // Bytes per second, as of the last sample; 0 before meter_least of samples with bytes.
     [[nodiscard]] double rate() const { return rate_; }
+    // Restarted, and the speed after it doesn't show yet: rate() is still the one from before.
+    [[nodiscard]] bool holding() const { return holding_; }
+    // Restarted for a limit below the speed then: the bytes come at that limit from now on (the
+    // link gave more), which is known at once, while the first speed measured after the change is
+    // off by up to a third (replies already on their way when it came, then the limiter's pause
+    // for them). Until meter_full after the restart.
+    [[nodiscard]] bool foreseen() const { return limited_ > 0; }
+    // The speed for the time left: the limit while foreseen(), rate() otherwise.
+    [[nodiscard]] double ahead() const { return foreseen() ? limited_ : rate_; }
     // When the bytes it measures started coming (the sample before the first of them); nullopt
     // while none came.
     [[nodiscard]] std::optional<Clock::time_point> since() const { return since_; }
@@ -64,6 +74,7 @@ private:
     bool holding_ = false;                       // restarted, and the old rate shown until the new one shows
     std::uint64_t total_ = 0;
     double rate_ = 0;
+    double limited_ = 0; // foreseen(): the limit, bytes per second
 };
 
 // A download's pace, for its time left, learned from its own recent progress in both files and
@@ -91,7 +102,9 @@ private:
 // per_byte = the window's seconds / its bytes.
 //
 // The window's costs are its 20 s average; time_left scales them by the speed now (the Meter's
-// ~5 s) against that average, so a change in the link's speed shows within seconds.
+// ~5 s) against that average, so a change in the link's speed shows within seconds. A new speed
+// limit starts the window again (restart): seconds at the old speed and the new one in one window
+// make a pace neither has, and the time left fell far too fast for the window's 20 s.
 inline constexpr std::chrono::seconds pace_window{20};
 inline constexpr std::chrono::seconds pace_step{1};
 // No time left until the points span this long ("blank until it has enough data").
@@ -103,6 +116,11 @@ public:
     // Files finished so far and bytes come so far (counters; a file queued again may take one
     // back, which counts as none). A point is kept at most every pace_step.
     void sample(Clock::time_point now, std::uint64_t files, std::uint64_t bytes);
+    // A new speed limit applies (with Meter::restart): the points so far go, the next sample
+    // starts the window again (sample it once the new speed shows, Meter::holding). Until its
+    // points span pace_least again, time_left with a rate is the bytes left at that rate, when
+    // it had a pace before (so a time left shown before goes on); nullopt as at the start if not.
+    void restart();
     struct Model {
         double per_file = 0; // seconds
         double per_byte = 0; // seconds
@@ -113,7 +131,7 @@ public:
     // The time left for `files` files and `bytes` bytes, in seconds, by model().
     [[nodiscard]] std::optional<double> time_left(std::uint64_t files, std::uint64_t bytes) const;
     // The same, its costs scaled by `rate` (bytes per second now) against the window's: the pace
-    // as it is now. nullopt also while nothing comes now (rate 0).
+    // as it is now. nullopt also while nothing comes now (rate 0). After restart(), see there.
     [[nodiscard]] std::optional<double> time_left(std::uint64_t files, std::uint64_t bytes, double rate) const;
 
 private:
@@ -123,6 +141,7 @@ private:
         std::uint64_t bytes = 0;
     };
     std::deque<Point> points_;
+    bool restarted_ = false; // restarted with a pace, and the window not pace_least long again yet
 };
 
 // The time left as the row shows it: it counts down between estimates and moves part of the way
@@ -136,10 +155,19 @@ class Countdown {
 public:
     // The estimate now (nullopt: none, which blanks it); the time left to show.
     std::optional<double> next(Clock::time_point now, std::optional<double> estimate);
+    // Instead of next() while a new speed limit's speed doesn't show yet (Meter::holding): the
+    // estimates still come from the old speed, so what it shows only counts down (nullopt if
+    // nothing). The next estimate after it is shown as it is: the time left of the new speed at
+    // once, not approached over seconds (it would be off by up to half for about five).
+    std::optional<double> hold(Clock::time_point now);
+    // A new speed limit whose speed is known at once (Meter::foreseen): the next estimate is shown
+    // as it is.
+    void restart() { jump_ = true; }
 
 private:
     std::optional<double> shown_;
     Clock::time_point at_{};
+    bool jump_ = false; // held: the next estimate is shown as it is
 };
 
 // A single file's time left: its bytes left at its speed, once its bytes have come for pace_least

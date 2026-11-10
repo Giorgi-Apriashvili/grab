@@ -46,8 +46,12 @@ public:
         std::uint64_t left_bytes = 0; // and their bytes not here yet
         // How many times the speed limit changed (rate::RateLimiter::generation): a change starts
         // the speed again from it, so a new limit shows within about a second rather than fading
-        // in over five (speed::Meter::restart); the time left goes on.
+        // in over five (speed::Meter::restart); the time left goes on, its pace started again from
+        // the new speed (speed::Pace::restart, speed::Countdown::hold).
         std::uint64_t limit_changes = 0;
+        // The limit then, bytes per second (0: none): one below the speed is the speed from the
+        // change on (speed::Meter::foreseen).
+        std::uint64_t limit = 0;
     };
     void sample(speed::Clock::time_point now, const Counts& c);
     // Bytes per second; 0 until the bytes have come for about half a second.

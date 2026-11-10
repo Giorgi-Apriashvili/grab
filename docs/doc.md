@@ -467,7 +467,14 @@ them.
     way towards each new estimate, so it doesn't jump, and it stays within half to twice the
     estimate. A single file goes by its bytes left and its speed. While a folder's big files wait
     behind its small ones, their bytes are reckoned at no more than the fastest second's, so the
-    time errs long, never short, and comes down once they run.
+    time errs long, never short, and comes down once they run. A new speed limit (set, raised,
+    off, or the schedule's) starts the 20 seconds again. A limit below the speed a download had
+    while it fetches alone is its new speed: its time left goes at once to the bytes left at the
+    limit. Otherwise the time left counts down until the new speed shows (about a second), then
+    goes straight to the bytes left at the new speed. From 5 seconds after the change it goes by
+    the pace learned since. Seconds at the old speed and the new
+    one in one window made it fall far too fast for 20 seconds after a lowering (275 s to 92 s in
+    13 s at 2 MiB/s).
   - **The two buttons** stay in the same places on every row: Pause or Resume (Retry, or Resume
     from what came, after a failure; Show in folder once done) and Cancel; on a file of a folder,
     Pause or Resume and Skip, Retry and Skip after a failure, and Show in folder once done. One
@@ -611,9 +618,6 @@ them.
   second, scaled to the minute's peak (hover for the peak); it keeps its place, blank when
   nothing came. Once no download is fetching the total reads 0 at once. On the bar's right, "Limit speed" caps all downloads together, in MiB/s; the
   switch keeps the value, and both are remembered.
-  - A change applies within about a second, whether it comes from the switch, the MiB/s box or
-    the speed schedule (applied right as its minute begins): the downloads' real speed is at the new limit by then, and the speeds
-    shown follow it a moment later.
   - Typing in the MiB/s box sets nothing: press Enter, or leave the box (click elsewhere, Tab),
     to set the value; Escape puts back the limit that applies and sets nothing. While the box
     holds a value you typed that isn't set yet, it has a dashed amber border and says "Enter to
@@ -626,6 +630,9 @@ them.
     ("Limit off" when switched off). Changes made by the speed schedule show its own note
     instead ("Scheduled until 24:00"). With reduced motion on in Windows, the badge shows
     without moving.
+  - A change applies within about a second, whether it comes from the switch, the MiB/s box or
+    the speed schedule (applied right as its minute begins): the downloads' real speed is at the new limit by then, and the speeds
+    shown follow it a moment later.
   - Downloads are paced by a shared token bucket: while limited, every read is asked for only
     after taking its tokens, so the network really follows the limit. The connections keep up to a
     quarter second of the limit's reads on their way between them (each at least two reads, an
@@ -1219,7 +1226,8 @@ grab config [-c PATH]
     A folder's speed and ETA are measured as the window's are: the bytes that came over about
     the last 5 seconds, its small files' as well as its big ones', and the time left from its
     pace in files and bytes, so a folder of small files has both too. A new limit shows in the
-    speed within about a second.
+    speed within about a second, and in the ETA as in the window (at once for a limit below the
+    folder's speed).
     When stderr is not a console (a log file, a script), only the start and end lines appear.
   - Free space is checked before fetching: the files picked together, and each folder right
     after it's listed. If it won't fit, grab stops with `grab: error: not enough free space on

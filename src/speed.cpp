@@ -22,6 +22,7 @@ void Meter::sample(Clock::time_point now, std::uint64_t total) {
     const std::uint64_t came = at_ && total > total_ ? total - total_ : 0;
     if (restarted_ && now - *restarted_ >= meter_full) {
         restarted_.reset(); // its usual rules again
+        limited_ = 0;
         // Never shown, and nothing in its window since: it starts again at the next bytes.
         if (std::exchange(holding_, false) && steps_.empty()) {
             since_.reset();
@@ -78,7 +79,9 @@ void Meter::sample(Clock::time_point now, std::uint64_t total) {
     }
 }
 
-void Meter::restart(Clock::time_point now, std::uint64_t total) {
+void Meter::restart(Clock::time_point now, std::uint64_t total, double limit) {
+    // Below the speed then (the link gives at least that): the bytes will come at the limit.
+    limited_ = limit > 0 && rate_ > limit ? limit : 0;
     steps_.clear();
     at_ = now;
     total_ = total;
@@ -91,6 +94,13 @@ void Pace::sample(Clock::time_point now, std::uint64_t files, std::uint64_t byte
     points_.push_back(Point{.at = now, .files = files, .bytes = bytes});
     // The window: the points of its last pace_window, the first of them its start.
     while (points_.size() > 2 && now - points_[1].at >= pace_window) points_.pop_front();
+    if (now - points_.front().at >= pace_least) restarted_ = false; // its own pace again
+}
+
+void Pace::restart() {
+    // With a pace now, or still from a change just before (whose window wasn't long enough yet).
+    restarted_ = restarted_ || model().has_value();
+    points_.clear();
 }
 
 std::optional<Pace::Model> Pace::model() const {
@@ -147,19 +157,24 @@ std::optional<double> Pace::time_left(std::uint64_t files, std::uint64_t bytes) 
 }
 
 std::optional<double> Pace::time_left(std::uint64_t files, std::uint64_t bytes, double rate) const {
+    if (!(rate > 0)) return std::nullopt;
+    // Restarted for a new limit: until the window is long enough again, the bytes left at the
+    // speed now (the restarted Meter's, which follows the new limit within about a second).
+    if (restarted_) return static_cast<double>(bytes) / rate;
     const auto m = model();
-    if (!m || !(rate > 0)) return std::nullopt;
+    if (!m) return std::nullopt;
     const double scale = m->rate > 0 ? m->rate / rate : 1.0;
     return scale * (m->per_file * static_cast<double>(files) + m->per_byte * static_cast<double>(bytes));
 }
 
 std::optional<double> Countdown::next(Clock::time_point now, std::optional<double> estimate) {
+    const bool jump = std::exchange(jump_, false);
     if (!estimate || !std::isfinite(*estimate)) {
         shown_.reset();
         return std::nullopt;
     }
     const double e = std::max(0.0, *estimate);
-    if (!shown_) {
+    if (!shown_ || jump) {
         shown_ = e;
         at_ = now;
         return shown_;
@@ -168,6 +183,14 @@ std::optional<double> Countdown::next(Clock::time_point now, std::optional<doubl
     const double counted = std::max(0.0, *shown_ - dt);
     const double part = 1 - std::exp(-dt / seconds(countdown_tau));
     shown_ = std::clamp(counted + part * (e - counted), e / countdown_band, e * countdown_band);
+    at_ = now;
+    return shown_;
+}
+
+std::optional<double> Countdown::hold(Clock::time_point now) {
+    jump_ = true;
+    if (!shown_) return std::nullopt;
+    shown_ = std::max(0.0, *shown_ - std::max(0.0, seconds(now - at_)));
     at_ = now;
     return shown_;
 }

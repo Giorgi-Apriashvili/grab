@@ -2,11 +2,13 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 using namespace grab;
@@ -385,6 +387,12 @@ struct Folder {
         }
     }
     [[nodiscard]] bool done() const { return next >= sizes.size(); }
+    // A new speed (a limit set, raised or off): the file being fetched keeps the share of it done.
+    void set_bandwidth(double b) {
+        const double share = done() ? 0 : into / work(next);
+        bandwidth = b;
+        if (!done()) into = share * work(next);
+    }
 };
 
 } // namespace
@@ -557,4 +565,240 @@ TEST_CASE("time left: a folder's run, the shown time against the real one at 25,
     CHECK(std::abs(errors[0]) < 0.12);
     CHECK(std::abs(errors[1]) < 0.08);
     CHECK(std::abs(errors[2]) < 0.08);
+}
+
+namespace {
+
+// A row at each flush as App::meter has it: its speed, and its time left from its pace (a folder)
+// or from its bytes (a file), through the countdown, held while a new limit's speed doesn't show
+// yet, or from the limit at once when it is below the speed then; restart() as App::set_rate does
+// at a new limit (`limit` in bytes/s, 0: none, or not one it may foresee). `fixed` false: as before
+// the pace started again at a new limit, for the comparison.
+struct Row {
+    bool folder = true;
+    bool fixed = true;
+    speed::Meter meter;
+    speed::Pace pace;
+    speed::Countdown countdown;
+    std::optional<double> eta;
+
+    void restart(Clock::time_point now, std::uint64_t bytes, double limit) {
+        meter.restart(now, bytes, fixed ? limit : 0);
+        if (!fixed) return;
+        pace.restart();
+        countdown.restart();
+    }
+    void sample(Clock::time_point now, std::uint64_t files, std::uint64_t bytes, std::uint64_t files_left,
+                std::uint64_t bytes_left) {
+        meter.sample(now, bytes);
+        const bool holding = fixed && meter.holding();
+        if (holding && !meter.foreseen()) {
+            eta = countdown.hold(now);
+            return;
+        }
+        const double rate = meter.ahead();
+        std::optional<double> left;
+        if (folder) {
+            if (meter.since() && !holding) pace.sample(now, files, bytes);
+            left = pace.time_left(files_left, bytes_left, rate);
+        } else {
+            left = speed::file_left(meter.since(), now, bytes_left, rate);
+        }
+        eta = countdown.next(now, left);
+    }
+    void sample(Clock::time_point now, const Folder& f) {
+        sample(now, f.files, static_cast<std::uint64_t>(f.bytes), f.files_left(), f.bytes_left());
+    }
+};
+
+// How the time shown followed a new limit.
+struct Followed {
+    bool blank = false;    // it went blank after the change
+    double worst_off = 0;  // the furthest off the real time left, as a share of it, from 3 s after
+    double worst_fall = 0; // the most it fell in a tick beyond the tick's own 250 ms, as a share of the real time left
+    double at3 = 0;        // shown / real, 3 s after
+};
+
+// `f` at `before` bytes/s for 15 s, then at `after` from a new limit (`limit`: Row::restart's), for
+// 30 s more or until done. The fall counts from the change when slowed down (the time left jumps
+// up), from 3 s after it when sped up (it jumps down, rightly).
+Followed follow(Folder f, bool folder, bool fixed, double before, double after, double limit) {
+    Noise noise;
+    Row row;
+    row.folder = folder;
+    row.fixed = fixed;
+    f.bandwidth = before;
+    row.sample(at(0), f);
+    while (f.t < 15 - 1e-9) {
+        f.tick(noise);
+        row.sample(at(f.t), f);
+    }
+    REQUIRE(row.eta.has_value());
+    f.set_bandwidth(after);
+    row.restart(at(f.t), static_cast<std::uint64_t>(f.bytes), limit);
+    Followed out;
+    double last = row.eta.value_or(0);
+    while (f.t < 45 - 1e-9 && !f.done()) {
+        f.tick(noise);
+        row.sample(at(f.t), f);
+        if (!row.eta) {
+            out.blank = true;
+            continue;
+        }
+        const double shown = *row.eta;
+        const double real = f.left();
+        if (real < 5) break; // its last seconds: a share of them is no measure
+        const double since = f.t - 15;
+        if (since >= 3) out.worst_off = std::max(out.worst_off, std::abs(shown / real - 1));
+        if (since >= 3 && since < 3.25) out.at3 = shown / real;
+        if (since >= 3 || after < before) out.worst_fall = std::max(out.worst_fall, (last - shown - 0.25) / real);
+        last = shown;
+    }
+    return out;
+}
+
+// The downloads the limit changes under: a single big file; a folder's two big files; a folder of
+// small files and then two big ones (the live check's: its small files finished in the window
+// before the change, at any of the speeds, and the old pace mixed with the new one went wrong); a
+// folder of small files only.
+struct Case {
+    std::string name;
+    bool folder;
+    Folder f;
+};
+
+std::vector<Case> limit_cases() {
+    Noise noise;
+    std::vector<Case> cases;
+    cases.push_back({.name = "a big file", .folder = false,
+                     .f = Folder{.per_file = 0, .bandwidth = 0, .sizes = {1500 * MiB}, .jitter = 0.1}});
+    cases.push_back({.name = "a folder's two big files", .folder = true,
+                     .f = Folder{.per_file = 0.004, .bandwidth = 0, .sizes = {600 * MiB, 600 * MiB}, .jitter = 0.1}});
+    Folder mixed{.per_file = 0.004, .bandwidth = 0, .sizes = {}, .jitter = 0.1};
+    for (int k = 0; k < 150; ++k) mixed.sizes.push_back((1 + 199 * noise.next()) * KiB);
+    mixed.sizes.push_back(300 * MiB);
+    mixed.sizes.push_back(300 * MiB);
+    cases.push_back({.name = "a folder of small files, then big ones", .folder = true, .f = mixed});
+    Folder small_files{.per_file = 0.004, .bandwidth = 0, .sizes = {}, .jitter = 0.1};
+    for (int k = 0; k < 3000; ++k) small_files.sizes.push_back((1 + 199 * noise.next()) * KiB);
+    cases.push_back({.name = "a folder of small files", .folder = true, .f = small_files});
+    return cases;
+}
+
+} // namespace
+
+TEST_CASE("time left: a new limit, set, raised or off, shows in the time left within seconds, with no dip") {
+    // 15 s at one speed, then a new limit (the live check's: 15 MiB/s, then 2 MiB/s): from 3 s
+    // after the change, the time shown is within 15 % of the real one, and it never falls faster
+    // than the time passing, beyond a little smoothing (it fell from 275 s to 92 s in 13 s).
+    // The set also as when downloads side by side share the limit (no limit to foresee the speed
+    // by: the time left waits for the new speed to show).
+    struct Change {
+        std::string name;
+        double before;
+        double after;
+        double limit;
+    };
+    for (const auto& change : {Change{.name = "set", .before = 15 * MiB, .after = 2 * MiB, .limit = 2 * MiB},
+                               Change{.name = "set, side by side", .before = 15 * MiB, .after = 2 * MiB, .limit = 0},
+                               Change{.name = "raised", .before = 2 * MiB, .after = 15 * MiB, .limit = 15 * MiB},
+                               Change{.name = "off", .before = 2 * MiB, .after = 20 * MiB, .limit = 0}}) {
+        for (const auto& c : limit_cases()) {
+            CAPTURE(change.name);
+            CAPTURE(c.name);
+            const auto got = follow(c.f, c.folder, true, change.before, change.after, change.limit);
+            MESSAGE(change.name, ", ", c.name, ": 3 s after ", got.at3, " of the real time left; at worst ", got.worst_off * 100,
+                    " % off, fell ", got.worst_fall * 100, " % of it in a tick beyond the time passing");
+            CHECK_FALSE(got.blank);
+            CHECK(got.worst_off < 0.15);
+            CHECK(got.worst_fall < 0.01);
+        }
+    }
+}
+
+TEST_CASE("time left: before the pace started again at a new limit, it fell far too fast") {
+    // The same change as the live check's, the old way: the window mixing both speeds.
+    const auto cases = limit_cases();
+    const auto& mixed = cases[2];
+    const auto old = follow(mixed.f, mixed.folder, false, 15 * MiB, 2 * MiB, 2 * MiB);
+    const auto now = follow(mixed.f, mixed.folder, true, 15 * MiB, 2 * MiB, 2 * MiB);
+    MESSAGE("the old way at worst ", old.worst_off * 100, " % off; now ", now.worst_off * 100, " %");
+    CHECK(old.worst_off > 0.2);
+    CHECK(now.worst_off < 0.15);
+}
+
+namespace {
+
+// A download as the live check's at a lowered limit: 15 s at 12.6 MiB/s, then a limit of 2 MiB/s.
+// The replies on their way (6 MiB) come in the next 250 ms, the limiter then pauses for them until
+// 2 s after the change, and its first second comes at 2.7 MiB/s (its bucket's burst): the first
+// speed measured after the change is a third too high. The bytes come at each tick, from 0.
+struct Lowered {
+    double size = 0;
+    std::vector<double> bytes;
+    double end = 0; // when the last byte came
+};
+
+Lowered lowered(double size) {
+    Noise noise;
+    Lowered out{.size = size, .bytes = {0}, .end = 0};
+    double got = 0;
+    double t = 0;
+    while (got < size) {
+        t += 0.25;
+        double rate = 12.6 * MiB;
+        if (t > 15) rate = t <= 15.25 ? 24 * MiB : t <= 17 ? 0 : t <= 18 ? 2.7 * MiB : 2 * MiB;
+        got = std::min(size, got + 0.25 * rate * (1 + 0.05 * (2 * noise.next() - 1)));
+        out.bytes.push_back(got);
+    }
+    out.end = t;
+    return out;
+}
+
+// How its time left followed the change.
+struct AfterLowered {
+    double worst_off = 0;  // the furthest off the real time left, as a share of it, from `from` s after
+    double worst_fall = 0; // the most it fell in a tick beyond the tick's own 250 ms, as a share of it
+};
+
+AfterLowered after_lowered(const Lowered& d, bool folder, double limit, double from) {
+    Row row;
+    row.folder = folder;
+    AfterLowered out;
+    std::optional<double> last;
+    for (std::size_t k = 0; k < d.bytes.size(); ++k) {
+        const double t = 0.25 * static_cast<double>(k);
+        const auto bytes = static_cast<std::uint64_t>(d.bytes[k]);
+        if (k == 61) row.restart(at(15), static_cast<std::uint64_t>(d.bytes[60]), limit);
+        row.sample(at(t), 0, bytes, 1, static_cast<std::uint64_t>(d.size) - bytes);
+        if (t <= 15 || !row.eta) continue;
+        const double real = d.end - t;
+        if (real < 5) break;
+        if (t - 15 >= from) out.worst_off = std::max(out.worst_off, std::abs(*row.eta / real - 1));
+        if (last) out.worst_fall = std::max(out.worst_fall, (*last - *row.eta - 0.25) / real);
+        last = row.eta;
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("time left: a limit below the speed shows at once, though the first speed measured after it is off by a third") {
+    // The live check's: from the first speed measured, the time left was 22-25 % short 2-3 s after
+    // the change, and inside 15 % only from about 4 s. A download fetching alone knows its new
+    // speed at once: the limit.
+    const auto d = lowered(1000 * MiB);
+    for (const bool folder : {false, true}) {
+        CAPTURE(folder);
+        const auto foreseen = after_lowered(d, folder, 2 * MiB, 0.25);
+        const std::string what = folder ? "a folder" : "a file";
+        MESSAGE(what, ": from the limit, at worst ", foreseen.worst_off * 100,
+                " % off from the change, fell ", foreseen.worst_fall * 100, " %");
+        CHECK(foreseen.worst_off < 0.05);
+        CHECK(foreseen.worst_fall < 0.01);
+        const auto measured = after_lowered(d, folder, 0, 3);
+        MESSAGE("from the speed measured: ", measured.worst_off * 100, " % off from 3 s");
+        CHECK(measured.worst_off > 0.15); // the gap the limit closes
+        CHECK(measured.worst_fall < 0.01);
+    }
 }

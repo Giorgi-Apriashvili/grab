@@ -348,11 +348,13 @@ private:
         }
         const auto finished = p.counts[static_cast<std::size_t>(folder::State::done)] +
                               p.counts[static_cast<std::size_t>(folder::State::failed)];
+        const auto limit = limiter_.setting(); // its rate and generation together
         meter_.sample(Clock::now(), {.received = received_.load(),
                                      .finished = finished,
                                      .left_files = p.left_files,
                                      .left_bytes = p.left_bytes,
-                                     .limit_changes = limiter_.generation()});
+                                     .limit_changes = limit.generation,
+                                     .limit = limit.rate});
         const auto& t = p.totals;
         line_.show(progress::line({.bytes = t.bytes,
                                    .total = t.total,

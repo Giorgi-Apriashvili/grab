@@ -2758,12 +2758,20 @@ void App::set_rate(std::uint64_t bytes_per_s) {
     if (bytes_per_s == limiter_.rate()) return;
     limiter_.set_rate(bytes_per_s); // the streams follow the new rate at once
     // The speeds shown start again from the change, so the new limit shows within about a second
-    // rather than fading in over five (speed::Meter::restart); the times left go on.
+    // rather than fading in over five (speed::Meter::restart); the times left go on, and their
+    // pace starts again from the new speed (speed::Pace::restart, meter): at once from the limit
+    // when it is below the speed then (speed::Meter::foreseen), for a download fetching alone
+    // (downloads side by side share the limit in a way their speeds before don't tell).
     const auto now = speed::Clock::now();
-    total_meter_.restart(now, received_.load());
+    const auto limit = static_cast<double>(bytes_per_s);
+    total_meter_.restart(now, received_.load(), limit);
     std::lock_guard lock(mutex_);
+    const bool alone = std::ranges::count_if(items_, [](const auto& i) { return i->metered; }) == 1;
     for (const auto& i : items_) {
-        if (i->metered) i->speed_meter.restart(now, i->received.load());
+        if (!i->metered) continue;
+        i->speed_meter.restart(now, i->received.load(), alone ? limit : 0);
+        i->pace.restart();
+        i->countdown.restart();
     }
 }
 
@@ -3247,17 +3255,27 @@ bool App::meter(Item& item, speed::Clock::time_point now) {
     const std::uint64_t received = item.received.load();
     item.speed_meter.sample(now, received);
     item.speed = item.speed_meter.rate();
+    const bool holding = item.speed_meter.holding();
+    if (holding && !item.speed_meter.foreseen()) {
+        // A new limit (set_rate) whose speed doesn't show yet: the time left counts down on its
+        // own, then goes to the first estimate from the new speed at once (speed::Countdown::hold).
+        // A lower one than the speed then is known at once: its time left from the limit (ahead).
+        item.eta = item.countdown.hold(now);
+        return true;
+    }
+    const double rate = item.speed_meter.ahead();
     std::optional<double> left;
     if (item.mode == Mode::folder) {
         // Its files fetched (done or failed) and bytes come; its time left by both (speed::Pace).
         const auto finished = item.counts[static_cast<std::size_t>(folder::State::done)] +
                               item.counts[static_cast<std::size_t>(folder::State::failed)];
-        // From its first bytes, as its speed: the time spent connecting isn't its pace.
-        if (item.speed_meter.since()) item.pace.sample(now, finished, received);
-        left = item.pace.time_left(item.left_files, item.left_bytes, item.speed);
+        // From its first bytes, as its speed: the time spent connecting isn't its pace (nor, after
+        // a new limit, the second before its speed shows).
+        if (item.speed_meter.since() && !holding) item.pace.sample(now, finished, received);
+        left = item.pace.time_left(item.left_files, item.left_bytes, rate);
     } else if (item.total > item.bytes) {
         // A file: its bytes at its speed, after 5 s of them.
-        left = speed::file_left(item.speed_meter.since(), now, item.total - item.bytes, item.speed);
+        left = speed::file_left(item.speed_meter.since(), now, item.total - item.bytes, rate);
     }
     item.eta = item.countdown.next(now, left);
     return true;

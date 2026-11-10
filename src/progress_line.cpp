@@ -36,13 +36,26 @@ std::string line(const Status& s) {
 }
 
 void FolderMeter::sample(speed::Clock::time_point now, const Counts& c) {
-    if (limit_changes_ && *limit_changes_ != c.limit_changes) meter_.restart(now, c.received);
+    if (limit_changes_ && *limit_changes_ != c.limit_changes) {
+        meter_.restart(now, c.received, static_cast<double>(c.limit));
+        pace_.restart();
+        countdown_.restart();
+    }
     limit_changes_ = c.limit_changes;
     meter_.sample(now, c.received);
     speed_ = meter_.rate();
-    // From its first bytes, as its speed: the time spent connecting isn't its pace.
-    if (meter_.since()) pace_.sample(now, c.finished, c.received);
-    eta_ = countdown_.next(now, pace_.time_left(c.left_files, c.left_bytes, speed_));
+    const bool holding = meter_.holding();
+    if (holding && !meter_.foreseen()) {
+        // The new limit's speed doesn't show yet: the time left counts down on its own, then goes
+        // to the first estimate from the new speed at once. A lower one than the speed then is
+        // known at once: the time left from the limit (speed::Meter::ahead).
+        eta_ = countdown_.hold(now);
+        return;
+    }
+    // From its first bytes, as its speed: the time spent connecting isn't its pace (nor, after a
+    // new limit, the second before its speed shows).
+    if (meter_.since() && !holding) pace_.sample(now, c.finished, c.received);
+    eta_ = countdown_.next(now, pace_.time_left(c.left_files, c.left_bytes, meter_.ahead()));
 }
 
 std::string done(std::uint64_t total, std::uint64_t fetched, double seconds, std::optional<std::size_t> files) {
