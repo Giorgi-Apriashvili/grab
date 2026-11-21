@@ -33,11 +33,42 @@ jobs:
       - name: MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Put LLVM on PATH
+      # The runner's Visual Studio STL can need a newer Clang than the runner's own LLVM (MSVC
+      # 14.52 wants Clang 22; the image had LLVM 20.1.8 on 2026-11-21). The STL names the version it
+      # needs; the newest clang-cl here that meets it goes on PATH (Visual Studio's own, or
+      # C:\Program Files\LLVM), else the LLVM release grab is built with locally is installed.
+      - name: Put a clang-cl that fits the STL on PATH
         if: matrix.preset == 'clang-cl-release'
-        timeout-minutes: 10
+        timeout-minutes: 15
         shell: pwsh
-        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
+        env:
+          LLVM_FALLBACK: 22.1.8
+        run: |
+          $need = 0
+          $yvals = Join-Path $env:VCToolsInstallDir 'include\yvals_core.h'
+          if ((Test-Path $yvals) -and ((Get-Content -Raw $yvals) -match 'expected Clang (\d+)')) { $need = [int]$Matches[1] }
+          function Get-ClangVersion([string]$dir) {
+            $exe = Join-Path $dir 'clang-cl.exe'
+            if (-not (Test-Path $exe)) { return $null }
+            foreach ($tool in 'lld-link.exe', 'llvm-rc.exe') { if (-not (Test-Path (Join-Path $dir $tool))) { return $null } }
+            if ((& $exe --version | Select-Object -First 1) -match 'version (\d+\.\d+\.\d+)') { return [version]$Matches[1] }
+            return $null
+          }
+          $found = @(Join-Path $env:VCINSTALLDIR 'Tools\Llvm\x64\bin'; 'C:\Program Files\LLVM\bin') |
+            ForEach-Object { [pscustomobject]@{ Dir = $_; Version = (Get-ClangVersion $_) } } |
+            Where-Object { $_.Version }
+          $found | ForEach-Object { Write-Output "found clang-cl $($_.Version) in $($_.Dir)" }
+          $best = $found | Where-Object { $_.Version.Major -ge $need } | Sort-Object Version -Descending | Select-Object -First 1
+          if (-not $best) {
+            Write-Output "no clang-cl here meets the STL's Clang ${need}: installing LLVM $env:LLVM_FALLBACK"
+            $setup = Join-Path $env:RUNNER_TEMP "LLVM-$env:LLVM_FALLBACK-win64.exe"
+            Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_FALLBACK/LLVM-$env:LLVM_FALLBACK-win64.exe" -OutFile $setup
+            Start-Process -Wait -FilePath $setup -ArgumentList '/S', '/D=C:\llvm-ci'
+            $best = [pscustomobject]@{ Dir = 'C:\llvm-ci\bin'; Version = (Get-ClangVersion 'C:\llvm-ci\bin') }
+            if (-not $best.Version -or $best.Version.Major -lt $need) { throw "LLVM $env:LLVM_FALLBACK did not install a clang-cl that meets Clang $need" }
+          }
+          Write-Output "using clang-cl $($best.Version) from $($best.Dir) (the STL wants Clang $need or newer)"
+          Add-Content -Path $env:GITHUB_PATH -Value $best.Dir
 
       # OpenSSL comes from vcpkg (cmake/vcpkg.cmake): the runner's own checkout, with vcpkg's
       # built packages kept between runs so OpenSSL is built only when its port changes.
