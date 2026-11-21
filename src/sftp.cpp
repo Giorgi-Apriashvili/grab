@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <utility>
 
 namespace grab::sftp {
@@ -17,12 +18,20 @@ enum : std::uint8_t {
     fxp_open = 3,
     fxp_close = 4,
     fxp_read = 5,
+    fxp_write = 6,
     fxp_lstat = 7,
     fxp_fstat = 8,
+    fxp_setstat = 9,
+    fxp_fsetstat = 10,
     fxp_opendir = 11,
     fxp_readdir = 12,
+    fxp_remove = 13,
+    fxp_mkdir = 14,
+    fxp_rmdir = 15,
     fxp_realpath = 16,
     fxp_stat = 17,
+    fxp_rename = 18,
+    fxp_extended = 200,
     fxp_status = 101,
     fxp_handle = 102,
     fxp_data = 103,
@@ -31,7 +40,6 @@ enum : std::uint8_t {
     fxp_extended_reply = 201,
 };
 
-constexpr std::uint32_t open_read = 0x1;
 constexpr std::uint32_t attr_size = 0x1, attr_uidgid = 0x2, attr_permissions = 0x4, attr_acmodtime = 0x8,
                         attr_extended = 0x80000000;
 // The largest packet taken from a server: a 255 KiB DATA plus headers, or a NAME batch (OpenSSH
@@ -105,6 +113,17 @@ Attrs read_attrs(Fields& f) {
     return a;
 }
 
+// The attributes `a` holds, as SETSTAT, MKDIR and OPEN take them; an mtime goes as the access time too.
+void put_attrs(std::string& out, const Attrs& a) {
+    put_u32(out, (a.size ? attr_size : 0) | (a.permissions ? attr_permissions : 0) | (a.mtime ? attr_acmodtime : 0));
+    if (a.size) put_u64(out, *a.size);
+    if (a.permissions) put_u32(out, *a.permissions);
+    if (a.mtime) {
+        put_u32(out, *a.mtime);
+        put_u32(out, *a.mtime);
+    }
+}
+
 Status read_status(std::string_view body) {
     Fields f(body);
     Status s;
@@ -138,6 +157,13 @@ bool Attrs::is_dir() const { return permissions && (*permissions & 0170000) == 0
 bool Attrs::is_file() const { return permissions && (*permissions & 0170000) == 0100000; }
 bool Attrs::is_link() const { return permissions && (*permissions & 0170000) == 0120000; }
 
+std::uint64_t Statvfs::free_bytes() const {
+    const std::uint64_t block = frsize != 0 ? frsize : bsize;
+    if (block != 0 && bavail > std::numeric_limits<std::uint64_t>::max() / block)
+        return std::numeric_limits<std::uint64_t>::max();
+    return bavail * block;
+}
+
 Client::Client(Channel& channel) : channel_(channel), in_(std::size_t{256} * 1024) {}
 
 void Client::start() {
@@ -151,22 +177,28 @@ void Client::start() {
     version_ = f.u32();
     if (version_ < 3) throw ProtocolError(std::format("the server speaks SFTP version {}; grab needs 3", version_));
     while (!f.empty()) {
-        extensions_.emplace_back(f.str());
-        f.str(); // its data
+        Extension e;
+        e.name = f.str();
+        e.data = f.str();
+        extensions_.push_back(std::move(e));
     }
 }
 
 bool Client::has_extension(std::string_view name) const {
-    return std::ranges::find(extensions_, name) != extensions_.end();
+    return std::ranges::find(extensions_, name, &Extension::name) != extensions_.end();
+}
+
+void Client::begin(std::uint8_t type, std::size_t size, Handler handler) {
+    std::uint32_t id = next_id_++;
+    put_u32(out_, static_cast<std::uint32_t>(1 + 4 + size));
+    put_u8(out_, type);
+    put_u32(out_, id);
+    pending_.emplace(id, std::move(handler));
 }
 
 void Client::request(std::uint8_t type, std::string_view payload, Handler handler) {
-    std::uint32_t id = next_id_++;
-    put_u32(out_, static_cast<std::uint32_t>(1 + 4 + payload.size()));
-    put_u8(out_, type);
-    put_u32(out_, id);
+    begin(type, payload.size(), std::move(handler));
     out_.append(payload);
-    pending_.emplace(id, std::move(handler));
 }
 
 void Client::flush() {
@@ -178,6 +210,27 @@ void Client::flush() {
 void Client::pump() {
     if (pending_.empty()) throw Broken("waiting for an SFTP reply with no request pending");
     flush();
+    take_reply();
+}
+
+std::size_t Client::pump_ready() {
+    std::size_t ran = 0;
+    while (!pending_.empty() && (packet_buffered() || channel_.readable())) {
+        take_reply();
+        ++ran;
+    }
+    return ran;
+}
+
+bool Client::packet_buffered() const {
+    const std::size_t here = in_len_ - in_pos_;
+    if (here < 4) return false;
+    std::uint32_t length = 0;
+    for (std::size_t i = 0; i < 4; ++i) length = (length << 8) | static_cast<std::uint8_t>(in_[in_pos_ + i]);
+    return here - 4 >= length;
+}
+
+void Client::take_reply() {
     read_packet();
     auto type = static_cast<std::uint8_t>(packet_[0]);
     if (type != fxp_status && type != fxp_handle && type != fxp_data && type != fxp_name && type != fxp_attrs &&
@@ -220,11 +273,23 @@ void Client::read_exact(char* to, std::size_t n) {
 
 // Each request below wraps its callback in a handler that parses the reply it expects.
 
-void Client::open(std::string_view path, Done<std::string> done) {
+Client::Handler Client::status_only(Done<void> done) {
+    return [done = std::move(done)](const Reply& r) mutable {
+        if (r.type != fxp_status) unexpected_reply(r.type);
+        Status s = read_status(r.body);
+        if (!done) return;
+        if (s.code == Code::ok) return done({});
+        done(std::unexpected(std::move(s)));
+    };
+}
+
+void Client::open(std::string_view path, Done<std::string> done) { open(path, OpenFlags::read, {}, std::move(done)); }
+
+void Client::open(std::string_view path, std::uint32_t flags, const Attrs& attrs, Done<std::string> done) {
     std::string p;
     put_str(p, path);
-    put_u32(p, open_read);
-    put_u32(p, 0); // no attributes
+    put_u32(p, flags);
+    put_attrs(p, attrs);
     request(fxp_open, p, [done = std::move(done)](const Reply& r) mutable {
         if (r.type == fxp_status) return done(std::unexpected(read_status(r.body)));
         if (r.type != fxp_handle) unexpected_reply(r.type);
@@ -263,16 +328,127 @@ void Client::read(std::string_view handle, std::uint64_t offset, std::uint32_t l
     });
 }
 
+void Client::write(std::string_view handle, std::uint64_t offset, std::string_view data, Done<void> done) {
+    begin(fxp_write, 4 + handle.size() + 8 + 4 + data.size(), status_only(std::move(done)));
+    put_str(out_, handle);
+    put_u64(out_, offset);
+    put_str(out_, data);
+}
+
 void Client::close(std::string_view handle, Done<void> done) {
     std::string p;
     put_str(p, handle);
-    request(fxp_close, p, [done = std::move(done)](const Reply& r) mutable {
-        if (r.type != fxp_status) unexpected_reply(r.type);
-        Status s = read_status(r.body);
-        if (!done) return;
-        if (s.code == Code::ok) return done({});
-        done(std::unexpected(std::move(s)));
+    request(fxp_close, p, status_only(std::move(done)));
+}
+
+void Client::setstat(std::string_view path, const Attrs& attrs, Done<void> done) {
+    std::string p;
+    put_str(p, path);
+    put_attrs(p, attrs);
+    request(fxp_setstat, p, status_only(std::move(done)));
+}
+
+void Client::fsetstat(std::string_view handle, const Attrs& attrs, Done<void> done) {
+    std::string p;
+    put_str(p, handle);
+    put_attrs(p, attrs);
+    request(fxp_fsetstat, p, status_only(std::move(done)));
+}
+
+void Client::remove(std::string_view path, Done<void> done) {
+    std::string p;
+    put_str(p, path);
+    request(fxp_remove, p, status_only(std::move(done)));
+}
+
+void Client::mkdir(std::string_view path, const Attrs& attrs, Done<void> done) {
+    std::string p;
+    put_str(p, path);
+    put_attrs(p, attrs);
+    request(fxp_mkdir, p, status_only(std::move(done)));
+}
+
+void Client::rmdir(std::string_view path, Done<void> done) {
+    std::string p;
+    put_str(p, path);
+    request(fxp_rmdir, p, status_only(std::move(done)));
+}
+
+void Client::rename(std::string_view from, std::string_view to, Done<void> done) {
+    std::string p;
+    put_str(p, from);
+    put_str(p, to);
+    request(fxp_rename, p, status_only(std::move(done)));
+}
+
+void Client::extended(std::string_view name, std::string_view payload, Done<std::string> done) {
+    std::string p;
+    put_str(p, name);
+    p.append(payload);
+    request(fxp_extended, p, [done = std::move(done)](const Reply& r) mutable {
+        if (r.type == fxp_status) {
+            Status s = read_status(r.body);
+            if (s.code == Code::ok) return done(std::string());
+            return done(std::unexpected(std::move(s)));
+        }
+        if (r.type != fxp_extended_reply) unexpected_reply(r.type);
+        done(std::string(r.body));
     });
+}
+
+void Client::posix_rename(std::string_view from, std::string_view to, Done<void> done) {
+    std::string p;
+    put_str(p, "posix-rename@openssh.com");
+    put_str(p, from);
+    put_str(p, to);
+    request(fxp_extended, p, status_only(std::move(done)));
+}
+
+void Client::statvfs(std::string_view path, Done<Statvfs> done) {
+    std::string p;
+    put_str(p, "statvfs@openssh.com");
+    put_str(p, path);
+    request(fxp_extended, p, [done = std::move(done)](const Reply& r) mutable {
+        if (r.type == fxp_status) {
+            Status s = read_status(r.body);
+            if (s.code == Code::ok) throw ProtocolError("the server answered statvfs with no figures");
+            return done(std::unexpected(std::move(s)));
+        }
+        if (r.type != fxp_extended_reply) unexpected_reply(r.type);
+        Fields f(r.body);
+        Statvfs v;
+        for (std::uint64_t* field : {&v.bsize, &v.frsize, &v.blocks, &v.bfree, &v.bavail, &v.files, &v.ffree, &v.favail,
+                                     &v.fsid, &v.flag, &v.namemax})
+            *field = f.u64();
+        done(v);
+    });
+}
+
+void Client::limits(Done<Limits> done) {
+    std::string p;
+    put_str(p, "limits@openssh.com");
+    request(fxp_extended, p, [done = std::move(done)](const Reply& r) mutable {
+        if (r.type == fxp_status) {
+            Status s = read_status(r.body);
+            if (s.code == Code::ok) throw ProtocolError("the server answered limits with no figures");
+            return done(std::unexpected(std::move(s)));
+        }
+        if (r.type != fxp_extended_reply) unexpected_reply(r.type);
+        Fields f(r.body);
+        Limits l;
+        l.packet = f.u64();
+        l.read = f.u64();
+        l.write = f.u64();
+        l.handles = f.u64();
+        done(l);
+    });
+}
+
+void Client::fsync(std::string_view handle, Done<void> done) {
+    std::string p;
+    put_str(p, "fsync@openssh.com");
+    put_str(p, handle);
+    request(fxp_extended, p, status_only(std::move(done)));
 }
 
 void Client::readdir(std::string_view handle, Done<std::vector<Entry>> done) {
@@ -339,8 +515,22 @@ std::expected<Attrs, Status> stat(Client& client, std::string_view path) {
     return wait_for<Attrs>(client, [&](Client::Done<Attrs> done) { client.stat(path, std::move(done)); });
 }
 
+std::expected<Attrs, Status> lstat(Client& client, std::string_view path) {
+    return wait_for<Attrs>(client, [&](Client::Done<Attrs> done) { client.lstat(path, std::move(done)); });
+}
+
+std::expected<Attrs, Status> fstat(Client& client, std::string_view handle) {
+    return wait_for<Attrs>(client, [&](Client::Done<Attrs> done) { client.fstat(handle, std::move(done)); });
+}
+
 std::expected<std::string, Status> open_file(Client& client, std::string_view path) {
     return wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.open(path, std::move(done)); });
+}
+
+std::expected<std::string, Status> open_file(Client& client, std::string_view path, std::uint32_t flags,
+                                             const Attrs& attrs) {
+    return wait_for<std::string>(
+        client, [&](Client::Done<std::string> done) { client.open(path, flags, attrs, std::move(done)); });
 }
 
 std::expected<void, Status> close_file(Client& client, std::string_view handle) {
@@ -349,6 +539,46 @@ std::expected<void, Status> close_file(Client& client, std::string_view handle) 
 
 std::expected<std::string, Status> realpath(Client& client, std::string_view path) {
     return wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.realpath(path, std::move(done)); });
+}
+
+std::expected<void, Status> setstat(Client& client, std::string_view path, const Attrs& attrs) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.setstat(path, attrs, std::move(done)); });
+}
+
+std::expected<void, Status> fsetstat(Client& client, std::string_view handle, const Attrs& attrs) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.fsetstat(handle, attrs, std::move(done)); });
+}
+
+std::expected<void, Status> remove(Client& client, std::string_view path) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.remove(path, std::move(done)); });
+}
+
+std::expected<void, Status> mkdir(Client& client, std::string_view path, const Attrs& attrs) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.mkdir(path, attrs, std::move(done)); });
+}
+
+std::expected<void, Status> rmdir(Client& client, std::string_view path) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.rmdir(path, std::move(done)); });
+}
+
+std::expected<void, Status> rename(Client& client, std::string_view from, std::string_view to) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.rename(from, to, std::move(done)); });
+}
+
+std::expected<void, Status> posix_rename(Client& client, std::string_view from, std::string_view to) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.posix_rename(from, to, std::move(done)); });
+}
+
+std::expected<Statvfs, Status> statvfs(Client& client, std::string_view path) {
+    return wait_for<Statvfs>(client, [&](Client::Done<Statvfs> done) { client.statvfs(path, std::move(done)); });
+}
+
+std::expected<Limits, Status> limits(Client& client) {
+    return wait_for<Limits>(client, [&](Client::Done<Limits> done) { client.limits(std::move(done)); });
+}
+
+std::expected<void, Status> fsync(Client& client, std::string_view handle) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.fsync(handle, std::move(done)); });
 }
 
 std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir, std::size_t limit) {
@@ -404,6 +634,49 @@ std::expected<void, Status> read_range(Client& client, std::string_view handle, 
             auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(chunk, end - next));
             send(next, n);
             next += n;
+        }
+        if (in_flight == 0) break;
+        client.pump();
+    }
+    if (failed) return std::unexpected(std::move(*failed));
+    return {};
+}
+
+std::expected<void, Status> write_range(Client& client, std::string_view handle, std::uint64_t offset,
+                                        std::uint64_t length, const Source& source, const Acked& acked, int depth,
+                                        std::uint64_t unacked, std::uint32_t chunk) {
+    const std::uint64_t end = offset + length;
+    std::uint64_t next = offset;
+    int in_flight = 0;
+    std::uint64_t in_flight_bytes = 0;
+    std::optional<Status> failed;
+    chunk = std::clamp<std::uint32_t>(chunk, 1, max_write);
+    depth = std::max(depth, 1);
+    for (;;) {
+        while (!failed && next < end && in_flight < depth) {
+            const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(chunk, end - next));
+            if (in_flight > 0 && in_flight_bytes + n > unacked) break;
+            const std::string_view data = source(next, n);
+            if (data.size() < n) {
+                failed = Status{.code = Code::eof, .message = "the bytes to write ended early"};
+                break;
+            }
+            ++in_flight;
+            in_flight_bytes += n;
+            client.write(handle, next, data.substr(0, n), [&, at = next, n](std::expected<void, Status> r) {
+                --in_flight;
+                in_flight_bytes -= n;
+                if (!r) {
+                    if (!failed) failed = std::move(r.error());
+                    return;
+                }
+                if (acked) acked(at, n);
+            });
+            next += n;
+            // Out now, so the server is never kept waiting for a batch: a full window holds it
+            // here, the server's pace. Then the replies that came meanwhile.
+            client.flush();
+            client.pump_ready();
         }
         if (in_flight == 0) break;
         client.pump();

@@ -243,6 +243,9 @@ socket_t connect_tcp(const Target& t) {
     if (s == no_socket) throw Error(budget::Failure::other, std::format("can't reach {}:{}: {}", t.host, t.port, why));
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+    if (t.send_buffer > 0) {
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&t.send_buffer), sizeof t.send_buffer);
+    }
     return s;
 }
 
@@ -295,6 +298,14 @@ public:
         if (n < 0) throw sftp::Broken("reading from the server failed: " + last_error(session_));
         if (n == 0) throw sftp::Broken("the server closed the SFTP channel");
         return static_cast<std::size_t>(n);
+    }
+    // What libssh2 took off the socket for this channel and holds (it reads whatever came while it
+    // sends, and while a write waits for the server's window). Its stderr is thrown away as it
+    // comes (open_sftp), so these are the SFTP stream's.
+    bool readable() override {
+        unsigned long queued = 0;
+        libssh2_channel_window_read_ex(channel_, &queued, nullptr);
+        return queued > 0;
     }
 
 private:
@@ -869,6 +880,12 @@ std::unique_ptr<sftp::Channel> Connection::open_sftp() {
         libssh2_channel_free(ch);
         // Refused is the server's answer; anything else is trouble on the link.
         if (rc == LIBSSH2_ERROR_CHANNEL_REQUEST_DENIED) fail(budget::Failure::fatal, "the server doesn't offer SFTP");
+        fail(budget::Failure::other, "SFTP didn't start");
+    }
+    // Whatever sftp-server writes to stderr is dropped as it comes (as libssh2's own SFTP does):
+    // nobody reads it, and kept it would fill the window and make the channel look readable.
+    if (libssh2_channel_handle_extended_data2(ch, LIBSSH2_CHANNEL_EXTENDED_DATA_IGNORE) != 0) {
+        libssh2_channel_free(ch);
         fail(budget::Failure::other, "SFTP didn't start");
     }
     return std::make_unique<ChannelStream>(session_, ch);

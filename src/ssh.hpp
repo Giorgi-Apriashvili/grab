@@ -58,6 +58,9 @@ struct Target {
     std::string bind_from = "--bind";
     std::chrono::milliseconds connect_timeout{30'000};
     std::chrono::milliseconds timeout{30'000};
+    // The socket's send buffer (SO_SNDBUF) in bytes; 0: the system's, which Windows grows as the
+    // link needs. Set only by the upload checks (UPLOADS.md chunk 0), which compare the two.
+    int send_buffer = 0;
     bool operator==(const Target&) const = default;
 };
 
