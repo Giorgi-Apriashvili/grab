@@ -116,8 +116,12 @@ try {
     $url = ([Uri](Join-Path $page 'index.html')).AbsoluteUri
 
     # Port 0: Edge takes a free port and writes it to DevToolsActivePort in its profile.
+    # Timers run at full rate even when Edge thinks the page is in the background: test.js waits on
+    # timers and frames, and a throttled page can take minutes (one CI run, 2026-11-21, gave no result
+    # in 180 s; the re-run passed in 21 s).
     $edgeArgs = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-sync',
         '--disable-extensions', '--disable-background-networking', '--disable-component-update',
+        '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
         '--enable-logging=stderr', '--enable-precise-memory-info', '--remote-debugging-port=0', "--user-data-dir=$profileDir",
         '--window-size=1400,900', $url)
     $start = [Diagnostics.ProcessStartInfo]::new($edgeExe)
@@ -172,6 +176,11 @@ try {
     }
 
     if (-not $result) {
+        # Where it stopped: the checks done so far (test.js's own list) and how Edge sees the page.
+        try {
+            $where = Invoke-Page '(() => { const o = window.pageTestOut || []; return JSON.stringify({ checks: o.length, last: o.slice(-3), visibility: document.visibilityState, ready: document.readyState }); })()'
+            if ($where) { Write-Host "page-logic: test.js had not finished: $where" }
+        } catch { Write-Host "page-logic: the page did not answer: $_" }
         $summary = "FAILED: no result from test.js within $resultWait s (did app.js or test.js throw before it finished?)"
     } else {
         $lines = $result -split "`r?`n"

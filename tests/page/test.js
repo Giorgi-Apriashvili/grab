@@ -6,6 +6,7 @@
 // grip and the head's free space; uploads in the window, UPLOADS.md chunk 3), run in headless Edge
 // by run_page_test.ps1.
 const out = [];
+window.pageTestOut = out; // read by run_page_test.ps1 when test.js never finishes, to name where it stopped
 let failed = 0;
 function check(name, got, want) {
   const ok = JSON.stringify(got) === JSON.stringify(want);
