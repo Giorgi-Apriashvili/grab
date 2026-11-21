@@ -1,12 +1,11 @@
 #include "folder_job.hpp"
 
 #include "existing.hpp"
+#include "folder_sched.hpp"
 #include "local_name.hpp"
 #include "rclone_encoding.hpp"
 #include "remote.hpp"
 #include "sftp.hpp"
-#include "ssh.hpp"
-#include "ssh_pool.hpp"
 #include "ssh_walk.hpp"
 #include "util.hpp"
 
@@ -14,7 +13,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <format>
@@ -27,7 +25,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -38,69 +35,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void notify(const Job& job, Event e) {
-    if (job.on_event) job.on_event(e);
-}
-
-// How many of the folder's files may download at once now (Job::files_at_once).
-int allowed(const Job& job) { return job.files_at_once ? std::max(1, job.files_at_once()) : 4; }
-
-// Waits `d` unless `stop` comes first.
-void pause_for(std::chrono::milliseconds d, const std::stop_token& stop) {
-    std::mutex wait_m;
-    std::condition_variable_any wait_cv;
-    std::unique_lock lock(wait_m);
-    wait_cv.wait_for(lock, stop, d, [] { return false; });
-}
-
-// Files under small_limit come too quickly for a speed of their own: their priority only orders
-// them. Under a speed limit a small worker takes a normal file's part of the folder's turns,
-// whatever its file's priority.
-constexpr int small_weight = 2;
-// The limiter's members of a folder (rate::flow_of; member 0 is a download as a whole): a big
-// file's number is its index + 1, a small worker's has the top bit set.
-constexpr std::uint32_t small_member = std::uint32_t{1} << 31;
-std::uint32_t big_member(std::size_t index) { return static_cast<std::uint32_t>(index) + 1; }
-
-// What the folder's running files share (DOWNLOADS-UI.md 7), under the caller's mutex. The
-// connections its small workers don't claim (Tree::small_claim) go to its running big files by
-// their priorities (connection_parts). The claim counts from before the big files start, not from
-// when a worker holds a connection: counting only those held let big files started first take
-// every connection when the small files' thread ran late (a busy machine), and keep each until its
-// range ended. Under a speed limit the folder is one download in the limiter, at its own weight,
-// and its files that read take its turns by their priorities (rate::FairQueue's parts), so its
-// share against other downloads stays as it was, however many of its files run and whenever they
-// start. A file that waits for a connection asks the limiter nothing, so those that read take all
-// of the folder's turns.
-struct Members {
-    struct Big {
-        std::size_t index = 0; // the file's
-        int reading = 0;       // its streams reading now (fetch::Download::on_reading)
-        bool all_in = false;   // every byte of it is in: it no longer waits for anything
-    };
-    std::vector<Big> big; // running big files, in the order they started
-
-    // The running big files' priorities, in the order of `big`.
-    [[nodiscard]] std::vector<int> big_weights(const Tree& tree) const {
-        std::vector<int> weights;
-        weights.reserve(big.size());
-        for (const auto& b : big) weights.push_back(tree.files[b.index].weight);
-        return weights;
-    }
-    Big* find(std::size_t index) {
-        const auto it = std::ranges::find(big, index, &Big::index);
-        return it != big.end() ? &*it : nullptr;
-    }
-};
-
-// What one worker's turn on a connection came to.
-struct SmallRun {
-    std::size_t landed = 0;            // files put in place (or failed for their own reasons)
-    bool worked = false;               // data came: the pool counts the connection as working
-    bool yielded = false;              // handed its connection to another download, which released it
-    bool cut = false;                  // a limit switched on or lowered below what it had on its way
-    std::optional<std::string> broken; // the connection broke: why
-};
+using sched::notify;
+using sched::small_weight;
+using sched::SmallRun;
 
 // Small files on one connection (run_small_grab): up to 32 in flight, each OPEN, then its READs
 // and an FSTAT (the size and time now, which may have changed since the listing), then CLOSE, all
@@ -413,281 +350,61 @@ SmallRun small_on(const Job& job, Tree& tree, std::mutex& m, std::uint32_t membe
     return run;
 }
 
-// The queued small files (under small_limit): `workers` of them (the server's budget), each
-// holding one of the folder's connections while small files are left, many files in flight on
-// each (small_on). They don't count against At once; the folder's big files, started beside them
-// (run_big), do, and get the connections the small files leave: each worker's claim
-// (Tree::small_claim) counts from before the big files start (the caller sets it) until it finds no
-// small file left, so however late this thread runs, the big files wait while the small files
-// claim them all (the window says "Waiting" while the claim lasts), and take them as the workers
-// end.
-void run_small_grab(const Job& job, Tree& tree, std::mutex& m, int workers, const std::stop_token& stop) {
-    const auto dir = job_dir(job);
-    auto any_queued = [&] {
-        std::lock_guard lock(m);
-        return next_queued(tree, false).has_value();
-    };
-    auto fail_queued = [&](const std::string& why) {
-        {
-            std::lock_guard lock(m);
-            for (auto& f : tree.files) {
-                if (f.big || f.status != State::queued) continue;
-                f.status = State::failed;
-                f.error = why;
-            }
-        }
-        notify(job, Event::changed);
-    };
-    auto worker = [&](std::uint32_t k) {
-        int failures = 0; // in a row, nothing landing
-        // The connection it holds (Tree::small_connections); its claim on one (Tree::small_claim)
-        // holds the big files back. A worker whose turn a new limit cut keeps counting while it
-        // logs in again, so the folder's count of its small files' connections doesn't dip for
-        // that moment.
-        auto member = [&](int delta) {
-            std::lock_guard lock(m);
-            tree.small_connections += delta;
-            if (delta > 0) tree.connections = job.connections->active(job.server, job.id);
-        };
-        // Its claim ends with it: the big files take its connection at their next look.
-        auto unclaim = [&] {
-            std::lock_guard lock(m);
-            --tree.small_claim;
-        };
-        bool kept = false;
-        // Its files a cut left running for its next turn (small_on); back to the queue when there
-        // is none soon.
-        std::vector<std::size_t> carried;
-        auto requeue_carried = [&] {
-            if (carried.empty()) return;
-            {
-                std::lock_guard lock(m);
-                for (const std::size_t i : carried) {
-                    auto& f = tree.files[i];
-                    if (f.status != State::running) continue;
-                    f.status = State::queued;
-                    ++tree.requeued;
-                }
-            }
-            carried.clear();
-            notify(job, Event::changed);
-        };
-        struct Leave {
-            bool& kept;
-            decltype(member)& leave;
-            decltype(requeue_carried)& requeue;
-            decltype(unclaim)& unclaim;
-            ~Leave() {
-                requeue();
-                if (std::exchange(kept, false)) leave(-1);
-                unclaim();
-            }
-        } leave_at_end{.kept = kept, .leave = member, .requeue = requeue_carried, .unclaim = unclaim};
-        for (;;) {
-            if (stop.stop_requested() || (carried.empty() && !any_queued())) return;
-            if (!job.connections->acquire(job.server, job.id, stop, false)) return;
-            std::optional<ssh::Pool::Lease> lease;
-            std::string why;
-            auto kind = budget::Failure::other;
-            try {
-                lease = job.pool->acquire(stop);
-            } catch (const ssh::Error& e) {
-                why = e.what();
-                kind = e.kind;
-            }
-            if (!lease) {
-                requeue_carried(); // another worker may take them meanwhile
-                if (std::exchange(kept, false)) member(-1);
-                if (!why.empty() && kind == budget::Failure::refused) job.connections->refused(job.server);
-                job.connections->release(job.server, job.id);
-                if (why.empty()) return; // stopped
-                if (kind == budget::Failure::fatal || ++failures > fetch::max_retries) return fail_queued(why);
-                // A full server is asked again 1, 2, 4, 8, then 15 s apart (as fetch does, G9).
-                pause_for(std::min(std::chrono::seconds(1 << std::min(failures - 1, 4)), std::chrono::seconds(15)), stop);
-                continue;
-            }
-            if (!std::exchange(kept, false)) member(+1);
-            SmallRun run;
-            try {
-                run = small_on(job, tree, m, small_member | k, (*lease)->sftp(), dir, stop, carried);
-            } catch (const sftp::Unavailable& e) { // the server has no SFTP: no use trying again
-                requeue_carried();
-                member(-1);
-                lease.reset();
-                job.connections->release(job.server, job.id);
-                return fail_queued(e.what());
-            } catch (const sftp::Broken& e) {
-                run.broken = e.what(); // SFTP didn't start on it
-            }
-            kept = run.cut && !stop.stop_requested();
-            if (!kept) {
-                requeue_carried(); // a stop, or SFTP didn't start on it: none taken
-                member(-1);
-            }
-            // Replies still on their way: dropped with the connection.
-            if (stop.stop_requested() || run.broken || run.cut) lease->broken();
-            lease.reset();
-            if (!run.yielded) job.connections->release(job.server, job.id, 1, run.worked);
-            if (run.landed > 0) failures = 0;
-            if (run.cut) continue; // not a failure: its files go on over a new login
-            if (run.broken && run.landed == 0 && ++failures > fetch::max_retries) return fail_queued(*run.broken);
-            if (run.broken) pause_for(std::chrono::seconds(2), stop);
-        }
-    };
-    if (job.on_small_start) job.on_small_start();
-    std::vector<std::jthread> threads;
-    for (int k = 0; k < workers; ++k) threads.emplace_back(worker, static_cast<std::uint32_t>(k));
-}
-
-// The queued big files, each resumable like a single-file download, as many at a time as the
-// folder may download ("At once": Job::files_at_once, asked again as each file ends), the highest
-// priority's first (next_queued). They share the folder's connections (same pool id) by their
-// priorities and split ranges to keep them busy.
-void run_big(const Job& job, Tree& tree, std::mutex& m, Members& members, const std::stop_token& stop) {
-    constexpr int most = 8; // "At once" goes up to 8
-    const auto dir = job_dir(job);
-    fetch::Reserved reserved;
+// One big file (sched::run_big's), resumable like a single-file download (fetch::run), into its
+// place in `dir`; `reserved`: the names of the folder's files (reserved_names).
+sched::BigEnd fetch_big(const Job& job, Tree& tree, std::mutex& m, const fs::path& dir, const fetch::Reserved& reserved,
+                        const sched::BigFile& b) {
+    std::string path;
+    fs::path target;
     {
         std::lock_guard lock(m);
-        reserved = reserved_names(dir, tree);
+        const auto& f = tree.files[b.index];
+        path = f.path;
+        target = target_of(dir, f);
     }
-    auto worker = [&] {
-        for (;;) {
-            if (stop.stop_requested()) return;
-            const int may = allowed(job); // without the lock: the window's answer takes its own
-            std::size_t i = 0;
-            std::stop_source file_stop;
-            std::string path;
-            fs::path target;
-            bool wait = false;
-            {
-                std::lock_guard lock(m);
-                if (!next_queued(tree, true)) return;
-                wait = tree.files_at_once >= may;
-            }
-            if (wait) { // as many as it may are running: another starts when one ends or more are allowed
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                continue;
-            }
-            {
-                std::lock_guard lock(m);
-                const auto next = next_queued(tree, true);
-                if (!next) return;
-                if (tree.files_at_once >= may) continue; // another worker took the place
-                ++tree.files_at_once;
-                i = *next;
-                members.big.push_back(Members::Big{.index = i});
-                auto& f = tree.files[i];
-                f.status = State::running;
-                f.waiting = true; // until a stream reads
-                f.error.clear();
-                f.stop = file_stop;
-                f.stop_reason = StopReason::none;
-                path = f.path;
-                target = target_of(dir, f);
-            }
-            notify(job, Event::changed);
-            std::stop_callback forward(stop, [&file_stop] { file_stop.request_stop(); });
-            fetch::Download d;
-            d.source = fetch::Source{.rclone_remote = job.ctx->settings.rclone_remote,
-                                     .path = child_remote_path(job.remote_path, path)};
-            d.server = job.server;
-            d.id = job.id;
-            d.target = target;
-            d.reserved = reserved;
-            d.replace = job.existing == existing::Choice::replace;
-            d.joined = true;
-            d.limiter = job.limiter;
-            d.weight = job.weight;
-            // Its part of the folder's connections and of its share of a speed limit, by its
-            // priority among the folder's running files: one that starts later gets its part
-            // instead of waiting for the first ones to end, and a priority changed meanwhile
-            // counts at the next reads. Of the connections the small files' workers don't claim
-            // (Tree::small_claim): none while they claim the whole share, more as they end.
-            d.streams_cap = [&, i] {
-                const int share = job.connections->share(job.server, job.id); // without the lock
-                std::lock_guard lock(m);
-                const auto at = std::ranges::find(members.big, i, &Members::Big::index) - members.big.begin();
-                const auto parts = connection_parts(share - tree.small_claim, members.big_weights(tree));
-                return at < std::ssize(parts) ? parts[static_cast<std::size_t>(at)] : 1;
-            };
-            // Only a file that reads takes the folder's turns, and one that doesn't is
-            // shown waiting: before its first read, and when its streams lost their connections,
-            // but not once all its bytes are in (its last stream ending before it is put in place
-            // flashed it Queued just before Done).
-            d.on_reading = [&, i](int delta, bool all_in) {
-                std::lock_guard lock(m);
-                if (auto* b = members.find(i)) {
-                    b->reading += delta;
-                    b->all_in = b->all_in || all_in;
-                    tree.files[i].waiting = b->reading <= 0 && !b->all_in;
-                }
-            };
-            d.on_received = job.on_received;
-            d.member = big_member(i);
-            d.flow_part = [&, i] {
-                std::lock_guard lock(m);
-                return static_cast<double>(tree.files[i].weight);
-            };
-            d.on_command = job.on_command;
-            d.pool = job.pool;
-            std::error_code ec;
-            fs::create_directories(d.target.parent_path(), ec);
-            const auto on_progress = [&](const fetch::Progress& p) {
-                {
-                    std::lock_guard lock(m);
-                    auto& f = tree.files[i];
-                    f.bytes = p.bytes;
-                    f.speed = p.speed;
-                    f.eta = p.eta;
-                    if (p.total > 0 && p.bytes >= p.total) { // there already, or put in place: no wait
-                        f.waiting = false;
-                        if (auto* b = members.find(i)) b->all_in = true;
-                    }
-                    tree.connections = p.connections;
-                }
-                notify(job, Event::progress);
-            };
-            const auto result = fetch::run(d, *job.connections, on_progress, file_stop.get_token());
+    fetch::Download d;
+    d.source = fetch::Source{.rclone_remote = job.ctx->settings.rclone_remote, .path = child_remote_path(job.remote_path, path)};
+    d.server = job.server;
+    d.id = job.id;
+    d.target = target;
+    d.reserved = reserved;
+    d.replace = job.existing == existing::Choice::replace;
+    d.joined = true;
+    d.limiter = job.limiter;
+    d.weight = job.weight;
+    d.streams_cap = b.streams_cap;
+    d.on_reading = b.on_reading;
+    d.on_received = job.on_received;
+    d.member = b.member;
+    d.flow_part = b.flow_part;
+    d.on_command = job.on_command;
+    d.pool = job.pool;
+    std::error_code ec;
+    fs::create_directories(d.target.parent_path(), ec);
+    const auto result = fetch::run(d, *job.connections, b.on_progress, b.stop);
 
-            bool discard = false;
-            {
-                std::lock_guard lock(m);
-                --tree.files_at_once;
-                std::erase_if(members.big, [i](const Members::Big& b) { return b.index == i; });
-                auto& f = tree.files[i];
-                f.waiting = false;
-                f.speed = 0;
-                f.eta.reset();
-                switch (result.outcome) {
-                case fetch::Outcome::done:
-                    f.status = State::done;
-                    f.fetched = f.fetched || !result.present;
-                    // The server's file as fetched, which verification proves against.
-                    f.size = result.size;
-                    f.modtime = result.modtime;
-                    f.bytes = f.size;
-                    break;
-                case fetch::Outcome::failed:
-                case fetch::Outcome::exists: // appeared since the question: Retry asks
-                    f.status = State::failed;
-                    f.error = result.error;
-                    break;
-                case fetch::Outcome::stopped:
-                    f.status = f.stop_reason == StopReason::pause  ? State::paused
-                               : f.stop_reason == StopReason::skip ? State::skipped
-                                                                   : State::queued; // the folder stopped
-                    if (f.status == State::queued) ++tree.requeued;
-                    discard = f.status == State::skipped;
-                    break;
-                }
-            }
-            if (discard) fetch::discard(d.target, d.source.path, d.reserved, d.source.rclone_remote);
-            notify(job, Event::changed);
-        }
-    };
-    std::vector<std::jthread> workers;
-    for (int k = 0; k < most; ++k) workers.emplace_back(worker);
+    sched::BigEnd end;
+    switch (result.outcome) {
+    case fetch::Outcome::done:
+        end.kind = sched::BigEnd::Kind::done;
+        end.moved = !result.present;
+        // The server's file as fetched, which verification proves against.
+        end.size = result.size;
+        end.modtime = result.modtime;
+        break;
+    case fetch::Outcome::failed:
+    case fetch::Outcome::exists: // appeared since the question: Retry asks
+        end.kind = sched::BigEnd::Kind::failed;
+        end.error = result.error;
+        break;
+    case fetch::Outcome::stopped:
+        end.kind = sched::BigEnd::Kind::stopped;
+        end.discard = [at = d.target, from = d.source.path, names = d.reserved, rclone_remote = d.source.rclone_remote] {
+            fetch::discard(at, from, names, rclone_remote);
+        };
+        break;
+    }
+    return end;
 }
 
 } // namespace
@@ -1105,59 +822,21 @@ void apply(existing::Choice choice, const std::vector<Conflict>& found, const fs
 }
 
 void run(const Job& job, Tree& tree, std::mutex& m, std::stop_token stop) {
-    {
-        std::lock_guard lock(m);
-        set_big(tree.files);
-    }
-    job.connections->join(job.server, job.id, job.weight != nullptr ? job.weight->load() : 2);
-    // The small files on every free connection beside the big ones under At once, a pass at a time
-    // until none is queued (a paused one resumed, a failed one retried). Without a pool (never set
-    // up) nothing is fetched.
-    while (job.pool && !stop.stop_requested()) {
-        bool small_left = false;
-        bool big_left = false;
+    // The folder's scheduling (folder_sched.hpp) with a download's small files (small_on) and big
+    // ones (fetch_big), each pass's big files kept off the names of the folder's own files.
+    const auto dir = job_dir(job);
+    auto small_turn = [&](std::uint32_t member, sftp::Client& c, const std::stop_token& st, std::vector<std::size_t>& carried) {
+        return small_on(job, tree, m, member, c, dir, st, carried);
+    };
+    auto big_pass = [&] {
+        fetch::Reserved reserved;
         {
             std::lock_guard lock(m);
-            for (const auto& f : tree.files) {
-                if (f.status != State::queued) continue;
-                (f.big ? big_left : small_left) = true;
-            }
-            // Each pass looks from the first file again: a file queued again without saying so
-            // waits for the next pass instead of being missed for good.
-            ++tree.requeued;
+            reserved = reserved_names(dir, tree);
         }
-        if (!small_left && !big_left) break;
-        Members members; // the files running in this pass
-        {
-            std::jthread small_files;
-            if (small_left) {
-                // The small files' claim holds before the big files start, however late their
-                // thread runs.
-                const int workers = std::max(1, job.connections->budget(job.server));
-                {
-                    std::lock_guard lock(m);
-                    tree.small_claim = workers;
-                }
-                small_files = std::jthread([&, workers] { run_small_grab(job, tree, m, workers, stop); });
-            }
-            if (big_left) run_big(job, tree, m, members, stop);
-        }
-        notify(job, Event::checkpoint);
-    }
-    job.connections->leave(job.server, job.id);
-
-    {
-        std::lock_guard lock(m);
-        tree.connections = 0;
-        for (auto& f : tree.files) {
-            if (f.status != State::running) continue;
-            f.status = State::queued; // stopped with the folder: picked up again on the next run
-            f.speed = 0;
-            f.eta.reset();
-        }
-        ++tree.requeued;
-    }
-    notify(job, Event::changed);
+        return [&, reserved = std::move(reserved)](const sched::BigFile& b) { return fetch_big(job, tree, m, dir, reserved, b); };
+    };
+    sched::run(job, tree, m, stop, small_turn, big_pass);
 }
 
 std::string Checked::summary() const { return verify::summary(report, true); }
