@@ -26,11 +26,15 @@
 // At most 4 logins at once.
 
 #include "conn_budget.hpp"
+#include "fetch.hpp"
 #include "live_settings.hpp"
+#include "rate.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
+#include "upload.hpp"
+#include "upload_existing.hpp"
 #include "util.hpp"
 
 #include <openssl/evp.h>
@@ -39,15 +43,19 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <expected>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <initializer_list>
 #include <latch>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <span>
@@ -58,6 +66,7 @@
 #include <vector>
 
 using namespace grab;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -571,8 +580,8 @@ void speed(ssh::Pool& pool, const Settings& d, int conns) {
     say(std::format("speed: REMOVE {}", code_of(removed)));
 }
 
-// The folder's own files (those this case names: up-*, .grab-probe-*) and the folders among them,
-// one level down, then the folder itself.
+// The folder's own files (those these cases name: up-*, .grab-probe-*, and upload::run's temps of
+// up-* files) and the folders among them, one level down, then the folder itself.
 void cleanup(sftp::Client& s, const Settings& d) {
     // A real folder only: OPENDIR follows a link, which would list (and remove in) its target.
     auto there = sftp::lstat(s, d.raw);
@@ -589,13 +598,18 @@ void cleanup(sftp::Client& s, const Settings& d) {
     int folders = 0;
     int kept = 0;
     for (const auto& e : *listed) {
-        const bool ours = e.name.starts_with("up-") || e.name.starts_with(".grab-probe-");
+        const bool ours = e.name.starts_with("up-") || e.name.starts_with(".grab-probe-") ||
+                          (e.name.starts_with(".up-") && upload::is_temp_name(e.name));
         const std::string path = d.raw + "/" + e.name;
         if (!ours) {
             ++kept;
             continue;
         }
         if (e.attrs.is_dir()) {
+            // A folder a case made read-only (up-ro) is made writable again first.
+            if (auto opened = sftp::setstat(s, path, sftp::Attrs{.size = {}, .permissions = 0700, .mtime = {}}); !opened) {
+                // Not ours to change, or gone: what is left is counted below.
+            }
             if (auto inner = sftp::list(s, path)) {
                 for (const auto& f : *inner) {
                     if (!f.attrs.is_dir() && sftp::remove(s, path + "/" + f.name)) ++files;
@@ -615,7 +629,413 @@ void cleanup(sftp::Client& s, const Settings& d) {
                     code_of(removed), yes(gone)));
 }
 
+// ---- upload::run on the server (GRAB_TEST_UPLOAD_RUN) ----------------------------------------
+
+// The uploads' engine as the window and the command will run it: the server's pool and budget,
+// local files made up in GRAB_TEST_UPLOAD_LOCAL, their records in a folder there.
+struct Uploader {
+    std::string server;
+    Settings d;
+    std::shared_ptr<ssh::Pool> pool;
+    fetch::Connections connections;
+    fs::path local;
+    fs::path records;
+    int next_id = 1;
+};
+
+const char* outcome_name(upload::Outcome o) {
+    switch (o) {
+    case upload::Outcome::done: return "done";
+    case upload::Outcome::stopped: return "stopped";
+    case upload::Outcome::exists: return "exists";
+    case upload::Outcome::skipped: return "skipped";
+    case upload::Outcome::failed: break;
+    }
+    return "failed";
+}
+
+const char* pass(bool b) { return b ? "PASS" : "FAIL"; }
+
+// A local file of `size` bytes of `data`, made unless it is there with that size already.
+fs::path local_data(const Uploader& e, const std::string& name, const Data& data, std::uint64_t size) {
+    const fs::path p = e.local / name;
+    std::error_code ec;
+    if (fs::is_regular_file(p, ec) && fs::file_size(p, ec) == size) return p;
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    std::vector<char> buf(Data::block);
+    for (std::uint64_t at = 0; at < size; at += buf.size()) {
+        const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), size - at));
+        data.fill(at, std::span(buf.data(), n));
+        out.write(buf.data(), static_cast<std::streamsize>(n));
+    }
+    out.close();
+    const std::string why = "cannot write " + util::path_to_utf8(p);
+    REQUIRE_MESSAGE(out.good(), why);
+    return p;
+}
+
+void set_local_mtime(const fs::path& p, std::chrono::system_clock::time_point t) {
+    fs::last_write_time(p, std::chrono::clock_cast<std::chrono::file_clock>(t));
+}
+
+// One upload::run, and what came of it.
+struct Ran {
+    upload::Result result;
+    double took = 0;          // s, the whole run
+    double sending = 0;       // s, from the first acknowledgement to the last
+    std::uint64_t acked = 0;  // bytes the server acknowledged in this run
+    std::vector<std::pair<double, std::uint64_t>> acks; // (s from the first acknowledgement, bytes), when kept
+};
+
+struct RunOptions {
+    upload::Existing existing = upload::Existing::ask;
+    rate::RateLimiter* limiter = nullptr;
+    std::uint64_t stop_at = 0; // stops once the server acknowledged this much (0: never)
+    bool keep_acks = false;
+};
+
+Ran run_upload(Uploader& e, const fs::path& local, const std::string& remote, const RunOptions& o) {
+    upload::Upload u;
+    u.local = local;
+    u.server = e.server;
+    u.id = e.next_id++;
+    u.remote_path = remote;
+    u.existing = o.existing;
+    u.limiter = o.limiter;
+    u.pool = e.pool;
+    u.records_dir = e.records;
+    Ran ran;
+    std::mutex m;
+    std::optional<Clock::time_point> first;
+    Clock::time_point last;
+    std::stop_source stop;
+    u.on_sent = [&](std::uint64_t n) {
+        std::scoped_lock lock(m);
+        const auto now = Clock::now();
+        if (!first) first = now;
+        last = now;
+        ran.acked += n;
+        if (o.keep_acks) ran.acks.emplace_back(seconds(now - *first), n);
+        if (o.stop_at > 0 && ran.acked >= o.stop_at) stop.request_stop();
+    };
+    const auto started = Clock::now();
+    ran.result = upload::run(u, e.connections, {}, stop.get_token());
+    ran.took = seconds(Clock::now() - started);
+    if (first) ran.sending = seconds(last - *first);
+    return ran;
+}
+
+std::string md5_line(Uploader& e, const std::string& remote, const std::string& want) {
+    const auto got = server_md5(*e.pool, rclone_enc::raw_path(remote));
+    if (!got) return "md5 unavailable (" + got.error() + ")";
+    return *got == want ? "md5 equal" : "md5 DIFFERENT";
+}
+
+// The temp files of `name` in the folder (upload::run's, by their names).
+std::vector<std::string> temps_of(Uploader& e, const std::string& name) {
+    auto lease = e.pool->acquire({}, ssh::interactive_retry);
+    REQUIRE(lease);
+    auto listed = sftp::list((*lease)->sftp(), e.d.raw);
+    REQUIRE(listed);
+    std::vector<std::string> out;
+    for (const auto& entry : *listed)
+        if (upload::is_temp_name(entry.name, name)) out.push_back(entry.name);
+    return out;
+}
+
+void engine_big(Uploader& e) {
+    const std::uint64_t size = number_from_env("GRAB_TEST_UPLOAD_MIB", 1024) * mib;
+    const Data data(0xB16);
+    const fs::path local = local_data(e, "up-big.bin", data, size);
+    const std::string remote = in_dir(e.d.dir, "up-big.bin");
+    const Ran r = run_upload(e, local, remote, {});
+    const double sending = r.sending > 0 ? static_cast<double>(r.acked) / mib / r.sending : 0;
+    const double overall = r.took > 0 ? static_cast<double>(size) / mib / r.took : 0;
+    say(std::format("big: {} MiB {} in {:.1f} s: {:.2f} MiB/s sending, {:.2f} MiB/s overall (target >= 12.0: 90% of 8 "
+                    "connections' 13.3) {}; {}; temps left {}{}",
+                    size / mib, outcome_name(r.result.outcome), r.took, sending, overall, pass(sending >= 12.0),
+                    md5_line(e, remote, data.md5(size)), temps_of(e, "up-big.bin").size(),
+                    r.result.error.empty() ? "" : "; error: " + r.result.error));
+}
+
+void engine_small(Uploader& e) {
+    for (const auto& [name, size] : {std::pair{std::string("up-small-0.bin"), std::uint64_t{0}},
+                                     std::pair{std::string("up-small-1.bin"), std::uint64_t{1024}},
+                                     std::pair{std::string("up-small-2.bin"), std::uint64_t{100} * 1024},
+                                     std::pair{std::string("up-small-3.bin"), std::uint64_t{1536} * 1024}}) {
+        const Data data(size + 7);
+        const fs::path local = local_data(e, name, data, size);
+        const std::string remote = in_dir(e.d.dir, name);
+        const Ran r = run_upload(e, local, remote, {});
+        const std::string line = md5_line(e, remote, data.md5(size));
+        say(std::format("small: {} ({} bytes) {} in {:.2f} s; {}; no record: {} {}", name, size, outcome_name(r.result.outcome),
+                        r.took, line, yes(!upload::saved_progress(e.records, e.server, remote)),
+                        pass(r.result.outcome == upload::Outcome::done && line == "md5 equal")));
+    }
+}
+
+void engine_resume(Uploader& e) {
+    const std::uint64_t size = number_from_env("GRAB_TEST_UPLOAD_RESUME_MIB", 256) * mib;
+    const Data data(0x2E5);
+    const fs::path local = local_data(e, "up-resume.bin", data, size);
+    const std::string remote = in_dir(e.d.dir, "up-resume.bin");
+    const Ran first = run_upload(e, local, remote, RunOptions{.existing = upload::Existing::ask, .limiter = nullptr,
+                                                            .stop_at = size / 2, .keep_acks = false});
+    const auto saved = upload::saved_progress(e.records, e.server, remote);
+    const auto temps = temps_of(e, "up-resume.bin");
+    say(std::format("resume: stopped at {} acknowledged: {}; the record keeps {} of {}; temps on the server {}",
+                    first.acked, outcome_name(first.result.outcome), saved ? saved->first : 0, saved ? saved->second : 0, temps.size()));
+    if (!saved || first.result.outcome != upload::Outcome::stopped) {
+        say("resume: FAIL (no partial upload to go on from)");
+        return;
+    }
+    const Ran second = run_upload(e, local, remote, {});
+    const bool none_again = second.acked == size - saved->first;
+    say(std::format("resume: the second run {} in {:.1f} s, note \"{}\"; acknowledged {} = the {} the record lacked: {}; {}; "
+                    "temps left {}; record gone {} {}",
+                    outcome_name(second.result.outcome), second.took, second.result.note, second.acked, size - saved->first,
+                    yes(none_again), md5_line(e, remote, data.md5(size)), temps_of(e, "up-resume.bin").size(),
+                    yes(!upload::saved_progress(e.records, e.server, remote)),
+                    pass(second.result.outcome == upload::Outcome::done && none_again && second.result.note.empty())));
+}
+
+void engine_changed(Uploader& e) {
+    const std::uint64_t size = std::uint64_t{64} * mib;
+    const fs::path local = local_data(e, "up-changed.bin", Data(0xC1), size);
+    const std::string remote = in_dir(e.d.dir, "up-changed.bin");
+    const Ran first = run_upload(e, local, remote, RunOptions{.existing = upload::Existing::ask, .limiter = nullptr,
+                                                            .stop_at = size / 2, .keep_acks = false});
+    const auto old_temps = temps_of(e, "up-changed.bin");
+    // The local file changed meanwhile: other bytes, a new time.
+    const Data changed(0xC2);
+    fs::remove(local);
+    REQUIRE(local_data(e, "up-changed.bin", changed, size) == local);
+    const Ran second = run_upload(e, local, remote, {});
+    const std::string line = md5_line(e, remote, changed.md5(size));
+    const auto left = temps_of(e, "up-changed.bin");
+    say(std::format("changed: first run {} ({} temp), second {} with note \"{}\"; {} (the new bytes); temps left {} {}",
+                    outcome_name(first.result.outcome), old_temps.size(), outcome_name(second.result.outcome), second.result.note,
+                    line, left.size(),
+                    pass(second.result.outcome == upload::Outcome::done && second.result.note.find("started over") != std::string::npos &&
+                         line == "md5 equal" && left.empty())));
+}
+
+void engine_limit(Uploader& e) {
+    const std::uint64_t limit = number_from_env("GRAB_TEST_UPLOAD_LIMIT_MIB", 2) * mib;
+    const std::uint64_t size = limit * 26;
+    const Data data(0x11);
+    const fs::path local = local_data(e, "up-limit.bin", data, size);
+    const std::string remote = in_dir(e.d.dir, "up-limit.bin");
+    rate::RateLimiter limiter;
+    limiter.set_rate(limit);
+    const Ran r = run_upload(e, local, remote, RunOptions{.existing = upload::Existing::ask, .limiter = &limiter, .stop_at = 0,
+                                                          .keep_acks = true});
+    std::uint64_t in_window = 0;
+    for (const auto& [at, n] : r.acks)
+        if (at >= 3.0 && at < 23.0) in_window += n;
+    const double rate = static_cast<double>(in_window) / 20.0 / mib;
+    const double want = static_cast<double>(limit) / mib;
+    say(std::format("limit: {} MiB/s: {} in {:.1f} s; acknowledged from 3 s to 23 s after the first: {:.3f} MiB/s ({:+.1f} %); {} {}",
+                    want, outcome_name(r.result.outcome), r.took, rate, (rate / want - 1) * 100, md5_line(e, remote, data.md5(size)),
+                    pass(std::abs(rate / want - 1) <= 0.05)));
+}
+
+void engine_rules(Uploader& e) {
+    const Data a_data(0xA), b_data(0xB);
+    const std::uint64_t a_size = std::uint64_t{300} * 1024, b_size = std::uint64_t{400} * 1024;
+    const fs::path a = local_data(e, "up-rules-a.bin", a_data, a_size);
+    const fs::path b = local_data(e, "up-rules-b.bin", b_data, b_size);
+    const std::string remote = in_dir(e.d.dir, "up-rules.bin");
+    const std::string a_md5 = a_data.md5(a_size), b_md5 = b_data.md5(b_size);
+    const auto now = std::chrono::system_clock::now();
+    set_local_mtime(a, now - std::chrono::hours(1));
+    const auto check = [&](const std::string& label, upload::Existing choice, const fs::path& local, upload::Outcome want,
+                           const std::string& want_md5, const std::string& want_placed = {}) {
+        const Ran r = run_upload(e, local, remote, RunOptions{.existing = choice, .limiter = nullptr, .stop_at = 0, .keep_acks = false});
+        const std::string line = md5_line(e, remote, want_md5);
+        const bool placed = want_placed.empty() || r.result.placed == want_placed;
+        say(std::format("rules: {}: {}{}; the file there: {} {}", label, outcome_name(r.result.outcome),
+                        r.result.placed.empty() ? "" : " to " + r.result.placed, line,
+                        pass(r.result.outcome == want && line == "md5 equal" && placed)));
+    };
+    check("a new name", upload::Existing::ask, a, upload::Outcome::done, a_md5, remote);
+    check("ask", upload::Existing::ask, b, upload::Outcome::exists, a_md5);
+    check("skip", upload::Existing::skip, b, upload::Outcome::skipped, a_md5);
+    set_local_mtime(b, now - std::chrono::hours(48));
+    check("if newer, older here", upload::Existing::newer, b, upload::Outcome::skipped, a_md5);
+    set_local_mtime(b, now);
+    check("if newer, newer here", upload::Existing::newer, b, upload::Outcome::done, b_md5, remote);
+    check("if different, the same", upload::Existing::different, b, upload::Outcome::skipped, b_md5);
+    check("if different, another", upload::Existing::different, a, upload::Outcome::done, a_md5, remote);
+    check("replace", upload::Existing::replace, b, upload::Outcome::done, b_md5, remote);
+    const Ran both = run_upload(e, a, remote, RunOptions{.existing = upload::Existing::keep_both, .limiter = nullptr, .stop_at = 0,
+                                                         .keep_acks = false});
+    const std::string numbered = in_dir(e.d.dir, "up-rules (2).bin");
+    std::string beside;
+    {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        auto got = read_small((*lease)->sftp(), rclone_enc::raw_path(numbered));
+        beside = got ? md5_of(*got) : "";
+    }
+    say(std::format("rules: keep both: {} to {}; read back, MD5 equal: {}; the file there still the other: {} {}",
+                    outcome_name(both.result.outcome), both.result.placed, yes(beside == a_md5), md5_line(e, remote, b_md5),
+                    pass(both.result.outcome == upload::Outcome::done && both.result.placed == numbered && beside == a_md5)));
+    // A folder of that name.
+    const std::string folder = in_dir(e.d.dir, "up-rules-dir");
+    {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        REQUIRE(sftp::mkdir((*lease)->sftp(), rclone_enc::raw_path(folder)));
+    }
+    const Ran over = run_upload(e, a, folder, RunOptions{.existing = upload::Existing::replace, .limiter = nullptr, .stop_at = 0,
+                                                        .keep_acks = false});
+    say(std::format("rules: a folder there, replace: {} \"{}\" {}", outcome_name(over.result.outcome), over.result.note,
+                    pass(over.result.outcome == upload::Outcome::skipped && over.result.note == "a folder of that name is there")));
+    const Ran next_to = run_upload(e, a, folder, RunOptions{.existing = upload::Existing::keep_both, .limiter = nullptr, .stop_at = 0,
+                                                           .keep_acks = false});
+    say(std::format("rules: a folder there, keep both: {} to {} {}", outcome_name(next_to.result.outcome), next_to.result.placed,
+                    pass(next_to.result.outcome == upload::Outcome::done && next_to.result.placed == folder + " (2)")));
+}
+
+void engine_readonly(Uploader& e) {
+    const std::string folder = in_dir(e.d.dir, "up-ro");
+    const std::string raw = rclone_enc::raw_path(folder);
+    {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        auto& s = (*lease)->sftp();
+        REQUIRE(sftp::mkdir(s, raw));
+        REQUIRE(sftp::setstat(s, raw, sftp::Attrs{.size = {}, .permissions = 0555, .mtime = {}}));
+    }
+    const std::string want = std::format("{} doesn't let this account write in {}", e.server, folder);
+    const auto p = upload::probe(*e.pool, e.server, folder);
+    say(std::format(R"(readonly: probe {}: writable {}; "{}"; left "{}" {})", folder, p ? yes(p->writable) : "unknown",
+                    p ? p->why : p.error(), p ? p->left : "", pass(p && !p->writable && p->why == want && p->left.empty())));
+    const fs::path local = local_data(e, "up-ro-x.bin", Data(0x50), 3 * mib);
+    const Ran r = run_upload(e, local, in_dir(folder, "up-x.bin"), {});
+    std::size_t inside = 99;
+    {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        auto& s = (*lease)->sftp();
+        if (auto listed = sftp::list(s, raw)) inside = listed->size();
+        if (auto back = sftp::setstat(s, raw, sftp::Attrs{.size = {}, .permissions = 0700, .mtime = {}}); !back) {
+            say("readonly: the folder couldn't be made writable again: " + code_of(back));
+        }
+    }
+    say(std::format("readonly: upload into it: {} \"{}\"; entries left in it {}; record {} {}", outcome_name(r.result.outcome),
+                    r.result.error, inside, yes(upload::saved_progress(e.records, e.server, in_dir(folder, "up-x.bin")).has_value()),
+                    pass(r.result.outcome == upload::Outcome::failed && r.result.error == want && inside == 0)));
+}
+
+void engine_cancel(Uploader& e) {
+    const std::uint64_t size = number_from_env("GRAB_TEST_UPLOAD_RESUME_MIB", 256) * mib;
+    const fs::path local = local_data(e, "up-cancel.bin", Data(0xCA), size);
+    const std::string remote = in_dir(e.d.dir, "up-cancel.bin");
+    const Ran r = run_upload(e, local, remote, RunOptions{.existing = upload::Existing::ask, .limiter = nullptr, .stop_at = size / 4,
+                                                        .keep_acks = false});
+    const auto before = temps_of(e, "up-cancel.bin");
+    const auto gone = upload::discard(*e.pool, e.records, e.server, remote);
+    const auto after = temps_of(e, "up-cancel.bin");
+    const bool record = upload::saved_progress(e.records, e.server, remote).has_value();
+    say(std::format("cancel: {} at {} acknowledged; temps {}; discard {}; temps after {}; record kept {} {}", outcome_name(r.result.outcome),
+                    r.acked, before.size(), gone ? std::string("ok") : gone.error(), after.size(), yes(record),
+                    pass(r.result.outcome == upload::Outcome::stopped && before.size() == 1 && gone && after.empty() && !record)));
+    // A small file has no record: the stopped run hands its temp back, and that is removed.
+    const fs::path small_local = local_data(e, "up-cancel-small.bin", Data(0xCB), std::uint64_t{1536} * 1024);
+    rate::RateLimiter slow;
+    slow.set_rate(std::uint64_t{256} * 1024);
+    const std::string small_remote = in_dir(e.d.dir, "up-cancel-small.bin");
+    const Ran s = run_upload(e, small_local, small_remote, RunOptions{.existing = upload::Existing::ask, .limiter = &slow, .stop_at = 1,
+                                                                    .keep_acks = false});
+    const auto removed = s.result.temp.empty() ? std::expected<void, std::string>(std::unexpected(std::string("no temp")))
+                                               : upload::remove_temp(*e.pool, s.result.temp);
+    const auto left = temps_of(e, "up-cancel-small.bin");
+    say(std::format("cancel: a small file {}, its temp handed back: {}; removed {}; temps after {} {}", outcome_name(s.result.outcome),
+                    yes(!s.result.temp.empty()), removed ? std::string("ok") : removed.error(), left.size(),
+                    pass(s.result.outcome == upload::Outcome::stopped && removed && left.empty())));
+}
+
 } // namespace
+
+TEST_CASE("live server: uploads through upload::run, printed only (GRAB_TEST_UPLOAD_RUN)") {
+    // GRAB_TEST_SERVER, GRAB_TEST_APPDATA, GRAB_TEST_UPLOAD_DIR as above (made here when missing;
+    // 'cleanup' removes it), and:
+    //   GRAB_TEST_UPLOAD_RUN    some of big,small,resume,changed,limit,rules,readonly,cancel,cleanup,
+    //                           run in that order
+    //   GRAB_TEST_UPLOAD_LOCAL  a local folder for the made-up files (kept for the next run) and the
+    //                           records (records\)
+    //   GRAB_TEST_UPLOAD_BUDGET the server's connections (default: budget::default_budget, 12 for Main)
+    //   big: GRAB_TEST_UPLOAD_MIB MiB (1024); resume, cancel: GRAB_TEST_UPLOAD_RESUME_MIB (256);
+    //   limit: GRAB_TEST_UPLOAD_LIMIT_MIB MiB/s (2), measured over 20 s
+    const auto name = util::getenv_utf8("GRAB_TEST_SERVER");
+    const auto appdata = util::getenv_utf8("GRAB_TEST_APPDATA");
+    const auto modes = util::getenv_utf8("GRAB_TEST_UPLOAD_RUN");
+    const auto local = util::getenv_utf8("GRAB_TEST_UPLOAD_LOCAL");
+    if (!name || !appdata || !modes || !local) {
+        MESSAGE("skipped: GRAB_TEST_SERVER / GRAB_TEST_APPDATA / GRAB_TEST_UPLOAD_RUN / GRAB_TEST_UPLOAD_LOCAL not set");
+        return;
+    }
+    const auto wanted = [&](std::string_view mode) {
+        const auto list = util::split(*modes, ',');
+        return std::ranges::find(list, mode) != list.end();
+    };
+    Uploader e;
+    e.server = *name;
+    e.d.dir = util::getenv_utf8("GRAB_TEST_UPLOAD_DIR").value_or("");
+    const bool in_tmp = allowed_dir(e.d.dir) && e.d.dir.starts_with("/tmp/grab-up-");
+    const std::string why = "GRAB_TEST_UPLOAD_DIR must be /tmp/grab-up-* (got \"" + e.d.dir + "\")";
+    REQUIRE_MESSAGE(in_tmp, why);
+    e.d.raw = rclone_enc::raw_path(e.d.dir);
+    e.local = util::path_from_utf8(*local);
+    e.records = e.local / "records";
+    std::error_code ec;
+    REQUIRE_MESSAGE(fs::is_directory(e.local, ec), "GRAB_TEST_UPLOAD_LOCAL must be a folder");
+
+#ifdef _WIN32
+    const test::AppData settings(util::path_from_utf8(*appdata));
+#endif
+    auto ctx = test::read_context(*name);
+    REQUIRE_MESSAGE(ctx, ctx.error_or(""));
+    auto target = test::live_target(*ctx);
+    REQUIRE_MESSAGE(target, target.error_or(""));
+    const int budget = static_cast<int>(number_from_env("GRAB_TEST_UPLOAD_BUDGET", static_cast<std::uint64_t>(budget::default_budget(target->host))));
+    say(std::format("upload::run on {} ({}); folder {}; {} connections, {} logins at once", *name, *modes, e.d.dir, budget,
+                    ssh::Pool::Options{}.logins_at_once));
+
+    std::atomic<int> logins = 0;
+    auto o = ssh::Pools::download_options(budget);
+    o.idle_timer = false;
+    const ssh::Target& t = *target;
+    e.pool = std::make_shared<ssh::Pool>([&] {
+        ++logins;
+        return ssh::open_session(t);
+    }, o);
+    e.connections.configure(e.server, budget);
+    const auto started = Clock::now();
+    const bool writes = wanted("big") || wanted("small") || wanted("resume") || wanted("changed") || wanted("limit") ||
+                        wanted("rules") || wanted("readonly") || wanted("cancel");
+    if (writes) {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        if (!ensure_dir((*lease)->sftp(), e.d)) return;
+    }
+    if (wanted("big")) engine_big(e);
+    if (wanted("small")) engine_small(e);
+    if (wanted("resume")) engine_resume(e);
+    if (wanted("changed")) engine_changed(e);
+    if (wanted("limit")) engine_limit(e);
+    if (wanted("rules")) engine_rules(e);
+    if (wanted("readonly")) engine_readonly(e);
+    if (wanted("cancel")) engine_cancel(e);
+    if (wanted("cleanup")) {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        cleanup((*lease)->sftp(), e.d);
+    }
+    say(std::format("{} login(s) in all; {:.1f} s", logins.load(), seconds(Clock::now() - started)));
+}
 
 TEST_CASE("live server: SFTP writes, printed only (GRAB_TEST_UPLOAD)") {
     const auto name = util::getenv_utf8("GRAB_TEST_SERVER");

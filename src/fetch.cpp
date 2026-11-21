@@ -6,6 +6,7 @@
 #include "speed.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
+#include "transfer.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -585,11 +586,6 @@ std::expected<PartialFiles, std::string> claim(const fs::path& target, const Sta
     return *f;
 }
 
-std::chrono::seconds backoff(int attempt) {
-    constexpr int steps[] = {2, 4, 8, 16, 30, 30};
-    return std::chrono::seconds(steps[std::clamp(attempt - 1, 0, 5)]);
-}
-
 // One look at the server's file: what it is, or why that failed.
 struct Look {
     std::optional<RemoteStat> stat;
@@ -636,26 +632,6 @@ Look look_sftp(const Download& d, const std::stop_token& stop) {
     }
 }
 
-// The download's place in its server's pool, from the size check on, left on every way out.
-class Seat {
-public:
-    Seat(Connections& connections, const Download& d, int weight) : connections_(connections), d_(d) {
-        if (!d.joined) connections_.join(d.server, d.id, weight);
-    }
-    Seat(const Seat&) = delete;
-    Seat& operator=(const Seat&) = delete;
-    ~Seat() { leave(); }
-    void leave() {
-        if (!d_.joined && !left_) connections_.leave(d_.server, d_.id);
-        left_ = true;
-    }
-
-private:
-    Connections& connections_;
-    const Download& d_;
-    bool left_ = false;
-};
-
 } // namespace
 
 // ---- a download ------------------------------------------------------------------------------
@@ -668,7 +644,8 @@ Result run(const Download& d, Connections& connections, const std::function<void
     // Past what Windows takes here, the partial download's record could never be written (G19).
     if (auto why = util::too_long(d.target, std::string_view(".2.grabpart.json").size())) return failed(std::move(*why));
     auto weight = [&] { return d.weight != nullptr ? d.weight->load() : 2; };
-    Seat seat(connections, d, weight());
+    // The download's place in its server's pool, from the size check on.
+    transfer::Seat seat(connections, d.server, d.id, d.joined, weight());
 
     // The size check is a connection like the others: taken from the pool, and when the server
     // is full, asked again 1, 2, 4, 8, then 15 s apart rather than failing the file (review G193).
@@ -1196,7 +1173,7 @@ Result run(const Download& d, Connections& connections, const std::function<void
                 inner.request_stop();
                 return;
             }
-            not_before[i] = Clock::now() + backoff(tries[i]);
+            not_before[i] = Clock::now() + transfer::backoff(tries[i]);
         }
     };
 

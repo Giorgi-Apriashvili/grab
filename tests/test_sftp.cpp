@@ -503,16 +503,21 @@ TEST_CASE("sftp: a read-only server refuses every change and still reads") {
     auto got = read_all(c, "/ro/f", 0, 4, 2, 1024);
     REQUIRE(got);
     CHECK(*got == "data");
+    // A folder this account can't write is on a file system that can be written.
     auto fs = sftp::statvfs(c, "/ro");
     REQUIRE(fs);
-    CHECK(fs->read_only());
+    CHECK_FALSE(fs->read_only());
 
-    // A read-only file system, as OpenSSH answers EROFS: "Failure".
+    // A read-only file system, as OpenSSH answers EROFS and Box.Guest an account that may only
+    // read: "Failure", and statvfs says read-only.
     srv.read_only_as = sftp::Code::failure;
     auto erofs = sftp::open_file(c, "/ro/x", creat_excl);
     REQUIRE_FALSE(erofs);
     CHECK(erofs.error().code == sftp::Code::failure);
     CHECK(sftp::describe(erofs.error()) == "Failure");
+    fs = sftp::statvfs(c, "/ro");
+    REQUIRE(fs);
+    CHECK(fs->read_only());
     CHECK(srv.files.size() == 1);
     CHECK(srv.dirs.size() == 1);
     CHECK(c.pending() == 0);

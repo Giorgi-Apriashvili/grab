@@ -1,7 +1,7 @@
 #pragma once
 
 // A server's pool of logins on in-memory SFTP servers (fake_sftp.hpp), for the tests of what reads
-// through ssh::Pool (test_ssh_read.cpp, test_play_stream.cpp).
+// or writes through ssh::Pool (test_ssh_read.cpp, test_play_stream.cpp, test_upload.cpp).
 
 #include "conn_budget.hpp"
 #include "fake_sftp.hpp"
@@ -48,8 +48,25 @@ struct FakePool {
     // all find work as they log in, however late their threads run on a busy machine); 20 s at most.
     int reads_wait_for_logins = 0;
     bool shared = false; // the sessions read `files` itself, not a copy each (big files; not changed meanwhile)
+    // Every session reads and writes `store` instead (FakeServer::shared), one server's file system
+    // for all its logins: uploads, several connections writing one file. `files` and `dirs` unused.
+    bool writable = false;
+    FakeFiles store;
+    // Each session's server as these say (fake_sftp.hpp).
+    std::chrono::milliseconds latency{0};
+    bool read_only = false;
+    sftp::Code read_only_as = sftp::Code::permission_denied;
+    std::uint64_t quota_bytes = 0;
+    bool posix_rename = true;
+    bool rename_overwrites = false;
+    std::uint32_t max_write = 0;
+    bool statvfs = false;
+    bool no_setstat = false;
+    std::atomic<bool> break_after_rename{false}; // the next RENAME/posix-rename, on any session
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
+    std::vector<FakeServer::Write> writes;   // every session's WRITEs, as each closed
+    std::vector<std::string> requests;       // and their requests, by name
     std::map<int, std::uint64_t> asked_by; // login -> bytes its READs asked for
     std::map<int, std::vector<std::pair<std::uint64_t, std::uint32_t>>> reads_by; // login -> its READs
     std::vector<std::string> opened;
@@ -60,9 +77,11 @@ struct FakePool {
         Session(FakePool& f, int n) : fake(f), login(n), client(server) {
             {
                 std::scoped_lock lock(f.mutex);
-                if (f.shared) server.shared_files = &f.files;
+                if (f.writable) server.shared = &f.store;
+                else if (f.shared) server.shared_files = &f.files;
                 else server.files = f.files;
-                for (const auto& d : f.dirs) server.dirs[d] = {".", ".."};
+                if (!f.writable)
+                    for (const auto& d : f.dirs) server.dirs[d] = {".", ".."};
                 server.fifos = f.fifos;
                 server.no_size = f.no_size;
                 server.denied = f.denied;
@@ -75,6 +94,16 @@ struct FakePool {
             server.max_data = f.max_data;
             server.reverse = f.reverse;
             server.slice = f.slice;
+            server.latency = f.latency;
+            server.read_only = f.read_only;
+            server.read_only_as = f.read_only_as;
+            server.quota_bytes = f.quota_bytes;
+            server.posix_rename = f.posix_rename;
+            server.rename_overwrites = f.rename_overwrites;
+            server.max_write = f.max_write;
+            server.statvfs = f.statvfs;
+            server.no_setstat = f.no_setstat;
+            server.break_after_rename = &f.break_after_rename;
             if (f.reads_wait_for_logins > 0) {
                 server.on_read = [&f](const std::string&, std::uint32_t) {
                     const auto until = std::chrono::steady_clock::now() + 20s;
@@ -92,6 +121,8 @@ struct FakePool {
             mine.insert(mine.end(), server.reads.begin(), server.reads.end());
             for (const auto& [off, len] : server.reads) fake.asked_by[login] += len;
             fake.opened.insert(fake.opened.end(), server.opened.begin(), server.opened.end());
+            fake.writes.insert(fake.writes.end(), server.writes.begin(), server.writes.end());
+            fake.requests.insert(fake.requests.end(), server.requests.begin(), server.requests.end());
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;

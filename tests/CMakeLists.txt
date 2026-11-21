@@ -65,6 +65,7 @@ add_executable(grab_tests
     test_preview_jobs.cpp
     test_body_stream.cpp
     test_fetch_grab.cpp
+    test_upload.cpp
     test_folder_grab.cpp
     test_lookup_grab.cpp
     test_live_server.cpp

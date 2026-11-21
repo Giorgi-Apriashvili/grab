@@ -1,10 +1,11 @@
 #pragma once
 
-// An SFTP server in memory for the tests (test_sftp.cpp, test_fetch_grab.cpp).
+// An SFTP server in memory for the tests (test_sftp.cpp, test_fetch_grab.cpp, test_upload.cpp).
 
 #include "sftp.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -23,6 +25,50 @@
 
 namespace grab::test {
 
+// A fake server's files and folders: a session's own, or one store several sessions share
+// (FakeServer::shared), as one server's file system is shared by its logins. A file's bytes stay
+// where they are while it is renamed, and an open handle keeps them when its name is removed or
+// replaced, as an inode does: WRITE, READ and FSTAT on it go on, and the name doesn't come back.
+struct FakeFiles {
+    std::map<std::string, std::string> files;             // path -> content
+    std::map<std::string, std::vector<std::string>> dirs; // path -> entry names (". and .." too)
+    std::map<std::string, std::uint32_t> mtimes;          // times set (SETSTAT); else 1700000000
+    std::map<std::string, std::uint32_t> modes;           // permissions given (OPEN, MKDIR, SETSTAT), without the type bits
+    std::mutex mutex;                                     // held for each packet of a session sharing it
+
+    // The bytes all named files hold, as the quota counts them.
+    [[nodiscard]] std::uint64_t used() const {
+        std::uint64_t n = 0;
+        for (const auto& [path, content] : files) n += content.size();
+        return n;
+    }
+    // The file's name goes; its bytes stay while a handle has them open.
+    void unlink(const std::string& path) {
+        auto node = files.extract(path);
+        mtimes.erase(path);
+        modes.erase(path);
+        if (!node.empty() && open.contains(&node.mapped())) unlinked.push_back(std::move(node));
+    }
+    void opened(const std::string* content) { ++open[content]; }
+    void closed(const std::string* content) {
+        const auto it = open.find(content);
+        if (it == open.end() || --it->second > 0) return;
+        open.erase(it);
+        std::erase_if(unlinked, [&](const auto& node) { return &node.mapped() == content; });
+    }
+    // The name a file's bytes have now (renamed meanwhile, perhaps by another session); empty once
+    // it has none.
+    [[nodiscard]] std::string path_of(const std::string* content) const {
+        for (const auto& [path, bytes] : files)
+            if (&bytes == content) return path;
+        return {};
+    }
+
+private:
+    std::map<const std::string*, int> open; // handles open on each file's bytes
+    std::vector<std::map<std::string, std::string>::node_type> unlinked;
+};
+
 // An SFTP server in memory, answering the client's packets as they are written. Its switches
 // reorder the replies, shorten READs, cut the stream into small pieces, refuse paths or corrupt
 // the stream; it records the READs it was asked for.
@@ -32,22 +78,37 @@ namespace grab::test {
 // on an existing name and RMDIR of a folder with something in it fail with "Failure", and a name
 // whose folder isn't there is "No such file". A new file or folder needs its folder in `dirs`.
 class FakeServer : public sftp::Channel {
+    FakeFiles own_; // the session's own files, unless `shared`
+
 public:
-    std::map<std::string, std::string> files;               // path -> content
-    std::map<std::string, std::vector<std::string>> dirs;   // path -> entry names (". and .." too)
+    FakeServer() = default;
+    FakeServer(const FakeServer&) = delete;
+    FakeServer& operator=(const FakeServer&) = delete;
+    ~FakeServer() override {
+        // Its handles close with the session.
+        const auto lock = locked();
+        for (const auto& [h, open_handle] : handles_)
+            if (open_handle.content != nullptr) st().closed(open_handle.content);
+    }
+
+    // The session's own files and folders (FakeFiles); a store several sessions write instead:
+    // `shared`, every request of this session going through it under its lock.
+    std::map<std::string, std::string>& files = own_.files;
+    std::map<std::string, std::vector<std::string>>& dirs = own_.dirs;
+    std::map<std::string, std::uint32_t>& mtimes = own_.mtimes;
+    std::map<std::string, std::uint32_t>& modes = own_.modes;
+    FakeFiles* shared = nullptr;
     std::map<std::string, std::uint64_t> listed_size;       // sizes to claim in ATTRS instead
     std::map<std::string, std::uint64_t> readdir_size;      // sizes to claim in folder listings only (a file changed since)
     std::map<std::string, std::string> links;               // path -> where the link points (a full path)
-    std::map<std::string, std::uint32_t> mtimes;            // times set (SETSTAT); else 1700000000
-    std::map<std::string, std::uint32_t> modes;             // permissions given (OPEN, MKDIR, SETSTAT), without the type bits
     std::set<std::string> denied;                           // answered with permission denied
     std::uint32_t max_data = sftp::max_read;                // a DATA carries at most this
     bool reverse = false;                                   // answer each batch last first
     std::size_t slice = 0;                                  // hand out at most this many bytes per read
     std::size_t readdir_batch = 2;                          // entries per NAME
     bool corrupt = false;                                   // send a packet claiming 1 GiB
-    // Instead of files: one copy for many sessions. Read only: writes (OPEN for writing, WRITE,
-    // SETSTAT, REMOVE, RENAME, MKDIR) go to this session's own `files`/`dirs`.
+    // Instead of files, for reading: one copy for many sessions. Read only: writes (OPEN for
+    // writing, WRITE, SETSTAT, REMOVE, RENAME, MKDIR) go to the session's files (or `shared`'s).
     const std::map<std::string, std::string>* shared_files = nullptr;
     const std::map<std::string, std::uint32_t>* shared_mtimes = nullptr; // files' times instead of 1700000000
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
@@ -62,16 +123,21 @@ public:
     std::set<std::string> no_size;                          // files whose ATTRS carry no size
 
     // Writes. Every change is refused while `read_only`: with `read_only_as` (permission denied, a
-    // folder this account can't write; or failure, "Failure", as OpenSSH answers a read-only file
-    // system's EROFS).
+    // folder this account can't write, as Main's chmod 555 folder answers; or failure, "Failure",
+    // as OpenSSH answers a read-only file system's EROFS and a Storage Box an account that may only
+    // read, Box.Guest, whose statvfs then says ST_RDONLY).
     bool read_only = false;
     sftp::Code read_only_as = sftp::Code::permission_denied;
     std::uint64_t quota_bytes = 0;  // 0: none; else what all files may hold: a WRITE past it fails ("Failure", ENOSPC)
     bool posix_rename = true;       // posix-rename@openssh.com offered (and answered)
     bool rename_overwrites = false; // RENAME replaces an existing file, as a server unlike OpenSSH's might
     std::uint32_t max_write = 0;    // nonzero: limits@openssh.com offered, saying so; a bigger WRITE ends the session
-    bool statvfs = false;           // statvfs@openssh.com offered: quota_bytes' figures (else 1 TiB), ST_RDONLY when read_only
+    bool statvfs = false;           // statvfs@openssh.com offered: quota_bytes' figures (else 1 TiB), ST_RDONLY as above
     bool fsync = false;             // fsync@openssh.com offered
+    bool no_setstat = false;        // SETSTAT and FSETSTAT answer "Operation unsupported", as some gateways do
+    // Set: the next RENAME or posix-rename done (by any session pointing here) breaks its
+    // connection before the reply goes; cleared by it.
+    std::atomic<bool>* break_after_rename = nullptr;
     std::optional<std::string> bad_extended_reply; // every EXTENDED gets an EXTENDED_REPLY of just these bytes
 
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads; // (offset, length) of each READ
@@ -99,7 +165,10 @@ public:
         while (in_.size() >= 4) {
             std::uint32_t len = be32(in_.data());
             if (in_.size() < 4 + len) break;
-            handle(std::string_view(in_).substr(4, len));
+            {
+                const auto lock = locked();
+                handle(std::string_view(in_).substr(4, len));
+            }
             in_.erase(0, 4 + len);
         }
     }
@@ -154,13 +223,18 @@ public:
     }
 
     // The bytes all files hold, as the quota counts them.
-    [[nodiscard]] std::uint64_t used() const {
-        std::uint64_t n = 0;
-        for (const auto& [path, content] : files) n += content.size();
-        return n;
+    [[nodiscard]] std::uint64_t used() {
+        const auto lock = locked();
+        return st().used();
     }
 
 private:
+    [[nodiscard]] FakeFiles& st() { return shared != nullptr ? *shared : own_; }
+    [[nodiscard]] const FakeFiles& st() const { return shared != nullptr ? *shared : own_; }
+    // The shared store's lock, for a packet; none for the session's own files.
+    std::unique_lock<std::mutex> locked() {
+        return shared != nullptr ? std::unique_lock(shared->mutex) : std::unique_lock<std::mutex>();
+    }
     static std::uint32_t be32(const char* p) {
         std::uint32_t v = 0;
         for (int i = 0; i < 4; ++i) v = (v << 8) | static_cast<std::uint8_t>(p[i]);
@@ -256,7 +330,7 @@ private:
         u32(b, 1700000000);
     }
     [[nodiscard]] std::uint32_t mtime_of(const std::string& path) const {
-        if (mtimes.contains(path)) return mtimes.at(path);
+        if (st().mtimes.contains(path)) return st().mtimes.at(path);
         return shared_mtimes != nullptr && shared_mtimes->contains(path) ? shared_mtimes->at(path) : 1700000000;
     }
     void attrs(std::string& b, const std::string& path, bool in_listing = false) {
@@ -275,26 +349,29 @@ private:
             u32(b, 1700000000);
             return;
         }
-        if (dirs.contains(path)) {
+        const FakeFiles& fs = st();
+        if (fs.dirs.contains(path)) {
             u32(b, 0x4 | 0x8);
-            u32(b, 040000 | (modes.contains(path) ? modes.at(path) : 0755));
+            u32(b, 040000 | (fs.modes.contains(path) ? fs.modes.at(path) : 0755));
             u32(b, 0);
             u32(b, mtime_of(path));
             return;
         }
         u32(b, 0x1 | 0x4 | 0x8);
         u64(b, in_listing && readdir_size.contains(path) ? readdir_size[path] : listed_size.contains(path) ? listed_size[path] : all_files().at(path).size());
-        u32(b, 0100000 | (modes.contains(path) ? modes.at(path) : 0644));
+        u32(b, 0100000 | (fs.modes.contains(path) ? fs.modes.at(path) : 0644));
         u32(b, mtime_of(path));
         u32(b, mtime_of(path));
     }
-    const std::map<std::string, std::string>& all_files() const { return shared_files ? *shared_files : files; }
+    [[nodiscard]] const std::map<std::string, std::string>& all_files() const { return shared_files ? *shared_files : st().files; }
     [[nodiscard]] bool known(const std::string& path) const {
-        return all_files().contains(path) || dirs.contains(path) || fifos.contains(path);
+        return all_files().contains(path) || st().dirs.contains(path) || fifos.contains(path);
     }
-    std::string new_handle(std::string path, bool writable = false, bool append = false) {
+    // `content`: the bytes of a file of the store open on it (writes go there, as do READ and FSTAT).
+    std::string new_handle(std::string path, bool writable = false, bool append = false, std::string* content = nullptr) {
         std::string h = "h" + std::to_string(next_handle_++);
-        handles_[h] = {.path = std::move(path), .pos = 0, .writable = writable, .append = append};
+        if (content != nullptr) st().opened(content);
+        handles_[h] = {.path = std::move(path), .pos = 0, .writable = writable, .append = append, .content = content};
         return h;
     }
     // The folder a path is in ("/" for "/x"); empty for a name without one.
@@ -310,17 +387,18 @@ private:
     // A new name's folder: there (or the name has none).
     [[nodiscard]] bool parent_there(const std::string& path) const {
         const std::string parent = parent_of(path);
-        return parent.empty() || dirs.contains(parent);
+        return parent.empty() || st().dirs.contains(parent);
     }
     void listed(const std::string& path) {
         const std::string parent = parent_of(path);
-        if (!parent.empty() && dirs.contains(parent)) dirs[parent].push_back(name_of(path));
+        if (!parent.empty() && st().dirs.contains(parent)) st().dirs[parent].push_back(name_of(path));
     }
     void unlisted(const std::string& path) {
         const std::string parent = parent_of(path);
-        if (!parent.empty() && dirs.contains(parent)) std::erase(dirs[parent], name_of(path));
+        if (!parent.empty() && st().dirs.contains(parent)) std::erase(st().dirs[parent], name_of(path));
     }
-    // Every path at or below `from` moves below `to` (a folder renamed), open handles too.
+    // Every path at or below `from` moves below `to` (a folder renamed), this session's open handles
+    // too (a file's bytes move with it, so other sessions' handles keep writing into it).
     void move_tree(const std::string& from, const std::string& to) {
         const auto moved = [&](const std::string& p) -> std::optional<std::string> {
             if (p == from) return to;
@@ -337,20 +415,22 @@ private:
                 map.insert(std::move(node));
             }
         };
-        move_keys(files);
-        move_keys(dirs);
-        move_keys(mtimes);
-        move_keys(modes);
+        FakeFiles& fs = st();
+        move_keys(fs.files);
+        move_keys(fs.dirs);
+        move_keys(fs.mtimes);
+        move_keys(fs.modes);
         for (auto& [h, open_handle] : handles_)
             if (auto p = moved(open_handle.path)) open_handle.path = *p;
     }
     [[nodiscard]] bool empty_dir(const std::string& path) const {
-        return std::ranges::all_of(dirs.at(path), [](const std::string& n) { return n == "." || n == ".."; });
+        return std::ranges::all_of(st().dirs.at(path), [](const std::string& n) { return n == "." || n == ".."; });
     }
 
     void handle(std::string_view packet) {
         auto type = static_cast<std::uint8_t>(packet[0]);
         In in{packet.substr(1)};
+        FakeFiles& fs = st();
         if (type == 1) { // INIT: no id
             std::string r;
             std::string b;
@@ -395,39 +475,39 @@ private:
             if ((flags & (F::write | F::append | F::creat | F::trunc)) == 0) {
                 if (!all_files().contains(path)) return status(id, 2, "No such file");
                 std::string b;
-                str(b, new_handle(path));
+                str(b, new_handle(path, false, false, shared_files == nullptr ? &fs.files.at(path) : nullptr));
                 return reply(102, id, b);
             }
             if (read_only) return refuse(id);
-            if (dirs.contains(path) || fifos.contains(path)) return status(id, 4, "Failure"); // EISDIR
-            if (files.contains(path)) {
+            if (fs.dirs.contains(path) || fifos.contains(path)) return status(id, 4, "Failure"); // EISDIR
+            if (fs.files.contains(path)) {
                 if ((flags & F::creat) && (flags & F::excl)) return status(id, 4, "Failure"); // EEXIST
-                if (flags & F::trunc) files[path].clear();
+                if (flags & F::trunc) fs.files[path].clear();
             } else {
                 if (!(flags & F::creat) || !parent_there(path)) return status(id, 2, "No such file");
-                files[path] = {};
+                fs.files[path] = {};
                 listed(path);
-                if (given.permissions) modes[path] = *given.permissions & 07777;
+                if (given.permissions) fs.modes[path] = *given.permissions & 07777;
             }
             std::string b;
-            str(b, new_handle(path, (flags & (F::write | F::append)) != 0, (flags & F::append) != 0));
+            str(b, new_handle(path, (flags & (F::write | F::append)) != 0, (flags & F::append) != 0, &fs.files.at(path)));
             return reply(102, id, b);
         }
         case 11: { // OPENDIR
             std::string path = resolve(in.str());
             if (denied.contains(path)) return status(id, 3, "Permission denied");
-            if (!dirs.contains(path)) return status(id, 2, "No such file");
+            if (!fs.dirs.contains(path)) return status(id, 2, "No such file");
             std::string b;
             str(b, new_handle(path));
             return reply(102, id, b);
         }
         case 5: { // READ
-            const std::string& path = handles_.at(in.str()).path;
-            const std::string& content = all_files().at(path);
+            const OpenHandle& h = handles_.at(in.str());
+            const std::string& content = h.content != nullptr ? *h.content : all_files().at(h.path);
             std::uint64_t off = in.u64();
             std::uint32_t len = in.u32();
             reads.emplace_back(off, len);
-            if (on_read) on_read(path, len);
+            if (on_read) on_read(h.path, len);
             if (off >= content.size()) return status(id, 1, "EOF");
             std::size_t n = std::min<std::uint64_t>({len, max_data, content.size() - off});
             std::string b;
@@ -456,16 +536,17 @@ private:
                 write_of_.back() = len;
             };
             if (h == handles_.end()) return answer(4, "Failure");
-            if (!h->second.writable) return answer(2, "No such file"); // EBADF
+            if (!h->second.writable || h->second.content == nullptr) return answer(2, "No such file"); // EBADF
             if (read_only) {
                 refuse(id);
                 write_of_.back() = len;
                 return;
             }
-            std::string& content = files[h->second.path];
+            // Into the file's bytes, also once its name is gone (an inode).
+            std::string& content = *h->second.content;
             const std::uint64_t at = h->second.append ? content.size() : off;
             const std::uint64_t size = std::max<std::uint64_t>(content.size(), at + len);
-            if (quota_bytes != 0 && used() + (size - content.size()) > quota_bytes) return answer(4, "Failure"); // ENOSPC
+            if (quota_bytes != 0 && fs.used() + (size - content.size()) > quota_bytes) return answer(4, "Failure"); // ENOSPC
             if (content.size() < size) content.resize(size, '\0');
             std::memcpy(content.data() + at, data.data(), len);
             return answer(0, "");
@@ -474,6 +555,7 @@ private:
             const auto closed = handles_.find(in.str());
             if (closed != handles_.end()) {
                 if (on_close) on_close(closed->second.path);
+                if (closed->second.content != nullptr) fs.closed(closed->second.content);
                 handles_.erase(closed);
             }
             if (break_on_close) {
@@ -484,7 +566,7 @@ private:
         }
         case 12: { // READDIR
             auto& h = handles_.at(in.str());
-            const auto& names = dirs[h.path];
+            const auto& names = fs.dirs[h.path];
             if (h.pos >= names.size() && !never_eof) return status(id, 1, "EOF");
             std::string b;
             std::size_t n = std::min(readdir_batch, names.size() - h.pos);
@@ -515,8 +597,18 @@ private:
             return reply(105, id, b);
         }
         case 8: { // FSTAT
+            const OpenHandle& h = handles_.at(in.str());
             std::string b;
-            attrs(b, handles_.at(in.str()).path);
+            const std::string now = h.content != nullptr ? fs.path_of(h.content) : h.path;
+            if (h.content != nullptr && now.empty()) { // its name is gone: the bytes it still has
+                u32(b, 0x1 | 0x4 | 0x8);
+                u64(b, h.content->size());
+                u32(b, 0100644);
+                u32(b, 1700000000);
+                u32(b, 1700000000);
+            } else {
+                attrs(b, now);
+            }
             return reply(105, id, b);
         }
         case 9:    // SETSTAT
@@ -527,32 +619,31 @@ private:
             } else {
                 const auto h = handles_.find(in.str());
                 if (h == handles_.end()) return status(id, 4, "Failure");
-                path = h->second.path;
+                path = h->second.content != nullptr ? fs.path_of(h->second.content) : h->second.path;
             }
             const sftp::Attrs a = in.attrs();
+            if (no_setstat) return status(id, 8, "Operation unsupported");
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (!known(path)) return status(id, 2, "No such file");
             if (read_only) return refuse(id);
             if (a.size) {
-                if (!files.contains(path)) return status(id, 4, "Failure");
-                std::string& content = files[path];
-                if (quota_bytes != 0 && *a.size > content.size() && used() + (*a.size - content.size()) > quota_bytes)
+                if (!fs.files.contains(path)) return status(id, 4, "Failure");
+                std::string& content = fs.files[path];
+                if (quota_bytes != 0 && *a.size > content.size() && fs.used() + (*a.size - content.size()) > quota_bytes)
                     return status(id, 4, "Failure");
                 content.resize(*a.size, '\0');
             }
-            if (a.permissions) modes[path] = *a.permissions & 07777;
-            if (a.mtime) mtimes[path] = *a.mtime;
+            if (a.permissions) fs.modes[path] = *a.permissions & 07777;
+            if (a.mtime) fs.mtimes[path] = *a.mtime;
             return status(id, 0);
         }
         case 13: { // REMOVE
             const std::string path = in.str();
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (read_only) return refuse(id);
-            if (dirs.contains(path)) return status(id, 4, "Failure"); // EISDIR
-            if (!files.contains(path)) return status(id, 2, "No such file");
-            files.erase(path);
-            mtimes.erase(path);
-            modes.erase(path);
+            if (fs.dirs.contains(path)) return status(id, 4, "Failure"); // EISDIR
+            if (!fs.files.contains(path)) return status(id, 2, "No such file");
+            fs.unlink(path);
             unlisted(path);
             return status(id, 0);
         }
@@ -563,8 +654,8 @@ private:
             if (read_only) return refuse(id);
             if (known(path) || links.contains(path)) return status(id, 4, "Failure"); // EEXIST
             if (!parent_there(path)) return status(id, 2, "No such file");
-            dirs[path] = {".", ".."};
-            if (a.permissions) modes[path] = *a.permissions & 07777;
+            fs.dirs[path] = {".", ".."};
+            if (a.permissions) fs.modes[path] = *a.permissions & 07777;
             listed(path);
             return status(id, 0);
         }
@@ -572,11 +663,11 @@ private:
             const std::string path = in.str();
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (read_only) return refuse(id);
-            if (!dirs.contains(path)) return status(id, 2, "No such file"); // ENOENT, ENOTDIR
-            if (!empty_dir(path)) return status(id, 4, "Failure");          // ENOTEMPTY
-            dirs.erase(path);
-            mtimes.erase(path);
-            modes.erase(path);
+            if (!fs.dirs.contains(path)) return status(id, 2, "No such file"); // ENOENT, ENOTDIR
+            if (!empty_dir(path)) return status(id, 4, "Failure");             // ENOTEMPTY
+            fs.dirs.erase(path);
+            fs.mtimes.erase(path);
+            fs.modes.erase(path);
             unlisted(path);
             return status(id, 0);
         }
@@ -600,11 +691,14 @@ private:
                 const std::string path = resolve(in.str());
                 if (!known(path)) return status(id, 2, "No such file");
                 const std::uint64_t total = quota_bytes != 0 ? quota_bytes : std::uint64_t{1} << 40;
-                const std::uint64_t left = total - std::min(total, used());
+                const std::uint64_t left = total - std::min(total, fs.used());
+                // ST_RDONLY for a read-only file system: one that refuses with "Failure" (a folder
+                // that refuses with "Permission denied" is on a writable one).
+                const bool rdonly = read_only && read_only_as == sftp::Code::failure;
                 std::string b;
                 for (const std::uint64_t v : {std::uint64_t{4096}, std::uint64_t{4096}, total / 4096, left / 4096, left / 4096,
                                               std::uint64_t{1000000}, std::uint64_t{900000}, std::uint64_t{900000},
-                                              std::uint64_t{0x1234}, std::uint64_t{read_only ? 1u : 0u}, std::uint64_t{255}})
+                                              std::uint64_t{0x1234}, std::uint64_t{rdonly ? 1u : 0u}, std::uint64_t{255}})
                     u64(b, v);
                 return reply(201, id, b);
             }
@@ -638,6 +732,7 @@ private:
     // RENAME as OpenSSH's sftp-server does it (link and unlink: an existing `to` fails it), or,
     // `overwrite`, as rename(2) does (posix-rename): a file replaces a file, a folder an empty one.
     void rename(std::uint32_t id, const std::string& from, const std::string& to, bool overwrite) {
+        FakeFiles& fs = st();
         if (denied.contains(from) || denied.contains(to)) return status(id, 3, "Permission denied");
         if (read_only) return refuse(id);
         if (!known(from)) return status(id, 2, "No such file");
@@ -645,19 +740,21 @@ private:
         if (from == to) return status(id, 0);
         if (known(to)) {
             if (!overwrite) return status(id, 4, "Failure");
-            const bool from_dir = dirs.contains(from);
-            const bool to_dir = dirs.contains(to);
+            const bool from_dir = fs.dirs.contains(from);
+            const bool to_dir = fs.dirs.contains(to);
             if (from_dir != to_dir) return status(id, 4, "Failure");     // EISDIR, ENOTDIR
             if (to_dir && !empty_dir(to)) return status(id, 4, "Failure"); // ENOTEMPTY
-            files.erase(to);
-            dirs.erase(to);
-            mtimes.erase(to);
-            modes.erase(to);
+            fs.unlink(to);
+            fs.dirs.erase(to);
             unlisted(to);
         }
         unlisted(from);
         move_tree(from, to);
         listed(to);
+        if (break_after_rename != nullptr && break_after_rename->exchange(false)) {
+            dropped = true; // done, and the link gone before the answer
+            return;
+        }
         return status(id, 0);
     }
 
@@ -666,6 +763,7 @@ private:
         std::size_t pos;
         bool writable;
         bool append;
+        std::string* content; // a file of the store's: its bytes (nullptr: a folder, or shared_files)
     };
     std::string in_, out_;
     std::vector<std::string> queue_;
