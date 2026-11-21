@@ -35,6 +35,9 @@ public:
         // host until the answer reaches the UI thread.
         std::function<void(const std::string& url, std::function<void(WebResource)> reply)> on_preview;
         std::function<void(std::function<void()>)> defer; // any thread: run on the UI thread
+        // The drop spike (UPLOADS.md step 0.7; GRAB_DEBUG_DROPS=1): drops from outside allowed and
+        // what they hand the page logged (note_drop). Off, the window takes no drop at all.
+        bool debug_drops = false;
     };
     using OnMessage = std::function<void(const std::string& json)>;
     // Called once: S_OK when the UI is navigating, or the failure (e.g. no WebView2 runtime).
@@ -57,6 +60,11 @@ private:
     void offer_link(std::wstring uri);
     // The answer to request `id` (UI thread): its response, over a stream of the shared body.
     void complete(std::uint64_t id, const WebResource& r);
+    // The drop spike (Options::debug_drops): the page's "init" is answered with "debugDrops", which
+    // turns its drop logger on; its "debugDrop" reports go to %TEMP%\grab-drops.log with what
+    // WebView2 handed over beside them (each object's interface, kind, permission and path), and a
+    // banner says so.
+    void note_drop(const std::string& json, ICoreWebView2WebMessageReceivedEventArgs* args);
 
     HWND hwnd_ = nullptr;
     bool asking_ = false;

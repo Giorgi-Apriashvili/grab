@@ -68,12 +68,13 @@ add_executable(grab_tests
     test_folder_grab.cpp
     test_lookup_grab.cpp
     test_live_server.cpp
+    test_live_upload.cpp
     test_guard.cpp
     test_notices.cpp
     test_ssh_keys.cpp)
 
-# OpenSSL's MD5 for the checks' own sums (test_ssh_hash.cpp, test_live_server.cpp) and the local
-# hash timing.
+# OpenSSL's MD5 for the checks' own sums (test_ssh_hash.cpp, test_live_server.cpp,
+# test_live_upload.cpp) and the local hash timing.
 target_link_libraries(grab_tests PRIVATE grab_core doctest::doctest OpenSSL::Crypto)
 # grab.conf.example as shipped, compared with the example built into grab (test_config.cpp).
 target_compile_definitions(grab_tests PRIVATE GRAB_SOURCE_DIR="${PROJECT_SOURCE_DIR}")

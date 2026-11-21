@@ -5451,7 +5451,97 @@ if (webview) {
       case 'serverError': onServerError(msg); break;
       case 'filePicked': $('#f-key').value = msg.path; setSecretPlaceholder(); break;
       case 'importBanner': showImportBanner(msg.text); break;
+      case 'debugDrops': debugDropsOn(); break;
+      case 'debugDropLogged': showBanner(msg.text); break;
     }
+  });
+}
+
+// ---- the uploads' drop spike (UPLOADS.md step 0.7) ----------------------------------------
+
+// Posts `msg` with File and FileSystemHandle objects beside it, which the host gets as
+// ICoreWebView2File and ICoreWebView2FileSystemHandle (with their paths). Replaceable: the page
+// tests stub it.
+function postWithObjects(msg, objects) {
+  if (webview && webview.postMessageWithAdditionalObjects) webview.postMessageWithAdditionalObjects(msg, objects);
+  else send(msg);
+}
+
+// What a drop from outside hands the page, sent to the host to log (debugDrop messages): only once
+// grab-gui says 'debugDrops' (GRAB_DEBUG_DROPS=1); otherwise the window takes no drop at all. Every
+// drag over the page and every drop is kept from navigating the window.
+let debugDropsListening = false;
+let debugDropWaitMs = 5000; // how long the drop waits for each handle and text (the page tests shorten it)
+function debugDropsOn() {
+  if (debugDropsListening) return;
+  debugDropsListening = true;
+  const short = (s) => { const t = String(s ?? ''); return t.length > 80 ? `${t.slice(0, 80)}…` : t; };
+  const entryOf = (e) => (e ? { name: e.name, isFile: e.isFile, isDirectory: e.isDirectory, fullPath: e.fullPath } : null);
+  const fileOf = (f) => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified,
+    relativePath: f.webkitRelativePath || '' });
+  const handleOf = (h) => (h && h.error ? { error: h.error } : h ? { kind: h.kind, name: h.name } : null);
+  // One dragenter per drag into the window (it comes again for each element the pointer enters).
+  let inside = false;
+  document.addEventListener('dragenter', (ev) => {
+    ev.preventDefault();
+    if (inside) return;
+    inside = true;
+    const dt = ev.dataTransfer;
+    send({ type: 'debugDrop', phase: 'dragenter', types: dt ? Array.from(dt.types) : [],
+      items: dt ? Array.from(dt.items).map((i) => ({ kind: i.kind, type: i.type })) : [] });
+  });
+  document.addEventListener('dragleave', (ev) => {
+    if (ev.clientX <= 0 || ev.clientY <= 0 || ev.clientX >= innerWidth || ev.clientY >= innerHeight) inside = false;
+  });
+  document.addEventListener('dragover', (ev) => {
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+  });
+  // `msg` with `objects` beside it; if WebView2 refuses them, the report alone, saying why.
+  const report = (msg, objects, label) => {
+    try {
+      msg.objects = label;
+      postWithObjects(msg, objects);
+    } catch (e) {
+      msg.objects = 'none';
+      msg.postError = String(e);
+      send(msg);
+    }
+  };
+  // A promise's value, or { error } when it fails or hasn't settled in debugDropWaitMs (WebView2
+  // never settles a dropped folder's getAsFileSystemHandle()).
+  const settled = (p) => (p == null ? Promise.resolve(null) : Promise.race([
+    Promise.resolve(p).then((v) => v, (e) => ({ error: String(e) })),
+    new Promise((done) => { setTimeout(() => done({ error: `no answer in ${debugDropWaitMs} ms` }), debugDropWaitMs); }),
+  ]));
+  document.addEventListener('drop', (ev) => {
+    ev.preventDefault();
+    inside = false;
+    const dt = ev.dataTransfer;
+    if (!dt) return;
+    // All of it read now, during the event: the drop's data is gone once it returns. The promises
+    // (handles, strings) settle after.
+    const types = Array.from(dt.types);
+    const files = Array.from(dt.files);
+    const items = Array.from(dt.items).map((i) => {
+      let entry = null;
+      let handle = null;
+      try { entry = i.webkitGetAsEntry ? entryOf(i.webkitGetAsEntry()) : null; } catch (e) { entry = { error: String(e) }; }
+      try { handle = i.getAsFileSystemHandle ? i.getAsFileSystemHandle() : null; } catch (e) { handle = Promise.reject(e); }
+      const text = i.kind === 'string' ? new Promise((done) => i.getAsString((s) => done(short(s)))) : null;
+      return { kind: i.kind, type: i.type, entry, handle, text };
+    });
+    // The files at once (a dropped folder comes as a File too), so nothing that never settles can
+    // hold them back; then each item's handle and text, the handles beside them.
+    report({ type: 'debugDrop', phase: 'drop', types, files: files.map(fileOf),
+      items: items.map((i) => ({ kind: i.kind, type: i.type, entry: i.entry })) }, files, 'files');
+    (async () => {
+      const handles = await Promise.all(items.map((i) => settled(i.handle)));
+      const texts = await Promise.all(items.map((i) => settled(i.text)));
+      const real = handles.filter((h) => h && (h.kind === 'file' || h.kind === 'directory'));
+      report({ type: 'debugDrop', phase: 'handles',
+        items: items.map((i, n) => ({ kind: i.kind, type: i.type, handle: handleOf(handles[n]), text: texts[n] })) }, real, 'handles');
+    })();
   });
 }
 

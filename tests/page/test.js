@@ -1784,6 +1784,78 @@ try {
     check('update: no banner after', ub.hidden, true);
   }
 
+  // The uploads' drop spike (UPLOADS.md step 0.7): no drop is taken until grab-gui says
+  // 'debugDrops'; then dragging over the page and dropping never navigate it, one dragenter per
+  // drag is reported, and the drop with its File objects beside it.
+  {
+    const dragEvent = (type, dt) => new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true, clientX: 100, clientY: 100 });
+    const dt = new DataTransfer();
+    dt.items.add(new File(['abc'], 'a.txt', { type: 'text/plain' }));
+    dt.items.add('https://example.com/x', 'text/uri-list');
+    const before = dragEvent('drop', dt);
+    document.body.dispatchEvent(before);
+    check('drops: none taken before grab-gui asks', [before.defaultPrevented, debugDropsListening], [false, false]);
+    const posted = [];
+    const realPost = postWithObjects;
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = (m, o) => posted.push([m, o]);
+    sent.length = 0;
+    debugDropsOn();
+    debugDropsOn(); // a second 'debugDrops' (a reload's init): still one set of listeners
+    const enter = dragEvent('dragenter', dt);
+    document.body.dispatchEvent(enter);
+    $('#rows').dispatchEvent(dragEvent('dragenter', dt)); // an element inside: no second report
+    const over = dragEvent('dragover', dt);
+    $('#rows').dispatchEvent(over);
+    const drop = dragEvent('drop', dt);
+    $('#rows').dispatchEvent(drop);
+    const [msg, objects] = posted[0] || [{}, []];
+    check('drops: the drop reported at once, its File beside it',
+      [posted.length, msg.type, msg.phase, msg.objects, msg.files, objects.length, objects[0] instanceof File, objects[0] && objects[0].name],
+      [1, 'debugDrop', 'drop', 'files', [{ name: 'a.txt', size: 3, type: 'text/plain', lastModified: msg.files && msg.files[0].lastModified, relativePath: '' }],
+        1, true, 'a.txt']);
+    check('drops: each item kind and type', (msg.items || []).map((i) => [i.kind, i.type]), [['file', 'text/plain'], ['string', 'text/uri-list']]);
+    for (let i = 0; i < 50 && posted.length < 2; i++) await tick();
+    check('drops: one dragenter reported, with its kinds and types',
+      sent.map((m) => [m.type, m.phase, [...m.types].sort(), m.items]),
+      [['debugDrop', 'dragenter', ['Files', 'text/uri-list'], [{ kind: 'file', type: 'text/plain' }, { kind: 'string', type: 'text/uri-list' }]]]);
+    // (dropEffect stays "none" on a DataTransfer made by a page: only a real drag takes 'copy'.)
+    check('drops: the drag and the drop kept from navigating the window',
+      [enter.defaultPrevented, over.defaultPrevented, drop.defaultPrevented], [true, true, true]);
+    const [after] = posted[1] || [{}];
+    check('drops: then the handles and texts; the link as text',
+      [posted.length, after.phase, (after.items || []).map((i) => [i.kind, i.text])],
+      [2, 'handles', [['file', null], ['string', 'https://example.com/x']]]);
+    // A handle that never settles (WebView2's for a dropped folder): the files went all the same,
+    // and the handles' report comes once the wait is over, saying so.
+    const realHandle = DataTransferItem.prototype.getAsFileSystemHandle;
+    const realWait = debugDropWaitMs;
+    DataTransferItem.prototype.getAsFileSystemHandle = () => new Promise(() => {});
+    // eslint-disable-next-line no-global-assign
+    debugDropWaitMs = 30;
+    posted.length = 0;
+    document.body.dispatchEvent(dragEvent('drop', dt));
+    check('drops: a handle that never settles: the files at once', posted.map(([m, o]) => [m.phase, o.length]), [['drop', 1]]);
+    for (let i = 0; i < 500 && posted.length < 2; i++) await tick();
+    check('drops: ... and the handles after the wait',
+      posted.map(([m]) => [m.phase, (m.items || []).map((i) => i.handle && i.handle.error)]),
+      [['drop', [undefined, undefined]], ['handles', ['no answer in 30 ms', 'no answer in 30 ms']]]);
+    DataTransferItem.prototype.getAsFileSystemHandle = realHandle;
+    // eslint-disable-next-line no-global-assign
+    debugDropWaitMs = realWait;
+    // A WebView2 that refuses the objects: the reports go all the same, saying why.
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = () => { throw new Error('unsupported object'); };
+    sent.length = 0;
+    document.body.dispatchEvent(dragEvent('drop', dt));
+    for (let i = 0; i < 50 && sent.length < 2; i++) await tick();
+    check('drops: objects refused: the reports alone, with the error',
+      sent.map((m) => [m.phase, m.objects, m.postError]), [['drop', 'none', 'Error: unsupported object'], ['handles', 'none', 'Error: unsupported object']]);
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = realPost;
+    sent.length = 0;
+  }
+
   panel.style.width = '1250px';
   state.queue = [
     folder({ id: 11, name: 'season', phase: '', files: { total: 304, queued: 290, running: 4, paused: 0, done: 8, failed: 1, skipped: 1 }, bytes: 31457280, total: 104857600 }),

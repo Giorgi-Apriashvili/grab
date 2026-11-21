@@ -1,6 +1,7 @@
 #include "webview.hpp"
 
 #include "body_stream.hpp"
+#include "json.hpp"
 #include "resources.hpp"
 #include "ui_origin.hpp"
 #include "util.hpp"
@@ -9,7 +10,12 @@
 #include <shlwapi.h>
 #include <wrl/event.h>
 
+#include <chrono>
+#include <filesystem>
+#include <format>
+#include <fstream>
 #include <string_view>
+#include <system_error>
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
@@ -124,9 +130,10 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
         }
     }
 
-    // Nothing dragged in from outside: a dropped link would navigate the window.
+    // Nothing dragged in from outside: a dropped link would navigate the window. Only the drop
+    // spike takes drops, and its page stops them from navigating (debugDropsOn in app.js).
     ComPtr<ICoreWebView2Controller4> controller4;
-    if (SUCCEEDED(controller_.As(&controller4))) controller4->put_AllowExternalDrop(FALSE);
+    if (SUCCEEDED(controller_.As(&controller4))) controller4->put_AllowExternalDrop(options_.debug_drops ? TRUE : FALSE);
 
     EventRegistrationToken token{};
     // Only grab's own page talks to grab (ui_origin.hpp).
@@ -136,8 +143,10 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
                 CoString source;
                 if (FAILED(args->get_Source(&source.p)) || !ui_origin::is_page(source.view())) return S_OK;
                 CoString json;
-                if (SUCCEEDED(args->get_WebMessageAsJson(&json.p)) && on_message_) {
-                    on_message_(util::to_utf8(json.view()));
+                if (SUCCEEDED(args->get_WebMessageAsJson(&json.p))) {
+                    const std::string text = util::to_utf8(json.view());
+                    if (options_.debug_drops) note_drop(text, args);
+                    if (on_message_) on_message_(text);
                 }
                 return S_OK;
             })
@@ -268,6 +277,70 @@ void WebViewHost::complete(std::uint64_t id, const WebResource& r) {
         }
     }
     request.mapped().deferral->Complete();
+}
+
+void WebViewHost::note_drop(const std::string& json, ICoreWebView2WebMessageReceivedEventArgs* args) {
+    const auto msg = json::parse(json);
+    if (!msg || msg->kind != json::Value::Kind::object) return;
+    const std::string type = msg->string_of("type").value_or("");
+    if (type == "init") {
+        post_json(R"({"type":"debugDrops"})");
+        return;
+    }
+    if (type != "debugDrop") return;
+    std::string log = std::format("{:%F %T} UTC {}\n", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()), json);
+    ComPtr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
+    ComPtr<ICoreWebView2ObjectCollectionView> objects;
+    UINT32 count = 0;
+    if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))) && SUCCEEDED(args2->get_AdditionalObjects(&objects)) && objects) {
+        if (FAILED(objects->get_Count(&count))) count = 0;
+    }
+    int files = 0;
+    int handles = 0;
+    for (UINT32 i = 0; i < count; ++i) {
+        ComPtr<IUnknown> item;
+        ComPtr<ICoreWebView2File> file;
+        ComPtr<ICoreWebView2FileSystemHandle> handle;
+        if (FAILED(objects->GetValueAtIndex(i, &item)) || !item) {
+            log += std::format("  object {}: null\n", i);
+        } else if (SUCCEEDED(item.As(&file))) {
+            CoString path;
+            file->get_Path(&path.p);
+            log += std::format("  object {}: ICoreWebView2File path={}\n", i, util::to_utf8(path.view()));
+            ++files;
+        } else if (SUCCEEDED(item.As(&handle))) {
+            COREWEBVIEW2_FILE_SYSTEM_HANDLE_KIND kind = COREWEBVIEW2_FILE_SYSTEM_HANDLE_KIND_FILE;
+            COREWEBVIEW2_FILE_SYSTEM_HANDLE_PERMISSION permission = COREWEBVIEW2_FILE_SYSTEM_HANDLE_PERMISSION_READ_ONLY;
+            CoString path;
+            const bool kind_known = SUCCEEDED(handle->get_Kind(&kind));
+            const bool permission_known = SUCCEEDED(handle->get_Permission(&permission));
+            handle->get_Path(&path.p);
+            log += std::format("  object {}: ICoreWebView2FileSystemHandle kind={} permission={} path={}\n", i,
+                               !kind_known ? "?" : kind == COREWEBVIEW2_FILE_SYSTEM_HANDLE_KIND_DIRECTORY ? "directory" : "file",
+                               !permission_known                                                  ? "?"
+                               : permission == COREWEBVIEW2_FILE_SYSTEM_HANDLE_PERMISSION_READ_WRITE ? "read-write"
+                                                                                                    : "read-only",
+                               util::to_utf8(path.view()));
+            ++handles;
+        } else {
+            log += std::format("  object {}: neither ICoreWebView2File nor ICoreWebView2FileSystemHandle\n", i);
+        }
+    }
+    if (count == 0) log += "  no additional objects\n";
+    std::error_code ec;
+    const std::filesystem::path where = std::filesystem::temp_directory_path(ec) / "grab-drops.log";
+    bool written = false;
+    if (!ec) {
+        std::ofstream out(where, std::ios::binary | std::ios::app);
+        out << log;
+        written = static_cast<bool>(out);
+    }
+    json::Value banner = json::Value::make_object();
+    banner.set("type", json::Value::make_string("debugDropLogged"));
+    banner.set("text", json::Value::make_string(std::format(
+                           "Drop spike: {} with {} File object(s) and {} handle(s) of {} {}", msg->string_of("phase").value_or("?"),
+                           files, handles, count, written ? "logged to " + util::path_to_utf8(where) : "NOT logged (no temp folder)")));
+    post_json(json::stringify(banner));
 }
 
 void WebViewHost::resize(const RECT& bounds) {

@@ -8,8 +8,9 @@ MiB/s box (typing sets nothing; Enter or leaving it sets, confirmed by the backe
 pending look, the badge), Waiting files, opening finished files (double-click, Open, Ctrl+Enter,
 the question before a program runs), resizing Browse and Downloads (the grip on the panel's top
 edge and the head's free space: drags, clicks, keys, double-clicks, limits, nothing in the head
-moving), and timing budgets for 10,000 and 177,191 files. It stubs what the host would send and
-records what the page sends back.
+moving), the uploads' drop spike (no drop taken until grab-gui asks; then drags and drops never
+navigate the page, and each drop is reported with its File objects), and timing budgets for 10,000
+and 177,191 files. It stubs what the host would send and records what the page sends back.
 
 `run_page_test.ps1` copies the page into a scratch folder with `test.js` loaded after `app.js`
 (and the Content-Security-Policy meta removed: its `script-src 'self'` does not cover a `file://`
