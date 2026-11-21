@@ -184,11 +184,12 @@ void refresh_tray_tip() {
 }
 
 // UI thread: a download finished or failed.
-void on_download_finished(HWND hwnd, const std::string& name, bool ok, const std::string& error) {
+void on_download_finished(HWND hwnd, const std::string& name, bool ok, const std::string& error, bool up) {
     const bool in_front = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
     if (!in_front) {
         const std::wstring wname = util::to_wide(name);
-        notify(ok ? L"Downloaded" : L"Download failed", ok ? wname : wname + L"\n" + util::to_wide(error), !ok);
+        const wchar_t* title = up ? (ok ? L"Uploaded" : L"Upload failed") : (ok ? L"Downloaded" : L"Download failed");
+        notify(title, ok ? wname : wname + L"\n" + util::to_wide(error), !ok);
     }
     refresh_tray_tip();
     if (g.in_tray && g.app && !g.app->downloads_active()) {
@@ -533,9 +534,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
         auto* payload = new std::function<void()>(std::move(fn));
         post_to_ui(wm_run, payload, [payload] { delete payload; });
     };
-    host.on_finished = [defer = host.defer](const std::string& name, bool ok, const std::string& error) {
-        defer([name, ok, error] {
-            if (g.hwnd != nullptr) on_download_finished(g.hwnd, name, ok, error);
+    host.on_finished = [defer = host.defer](const std::string& name, bool ok, const std::string& error, bool up) {
+        defer([name, ok, error, up] {
+            if (g.hwnd != nullptr) on_download_finished(g.hwnd, name, ok, error, up);
         });
     };
     // Posted: App's teardown must not run inside the App call that asked for it (review G138).

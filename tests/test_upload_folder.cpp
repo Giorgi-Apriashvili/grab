@@ -3,6 +3,7 @@
 // Folder uploads (upload_folder.hpp; UPLOADS.md 5.3, 5.6, 5.8) on an in-memory server every login
 // writes (fake_pool.hpp), and the walk of the local folder they start from (local_walk.hpp).
 
+#include "conn_budget.hpp"
 #include "engine.hpp"
 #include "fake_md5sum.hpp"
 #include "fake_pool.hpp"
@@ -677,6 +678,69 @@ TEST_CASE("folder uploads: cancel removes the temps and the empty folders this u
     }
 }
 
+TEST_CASE("folder uploads: a cancel's leftovers, cleaned later, go as a cancel's own would; out of reach they stay") {
+    Dir d("leftovers");
+    const fs::path src = d.path / "src";
+    for (int i = 0; i < 30; ++i) {
+        put_local(src, std::format("d{}/f{:02}.bin", i % 3, i), content_of(std::size_t{30} * 1024, static_cast<std::size_t>(i)));
+    }
+    put_local(src, "later/x.txt", "never sent");
+    put_local(src, "big.bin", content_of(std::size_t{6} << 20, 4));
+    Server server;
+    server.fake.latency = std::chrono::milliseconds(2);
+    Up up(server, src);
+    up.walk();
+    {
+        std::lock_guard lock(up.m);
+        CHECK(folder::pause_file(up.tree, up.index("later/x.txt")));
+    }
+    std::stop_source stop;
+    std::atomic<std::uint64_t> acked{0};
+    up.job.on_sent = [&](std::uint64_t n) {
+        acked += n;
+        if (acked >= std::uint64_t{400} * 1024) stop.request_stop();
+    };
+    up.run(stop.get_token());
+    REQUIRE_FALSE(server.temps().empty());
+    // The window's cancel: what is there, without asking the server (no pool), for the cleaner.
+    upload::FolderJob offline = up.job;
+    offline.pool.reset();
+    const auto plan = upload::discard(offline, up.tree, up.m);
+    CHECK(plan.temps.size() == up.tree.temps.size());
+    CHECK(std::ranges::find(plan.partials, "/up/src/big.bin") != plan.partials.end());
+    CHECK(std::ranges::find(plan.folders, "/up/src/later") != plan.folders.end());
+    CHECK(std::ranges::find(plan.folders, "/up/src") != plan.folders.end());
+
+    // Out of reach: everything stays for the next try.
+    {
+        test::FakePool down;
+        down.login_fails = budget::Failure::fatal;
+        auto pool = down.pool(2);
+        const auto still = upload::clean(*pool, up.records, "Fake", plan);
+        CHECK(still.temps == plan.temps);
+        // A big file that began has a record, which only the server's side can undo.
+        const bool recorded = upload::saved_progress(up.records, "Fake", "/up/src/big.bin").has_value();
+        CHECK(still.partials == (recorded ? std::vector<std::string>{"/up/src/big.bin"} : std::vector<std::string>{}));
+        CHECK(std::set<std::string>(still.folders.begin(), still.folders.end()) ==
+              std::set<std::string>(plan.folders.begin(), plan.folders.end()));
+    }
+    // Someone else's file in a folder the upload made: that folder stays, and is done with.
+    server.put("/up/src/d0/theirs.txt", "theirs");
+    auto pool = server.fake.pool(2);
+    const auto still = upload::clean(*pool, up.records, "Fake", plan);
+    CHECK(still.empty());
+    CHECK(server.temps().empty());
+    CHECK_FALSE(upload::saved_progress(up.records, "Fake", "/up/src/big.bin"));
+    CHECK_FALSE(server.is_dir("/up/src/later"));
+    CHECK(server.is_dir("/up/src/d0"));
+    CHECK(server.file("/up/src/d0/theirs.txt") == "theirs");
+    for (const auto& f : up.tree.files) {
+        if (f.status == folder::State::done) CHECK(server.file("/up/src/" + f.path).has_value()); // sent files stay
+    }
+    // Again: nothing left to do, nothing asked to fail.
+    CHECK(upload::clean(*pool, up.records, "Fake", plan).empty());
+}
+
 TEST_CASE("folder uploads: paused and skipped files stay, a higher priority starts first, At once holds, a retry sends") {
     Dir d("actions");
     const fs::path src = d.path / "src";
@@ -926,6 +990,52 @@ TEST_CASE("folder uploads: a copy verify found different goes again over grab's 
     CHECK(server.file("/up/src/x.txt") == "theirs"); // the file the user kept
     CHECK(server.file("/up/src/x (2).txt") == "mine");
     CHECK_FALSE(server.file("/up/src/x (3).txt"));
+    CHECK(up.tree.resend.empty());
+    CHECK(server.temps().empty());
+}
+
+TEST_CASE("folder uploads: restored after a restart, a file whose server copy differed replaces it under Skip") {
+    Dir d("resend-restored");
+    const fs::path src = d.path / "src";
+    put_local(src, "a.txt", "alpha");
+    put_local(src, "b.txt", "bravo");
+    Server server;
+    {
+        Up first(server, src);
+        first.walk();
+        first.run();
+        REQUIRE(first.file("b.txt").status == folder::State::done);
+    }
+    // grab's copy damaged since: verify had failed it (the server's copy differs).
+    {
+        std::scoped_lock lock(server.fake.store.mutex);
+        server.fake.store.files["/up/src/b.txt"] = "brAvo";
+    }
+    // As the window restores it from uploads.json (App::restored_upload): its files with their
+    // states, the flag for b.txt, the server not looked at yet, the upload's choice Skip.
+    Up up(server, src);
+    up.job.existing = upload::Existing::skip;
+    up.walk();
+    const std::size_t b = up.index("b.txt");
+    {
+        std::lock_guard lock(up.m);
+        up.tree.files[up.index("a.txt")].status = folder::State::done;
+        up.tree.files[b].status = folder::State::failed;
+        up.tree.files[b].error = "the server's copy differs (MD5)";
+        up.tree.resend.insert(b);
+        up.tree.looked = false;
+        // Resume: the failed files queued again (App::run_upload_folder), then look and apply.
+        folder::retry_files(up.tree, false);
+    }
+    auto seen = upload::look(up.job, up.tree, up.m, {});
+    REQUIRE_MESSAGE(seen, seen.error_or(""));
+    {
+        std::lock_guard lock(up.m);
+        upload::apply(up.job, up.tree);
+    }
+    up.run();
+    CHECK_MESSAGE(up.file("b.txt").status == folder::State::done, up.file("b.txt").error);
+    CHECK(server.file("/up/src/b.txt") == "bravo"); // replaced, not "skipped: already there"
     CHECK(up.tree.resend.empty());
     CHECK(server.temps().empty());
 }

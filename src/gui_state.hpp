@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace grab {
@@ -140,6 +141,9 @@ struct SavedFile {
     // Its priority in the folder: "high" | "normal" | "low", written only when not normal (since
     // 0.22; grab 0.21 reads only the keys it knows, so its files are all normal there).
     std::string priority = "normal";
+    // An upload's file whose server copy verify found different: its retry replaces that copy,
+    // grab's own (upload::Tree::resend). Written only when set; downloads never set it.
+    bool resend = false;
     bool operator==(const SavedFile&) const = default;
 };
 
@@ -177,6 +181,73 @@ bool move_before(std::vector<int>& ids, int id, int before);
 [[nodiscard]] std::expected<std::optional<std::vector<SavedDownload>>, std::string>
 read_queue(const std::filesystem::path& p);
 [[nodiscard]] std::string queue_to_json(const std::vector<SavedDownload>& items);
+
+// An unfinished upload (UPLOADS.md 5.9), kept in state_dir's uploads.json beside queue.json. Its
+// own file: queue.json is a bare array that an older grab reads as downloads, so an upload saved
+// there would come back as a download of its server path.
+struct SavedUpload {
+    std::size_t pos = 0;       // its place among the downloads and uploads saved, in the queue's order
+    std::string server;
+    std::string kind = "file"; // "file" | "folder"
+    std::string source;        // the local file or folder, UTF-8
+    std::string into;          // the server folder it goes into, grab's form ("" the login folder)
+    std::string path;          // where it goes there: the file or folder, grab's form
+    std::string name;
+    std::uint64_t total = 0;
+    std::string priority = "normal";
+    std::string existing = {}; // a file already there: upload_existing.hpp's names, "" ask
+    bool resume = false;       // as SavedDownload::resume
+    std::optional<bool> expanded = {};
+    std::vector<SavedFile> files;     // a folder's files, once walked (SavedFile::local: a Keep-both name)
+    std::vector<std::string> folders; // a folder's own folders below it, as walked (empty ones too)
+    std::vector<std::string> made;    // the server folders it made, below it ("" itself): a cancel removes them
+    std::vector<std::string> temps;   // its temp files left on the server: its next run removes them
+    // A file whose server copy verify found different: its retry replaces that copy (Item::resend).
+    bool resend = false;
+    bool operator==(const SavedUpload&) const = default;
+};
+
+// A server folder an upload changed (the window's Browse lists it live while its listings are
+// older): when the last upload there ended, and whether the folders below it changed too.
+struct SavedChanged {
+    std::string server;
+    std::string path; // grab's form
+    bool below = false;
+    std::int64_t ended = 0; // Unix seconds
+    bool operator==(const SavedChanged&) const = default;
+};
+
+// What uploads left on the server to undo (UPLOADS.md 5.3), tried again at the next start: a temp
+// file of grab's, a big file's partial upload (by its record), a folder an upload made (removed
+// only once empty).
+struct SavedLeftover {
+    std::string server;
+    std::string kind; // "temp" | "partial" | "folder"
+    std::string path; // on the server, grab's form
+    bool operator==(const SavedLeftover&) const = default;
+};
+
+// uploads.json: {"version": 1, "uploads": [...], "leftovers": [...], "changed": [...]} ("changed"
+// only when there are some).
+struct SavedUploads {
+    std::vector<SavedUpload> uploads;
+    std::vector<SavedLeftover> leftovers;
+    std::vector<SavedChanged> changed;
+    bool operator==(const SavedUploads&) const = default;
+};
+inline constexpr int uploads_version = 1;
+// Bad entries skipped, as parse_queue.
+[[nodiscard]] SavedUploads parse_uploads(std::string_view json_text);
+// uploads.json as saved: nullopt when there is none; an error when it exists but can't be read,
+// isn't a JSON object, or is of a newer version, so that it is never replaced unseen.
+[[nodiscard]] std::expected<std::optional<SavedUploads>, std::string> read_uploads(const std::filesystem::path& p);
+[[nodiscard]] std::string uploads_to_json(const SavedUploads& u);
+// The saved downloads (queue.json's order) and uploads (at their SavedUpload::pos) in one order:
+// each entry {upload?, its index in its own list}. An upload whose place is past the others goes
+// after them; downloads fill the places between, in their order (an older grab may have changed
+// queue.json since).
+[[nodiscard]] std::vector<std::pair<bool, std::size_t>> combined_order(std::size_t downloads,
+                                                                       const std::vector<SavedUpload>& uploads);
 
 // Unknown or malformed content yields defaults for the affected fields, never an error: a
 // broken state file must not keep the GUI from starting.

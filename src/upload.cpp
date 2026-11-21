@@ -1496,15 +1496,21 @@ std::expected<void, std::string> discard(ssh::Pool& pool, const fs::path& record
     const fs::path file = record_path(records_dir, server, remote_path);
     std::error_code ec;
     if (!fs::exists(fs::symlink_status(file, ec))) return {};
+    // The connection first, then the record's lock: waiting for a connection while holding the
+    // lock would fail a Retry of that upload meanwhile ("being uploaded already", review chunk 3).
+    std::optional<ssh::Pool::Lease> lease;
+    try {
+        lease = pool.acquire(stop, ssh::interactive_retry);
+    } catch (const ssh::Error& e) {
+        return util::fail(e.what());
+    }
+    if (!lease) return util::fail("stopped");
     auto lock = util::lock_file(lock_path(file), std::chrono::milliseconds(0));
-    if (!lock) return util::failf("{}:{} is still being uploaded", server, remote_path);
+    if (!lock) return util::failf("{}:{} is still being uploaded", server, remote_path); // the lease goes back unbroken
     const auto r = read_record(file, server, remote_path);
     if (r) {
         const std::string raw = in_folder(rclone_enc::raw_path(split_remote(remote_path).first), rclone_enc::raw_path(r->temp));
-        std::optional<ssh::Pool::Lease> lease;
         try {
-            lease = pool.acquire(stop, ssh::interactive_retry);
-            if (!lease) return util::fail("stopped");
             if (auto removed = sftp::remove((*lease)->sftp(), raw); !removed && removed.error().code != sftp::Code::no_such_file) {
                 return util::failf("cannot remove the partial upload {} on {}: {}", rclone_enc::from_raw_path(raw), server,
                                    sftp::describe(removed.error()));

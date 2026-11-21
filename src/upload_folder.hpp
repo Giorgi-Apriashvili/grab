@@ -36,6 +36,7 @@
 #include <set>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace grab::ssh {
@@ -164,6 +165,15 @@ struct Leftovers {
 // anything in it stays). Files sent stay, and so do the temps in Tree::kept (Leftovers::kept).
 // What can't be reached or removed is returned.
 [[nodiscard]] Leftovers discard(const FolderJob& job, Tree& tree, std::mutex& m, std::stop_token stop = {});
+
+// What a cancel left to undo on `server`, tried again (the window's leftovers, at its start and
+// after each cancel): the big files' partial uploads by their records (upload::discard), the temps
+// (upload::remove_temp), then the folders, deepest first, each removed only when it is empty (one
+// that isn't holds files that were sent, or someone else's: it stays, and is done with). Returns
+// what is still to be undone: what the server couldn't be reached for, or refused. `kept` is
+// never touched, and comes back as it was.
+[[nodiscard]] Leftovers clean(ssh::Pool& pool, const std::filesystem::path& records_dir, std::string_view server,
+                              Leftovers left, std::stop_token stop = {});
 
 // Where a file of the folder goes on the server (grab's form): its path, or its Keep-both name.
 [[nodiscard]] std::string target_of(const FolderJob& job, const folder::File& f);

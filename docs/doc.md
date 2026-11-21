@@ -418,10 +418,44 @@ them.
     folders, never from the current folder or grab's own, so a `curl.exe` that lands in the
     folder you run `grab` from is never started. A full path in grab.conf is used as given.
 
+- **Upload** (a side feature: grab is still for downloading): files and folders from this PC go
+  into a folder of a server.
+  - **Right-click a folder** in Browse for **Upload files here…** or **Upload folder here…**
+    (Windows' file dialog; pick one or several). Into the folder that is open: right-click the
+    list's empty part, or a file row (**Upload files to** *folder*…), or press Shift+F10 in an
+    empty folder. Uploads go into one folder of one server: on search
+    results, on All servers' list of servers and on the list of a server's search roots the
+    entries say why not (open the folder first).
+  - **A dialog asks first** and checks before anything is sent: what goes ("holiday — 1,204
+    files, 3.2 GiB"; links and junctions inside a folder are left out and counted, never
+    followed; names over 255 bytes, which no Linux server takes, are said), where ("To
+    Main:/srv/tv", merged into a folder of the same name there or a new folder), and whether
+    you can write there: "✓ You can write here · 120 GiB free", or the server's refusal in plain
+    words with Upload disabled ("Box.Guest is read-only for this account: nothing can be
+    uploaded to software"). Too little free space says so, and the button becomes Upload
+    anyway. Files whose names are already there are counted ("37 already there: skipped (30
+    the same, 5 newer here, 2 older here)") and skipped: nothing on the server is replaced.
+  - **Each file goes to a temp name of grab's** (".name.0a1b2c.grabpart") beside its target and
+    takes its name only when complete, so no half-sent file ever has the real name. Folders
+    are made first; an existing one is merged into. A file of 2 MiB or more is sent in pieces
+    over several connections and resumes after a pause, a failure or a restart from what the
+    server acknowledged; smaller ones start over. The server's copy gets your file's time.
+  - **Cancel** removes the temps and the partial uploads it left, and the folders it made once
+    they are empty; files already sent stay. What can't be reached then (the server offline) is
+    remembered and removed at the next start. Your local files are only read, never changed.
+  - **Verify** (Settings → Downloads) covers uploads too: a copy on the server that differs
+    fails the upload, "the server's copy differs (MD5)", and Retry sends it again over that
+    copy, grab's own.
+  - Uploads and downloads share each server's connections (one budget for both, At once
+    counting both); Pause all and Cancel all cover uploads too. Once an upload ends, the folder
+    it went into is listed again from the server (Browse shows it at once when it is open).
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
-    Save to stays), Open folder location (search results), Copy path (the server path) and Copy
-    name. With several rows selected, they act on all of them.
+    Save to stays), Open folder location (search results), Upload files here… and Upload folder
+    here… (one folder; on other rows Upload files to *folder*… and Upload folder to *folder*…,
+    into the folder that is open), Copy path (the server path) and Copy name. With several rows
+    selected, they act on all of them. The list's empty part has the upload entries for the open
+    folder.
   - **On a download:** Open (a finished file download: the file in its app) or Open folder (a
     finished folder download: its folder in Explorer), Pause, Resume or Retry, Cancel, Priority,
     Set all files to High / Normal / Low (a listed folder: its unfinished files' own priority),
@@ -431,9 +465,16 @@ them.
     Priority (unfinished ones), Show in folder, Copy path (where it lands, under the name grab
     saved it as) and Copy error. With several selected, each entry acts on those it applies to,
     all at once (Show in folder shows the first); Open and Open folder are there for one row only.
+  - **On an upload** (↑): Pause, Resume or Retry, Cancel, Priority, the moves, Show on server
+    (Browse at the folder it goes into, the upload picked; also its Show button, Enter once it is
+    done, and a double-click), Show in Explorer (the file or folder it sends), Copy server path
+    and Copy error. Nothing opens or deletes a local file. A file of a folder upload has the same,
+    for that file.
   - Shift+F10 or the menu key opens the menu for the row under the cursor, or in Downloads for
     the selected rows (the cursor's row when none is selected).
-- **The Downloads table** has a row per download and fixed columns: Name (with where it goes),
+- **The Downloads table** has a row per download, and one per upload: "↑ holiday → Main:/srv/tv",
+  Uploading while it runs, its speed what the server acknowledged; the head adds "· 1 uploading"
+  while uploads run. Fixed columns: Name (with where it goes),
   Status, Progress, Size, Speed, ETA, Priority (on unfinished downloads and on the unfinished
   files of a folder) and two buttons. Numbers keep one format ("85.7
   MiB / 8.0 GiB", "12.3 MiB/s", "5:12", a whole percent) and every column keeps its width, so
@@ -540,9 +581,10 @@ them.
     that still holds its longest value (Name 160 pixels). A double-click on the line gives both
     columns their default widths.
   - The sort and the widths are kept in gui.json (`"downloads": {"sort": ..., "widths": ...}`).
-  - **Show** (All, Unfinished, Failed) in the Downloads bar picks what the table lists, for this
-    window: Unfinished leaves out what is done, skipped or cancelled, Failed shows failed
-    downloads and failed files with their folders. A row that no longer belongs dims and goes
+  - **Show** (All, Unfinished, Failed, Downloads, Uploads) in the Downloads bar picks what the
+    table lists, for this window: Unfinished leaves out what is done, skipped or cancelled, Failed
+    shows failed downloads and failed files with their folders, Downloads and Uploads one
+    direction. A row that no longer belongs dims and goes
     within a second, never while the pointer is over the table. **Go to running** scrolls to the
     next file downloading now (again: the one after it), opening a folded folder that runs.
   - In a narrow window ETA hides first, then Speed, then Priority (still in the menu and the

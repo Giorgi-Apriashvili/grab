@@ -1276,4 +1276,42 @@ Leftovers discard(const FolderJob& job, Tree& tree, std::mutex& m, std::stop_tok
     return left;
 }
 
+Leftovers clean(ssh::Pool& pool, const fs::path& records_dir, std::string_view server, Leftovers left,
+                std::stop_token stop) {
+    Leftovers still;
+    still.kept = std::move(left.kept);
+    for (auto& t : left.partials) {
+        if (stop.stop_requested() || records_dir.empty() || !upload::discard(pool, records_dir, server, t, stop)) {
+            still.partials.push_back(std::move(t));
+        }
+    }
+    for (auto& t : left.temps) {
+        if (stop.stop_requested() || !remove_temp(pool, t, stop)) still.temps.push_back(std::move(t));
+    }
+    if (left.folders.empty()) return still;
+    std::ranges::stable_sort(left.folders, std::greater<>{}, [](const std::string& p) { return std::ranges::count(p, '/'); });
+    std::optional<ssh::Pool::Lease> lease;
+    std::size_t at = 0;
+    try {
+        lease = pool.acquire(stop, ssh::interactive_retry);
+        if (lease) {
+            sftp::Client& c = (*lease)->sftp();
+            for (; at < left.folders.size() && !stop.stop_requested(); ++at) {
+                auto gone = sftp::rmdir(c, rclone_enc::raw_path(left.folders[at]));
+                // Not empty ("Failure"): files went into it, or someone else's; it stays, as it should.
+                if (!gone && gone.error().code != sftp::Code::no_such_file && gone.error().code != sftp::Code::failure) {
+                    still.folders.push_back(left.folders[at]);
+                }
+            }
+        }
+    } catch (const ssh::Error&) {
+        // Out of reach: the folders not asked about yet stay for the next try.
+        if (lease) lease->broken();
+    } catch (const sftp::Broken&) {
+        if (lease) lease->broken();
+    }
+    for (; at < left.folders.size(); ++at) still.folders.push_back(std::move(left.folders[at]));
+    return still;
+}
+
 } // namespace grab::upload

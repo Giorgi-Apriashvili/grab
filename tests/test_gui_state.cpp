@@ -4,10 +4,12 @@
 
 #include <doctest/doctest.h>
 
+#include <cstddef>
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace grab;
@@ -336,6 +338,128 @@ TEST_CASE("the download queue round-trips and skips incomplete entries") {
     REQUIRE(partial.size() == 1);
     CHECK(partial[0].name == "/x");
     CHECK(partial[0].mode == "file");
+}
+
+TEST_CASE("unfinished uploads and what they left on servers round-trip through uploads.json; queue.json never holds one") {
+    SavedFile done{.path = "sub/a.jpg", .size = 3, .modtime = "2026-11-21T10:00:00.123456789Z", .state = "done", .fetched = true,
+                   .verified = true, .local = "", .error = "", .priority = "normal", .resend = false};
+    SavedFile failed{.path = "b.jpg", .size = 4, .modtime = "", .state = "failed", .fetched = false, .verified = false,
+                     .local = "", .error = "Main doesn't let this account write in /srv/x", .priority = "high", .resend = false};
+    // Its server copy differed (verify): its retry replaces that copy, after a restart too (review, chunk 3).
+    SavedFile differs{.path = "c.jpg", .size = 5, .modtime = "", .state = "failed", .fetched = false, .verified = false,
+                      .local = "", .error = "the server's copy differs (MD5)", .priority = "normal", .resend = true};
+    SavedUploads u;
+    u.uploads.push_back(SavedUpload{.pos = 1,
+                                    .server = "Main",
+                                    .kind = "folder",
+                                    .source = "E:\\Pictures\\holiday \xE1\x83\x90",
+                                    .into = "/srv/tv",
+                                    .path = "/srv/tv/holiday \xE1\x83\x90",
+                                    .name = "holiday \xE1\x83\x90",
+                                    .total = 7,
+                                    .priority = "low",
+                                    .existing = "skip",
+                                    .resume = true,
+                                    .expanded = false,
+                                    .files = {done, failed, differs},
+                                    .folders = {"empty", "sub"},
+                                    .made = {"", "sub"},
+                                    .temps = {"/srv/tv/holiday \xE1\x83\x90/.b.jpg.0a1b2c.grabpart"},
+                                    .resend = false});
+    u.uploads.push_back(SavedUpload{.pos = 3,
+                                    .server = "Box",
+                                    .kind = "file",
+                                    .source = "C:\\x.mkv",
+                                    .into = "",
+                                    .path = "x.mkv",
+                                    .name = "x.mkv",
+                                    .total = 123456789012ULL,
+                                    .priority = "normal",
+                                    .existing = {},
+                                    .resume = false,
+                                    .expanded = {},
+                                    .files = {},
+                                    .folders = {},
+                                    .made = {},
+                                    .temps = {},
+                                    .resend = true});
+    u.leftovers = {SavedLeftover{.server = "Main", .kind = "temp", .path = "/srv/.a.0a1b2c.grabpart"},
+                   SavedLeftover{.server = "Main", .kind = "partial", .path = "/srv/big.bin"},
+                   SavedLeftover{.server = "Box", .kind = "folder", .path = "grab-up-x"}};
+    CHECK(uploads_to_json(u).find("changed") == std::string::npos); // none: no key
+    // The folders uploads changed, which Browse lists live after a restart (live check G, chunk 3).
+    u.changed = {SavedChanged{.server = "Main", .path = "/srv/tv", .below = false, .ended = 1'763'800'000},
+                 SavedChanged{.server = "Main", .path = "/srv/tv/holiday \xE1\x83\x90", .below = true, .ended = 1'763'800'001}};
+    const auto text = uploads_to_json(u);
+    CHECK(text.starts_with(R"({"version":1,"uploads":[)"));
+    CHECK(parse_uploads(text) == u);
+
+    // Bad entries are skipped; a leftover of another kind is never acted on.
+    const auto partial = parse_uploads(R"({"version":1,"uploads":[{"server":"A","source":"C:\\a","path":"/a"},{"server":"B"},7],)"
+                                       R"("leftovers":[{"server":"A","kind":"anything","path":"/x"},{"server":"A","kind":"temp"}]})");
+    REQUIRE(partial.uploads.size() == 1);
+    CHECK(partial.uploads[0].kind == "file");
+    CHECK(partial.uploads[0].name == "/a");
+    CHECK(partial.leftovers.empty());
+    CHECK(parse_uploads("[]") == SavedUploads{});
+
+    // On disk: none, damaged, another version's (never read as this one's, nor replaced unseen).
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-uploads-json";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "uploads.json";
+    const auto none = read_uploads(file);
+    CHECK((none.has_value() && !none->has_value()));
+    REQUIRE(util::write_file_atomic(file, text));
+    const auto back = read_uploads(file);
+    REQUIRE(back.has_value());
+    CHECK(back->value_or(SavedUploads{}) == u);
+    for (const char* bad : {R"({"version":1,"uploads":[{"server")", "[]", R"({"uploads":[]})", R"({"version":2,"uploads":[]})"}) {
+        CAPTURE(bad);
+        REQUIRE(util::write_file_atomic(file, bad));
+        CHECK_FALSE(read_uploads(file).has_value());
+    }
+    std::filesystem::remove_all(dir);
+
+    // queue.json stays what an older grab reads: downloads only, its keys as before.
+    const std::vector<SavedDownload> downloads{SavedDownload{.remote = "Main",
+                                                             .mode = "file",
+                                                             .path = "/a.mkv",
+                                                             .name = "a.mkv",
+                                                             .dest = "E:\\TV",
+                                                             .total = 5,
+                                                             .files = {},
+                                                             .priority = "normal",
+                                                             .resume = false,
+                                                             .space_ok = false,
+                                                             .existing = {},
+                                                             .local_name = {},
+                                                             .expanded = {}}};
+    CHECK(queue_to_json(downloads) ==
+          R"([{"remote":"Main","mode":"file","path":"/a.mkv","name":"a.mkv","dest":"E:\\TV","total":5,"priority":"normal"}])");
+}
+
+TEST_CASE("downloads and uploads come back in their order: uploads at their places, downloads between") {
+    const auto at = [](std::vector<std::size_t> pos) {
+        std::vector<SavedUpload> ups;
+        for (const auto p : pos) {
+            SavedUpload u;
+            u.pos = p;
+            ups.push_back(u);
+        }
+        return ups;
+    };
+    using Order = std::vector<std::pair<bool, std::size_t>>;
+    // D0 U0 D1 U1: as saved.
+    CHECK(combined_order(2, at({1, 3})) == Order{{false, 0}, {true, 0}, {false, 1}, {true, 1}});
+    // Saved out of order: by their places.
+    CHECK(combined_order(2, at({3, 1})) == Order{{false, 0}, {true, 1}, {false, 1}, {true, 0}});
+    // An older grab dropped downloads meanwhile: the uploads follow the ones left.
+    CHECK(combined_order(0, at({2, 5})) == Order{{true, 0}, {true, 1}});
+    CHECK(combined_order(1, at({0, 4})) == Order{{true, 0}, {false, 0}, {true, 1}});
+    // ... or added some: after the uploads.
+    CHECK(combined_order(3, at({0})) == Order{{true, 0}, {false, 0}, {false, 1}, {false, 2}});
+    CHECK(combined_order(2, {}) == Order{{false, 0}, {false, 1}});
 }
 
 TEST_CASE("saved settings and a saved queue that can't be read are told apart from none (G212, G213)") {

@@ -55,6 +55,7 @@ add_library(grab_core STATIC
     src/upload.cpp
     src/upload_existing.cpp
     src/upload_folder.cpp
+    src/upload_check.cpp
     src/local_walk.cpp
     src/folder_job.cpp
     src/file_list.cpp
@@ -90,6 +91,7 @@ add_library(grab_core STATIC
     src/guard.cpp
     src/notices.cpp
     src/queue_view.cpp
+    src/queue_row.cpp
     src/open_file.cpp
     src/speed.cpp)
 
@@ -201,6 +203,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
     add_executable(grab-gui WIN32
         src/gui/main_gui.cpp
         src/gui/app.cpp
+        src/gui/app_upload.cpp
         src/gui/tray.cpp
         src/gui/webview.cpp
         src/gui/play_server.cpp

@@ -3,7 +3,8 @@
 // column widths, keys and the treegrid ARIA, every file of a folder by subscription, the filter, Go
 // to running, the performance numbers, a file's priority in its folder, the status bar's total and
 // its graph, the MiB/s box and its confirmation, Waiting files, opening finished files, the split's
-// grip and the head's free space), run in headless Edge by run_page_test.ps1.
+// grip and the head's free space; uploads in the window, UPLOADS.md chunk 3), run in headless Edge
+// by run_page_test.ps1.
 const out = [];
 let failed = 0;
 function check(name, got, want) {
@@ -1853,6 +1854,323 @@ try {
       sent.map((m) => [m.phase, m.objects, m.postError]), [['drop', 'none', 'Error: unsupported object'], ['handles', 'none', 'Error: unsupported object']]);
     // eslint-disable-next-line no-global-assign
     postWithObjects = realPost;
+    sent.length = 0;
+  }
+
+  // ---- uploads in the window (UPLOADS.md 5.10, chunk 3) ------------------------------------------
+  // Upload rows in the same table: "↑ name → Server:/folder", Uploading, the Show filter's
+  // Downloads / Uploads, the head's "N uploading"; every row action on an upload row acts on the
+  // upload (the server side, its source), never on a downloaded file; Browse's upload entries and
+  // their refusals; the confirm dialog's states.
+  {
+    dlSort.key = '';
+    showDlOrder();
+    clearSel();
+    dl.cursor = '';
+    setDlShow('all');
+    const remotesWas = state.remotes;
+    const remoteWas = state.remote;
+    state.remotes = [{ name: 'Main', host: 'h', user: 'u' }, { name: 'Box', host: 'b', user: 'u' }];
+    state.remote = 'Main';
+    const upFile = (id, over) => file(id, { dir: 'up', path: `/srv/tv/u${id}.mkv`, name: `u${id}.mkv`, into: '/srv/tv',
+      source: `E:\\Videos\\u${id}.mkv`, dest: '', local: `E:\\Videos\\u${id}.mkv`, ...over });
+    const upFolder = (id, over) => folder({ id, dir: 'up', path: '/srv/tv/holiday', name: 'holiday', into: '/srv/tv',
+      source: 'E:\\Pictures\\holiday', dest: '', local: 'E:\\Pictures\\holiday', ...over });
+
+    // The rows.
+    const v = dlView(upFile(1, { status: 'running', speed: 1048576, connections: 2 }));
+    check('up: a running upload: Uploading, ↑ name → Server:/folder',
+      [v.word, v.text, v.dest, v.cls.split(' ').slice(0, 2), v.speed], ['Uploading', '↑ u1.mkv', '→ Main:/srv/tv', ['st-uploading', 'up'], '1.0 MiB/s']);
+    check('up: its name tip: from where, to where', v.nameTip, 'E:\\Videos\\u1.mkv\n→ Main:/srv/tv/u1.mkv');
+    check('up: a folder', [dlView(upFolder(2)).text, dlView(upFolder(2)).word], ['↑ holiday/', 'Uploading']);
+    check('up: into the login folder', dlView(upFile(3, { into: '', path: 'u3.mkv' })).dest, '→ Main:~');
+    check('up: queued and paused say so', [dlView(upFile(4, { position: 2 })).word, dlView(upFile(4, { status: 'paused' })).word], ['Queued #2', 'Paused']);
+    check('up: a folder upload listing its folder, looking at the server', [dlView(upFolder(2, { phase: 'listing' })).statusTip,
+      dlView(upFolder(2, { phase: 'checking' })).statusTip.split('\n')[0]], [dlView(upFolder(2, { phase: 'listing' })).statusTip, 'Looking at the folder on the server: the files already there']);
+    check('up: slots: Pause and Cancel the upload', dlSlots(upFile(1, { status: 'running' })).map((s) => s && (s[2] || s[1])), ['Pause', 'Cancel the upload']);
+    check('up: slots once done: Show on server', dlSlots(upFile(1, { status: 'done' })).map((s) => s && [s[0], s[2]]), [['show', 'Show on server'], null]);
+    check('up: slots after a failure with bytes: Resume from what was sent', dlSlots(upFile(1, { status: 'failed', bytes: 5 }))[0][2], 'Resume from what was sent');
+    check('up: a file of an upload folder: Uploading, Show on server once done',
+      [fileStatus(upFolder(2), { status: 'running' }).word, fileSlots({ status: 'done' }, fileStatus(upFolder(2), { status: 'done' }), true)[0][2]],
+      ['Uploading', 'Show on server']);
+
+    // The filter and the head.
+    state.queue = [file(10, { status: 'running', total: 100, bytes: 5 }), upFile(11, { status: 'running', total: 100, bytes: 5 }),
+      upFile(12, { status: 'queued', position: 1 }), upFolder(13, { status: 'done', gen: 4, expanded: true,
+        files: { total: 2, queued: 0, running: 0, paused: 0, done: 2, failed: 0, skipped: 0 } }),
+      upFile(14, { status: 'paused', bytes: 7, total: 100 }), upFile(15, { status: 'failed', error: 'Main doesn’t let this account write in /srv/tv' })];
+    sent.length = 0;
+    renderQueue();
+    onFiles({ type: 'files', id: 13, gen: 4, from: 0, total: 2, rows: [
+      kidRow({ path: 'S01/a.jpg', size: 3, status: 'done', bytes: 3 }), kidRow({ path: 'b.jpg', size: 4, status: 'done', bytes: 4 })] });
+    check('up: the head counts running uploads apart', $('#dl-summary').textContent, '1 running · 1 queued · 1 paused · 1 uploading');
+    check('up: the status bar: downloads\' total, uploads counted', $('#total-speed').textContent, `↓ ${fmtSpeed(state.totalSpeed)} total · 1 running · 1 uploading`);
+    const shows = (show) => {
+      setDlShow(show);
+      return state.queue.filter(dlMatches).map((q) => q.id);
+    };
+    check('up: Show: Downloads, Uploads', [shows('downloads'), shows('uploads'), shows('all')], [[10], [11, 12, 13, 14, 15], [10, 11, 12, 13, 14, 15]]);
+    check('up: Show has Downloads and Uploads', [...$('#dl-show').options].map((o) => o.value), ['all', 'unfinished', 'failed', 'downloads', 'uploads']);
+    setDlShow('uploads');
+    check('up: a folder upload\'s files show under Uploads', fileMatches(dl.stores.get(13), 0), true);
+    setDlShow('all');
+
+    // Every row action on an upload row.
+    const labels = (qs) => downloadsMenu(qs).filter((m) => m.label).map((m) => m.label);
+    const actOn = (qs, label) => {
+      sent.length = 0;
+      downloadsMenu(qs).find((m) => m.label === label).act();
+      return sent.map((m) => JSON.stringify(m));
+    };
+    const q = (id) => dl.byId.get(id);
+    check('up: a running upload\'s menu', labels([q(11)]), ['Pause', 'Cancel', 'High', 'Normal', 'Low', 'Show on server', 'Show in Explorer', 'Copy server path']);
+    check('up: Pause', actOn([q(11)], 'Pause'), [JSON.stringify({ type: 'pauseItem', id: 11 })]);
+    check('up: Cancel (nothing sent yet: at once)', actOn([q(12)], 'Cancel'), [JSON.stringify({ type: 'cancelItem', id: 12 })]);
+    check('up: Resume', actOn([q(14)], 'Resume'), [JSON.stringify({ type: 'resumeItem', id: 14 })]);
+    check('up: Retry', actOn([q(15)], 'Retry'), [JSON.stringify({ type: 'retryItem', id: 15 })]);
+    check('up: High', actOn([q(11)], 'High'), [JSON.stringify({ type: 'setPriority', id: 11, priority: 'high' })]);
+    check('up: Show in Explorer: its source', actOn([q(11)], 'Show in Explorer'), [JSON.stringify({ type: 'openFolder', id: 11 })]);
+    check('up: Copy server path', actOn([q(11), q(12)], 'Copy 2 server paths'), [JSON.stringify({ type: 'copyText', text: '/srv/tv/u11.mkv\n/srv/tv/u12.mkv' })]);
+    check('up: Copy error', actOn([q(15)], 'Copy error'), [JSON.stringify({ type: 'copyText', text: 'Main doesn’t let this account write in /srv/tv' })]);
+    const browsed = () => sent.filter((m) => m.type === 'browse').map((m) => [m.remote, m.path, m.top, state.browse.pendingSelect]);
+    actOn([q(11)], 'Show on server');
+    check('up: Show on server: Browse at its folder, the upload picked', browsed(), [['Main', '/srv/tv', false, '/srv/tv/u11.mkv']]);
+    check('up: a waiting upload moves like a download', labels([q(12)]).filter((l) => l.startsWith('Move')).length, 4);
+    check('up: a finished upload: nothing opens, nothing local', labels([q(13)]), ['Show on server', 'Show in Explorer', 'Copy server path']);
+    check('up: Open is never an upload\'s', [dlOpenKind({ kind: 'dl', id: 13 }), dlOpenKind({ kind: 'file', id: 13, index: 0 }), dlOpen({ kind: 'dl', id: 13 })], ['', '', false]);
+    check('up: downloads and uploads together: each their own entries', labels([q(10), q(11)]),
+      ['Pause 2', 'Cancel 2', 'High', 'Normal', 'Low', 'Show in folder', 'Copy path', 'Show on server', 'Show in Explorer', 'Copy server path']);
+    // Cancel from the menu on several, with bytes sent: asks, saying what goes.
+    sent.length = 0;
+    downloadsMenu([q(11), q(14)]).find((m) => m.label === 'Cancel 2').act();
+    check('up: cancelling several uploads asks first', [$('#modal').hidden, $('#modal-title').textContent, $('#modal-cancel').textContent,
+      $('#modal-body').textContent.includes('removed from the server'), sent.length], [false, 'Cancel 2 uploads?', 'Keep uploading', true, 0]);
+    closeModal(true);
+    check('up: then both', sent.map((m) => `${m.type}:${m.id}`), ['cancelItem:11', 'cancelItem:14']);
+    // A file of a finished folder upload.
+    selectDl(rowOf('f13:0'));
+    const fl = dlMenu().filter((m) => m.label).map((m) => m.label);
+    check('up: a file of a folder upload: no Open, its server side', fl, ['Show on server', 'Show in Explorer', 'Copy server path']);
+    sent.length = 0;
+    dlMenu().find((m) => m.label === 'Show in Explorer').act();
+    check('up: its Show in Explorer: the local file, by its index', sent.map((m) => JSON.stringify(m)), [JSON.stringify({ type: 'showFile', id: 13, gen: 4, index: 0 })]);
+    sent.length = 0;
+    dlMenu().find((m) => m.label === 'Copy server path').act();
+    check('up: its server path', sent.map((m) => m.text), ['/srv/tv/holiday/S01/a.jpg']);
+    sent.length = 0;
+    dlMenu().find((m) => m.label === 'Show on server').act();
+    check('up: its Show on server: its folder there', browsed(), [['Main', '/srv/tv/holiday/S01', false, '/srv/tv/holiday/S01/a.jpg']]);
+    // The Show button, Enter and a double-click open Browse there; nothing opens a file.
+    const el = (key) => document.querySelector(`.dl-row[data-key="${CSS.escape(key)}"]`);
+    sent.length = 0;
+    el('d13').querySelector('[data-act="show"]').click();
+    check('up: the Show button', browsed(), [['Main', '/srv/tv', false, '/srv/tv/holiday']]);
+    const press = (target, detail) => {
+      const r = target.getBoundingClientRect();
+      const at = { bubbles: true, cancelable: true, button: 0, detail, clientX: r.x + 4, clientY: r.y + 4 };
+      target.dispatchEvent(new MouseEvent('mousedown', at));
+      target.dispatchEvent(new MouseEvent('mouseup', at));
+      target.dispatchEvent(new MouseEvent('click', at));
+    };
+    sent.length = 0;
+    press(el('d11').querySelector('.dl-text'), 1);
+    press(el('d11').querySelector('.dl-text'), 2);
+    check('up: a double-click on an upload: Browse there, nothing opened', [browsed(), sent.filter((m) => m.type === 'openFile').length],
+      [[['Main', '/srv/tv', false, '/srv/tv/u11.mkv']], 0]);
+    sent.length = 0;
+    press(el('f13:1').querySelector('.dl-text'), 1);
+    press(el('f13:1').querySelector('.dl-text'), 2);
+    check('up: a double-click on its file', browsed(), [['Main', '/srv/tv/holiday', false, '/srv/tv/holiday/b.jpg']]);
+    const grid = $('#queue');
+    const key = (k, mods = {}) => grid.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...mods }));
+    selectDl(rowOf('d13'));
+    setDlCursor(rowOf('d13'));
+    sent.length = 0;
+    key('Enter');
+    check('up: Enter on a finished upload: Browse there, not a folder here', [browsed().length, sent.filter((m) => m.type === 'openFolder').length], [1, 0]);
+    sent.length = 0;
+    key('Enter', { ctrlKey: true });
+    check('up: Ctrl+Enter opens nothing', sent.filter((m) => m.type === 'openFile' || m.type === 'openDir').length, 0);
+    // A server no longer configured: said, nothing browsed.
+    sent.length = 0;
+    showOnServer(upFile(20, { remote: 'Gone' }));
+    check('up: a server gone: said in the head', [browsed(), $('#dl-note').textContent], [[], 'Gone isn’t one of your servers any more.']);
+    // Cancel all names the uploads.
+    sent.length = 0;
+    cancelAll();
+    check('up: Cancel all asks about both', [$('#modal-title').textContent, $('#modal-cancel').textContent], ['Cancel all downloads and uploads?', 'Keep going']);
+    closeModal(false);
+
+    // Browse: Upload files here… / Upload folder here… on one folder row, and the folder's own on the
+    // list's empty part; refusals say why.
+    const b = state.browse;
+    const browseWas = { ...b };
+    Object.assign(b, { server: 'Main', path: '/srv', top: false, under: null, loading: false, error: '', uploadable: true, severalRoots: false,
+      crumbs: [{ name: 'srv', path: '/srv' }] });
+    state.hits = [{ name: 'tv', path: '/srv/tv', dir: true, remote: 'Main' }, { name: 'a.txt', path: '/srv/a.txt', remote: 'Main', size: 3 }];
+    const pick = (i) => {
+      state.selected = new Set([i]);
+      state.cursor = i;
+    };
+    const entries = () => resultMenu().filter((m) => m.label && m.label.startsWith('Upload')).map((m) => m.label);
+    pick(0);
+    check('up: a folder row offers both', entries(), ['Upload files here…', 'Upload folder here…']);
+    sent.length = 0;
+    resultMenu().find((m) => m.label === 'Upload files here…').act();
+    resultMenu().find((m) => m.label === 'Upload folder here…').act();
+    check('up: each asks for the file dialog, into that folder', sent.map((m) => [m.type, m.server, m.dir, m.folders, m.token > 0]),
+      [['uploadPick', 'Main', '/srv/tv', false, true], ['uploadPick', 'Main', '/srv/tv', true, true]]);
+    // A file row, or several rows: the open folder's own, named for it (a folder whose rows fill
+    // the list has no empty part to right-click).
+    pick(1);
+    check('up: a file row: the open folder\'s', entries(), ['Upload files to srv…', 'Upload folder to srv…']);
+    state.selected = new Set([0, 1]);
+    check('up: several rows: the open folder\'s', entries(), ['Upload files to srv…', 'Upload folder to srv…']);
+    pick(1);
+    sent.length = 0;
+    resultMenu().find((m) => m.label === 'Upload folder to srv…').act();
+    check('up: a file row\'s entry: into the open folder', sent.map((m) => [m.type, m.server, m.dir, m.folders]),
+      [['uploadPick', 'Main', '/srv', true]]);
+    upload.pending = null;
+    // Shift+F10 or the menu key with no row under the cursor (an empty folder): the open folder's menu.
+    const hitsWas = state.hits;
+    state.hits = [];
+    state.selected = new Set();
+    state.cursor = -1;
+    $('#results').dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true, cancelable: true }));
+    check('up: Shift+F10 in an empty folder opens its menu', [$('#menu').hidden,
+      [...$('#menu').querySelectorAll('button')].map((x) => x.textContent)], [false, ['Upload files here…', 'Upload folder here…']]);
+    closeMenu();
+    state.hits = hitsWas;
+    sent.length = 0;
+    const bg = () => folderMenu().map((m) => m.label);
+    check('up: the empty part: the open folder\'s', bg(), ['Upload files here…', 'Upload folder here…']);
+    folderMenu()[1].act();
+    check('up: into the open folder', sent.map((m) => [m.type, m.server, m.dir, m.folders]), [['uploadPick', 'Main', '/srv', true]]);
+    const refused = (over) => {
+      Object.assign(b, over);
+      sent.length = 0;
+      state.flash = null;
+      folderMenu()[0].act();
+      const said = state.flash ? state.flash.text : '';
+      Object.assign(b, { server: 'Main', path: '/srv', top: false, under: null, loading: false, error: '', uploadable: true, severalRoots: false });
+      return [sent.length, said];
+    };
+    check('up: All servers\' top refuses, saying why', refused({ server: '' }), [0, 'Open a folder of a server first: uploads go into one folder of one server.']);
+    check('up: the made-up top of several roots refuses', refused({ top: true, severalRoots: true, uploadable: false, path: '' }),
+      [0, 'This is the list of the server’s search roots, not a folder: open one of them first.']);
+    check('up: search results refuse', refused({ under: { path: '/srv', name: 'srv' } }),
+      [0, 'Search results aren’t a folder: close the search (Esc) to upload into the folder.']);
+    check('up: a folder still opening refuses', refused({ loading: true }), [0, 'srv is still opening.']);
+    // A folder row among search results: its entries say why.
+    b.under = { path: '/srv', name: 'srv' };
+    pick(0);
+    sent.length = 0;
+    state.flash = null;
+    resultMenu().find((m) => m.label === 'Upload files here…').act();
+    check('up: a folder found by a search refuses', [sent.length, state.flash && state.flash.text],
+      [0, 'Uploads go into a folder you have open, not into search results: open this folder first.']);
+    b.under = null;
+    // The backend's word on the folder shown.
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', path: '/srv', top: false, items: [], uploadable: true });
+    check('up: browseResult: uploadable', b.uploadable, true);
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', path: '', top: true, severalRoots: true, items: [], uploadable: false });
+    check('up: browseResult: the made-up top is not', b.uploadable, false);
+
+    // The confirm dialog: opens with the backend's first check, Upload once the server takes it.
+    const check0 = { type: 'uploadCheck', server: 'Main', dir: '/srv/tv', items: [], count: 0, errors: 0, files: 0, bytes: 0,
+      skippedLinks: 0, longNames: 0, unreadable: 0, writable: null, existing: { count: 0, same: 0, newer: 0, older: 0, differs: 0, folders: 0 },
+      setting: 'skip' };
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', true);
+    const token = sent[0].token;
+    const okBtn = $('#modal-ok');
+    const body = () => $('#modal-body').textContent;
+    onUploadCheck({ ...check0, token: token + 7, phase: 'local' });
+    check('up: another pick\'s check is ignored', $('#modal').hidden, true);
+    onUploadCheck({ ...check0, token, phase: 'local' });
+    check('up: the dialog opens with the first, Upload waits', [$('#modal').hidden, $('#modal-title').textContent, okBtn.disabled, okBtn.textContent],
+      [false, 'Upload to Main:/srv/tv', true, 'Upload']);
+    const items = [{ name: 'holiday', dir: true, files: 1204, bytes: 3435973837 }, { name: 'notes.txt', dir: false, files: 1, bytes: 2048 }];
+    onUploadCheck({ ...check0, token, phase: 'server', items, count: 2, files: 1205, bytes: 3435975885, skippedLinks: 2, longNames: 1 });
+    check('up: what goes, and the server being checked', [body().includes('holiday/1,204 files, 3.2 GiB'), body().includes('notes.txt2.0 KiB'),
+      body().includes('1,205 files, 3.2 GiB in all'), body().includes('2 links left out'), body().includes('1 name longer than a server takes'),
+      body().includes('Checking Main…'), okBtn.disabled], [true, true, true, true, true, true, true]);
+    onUploadCheck({ ...check0, token, phase: 'ready', items: [{ ...items[0], merging: true }, items[1]], count: 2, files: 1205, bytes: 3435975885,
+      writable: true, free: 128849018880, existing: { count: 37, same: 30, newer: 5, older: 2, differs: 0, folders: 0 } });
+    check('up: ready: you can write, the free space, the folder merged, the files there skipped',
+      [body().includes('✓ You can write here · 120.0 GiB free'), body().includes('merged into the folder “holiday” there'),
+        body().includes('37 already there: skipped (30 the same, 5 newer here, 2 older here)'), okBtn.disabled, okBtn.textContent, okBtn.classList.contains('danger')],
+      [true, true, true, false, 'Upload', false]);
+    sent.length = 0;
+    okBtn.click();
+    check('up: Upload starts it', [sent.map((m) => JSON.stringify(m)), $('#modal').hidden], [[JSON.stringify({ type: 'uploadStart', token })], true]);
+    onUploadCheck({ ...check0, token, phase: 'ready', writable: true });
+    check('up: a late message of a started upload opens nothing', $('#modal').hidden, true);
+    // Box.Guest: read-only, said plainly, Upload disabled; Esc cancels the check.
+    sent.length = 0;
+    pickUpload('Box.Guest', 'software', false);
+    const t2 = sent[0].token;
+    const why = 'Box.Guest is read-only for this account: nothing can be uploaded to software';
+    onUploadCheck({ ...check0, token: t2, server: 'Box.Guest', dir: 'software', phase: 'refused', items: [items[1]], count: 1, files: 1, bytes: 2048,
+      writable: false, why });
+    check('up: refused: the reason, Upload disabled', [$('#modal').hidden, body().includes(why), okBtn.disabled], [false, true, true]);
+    sent.length = 0;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    check('up: Esc cancels the check', [$('#modal').hidden, sent.map((m) => JSON.stringify(m))], [true, [JSON.stringify({ type: 'uploadCheckCancel', token: t2 })]]);
+    // Not reachable: said, Upload disabled.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', false);
+    const t3 = sent[0].token;
+    onUploadCheck({ ...check0, token: t3, phase: 'refused', items: [items[1]], count: 1, files: 1, bytes: 2048, writable: null,
+      why: 'Couldn\'t reach Main: connection refused' });
+    check('up: no login: the reason, Upload disabled', [body().includes('Couldn\'t reach Main: connection refused'), okBtn.disabled], [true, true]);
+    closeModal(false);
+    // Too little room: Upload anyway.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', false);
+    const t4 = sent[0].token;
+    onUploadCheck({ ...check0, token: t4, phase: 'ready', items: [items[1]], count: 1, files: 1, bytes: 2048, writable: true, free: 1024, short: true });
+    check('up: not enough space: Upload anyway', [body().includes('Not enough space: 1.0 KiB free, 2.0 KiB needed'), okBtn.disabled, okBtn.textContent,
+      okBtn.classList.contains('danger'), body().includes('Nothing of it is there yet.')], [true, false, 'Upload anyway', true, true]);
+    closeModal(false);
+    check('up: another dialog after it is as it was', (() => {
+      showModal({ title: 't', html: '', ok: 'OK' });
+      const r = [okBtn.disabled, okBtn.classList.contains('danger')];
+      closeModal(false);
+      return r;
+    })(), [false, false]);
+    // The file dialog closed: nothing opens.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', false);
+    const t5 = sent[0].token;
+    onUploadCheck({ type: 'uploadCheck', token: t5, phase: 'cancelled' });
+    onUploadCheck({ ...check0, token: t5, phase: 'local' });
+    check('up: the file dialog closed: no dialog', [$('#modal').hidden, upload.pending], [true, null]);
+    // Another question open: this one isn't asked over it.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', false);
+    const t6 = sent[0].token;
+    showModal({ title: 'other', html: '', ok: 'OK' });
+    sent.length = 0;
+    onUploadCheck({ ...check0, token: t6, phase: 'local' });
+    check('up: over another question: cancelled', [$('#modal-title').textContent, sent.map((m) => m.type)], ['other', ['uploadCheckCancel']]);
+    closeModal(false);
+    // Names are text.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', false);
+    const t7 = sent[0].token;
+    onUploadCheck({ ...check0, token: t7, phase: 'local', items: [{ name: '<img src=x>', dir: false, files: 1, bytes: 1 }], count: 1 });
+    check('up: a name is text', [$('#modal-body').querySelector('img'), body().includes('<img src=x>')], [null, true]);
+    closeModal(false);
+
+    Object.assign(b, browseWas);
+    state.hits = [];
+    state.selected = new Set();
+    state.remotes = remotesWas;
+    state.remote = remoteWas;
+    clearSel();
+    dl.cursor = '';
     sent.length = 0;
   }
 

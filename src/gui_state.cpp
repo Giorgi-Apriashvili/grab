@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <functional>
 #include <map>
 #include <optional>
@@ -16,6 +18,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace grab {
 
@@ -293,6 +296,51 @@ bool move_before(std::vector<int>& ids, int id, int before) {
 
 namespace {
 
+// A folder's saved file; nullopt without a path.
+std::optional<SavedFile> file_from(const json::Value& f) {
+    auto file_path = f.string_of("path");
+    if (!file_path || file_path->empty()) return std::nullopt;
+    SavedFile sf;
+    sf.path = *file_path;
+    if (const auto* s = f.find("size"); s != nullptr && s->kind == json::Value::Kind::number && s->number > 0) {
+        sf.size = static_cast<std::uint64_t>(s->number);
+    }
+    sf.modtime = f.string_of("modtime").value_or("");
+    const auto state = f.string_of("state").value_or("queued");
+    sf.state = state == "paused" || state == "done" || state == "skipped" || state == "failed" ? state : "queued";
+    for (auto [key, flag] : {std::pair{"fetched", &sf.fetched}, std::pair{"verified", &sf.verified}}) {
+        const auto* b = f.find(key);
+        *flag = b != nullptr && b->kind == json::Value::Kind::boolean && b->boolean;
+    }
+    sf.local = f.string_of("local").value_or("");
+    if (sf.state == "failed") sf.error = f.string_of("error").value_or("");
+    if (auto p = f.string_of("priority"); p == "high" || p == "low") sf.priority = *p;
+    if (const auto* r = f.find("resend"); r != nullptr && r->kind == json::Value::Kind::boolean) sf.resend = r->boolean;
+    return sf;
+}
+
+// A folder's files as text, after its other keys (queue_to_json): `item` is its JSON object without
+// them, closed by the '}' that is replaced.
+void append_files(std::string& item, const std::vector<SavedFile>& files) {
+    item.pop_back(); // its '}'
+    item += R"(,"files":[)";
+    bool first = true;
+    for (const auto& f : files) {
+        if (!first) item += ',';
+        first = false;
+        item += R"({"path":)" + json::quote(f.path) + R"(,"size":)" + std::to_string(f.size) +
+                R"(,"modtime":)" + json::quote(f.modtime) + R"(,"state":)" + json::quote(f.state);
+        if (f.fetched) item += R"(,"fetched":true)";
+        if (f.verified) item += R"(,"verified":true)";
+        if (!f.local.empty()) item += R"(,"local":)" + json::quote(f.local);
+        if (f.state == "failed" && !f.error.empty()) item += R"(,"error":)" + json::quote(f.error);
+        if (f.priority == "high" || f.priority == "low") item += R"(,"priority":)" + json::quote(f.priority);
+        if (f.resend) item += R"(,"resend":true)";
+        item += '}';
+    }
+    item += "]}";
+}
+
 std::vector<SavedDownload> queue_from(const json::Value* doc) {
     std::vector<SavedDownload> out;
     if (doc == nullptr || doc->kind != json::Value::Kind::array) return out;
@@ -318,24 +366,7 @@ std::vector<SavedDownload> queue_from(const json::Value* doc) {
         }
         if (const auto* files = v.find("files"); files != nullptr && files->kind == json::Value::Kind::array) {
             for (const auto& f : files->items) {
-                auto file_path = f.string_of("path");
-                if (!file_path || file_path->empty()) continue;
-                SavedFile sf;
-                sf.path = *file_path;
-                if (const auto* s = f.find("size"); s != nullptr && s->kind == json::Value::Kind::number && s->number > 0) {
-                    sf.size = static_cast<std::uint64_t>(s->number);
-                }
-                sf.modtime = f.string_of("modtime").value_or("");
-                const auto state = f.string_of("state").value_or("queued");
-                sf.state = state == "paused" || state == "done" || state == "skipped" || state == "failed" ? state : "queued";
-                for (auto [key, flag] : {std::pair{"fetched", &sf.fetched}, std::pair{"verified", &sf.verified}}) {
-                    const auto* b = f.find(key);
-                    *flag = b != nullptr && b->kind == json::Value::Kind::boolean && b->boolean;
-                }
-                sf.local = f.string_of("local").value_or("");
-                if (sf.state == "failed") sf.error = f.string_of("error").value_or("");
-                if (auto p = f.string_of("priority"); p == "high" || p == "low") sf.priority = *p;
-                d.files.push_back(std::move(sf));
+                if (auto sf = file_from(f)) d.files.push_back(std::move(*sf));
             }
         }
         out.push_back(std::move(d));
@@ -343,7 +374,179 @@ std::vector<SavedDownload> queue_from(const json::Value* doc) {
     return out;
 }
 
+// A list of strings saved under `key`; others in it are left out.
+std::vector<std::string> strings_of(const json::Value& v, std::string_view key) {
+    std::vector<std::string> out;
+    if (const auto* list = v.find(key); list != nullptr && list->kind == json::Value::Kind::array) {
+        for (const auto& s : list->items) {
+            if (s.kind == json::Value::Kind::string) out.push_back(s.str);
+        }
+    }
+    return out;
+}
+
+json::Value strings_value(const std::vector<std::string>& list) {
+    json::Value v = json::Value::make_array();
+    for (const auto& s : list) v.push(json::Value::make_string(s));
+    return v;
+}
+
+SavedUploads uploads_from(const json::Value& doc) {
+    SavedUploads out;
+    if (const auto* list = doc.find("uploads"); list != nullptr && list->kind == json::Value::Kind::array) {
+        for (const auto& v : list->items) {
+            SavedUpload u;
+            auto server = v.string_of("server");
+            auto source = v.string_of("source");
+            auto path = v.string_of("path");
+            if (!server || !source || !path || server->empty() || source->empty() || path->empty()) continue;
+            u.server = *server;
+            u.source = *source;
+            u.path = *path;
+            u.kind = v.string_of("kind") == "folder" ? "folder" : "file";
+            u.into = v.string_of("into").value_or("");
+            u.name = v.string_of("name").value_or(*path);
+            if (const auto* p = v.find("pos"); p != nullptr && p->kind == json::Value::Kind::number && p->number >= 0) {
+                u.pos = static_cast<std::size_t>(p->number);
+            }
+            if (const auto* t = v.find("total"); t != nullptr && t->kind == json::Value::Kind::number && t->number > 0) {
+                u.total = static_cast<std::uint64_t>(t->number);
+            }
+            if (auto p = v.string_of("priority"); p == "high" || p == "low") u.priority = *p;
+            u.existing = v.string_of("existing").value_or("");
+            if (const auto* r = v.find("resume"); r != nullptr && r->kind == json::Value::Kind::boolean) u.resume = r->boolean;
+            if (const auto* e = v.find("expanded"); e != nullptr && e->kind == json::Value::Kind::boolean) u.expanded = e->boolean;
+            if (const auto* files = v.find("files"); files != nullptr && files->kind == json::Value::Kind::array) {
+                for (const auto& f : files->items) {
+                    if (auto sf = file_from(f)) u.files.push_back(std::move(*sf));
+                }
+            }
+            u.folders = strings_of(v, "folders");
+            u.made = strings_of(v, "made");
+            u.temps = strings_of(v, "temps");
+            if (const auto* r = v.find("resend"); r != nullptr && r->kind == json::Value::Kind::boolean) u.resend = r->boolean;
+            out.uploads.push_back(std::move(u));
+        }
+    }
+    if (const auto* list = doc.find("leftovers"); list != nullptr && list->kind == json::Value::Kind::array) {
+        for (const auto& v : list->items) {
+            auto server = v.string_of("server");
+            auto kind = v.string_of("kind");
+            auto path = v.string_of("path");
+            if (!server || !path || server->empty() || path->empty()) continue;
+            if (kind != "temp" && kind != "partial" && kind != "folder") continue;
+            out.leftovers.push_back(SavedLeftover{.server = *server, .kind = *kind, .path = *path});
+        }
+    }
+    if (const auto* list = doc.find("changed"); list != nullptr && list->kind == json::Value::Kind::array) {
+        for (const auto& v : list->items) {
+            auto server = v.string_of("server");
+            auto path = v.string_of("path");
+            const auto* ended = v.find("ended");
+            if (!server || !path || server->empty() || ended == nullptr || ended->kind != json::Value::Kind::number) continue;
+            const auto* below = v.find("below");
+            out.changed.push_back(SavedChanged{.server = *server,
+                                               .path = *path,
+                                               .below = below != nullptr && below->kind == json::Value::Kind::boolean && below->boolean,
+                                               .ended = static_cast<std::int64_t>(ended->number)});
+        }
+    }
+    return out;
+}
+
 } // namespace
+
+SavedUploads parse_uploads(std::string_view json_text) {
+    const auto doc = json::parse(json_text);
+    if (!doc || doc->kind != json::Value::Kind::object) return {};
+    return uploads_from(*doc);
+}
+
+std::expected<std::optional<SavedUploads>, std::string> read_uploads(const std::filesystem::path& p) {
+    auto text = util::read_file_if_exists(p);
+    if (!text) return util::fail(text.error());
+    if (!*text) return std::nullopt;
+    const auto doc = json::parse(**text);
+    if (!doc) return util::fail(doc.error());
+    if (doc->kind != json::Value::Kind::object) return util::fail("not saved uploads");
+    // A newer grab's: never read as this one's, nor replaced by its save.
+    if (const auto* v = doc->find("version"); v == nullptr || v->kind != json::Value::Kind::number ||
+                                              v->number != uploads_version) {
+        return util::fail("saved by another version of grab");
+    }
+    return uploads_from(*doc);
+}
+
+std::string uploads_to_json(const SavedUploads& u) {
+    using json::Value;
+    std::string out = std::format(R"({{"version":{},"uploads":[)", uploads_version);
+    for (std::size_t k = 0; k < u.uploads.size(); ++k) {
+        const auto& s = u.uploads[k];
+        Value v = Value::make_object();
+        v.set("pos", Value::make_number(static_cast<double>(s.pos)));
+        v.set("server", Value::make_string(s.server));
+        v.set("kind", Value::make_string(s.kind));
+        v.set("source", Value::make_string(s.source));
+        v.set("into", Value::make_string(s.into));
+        v.set("path", Value::make_string(s.path));
+        v.set("name", Value::make_string(s.name));
+        v.set("total", Value::make_number(static_cast<double>(s.total)));
+        v.set("priority", Value::make_string(s.priority));
+        if (!s.existing.empty()) v.set("existing", Value::make_string(s.existing));
+        if (s.resume) v.set("resume", Value::make_bool(true));
+        if (s.expanded) v.set("expanded", Value::make_bool(*s.expanded));
+        if (!s.folders.empty()) v.set("folders", strings_value(s.folders));
+        if (!s.made.empty()) v.set("made", strings_value(s.made));
+        if (!s.temps.empty()) v.set("temps", strings_value(s.temps));
+        if (s.resend) v.set("resend", Value::make_bool(true));
+        if (k > 0) out += ',';
+        std::string item = json::stringify(v);
+        if (!s.files.empty()) append_files(item, s.files);
+        out += item;
+    }
+    out += R"(],"leftovers":[)";
+    for (std::size_t k = 0; k < u.leftovers.size(); ++k) {
+        const auto& l = u.leftovers[k];
+        Value v = Value::make_object();
+        v.set("server", Value::make_string(l.server));
+        v.set("kind", Value::make_string(l.kind));
+        v.set("path", Value::make_string(l.path));
+        if (k > 0) out += ',';
+        out += json::stringify(v);
+    }
+    out += ']';
+    if (!u.changed.empty()) {
+        out += R"(,"changed":[)";
+        for (std::size_t k = 0; k < u.changed.size(); ++k) {
+            const auto& c = u.changed[k];
+            Value v = Value::make_object();
+            v.set("server", Value::make_string(c.server));
+            v.set("path", Value::make_string(c.path));
+            if (c.below) v.set("below", Value::make_bool(true));
+            v.set("ended", Value::make_number(static_cast<double>(c.ended)));
+            if (k > 0) out += ',';
+            out += json::stringify(v);
+        }
+        out += ']';
+    }
+    out += '}';
+    return out;
+}
+
+std::vector<std::pair<bool, std::size_t>> combined_order(std::size_t downloads, const std::vector<SavedUpload>& uploads) {
+    std::vector<std::size_t> by_pos(uploads.size());
+    for (std::size_t k = 0; k < by_pos.size(); ++k) by_pos[k] = k;
+    std::ranges::stable_sort(by_pos, {}, [&](std::size_t k) { return uploads[k].pos; });
+    std::vector<std::pair<bool, std::size_t>> out;
+    out.reserve(downloads + uploads.size());
+    std::size_t next = 0; // the next download
+    for (const std::size_t k : by_pos) {
+        while (out.size() < uploads[k].pos && next < downloads) out.emplace_back(false, next++);
+        out.emplace_back(true, k);
+    }
+    while (next < downloads) out.emplace_back(false, next++);
+    return out;
+}
 
 std::vector<SavedDownload> parse_queue(std::string_view json_text) {
     const auto doc = json::parse(json_text);
@@ -385,24 +588,7 @@ std::string queue_to_json(const std::vector<SavedDownload>& items) {
     for (std::size_t k = 0; k < items.size(); ++k) {
         if (k > 0) out += ',';
         std::string item = json::stringify(list.items[k]);
-        if (!items[k].files.empty()) {
-            item.pop_back(); // its '}'
-            item += R"(,"files":[)";
-            bool first = true;
-            for (const auto& f : items[k].files) {
-                if (!first) item += ',';
-                first = false;
-                item += R"({"path":)" + json::quote(f.path) + R"(,"size":)" + std::to_string(f.size) +
-                        R"(,"modtime":)" + json::quote(f.modtime) + R"(,"state":)" + json::quote(f.state);
-                if (f.fetched) item += R"(,"fetched":true)";
-                if (f.verified) item += R"(,"verified":true)";
-                if (!f.local.empty()) item += R"(,"local":)" + json::quote(f.local);
-                if (f.state == "failed" && !f.error.empty()) item += R"(,"error":)" + json::quote(f.error);
-                if (f.priority == "high" || f.priority == "low") item += R"(,"priority":)" + json::quote(f.priority);
-                item += '}';
-            }
-            item += "]}";
-        }
+        if (!items[k].files.empty()) append_files(item, items[k].files);
         out += item;
     }
     out += ']';

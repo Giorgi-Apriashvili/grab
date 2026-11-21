@@ -11,6 +11,7 @@
 #include "open_file.hpp"
 #include "play_stream.hpp"
 #include "preview_jobs.hpp"
+#include "queue_row.hpp"
 #include "queue_view.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
@@ -20,6 +21,9 @@
 #include "ssh_pool.hpp"
 #include "ssh_read.hpp"
 #include "update.hpp"
+#include "upload_check.hpp"
+#include "upload_existing.hpp"
+#include "upload_folder.hpp"
 #include "verify.hpp"
 #include "webview.hpp"
 
@@ -55,9 +59,9 @@ public:
         HWND hwnd = nullptr;
         std::function<void(std::string)> post;             // any thread: JSON to the page
         std::function<void(std::function<void()>)> defer;  // any thread: run on the UI thread
-        // Worker thread: a download finished (ok) or failed (error says why); not called for
-        // cancelled ones.
-        std::function<void(const std::string& name, bool ok, const std::string& error)> on_finished;
+        // Worker thread: a download (or an upload: `up`) finished (ok) or failed (error says why);
+        // not called for cancelled ones.
+        std::function<void(const std::string& name, bool ok, const std::string& error, bool up)> on_finished;
         std::function<void()> quit; // UI thread: close the window and exit, even with downloads running
     };
 
@@ -237,13 +241,20 @@ private:
         existing::Local mine;
     };
 
+    // A download, or an upload (UPLOADS.md 5.10): both share the queue, its ids, its order and the
+    // server's connection budget. An upload's `remote` is its server, `path` where it goes there
+    // (grab's form), `source` the local file or folder it sends, `into` the server folder it goes
+    // into; `dest` and what a download keeps of its local copy are unused.
     struct Item {
         int id = 0;
+        queue_row::Direction direction = queue_row::Direction::down;
         std::string remote;
         Mode mode = Mode::file;
         std::string path;
         std::string name;
         std::filesystem::path dest;
+        std::filesystem::path source;
+        std::string into;
         Status status = Status::queued;
         std::uint64_t bytes = 0;
         std::uint64_t total = 0;
@@ -281,6 +292,11 @@ private:
         // A different file already at a target: what to do. Answered before queuing, or when a
         // folder was listed; ask = not answered (it then waits paused with the question).
         existing::Choice existing = existing::Choice::ask;
+        // An upload's file already on the server: what to do (chunk 3: Skip; the question is chunk
+        // 5's), and a file whose copy there verify found different: its retry replaces that copy,
+        // grab's own.
+        upload::Existing up_existing = upload::Existing::skip;
+        bool resend = false;
         std::filesystem::path local_name; // a file's Keep-both name, instead of the server's
         // A done file download: the server's copy it left (fetched, already there, or a copy an
         // earlier Keep both kept) and its size, which Open opens. Unset otherwise, and when Skip
@@ -289,7 +305,9 @@ private:
         // Waiting for that answer: some of the files concerned, and how many there are.
         std::vector<Asked> asked;
         std::size_t asked_count = 0;
-        folder::Tree tree; // folders: their files once listed (under mutex_)
+        // Folders: their files once listed (under mutex_); an upload's as walked, with what it adds
+        // (upload::Tree), which a download leaves empty.
+        upload::Tree tree;
         // A listed folder's file names, which the page's rows, queue.json and the actions by index
         // read without the lock, and their generation, which the page's "files" and actions carry:
         // new when the folder is listed or restored, or its files' local names change (Keep both).
@@ -408,8 +426,11 @@ private:
     void resolve_existing(int id, existing::Choice choice);
     // The question's files for the page: {count, files: [{name, size, modified, mineSize, mineModified}]}.
     [[nodiscard]] static json::Value asked_json(const std::vector<Asked>& asked, std::size_t count);
-    // Where a file download lands: its server name made safe, or its Keep-both name.
+    // Where a file download lands: its server name made safe, or its Keep-both name; an upload's
+    // source (queue_row::local_of).
     [[nodiscard]] static std::filesystem::path item_target(const Item& item);
+    [[nodiscard]] static queue_row::Row row_of(const Item& item);
+    [[nodiscard]] static bool is_up(const Item& item) { return item.direction == queue_row::Direction::up; }
     // Queue actions; `id` 0 means every item the action applies to.
     void pause_items(int id);
     void resume_items(int id);
@@ -457,6 +478,10 @@ private:
     // "downloadTo" for the menu's Download to....
     void pick_folder(std::wstring current, std::string purpose);
     void pick_file(std::wstring current);
+    // Windows' file dialog (UI thread): files, or folders, one or several (`multi`), starting in
+    // `start` when it is a folder; empty when cancelled.
+    [[nodiscard]] std::vector<std::filesystem::path> pick_paths(const std::wstring& title, bool folders, bool multi,
+                                                                const std::filesystem::path& start) const;
     void open_item_folder(int id);
     void copy_text(const std::string& text) const; // to the Windows clipboard, lines ending in CR LF
     void open_config() const;
@@ -513,7 +538,7 @@ private:
     // id; the row's "12 of 40" as files end.
     [[nodiscard]] verify::Request verify_request(const engine::Context& ctx, const std::shared_ptr<Item>& item,
                                                  const std::shared_ptr<ssh::Pool>& download_pool);
-    void discard_folder_partials(const Item& item) const; // cancelled folder: big files' .grabpart
+    void discard_folder_partials(const Item& item) const; // cancelled folder download: big files' .grabpart
     // grab.conf's rclone remote for `server` (else the name): partial downloads are told apart by
     // it, so another server's of the same path is left alone (review G20).
     [[nodiscard]] std::string rclone_remote_of(const std::string& server) const;
@@ -525,7 +550,7 @@ private:
     [[nodiscard]] int files_in_use(const Item* except = nullptr) const;
     // A failed or cancelled row queued again (Retry): a file goes on from its partial download
     // when one is left. Caller holds mutex_.
-    void requeue(Item& item) const;
+    void requeue(Item& item);
     // The connection budget for a server, from grab.conf, its host and what grab (or the command)
     // learned, read from limits.json each time.
     [[nodiscard]] int connection_budget(const std::string& remote, const std::string& host,
@@ -565,9 +590,57 @@ private:
     void start_files(int id);
     void send_files_chunk(int id, const std::shared_ptr<FilesSend>& send);
     void restore_queue();
-    // queue.json now, from any thread: unfinished items. Under mutex_ it copies only compact data
-    // (each file's state in a few bytes, the names from Item::names); the text is made after.
+    [[nodiscard]] std::shared_ptr<Item> restored_download(const SavedDownload& saved);
+    [[nodiscard]] std::shared_ptr<Item> restored_upload(const SavedUpload& saved);
+    // queue.json now, from any thread: unfinished downloads; and uploads.json: unfinished uploads
+    // and what uploads left on servers. Under mutex_ it copies only compact data (each file's
+    // state in a few bytes, the names from Item::names); the text is made after.
     void save_queue() const;
+
+    // ---- uploads (app_upload.cpp; UPLOADS.md 5.10) ----
+    // "Upload files here…" / "Upload folder here…" in Browse: the file dialog (UI thread), then the
+    // check of what was picked and of the server folder, sent to the page as "uploadCheck" {token,
+    // phase: local | server | ready | refused | cancelled, ...} for the confirm dialog.
+    void pick_upload(const std::string& server, const std::string& dir, bool folders, int token);
+    struct UploadCheck {
+        int token = 0;
+        upload::Check check;            // written by its thread alone; read once it is over
+        std::atomic<bool> ready{false}; // the server folder takes it: Upload may start it
+        std::atomic<bool> over{false};  // its thread ended
+        std::jthread thread;            // last: joined before the rest goes
+    };
+    void start_check(int token, const std::string& server, const std::string& dir, std::vector<std::filesystem::path> paths);
+    void run_check(UploadCheck& c, const std::vector<std::filesystem::path>& paths, const std::stop_token& stop);
+    void post_check(const UploadCheck& c, std::string_view phase) const;
+    void cancel_check(int token);
+    // "uploadStart" {token}: the checked items into the queue, each an upload.
+    void start_upload(int token);
+    void run_upload_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
+    void run_upload_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
+    // An upload's folder job, without its pool and hooks: what discard and skip_file need too.
+    [[nodiscard]] upload::FolderJob upload_job(Item& item);
+    // A cancelled upload: what it left on the server (its temps, partial uploads and the folders
+    // it made) goes to the leftovers, which the cleaner removes. Without mutex_.
+    void discard_upload(const std::shared_ptr<Item>& item);
+    // Leftovers of `server` noted (saved, then removed by the cleaner). Without mutex_.
+    void add_leftovers(const std::string& server, const upload::Leftovers& left);
+    // An upload queued (new, retried or restored) takes over the leftovers it uses: a file its own
+    // partial upload, which it goes on from; a folder its big files' partial uploads below it and
+    // the folders it made (back into its Tree::made). Everything else stays for the cleaner, as do
+    // temps (their tokens are an earlier run's) and what the cleaner's pass holds (cleaning_).
+    // Caller holds mutex_.
+    void adopt_leftovers(Item& item);
+    void run_cleanups(const std::stop_token& stop);
+    void clean_pass(const std::string& server, const std::stop_token& stop); // one server's, on cleaner_
+    void wake_cleaner(const std::string& server);
+    // Before an upload to `server` starts: waits while the cleaner's pass is removing leftovers
+    // there, so the upload sees the server after it. Whether it waited.
+    bool wait_for_cleaner(const std::string& server, const std::stop_token& stop);
+    // An upload ended: the folders it changed are listed live again when shown (not from this
+    // session's live listings, nor the file list), and Browse shows them again now if it is there.
+    // Without mutex_.
+    void upload_ended(const Item& item);
+    void refresh_browse(); // UI thread
     // queue.json soon, from any thread: at most once every queue_save_gap (longer after a slow
     // save), on saver_. now (a download ended): without the queue_save_gap floor, still at most
     // once every ten times the last save's duration. Closing and an update's restart save at once.
@@ -588,6 +661,8 @@ private:
     std::filesystem::path config_path_;
     std::filesystem::path state_path_;
     std::filesystem::path queue_path_;
+    std::filesystem::path uploads_path_; // uploads.json, beside queue.json
+    std::filesystem::path records_dir_;  // partial uploads' records (upload.hpp)
     std::filesystem::path recent_path_; // recent searches, sealed (gui_state.hpp)
     std::filesystem::path limits_path_; // learned connection limits, shared with the command
     GuiState state_;
@@ -598,6 +673,8 @@ private:
     fetch::Connections connections_;
     ssh::Pools pools_;          // grab's own SSH connections: engine = grab servers, every server's verification
     rate::RateLimiter limiter_; // shared by every download's streams
+    // Uploads' own, shared by every upload's streams; unlimited until chunk 6 gives it a box.
+    rate::RateLimiter up_limiter_;
     std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers
     std::string limit_posted_;  // the last "limit" message, so only changes are sent
 
@@ -616,10 +693,24 @@ private:
     // After the lists: the search thread uses them and starts refreshes, so it ends first.
     std::jthread search_thread_;
     std::atomic<bool> search_replaced_{false}; // a stopped search is being replaced: no "cancelled"
-    std::mutex browse_mutex_; // guards last_browse_, shown_browse_ and live_folders_
+    mutable std::mutex browse_mutex_; // guards last_browse_, shown_browse_, live_folders_ and changed_folders_
     LastBrowse last_browse_;  // the last request, again after a list refresh
     LastBrowse shown_browse_; // the folder the window shows: where a failed typed path leaves it
     std::map<std::pair<std::string, std::string>, LiveFolder> live_folders_; // (server, folder)
+    // Folders uploads changed (server, folder): the end of the last upload there, and whether the
+    // folders below it changed too (a folder upload's own). A listing older than that, the file
+    // list's or a live one, isn't shown: the folder is listed live instead. Kept in uploads.json,
+    // so a restart doesn't show the list from before (live check G, chunk 3).
+    struct Changed {
+        std::int64_t ended = 0; // Unix seconds
+        bool below = false;
+    };
+    std::map<std::pair<std::string, std::string>, Changed> changed_folders_;
+    // When an upload last changed `folder` of `server` (changed_folders_), if one did; the
+    // server's entries older than `list_fetched` (its file list's time, 0 none) are dropped, the
+    // list showing them. Caller holds browse_mutex_; `dropped` set when some went.
+    [[nodiscard]] std::optional<std::int64_t> changed_at(const std::string& server, const std::string& folder,
+                                                         std::int64_t list_fetched, bool& dropped);
     std::jthread browse_thread_; // after the lists, which it uses
 
     UpdateBanner update_;
@@ -636,7 +727,7 @@ private:
     std::atomic<bool> settings_busy_{false};
     std::jthread settings_thread_;
 
-    // Guards items_, next_id_, next_gen_, parallel_, learned_, defaults_. Worker threads read
+    // Guards items_, next_id_, next_gen_, parallel_, learned_, defaults_, leftovers_. Worker threads read
     // parallel_ here rather than state_, which belongs to the UI thread.
     mutable std::mutex mutex_;
     std::condition_variable_any wake_;
@@ -646,6 +737,7 @@ private:
     int parallel_ = 4;
     std::map<std::string, int> learned_;  // as limits.json had it when last read
     std::map<std::string, int> defaults_; // each server's default budget, by its host
+    std::vector<SavedLeftover> leftovers_; // what uploads left on servers to undo (uploads.json)
     // The page's view, UI thread (dirty_ any thread): what flush() sends next.
     DWORD ui_thread_ = 0;
     std::atomic<bool> dirty_{false}; // something changed: set by workers, actions, folder events
@@ -668,6 +760,7 @@ private:
     std::chrono::steady_clock::time_point next_urgent_save_{};
     mutable std::atomic<bool> queue_unsaved_{false}; // the last save of queue.json failed (shown once)
     mutable std::atomic<bool> state_unsaved_{false}; // the same for gui.json
+    mutable std::atomic<bool> uploads_unsaved_{false}; // and for uploads.json
     mutable std::atomic<bool> limits_unsaved_{false}; // and for limits.json
 
     // The status bar's activities: their ids, and how long steps took (from and to gui.json).
@@ -711,6 +804,21 @@ private:
     std::condition_variable_any discard_wake_;
     std::deque<DiscardJob> discard_jobs_;
     std::jthread discarder_; // what was asked for is done at its stop
+
+    // Upload checks, one dialog's at a time; those whose thread ended are dropped at the next.
+    std::mutex checks_mutex_;
+    std::vector<std::shared_ptr<UploadCheck>> checks_;
+    // The cleaner: the servers whose leftovers it tries next, and the server of the pass it is
+    // making ("" none), both under clean_mutex_. clean_wake_ also tells the end of a pass.
+    std::mutex clean_mutex_;
+    std::condition_variable_any clean_wake_;
+    std::set<std::string> clean_servers_;
+    std::string cleaning_server_;
+    // The leftovers the cleaner's pass took (under mutex_): no upload adopts them meanwhile; they
+    // leave leftovers_ at the pass's end, or stay when the server couldn't remove them.
+    std::vector<SavedLeftover> cleaning_;
+    std::jthread cleaner_;
+    std::filesystem::path last_upload_dir_; // UI thread: where the upload dialog last picked from
 
     std::jthread saver_; // ends after workers_: the saves they asked for are made, the last at its stop
     std::vector<std::jthread> workers_; // last member: stopped and joined first

@@ -26,6 +26,8 @@
 #include "ssh.hpp"
 #include "ssh_read.hpp"
 #include "update.hpp"
+#include "upload.hpp"
+#include "upload_folder.hpp"
 #include "util.hpp"
 #include "verify.hpp"
 
@@ -64,7 +66,13 @@ namespace {
 // Where a file download lands: dest and the server's name as a safe Windows one (local_name.hpp),
 // from the server path (the page's "name" is only shown).
 std::filesystem::path file_target(const std::filesystem::path& dest, const std::string& remote_path) {
-    return dest / local::relative(remote_basename(remote_path));
+    return queue_row::local_of(queue_row::Row{.direction = queue_row::Direction::down,
+                                              .folder = false,
+                                              .server = {},
+                                              .path = remote_path,
+                                              .dest = dest,
+                                              .local_name = {},
+                                              .source = {}});
 }
 
 std::optional<std::int64_t> seconds_to_ns(std::optional<std::int64_t> seconds) {
@@ -141,6 +149,8 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       config_path_(std::move(config_path)),
       state_path_(std::move(state_path)),
       queue_path_(state_path_.parent_path() / "queue.json"),
+      uploads_path_(state_path_.parent_path() / "uploads.json"),
+      records_dir_(state_path_.parent_path() / "uploads"),
       recent_path_(state_path_.parent_path() / "recent"),
       limits_path_(state_path_.parent_path() / "limits.json"),
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
@@ -233,6 +243,13 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
         });
     });
     discarder_ = std::jthread([this](const std::stop_token& stop) { run_discards(stop); });
+    // What uploads left on servers before (a cancel that couldn't reach them) is tried again now.
+    cleaner_ = std::jthread([this](const std::stop_token& stop) { run_cleanups(stop); });
+    {
+        std::set<std::string> servers;
+        for (const auto& l : leftovers_) servers.insert(l.server);
+        for (const auto& server : servers) wake_cleaner(server);
+    }
     saver_ = std::jthread([this](const std::stop_token& stop) { run_saves(stop); });
     // Up to max_parallel downloads at once; parallel_ decides how many actually run.
     for (int i = 0; i < max_parallel; ++i) {
@@ -282,6 +299,11 @@ void App::close() {
         for (auto& [server, refresh] : refresh_threads_) refresh.request_stop();
     }
     if (settings_thread_.joinable()) settings_thread_.request_stop();
+    {
+        std::scoped_lock lock(checks_mutex_);
+        for (const auto& c : checks_) c->thread.request_stop();
+    }
+    cleaner_.request_stop(); // what it hasn't removed yet stays in uploads.json, for the next start
     if (update_check_thread_.joinable()) update_check_thread_.request_stop();
     if (update_thread_.joinable()) update_thread_.request_stop(); // `grab update` carries on by itself
     cancel_pending();
@@ -597,7 +619,15 @@ void App::forget_server(const std::string& server) {
     {
         std::lock_guard lock(mutex_);
         learned_.erase(server);
+        // What uploads left there: the name may now lead to another account or host, where
+        // nothing is grab's to remove.
+        std::erase_if(leftovers_, [&](const SavedLeftover& l) { return l.server == server; });
     }
+    {
+        std::lock_guard lock(browse_mutex_);
+        std::erase_if(changed_folders_, [&](const auto& kv) { return kv.first.first == server; });
+    }
+    request_save();
     // "<step>:<server>"; a copy of the name, for the UI thread's turn below.
     const auto of_server = [server](const auto& kv) {
         const auto colon = kv.first.find(':');
@@ -861,6 +891,20 @@ void App::on_message(const std::string& text) {
         host_.defer([this, current = std::move(current), purpose = std::move(purpose)] { pick_folder(current, purpose); });
     } else if (type == "enqueue") {
         enqueue(*msg);
+    } else if (type == "uploadPick") {
+        // Not from inside WebView2's event handler: the dialog runs its own message loop.
+        std::string server = msg->string_of("server").value_or("");
+        std::string dir = msg->string_of("dir").value_or("");
+        const bool folders = bool_of(*msg, "folders");
+        const int token = int_of(*msg, "token");
+        if (server.empty() || token <= 0) return;
+        host_.defer([this, server = std::move(server), dir = std::move(dir), folders, token] {
+            pick_upload(server, dir, folders, token);
+        });
+    } else if (type == "uploadCheckCancel") {
+        cancel_check(int_of(*msg, "token"));
+    } else if (type == "uploadStart") {
+        start_upload(int_of(*msg, "token"));
     } else if (type == "cancelItem") {
         cancel_items(int_of(*msg, "id", -1));
     } else if (type == "pauseItem") {
@@ -1547,6 +1591,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             v.set("path", str(path));
             v.set("top", Value::make_bool(top));
             v.set("error", str(error));
+            v.set("uploadable", Value::make_bool(false));
             {
                 std::lock_guard lock(browse_mutex_);
                 if (!typed) {
@@ -1589,11 +1634,17 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
         };
         auto rows_of = [&](const std::string& at) -> std::expected<Rows, browse::ListError> {
             std::optional<LiveFolder> cached;
+            std::optional<std::int64_t> changed; // an upload ended there: older listings aren't shown
+            bool dropped = false;
             if (!live) {
                 std::lock_guard lock(browse_mutex_);
+                changed = changed_at(remote, at, view.list ? view.list->fetched : 0, dropped);
                 if (const auto it = live_folders_.find({remote, at}); it != live_folders_.end()) cached = it->second;
             }
-            auto from_list = !live && view.index ? view.index->folder(at) : std::nullopt;
+            if (dropped) request_save();
+            if (cached && changed && cached->listed < *changed) cached.reset();
+            const bool list_older = changed && (!view.list || view.list->fetched <= *changed);
+            auto from_list = !live && !list_older && view.index ? view.index->folder(at) : std::nullopt;
             // A live listing made after the list was fetched is newer; otherwise the list wins,
             // which also knows the sub-folders' item counts.
             if (cached && (!from_list || cached->listed > view.list->fetched)) {
@@ -1694,6 +1745,8 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
         v.set("source", str(source));
         v.set("age", num(static_cast<double>(now - listed)));
         v.set("severalRoots", Value::make_bool(roots.size() > 1));
+        // Uploads go into a folder: not the made-up top of several roots (UPLOADS.md 5.10).
+        v.set("uploadable", Value::make_bool(!roots_top));
         Value list = Value::make_array();
         for (const auto& it : items) list.push(item_value(it));
         v.set("items", std::move(list));
@@ -1752,16 +1805,41 @@ void App::prune_lists() {
     });
 }
 
-void App::pick_folder(std::wstring current, std::string purpose) {
+std::vector<std::filesystem::path> App::pick_paths(const std::wstring& title, bool folders, bool multi,
+                                                   const std::filesystem::path& start) const {
+    std::vector<std::filesystem::path> picked;
     ComPtr<IFileOpenDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&dialog)))) {
-        return;
+        return picked;
     }
     DWORD options = 0;
     dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    dialog->SetTitle(purpose == "downloadTo" ? L"Download to" : L"Save downloads to");
+    options |= FOS_FORCEFILESYSTEM | (folders ? FOS_PICKFOLDERS | FOS_PATHMUSTEXIST : FOS_FILEMUSTEXIST);
+    if (multi) options |= FOS_ALLOWMULTISELECT;
+    dialog->SetOptions(options);
+    dialog->SetTitle(title.c_str());
+    ComPtr<IShellItem> folder;
+    if (!start.empty() &&
+        SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+        dialog->SetFolder(folder.Get());
+    }
+    if (FAILED(dialog->Show(host_.hwnd))) return picked; // cancelled
+    ComPtr<IShellItemArray> results;
+    DWORD count = 0;
+    if (FAILED(dialog->GetResults(&results)) || FAILED(results->GetCount(&count))) return picked;
+    for (DWORD k = 0; k < count; ++k) {
+        ComPtr<IShellItem> result;
+        PWSTR path = nullptr;
+        if (SUCCEEDED(results->GetItemAt(k, &result)) && SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+            picked.emplace_back(path);
+        }
+        CoTaskMemFree(path);
+    }
+    return picked;
+}
+
+void App::pick_folder(std::wstring current, std::string purpose) {
     // Start in the current folder, or its nearest existing parent.
     std::filesystem::path start(current);
     std::error_code ec;
@@ -1769,57 +1847,29 @@ void App::pick_folder(std::wstring current, std::string purpose) {
         if (start == start.parent_path()) break;
         start = start.parent_path();
     }
-    ComPtr<IShellItem> folder;
-    if (!start.empty() &&
-        SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
-        dialog->SetFolder(folder.Get());
-    }
-    if (FAILED(dialog->Show(host_.hwnd))) return; // cancelled
-    ComPtr<IShellItem> result;
-    PWSTR path = nullptr;
-    if (SUCCEEDED(dialog->GetResult(&result)) &&
-        SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-        Value v = Value::make_object();
-        v.set("type", str("folderPicked"));
-        v.set("path", str(util::to_utf8(path)));
-        v.set("purpose", str(purpose));
-        post(v);
-    }
-    CoTaskMemFree(path);
+    const auto picked = pick_paths(purpose == "downloadTo" ? L"Download to" : L"Save downloads to", true, false, start);
+    if (picked.empty()) return;
+    Value v = Value::make_object();
+    v.set("type", str("folderPicked"));
+    v.set("path", str(util::path_to_utf8(picked.front())));
+    v.set("purpose", str(purpose));
+    post(v);
 }
 
 void App::pick_file(std::wstring current) {
-    ComPtr<IFileOpenDialog> dialog;
-    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&dialog)))) {
-        return;
-    }
-    DWORD options = 0;
-    dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
-    dialog->SetTitle(L"Private key file");
     // Start next to the current key, else in ~/.ssh when it exists.
     std::filesystem::path start = std::filesystem::path(current).parent_path();
     std::error_code ec;
     if (start.empty() || !std::filesystem::is_directory(start, ec)) {
         start = util::path_from_utf8(known_folder(FOLDERID_Profile)) / ".ssh";
     }
-    ComPtr<IShellItem> folder;
-    if (std::filesystem::is_directory(start, ec) &&
-        SUCCEEDED(SHCreateItemFromParsingName(start.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
-        dialog->SetFolder(folder.Get());
-    }
-    if (FAILED(dialog->Show(host_.hwnd))) return; // cancelled
-    ComPtr<IShellItem> result;
-    PWSTR path = nullptr;
-    if (SUCCEEDED(dialog->GetResult(&result)) &&
-        SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-        Value v = Value::make_object();
-        v.set("type", str("filePicked"));
-        v.set("path", str(util::to_utf8(path)));
-        post(v);
-    }
-    CoTaskMemFree(path);
+    if (!std::filesystem::is_directory(start, ec)) start.clear();
+    const auto picked = pick_paths(L"Private key file", false, false, start);
+    if (picked.empty()) return;
+    Value v = Value::make_object();
+    v.set("type", str("filePicked"));
+    v.set("path", str(util::path_to_utf8(picked.front())));
+    post(v);
 }
 
 // Like `grab config`: [grab] editor, $VISUAL, $EDITOR, else Notepad. Started, not waited for.
@@ -2177,6 +2227,7 @@ void App::enqueue(const Value& msg) {
         {
             std::lock_guard lock(mutex_);
             for (const auto& i : items_) {
+                if (is_up(*i)) continue; // nothing of it lands here
                 if (i->status == Status::queued || i->status == Status::running || i->status == Status::paused) {
                     pending.emplace_back(i->dest, i->total > i->bytes ? i->total - i->bytes : 0);
                 }
@@ -2385,6 +2436,7 @@ void App::resolve_existing(int id, existing::Choice choice) {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id || item->status != Status::paused) continue;
+            if (!queue_row::allows(item->direction, queue_row::Act::resolve_existing)) continue;
             item->existing = choice;
             item->asked.clear();
             item->asked_count = 0;
@@ -2417,8 +2469,16 @@ Value App::asked_json(const std::vector<Asked>& asked, std::size_t count) {
     return v;
 }
 
-std::filesystem::path App::item_target(const Item& item) {
-    return item.local_name.empty() ? file_target(item.dest, item.path) : item.dest / item.local_name;
+std::filesystem::path App::item_target(const Item& item) { return queue_row::local_of(row_of(item)); }
+
+queue_row::Row App::row_of(const Item& item) {
+    return queue_row::Row{.direction = item.direction,
+                          .folder = item.mode == Mode::folder,
+                          .server = item.remote,
+                          .path = item.path,
+                          .dest = item.dest,
+                          .local_name = item.local_name,
+                          .source = item.source};
 }
 
 void App::resume_items(int id) {
@@ -2447,6 +2507,7 @@ void App::cancel_items(int id) {
         std::string server;
     };
     std::vector<Discard> discard; // partial downloads not running now
+    std::vector<std::shared_ptr<Item>> uploads; // and uploads: what they left on the server
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
@@ -2455,6 +2516,11 @@ void App::cancel_items(int id) {
                 item->status = Status::cancelled;
                 item->speed = 0;
                 item->eta.reset();
+                // An upload's are on its server, never on this PC (queue_row::undo_of).
+                if (queue_row::undo_of(row_of(*item)) == queue_row::Act::discard_server) {
+                    uploads.push_back(item);
+                    continue;
+                }
                 // Not while another row for the same file into the same place goes on from it (G134).
                 if (twin_of(*item)) continue;
                 if (item->mode == Mode::file) {
@@ -2469,6 +2535,7 @@ void App::cancel_items(int id) {
         }
     }
     for (const auto& d : discard) fetch::discard(d.target, d.path, {}, rclone_remote_of(d.server));
+    for (const auto& item : uploads) discard_upload(item);
     request_save();
     dirty_ = true;
     flush();
@@ -2489,7 +2556,7 @@ void App::retry_item(int id) {
     flush();
 }
 
-void App::requeue(Item& item) const {
+void App::requeue(Item& item) {
     // A failed file download continues from its partial file; a cancelled one's was deleted, so
     // it starts over.
     const bool cancelled = item.status == Status::cancelled;
@@ -2497,7 +2564,17 @@ void App::requeue(Item& item) const {
     item.error.clear();
     item.note.clear(); // the last run's, which a retried, then paused row showed again
     item.waiting.clear();
-    if (item.mode == Mode::folder) {
+    if (is_up(item)) {
+        if (item.mode == Mode::folder) {
+            folder::retry_files(item.tree, cancelled);
+            // After a cancel the server is looked at again: what the cancel removed is made again.
+            if (cancelled) item.tree.looked = false;
+            item.touched = true;
+        } else if (!upload::saved_progress(records_dir_, item.remote, item.path)) {
+            item.bytes = 0;
+        }
+        if (cancelled) adopt_leftovers(item);
+    } else if (item.mode == Mode::folder) {
         folder::retry_files(item.tree, cancelled); // after a cancel, everything not finished
         item.touched = true;
     } else if (!fetch::saved_progress(item_target(item), item.path, {}, rclone_remote_of(item.remote))) {
@@ -2513,6 +2590,7 @@ void App::file_action(const Value& msg) {
     const std::string act = msg.string_of("act").value_or("");
     if (act != "pause" && act != "resume" && act != "retry" && act != "skip") return;
     std::vector<folder::Discard> discard; // skipped big files' partial downloads, deleted after unlocking
+    upload::Leftovers partials;           // and an upload's skipped big files' partial uploads
     std::shared_ptr<const queue_view::Names> names;
     std::filesystem::path dir;
     std::string server;
@@ -2524,7 +2602,10 @@ void App::file_action(const Value& msg) {
         Item& item = **it;
         // The rows of another generation: the page gets the new ones and asks again.
         if (item.gen != gen || !item.tree.listed || !item.names) return;
-        dir = folder::local_dir(item.dest, item.path);
+        // A skipped file's partial work: an upload's on its server, a download's here.
+        const bool up = queue_row::undo_of(row_of(item)) == queue_row::Act::discard_server;
+        const auto job = up ? upload_job(item) : upload::FolderJob{};
+        if (!up) dir = folder::local_dir(item.dest, item.path);
         bool changed = false;
         for (const auto k : queue_view::indices_of(msg.find("ranges"), item.tree.files.size())) {
             if (act == "pause") {
@@ -2533,6 +2614,10 @@ void App::file_action(const Value& msg) {
                 changed = folder::resume_file(item.tree, k) || changed;
             } else if (act == "retry") {
                 changed = folder::retry_file(item.tree, k) || changed;
+            } else if (up) {
+                bool skipped = false;
+                if (auto target = upload::skip_file(job, item.tree, k, &skipped)) partials.partials.push_back(std::move(*target));
+                changed = skipped || changed;
             } else {
                 bool skipped = false;
                 if (auto d = folder::skip_file(item.tree, dir, item.path, k, &skipped)) discard.push_back(std::move(*d));
@@ -2557,6 +2642,7 @@ void App::file_action(const Value& msg) {
         }
         discard_wake_.notify_all();
     }
+    if (!partials.empty()) add_leftovers(server, partials);
     if (wake) wake_.notify_all();
     request_save();
     dirty_ = true;
@@ -2595,7 +2681,10 @@ void App::show_file(int id, int gen, std::size_t index) {
         std::lock_guard lock(mutex_);
         for (const auto& item : items_) {
             if (item->id != id || item->gen != gen || !item->names || index >= item->names->path.size()) continue;
-            target = queue_view::target_of(folder::local_dir(item->dest, item->path), *item->names, index);
+            // An upload's: the file of the local folder it sends.
+            const auto both = item->names->local.find(index); // a download's Keep-both name
+            target = queue_row::local_file(row_of(*item), item->names->path[index],
+                                           both == item->names->local.end() ? std::filesystem::path() : both->second);
         }
     }
     if (!target.empty()) show_in_explorer(target);
@@ -2610,6 +2699,7 @@ void App::open_finished(int id, int gen, std::optional<std::size_t> index, bool 
         const auto it = std::ranges::find(items_, id, [](const auto& i) { return i->id; });
         if (it == items_.end()) return;
         const Item& item = **it;
+        if (!queue_row::allows(item.direction, queue_row::Act::open)) return; // an upload's file isn't grab's
         server = item.remote;
         if (index) {
             // A file of a folder download, of the generation the page shows.
@@ -2670,7 +2760,8 @@ void App::open_dir(int id) {
     {
         std::lock_guard lock(mutex_);
         for (const auto& item : items_) {
-            if (item->id == id && item->mode == Mode::folder && item->status == Status::done) {
+            if (item->id == id && item->mode == Mode::folder && item->status == Status::done &&
+                queue_row::allows(item->direction, queue_row::Act::open_folder)) {
                 dir = folder::local_dir(item->dest, item->path);
             }
         }
@@ -2766,9 +2857,10 @@ void App::set_rate(std::uint64_t bytes_per_s) {
     const auto limit = static_cast<double>(bytes_per_s);
     total_meter_.restart(now, received_.load(), limit);
     std::lock_guard lock(mutex_);
-    const bool alone = std::ranges::count_if(items_, [](const auto& i) { return i->metered; }) == 1;
+    // Uploads have their own limit (up_limiter_): their meters go on.
+    const bool alone = std::ranges::count_if(items_, [](const auto& i) { return i->metered && !is_up(*i); }) == 1;
     for (const auto& i : items_) {
-        if (!i->metered) continue;
+        if (!i->metered || is_up(*i)) continue;
         i->speed_meter.restart(now, i->received.load(), alone ? limit : 0);
         i->pace.restart();
         i->countdown.restart();
@@ -2918,8 +3010,9 @@ void App::worker_loop(std::stop_token stop) {
                 // Never two downloads into the same file or folder at once: they would share
                 // one partial file.
                 auto same_target = [](const Item& a, const Item& b) {
-                    // Where they write, as Windows names it: "D:\x\" and "d:\X" are one folder (G44).
-                    return local::key(item_target(a)) == local::key(item_target(b));
+                    // Where they write, as Windows names it: "D:\x\" and "d:\X" are one folder (G44);
+                    // an upload, the file or folder it makes on its server.
+                    return queue_row::key(row_of(a)) == queue_row::key(row_of(b));
                 };
                 // Nor more downloads on one server than its connections: past that the extra ones
                 // would only wait for one (review G194); a queued one for another server goes first.
@@ -2964,7 +3057,7 @@ void App::worker_loop(std::stop_token stop) {
             error = item->error;
         }
         if ((status == Status::done || status == Status::failed) && host_.on_finished) {
-            host_.on_finished(name, status == Status::done, error);
+            host_.on_finished(name, status == Status::done, error, is_up(*item));
         }
     }
 }
@@ -2978,6 +3071,28 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     // Closing the app stops the running download too; it is resumed on the next start.
     std::stop_callback on_app_stop(app_stop, [item] { item->stop.request_stop(); });
     if (item->fake) return run_fake(*item, item_stop);
+    if (is_up(*item)) {
+        // An upload (UPLOADS.md 5.10): nothing lands on this PC.
+        const auto refusals_before = connections_.refusals(item->remote);
+        if (item->mode == Mode::file) run_upload_file(item, item_stop);
+        else run_upload_folder(item, item_stop);
+        bool done = false;
+        bool cancelled = false;
+        {
+            std::lock_guard lock(mutex_);
+            done = item->status == Status::done;
+            cancelled = item->status == Status::cancelled;
+            item->speed = 0;
+            item->eta.reset();
+            item->connections = 0;
+            item->current.clear();
+            item->phase = Phase::none;
+        }
+        if (done) download_went_well(item->remote, refusals_before);
+        if (cancelled) discard_upload(item);
+        upload_ended(*item);
+        return;
+    }
 
     std::error_code ec;
     std::filesystem::create_directories(item->dest, ec);
@@ -3004,7 +3119,8 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     item->connections = 0;
     item->current.clear();
     item->phase = Phase::none;
-    if (item->status == Status::cancelled && item->mode == Mode::file && !twin_of(*item)) {
+    if (item->status == Status::cancelled && item->mode == Mode::file && !twin_of(*item) &&
+        queue_row::allows(item->direction, queue_row::Act::discard_local)) {
         fetch::discard(item_target(*item), item->path, {}, rclone_remote_of(item->remote));
     }
 }
@@ -3291,14 +3407,16 @@ void App::new_names(Item& item) {
 }
 
 void App::discard_folder_partials(const Item& item) const {
+    if (!queue_row::allows(item.direction, queue_row::Act::discard_local)) return; // an upload's are on its server
     folder::discard_partials(item.path, folder::local_dir(item.dest, item.path), item.tree, rclone_remote_of(item.remote));
 }
 
 std::shared_ptr<App::Item> App::twin_of(const Item& item) const {
-    const auto key = local::key(item_target(item));
+    const auto key = queue_row::key(row_of(item));
     const auto it = std::ranges::find_if(items_, [&](const auto& o) {
-        return o.get() != &item && o->remote == item.remote && o->path == item.path && o->mode == item.mode &&
-               o->status != Status::done && o->status != Status::cancelled && local::key(item_target(*o)) == key;
+        return o.get() != &item && o->direction == item.direction && o->remote == item.remote && o->path == item.path &&
+               o->mode == item.mode && o->status != Status::done && o->status != Status::cancelled &&
+               queue_row::key(row_of(*o)) == key;
     });
     return it == items_.end() ? nullptr : *it;
 }
@@ -3512,7 +3630,13 @@ json::Value App::queue_item(const Item& i, int position) const {
     v.set("path", str(i.path));
     v.set("name", str(i.name));
     v.set("dest", str(util::path_to_utf8(i.dest)));
-    v.set("local", str(util::path_to_utf8(item_target(i)))); // where it lands
+    v.set("local", str(util::path_to_utf8(item_target(i)))); // where it lands; an upload's source
+    if (is_up(i)) {
+        // An upload (UPLOADS.md 5.10): "↑ name → Server:/into".
+        v.set("dir", str("up"));
+        v.set("into", str(i.into));
+        v.set("source", str(util::path_to_utf8(i.source)));
+    }
     v.set("status", str(status_name(static_cast<int>(i.status))));
     if (!i.asked.empty()) v.set("ask", asked_json(i.asked, i.asked_count));
     v.set("bytes", num(static_cast<double>(i.bytes)));
@@ -3524,7 +3648,7 @@ json::Value App::queue_item(const Item& i, int position) const {
     v.set("error", str(i.error));
     v.set("note", str(i.note));
     // A file download Skip ended by keeping the user's own file: done, but nothing of grab's to open.
-    if (i.mode == Mode::file && i.status == Status::done && !i.finished) v.set("kept", Value::make_bool(true));
+    if (i.mode == Mode::file && i.status == Status::done && !i.finished && !is_up(i)) v.set("kept", Value::make_bool(true));
     if (!i.waiting.empty()) v.set("waiting", str(i.waiting)); // why it waits paused: a message row
     v.set("connections", num(i.connections));
     // Listing, checking or verifying, while running (DOWNLOADS-UI.md 5.3), and the ✓ or ⚠ after a check.
@@ -3563,73 +3687,158 @@ json::Value App::queue_item(const Item& i, int position) const {
     return v;
 }
 
-// Unfinished downloads from the last run come back paused, with their progress.
+// Unfinished downloads and uploads from the last run come back paused, with their progress, in
+// their order: queue.json's downloads and uploads.json's uploads at their places.
 void App::restore_queue() {
-    auto queue = read_queue(queue_path_);
-    if (!queue) {
+    std::vector<SavedDownload> downloads;
+    if (auto queue = read_queue(queue_path_); !queue) {
         // This run didn't load it, so its saves (at the latest when the window closes) must not
         // delete or replace it (review G212).
-        return set_aside("The saved download queue", queue_path_, queue.error(), "it starts empty");
+        set_aside("The saved download queue", queue_path_, queue.error(), "it starts empty");
+    } else if (*queue) {
+        downloads = std::move(**queue);
     }
-    if (!*queue) return;
-    for (const auto& saved : **queue) {
-        auto item = std::make_shared<Item>();
-        item->id = next_id_++;
-        item->remote = saved.remote;
-        item->mode = saved.mode == "folder" ? Mode::folder : Mode::file;
-        item->path = saved.path;
-        item->name = saved.name;
-        item->dest = util::path_from_utf8(saved.dest);
-        item->total = saved.total;
-        item->space_ok = saved.space_ok;
-        item->existing = existing::parse(saved.existing).value_or(existing::Choice::ask);
-        item->local_name = util::path_from_utf8(saved.local_name);
-        item->expanded = saved.expanded;
-        // Saved for an update's restart while running or queued: it goes on by itself.
-        item->status = saved.resume ? Status::queued : Status::paused;
-        item->weight = weight_of(saved.priority);
-        if (item->mode == Mode::file) {
-            if (auto p = fetch::saved_progress(item_target(*item), item->path, {}, rclone_remote_of(item->remote))) {
-                item->bytes = p->first;
-                item->total = p->second;
-            }
-        } else if (!saved.files.empty()) {
-            const auto dir = folder::local_dir(item->dest, item->path);
-            for (const auto& f : saved.files) {
-                auto c = folder::make_file(f.path, f.size, f.modtime);
-                c.status = f.state == "done"      ? folder::State::done
-                           : f.state == "skipped" ? folder::State::skipped
-                           : f.state == "paused"  ? folder::State::paused
-                           : f.state == "failed"  ? folder::State::failed
-                                                  : folder::State::queued;
-                // A failed file shows with its error until the folder runs again (retry_failed).
-                if (c.status == folder::State::failed) {
-                    c.error = f.error;
-                    item->retry_failed = true;
-                }
-                c.fetched = f.fetched;
-                c.verified = f.verified;
-                c.weight = weight_of(f.priority);
-                if (!f.local.empty()) {
-                    c.local = util::path_from_utf8(f.local);
-                    c.big = true; // a second copy: grab writes it under that name
-                }
-                if (c.status == folder::State::done) c.bytes = c.size;
-                else if (c.big) {
-                    if (auto p = fetch::saved_progress(folder::target_of(dir, c), folder::child_remote_path(item->path, c.path),
-                                                       {}, rclone_remote_of(item->remote))) {
-                        c.bytes = p->first;
-                    }
-                }
-                item->tree.files.push_back(std::move(c));
-            }
-            item->tree.listed = true;
-            refresh_folder(*item);
-            item->names = std::make_shared<const queue_view::Names>(queue_view::names_of(item->tree.files));
-            item->gen = next_gen_++;
+    SavedUploads uploads;
+    if (auto saved = read_uploads(uploads_path_); !saved) {
+        set_aside("The saved uploads", uploads_path_, saved.error(), "they start empty");
+    } else if (*saved) {
+        uploads = std::move(**saved);
+    }
+    leftovers_ = std::move(uploads.leftovers);
+    {
+        // The folders uploads changed, for Browse; a week on, the file list has caught up.
+        constexpr std::int64_t kept_for = 7 * 24 * 3600;
+        const auto now = unix_now();
+        std::lock_guard lock(browse_mutex_);
+        for (const auto& c : uploads.changed) {
+            if (c.ended + kept_for < now) continue;
+            changed_folders_[{c.server, c.path}] = Changed{.ended = c.ended, .below = c.below};
         }
-        items_.push_back(std::move(item));
     }
+    for (const auto& [up, k] : combined_order(downloads.size(), uploads.uploads)) {
+        items_.push_back(up ? restored_upload(uploads.uploads[k]) : restored_download(downloads[k]));
+    }
+}
+
+std::shared_ptr<App::Item> App::restored_download(const SavedDownload& saved) {
+    auto item = std::make_shared<Item>();
+    item->id = next_id_++;
+    item->remote = saved.remote;
+    item->mode = saved.mode == "folder" ? Mode::folder : Mode::file;
+    item->path = saved.path;
+    item->name = saved.name;
+    item->dest = util::path_from_utf8(saved.dest);
+    item->total = saved.total;
+    item->space_ok = saved.space_ok;
+    item->existing = existing::parse(saved.existing).value_or(existing::Choice::ask);
+    item->local_name = util::path_from_utf8(saved.local_name);
+    item->expanded = saved.expanded;
+    // Saved for an update's restart while running or queued: it goes on by itself.
+    item->status = saved.resume ? Status::queued : Status::paused;
+    item->weight = weight_of(saved.priority);
+    if (item->mode == Mode::file) {
+        if (auto p = fetch::saved_progress(item_target(*item), item->path, {}, rclone_remote_of(item->remote))) {
+            item->bytes = p->first;
+            item->total = p->second;
+        }
+    } else if (!saved.files.empty()) {
+        const auto dir = folder::local_dir(item->dest, item->path);
+        for (const auto& f : saved.files) {
+            auto c = folder::make_file(f.path, f.size, f.modtime);
+            c.status = f.state == "done"      ? folder::State::done
+                       : f.state == "skipped" ? folder::State::skipped
+                       : f.state == "paused"  ? folder::State::paused
+                       : f.state == "failed"  ? folder::State::failed
+                                              : folder::State::queued;
+            // A failed file shows with its error until the folder runs again (retry_failed).
+            if (c.status == folder::State::failed) {
+                c.error = f.error;
+                item->retry_failed = true;
+            }
+            c.fetched = f.fetched;
+            c.verified = f.verified;
+            c.weight = weight_of(f.priority);
+            if (!f.local.empty()) {
+                c.local = util::path_from_utf8(f.local);
+                c.big = true; // a second copy: grab writes it under that name
+            }
+            if (c.status == folder::State::done) c.bytes = c.size;
+            else if (c.big) {
+                if (auto p = fetch::saved_progress(folder::target_of(dir, c), folder::child_remote_path(item->path, c.path),
+                                                   {}, rclone_remote_of(item->remote))) {
+                    c.bytes = p->first;
+                }
+            }
+            item->tree.files.push_back(std::move(c));
+        }
+        item->tree.listed = true;
+        refresh_folder(*item);
+        item->names = std::make_shared<const queue_view::Names>(queue_view::names_of(item->tree.files));
+        item->gen = next_gen_++;
+    }
+    return item;
+}
+
+// An upload goes on from its partial uploads' records; a folder's look at the server is made
+// again when it runs (the server may have changed meanwhile).
+std::shared_ptr<App::Item> App::restored_upload(const SavedUpload& saved) {
+    auto item = std::make_shared<Item>();
+    item->id = next_id_++;
+    item->direction = queue_row::Direction::up;
+    item->remote = saved.server;
+    item->mode = saved.kind == "folder" ? Mode::folder : Mode::file;
+    item->path = saved.path;
+    item->name = saved.name;
+    item->source = util::path_from_utf8(saved.source);
+    item->into = saved.into;
+    item->total = saved.total;
+    item->up_existing = upload::parse_existing(saved.existing).value_or(upload::Existing::ask);
+    item->expanded = saved.expanded;
+    item->status = saved.resume ? Status::queued : Status::paused;
+    item->weight = weight_of(saved.priority);
+    item->resend = saved.resend; // its server copy differed: Resume replaces it, as Retry would
+    if (item->mode == Mode::file) {
+        if (auto p = upload::saved_progress(records_dir_, item->remote, item->path)) {
+            item->bytes = p->first;
+            item->total = p->second;
+        }
+    } else if (!saved.files.empty() || !saved.folders.empty()) {
+        for (const auto& f : saved.files) {
+            auto c = folder::make_file(f.path, f.size, f.modtime);
+            c.status = f.state == "done"      ? folder::State::done
+                       : f.state == "skipped" ? folder::State::skipped
+                       : f.state == "paused"  ? folder::State::paused
+                       : f.state == "failed"  ? folder::State::failed
+                                              : folder::State::queued;
+            if (c.status == folder::State::failed) {
+                c.error = f.error;
+                item->retry_failed = true;
+            }
+            c.fetched = f.fetched;
+            c.verified = f.verified;
+            c.weight = weight_of(f.priority);
+            c.local = util::path_from_utf8(f.local); // a Keep-both name on the server
+            if (f.resend) item->tree.resend.insert(item->tree.files.size());
+            item->tree.files.push_back(std::move(c));
+        }
+        // Big files' bytes from their records, where they go (a Keep-both name too).
+        const auto job = upload_job(*item);
+        for (auto& c : item->tree.files) {
+            if (c.status == folder::State::done) c.bytes = c.size;
+            else if (c.big) {
+                if (auto p = upload::saved_progress(records_dir_, item->remote, upload::target_of(job, c))) c.bytes = p->first;
+            }
+        }
+        item->tree.folders = saved.folders;
+        item->tree.made = saved.made;
+        item->tree.temps.insert(saved.temps.begin(), saved.temps.end());
+        item->tree.listed = true;
+        refresh_folder(*item);
+        item->names = std::make_shared<const queue_view::Names>(queue_view::names_of(item->tree.files));
+        item->gen = next_gen_++;
+    }
+    adopt_leftovers(*item);
+    return item;
 }
 
 namespace {
@@ -3643,14 +3852,16 @@ struct SavedFiles {
     std::vector<std::pair<std::size_t, std::filesystem::path>> locals; // without names, by index
     std::vector<std::uint64_t> sizes;
     std::vector<folder::State> states;
-    std::vector<std::uint8_t> flags; // 1: fetched, 2: verified (done files)
+    std::vector<std::uint8_t> flags; // 1: fetched, 2: verified (done files), 4: resend (an upload's)
     std::vector<std::uint8_t> weights; // priorities
     std::string times;
     std::vector<std::size_t> time_ends;
     std::vector<std::pair<std::size_t, std::string>> errors; // by index
 };
 
-SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_ptr<const queue_view::Names>& names) {
+// `resend`: an upload's files whose retry replaces grab's own copy (upload::Tree::resend).
+SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_ptr<const queue_view::Names>& names,
+                      const std::set<std::size_t>& resend = {}) {
     SavedFiles s;
     const auto n = files.size();
     if (names && names->path.size() == n) {
@@ -3673,7 +3884,8 @@ SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_
         const bool done = c.status == folder::State::done;
         s.sizes.push_back(c.size);
         s.states.push_back(c.status);
-        s.flags.push_back(static_cast<std::uint8_t>((done && c.fetched ? 1 : 0) | (done && c.verified ? 2 : 0)));
+        s.flags.push_back(static_cast<std::uint8_t>((done && c.fetched ? 1 : 0) | (done && c.verified ? 2 : 0) |
+                                                    (resend.contains(k) ? 4 : 0)));
         s.weights.push_back(static_cast<std::uint8_t>(c.weight));
         s.times += c.modtime;
         s.time_ends.push_back(s.times.size());
@@ -3704,6 +3916,7 @@ std::vector<SavedFile> saved_files(const SavedFiles& s) {
         }
         f.fetched = (s.flags[k] & 1) != 0;
         f.verified = (s.flags[k] & 2) != 0;
+        f.resend = (s.flags[k] & 4) != 0;
         f.priority = priority_name(s.weights[k]);
         if (s.names) {
             if (const auto it = s.names->local.find(k); it != s.names->local.end()) f.local = util::path_to_utf8(it->second);
@@ -3725,12 +3938,45 @@ void App::save_queue() const {
     const auto started = std::chrono::steady_clock::now();
     std::vector<SavedDownload> unfinished;
     std::vector<SavedFiles> files; // by unfinished's index
+    SavedUploads ups;
+    std::vector<SavedFiles> up_files; // by ups.uploads' index
+    {
+        std::lock_guard lock(browse_mutex_);
+        for (const auto& [at, c] : changed_folders_) {
+            ups.changed.push_back(SavedChanged{.server = at.first, .path = at.second, .below = c.below, .ended = c.ended});
+        }
+    }
     double held = 0;
     {
         std::lock_guard lock(mutex_);
         const auto locked = std::chrono::steady_clock::now();
+        std::size_t pos = 0; // the place among both
         for (const auto& i : items_) {
             if (i->status == Status::done || i->status == Status::cancelled) continue;
+            if (is_up(*i)) {
+                SavedUpload u{.pos = pos++,
+                              .server = i->remote,
+                              .kind = i->mode == Mode::folder ? "folder" : "file",
+                              .source = util::path_to_utf8(i->source),
+                              .into = i->into,
+                              .path = i->path,
+                              .name = i->name,
+                              .total = i->total,
+                              .priority = priority_name(i->weight.load()),
+                              .existing = i->up_existing == upload::Existing::ask ? std::string()
+                                                                                  : std::string(upload::name(i->up_existing)),
+                              .resume = resume_after_restart_ && i->resume_mark,
+                              .expanded = i->expanded,
+                              .files = {},
+                              .folders = i->tree.folders,
+                              .made = i->tree.made,
+                              .temps = std::vector<std::string>(i->tree.temps.begin(), i->tree.temps.end()),
+                              .resend = i->resend};
+                up_files.push_back(copy_files(i->tree.files, i->names, i->tree.resend));
+                ups.uploads.push_back(std::move(u));
+                continue;
+            }
+            ++pos;
             SavedDownload d{i->remote, i->mode == Mode::folder ? "folder" : "file", i->path, i->name,
                             util::path_to_utf8(i->dest), i->total, {}, priority_name(i->weight.load())};
             d.resume = resume_after_restart_ && i->resume_mark;
@@ -3741,17 +3987,29 @@ void App::save_queue() const {
             files.push_back(copy_files(i->tree.files, i->names));
             unfinished.push_back(std::move(d));
         }
+        ups.leftovers = leftovers_;
         held = ms_since(locked);
     }
     for (std::size_t k = 0; k < unfinished.size(); ++k) unfinished[k].files = saved_files(files[k]);
+    for (std::size_t k = 0; k < ups.uploads.size(); ++k) ups.uploads[k].files = saved_files(up_files[k]);
     std::error_code ec;
+    // queue.json as an older grab reads it: downloads only (UPLOADS.md 5.9).
+    std::size_t bytes = 0;
     if (unfinished.empty()) {
         std::filesystem::remove(queue_path_, ec);
-        return;
+    } else {
+        const auto text = queue_to_json(unfinished);
+        bytes += text.size();
+        report_save("the download queue", util::write_file_atomic(queue_path_, text), queue_unsaved_);
     }
-    const auto text = queue_to_json(unfinished);
-    report_save("the download queue", util::write_file_atomic(queue_path_, text), queue_unsaved_);
-    if (test_logging()) test_log(std::format("save lock={:.2f}ms total={:.0f}ms bytes={}", held, ms_since(started), text.size()));
+    if (ups.uploads.empty() && ups.leftovers.empty() && ups.changed.empty()) {
+        std::filesystem::remove(uploads_path_, ec);
+    } else {
+        const auto text = uploads_to_json(ups);
+        bytes += text.size();
+        report_save("the uploads", util::write_file_atomic(uploads_path_, text), uploads_unsaved_);
+    }
+    if (test_logging()) test_log(std::format("save lock={:.2f}ms total={:.0f}ms bytes={}", held, ms_since(started), bytes));
 }
 
 // ---- updates ------------------------------------------------------------------------------

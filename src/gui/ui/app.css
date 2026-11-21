@@ -873,7 +873,7 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .dl-bar > i { display: block; height: 100%; background: var(--bar); transform: scaleX(0); transform-origin: left; }
 .st-paused .dl-bar > i, .st-failed .dl-bar > i, .st-cancelled .dl-bar > i, .w-muted .dl-bar > i { background: var(--muted); }
 .st-done .dl-bar > i { background: var(--ok); }
-.st-uploading .dl-bar > i { background: var(--bar); } /* reserved: nothing uploads yet */
+.st-uploading .dl-bar > i { background: var(--bar); } /* a running upload (UPLOADS.md 5.10) */
 .dl-pct { flex: none; width: 36px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 .c-size, .c-speed, .c-eta {
   overflow: hidden;
@@ -1128,3 +1128,14 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .fingerprints td { padding: 5px 8px; border-top: 1px solid var(--line); vertical-align: top; }
 .fingerprints td:first-child { width: 80px; color: var(--muted); white-space: nowrap; }
 .fingerprints code { word-break: break-all; font-size: 12.5px; }
+/* The upload dialog (UPLOADS.md 5.10): what goes, where, the server's word, the files there already. */
+.up-what { list-style: none; max-height: 9.5em; margin: 0 0 10px; padding: 0; overflow-y: auto; }
+.up-what li { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.up-what .ico { flex: none; width: 16px; height: 16px; fill: var(--folder); }
+.up-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: isolate; }
+.up-what li > .muted { flex: none; margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.up-what li > .up-bad { flex: 1 1 auto; text-align: right; }
+.up-notes { font-size: 12px; }
+.up-ok { color: var(--ok); }
+.up-warn { color: var(--warn); }
+.up-bad { color: var(--danger); }

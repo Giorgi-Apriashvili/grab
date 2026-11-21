@@ -4,13 +4,13 @@
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, openFile, openDir, setExpanded,
-//                 resolveExisting, play, previewCancel,
+//                 resolveExisting, play, previewCancel, uploadPick, uploadCheckCancel, uploadStart,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
 //                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
-//                 updateChecked, limit, played,
+//                 updateChecked, limit, played, uploadCheck,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -60,6 +60,7 @@ const state = {
     id: 0, server: '', path: '', top: true, crumbs: [], items: [], severalRoots: false,
     source: '', age: 0, refreshing: false, listError: '', error: '', loading: false,
     under: null, pendingSelect: null, keepSelection: false, typed: null,
+    uploadable: false, // the backend's word: the folder shown takes uploads (not the made-up top of several roots)
   },
   // The path bar as a field (the address bar): `typed` the text typed (the suggestions follow
   // it), `shown` the suggestions ({ label, text, server }), `sel` the highlighted one, `cache`
@@ -1319,7 +1320,7 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   state.addr.error = '';
   if (state.addr.editing) endEdit(false);
   if (!server) {
-    Object.assign(b, { server: '', path: '', top: true, crumbs: [], error: '', loading: false, source: '' });
+    Object.assign(b, { server: '', path: '', top: true, crumbs: [], error: '', loading: false, source: '', uploadable: false });
     b.items = state.remotes.map((r, i) => ({ name: r.name, path: '', dir: true, server: r.name, remote: r.name,
       info: r.error ? 'misconfigured' : `${r.user}@${r.host}`, ord: i }));
     remember();
@@ -1385,7 +1386,7 @@ function onBrowseResult(msg) {
   Object.assign(b, {
     loading: false, error: msg.error || '', path: msg.path, top: msg.top, crumbs: msg.crumbs || [],
     source: msg.source || '', age: msg.age || 0, refreshing: !!msg.refreshing, listError: msg.listError || '',
-    severalRoots: !!msg.severalRoots,
+    severalRoots: !!msg.severalRoots, uploadable: !!msg.uploadable && !msg.error,
   });
   // `ord`: the backend's order (folders first, A to Z), the default one.
   b.items = (msg.items || []).map((it, i) => ({ ...it, remote: msg.remote, ord: i }));
@@ -2018,6 +2019,15 @@ function resultMenu() {
   items.push({ label: 'Download to…', act: () => downloadTo(picks) });
   // In a folder the row is already where it lives.
   if (one && state.browse.under) items.push({ label: 'Open folder location', act: () => openHitFolder(one) });
+  // Into one folder (UPLOADS.md 5.10); a search result says why not.
+  if (opens) {
+    items.push('-', ...uploadEntries(state.browse.server || one.remote, one.path,
+      state.browse.under ? 'Uploads go into a folder you have open, not into search results: open this folder first.' : ''));
+  } else if (state.browse.server) {
+    // Else the open folder's own, named so they aren't taken for the row's: a folder whose rows
+    // fill the list has no empty part to right-click.
+    items.push('-', ...uploadEntries(state.browse.server, state.browse.path, uploadRefusal(), browseHere()));
+  }
   items.push('-');
   items.push({ label: picks.length > 1 ? `Copy ${picks.length} paths` : 'Copy path', act: () => copyText(picks.map((h) => h.path)) });
   items.push({ label: picks.length > 1 ? `Copy ${picks.length} names` : 'Copy name', act: () => copyText(picks.map((h) => h.name)) });
@@ -2030,6 +2040,161 @@ $('#rows').addEventListener('contextmenu', (ev) => {
   const items = resultMenu();
   if (items.length) showMenu(ev.clientX, ev.clientY, items);
 });
+// The list's empty part: the open folder's own menu (UPLOADS.md 5.10).
+$('#results').addEventListener('contextmenu', (ev) => {
+  if (ev.target.closest('.row') || ev.target.closest('button')) return;
+  ev.preventDefault();
+  showMenu(ev.clientX, ev.clientY, folderMenu());
+});
+
+// ---- uploads (UPLOADS.md 5.10): into a folder of a server, from this PC ----------------------
+
+// Why the folder Browse shows takes no upload, or '': uploads go into one folder of one server,
+// never into search results, All servers' list of servers or the made-up top of several roots.
+function uploadRefusal() {
+  const b = state.browse;
+  if (!b.server) return 'Open a folder of a server first: uploads go into one folder of one server.';
+  if (b.under) return 'Search results aren’t a folder: close the search (Esc) to upload into the folder.';
+  if (b.loading) return `${browseHere()} is still opening.`;
+  if (b.top && b.severalRoots && !b.uploadable) return 'This is the list of the server’s search roots, not a folder: open one of them first.';
+  if (b.error || !b.uploadable) return `Uploads can’t go into ${browseHere()} now.`;
+  return '';
+}
+
+// "Upload files here…" and "Upload folder here…" into `dir` of `server` (with `name`: "Upload
+// files to <name>…"), or, with `why`, saying why not.
+function uploadEntries(server, dir, why, name = '') {
+  const go = (folders) => () => {
+    if (why) flash(why);
+    else pickUpload(server, dir, folders);
+  };
+  const where = name ? `to ${name}` : 'here';
+  return [{ label: `Upload files ${where}…`, act: go(false) }, { label: `Upload folder ${where}…`, act: go(true) }];
+}
+
+// The open folder's menu, on the list's empty part.
+function folderMenu() {
+  const b = state.browse;
+  return uploadEntries(b.server, b.path, uploadRefusal());
+}
+
+// The dialog's pick: its token, and the server folder. The backend opens Windows' file dialog,
+// then checks what was picked and the folder ("uploadCheck").
+const upload = { token: 0, pending: null };
+function pickUpload(server, dir, folders) {
+  const token = ++upload.token;
+  upload.pending = { token, server, dir };
+  send({ type: 'uploadPick', token, server, dir, folders });
+}
+
+const fmtNum = (n) => Number(n || 0).toLocaleString('en-US');
+const counted = (n, one, many = `${one}s`) => `${fmtNum(n)} ${n === 1 ? one : many}`;
+// A path in a server folder, grab's form: "" is the login folder.
+const serverChild = (dir, rel) => (!dir ? rel : dir.endsWith('/') ? `${dir}${rel}` : `${dir}/${rel}`);
+
+// The confirm dialog's text (UPLOADS.md 5.10): what goes (each item, its files and size; links left
+// out, names too long for a server), where (a new folder, or merged into one there), whether the
+// server takes it, and the files already there, which are skipped (the full question is chunk 5's).
+function uploadHtml(m) {
+  const where = `${m.server}:${m.dir || '~'}`;
+  const items = m.items || [];
+  let html = '<div class="up-check">';
+  if (!items.length) html += '<p class="muted"><span class="spinner"></span>Looking at what you picked…</p>';
+  else {
+    html += '<ul class="up-what">';
+    for (const it of items.slice(0, 5)) {
+      const size = it.dir ? `${counted(it.files, 'file')}, ${fmtSize(it.bytes)}` : fmtSize(it.bytes);
+      html += `<li>${itemIcon(it.name, it.dir)}<span class="up-name">${esc(it.name)}${it.dir ? '/' : ''}</span>` +
+        `${it.error ? `<span class="up-bad">${esc(it.error)}</span>` : `<span class="muted">${esc(size)}</span>`}</li>`;
+    }
+    if (m.count > 5) html += `<li class="muted">…and ${fmtNum(m.count - 5)} more</li>`;
+    html += '</ul>';
+  }
+  const notes = [];
+  if (m.phase === 'local' && items.length) notes.push(`Looking at your files… ${counted(m.files, 'file')} so far`);
+  else if (m.count > 1) notes.push(`${counted(m.files, 'file')}, ${fmtSize(m.bytes)} in all`);
+  if (m.skippedLinks) notes.push(`${counted(m.skippedLinks, 'link')} left out: grab doesn’t follow links or junctions`);
+  if (m.unreadable) notes.push(`${counted(m.unreadable, 'folder or name', 'folders or names')} couldn’t be read: left out`);
+  if (m.longNames) notes.push(`${counted(m.longNames, 'name')} longer than a server takes (255 bytes): ${m.longNames === 1 ? 'that file fails' : 'those files fail'}`);
+  if (notes.length) html += `<p class="muted up-notes">${notes.map(esc).join('<br>')}</p>`;
+  // Where it goes: a new folder, or merged into one there (known once the server was looked at).
+  const looked = m.phase === 'ready';
+  const folders = items.filter((it) => it.dir && !it.error);
+  html += `<p class="up-where">To <b>${esc(where)}</b>`;
+  if (looked && folders.length === 1) html += folders[0].merging ? `: merged into the folder “${esc(folders[0].name)}” there` : ': a new folder';
+  else if (looked && folders.length > 1) {
+    const merged = folders.filter((it) => it.merging).length;
+    if (merged) html += `: ${counted(merged, 'folder')} merged into ${merged === 1 ? 'one' : 'those'} of the same name there`;
+  }
+  html += '</p>';
+  // The server's side.
+  if (m.phase === 'server') {
+    html += `<p class="up-server muted"><span class="spinner"></span>Checking ${esc(m.server)}…</p>`;
+  } else if (m.phase === 'ready') {
+    html += `<p class="up-server up-ok">✓ You can write here${m.free != null ? ` · ${esc(fmtSize(m.free))} free` : ''}</p>`;
+    if (m.short) {
+      html += `<p class="up-server up-warn">Not enough space: ${esc(fmtSize(m.free))} free, ${esc(fmtSize(m.bytes))} needed. ` +
+        'Upload anyway only if room will be made first.</p>';
+    }
+  } else if (m.phase === 'refused') {
+    html += `<p class="up-server up-bad">${esc(m.why || 'This can’t be uploaded.')}</p>`;
+  }
+  // Files already there: skipped.
+  const e = m.existing || {};
+  if (looked && e.count > 0) {
+    const parts = [[e.same, 'the same'], [e.newer, 'newer here'], [e.older, 'older here'], [e.differs, 'of another size'],
+      [e.folders, e.folders === 1 ? 'a folder there' : 'folders there']].filter(([n]) => n > 0).map(([n, w]) => `${fmtNum(n)} ${w}`);
+    html += `<p class="up-existing">${fmtNum(e.count)} already there: skipped (${esc(parts.join(', '))})</p>`;
+  } else if (looked) {
+    html += '<p class="up-existing muted">Nothing of it is there yet.</p>';
+  }
+  return `${html}</div>`;
+}
+
+// The backend's check of a pick (UPLOADS.md 5.10): the dialog opens with the first, shows each
+// next, and Upload is enabled once the server takes it ("Upload anyway" when it says it has too
+// little room). Cancel or Esc drops it.
+function onUploadCheck(msg) {
+  const p = upload.pending;
+  if (!p || msg.token !== p.token) return; // an older pick, or one cancelled
+  if (msg.phase === 'cancelled') { // the file dialog was closed
+    upload.pending = null;
+    return;
+  }
+  if (modal && modal.upload === msg.token) {
+    $('#modal-body').innerHTML = uploadHtml(msg);
+  } else {
+    if (modal) { // another question is open: this one isn't asked over it
+      upload.pending = null;
+      send({ type: 'uploadCheckCancel', token: msg.token });
+      return;
+    }
+    showModal({ title: `Upload to ${msg.server}:${msg.dir || '~'}`, html: uploadHtml(msg), ok: 'Upload',
+      onOk: () => { upload.pending = null; send({ type: 'uploadStart', token: msg.token }); },
+      onCancel: () => { upload.pending = null; send({ type: 'uploadCheckCancel', token: msg.token }); } });
+    modal.upload = msg.token;
+  }
+  const ok = $('#modal-ok');
+  const ready = msg.phase === 'ready';
+  ok.disabled = !ready;
+  ok.textContent = ready && msg.short ? 'Upload anyway' : 'Upload';
+  ok.classList.toggle('danger', ready && !!msg.short);
+}
+
+// Browse at an upload's folder on its server, the upload (or its file `index`) picked: its row's
+// menu and Show button, Enter once it is done, a double-click.
+function showOnServer(q, index = null) {
+  const st = index === null ? null : dl.stores.get(q.id);
+  const target = st ? serverChild(q.path, st.path[index]) : q.path;
+  const folder = st ? parentOf(target) : q.into || '';
+  if (!state.remotes.some((r) => r.name === q.remote)) {
+    dlNote(`${q.remote} isn’t one of your servers any more.`);
+    return;
+  }
+  if (settings.open) closeSettings();
+  if (state.remote !== q.remote && state.remote !== ALL) pickRemote(q.remote, false);
+  browseTo(q.remote, folder, false, { select: target });
+}
 
 // Where a download lands on this PC: DEST\<name>, and a folder's file `i` below that (5.10): the
 // name grab saved it under when it isn't the server's.
@@ -2170,12 +2335,16 @@ const DL_NEED = DL_HIDES.map((hide) => {
 const DL_COMPACT = DL_HIDES.length; // the last step
 const DL_HEAD_NARROW = 900;         // px of panel: the head's summary moves into the title's tooltip
 
-// The status words (5.3). 'Uploading' is reserved: the backend never sends it yet.
+// The status words (5.3); a running upload's is Uploading (UPLOADS.md 5.10).
 const DL_WORD = { queued: 'Queued', running: 'Downloading', paused: 'Paused', done: 'Done', failed: 'Failed',
   cancelled: 'Cancelled', skipped: 'Skipped', uploading: 'Uploading' };
 const PHASE_WORD = { listing: 'Listing', checking: 'Checking', verifying: 'Verifying' };
 const PHASE_TIP = { listing: 'Listing the folder on the server', verifying: 'Verifying against the server’s checksums',
   checking: 'Checking the files already here and the free space' };
+const UP_PHASE_TIP = { listing: 'Listing your folder', verifying: 'Verifying against the server’s checksums',
+  checking: 'Looking at the folder on the server: the files already there' };
+// An upload's row (UPLOADS.md 5.10): "↑ name → Server:/folder" in the same table.
+const isUp = (q) => q.dir === 'up';
 const PRIORITIES = [['high', 'High'], ['normal', 'Normal'], ['low', 'Low']];
 const prioLabel = (p) => (PRIORITIES.find(([k]) => k === p) || PRIORITIES[1])[1];
 const UNFINISHED = ['queued', 'running', 'paused', 'failed']; // what Cancel, the priority and the moves apply to
@@ -2248,7 +2417,7 @@ const dl = {
   widths: {},            // column -> px dragged by hand (gui.json downloads.widths); absent: DL_W
   resize: null,          // while a title's edge is dragged
   keyAt: 0,              // when the table last had a key (performance.now())
-  show: 'all',           // decision 2's filter, for the session: 'all', 'unfinished' or 'failed'
+  show: 'all',           // the filter, for the session: 'all', 'unfinished', 'failed', 'downloads' or 'uploads'
   lastRun: -1,           // the row 'Go to running' went to, and where the body was scrolled then
   lastRunTop: -1,
   goPending: 0,          // a folder 'Go to running' opened: the jump comes with its files
@@ -2328,14 +2497,17 @@ function fileOf(st, i) {
 const fileSize = (st, i) => (st.status[i] === FS.done ? st.bytes[i] || st.size[i] : st.size[i]);
 
 // The filter (decision 2): what a download or a file must be to show. Unfinished is what still
-// comes (queued, running, paused, failed); Failed the failed ones, and folders with failed files.
+// comes (queued, running, paused, failed); Failed the failed ones, and folders with failed files;
+// Downloads and Uploads one direction (UPLOADS.md 5.10), every file of its folders.
 function dlMatches(q) {
   if (dl.show === 'all') return true;
+  if (dl.show === 'downloads') return !isUp(q);
+  if (dl.show === 'uploads') return isUp(q);
   if (dl.show === 'failed') return q.status === 'failed' || !!(q.files && q.files.failed > 0);
   return UNFINISHED.includes(q.status);
 }
 function fileMatches(st, i) {
-  if (dl.show === 'all') return true;
+  if (dl.show === 'all' || dl.show === 'downloads' || dl.show === 'uploads') return true;
   const s = st.status[i];
   return dl.show === 'failed' ? s === FS.failed : s !== FS.done && s !== FS.skipped;
 }
@@ -2764,27 +2936,30 @@ function sizeOf(bytes, total, full) {
   return { size: partial ? fmtSizePair(bytes, total) : fmtSize(total), sizeTip: '' };
 }
 
-// The two action slots (5.4): [act, label, tooltip] or null, which keeps its place.
+// The two action slots (5.4): [act, label, tooltip] or null, which keeps its place. A finished
+// upload's Show opens Browse where it went.
 function dlSlots(q) {
-  const cancel = ['cancel', 'Cancel', 'Cancel the download'];
+  const up = isUp(q);
+  const cancel = ['cancel', 'Cancel', up ? 'Cancel the upload' : 'Cancel the download'];
   switch (q.status) {
     case 'queued': case 'running': return [['pause', 'Pause'], cancel];
     case 'paused': return [['resume', 'Resume'], cancel];
-    case 'failed': return [q.bytes > 0 ? ['retry', 'Resume', 'Resume from what was downloaded'] : ['retry', 'Retry'], cancel];
+    case 'failed': return [q.bytes > 0 ? ['retry', 'Resume', up ? 'Resume from what was sent' : 'Resume from what was downloaded'] : ['retry', 'Retry'], cancel];
     case 'cancelled': return [['retry', 'Retry'], null];
-    case 'done': case 'skipped': return [['show', 'Show', 'Show in folder'], null];
+    case 'done': case 'skipped': return [['show', 'Show', up ? 'Show on server' : 'Show in folder'], null];
     default: return [null, null];
   }
 }
 
 function dlView(q) {
   const st = q.status;
+  const up = isUp(q);
   const phase = st === 'running' && PHASE_WORD[q.phase] ? q.phase : '';
   const fetching = st === 'running' && !phase;
   const f = q.files;
-  let word = phase ? PHASE_WORD[phase] : DL_WORD[st] || st;
+  let word = phase ? PHASE_WORD[phase] : DL_WORD[up && st === 'running' ? 'uploading' : st] || st;
   if (st === 'queued' && q.position) word = `Queued #${q.position}`;
-  const tip = [phase ? PHASE_TIP[phase] : st === 'queued' && q.position ? `Queued: #${q.position} to start` : word];
+  const tip = [phase ? (up ? UP_PHASE_TIP : PHASE_TIP)[phase] : st === 'queued' && q.position ? `Queued: #${q.position} to start` : word];
   let count = '';
   if (phase === 'verifying' && q.verified) {
     count = `${fmtCount(q.verified.done)}/${fmtCount(q.verified.total)}`;
@@ -2812,13 +2987,14 @@ function dlView(q) {
   const full = st === 'done' || phase === 'verifying';
   const mark = q.check === 'ok' ? '✓' : q.check === 'warn' ? '⚠︎' : '';
   return {
-    cls: `st-${st}${dlMatches(q) ? '' : ' leave'}`, // dimmed while it waits to leave under the filter
+    // Dimmed while it waits to leave under the filter.
+    cls: `st-${up && st === 'running' ? 'uploading' : st}${up ? ' up' : ''}${dlMatches(q) ? '' : ' leave'}`,
     grip: true,
     toggle: q.files ? (folderIsOpen(q) ? '▾' : '▸') : '',
     icon: [q.name, q.mode === 'folder'],
-    text: q.mode === 'folder' ? `${q.name}/` : q.name,
-    dest: `→ ${q.dest}`,
-    nameTip: `${q.remote}:${q.path}\n→ ${q.local || q.dest}`,
+    text: `${up ? '↑ ' : ''}${q.name}${q.mode === 'folder' ? '/' : ''}`,
+    dest: up ? `→ ${q.remote}:${q.into || '~'}` : `→ ${q.dest}`,
+    nameTip: up ? `${q.source}\n→ ${q.remote}:${q.path}` : `${q.remote}:${q.path}\n→ ${q.local || q.dest}`,
     word,
     wordCls: st === 'failed' ? 'bad' : '',
     statusTip: tip.join('\n'),
@@ -2845,7 +3021,7 @@ function fileStatus(q, c) {
   if (c.status === 'done') return { word: 'Done' };
   if (c.status === 'skipped') return { word: 'Skipped' };
   if (q.status === 'cancelled') return { word: 'Cancelled', muted: true, why: 'The folder was cancelled', over: true };
-  if (c.status === 'running') return { word: 'Downloading' };
+  if (c.status === 'running') return { word: isUp(q) ? 'Uploading' : 'Downloading' };
   if (c.status === 'waiting') return { word: 'Waiting', muted: true, why: WAIT_WHY };
   if (c.status === 'paused') return { word: 'Paused' };
   if (c.status === 'failed') return { word: 'Failed', bad: true, why: c.error || 'Failed' };
@@ -2855,13 +3031,14 @@ function fileStatus(q, c) {
 }
 
 // A file's two slots (5.4): Pause or Resume and Skip while it comes, Retry and Skip once failed,
-// Show once done; Skip alone while it waits with its folder; none once skipped or cancelled.
-function fileSlots(c, s) {
+// Show once done (an upload's: on the server); Skip alone while it waits with its folder; none
+// once skipped or cancelled.
+function fileSlots(c, s, up = false) {
   if (s.over || c.status === 'skipped') return [null, null];
   const skip = ['skip', 'Skip', 'Skip this file'];
   switch (c.status) {
-    case 'done': return [['show', 'Show', 'Show in folder'], null];
-    case 'failed': return [['retry', 'Retry', 'Download this file again'], skip];
+    case 'done': return [['show', 'Show', up ? 'Show on server' : 'Show in folder'], null];
+    case 'failed': return [['retry', 'Retry', up ? 'Upload this file again' : 'Download this file again'], skip];
     case 'paused': return [['resume', 'Resume'], skip];
     default: return [s.withFolder ? null : ['pause', 'Pause'], skip];
   }
@@ -2884,17 +3061,20 @@ function fileView(q, st, i) {
   const full = c.status === 'done';
   const total = full ? c.bytes || c.size : c.size; // done: as fetched
   // Saved under another name: one grab gave it (Keep both, or another file of the folder has its
-  // name on Windows), shown after an arrow; or the server's name made safe for Windows.
+  // name on Windows), shown after an arrow; or the server's name made safe for Windows. An
+  // upload's file goes under its own name.
+  const up = isUp(q);
   const name = c.local.slice(c.local.lastIndexOf('\\') + 1);
   return {
-    cls: `st-${c.status}${s.muted ? ' w-muted' : ''}${fileMatches(st, i) ? '' : ' leave'}`,
+    cls: `st-${up && c.status === 'running' ? 'uploading' : c.status}${s.muted ? ' w-muted' : ''}${fileMatches(st, i) ? '' : ' leave'}`,
     grip: false,
     toggle: '',
     icon: [c.path, false],
     text: c.named ? `${c.path} → ${name}` : c.path,
     dest: '',
-    nameTip: c.named ? `${c.path}\nSaved as ${name}: a file with its name on Windows is there or in the folder`
-      : c.local ? `${c.path}\nSaved as ${c.local}: Windows can’t take its name as it is` : c.path,
+    nameTip: up ? `${c.path}\n→ ${q.remote}:${serverChild(q.path, c.path)}`
+      : c.named ? `${c.path}\nSaved as ${name}: a file with its name on Windows is there or in the folder`
+        : c.local ? `${c.path}\nSaved as ${c.local}: Windows can’t take its name as it is` : c.path,
     word: s.word,
     wordCls: s.bad ? 'bad' : s.muted ? 'muted' : '',
     statusTip: tip.join('\n'),
@@ -2911,7 +3091,7 @@ function fileView(q, st, i) {
     prio,
     prioTip: 'Priority in the folder: higher ones start first, and running files of 2 MiB and more share ' +
       'the folder’s connections and speed by it',
-    slots: fileSlots(c, s),
+    slots: fileSlots(c, s, up),
   };
 }
 
@@ -3673,14 +3853,16 @@ function moveDownload(id, how) {
 
 // Cancel or Skip that deletes partly downloaded files asks first (5.8): Delete, and the menu on
 // more than one row (`ask`). A row's own button acts at once.
-function confirmDelete(ask, started, title, what, ok, go) {
+// `gone`: what goes with them ("their partly downloaded files are deleted").
+function confirmDelete(ask, started, title, what, ok, go, gone = 'their partly downloaded files are deleted',
+  keep = 'Keep downloading') {
   if (!ask || !started) { go(); return; }
   showModal({
     title,
-    html: `<p>${what}, and their partly downloaded files are deleted.</p>`,
+    html: `<p>${what}, and ${gone}.</p>`,
     ok,
     danger: true,
-    cancel: 'Keep downloading',
+    cancel: keep,
     onOk: go,
   });
 }
@@ -3689,15 +3871,22 @@ function cancelDownloads(qs, ask) {
   const list = qs.filter((q) => UNFINISHED.includes(q.status));
   if (!list.length) return;
   const one = list.length === 1;
-  confirmDelete(ask, list.some(startedBytes), one ? `Cancel “${list[0].name}”?` : `Cancel ${list.length} downloads?`,
-    `${one ? 'It stops' : 'They stop'} (files a folder finished are kept)`, one ? 'Cancel download' : `Cancel ${list.length}`,
-    () => list.forEach((q) => send({ type: 'cancelItem', id: q.id })));
+  const ups = list.filter(isUp).length;
+  const kind = ups === 0 ? 'downloads' : ups === list.length ? 'uploads' : 'transfers';
+  const gone = ups === 0 ? 'their partly downloaded files are deleted'
+    : ups === list.length ? 'what they sent but didn’t finish is removed from the server'
+      : 'partly downloaded files are deleted, and what uploads sent but didn’t finish is removed from the server';
+  confirmDelete(ask, list.some(startedBytes), one ? `Cancel “${list[0].name}”?` : `Cancel ${list.length} ${kind}?`,
+    `${one ? 'It stops' : 'They stop'} (files a folder finished are kept)`,
+    one ? (ups ? 'Cancel upload' : 'Cancel download') : `Cancel ${list.length}`,
+    () => list.forEach((q) => send({ type: 'cancelItem', id: q.id })), gone,
+    ups === 0 ? 'Keep downloading' : ups === list.length ? 'Keep uploading' : 'Keep going');
 }
 
 // What a file's slots offer (fileSlots), from its state alone.
 function fileActs(q, st, i) {
   const c = { status: FILE_STATES[st.status[i]] || 'queued', error: '' };
-  return fileSlots(c, fileStatus(q, c));
+  return fileSlots(c, fileStatus(q, c), isUp(q));
 }
 
 // Files of a folder, by index, in one "fileAction" (one save and one flush in the backend).
@@ -3781,8 +3970,18 @@ function downloadsMenu(qs) {
     }
   }
   items.push('-');
-  items.push({ label: 'Show in folder', act: () => send({ type: 'openFolder', id: qs[0].id }) });
-  items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(qs.map((q) => localPath(q))) });
+  // A download's local copy; an upload's server side (Browse there) and its source (UPLOADS.md 5.10).
+  const downs = qs.filter((q) => !isUp(q));
+  const ups = qs.filter(isUp);
+  if (downs.length) {
+    items.push({ label: 'Show in folder', act: () => send({ type: 'openFolder', id: downs[0].id }) });
+    items.push({ label: downs.length > 1 ? `Copy ${downs.length} paths` : 'Copy path', act: () => copyText(downs.map((q) => localPath(q))) });
+  }
+  if (ups.length) {
+    items.push({ label: 'Show on server', act: () => showOnServer(ups[0]) });
+    items.push({ label: 'Show in Explorer', act: () => send({ type: 'openFolder', id: ups[0].id }) });
+    items.push({ label: ups.length > 1 ? `Copy ${ups.length} server paths` : 'Copy server path', act: () => copyText(ups.map((q) => q.path)) });
+  }
   const errors = qs.filter((q) => q.status === 'failed' && q.error);
   if (errors.length) items.push({ label: errors.length > 1 ? `Copy ${errors.length} errors` : 'Copy error', act: () => copyText(errors.map((q) => q.error)) });
   return items;
@@ -3798,8 +3997,9 @@ function filesMenu(q, st, list) {
     for (const slot of fileActs(q, st, i)) if (slot && by[slot[0]]) by[slot[0]].push(i);
   }
   const items = [];
-  // One finished file opens in its app (chunk H); double-click and Ctrl+Enter do the same.
-  if (n === 1 && st.status[list[0]] === FS.done) {
+  // One finished file opens in its app (chunk H); double-click and Ctrl+Enter do the same. Not an
+  // upload's: it isn't grab's.
+  if (n === 1 && st.status[list[0]] === FS.done && !isUp(q)) {
     items.push({ label: 'Open', key: 'Ctrl+Enter', act: () => dlOpen({ kind: 'file', id: q.id, index: list[0] }) }, '-');
   }
   if (by.pause.length) items.push({ label: counted('Pause', by.pause), act: () => fileAction(q, st, 'pause', by.pause) });
@@ -3816,8 +4016,14 @@ function filesMenu(q, st, list) {
     }
   }
   if (items.length) items.push('-');
-  items.push({ label: 'Show in folder', act: () => send({ type: 'showFile', id: q.id, gen: st.gen, index: list[0] }) });
-  items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(list.map((i) => localPath(q, st, i))) });
+  if (isUp(q)) {
+    items.push({ label: 'Show on server', act: () => showOnServer(q, list[0]) });
+    items.push({ label: 'Show in Explorer', act: () => send({ type: 'showFile', id: q.id, gen: st.gen, index: list[0] }) });
+    items.push({ label: n > 1 ? `Copy ${n} server paths` : 'Copy server path', act: () => copyText(list.map((i) => serverChild(q.path, st.path[i]))) });
+  } else {
+    items.push({ label: 'Show in folder', act: () => send({ type: 'showFile', id: q.id, gen: st.gen, index: list[0] }) });
+    items.push({ label: n > 1 ? `Copy ${n} paths` : 'Copy path', act: () => copyText(list.map((i) => localPath(q, st, i))) });
+  }
   const errors = list.filter((i) => st.status[i] === FS.failed && st.errors.get(i));
   if (errors.length) {
     items.push({ label: errors.length > 1 ? `Copy ${errors.length} errors` : 'Copy error',
@@ -3838,7 +4044,7 @@ function dlMenu() {
 // Explorer; '' for anything else (unfinished, failed, cancelled, skipped, a message row).
 function dlOpenKind(r) {
   const q = r && dl.byId.get(r.id);
-  if (!q) return '';
+  if (!q || isUp(q)) return ''; // an upload's file is the user's own, not one grab wrote
   if (r.kind === 'file') {
     const st = dl.stores.get(r.id);
     return st && st.status[r.index] === FS.done ? 'file' : '';
@@ -3882,8 +4088,11 @@ function dlAct(r, act) {
   } else if (r.kind === 'file') {
     const st = dl.stores.get(r.id);
     if (!st) return;
-    if (act === 'show') send({ type: 'showFile', id: q.id, gen: st.gen, index: r.index });
+    if (act === 'show' && isUp(q)) showOnServer(q, r.index);
+    else if (act === 'show') send({ type: 'showFile', id: q.id, gen: st.gen, index: r.index });
     else if (['pause', 'resume', 'retry', 'skip'].includes(act)) fileAction(q, st, act, [r.index]);
+  } else if (act === 'show' && isUp(q)) {
+    showOnServer(q);
   } else if (act === 'resume') {
     resumeItem(q);
   } else {
@@ -3973,8 +4182,13 @@ function endDrag(drop) {
     if (ev.button === 2) { if (!isSel(r)) selectDl(r); else renderDlBody(); return; }
     selectDl(r, { toggle: ev.ctrlKey, extend: ev.shiftKey });
     // A double-click opens a finished file (chunk H), by the second press's click count, as in
-    // Browse; a folder's row and an unfinished one do nothing more than a click.
-    if (ev.button === 0 && ev.detail === 2 && !ev.ctrlKey && !ev.shiftKey && dlOpenKind(r) === 'file') dlOpen(r);
+    // Browse; a folder's row and an unfinished one do nothing more than a click. An upload's row
+    // (or file) opens Browse where it goes.
+    if (ev.button === 0 && ev.detail === 2 && !ev.ctrlKey && !ev.shiftKey) {
+      const q = dl.byId.get(r.id);
+      if (dlOpenKind(r) === 'file') dlOpen(r);
+      else if (q && isUp(q) && r.kind !== 'msg') showOnServer(q, r.kind === 'file' ? r.index : null);
+    }
   });
   body.addEventListener('contextmenu', (ev) => {
     const r = rowOfEl(ev.target.closest('.dl-row'));
@@ -4055,8 +4269,12 @@ function endDrag(drop) {
       ev.preventDefault();
       const q = r && r.kind === 'dl' ? dl.byId.get(r.id) : null;
       const st = r && r.kind === 'file' ? dl.stores.get(r.id) : null;
-      if (q && (q.status === 'done' || q.status === 'skipped')) send({ type: 'openFolder', id: q.id });
-      else if (st && st.status[r.index] === FS.done) send({ type: 'showFile', id: r.id, gen: st.gen, index: r.index });
+      const fq = st ? dl.byId.get(r.id) : null;
+      if (q && (q.status === 'done' || q.status === 'skipped')) {
+        if (isUp(q)) showOnServer(q); else send({ type: 'openFolder', id: q.id });
+      } else if (st && st.status[r.index] === FS.done) {
+        if (fq && isUp(fq)) showOnServer(fq, r.index); else send({ type: 'showFile', id: r.id, gen: st.gen, index: r.index });
+      }
     } else if (ev.key === 'Enter' && ev.ctrlKey && !ev.shiftKey) {
       ev.preventDefault();
       if (r) dlOpen(r); // the cursor's row, once finished
@@ -4173,10 +4391,10 @@ function goToRunning() {
   renderDlBody();
 }
 
-// Show: All / Unfinished / Failed (decision 2), for this session: rows that no longer pass dim and
-// leave at most once a second, never while the pointer is over the table.
+// Show: All / Unfinished / Failed (decision 2) / Downloads / Uploads, for this session: rows that no
+// longer pass dim and leave at most once a second, never while the pointer is over the table.
 function setDlShow(show) {
-  dl.show = ['unfinished', 'failed'].includes(show) ? show : 'all';
+  dl.show = ['unfinished', 'failed', 'downloads', 'uploads'].includes(show) ? show : 'all';
   $('#dl-show').value = dl.show;
   showDlOrder();
 }
@@ -4210,13 +4428,16 @@ function renderQueue() {
     }
   }
   const count = (st) => state.queue.filter((q) => q.status === st).length;
+  const uploading = state.queue.filter((q) => q.status === 'running' && isUp(q)).length;
   const running = count('running');
   const queued = count('queued');
   const paused = count('paused');
+  // The title stays "Downloads"; running uploads have their own count (UPLOADS.md decision 2).
   const parts = [];
-  if (running) parts.push(`${running} running`);
+  if (running - uploading) parts.push(`${running - uploading} running`);
   if (queued) parts.push(`${queued} queued`);
   if (paused) parts.push(`${paused} paused`);
+  if (uploading) parts.push(`${uploading} uploading`);
   const summary = parts.join(' · ');
   if ($('#dl-summary').textContent !== summary) $('#dl-summary').textContent = summary; // announced when it changes
   $('#downloads .title').title = summary; // a narrow panel shows it only here
@@ -4450,17 +4671,20 @@ function splitZone(target) {
 // 'speed': a recent average over about 5 s), not the rows' speeds added up. The limit that
 // applies follows it while there is one, running or not: "· 12 MiB/s limit".
 function renderTotalSpeed() {
-  const running = state.queue.filter((q) => q.status === 'running');
+  // Downloads' own: uploads' bytes aren't in the total (their ↑ comes with chunk 6), only their count.
+  const running = state.queue.filter((q) => q.status === 'running' && !isUp(q));
+  const uploading = state.queue.filter((q) => q.status === 'running' && isUp(q)).length;
   const el = $('#total-speed');
   const limit = $('#total-limit');
   limit.hidden = !state.limitOn;
   limit.textContent = state.limitOn ? `· ${fmtMiBps(state.limitMiBps)} limit` : '';
+  const ups = uploading ? ` · ${uploading} uploading` : '';
   if (!running.length) {
-    el.textContent = 'No downloads running';
+    el.textContent = `No downloads running${ups}`;
     el.classList.remove('limited');
     return;
   }
-  el.textContent = `↓ ${fmtSpeed(state.totalSpeed)} total · ${running.length} running`;
+  el.textContent = `↓ ${fmtSpeed(state.totalSpeed)} total · ${running.length} running${ups}`;
   el.classList.toggle('limited', state.limitOn);
 }
 
@@ -4742,13 +4966,15 @@ function setParallel(n) {
 function cancelAll() {
   const started = state.queue.some((q) => ['running', 'paused', 'failed'].includes(q.status) && q.bytes > 0);
   if (!started) { send({ type: 'cancelAll' }); return; }
+  const ups = state.queue.some((q) => isUp(q) && UNFINISHED.includes(q.status));
   showModal({
-    title: 'Cancel all downloads?',
-    html: '<p>Every running, queued and paused download stops, and their partly downloaded files are deleted. ' +
-      'Finished downloads are kept.</p>',
+    title: ups ? 'Cancel all downloads and uploads?' : 'Cancel all downloads?',
+    html: `<p>Every running, queued and paused ${ups ? 'download and upload' : 'download'} stops, and their partly ` +
+      `downloaded files are deleted${ups ? ' (what uploads sent but didn’t finish is removed from the server)' : ''}. ` +
+      `Finished ${ups ? 'ones' : 'downloads'} are kept.</p>`,
     ok: 'Cancel all',
     danger: true,
-    cancel: 'Keep downloading',
+    cancel: ups ? 'Keep going' : 'Keep downloading',
     onOk: () => send({ type: 'cancelAll' }),
   });
 }
@@ -5293,6 +5519,7 @@ function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, o
   $('#modal-cancel').textContent = cancel;
   const okBtn = $('#modal-ok');
   okBtn.textContent = ok;
+  okBtn.disabled = false; // the upload dialog's waits for its checks (onUploadCheck)
   okBtn.classList.toggle('danger', danger);
   // More choices, between Cancel and OK: each closes the dialog and acts.
   document.querySelectorAll('#modal .modal-extra').forEach((b) => b.remove());
@@ -5408,6 +5635,7 @@ if (webview) {
       case 'browseResult': onBrowseResult(msg); break;
       case 'spaceShort': onSpaceShort(msg); break;
       case 'existing': onExisting(msg); break;
+      case 'uploadCheck': onUploadCheck(msg); break;
       case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
@@ -5800,6 +6028,12 @@ $('#results').addEventListener('keydown', (ev) => {
     renderRows();
   } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
     ev.preventDefault();
+    // No row under the cursor (an empty folder): the open folder's own menu, as on the list's empty part.
+    if (state.cursor < 0 || !state.hits[state.cursor]) {
+      const r = $('#results').getBoundingClientRect();
+      showMenu(r.left + 40, r.top + 8, folderMenu());
+      return;
+    }
     const row = document.querySelector(`#rows .row[data-i="${state.cursor}"]`);
     if (!row) return;
     const r = row.getBoundingClientRect();

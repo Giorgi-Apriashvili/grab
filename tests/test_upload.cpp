@@ -981,6 +981,58 @@ TEST_CASE("upload: cancel removes the temp and the record; a small file's temp c
     CHECK(upload::discard(*pool, dir.records(), "Fake", "/up/none"));
 }
 
+TEST_CASE("upload: discarding a partial upload waits for a connection without holding its record") {
+    Server srv;
+    Dir dir("discard-wait");
+    const fs::path local = local_file(dir, test::pattern(3u << 20));
+    auto pool = srv.fake.pool(1);
+    fetch::Connections connections;
+    connections.configure("Fake", 1);
+    {
+        auto u = upload_of(local, pool, dir);
+        std::stop_source stop;
+        u.on_sent = [&](std::uint64_t) { stop.request_stop(); };
+        REQUIRE(upload::run(u, connections, {}, stop.get_token()).outcome == upload::Outcome::stopped);
+    }
+    REQUIRE(upload::saved_progress(dir.records(), "Fake", "/up/f.bin"));
+    fs::path lock_file = upload::record_path(dir.records(), "Fake", "/up/f.bin");
+    lock_file.replace_extension(".lock");
+
+    // The record held (a Retry's run has it): the connection goes back unbroken, the record stays.
+    {
+        auto held = util::lock_file(lock_file, 0ms);
+        REQUIRE(held);
+        const auto busy = upload::discard(*pool, dir.records(), "Fake", "/up/f.bin");
+        CHECK_FALSE(busy);
+        CHECK(busy.error_or("") == "Fake:/up/f.bin is still being uploaded");
+    }
+    CHECK(srv.temps().size() == 1);
+    REQUIRE(upload::saved_progress(dir.records(), "Fake", "/up/f.bin"));
+    const int logins = srv.fake.logins;
+
+    // The pool's one connection in use (a transfer's): while discard waits for it, the record is
+    // free for a Retry's run (review, chunk 3: it was locked for that whole wait).
+    auto in_use = pool->acquire();
+    REQUIRE(in_use);
+    std::atomic<bool> over{false};
+    std::expected<void, std::string> gone;
+    std::jthread discarding([&] {
+        gone = upload::discard(*pool, dir.records(), "Fake", "/up/f.bin");
+        over = true;
+    });
+    for (int i = 0; i < 20; ++i) {
+        CHECK_FALSE(over.load());
+        CHECK(util::lock_file(lock_file, 0ms)); // taken and given back at once
+        std::this_thread::sleep_for(10ms);
+    }
+    in_use.reset();
+    discarding.join();
+    CHECK_MESSAGE(gone, gone.error_or(""));
+    CHECK_FALSE(upload::saved_progress(dir.records(), "Fake", "/up/f.bin"));
+    CHECK(srv.temps().empty());
+    CHECK(srv.fake.logins == logins); // the one connection, never broken
+}
+
 TEST_CASE("upload: a small file stopped as its temp is made hands the temp back") {
     Server srv;
     srv.put("/up/other", "x");
