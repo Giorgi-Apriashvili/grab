@@ -19,6 +19,7 @@
 
 #include "fetch.hpp"
 #include "rate.hpp"
+#include "sftp.hpp"
 #include "upload_existing.hpp"
 
 #include <atomic>
@@ -38,11 +39,6 @@
 namespace grab::ssh {
 class Pool;
 } // namespace grab::ssh
-
-namespace grab::sftp {
-class Client;
-struct Status;
-} // namespace grab::sftp
 
 namespace grab::upload {
 
@@ -104,6 +100,10 @@ private:
 // Six random hex digits.
 [[nodiscard]] std::string new_token();
 
+// How an upload ended. skipped: the choice kept the file there (Result::note says why when it
+// wasn't the user's choice); exists: a file is there and the choice is to ask.
+enum class Outcome { done, stopped, failed, exists, skipped };
+
 // The bytes this account may still write where the server says (statvfs), its WRITE size and
 // whether it replaces in one step: what the connection's server offers.
 struct Caps {
@@ -120,10 +120,16 @@ struct Caps {
 // refuses with "Failure"), "<Server> doesn't let this account write in <dir>" for "permission
 // denied", "<Server>:<dir> is full: X free, Y needed" for a "Failure" with less than `needed`
 // bytes free, "the name is too long for the server" for a bad message, else the server's own.
-// `fatal`: trying again can't help.
+// `fatal`: trying again can't help. `scope`: what else it holds for: the whole server (read-only,
+// full), every new file in that folder (no write access, no such folder), or this file alone.
+// `kept_temp`: place's "the old X was removed, but the new file couldn't take its name": the temp
+// holds the only copy now, and stays.
 struct Refusal {
+    enum class Scope { file, folder, server };
     std::string why;
     bool fatal = false;
+    Scope scope = Scope::file;
+    bool kept_temp = false;
 };
 [[nodiscard]] Refusal refusal(sftp::Client& client, const Caps& caps, std::string_view server, std::string_view dir,
                               std::string_view raw_dir, const sftp::Status& status, std::uint64_t needed);
@@ -142,6 +148,39 @@ struct Probe {
 // then not known.
 [[nodiscard]] std::expected<Probe, std::string> probe(ssh::Pool& pool, std::string_view server, std::string_view dir,
                                                       std::stop_token stop = {});
+
+// What is at `raw` on the server: nothing (nullopt), or its attributes, through a link (a link
+// that leads nowhere: a file of unknown size and time).
+[[nodiscard]] std::expected<std::optional<sftp::Attrs>, sftp::Status> look_at(sftp::Client& c, const std::string& raw);
+// The clash of a file of `size` bytes modified at `mtime` (seconds since 1970) with what is at its
+// name `name` on the server.
+[[nodiscard]] Clash clash_with(std::string_view name, std::uint64_t size, std::int64_t mtime, const sftp::Attrs& there);
+
+// A complete temp file to put in place (place).
+struct PlaceRequest {
+    std::string server;      // its name in messages
+    std::string temp;        // the temp file, grab's form, in the target's folder
+    std::string target;      // where it goes, grab's form
+    Existing existing = Existing::ask;
+    std::uint64_t size = 0;  // the local file's, for the clash
+    std::int64_t mtime = 0;  // seconds since 1970
+    std::function<void(const std::vector<std::string>&)> on_command;
+};
+struct Placement {
+    Outcome outcome = Outcome::done; // done, exists (the choice is to ask) or skipped
+    std::string placed;              // done: where it went (Keep both: the numbered name)
+    std::optional<Clash> clash;      // exists, skipped: the file there
+    std::string note;                // skipped: why, when it wasn't the user's choice
+};
+// The temp file into place by the rules (UPLOADS.md 5.3), the name looked at right before each
+// try: a new name by a plain RENAME (which never replaces anything on OpenSSH), a taken one by the
+// choice (decide): Replace with posix-rename where offered, else REMOVE then RENAME; Skip removes
+// the temp; Keep both takes the first numbered name free; Ask leaves the temp (Outcome::exists).
+// `renaming` keeps the name a rename was last sent for, so a step tried again after a broken link
+// can find the file placed. Blocking requests on `c`; a refusal says why (fatal: trying again
+// can't help).
+[[nodiscard]] std::expected<Placement, Refusal> place(sftp::Client& c, const Caps& caps, const PlaceRequest& r,
+                                                      std::string& renaming);
 
 // What a file's record (records_dir/<hash>.json, record_path) keeps: the State of the file's
 // ranges as a download's (fetch::State: rclone_remote = the server, path = the target, modtime =
@@ -192,15 +231,13 @@ struct Upload {
     std::filesystem::path records_dir;
 };
 
-// skipped: the choice kept the file there (Result::note says why when it wasn't the user's
-// choice); exists: a file is there and the choice is to ask.
-enum class Outcome { done, stopped, failed, exists, skipped };
 struct Result {
     Outcome outcome = Outcome::failed;
     std::string error;
     std::string note;   // e.g. "the file changed while uploading; started over"
     std::string placed; // done: where the file went, grab's form (Keep both: the numbered name)
     std::uint64_t size = 0; // the local file's, once looked at
+    std::int64_t mtime_ns = 0; // ...and its time (nanoseconds since 1970), which done gave the server's copy
     std::optional<Clash> clash; // exists, skipped: the file there
     // A temp file left on the server without a record (a small file stopped or failed, or one that
     // couldn't be removed), grab's form: the caller removes it (remove_temp) or notes it.

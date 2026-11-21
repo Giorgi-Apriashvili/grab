@@ -62,11 +62,15 @@ struct FakePool {
     std::uint32_t max_write = 0;
     bool statvfs = false;
     bool no_setstat = false;
+    std::set<std::string> locked_dirs;           // folders no name may be added to or removed from (chmod 555)
+    sftp::Code mkdir_existing_as = sftp::Code::failure; // what MKDIR of a name there answers
+    std::set<std::string> rename_refused;        // plain RENAMEs to these answer "Permission denied"
     std::atomic<bool> break_after_rename{false}; // the next RENAME/posix-rename, on any session
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
     std::vector<FakeServer::Write> writes;   // every session's WRITEs, as each closed
     std::vector<std::string> requests;       // and their requests, by name
+    std::map<int, std::vector<std::string>> requests_by; // login -> its requests, in order
     std::map<int, std::uint64_t> asked_by; // login -> bytes its READs asked for
     std::map<int, std::vector<std::pair<std::uint64_t, std::uint32_t>>> reads_by; // login -> its READs
     std::vector<std::string> opened;
@@ -85,6 +89,8 @@ struct FakePool {
                 server.fifos = f.fifos;
                 server.no_size = f.no_size;
                 server.denied = f.denied;
+                server.locked_dirs = f.locked_dirs;
+                server.rename_refused = f.rename_refused;
                 server.listed_size = f.claimed;
                 server.break_on_close = f.break_on_close;
                 if (const auto it = f.slow.find(n); it != f.slow.end()) server.delay = it->second;
@@ -103,6 +109,7 @@ struct FakePool {
             server.max_write = f.max_write;
             server.statvfs = f.statvfs;
             server.no_setstat = f.no_setstat;
+            server.mkdir_existing_as = f.mkdir_existing_as;
             server.break_after_rename = &f.break_after_rename;
             if (f.reads_wait_for_logins > 0) {
                 server.on_read = [&f](const std::string&, std::uint32_t) {
@@ -123,6 +130,7 @@ struct FakePool {
             fake.opened.insert(fake.opened.end(), server.opened.begin(), server.opened.end());
             fake.writes.insert(fake.writes.end(), server.writes.begin(), server.writes.end());
             fake.requests.insert(fake.requests.end(), server.requests.begin(), server.requests.end());
+            fake.requests_by[login] = server.requests;
         }
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;

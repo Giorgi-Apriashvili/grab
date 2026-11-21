@@ -301,20 +301,33 @@ Refusal refusal(sftp::Client& client, const Caps& caps, std::string_view server,
     const std::string said = util::to_lower(status.message);
     const bool says_read_only = said.find("read-only") != std::string::npos || said.find("read only") != std::string::npos;
     if ((fs && fs->read_only()) || (!fs && status.code == sftp::Code::failure && says_read_only)) {
-        return {.why = std::format("{} is read-only for this account: nothing can be uploaded to {}", server, where), .fatal = true};
+        return {.why = std::format("{} is read-only for this account: nothing can be uploaded to {}", server, where),
+                .fatal = true,
+                .scope = Refusal::Scope::server,
+                .kept_temp = false};
     }
     if (status.code == sftp::Code::permission_denied ||
         (!fs && status.code == sftp::Code::failure && said.find("denied") != std::string::npos)) {
-        return {.why = std::format("{} doesn't let this account write in {}", server, where), .fatal = true};
+        return {.why = std::format("{} doesn't let this account write in {}", server, where),
+                .fatal = true,
+                .scope = Refusal::Scope::folder,
+                .kept_temp = false};
     }
     if (status.code == sftp::Code::failure && fs && fs->free_bytes() < needed) {
         return {.why = std::format("{}:{} is full: {} free, {} needed", server, where, util::format_size(fs->free_bytes()),
                                    util::format_size(needed)),
-                .fatal = true};
+                .fatal = true,
+                .scope = Refusal::Scope::server,
+                .kept_temp = false};
     }
-    if (status.code == sftp::Code::bad_message) return {.why = "the name is too long for the server", .fatal = true};
+    if (status.code == sftp::Code::bad_message) {
+        return {.why = "the name is too long for the server", .fatal = true, .scope = Refusal::Scope::file, .kept_temp = false};
+    }
     const bool fatal = status.code == sftp::Code::no_such_file || status.code == sftp::Code::op_unsupported;
-    return {.why = sftp::describe(status), .fatal = fatal};
+    return {.why = sftp::describe(status),
+            .fatal = fatal,
+            .scope = status.code == sftp::Code::no_such_file ? Refusal::Scope::folder : Refusal::Scope::file,
+            .kept_temp = false};
 }
 
 std::expected<Probe, std::string> probe(ssh::Pool& pool, std::string_view server, std::string_view dir,
@@ -505,19 +518,6 @@ std::expected<T, Trouble> on_connection(const Upload& u, fetch::Connections& con
     }
 }
 
-// What is at `raw` on the server: nothing (nullopt), or its attributes, through a link (a link
-// that leads nowhere: a file of unknown size and time).
-std::expected<std::optional<sftp::Attrs>, sftp::Status> look_at(sftp::Client& c, const std::string& raw) {
-    auto a = sftp::lstat(c, raw);
-    if (!a) {
-        if (a.error().code == sftp::Code::no_such_file) return std::optional<sftp::Attrs>();
-        return std::unexpected(a.error());
-    }
-    if (!a->is_link()) return std::optional<sftp::Attrs>(*a);
-    if (auto through = sftp::stat(c, raw)) return std::optional<sftp::Attrs>(*through);
-    return std::optional<sftp::Attrs>(sftp::Attrs{.size = {}, .permissions = 0100644, .mtime = {}});
-}
-
 std::int64_t seconds_of(std::int64_t ns) {
     return ns >= 0 ? ns / 1'000'000'000 : -((-ns + 999'999'999) / 1'000'000'000);
 }
@@ -528,12 +528,7 @@ std::string utc_rfc3339_ns(std::int64_t ns) {
 }
 
 Clash clash_of(const LocalFile& file, std::string_view name, const sftp::Attrs& there) {
-    return Clash{.file = std::string(name),
-                 .local_size = file.size(),
-                 .local_mtime = seconds_of(file.mtime_ns()),
-                 .remote_size = there.size.value_or(0),
-                 .remote_mtime = there.mtime ? std::optional<std::int64_t>(*there.mtime) : std::nullopt,
-                 .remote_is_dir = there.is_dir()};
+    return clash_with(name, file.size(), seconds_of(file.mtime_ns()), there);
 }
 
 // The first "name (n).ext" in the folder that nothing on the server has (Keep both).
@@ -546,6 +541,102 @@ std::expected<std::string, sftp::Status> free_numbered(sftp::Client& c, std::str
     }
     return std::unexpected(sftp::Status{.code = sftp::Code::failure, .message = "every numbered name up to 999 is taken"});
 }
+
+} // namespace
+
+Clash clash_with(std::string_view name, std::uint64_t size, std::int64_t mtime, const sftp::Attrs& there) {
+    return Clash{.file = std::string(name),
+                 .local_size = size,
+                 .local_mtime = mtime,
+                 .remote_size = there.size.value_or(0),
+                 .remote_mtime = there.mtime ? std::optional<std::int64_t>(*there.mtime) : std::nullopt,
+                 .remote_is_dir = there.is_dir()};
+}
+
+std::expected<std::optional<sftp::Attrs>, sftp::Status> look_at(sftp::Client& c, const std::string& raw) {
+    auto a = sftp::lstat(c, raw);
+    if (!a) {
+        if (a.error().code == sftp::Code::no_such_file) return std::optional<sftp::Attrs>();
+        return std::unexpected(a.error());
+    }
+    if (!a->is_link()) return std::optional<sftp::Attrs>(*a);
+    if (auto through = sftp::stat(c, raw)) return std::optional<sftp::Attrs>(*through);
+    return std::optional<sftp::Attrs>(sftp::Attrs{.size = {}, .permissions = 0100644, .mtime = {}});
+}
+
+std::expected<Placement, Refusal> place(sftp::Client& c, const Caps& caps, const PlaceRequest& r, std::string& renaming) {
+    const auto [dir, name] = split_remote(r.target);
+    const std::string raw_dir = rclone_enc::raw_path(dir);
+    const std::string raw_temp = rclone_enc::raw_path(r.temp);
+    auto fatal = [](std::string why, bool kept_temp = false) {
+        return std::unexpected(Refusal{.why = std::move(why), .fatal = true, .scope = Refusal::Scope::file, .kept_temp = kept_temp});
+    };
+    std::string target = r.target;
+    for (int tries = 0; tries < 8; ++tries) {
+        const std::string raw = rclone_enc::raw_path(target);
+        auto there = look_at(c, raw);
+        if (!there) return fatal(refusal(c, caps, r.server, dir, raw_dir, there.error(), 0).why);
+        if (!*there) {
+            // A new name: RENAME, which never replaces anything on OpenSSH; a name taken
+            // meanwhile gets the choice on the next round.
+            if (r.on_command) r.on_command({"sftp", "rename", r.temp, target});
+            renaming = target;
+            auto moved = sftp::rename(c, raw_temp, raw);
+            if (moved) return Placement{.outcome = Outcome::done, .placed = target, .clash = {}, .note = {}};
+            renaming.clear();
+            if (sftp::lstat(c, raw)) continue;
+            return fatal(refusal(c, caps, r.server, dir, raw_dir, moved.error(), 0).why);
+        }
+        const Clash clash = clash_with(split_remote(target).second, r.size, r.mtime, **there);
+        const Decision d = decide(r.existing, clash);
+        switch (d.action) {
+        case Action::ask: return Placement{.outcome = Outcome::exists, .placed = {}, .clash = clash, .note = {}};
+        case Action::skip: {
+            if (r.on_command) r.on_command({"sftp", "rm", r.temp});
+            if (auto removed = sftp::remove(c, raw_temp); !removed && removed.error().code != sftp::Code::no_such_file) {
+                return std::unexpected(
+                    Refusal{.why = sftp::describe(removed.error()), .fatal = false, .scope = Refusal::Scope::file, .kept_temp = false});
+            }
+            return Placement{.outcome = Outcome::skipped, .placed = {}, .clash = clash, .note = d.note};
+        }
+        case Action::numbered: {
+            auto numbered = free_numbered(c, dir, name);
+            if (!numbered) return fatal(refusal(c, caps, r.server, dir, raw_dir, numbered.error(), 0).why);
+            target = *numbered;
+            continue;
+        }
+        case Action::replace: break;
+        }
+        if (caps.posix_rename) { // in one step
+            if (r.on_command) r.on_command({"sftp", "posix-rename", r.temp, target});
+            renaming = target;
+            if (auto moved = sftp::posix_rename(c, raw_temp, raw); !moved) {
+                return fatal(refusal(c, caps, r.server, dir, raw_dir, moved.error(), 0).why);
+            }
+            return Placement{.outcome = Outcome::done, .placed = target, .clash = {}, .note = {}};
+        }
+        // Without posix-rename: the old file goes first (only because the user chose to
+        // replace it), then the new one takes its name.
+        if (r.on_command) r.on_command({"sftp", "rm", target});
+        if (auto removed = sftp::remove(c, raw); !removed && removed.error().code != sftp::Code::no_such_file) {
+            return fatal(refusal(c, caps, r.server, dir, raw_dir, removed.error(), 0).why);
+        }
+        if (r.on_command) r.on_command({"sftp", "rename", r.temp, target});
+        renaming = target;
+        if (auto moved = sftp::rename(c, raw_temp, raw); !moved) {
+            renaming.clear();
+            if (sftp::lstat(c, raw)) continue; // taken again meanwhile
+            return fatal(std::format("the old {} was removed, but the new file couldn't take its name: it is {} ({})", target,
+                                     r.temp, sftp::describe(moved.error())),
+                         true);
+        }
+        return Placement{.outcome = Outcome::done, .placed = target, .clash = {}, .note = {}};
+    }
+    return std::unexpected(Refusal{
+        .why = "the name kept being taken on the server meanwhile", .fatal = false, .scope = Refusal::Scope::file, .kept_temp = false});
+}
+
+namespace {
 
 // What the streams came to.
 struct Sent {
@@ -1109,10 +1200,12 @@ Result run(const Upload& u, fetch::Connections& connections, const std::function
         r.outcome = Outcome::stopped;
         r.note = note;
         r.size = file.size();
+        r.mtime_ns = file.mtime_ns();
         return r;
     };
     for (int round = 0;; ++round) {
         result.size = file.size();
+        result.mtime_ns = file.mtime_ns();
         // A file this big keeps a record, held by this run alone: the window and the command can't
         // upload to the same place at once.
         const bool recorded = !u.records_dir.empty() && file.size() >= small_limit;
@@ -1266,6 +1359,7 @@ Result run(const Upload& u, fetch::Connections& connections, const std::function
             r.error = std::move(error);
             r.note = note;
             r.size = file.size();
+            r.mtime_ns = file.mtime_ns();
             r.temp = left;
             return r;
         };
@@ -1354,67 +1448,17 @@ Result run(const Upload& u, fetch::Connections& connections, const std::function
                 default: return trouble(budget::Failure::other, refusal(c, caps, u.server, dir, raw_dir, timed.error(), 0).why);
                 }
             }
-            std::string target = u.remote_path;
-            for (int tries = 0; tries < 8; ++tries) {
-                const std::string raw = rclone_enc::raw_path(target);
-                auto there = look_at(c, raw);
-                if (!there) return trouble(budget::Failure::fatal, refusal(c, caps, u.server, dir, raw_dir, there.error(), 0).why);
-                if (!*there) {
-                    // A new name: RENAME, which never replaces anything on OpenSSH; a name taken
-                    // meanwhile gets the choice on the next round.
-                    if (u.on_command) u.on_command({"sftp", "rename", job.temp, target});
-                    renaming = target;
-                    auto moved = sftp::rename(c, job.raw_temp, raw);
-                    if (moved) return Placed{.outcome = Outcome::done, .placed = target, .clash = {}, .note = {}};
-                    renaming.clear();
-                    if (sftp::lstat(c, raw)) continue;
-                    return trouble(budget::Failure::fatal, refusal(c, caps, u.server, dir, raw_dir, moved.error(), 0).why);
-                }
-                const Clash clash = clash_of(file, split_remote(target).second, **there);
-                const Decision d = decide(u.existing, clash);
-                switch (d.action) {
-                case Action::ask: return Placed{.outcome = Outcome::exists, .placed = {}, .clash = clash, .note = {}};
-                case Action::skip: {
-                    if (u.on_command) u.on_command({"sftp", "rm", job.temp});
-                    if (auto r = sftp::remove(c, job.raw_temp); !r && r.error().code != sftp::Code::no_such_file) {
-                        return trouble(budget::Failure::other, sftp::describe(r.error()));
-                    }
-                    return Placed{.outcome = Outcome::skipped, .placed = {}, .clash = clash, .note = d.note};
-                }
-                case Action::numbered: {
-                    auto numbered = free_numbered(c, dir, name);
-                    if (!numbered) return trouble(budget::Failure::fatal, refusal(c, caps, u.server, dir, raw_dir, numbered.error(), 0).why);
-                    target = *numbered;
-                    continue;
-                }
-                case Action::replace: break;
-                }
-                if (caps.posix_rename) { // in one step
-                    if (u.on_command) u.on_command({"sftp", "posix-rename", job.temp, target});
-                    renaming = target;
-                    if (auto moved = sftp::posix_rename(c, job.raw_temp, raw); !moved) {
-                        return trouble(budget::Failure::fatal, refusal(c, caps, u.server, dir, raw_dir, moved.error(), 0).why);
-                    }
-                    return Placed{.outcome = Outcome::done, .placed = target, .clash = {}, .note = {}};
-                }
-                // Without posix-rename: the old file goes first (only because the user chose to
-                // replace it), then the new one takes its name.
-                if (u.on_command) u.on_command({"sftp", "rm", target});
-                if (auto removed = sftp::remove(c, raw); !removed && removed.error().code != sftp::Code::no_such_file) {
-                    return trouble(budget::Failure::fatal, refusal(c, caps, u.server, dir, raw_dir, removed.error(), 0).why);
-                }
-                if (u.on_command) u.on_command({"sftp", "rename", job.temp, target});
-                renaming = target;
-                if (auto moved = sftp::rename(c, job.raw_temp, raw); !moved) {
-                    renaming.clear();
-                    if (sftp::lstat(c, raw)) continue; // taken again meanwhile
-                    return trouble(budget::Failure::fatal,
-                                   std::format("the old {} was removed, but the new file couldn't take its name: it is {} ({})", target,
-                                               job.temp, sftp::describe(moved.error())));
-                }
-                return Placed{.outcome = Outcome::done, .placed = target, .clash = {}, .note = {}};
-            }
-            return trouble(budget::Failure::other, "the name kept being taken on the server meanwhile");
+            auto p = place(c, caps,
+                           PlaceRequest{.server = u.server,
+                                        .temp = job.temp,
+                                        .target = u.remote_path,
+                                        .existing = u.existing,
+                                        .size = file.size(),
+                                        .mtime = seconds_of(file.mtime_ns()),
+                                        .on_command = u.on_command},
+                           renaming);
+            if (!p) return trouble(p.error().fatal ? budget::Failure::fatal : budget::Failure::other, p.error().why);
+            return Placed{.outcome = p->outcome, .placed = p->placed, .clash = p->clash, .note = p->note};
         });
         if (stop.stop_requested() && !placed) return ended(Outcome::stopped, {});
         if (!placed) return ended(Outcome::failed, placed.error().why);

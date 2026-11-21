@@ -135,6 +135,13 @@ public:
     bool statvfs = false;           // statvfs@openssh.com offered: quota_bytes' figures (else 1 TiB), ST_RDONLY as above
     bool fsync = false;             // fsync@openssh.com offered
     bool no_setstat = false;        // SETSTAT and FSETSTAT answer "Operation unsupported", as some gateways do
+    // Folders this account can't write in (chmod 555, as on Main): a new file or folder in one, a
+    // REMOVE or RENAME of a name in one, answer "Permission denied".
+    std::set<std::string> locked_dirs;
+    // What MKDIR of a name there already answers: OpenSSH's "Failure", or "Permission denied" as a
+    // server that refuses MKDIR without looking (SFTPGo without create_dirs, ProFTPD's <Limit MKD>).
+    sftp::Code mkdir_existing_as = sftp::Code::failure;
+    std::set<std::string> rename_refused; // a plain RENAME to one of these answers "Permission denied"
     // Set: the next RENAME or posix-rename done (by any session pointing here) breaks its
     // connection before the reply goes; cleared by it.
     std::atomic<bool>* break_after_rename = nullptr;
@@ -485,6 +492,7 @@ private:
                 if (flags & F::trunc) fs.files[path].clear();
             } else {
                 if (!(flags & F::creat) || !parent_there(path)) return status(id, 2, "No such file");
+                if (locked_dirs.contains(parent_of(path))) return status(id, 3, "Permission denied");
                 fs.files[path] = {};
                 listed(path);
                 if (given.permissions) fs.modes[path] = *given.permissions & 07777;
@@ -643,6 +651,7 @@ private:
             if (read_only) return refuse(id);
             if (fs.dirs.contains(path)) return status(id, 4, "Failure"); // EISDIR
             if (!fs.files.contains(path)) return status(id, 2, "No such file");
+            if (locked_dirs.contains(parent_of(path))) return status(id, 3, "Permission denied");
             fs.unlink(path);
             unlisted(path);
             return status(id, 0);
@@ -652,8 +661,12 @@ private:
             const sftp::Attrs a = in.attrs();
             if (denied.contains(path)) return status(id, 3, "Permission denied");
             if (read_only) return refuse(id);
-            if (known(path) || links.contains(path)) return status(id, 4, "Failure"); // EEXIST
+            if (known(path) || links.contains(path)) { // EEXIST
+                if (mkdir_existing_as == sftp::Code::permission_denied) return status(id, 3, "Permission denied");
+                return status(id, 4, "Failure");
+            }
             if (!parent_there(path)) return status(id, 2, "No such file");
+            if (locked_dirs.contains(parent_of(path))) return status(id, 3, "Permission denied");
             fs.dirs[path] = {".", ".."};
             if (a.permissions) fs.modes[path] = *a.permissions & 07777;
             listed(path);
@@ -665,6 +678,7 @@ private:
             if (read_only) return refuse(id);
             if (!fs.dirs.contains(path)) return status(id, 2, "No such file"); // ENOENT, ENOTDIR
             if (!empty_dir(path)) return status(id, 4, "Failure");             // ENOTEMPTY
+            if (locked_dirs.contains(parent_of(path))) return status(id, 3, "Permission denied");
             fs.dirs.erase(path);
             fs.mtimes.erase(path);
             fs.modes.erase(path);
@@ -737,6 +751,8 @@ private:
         if (read_only) return refuse(id);
         if (!known(from)) return status(id, 2, "No such file");
         if (!parent_there(to)) return status(id, 2, "No such file");
+        if (locked_dirs.contains(parent_of(from)) || locked_dirs.contains(parent_of(to))) return status(id, 3, "Permission denied");
+        if (!overwrite && rename_refused.contains(to)) return status(id, 3, "Permission denied");
         if (from == to) return status(id, 0);
         if (known(to)) {
             if (!overwrite) return status(id, 4, "Failure");

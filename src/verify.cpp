@@ -106,13 +106,14 @@ void prove(const Request& r, std::span<const std::size_t> differing, const std::
             if (again) continue;
             return keep_all(j, std::format("the server's copy can't be looked at: {}", e.what()));
         }
+        const std::string_view since = r.upload ? "the upload" : "the download";
         if (!now) {
             give(differing[j], Result{Verdict::unchecked,
                                       "the server's copy can't be looked at: " + sftp::describe(now.error())});
         } else if (!server_unchanged(*now, f)) {
-            give(differing[j], Result{Verdict::unchecked, "the server's copy changed since the download"});
+            give(differing[j], Result{Verdict::unchecked, std::format("the server's copy changed since {}", since)});
         } else if (!copy_unchanged(f.local, f.size, f.modtime)) {
-            give(differing[j], Result{Verdict::unchecked, "your copy changed since the download"});
+            give(differing[j], Result{Verdict::unchecked, std::format("your {} changed since {}", r.upload ? "file" : "copy", since)});
         } else {
             give(differing[j], Result{Verdict::differs, {}});
         }
@@ -142,6 +143,7 @@ bool copy_unchanged(const fs::path& local, std::uint64_t size, std::string_view 
 
 Report run(const Request& r, std::stop_token stop) {
     Report report;
+    report.upload = r.upload;
     report.files.assign(r.files.size(), Result{Verdict::unchecked, std::string(stopped)});
     std::mutex mutex; // report, `settled` and the hooks
     std::size_t settled = 0;
@@ -157,12 +159,14 @@ Report run(const Request& r, std::stop_token stop) {
         give_locked(i, std::move(result));
     };
 
-    // A copy that is gone fails at once (nothing to delete; downloading it again brings it back).
+    // A copy that is gone fails at once (nothing to delete; downloading it again brings it back);
+    // an uploaded file that is gone here leaves nothing to check the server's copy against.
     std::vector<std::size_t> hashed; // indices into r.files, hashed on both sides
     for (std::size_t i = 0; i < r.files.size(); ++i) {
         std::error_code ec;
-        if (!fs::is_regular_file(r.files[i].local, ec)) give(i, Result{Verdict::missing, "the downloaded copy is gone"});
-        else hashed.push_back(i);
+        if (fs::is_regular_file(r.files[i].local, ec)) hashed.push_back(i);
+        else if (r.upload) give(i, Result{Verdict::unchecked, "your file is gone"});
+        else give(i, Result{Verdict::missing, "the downloaded copy is gone"});
     }
     if (hashed.empty()) return report;
     if (!r.pool) {
@@ -205,7 +209,9 @@ Report run(const Request& r, std::stop_token stop) {
         if (!*s.server) return give_locked(i, Result{Verdict::unchecked, s.server->error().why});
         if (!*s.local) {
             const std::string& e = s.local->error();
-            return give_locked(i, Result{Verdict::unchecked, e == stopped ? e : "your copy can't be read: " + e});
+            return give_locked(i, Result{Verdict::unchecked, e == stopped ? e
+                                                             : r.upload ? "your file can't be read: " + e
+                                                                        : "your copy can't be read: " + e});
         }
         if (**s.server == **s.local) return give_locked(i, Result{Verdict::same, {}});
         differing.push_back(i);
@@ -290,10 +296,11 @@ std::string summary(const Report& r, bool folder) {
         else if (f.why != why) one_reason = false;
     }
     if (!one_reason) why += ", and other reasons";
+    constexpr std::string_view server_differs = "the server's copy differs (MD5)";
     if (!folder && n == 1) {
         switch (r.files.front().verdict) {
         case Verdict::same: return "checksum verified (MD5)";
-        case Verdict::differs: return "differs from the server's copy (MD5)";
+        case Verdict::differs: return r.upload ? std::string(server_differs) : "differs from the server's copy (MD5)";
         case Verdict::missing: return "the downloaded copy is gone";
         case Verdict::unchecked: break;
         }
@@ -306,7 +313,9 @@ std::string summary(const Report& r, bool folder) {
     const std::size_t unchecked = r.count(Verdict::unchecked);
     if (differ > 0 || missing > 0) {
         std::string text;
-        if (differ > 0) {
+        if (differ > 0 && r.upload) {
+            text = std::format("{} of {} file{}: {}", differ, n, n == 1 ? "" : "s", server_differs);
+        } else if (differ > 0) {
             text = n == 1 ? "1 file differs from the server's copy (MD5)"
                           : std::format("{} of {} files differ from the server's copy (MD5)", differ, n);
         }

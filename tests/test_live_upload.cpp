@@ -26,16 +26,22 @@
 // At most 4 logins at once.
 
 #include "conn_budget.hpp"
+#include "engine.hpp"
 #include "fetch.hpp"
+#include "folder.hpp"
+#include "folder_job.hpp"
 #include "live_settings.hpp"
 #include "rate.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
+#include "ssh_walk.hpp"
 #include "upload.hpp"
 #include "upload_existing.hpp"
+#include "upload_folder.hpp"
 #include "util.hpp"
+#include "verify.hpp"
 
 #include <openssl/evp.h>
 
@@ -58,7 +64,9 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1106,6 +1114,384 @@ TEST_CASE("live server: SFTP writes, printed only (GRAB_TEST_UPLOAD)") {
         auto lease = pool->acquire({}, ssh::interactive_retry);
         REQUIRE(lease);
         cleanup((*lease)->sftp(), d);
+    }
+    say(std::format("{} login(s) in all; {:.1f} s", logins.load(), seconds(Clock::now() - started)));
+}
+
+// ---- folder uploads on the server (GRAB_TEST_UPLOAD_FOLDER) --------------------------------------
+
+namespace {
+
+// One folder upload (upload_folder.hpp) as the window will run it, and what came of it.
+struct FolderRun {
+    upload::Tree tree;
+    std::mutex m;
+    upload::FolderJob job;
+    std::atomic<std::uint64_t> acked{0};
+};
+
+void folder_job(Uploader& e, FolderRun& r, const fs::path& source, const std::string& remote, upload::Existing existing) {
+    r.job.connections = &e.connections;
+    r.job.files_at_once = [] { return 4; };
+    r.job.server = e.server;
+    r.job.id = e.next_id++;
+    r.job.source = source;
+    r.job.remote_path = remote;
+    r.job.existing = existing;
+    r.job.pool = e.pool;
+    r.job.records_dir = e.records;
+}
+
+// Walks the local folder (once) and runs the upload until done, or stopped once `stop_at` bytes
+// were acknowledged (0: never): its time in seconds.
+double run_folder(FolderRun& r, std::uint64_t stop_at = 0) {
+    std::stop_source stop;
+    r.job.on_sent = [&](std::uint64_t n) {
+        if ((r.acked += n) >= stop_at && stop_at > 0) stop.request_stop();
+    };
+    const auto started = Clock::now();
+    auto walked = upload::walk(r.job, r.tree, r.m, {});
+    REQUIRE_MESSAGE(walked, walked.error_or(""));
+    upload::run(r.job, r.tree, r.m, stop.get_token());
+    r.job.on_sent = {};
+    return seconds(Clock::now() - started);
+}
+
+struct Counts {
+    std::size_t done = 0, skipped = 0, failed = 0, waiting = 0;
+    std::uint64_t bytes = 0; // of all files
+    std::size_t sent = 0;    // done by this upload
+};
+Counts counts_of(FolderRun& r) {
+    Counts c;
+    std::lock_guard lock(r.m);
+    for (const auto& f : r.tree.files) {
+        c.bytes += f.size;
+        switch (f.status) {
+        case folder::State::done:
+            ++c.done;
+            if (f.fetched) ++c.sent;
+            break;
+        case folder::State::skipped: ++c.skipped; break;
+        case folder::State::failed: ++c.failed; break;
+        default: ++c.waiting; break;
+        }
+    }
+    return c;
+}
+std::string shown(const Counts& c) {
+    return std::format("{} done ({} sent), {} skipped, {} failed, {} waiting", c.done, c.sent, c.skipped, c.failed, c.waiting);
+}
+// The first failed file's error, for the line.
+std::string first_error(FolderRun& r) {
+    std::lock_guard lock(r.m);
+    const auto o = folder::outcome(r.tree);
+    return o.first_error;
+}
+
+// What is below `dir` on the server: files, folders, grab's temps, and empty folders.
+struct Below {
+    bool there = false;
+    std::size_t files = 0, folders = 0, temps = 0, empty = 0;
+};
+Below below_on_server(Uploader& e, const std::string& dir) {
+    Below b;
+    ssh::WalkOptions o;
+    o.connections = 2;
+    o.folders = true;
+    auto walked = ssh::walk(*e.pool, dir, o, {});
+    if (!walked) return b;
+    b.there = true;
+    std::set<std::string> holding;
+    for (const auto& w : walked->entries) {
+        const auto slash = w.path.rfind('/');
+        if (slash != std::string::npos) holding.insert(w.path.substr(0, slash));
+        if (w.dir) {
+            ++b.folders;
+            continue;
+        }
+        ++b.files;
+        if (upload::is_temp_name(rclone_enc::raw_path(w.path.substr(slash == std::string::npos ? 0 : slash + 1)))) ++b.temps;
+    }
+    for (const auto& w : walked->entries)
+        if (w.dir && !holding.contains(w.path)) ++b.empty;
+    return b;
+}
+
+// The made-up folder to upload: `small_n` files of 1 to 200 KiB in small\, `big_n` of `big_mib` MiB
+// in big\, each of its own bytes; files there with the right size already are kept.
+void make_source(const fs::path& source, std::size_t small_n, std::size_t big_n, std::uint64_t big_mib) {
+    const Data data(0x5F01);
+    std::vector<char> buf(Data::block);
+    auto write = [&](const fs::path& p, std::uint64_t offset, std::uint64_t size) {
+        std::error_code ec;
+        if (fs::is_regular_file(p, ec) && fs::file_size(p, ec) == size) return;
+        fs::create_directories(p.parent_path(), ec);
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        for (std::uint64_t at = 0; at < size; at += buf.size()) {
+            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), size - at));
+            data.fill(offset + at, std::span(buf.data(), n));
+            out.write(buf.data(), static_cast<std::streamsize>(n));
+        }
+        out.close();
+        const std::string why = "cannot write " + util::path_to_utf8(p);
+        REQUIRE_MESSAGE(out.good(), why);
+    };
+    for (std::size_t i = 0; i < small_n; ++i) {
+        const std::uint64_t size = (1 + (i * 37) % 200) * 1024;
+        write(source / "small" / std::format("s{:04}.bin", i), std::uint64_t{i} * 256 * 1024, size);
+    }
+    for (std::size_t i = 0; i < big_n; ++i) {
+        write(source / "big" / std::format("b{}.bin", i), (std::uint64_t{i} + 1) * (std::uint64_t{1} << 32), big_mib * mib);
+    }
+}
+
+// grab's own verification of the upload (upload::verify_files): every file sent, by MD5.
+std::string folder_verify(const engine::Context& ctx, Uploader& e, FolderRun& r) {
+    verify::Request base;
+    base.ctx = &ctx;
+    base.pool = e.pool;
+    const auto checked = upload::verify_files(r.job, r.tree, r.m, base, {});
+    const std::size_t same = checked.report.count(verify::Verdict::same);
+    return std::format("verify: {} of {} the same: \"{}\" {}", same, checked.files, checked.summary(),
+                       pass(checked.files > 0 && same == checked.files));
+}
+
+} // namespace
+
+TEST_CASE("live server: folder uploads, printed only (GRAB_TEST_UPLOAD_FOLDER)") {
+    // GRAB_TEST_SERVER, GRAB_TEST_APPDATA, GRAB_TEST_UPLOAD_DIR (made here when missing),
+    // GRAB_TEST_UPLOAD_LOCAL and GRAB_TEST_UPLOAD_BUDGET as GRAB_TEST_UPLOAD_RUN's, and:
+    //   GRAB_TEST_UPLOAD_FOLDER  some of make,up,verify,skip,different,pause,cancel,readonly, in that order
+    //   GRAB_TEST_UPLOAD_SOURCE  the local folder uploaded (default GRAB_TEST_UPLOAD_LOCAL\src); it goes
+    //                            to GRAB_TEST_UPLOAD_DIR/<its name> (pause: <name>-pause, cancel: <name>-cancel)
+    //   make: GRAB_TEST_UPLOAD_SMALL (2000) files of 1-200 KiB in <source>\small and GRAB_TEST_UPLOAD_BIG
+    //         (5) of GRAB_TEST_UPLOAD_BIG_MIB (200) MiB in <source>\big, unless they are there
+    //   different: GRAB_TEST_UPLOAD_TOUCH (3) of small\'s files (the source's own without one) get
+    //              other bytes and a new time first
+    //   pause, cancel: stopped once GRAB_TEST_UPLOAD_STOP_PCT (30) % of the bytes are acknowledged
+    // verify checks the last upload of this run (up, pause) with the server's md5sum.
+    const auto name = util::getenv_utf8("GRAB_TEST_SERVER");
+    const auto appdata = util::getenv_utf8("GRAB_TEST_APPDATA");
+    const auto modes = util::getenv_utf8("GRAB_TEST_UPLOAD_FOLDER");
+    const auto local = util::getenv_utf8("GRAB_TEST_UPLOAD_LOCAL");
+    if (!name || !appdata || !modes || !local) {
+        MESSAGE("skipped: GRAB_TEST_SERVER / GRAB_TEST_APPDATA / GRAB_TEST_UPLOAD_FOLDER / GRAB_TEST_UPLOAD_LOCAL not set");
+        return;
+    }
+    const auto wanted = [&](std::string_view mode) {
+        const auto list = util::split(*modes, ',');
+        return std::ranges::find(list, mode) != list.end();
+    };
+    Uploader e;
+    e.server = *name;
+    e.d.dir = util::getenv_utf8("GRAB_TEST_UPLOAD_DIR").value_or("");
+    const bool in_tmp = allowed_dir(e.d.dir) && e.d.dir.starts_with("/tmp/grab-up-");
+    const std::string why = "GRAB_TEST_UPLOAD_DIR must be /tmp/grab-up-* (got \"" + e.d.dir + "\")";
+    REQUIRE_MESSAGE(in_tmp, why);
+    e.d.raw = rclone_enc::raw_path(e.d.dir);
+    e.local = util::path_from_utf8(*local);
+    e.records = e.local / "records";
+    std::error_code ec;
+    REQUIRE_MESSAGE(fs::is_directory(e.local, ec), "GRAB_TEST_UPLOAD_LOCAL must be a folder");
+    const auto source_env = util::getenv_utf8("GRAB_TEST_UPLOAD_SOURCE");
+    const fs::path source = source_env && !source_env->empty() ? util::path_from_utf8(*source_env) : e.local / "src";
+    const std::string source_name = util::path_to_utf8(source.filename());
+    const bool plain = allowed_dir(e.d.dir + "/" + source_name);
+    REQUIRE_MESSAGE(plain, "the source folder's name must be plain (letters, digits, '.', '-', '_')");
+
+    if (wanted("make")) {
+        const auto small_n = static_cast<std::size_t>(number_from_env("GRAB_TEST_UPLOAD_SMALL", 2000));
+        const auto big_n = static_cast<std::size_t>(number_from_env("GRAB_TEST_UPLOAD_BIG", 5));
+        const std::uint64_t big_mib = number_from_env("GRAB_TEST_UPLOAD_BIG_MIB", 200);
+        make_source(source, small_n, big_n, big_mib);
+        say(std::format("make: {} with {} small files and {} of {} MiB", util::path_to_utf8(source), small_n, big_n, big_mib));
+    }
+
+#ifdef _WIN32
+    const test::AppData settings(util::path_from_utf8(*appdata));
+#endif
+    auto ctx = test::read_context(*name);
+    REQUIRE_MESSAGE(ctx, ctx.error_or(""));
+    auto target = test::live_target(*ctx);
+    REQUIRE_MESSAGE(target, target.error_or(""));
+    const int budget = static_cast<int>(number_from_env("GRAB_TEST_UPLOAD_BUDGET", static_cast<std::uint64_t>(budget::default_budget(target->host))));
+    say(std::format("folder uploads on {} ({}); folder {}; {} connections, {} logins at once", *name, *modes, e.d.dir, budget,
+                    ssh::Pool::Options{}.logins_at_once));
+    std::atomic<int> logins = 0;
+    auto o = ssh::Pools::download_options(budget);
+    o.idle_timer = false;
+    const ssh::Target& t = *target;
+    e.pool = std::make_shared<ssh::Pool>([&] {
+        ++logins;
+        return ssh::open_session(t);
+    }, o);
+    e.connections.configure(e.server, budget);
+    const auto started = Clock::now();
+    {
+        auto lease = e.pool->acquire({}, ssh::interactive_retry);
+        REQUIRE(lease);
+        if (!ensure_dir((*lease)->sftp(), e.d)) return;
+    }
+    const std::string remote = e.d.dir + "/" + source_name;
+    std::unique_ptr<FolderRun> last; // the upload `verify` checks
+
+    if (wanted("up")) {
+        auto r = std::make_unique<FolderRun>();
+        folder_job(e, *r, source, remote, upload::Existing::ask);
+        const double took = run_folder(*r);
+        const Counts c = counts_of(*r);
+        const Below b = below_on_server(e, remote);
+        const double rate = took > 0 ? static_cast<double>(r->acked.load()) / mib / took : 0;
+        say(std::format("up: {} files, {:.1f} MiB in {:.1f} s: {:.2f} MiB/s; {}; temps left {}{} {}", r->tree.files.size(),
+                        static_cast<double>(c.bytes) / mib, took, rate, shown(c), b.temps,
+                        c.failed > 0 ? "; first error: " + first_error(*r) : "",
+                        pass(c.done == r->tree.files.size() && b.temps == 0)));
+        last = std::move(r);
+    }
+    if (wanted("verify") && last) say(folder_verify(*ctx, e, *last));
+    if (wanted("skip")) {
+        FolderRun r;
+        folder_job(e, r, source, remote, upload::Existing::skip);
+        const double took = run_folder(r);
+        const Counts c = counts_of(r);
+        say(std::format("skip: again with Skip: {:.1f} s, {} bytes sent; {} {}", took, r.acked.load(), shown(c),
+                        pass(r.acked == 0 && c.sent == 0 && c.skipped == r.tree.files.size())));
+    }
+    if (wanted("different")) {
+        const auto touch = static_cast<std::size_t>(number_from_env("GRAB_TEST_UPLOAD_TOUCH", 3));
+        // small\'s files, or the source's own when it has no small\ (a source that is small\ itself).
+        const fs::path touch_in = fs::is_directory(source / "small") ? source / "small" : source;
+        std::vector<fs::path> small_files;
+        for (const auto& entry : fs::directory_iterator(touch_in)) {
+            if (entry.is_regular_file()) small_files.push_back(entry.path());
+        }
+        std::ranges::sort(small_files);
+        REQUIRE(small_files.size() >= touch);
+        std::uint64_t touched = 0;
+        const Data other(0x70C4);
+        for (std::size_t i = 0; i < touch; ++i) {
+            const fs::path& p = small_files[i * (small_files.size() / touch)];
+            const auto size = fs::file_size(p);
+            std::string bytes(static_cast<std::size_t>(size), '\0');
+            other.fill(std::uint64_t{i} * mib, std::span(bytes.data(), bytes.size()));
+            REQUIRE(util::write_file_atomic(p, bytes));
+            set_local_mtime(p, std::chrono::system_clock::now());
+            touched += size;
+        }
+        FolderRun r;
+        folder_job(e, r, source, remote, upload::Existing::different);
+        const double took = run_folder(r);
+        const Counts c = counts_of(r);
+        say(std::format("different: {} touched ({} bytes), again with Replace if different: {:.1f} s, {} bytes sent; {} {}", touch,
+                        touched, took, r.acked.load(), shown(c), pass(c.sent == touch && r.acked == touched && c.failed == 0)));
+        last.reset();
+    }
+    if (wanted("pause")) {
+        auto r = std::make_unique<FolderRun>();
+        folder_job(e, *r, source, remote + "-pause", upload::Existing::ask);
+        std::uint64_t total = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(source))
+            if (entry.is_regular_file()) total += entry.file_size();
+        const std::uint64_t stop_at = total * number_from_env("GRAB_TEST_UPLOAD_STOP_PCT", 30) / 100;
+        const double first = run_folder(*r, stop_at);
+        const Counts paused = counts_of(*r);
+        std::size_t known = 0;
+        {
+            std::lock_guard lock(r->m);
+            known = r->tree.temps.size();
+        }
+        const Below mid = below_on_server(e, remote + "-pause");
+        const double second = run_folder(*r);
+        const Counts c = counts_of(*r);
+        const Below b = below_on_server(e, remote + "-pause");
+        say(std::format("pause: stopped after {:.1f} s ({}; temps there {}, {} known to it); resumed: {:.1f} s, {}; temps left {} {}", first,
+                        shown(paused), mid.temps, known, second, shown(c), b.temps,
+                        pass(paused.done < r->tree.files.size() && c.done == r->tree.files.size() && b.temps == 0)));
+        last = std::move(r);
+        if (wanted("verify")) say(folder_verify(*ctx, e, *last));
+    }
+    if (wanted("cancel")) {
+        // The server's own folder in the way: merged into, never removed; one of its own inside.
+        const std::string place = remote + "-cancel";
+        {
+            auto lease = e.pool->acquire({}, ssh::interactive_retry);
+            REQUIRE(lease);
+            auto& s = (*lease)->sftp();
+            REQUIRE(sftp::mkdir(s, rclone_enc::raw_path(place)));
+            REQUIRE(sftp::mkdir(s, rclone_enc::raw_path(place + "/keep")));
+        }
+        FolderRun r;
+        folder_job(e, r, source, place, upload::Existing::ask);
+        std::uint64_t total = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(source))
+            if (entry.is_regular_file()) total += entry.file_size();
+        run_folder(r, total * number_from_env("GRAB_TEST_UPLOAD_STOP_PCT", 30) / 100);
+        const Counts c = counts_of(r);
+        const Below mid = below_on_server(e, place);
+        std::size_t made = 0;
+        {
+            std::lock_guard lock(r.m);
+            made = r.tree.made.size();
+        }
+        const auto left = upload::discard(r.job, r.tree, r.m);
+        const Below b = below_on_server(e, place);
+        Below keep;
+        {
+            auto lease = e.pool->acquire({}, ssh::interactive_retry);
+            REQUIRE(lease);
+            const auto there = sftp::lstat((*lease)->sftp(), rclone_enc::raw_path(place + "/keep"));
+            keep.there = there && there->is_dir();
+        }
+        const bool saved = upload::saved_progress(e.records, e.server, place + "/big/b0.bin").has_value();
+        say(std::format("cancel: stopped ({}; {} folders made; temps there {}); after the cancel: temps {}, empty folders {} (the "
+                        "server's own 'keep' one of them: {}), files {}, leftovers {}, a record kept {} {}",
+                        shown(c), made, mid.temps, b.temps, b.empty, yes(keep.there), b.files, left.empty() ? "none" : "SOME",
+                        yes(saved), pass(b.temps == 0 && keep.there && b.empty == 1 && left.empty() && !saved)));
+    }
+    if (wanted("readonly")) {
+        const fs::path ro_source = e.local / "ro-src";
+        fs::create_directories(ro_source / "ro" / "sub");
+        REQUIRE(util::write_file_atomic(ro_source / "ok.txt", "fine"));
+        REQUIRE(util::write_file_atomic(ro_source / "ro" / "a.txt", "a"));
+        REQUIRE(util::write_file_atomic(ro_source / "ro" / "sub" / "b.txt", "b"));
+        local_data(e, "ro-src/ro/big.bin", Data(0x5A), 3 * mib);
+        const std::string place = e.d.dir + "/ro-src";
+        const std::string ro = place + "/ro";
+        {
+            auto lease = e.pool->acquire({}, ssh::interactive_retry);
+            REQUIRE(lease);
+            auto& s = (*lease)->sftp();
+            REQUIRE(sftp::mkdir(s, rclone_enc::raw_path(place)));
+            REQUIRE(sftp::mkdir(s, rclone_enc::raw_path(ro)));
+            REQUIRE(sftp::setstat(s, rclone_enc::raw_path(ro), sftp::Attrs{.size = {}, .permissions = 0555, .mtime = {}}));
+        }
+        FolderRun r;
+        folder_job(e, r, ro_source, place, upload::Existing::ask);
+        run_folder(r);
+        const std::string want = std::format("{} doesn't let this account write in {}", e.server, ro);
+        bool ro_failed = true;
+        std::string seen;
+        {
+            std::lock_guard lock(r.m);
+            for (const auto& f : r.tree.files) {
+                if (!f.path.starts_with("ro/")) continue;
+                ro_failed = ro_failed && f.status == folder::State::failed && f.error == want;
+                if (seen.empty()) seen = f.error;
+            }
+        }
+        const Counts c = counts_of(r);
+        const Below inside = below_on_server(e, ro);
+        {
+            auto lease = e.pool->acquire({}, ssh::interactive_retry);
+            REQUIRE(lease);
+            if (auto back = sftp::setstat((*lease)->sftp(), rclone_enc::raw_path(ro), sftp::Attrs{.size = {}, .permissions = 0700, .mtime = {}});
+                !back) {
+                say("readonly: the folder couldn't be made writable again: " + code_of(back));
+            }
+        }
+        say(std::format(R"(readonly: {}; the ro\ files: "{}"; entries left in ro {} {})", shown(c), seen, inside.files + inside.folders,
+                        pass(ro_failed && c.done == 1 && c.failed == 3 && inside.files + inside.folders == 0)));
     }
     say(std::format("{} login(s) in all; {:.1f} s", logins.load(), seconds(Clock::now() - started)));
 }

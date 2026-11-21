@@ -54,6 +54,8 @@ add_library(grab_core STATIC
     src/fetch.cpp
     src/upload.cpp
     src/upload_existing.cpp
+    src/upload_folder.cpp
+    src/local_walk.cpp
     src/folder_job.cpp
     src/file_list.cpp
     src/secrets.cpp

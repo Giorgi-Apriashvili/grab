@@ -73,10 +73,16 @@ struct Request {
     std::function<void(std::size_t file, const Result& result, std::size_t done)> on_file;
     // After each on_file: how many files have their result, of how many (the row's "12 of 40").
     std::function<void(std::size_t done, std::size_t total)> on_progress;
+    // Uploads (UPLOADS.md 5.8): the files are local ones the server's copies were made from, each
+    // File's size and time the local file's, as the upload gave the server's copy. A proven
+    // mismatch is the server's copy differing ("the server's copy differs (MD5)"), which the caller
+    // fails and sends again: nothing local is deleted. A local file that is gone isn't checked.
+    bool upload = false;
 };
 
 struct Report {
     std::vector<Result> files; // in Request::files' order
+    bool upload = false;       // Request::upload: summary words it for an upload
     [[nodiscard]] std::size_t count(Verdict v) const;
 };
 
@@ -87,7 +93,9 @@ struct Report {
 [[nodiscard]] Report file(Request base, File copy, std::stop_token stop);
 
 // For the queue row and the command: "checksum verified (MD5)", or for a folder's files "3 files
-// verified (MD5)", or why not ("not verified: the server can't compute checksums (...)").
+// verified (MD5)", or why not ("not verified: the server can't compute checksums (...)"). An
+// upload's mismatch: "the server's copy differs (MD5)", for a folder "2 of 40 files: the server's
+// copy differs (MD5)".
 [[nodiscard]] std::string summary(const Report& r, bool folder = false);
 
 // The queue row's marker beside its status (DOWNLOADS-UI.md 5.3): ok (✓) when every file checked

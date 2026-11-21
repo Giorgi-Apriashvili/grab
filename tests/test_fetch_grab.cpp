@@ -691,7 +691,13 @@ TEST_CASE("grab engine: a limit lowered below what a connection has on its way c
     // the look that restarted is one from the first reported after the change began to the one
     // after the first reported after it was set. Each look's count is taken here just after the
     // meter's, so a reply that came in between counts in the next step instead: under 0.01 % apart
-    // idle and loaded, so within 3 %.
+    // idle, so within 3 %. On a busy machine the loop's thread can wait in between while replies
+    // come (one READ is an eighth of the new limit's second: 12 % of the meter's): it sampled after
+    // its 250 ms pause (fetch.cpp), so in between came at most what came from 250 ms after the look
+    // before to this one, over at most that long. Both ends of the meter's window (its last
+    // speed::meter_settle, at least speed::meter_least, since the restart) are off the same way, so
+    // its speed by at most the most of that over the window: that much more slack, measured here,
+    // none idle.
     std::vector<Shown> looks;
     {
         std::lock_guard lock(shown_m);
@@ -723,14 +729,25 @@ TEST_CASE("grab engine: a limit lowered below what a connection has on its way c
     }
     REQUIRE(restarted);
     const double came_all = replay(std::nullopt).rate() / mib;
+    std::uint64_t skew = 0;           // the most that came between a look's sample and its count here
+    Arrivals::Clock::duration gap{}; // ...over at most this long
+    for (std::size_t k = 1; k <= newest; ++k) {
+        const auto from = looks[k - 1].at + 250ms;
+        if (looks[k].at < lowered || looks[k].at <= from) continue;
+        gap = std::max(gap, looks[k].at - from);
+        skew = std::max(skew, came.between(from, 0ms, std::chrono::duration_cast<std::chrono::milliseconds>(looks[k].at - from) + 1ms));
+    }
+    const double window = std::clamp(std::chrono::duration<double>(looks[newest].at - looks[*restarted].at).count(),
+                                     std::chrono::duration<double>(speed::meter_least).count(),
+                                     std::chrono::duration<double>(speed::meter_settle).count());
+    const double slack = 0.03 * came_since + (static_cast<double>(skew) / mib + came_since * std::chrono::duration<double>(gap).count()) / window;
     MESSAGE("the first second after ", static_cast<double>(before) / mib, " -> 1 MiB/s: ", first, " MiB; then ", later, " MiB/s; shown at 1.5 s: ", shown_then,
-            " (a meter restarted at look ", *restarted, ": ", came_since, ", not restarted: ", came_all, ")");
+            " (a meter restarted at look ", *restarted, ": ", came_since, ", not restarted: ", came_all, "; slack ", slack, ")");
     CHECK(first <= static_cast<double>(after + fetch::limited_in_flight(before, 1)) / mib);
     CHECK(later > 1.0 * 0.85);
     CHECK(later < 1.0 * 1.15);
     CHECK_FALSE(holding); // the new speed shows
-    CHECK(shown_then > came_since * 0.97);
-    CHECK(shown_then < came_since * 1.03);
+    CHECK(std::abs(shown_then - came_since) <= slack);
     // And nearer that than the 5 s average a meter not restarted shows (about 1.7 here; under load
     // the last second can come within 5 % of it, so not a fixed part of it).
     CHECK(std::abs(shown_then - came_since) < std::abs(shown_then - came_all));
