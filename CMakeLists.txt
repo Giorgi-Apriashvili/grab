@@ -347,4 +347,12 @@ set_property(SOURCE src/update.cpp APPEND PROPERTY
 if(GRAB_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+    # tools/dropper: a drag source driven by SendInput, for the window's drop tests (UPLOADS.md
+    # chunk 4). Not shipped.
+    if(WIN32 AND (MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+        add_executable(dropper tools/dropper/dropper.cpp)
+        target_compile_definitions(dropper PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_compile_options(dropper PRIVATE /W4 /permissive- /utf-8 /EHsc)
+        target_link_libraries(dropper PRIVATE ole32 shell32 shlwapi user32 uuid)
+    endif()
 endif()
