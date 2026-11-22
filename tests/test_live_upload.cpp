@@ -588,8 +588,40 @@ void speed(ssh::Pool& pool, const Settings& d, int conns) {
     say(std::format("speed: REMOVE {}", code_of(removed)));
 }
 
+struct Removed {
+    int files = 0;
+    int folders = 0;
+    int kept = 0;
+};
+
+// A folder of ours and what is in it, `depth` levels of folders further down at most (deeper ones
+// are left and counted). The listing's attributes are LSTAT's (OpenSSH), so a link is removed as
+// itself, never followed.
+void remove_tree(sftp::Client& s, const std::string& path, int depth, Removed& r) {
+    // A folder a case made read-only (up-ro) is made writable again first.
+    if (auto opened = sftp::setstat(s, path, sftp::Attrs{.size = {}, .permissions = 0700, .mtime = {}}); !opened) {
+        // Not ours to change, or gone: what is left is counted below.
+    }
+    if (auto inner = sftp::list(s, path)) {
+        for (const auto& f : *inner) {
+            const std::string child = path + "/" + f.name;
+            if (f.attrs.is_dir()) {
+                if (depth > 0) remove_tree(s, child, depth - 1, r);
+                else ++r.kept;
+            } else if (sftp::remove(s, child)) {
+                ++r.files;
+            } else {
+                ++r.kept;
+            }
+        }
+    }
+    if (sftp::rmdir(s, path)) ++r.folders;
+    else ++r.kept;
+}
+
 // The folder's own files (those these cases name: up-*, .grab-probe-*, and upload::run's temps of
-// up-* files) and the folders among them, one level down, then the folder itself.
+// up-* files) and the folders among them with what is in them (3 levels down at most), then the
+// folder itself.
 void cleanup(sftp::Client& s, const Settings& d) {
     // A real folder only: OPENDIR follows a link, which would list (and remove in) its target.
     auto there = sftp::lstat(s, d.raw);
@@ -602,38 +634,26 @@ void cleanup(sftp::Client& s, const Settings& d) {
         say(std::format("cleanup: folder {}: {}", d.dir, code_of(listed)));
         return;
     }
-    int files = 0;
-    int folders = 0;
-    int kept = 0;
+    Removed r;
     for (const auto& e : *listed) {
         const bool ours = e.name.starts_with("up-") || e.name.starts_with(".grab-probe-") ||
                           (e.name.starts_with(".up-") && upload::is_temp_name(e.name));
         const std::string path = d.raw + "/" + e.name;
         if (!ours) {
-            ++kept;
+            ++r.kept;
             continue;
         }
         if (e.attrs.is_dir()) {
-            // A folder a case made read-only (up-ro) is made writable again first.
-            if (auto opened = sftp::setstat(s, path, sftp::Attrs{.size = {}, .permissions = 0700, .mtime = {}}); !opened) {
-                // Not ours to change, or gone: what is left is counted below.
-            }
-            if (auto inner = sftp::list(s, path)) {
-                for (const auto& f : *inner) {
-                    if (!f.attrs.is_dir() && sftp::remove(s, path + "/" + f.name)) ++files;
-                }
-            }
-            if (sftp::rmdir(s, path)) ++folders;
-            else ++kept;
+            remove_tree(s, path, 2, r);
         } else if (sftp::remove(s, path)) {
-            ++files;
+            ++r.files;
         } else {
-            ++kept;
+            ++r.kept;
         }
     }
     auto removed = sftp::rmdir(s, d.raw);
     const bool gone = !sftp::lstat(s, d.raw);
-    say(std::format("cleanup: {} file(s) and {} folder(s) removed, {} left; RMDIR of the folder {}; gone: {}", files, folders, kept,
+    say(std::format("cleanup: {} file(s) and {} folder(s) removed, {} left; RMDIR of the folder {}; gone: {}", r.files, r.folders, r.kept,
                     code_of(removed), yes(gone)));
 }
 

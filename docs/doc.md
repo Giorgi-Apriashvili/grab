@@ -426,6 +426,17 @@ them.
     empty folder. Uploads go into one folder of one server: on search
     results, on All servers' list of servers and on the list of a server's search roots the
     entries say why not (open the folder first).
+  - **Or drag files and folders from Explorer** onto Browse, mixed as you like: dropped on a
+    folder row they go into that folder, anywhere else on the list into the folder that is open;
+    while you drag, "Drop to upload to Main:/srv/tv" says where, and the same dialog asks first.
+    Search results, All servers, the list of a server's search roots and a folder still opening
+    say why not, and the Downloads table and the status bar say to drop on Browse. A file dragged
+    from inside a .zip (or a mail's attachment) isn't on this PC as a file: "Extract files from a
+    .zip first". A link dragged from a browser is refused, and dragged text does nothing. Nothing
+    dragged in ever opens in the window; should WebView2 ever end grab's page, grab opens it again
+    at once, at the folders Browse had open, and says so (a search and the selection are gone).
+    Windows doesn't let Explorer drop into a program run as administrator, so drops need grab-gui
+    started normally.
   - **A dialog asks first** and checks before anything is sent: what goes ("holiday — 1,204
     files, 3.2 GiB"; links and junctions inside a folder are left out and counted, never
     followed; names over 255 bytes, which no Linux server takes, are said), where ("To
@@ -811,7 +822,8 @@ them.
   and the settings' one-time notes (see [Notes about settings](#notes-about-settings)) show once
   in the notice above the search.
 - **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
-  only that page's messages reach grab, and files dragged in from outside are ignored.
+  only that page's messages reach grab, and nothing dragged in from outside opens in it (files and
+  folders dropped on Browse are uploads, above).
 - **Tray:** closing the window while downloads run keeps them going in the notification
   area, and grab exits by itself when they finish. When the window is idle, closing it
   quits. A notification reports each finished or failed download while the window isn't in

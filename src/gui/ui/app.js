@@ -4,13 +4,13 @@
 //                 pauseItem, resumeItem, retryItem, pauseAll, resumeAll, cancelAll,
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, openFile, openDir, setExpanded,
-//                 resolveExisting, play, previewCancel, uploadPick, uploadCheckCancel, uploadStart,
+//                 resolveExisting, play, previewCancel, uploadPick, uploadDrop, uploadCheckCancel, uploadStart,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
 //                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
-//                 updateChecked, limit, played, uploadCheck,
+//                 updateChecked, limit, played, uploadCheck, pageRestored (from the window itself),
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -1346,6 +1346,8 @@ function remember() {
     if (b.top) delete state.browsePaths[b.server];
     else state.browsePaths[b.server] = b.path;
   }
+  // For a page opened again by the window (onPageRestored): it outlives the page, not grab.
+  try { sessionStorage.setItem('grab.paths', JSON.stringify(state.browsePaths)); } catch (e) { /* no storage */ }
 }
 
 // Browse mode starts where it last was for the server picked in this run (All servers: in the
@@ -2157,8 +2159,16 @@ function uploadHtml(m) {
 function onUploadCheck(msg) {
   const p = upload.pending;
   if (!p || msg.token !== p.token) return; // an older pick, or one cancelled
+  try { sessionStorage.removeItem('grab.drag'); } catch (e) { /* no storage */ } // a drop's files reached grab
   if (msg.phase === 'cancelled') { // the file dialog was closed
     upload.pending = null;
+    return;
+  }
+  // A drop refused before anything was looked at (nothing came with it, or only WebView2's copies
+  // of files from inside a .zip): said in the footer, no dialog.
+  if (msg.phase === 'refused' && !msg.count && !(modal && modal.upload === msg.token)) {
+    upload.pending = null;
+    flash(msg.why || 'This can’t be uploaded.', 12000);
     return;
   }
   if (modal && modal.upload === msg.token) {
@@ -5679,98 +5689,236 @@ if (webview) {
       case 'serverError': onServerError(msg); break;
       case 'filePicked': $('#f-key').value = msg.path; setSecretPlaceholder(); break;
       case 'importBanner': showImportBanner(msg.text); break;
-      case 'debugDrops': debugDropsOn(); break;
-      case 'debugDropLogged': showBanner(msg.text); break;
+      case 'pageRestored': onPageRestored(msg); break;
     }
   });
 }
 
-// ---- the uploads' drop spike (UPLOADS.md step 0.7) ----------------------------------------
+// ---- drops from Explorer: uploads (UPLOADS.md 5.10, chunk 4) --------------------------------
+// Files and folders dragged in from Explorer onto Browse go into the folder row under the pointer,
+// else into the folder Browse shows: the same check and dialog as Upload files here…. Every drag
+// over the window is kept from navigating it (dragover and drop are taken everywhere, but text
+// over a text field, which goes in as before); a drag of text alone shows nothing, a link is refused, and Browse's refusals (search results, All servers,
+// the list of a server's search roots, a folder still opening) and the places outside Browse say
+// why, or where to drop. The overlay goes with the drag: a drop anywhere, the drag leaving the
+// window or cancelled (Escape: WebView2 then says dragleave at 0,0), or no dragover for
+// dropIdleMs (dragover comes every 50 ms while a drag is over the page, moving or not).
 
-// Posts `msg` with File and FileSystemHandle objects beside it, which the host gets as
-// ICoreWebView2File and ICoreWebView2FileSystemHandle (with their paths). Replaceable: the page
-// tests stub it.
+let dropIdleMs = 1000; // the page tests shorten it
+// UPLOADS.md decision 7, as the host says it too (upload_check.hpp drop_extract_first).
+const EXTRACT_FIRST = 'Extract files from a .zip first: a file inside a .zip (or a mail’s attachment) isn’t on this PC ' +
+  'as a file until it is extracted or saved. Then drop it from there.';
+const DROP_FILES = 'Drop files or folders from Explorer: grab uploads files, not links.';
+// `shown`: the overlay is up; `place`: where a drop would go ({ server, dir, row } or { refusal,
+// area }); `idle`: the timer that takes it down when dragovers stop.
+const drops = { shown: false, place: null, idle: 0 };
+
+// Posts `msg` with File objects beside it, which the host gets as ICoreWebView2File with their
+// paths (a dropped folder too). False when this WebView2 can't. Replaceable: the page tests stub it.
 function postWithObjects(msg, objects) {
-  if (webview && webview.postMessageWithAdditionalObjects) webview.postMessageWithAdditionalObjects(msg, objects);
-  else send(msg);
+  if (!webview || !webview.postMessageWithAdditionalObjects) return false;
+  webview.postMessageWithAdditionalObjects(msg, objects);
+  return true;
 }
 
-// What a drop from outside hands the page, sent to the host to log (debugDrop messages): only once
-// grab-gui says 'debugDrops' (GRAB_DEBUG_DROPS=1); otherwise the window takes no drop at all. Every
-// drag over the page and every drop is kept from navigating the window.
-let debugDropsListening = false;
-let debugDropWaitMs = 5000; // how long the drop waits for each handle and text (the page tests shorten it)
-function debugDropsOn() {
-  if (debugDropsListening) return;
-  debugDropsListening = true;
-  const short = (s) => { const t = String(s ?? ''); return t.length > 80 ? `${t.slice(0, 80)}…` : t; };
-  const entryOf = (e) => (e ? { name: e.name, isFile: e.isFile, isDirectory: e.isDirectory, fullPath: e.fullPath } : null);
-  const fileOf = (f) => ({ name: f.name, size: f.size, type: f.type, lastModified: f.lastModified,
-    relativePath: f.webkitRelativePath || '' });
-  const handleOf = (h) => (h && h.error ? { error: h.error } : h ? { kind: h.kind, name: h.name } : null);
-  // One dragenter per drag into the window (it comes again for each element the pointer enters).
-  let inside = false;
-  document.addEventListener('dragenter', (ev) => {
+// What a drag carries, by its types (its names can't be read before the drop): 'files', 'link'
+// (Edge drags a link as text/uri-list with a .url file) or '' (text alone, or nothing).
+function dragKind(dt) {
+  const types = dt ? [...dt.types] : [];
+  if (!types.includes('Files')) return '';
+  return types.includes('text/uri-list') ? 'link' : 'files';
+}
+
+// Where a drop at `target` (the element under the pointer) goes: { server, dir, row } (row: the
+// folder row's index, else -1), or { refusal, area } with the reason and the part of the window
+// it is about ('browse', 'downloads', 'status' or 'window').
+function dropPlace(target) {
+  const t = target instanceof Element ? target : null;
+  if (!$('#modal').hidden) return { refusal: 'Finish the open dialog first, then drop again.', area: 'window' };
+  if (viewer.open) return { refusal: 'Close the preview first, then drop on a folder in Browse.', area: 'window' };
+  if (settings.open) return { refusal: 'Close Settings first, then drop on a folder in Browse.', area: 'window' };
+  // Outside Browse (the Downloads table, the status bar): where to drop instead.
+  const outside = t && t.closest('#downloads, .bar.status');
+  if (outside) {
+    return { refusal: 'Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.',
+      area: outside.id === 'downloads' ? 'downloads' : 'status' };
+  }
+  const b = state.browse;
+  const el = t && t.closest('#rows .row');
+  const i = el ? Number(el.dataset.i) : -1;
+  const h = i >= 0 ? state.hits[i] : null;
+  // A folder row (not a server at All servers' top): that folder, as its menu's Upload entries.
+  if (h && h.dir && !h.server && !b.loading) {
+    if (b.under) return { refusal: 'Uploads go into a folder you have open, not into search results: open this folder first.', area: 'browse' };
+    return { server: b.server || h.remote, dir: h.path, row: i };
+  }
+  const why = uploadRefusal();
+  if (why) return { refusal: why, area: 'browse' };
+  return { server: b.server, dir: b.path, row: -1 };
+}
+
+// The overlay over the part of the window the drag is over, saying where a drop goes or why not;
+// the folder row a drop goes into is highlighted.
+function showDropPlace(place) {
+  drops.shown = true;
+  // A PDF preview is a frame whose drag events never reach this page: while a drag is on, the
+  // frame lets them through (html.dropping), so the preview's refusal shows over it too. A drag
+  // that enters the window straight onto the frame isn't seen until it crosses the bar or margin.
+  document.documentElement.classList.add('dropping');
+  drops.place = place;
+  const o = $('#drop-overlay');
+  const area = place.refusal ? place.area : 'browse';
+  const el = { browse: '#results', downloads: '#downloads', status: '.bar.status' }[area];
+  const r = el ? $(el).getBoundingClientRect() : { left: 0, top: 0, width: innerWidth, height: innerHeight };
+  Object.assign(o.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+  o.classList.toggle('refused', !!place.refusal);
+  const text = place.refusal || `Drop to upload to ${place.server}:${place.dir || '~'}`;
+  const label = o.querySelector('.drop-label');
+  if (label.textContent !== text) label.textContent = bidiVisible(text);
+  o.hidden = false;
+  markDropRow(place.refusal ? -1 : place.row);
+}
+
+function markDropRow(i) {
+  for (const el of document.querySelectorAll('#rows .row.drop-target')) {
+    if (Number(el.dataset.i) !== i) el.classList.remove('drop-target');
+  }
+  if (i < 0) return;
+  const el = document.querySelector(`#rows .row[data-i="${i}"]`);
+  if (el) el.classList.add('drop-target');
+}
+
+// The drag is over (dropped, gone, cancelled or quiet): the overlay goes. A refusal still shown
+// stays a moment in the footer (`say`), so a drop let go where none is taken says why.
+function endDropOverlay(say = false) {
+  clearTimeout(drops.idle);
+  drops.idle = 0;
+  const refusal = drops.place && drops.place.refusal;
+  drops.shown = false;
+  drops.place = null;
+  document.documentElement.classList.remove('dropping');
+  $('#drop-overlay').hidden = true;
+  markDropRow(-1);
+  try { sessionStorage.removeItem('grab.drag'); } catch (e) { /* no storage */ }
+  if (say && refusal) flash(refusal);
+}
+
+// A text field a drag of text may go into (or move within): the search box, the path bar, a form's
+// field. Not a checkbox or switch (selectionStart is null there), so a link dropped on one is still
+// taken and can't open a window.
+function textField(target) {
+  const el = target instanceof Element ? target.closest('input, textarea, [contenteditable]') : null;
+  return !!el && (el.isContentEditable || (!el.readOnly && !el.disabled && el.selectionStart !== null));
+}
+
+function onDragOver(ev) {
+  const dt = ev.dataTransfer;
+  const kind = dragKind(dt);
+  if (!kind) { // text: nothing to say, nothing to drop, but a text field takes it as it always did
+    if (drops.shown) endDropOverlay();
+    if (textField(ev.target)) return;
     ev.preventDefault();
-    if (inside) return;
-    inside = true;
-    const dt = ev.dataTransfer;
-    send({ type: 'debugDrop', phase: 'dragenter', types: dt ? Array.from(dt.types) : [],
-      items: dt ? Array.from(dt.items).map((i) => ({ kind: i.kind, type: i.type })) : [] });
-  });
-  document.addEventListener('dragleave', (ev) => {
-    if (ev.clientX <= 0 || ev.clientY <= 0 || ev.clientX >= innerWidth || ev.clientY >= innerHeight) inside = false;
-  });
-  document.addEventListener('dragover', (ev) => {
-    ev.preventDefault();
-    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
-  });
-  // `msg` with `objects` beside it; if WebView2 refuses them, the report alone, saying why.
-  const report = (msg, objects, label) => {
-    try {
-      msg.objects = label;
-      postWithObjects(msg, objects);
-    } catch (e) {
-      msg.objects = 'none';
-      msg.postError = String(e);
-      send(msg);
-    }
-  };
-  // A promise's value, or { error } when it fails or hasn't settled in debugDropWaitMs (WebView2
-  // never settles a dropped folder's getAsFileSystemHandle()).
-  const settled = (p) => (p == null ? Promise.resolve(null) : Promise.race([
-    Promise.resolve(p).then((v) => v, (e) => ({ error: String(e) })),
-    new Promise((done) => { setTimeout(() => done({ error: `no answer in ${debugDropWaitMs} ms` }), debugDropWaitMs); }),
-  ]));
-  document.addEventListener('drop', (ev) => {
-    ev.preventDefault();
-    inside = false;
-    const dt = ev.dataTransfer;
-    if (!dt) return;
-    // All of it read now, during the event: the drop's data is gone once it returns. The promises
-    // (handles, strings) settle after.
-    const types = Array.from(dt.types);
-    const files = Array.from(dt.files);
-    const items = Array.from(dt.items).map((i) => {
-      let entry = null;
-      let handle = null;
-      try { entry = i.webkitGetAsEntry ? entryOf(i.webkitGetAsEntry()) : null; } catch (e) { entry = { error: String(e) }; }
-      try { handle = i.getAsFileSystemHandle ? i.getAsFileSystemHandle() : null; } catch (e) { handle = Promise.reject(e); }
-      const text = i.kind === 'string' ? new Promise((done) => i.getAsString((s) => done(short(s)))) : null;
-      return { kind: i.kind, type: i.type, entry, handle, text };
-    });
-    // The files at once (a dropped folder comes as a File too), so nothing that never settles can
-    // hold them back; then each item's handle and text, the handles beside them.
-    report({ type: 'debugDrop', phase: 'drop', types, files: files.map(fileOf),
-      items: items.map((i) => ({ kind: i.kind, type: i.type, entry: i.entry })) }, files, 'files');
-    (async () => {
-      const handles = await Promise.all(items.map((i) => settled(i.handle)));
-      const texts = await Promise.all(items.map((i) => settled(i.text)));
-      const real = handles.filter((h) => h && (h.kind === 'file' || h.kind === 'directory'));
-      report({ type: 'debugDrop', phase: 'handles',
-        items: items.map((i, n) => ({ kind: i.kind, type: i.type, handle: handleOf(handles[n]), text: texts[n] })) }, real, 'handles');
-    })();
-  });
+    if (dt) dt.dropEffect = 'none';
+    return;
+  }
+  ev.preventDefault(); // never the browser's own handling: it would open what was dropped
+  if (!drops.shown) {
+    // A file drag is over the page: if the page is lost now (WebView2 ends it for a file it
+    // can't hand over), the page opened again says why (onPageRestored).
+    try { sessionStorage.setItem('grab.drag', String(Date.now())); } catch (e) { /* no storage */ }
+  }
+  const place = kind === 'link' ? { refusal: DROP_FILES, area: 'window' } : dropPlace(ev.target);
+  if (dt) dt.dropEffect = place.refusal ? 'none' : 'copy';
+  showDropPlace(place);
+  clearTimeout(drops.idle);
+  drops.idle = setTimeout(() => endDropOverlay(), dropIdleMs);
+}
+
+function onDragLeave(ev) {
+  // Leaving an element for another inside the page says dragleave too; out of the window (or a
+  // cancelled drag, or one let go where no drop is taken) WebView2 says it at 0,0.
+  const out = (ev.clientX === 0 && ev.clientY === 0) || ev.clientX < 0 || ev.clientY < 0 ||
+    ev.clientX >= innerWidth || ev.clientY >= innerHeight;
+  if (out && drops.shown) endDropOverlay(true);
+}
+
+function onDrop(ev) {
+  const dt = ev.dataTransfer;
+  const kind = dragKind(dt);
+  if (!kind && textField(ev.target)) { // text into a text field: the field's own handling
+    endDropOverlay();
+    return;
+  }
+  ev.preventDefault();
+  const place = kind === 'link' ? { refusal: DROP_FILES } : dropPlace(ev.target);
+  endDropOverlay();
+  if (!kind) return;
+  if (place.refusal) {
+    flash(place.refusal);
+    return;
+  }
+  // All of it read now: the drop's data is gone once the event returns.
+  const items = [...dt.items].filter((i) => i.kind === 'file');
+  const files = items.map((i) => i.getAsFile());
+  const entries = items.map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+  if (!items.length) {
+    flash(DROP_FILES);
+    return;
+  }
+  // A file WebView2 couldn't get (from inside a .zip whose contents didn't come): a File with no
+  // entry behind it. Never posted: WebView2 ends the page for such a File.
+  if (files.some((f) => !f) || entries.some((e) => !e)) {
+    flash(EXTRACT_FIRST, 12000);
+    return;
+  }
+  const token = ++upload.token;
+  upload.pending = { token, server: place.server, dir: place.dir };
+  // Until grab answers (onUploadCheck): if WebView2 ends the page over these files after all, the
+  // page opened again says why.
+  try { sessionStorage.setItem('grab.drag', String(Date.now())); } catch (e) { /* no storage */ }
+  let posted = false;
+  try {
+    posted = postWithObjects({ type: 'uploadDrop', token, server: place.server, dir: place.dir }, files);
+  } catch (e) { /* refused by WebView2: said below */ }
+  if (!posted) {
+    upload.pending = null;
+    try { sessionStorage.removeItem('grab.drag'); } catch (e) { /* no storage */ }
+    flash('This window can’t take dropped files: use Upload files here… instead.');
+  }
+}
+
+document.addEventListener('dragenter', onDragOver, true);
+document.addEventListener('dragover', onDragOver, true);
+document.addEventListener('dragleave', onDragLeave, true);
+document.addEventListener('drop', onDrop, true);
+// The page gets no keys during a drag from another program (Escape comes as dragleave), but a
+// stray overlay goes with Escape too.
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && drops.shown) endDropOverlay(); }, true);
+
+// What the page before this one held, when the window opened it again (onPageRestored): Browse's
+// folders (remember) and a file drag over it. sessionStorage outlives the page in the window, never
+// grab itself, so a new start finds nothing. Read before anything here writes it: Browse opens
+// those folders again at init.
+const pageWas = (() => {
+  try {
+    return { paths: JSON.parse(sessionStorage.getItem('grab.paths') || 'null'), drag: Number(sessionStorage.getItem('grab.drag') || 0) };
+  } catch (e) {
+    return { paths: null, drag: 0 };
+  }
+})();
+if (pageWas.paths && typeof pageWas.paths === 'object' && !Array.isArray(pageWas.paths)) state.browsePaths = { ...pageWas.paths };
+
+// grab's page was opened again by the window (its renderer ended, or an error page came in its
+// place: webview.cpp restore_page). The queue, the settings and everything else the backend holds
+// came back with init, and Browse with the folders it had open (pageWas); a search, the selection
+// and an open dialog are gone, as the banner says.
+function onPageRestored(msg) {
+  const how = msg.reason === 'error page' ? 'was replaced by an error page' : 'was ended by WebView2';
+  let text = `grab’s window ${how} and was opened again: downloads and uploads went on; a search, the selection and an open dialog are gone.`;
+  if (pageWas.drag && Date.now() - pageWas.drag < 60000) text += ` It happened during a drop. ${EXTRACT_FIRST}`;
+  pageWas.drag = 0;
+  try { sessionStorage.removeItem('grab.drag'); } catch (e) { /* no storage */ }
+  showBanner(text);
 }
 
 // ---- events ------------------------------------------------------------------------------

@@ -19,6 +19,7 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace grab::ssh {
@@ -92,5 +93,23 @@ void look_server(Check& check, const std::shared_ptr<ssh::Pool>& pool, fetch::Co
 
 // Whether the server said it has less room than the bytes to send.
 [[nodiscard]] bool short_of_space(const Check& check);
+
+// A drop's refusals (UPLOADS.md decision 7): nothing grab could take came with it; files that
+// aren't on this PC as files (from inside a .zip, a mail's attachments). As the page says them
+// (app.js EXTRACT_FIRST).
+inline constexpr std::string_view drop_nothing = "Drop files or folders from Explorer: nothing grab can upload came with this drop.";
+inline constexpr std::string_view drop_extract_first =
+    "Extract files from a .zip first: a file inside a .zip (or a mail’s attachment) isn’t on this PC as a file "
+    "until it is extracted or saved. Then drop it from there.";
+
+// Whether `path` is WebView2's own copy of a dropped file that has no place on disk (a file from
+// inside a .zip, a mail's attachment): WebView2 writes those straight into its temp folder `temp`
+// (grab-gui's, which it inherits) and hands their paths over like the user's own. They aren't
+// uploaded: WebView2 deletes them again, so an upload from one would fail later.
+[[nodiscard]] bool dropped_copy(const std::filesystem::path& path, const std::filesystem::path& temp);
+
+// Why a drop of `paths` isn't taken, or "" when its check may start: none came with it
+// (drop_nothing); some are WebView2's copies in `temp` (drop_extract_first).
+[[nodiscard]] std::string drop_refusal(const std::vector<std::filesystem::path>& paths, const std::filesystem::path& temp);
 
 } // namespace grab::upload

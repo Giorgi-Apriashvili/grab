@@ -803,7 +803,7 @@ App::QueueSummary App::summary() const {
 
 // ---- messages -----------------------------------------------------------------------------
 
-void App::on_message(const std::string& text) {
+void App::on_message(const std::string& text, std::vector<std::filesystem::path> paths) {
     auto msg = json::parse(text);
     if (!msg || msg->kind != Value::Kind::object) return;
     const std::string type = msg->string_of("type").value_or("");
@@ -901,6 +901,13 @@ void App::on_message(const std::string& text) {
         host_.defer([this, server = std::move(server), dir = std::move(dir), folders, token] {
             pick_upload(server, dir, folders, token);
         });
+    } else if (type == "uploadDrop") {
+        // Files and folders dropped on Browse: their paths come from WebView2 beside the message,
+        // the page names only the server folder.
+        const std::string server = msg->string_of("server").value_or("");
+        const int token = int_of(*msg, "token");
+        if (server.empty() || token <= 0) return;
+        drop_upload(token, server, msg->string_of("dir").value_or(""), std::move(paths));
     } else if (type == "uploadCheckCancel") {
         cancel_check(int_of(*msg, "token"));
     } else if (type == "uploadStart") {

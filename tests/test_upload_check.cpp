@@ -348,3 +348,45 @@ TEST_CASE("upload check: a picked file or folder whose name ends with a dot or a
     fs::remove(raw(L"d "), ec);
 }
 #endif
+
+TEST_CASE("upload check: a drop of WebView2's own copies (files from inside a .zip) or of nothing is refused, others go") {
+    // WebView2 writes a dropped file that has no place on disk straight into its temp folder (the
+    // window's): here a folder of the test's own stands for it.
+    Dir temp("webview-temp");
+    Dir mine("mine");
+    const auto copy = put_local(temp.path, "inner.png", "from a zip");
+    const auto deeper = put_local(temp.path, "sub/kept.txt", "the user's own, a level down");
+    const auto own = put_local(mine.path, "a.txt", "the user's own");
+    fs::create_directories(mine.path / "folder");
+
+    CHECK(upload::dropped_copy(copy, temp.path));
+    CHECK(upload::dropped_copy(copy, fs::path(temp.path.native() + fs::path::preferred_separator))); // "C:\T\" is "C:\T"
+    CHECK_FALSE(upload::dropped_copy(deeper, temp.path));
+    CHECK_FALSE(upload::dropped_copy(own, temp.path));
+    CHECK_FALSE(upload::dropped_copy(mine.path / "folder", temp.path));
+    CHECK_FALSE(upload::dropped_copy(copy, fs::path()));
+    // A temp folder that can't be opened: by its name, as Windows compares names.
+    CHECK(upload::dropped_copy(fs::path("C:/nowhere-grab/x.png"), fs::path("C:/nowhere-grab")));
+#ifdef _WIN32
+    CHECK(upload::dropped_copy(fs::path(LR"(C:\Nowhere-Grab\x.png)"), fs::path(LR"(c:\NOWHERE-GRAB\)")));
+#endif
+
+    CHECK(upload::drop_refusal({}, temp.path) == upload::drop_nothing);
+    CHECK(upload::drop_refusal({copy}, temp.path) == upload::drop_extract_first);
+    CHECK(upload::drop_refusal({own, copy}, temp.path) == upload::drop_extract_first); // one drag, one source
+    CHECK(upload::drop_refusal({own, mine.path / "folder", deeper}, temp.path).empty());
+    // Many from one folder (each folder is looked at once), then one copy: still refused.
+    std::vector<fs::path> many;
+    many.reserve(502);
+    for (int i = 0; i < 500; ++i) many.push_back(mine.path / std::format("f{}.txt", i));
+    CHECK(upload::drop_refusal(many, temp.path).empty());
+    many.push_back(copy);
+    CHECK(upload::drop_refusal(many, temp.path) == upload::drop_extract_first);
+    many.insert(many.begin(), temp.path / "first.png"); // the copy first, the user's own after
+    CHECK(upload::drop_refusal(many, temp.path) == upload::drop_extract_first);
+    // The dialog's check takes such a drop as the file dialog's pick: files and folders mixed.
+    const auto c = local_check({own, mine.path / "folder"});
+    REQUIRE(c.items.size() == 2);
+    CHECK_FALSE(c.items[0].folder);
+    CHECK(c.items[1].folder);
+}

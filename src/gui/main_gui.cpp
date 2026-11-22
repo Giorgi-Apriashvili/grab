@@ -573,8 +573,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
 #ifndef NDEBUG
     options.dev_tools = true;
 #endif
-    // The uploads' drop spike (UPLOADS.md step 0.7), in any build: the user runs it on a release one.
-    options.debug_drops = util::getenv_utf8("GRAB_DEBUG_DROPS") == "1";
     options.background = background_color(dark);
     // The viewer's previews come from the app, which answers on a worker thread.
     options.on_preview = [](const std::string& url, std::function<void(gui::WebResource)> reply) {
@@ -586,8 +584,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
         post_to_ui(wm_run, payload, [payload] { delete payload; });
     };
     g.webview.start(
-        g.hwnd, std::move(options), [](const std::string& json) {
-            if (g.app) g.app->on_message(json);
+        g.hwnd, std::move(options), [](const std::string& json, std::vector<std::filesystem::path> paths) {
+            if (g.app) g.app->on_message(json, std::move(paths));
         },
         [](HRESULT hr) {
             if (FAILED(hr)) show_webview_error(g.hwnd, hr);

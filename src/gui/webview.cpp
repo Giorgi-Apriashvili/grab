@@ -11,11 +11,11 @@
 #include <wrl/event.h>
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
-#include <format>
-#include <fstream>
 #include <string_view>
-#include <system_error>
+#include <utility>
+#include <vector>
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
@@ -34,6 +34,10 @@ std::wstring reason(int status) {
     default: return status >= 500 ? L"Error" : L"Bad Request";
     }
 }
+
+constexpr const wchar_t* page_url = L"https://grab.ui/index.html";
+// How often a minute grab's page is opened again after it was lost (WebViewHost::restore_page).
+constexpr std::size_t restore_limit = 3;
 
 // Frees a string WebView2 allocated with CoTaskMemAlloc.
 struct CoString {
@@ -130,10 +134,11 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
         }
     }
 
-    // Nothing dragged in from outside: a dropped link would navigate the window. Only the drop
-    // spike takes drops, and its page stops them from navigating (debugDropsOn in app.js).
+    // Files and folders dragged in from Explorer are uploads (UPLOADS.md 5.10): the page keeps every
+    // drag from navigating the window (it takes dragover and drop everywhere) and posts a drop's
+    // Files to grab, whose paths come from WebView2 below.
     ComPtr<ICoreWebView2Controller4> controller4;
-    if (SUCCEEDED(controller_.As(&controller4))) controller4->put_AllowExternalDrop(options_.debug_drops ? TRUE : FALSE);
+    if (SUCCEEDED(controller_.As(&controller4))) controller4->put_AllowExternalDrop(TRUE);
 
     EventRegistrationToken token{};
     // Only grab's own page talks to grab (ui_origin.hpp).
@@ -143,11 +148,65 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
                 CoString source;
                 if (FAILED(args->get_Source(&source.p)) || !ui_origin::is_page(source.view())) return S_OK;
                 CoString json;
-                if (SUCCEEDED(args->get_WebMessageAsJson(&json.p))) {
-                    const std::string text = util::to_utf8(json.view());
-                    if (options_.debug_drops) note_drop(text, args);
-                    if (on_message_) on_message_(text);
+                if (FAILED(args->get_WebMessageAsJson(&json.p))) return S_OK;
+                // The files posted beside the message (postMessageWithAdditionalObjects): WebView2
+                // gives each one's path; a dropped folder comes as a File with the folder's path.
+                std::vector<std::filesystem::path> paths;
+                ComPtr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
+                ComPtr<ICoreWebView2ObjectCollectionView> objects;
+                UINT32 count = 0;
+                if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))) && SUCCEEDED(args2->get_AdditionalObjects(&objects)) &&
+                    objects && SUCCEEDED(objects->get_Count(&count))) {
+                    for (UINT32 i = 0; i < count; ++i) {
+                        ComPtr<IUnknown> item;
+                        ComPtr<ICoreWebView2File> file;
+                        CoString path;
+                        if (SUCCEEDED(objects->GetValueAtIndex(i, &item)) && item && SUCCEEDED(item.As(&file)) &&
+                            SUCCEEDED(file->get_Path(&path.p)) && !path.view().empty()) {
+                            paths.emplace_back(path.view());
+                        }
+                    }
                 }
+                const std::string text = util::to_utf8(json.view());
+                if (on_message_) on_message_(text, std::move(paths));
+                // A page opened again (restore_page) is told why once it is listening: after the
+                // app's answers to its "init", which are queued to the UI thread the same way.
+                if (!restored_.empty()) {
+                    if (const auto msg = json::parse(text); msg && msg->string_of("type") == "init") {
+                        json::Value v = json::Value::make_object();
+                        v.set("type", json::Value::make_string("pageRestored"));
+                        v.set("reason", json::Value::make_string(std::exchange(restored_, {})));
+                        auto said = [this, out = json::stringify(v)] { post_json(out); };
+                        if (options_.defer) options_.defer(std::move(said));
+                        else said();
+                    }
+                }
+                return S_OK;
+            })
+            .Get(),
+        &token);
+
+    // grab's page never stays away: a renderer that ended (WebView2 ends the page's process when
+    // the page posts a dropped file it was never given, a file from inside a .zip: "This page is
+    // having a problem", RESULT_CODE_KILLED_BAD_MESSAGE) and an error page in its place bring
+    // grab's page back at once. A page that only stopped answering for a while is left alone: it
+    // comes back by itself, with everything it shows.
+    webview_->add_ProcessFailed(
+        Callback<ICoreWebView2ProcessFailedEventHandler>(
+            [this](ICoreWebView2*, ICoreWebView2ProcessFailedEventArgs* args) -> HRESULT {
+                COREWEBVIEW2_PROCESS_FAILED_KIND kind{};
+                if (SUCCEEDED(args->get_ProcessFailedKind(&kind)) && kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED) {
+                    restore_page("ended");
+                }
+                return S_OK;
+            })
+            .Get(),
+        &token);
+    webview_->add_ContentLoading(
+        Callback<ICoreWebView2ContentLoadingEventHandler>(
+            [this](ICoreWebView2*, ICoreWebView2ContentLoadingEventArgs* args) -> HRESULT {
+                BOOL error = FALSE;
+                if (SUCCEEDED(args->get_IsErrorPage(&error)) && error) restore_page("error page");
                 return S_OK;
             })
             .Get(),
@@ -252,7 +311,7 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
     GetClientRect(hwnd_, &bounds);
     controller_->put_Bounds(bounds);
     controller_->put_IsVisible(TRUE);
-    const HRESULT hr = webview_->Navigate(L"https://grab.ui/index.html");
+    const HRESULT hr = webview_->Navigate(page_url);
     if (on_ready_) {
         auto cb = std::move(on_ready_);
         on_ready_ = nullptr;
@@ -279,68 +338,18 @@ void WebViewHost::complete(std::uint64_t id, const WebResource& r) {
     request.mapped().deferral->Complete();
 }
 
-void WebViewHost::note_drop(const std::string& json, ICoreWebView2WebMessageReceivedEventArgs* args) {
-    const auto msg = json::parse(json);
-    if (!msg || msg->kind != json::Value::Kind::object) return;
-    const std::string type = msg->string_of("type").value_or("");
-    if (type == "init") {
-        post_json(R"({"type":"debugDrops"})");
-        return;
-    }
-    if (type != "debugDrop") return;
-    std::string log = std::format("{:%F %T} UTC {}\n", std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()), json);
-    ComPtr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
-    ComPtr<ICoreWebView2ObjectCollectionView> objects;
-    UINT32 count = 0;
-    if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&args2))) && SUCCEEDED(args2->get_AdditionalObjects(&objects)) && objects) {
-        if (FAILED(objects->get_Count(&count))) count = 0;
-    }
-    int files = 0;
-    int handles = 0;
-    for (UINT32 i = 0; i < count; ++i) {
-        ComPtr<IUnknown> item;
-        ComPtr<ICoreWebView2File> file;
-        ComPtr<ICoreWebView2FileSystemHandle> handle;
-        if (FAILED(objects->GetValueAtIndex(i, &item)) || !item) {
-            log += std::format("  object {}: null\n", i);
-        } else if (SUCCEEDED(item.As(&file))) {
-            CoString path;
-            file->get_Path(&path.p);
-            log += std::format("  object {}: ICoreWebView2File path={}\n", i, util::to_utf8(path.view()));
-            ++files;
-        } else if (SUCCEEDED(item.As(&handle))) {
-            COREWEBVIEW2_FILE_SYSTEM_HANDLE_KIND kind = COREWEBVIEW2_FILE_SYSTEM_HANDLE_KIND_FILE;
-            COREWEBVIEW2_FILE_SYSTEM_HANDLE_PERMISSION permission = COREWEBVIEW2_FILE_SYSTEM_HANDLE_PERMISSION_READ_ONLY;
-            CoString path;
-            const bool kind_known = SUCCEEDED(handle->get_Kind(&kind));
-            const bool permission_known = SUCCEEDED(handle->get_Permission(&permission));
-            handle->get_Path(&path.p);
-            log += std::format("  object {}: ICoreWebView2FileSystemHandle kind={} permission={} path={}\n", i,
-                               !kind_known ? "?" : kind == COREWEBVIEW2_FILE_SYSTEM_HANDLE_KIND_DIRECTORY ? "directory" : "file",
-                               !permission_known                                                  ? "?"
-                               : permission == COREWEBVIEW2_FILE_SYSTEM_HANDLE_PERMISSION_READ_WRITE ? "read-write"
-                                                                                                    : "read-only",
-                               util::to_utf8(path.view()));
-            ++handles;
-        } else {
-            log += std::format("  object {}: neither ICoreWebView2File nor ICoreWebView2FileSystemHandle\n", i);
-        }
-    }
-    if (count == 0) log += "  no additional objects\n";
-    std::error_code ec;
-    const std::filesystem::path where = std::filesystem::temp_directory_path(ec) / "grab-drops.log";
-    bool written = false;
-    if (!ec) {
-        std::ofstream out(where, std::ios::binary | std::ios::app);
-        out << log;
-        written = static_cast<bool>(out);
-    }
-    json::Value banner = json::Value::make_object();
-    banner.set("type", json::Value::make_string("debugDropLogged"));
-    banner.set("text", json::Value::make_string(std::format(
-                           "Drop spike: {} with {} File object(s) and {} handle(s) of {} {}", msg->string_of("phase").value_or("?"),
-                           files, handles, count, written ? "logged to " + util::path_to_utf8(where) : "NOT logged (no temp folder)")));
-    post_json(json::stringify(banner));
+void WebViewHost::restore_page(const char* why) {
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(restores_, [&](auto at) { return now - at > std::chrono::minutes(1); });
+    if (restores_.size() >= restore_limit || !webview_) return;
+    restores_.push_back(now);
+    restored_ = why;
+    // After WebView2's event handler has returned, as offer_link's question.
+    const auto reopen = [this] {
+        if (webview_) webview_->Navigate(page_url);
+    };
+    if (options_.defer) options_.defer(reopen);
+    else reopen();
 }
 
 void WebViewHost::resize(const RECT& bounds) {

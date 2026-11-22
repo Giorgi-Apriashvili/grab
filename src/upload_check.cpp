@@ -1,6 +1,7 @@
 #include "upload_check.hpp"
 
 #include "folder_job.hpp"
+#include "local_name.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
@@ -16,6 +17,7 @@
 #include <optional>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -246,5 +248,28 @@ std::string nothing_goes(const Check& check) {
 }
 
 bool short_of_space(const Check& check) { return check.free && *check.free < check.bytes; }
+
+bool dropped_copy(const fs::path& path, const fs::path& temp) {
+    if (temp.empty() || !path.has_parent_path()) return false;
+    const fs::path parent = path.parent_path();
+    std::error_code ec;
+    if (fs::equivalent(parent, temp, ec)) return true;
+    // Folders that can't be opened: by their names, as Windows compares them (a last separator
+    // or none: "C:\T\" is "C:\T").
+    const auto folder = [](const fs::path& p) { return local::key((p / "x").lexically_normal().parent_path()); };
+    return folder(parent) == folder(temp);
+}
+
+std::string drop_refusal(const std::vector<fs::path>& paths, const fs::path& temp) {
+    if (paths.empty()) return std::string(drop_nothing);
+    // Each folder looked at once: dropped_copy opens it and `temp`, and this runs on the window's
+    // thread (a drop of thousands of files from one share is one folder).
+    std::unordered_set<fs::path::string_type> seen;
+    for (const auto& p : paths) {
+        if (!p.has_parent_path() || !seen.insert(local::key(p.parent_path())).second) continue;
+        if (dropped_copy(p, temp)) return std::string(drop_extract_first);
+    }
+    return {};
+}
 
 } // namespace grab::upload

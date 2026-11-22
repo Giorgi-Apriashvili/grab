@@ -60,7 +60,7 @@ std::string rfc3339_ns(std::int64_t ns) {
     return std::format("{:%FT%TZ}", std::chrono::sys_time<std::chrono::nanoseconds>{std::chrono::nanoseconds{ns}});
 }
 
-// Tests only (UPLOADS.md chunk 3; to be removed before 0.24.0, as GRAB_DEBUG_DROPS): with
+// Tests only (UPLOADS.md chunk 3; to be removed before 0.24.0, step 7.5): with
 // GRAB_TEST_PICKS=<file>, the upload's file dialog isn't shown; its answer is the file's lines (one
 // path each, UTF-8; none: cancelled), so a window driven over DevTools can upload without a native
 // dialog in the way. What was asked goes to <file>.asked ("files|folders <title>").
@@ -100,6 +100,24 @@ void App::pick_upload(const std::string& server, const std::string& dir, bool fo
     }
     last_upload_dir_ = picked->front().parent_path();
     start_check(token, server, dir, std::move(*picked));
+}
+
+void App::drop_upload(int token, const std::string& server, const std::string& dir, std::vector<std::filesystem::path> paths) {
+    std::error_code ec;
+    const auto temp = std::filesystem::temp_directory_path(ec); // WebView2's too: it inherits grab-gui's
+    if (auto why = upload::drop_refusal(paths, ec ? std::filesystem::path() : temp); !why.empty()) {
+        return post_refused(token, server, dir, why);
+    }
+    start_check(token, server, dir, std::move(paths));
+}
+
+void App::post_refused(int token, const std::string& server, const std::string& dir, const std::string& why) const {
+    UploadCheck c;
+    c.token = token;
+    c.check.server = server;
+    c.check.dir = dir;
+    c.check.why = why;
+    post_check(c, "refused");
 }
 
 void App::start_check(int token, const std::string& server, const std::string& dir, std::vector<std::filesystem::path> paths) {

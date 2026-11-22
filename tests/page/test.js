@@ -3,8 +3,8 @@
 // column widths, keys and the treegrid ARIA, every file of a folder by subscription, the filter, Go
 // to running, the performance numbers, a file's priority in its folder, the status bar's total and
 // its graph, the MiB/s box and its confirmation, Waiting files, opening finished files, the split's
-// grip and the head's free space; uploads in the window, UPLOADS.md chunk 3), run in headless Edge
-// by run_page_test.ps1.
+// grip and the head's free space; uploads in the window and drops from Explorer, UPLOADS.md chunks 3
+// and 4), run in headless Edge by run_page_test.ps1.
 const out = [];
 window.pageTestOut = out; // read by run_page_test.ps1 when test.js never finishes, to name where it stopped
 let failed = 0;
@@ -1786,78 +1786,6 @@ try {
     check('update: no banner after', ub.hidden, true);
   }
 
-  // The uploads' drop spike (UPLOADS.md step 0.7): no drop is taken until grab-gui says
-  // 'debugDrops'; then dragging over the page and dropping never navigate it, one dragenter per
-  // drag is reported, and the drop with its File objects beside it.
-  {
-    const dragEvent = (type, dt) => new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true, clientX: 100, clientY: 100 });
-    const dt = new DataTransfer();
-    dt.items.add(new File(['abc'], 'a.txt', { type: 'text/plain' }));
-    dt.items.add('https://example.com/x', 'text/uri-list');
-    const before = dragEvent('drop', dt);
-    document.body.dispatchEvent(before);
-    check('drops: none taken before grab-gui asks', [before.defaultPrevented, debugDropsListening], [false, false]);
-    const posted = [];
-    const realPost = postWithObjects;
-    // eslint-disable-next-line no-global-assign
-    postWithObjects = (m, o) => posted.push([m, o]);
-    sent.length = 0;
-    debugDropsOn();
-    debugDropsOn(); // a second 'debugDrops' (a reload's init): still one set of listeners
-    const enter = dragEvent('dragenter', dt);
-    document.body.dispatchEvent(enter);
-    $('#rows').dispatchEvent(dragEvent('dragenter', dt)); // an element inside: no second report
-    const over = dragEvent('dragover', dt);
-    $('#rows').dispatchEvent(over);
-    const drop = dragEvent('drop', dt);
-    $('#rows').dispatchEvent(drop);
-    const [msg, objects] = posted[0] || [{}, []];
-    check('drops: the drop reported at once, its File beside it',
-      [posted.length, msg.type, msg.phase, msg.objects, msg.files, objects.length, objects[0] instanceof File, objects[0] && objects[0].name],
-      [1, 'debugDrop', 'drop', 'files', [{ name: 'a.txt', size: 3, type: 'text/plain', lastModified: msg.files && msg.files[0].lastModified, relativePath: '' }],
-        1, true, 'a.txt']);
-    check('drops: each item kind and type', (msg.items || []).map((i) => [i.kind, i.type]), [['file', 'text/plain'], ['string', 'text/uri-list']]);
-    for (let i = 0; i < 50 && posted.length < 2; i++) await tick();
-    check('drops: one dragenter reported, with its kinds and types',
-      sent.map((m) => [m.type, m.phase, [...m.types].sort(), m.items]),
-      [['debugDrop', 'dragenter', ['Files', 'text/uri-list'], [{ kind: 'file', type: 'text/plain' }, { kind: 'string', type: 'text/uri-list' }]]]);
-    // (dropEffect stays "none" on a DataTransfer made by a page: only a real drag takes 'copy'.)
-    check('drops: the drag and the drop kept from navigating the window',
-      [enter.defaultPrevented, over.defaultPrevented, drop.defaultPrevented], [true, true, true]);
-    const [after] = posted[1] || [{}];
-    check('drops: then the handles and texts; the link as text',
-      [posted.length, after.phase, (after.items || []).map((i) => [i.kind, i.text])],
-      [2, 'handles', [['file', null], ['string', 'https://example.com/x']]]);
-    // A handle that never settles (WebView2's for a dropped folder): the files went all the same,
-    // and the handles' report comes once the wait is over, saying so.
-    const realHandle = DataTransferItem.prototype.getAsFileSystemHandle;
-    const realWait = debugDropWaitMs;
-    DataTransferItem.prototype.getAsFileSystemHandle = () => new Promise(() => {});
-    // eslint-disable-next-line no-global-assign
-    debugDropWaitMs = 30;
-    posted.length = 0;
-    document.body.dispatchEvent(dragEvent('drop', dt));
-    check('drops: a handle that never settles: the files at once', posted.map(([m, o]) => [m.phase, o.length]), [['drop', 1]]);
-    for (let i = 0; i < 500 && posted.length < 2; i++) await tick();
-    check('drops: ... and the handles after the wait',
-      posted.map(([m]) => [m.phase, (m.items || []).map((i) => i.handle && i.handle.error)]),
-      [['drop', [undefined, undefined]], ['handles', ['no answer in 30 ms', 'no answer in 30 ms']]]);
-    DataTransferItem.prototype.getAsFileSystemHandle = realHandle;
-    // eslint-disable-next-line no-global-assign
-    debugDropWaitMs = realWait;
-    // A WebView2 that refuses the objects: the reports go all the same, saying why.
-    // eslint-disable-next-line no-global-assign
-    postWithObjects = () => { throw new Error('unsupported object'); };
-    sent.length = 0;
-    document.body.dispatchEvent(dragEvent('drop', dt));
-    for (let i = 0; i < 50 && sent.length < 2; i++) await tick();
-    check('drops: objects refused: the reports alone, with the error',
-      sent.map((m) => [m.phase, m.objects, m.postError]), [['drop', 'none', 'Error: unsupported object'], ['handles', 'none', 'Error: unsupported object']]);
-    // eslint-disable-next-line no-global-assign
-    postWithObjects = realPost;
-    sent.length = 0;
-  }
-
   // ---- uploads in the window (UPLOADS.md 5.10, chunk 3) ------------------------------------------
   // Upload rows in the same table: "↑ name → Server:/folder", Uploading, the Show filter's
   // Downloads / Uploads, the head's "N uploading"; every row action on an upload row acts on the
@@ -2173,6 +2101,277 @@ try {
     clearSel();
     dl.cursor = '';
     sent.length = 0;
+  }
+
+  // ---- drops from Explorer (UPLOADS.md 5.10, chunk 4) ---------------------------------------------
+  // Every drag is kept from navigating the window; over Browse the overlay says where a drop goes
+  // (the folder row under the pointer, else the folder open), Browse's refusals and the places
+  // outside it say why; text shows nothing, a link is refused; the overlay goes with a drop, the
+  // drag leaving or cancelled (dragleave at 0,0), Escape and dragovers stopping; a drop posts its
+  // Files beside "uploadDrop" for the same dialog as Upload files here…, never a file WebView2
+  // couldn't get (it ends the page for one).
+  {
+    const b = state.browse;
+    const browseWas = { ...b };
+    const hitsWas = state.hits;
+    const remotesWas = state.remotes;
+    const remoteWas = state.remote;
+    const reset = () => {
+      Object.assign(b, { server: 'Main', path: '/srv', top: false, under: null, loading: false, error: '', uploadable: true,
+        severalRoots: false, crumbs: [{ name: 'srv', path: '/srv' }] });
+      state.hits = [{ name: 'tv', path: '/srv/tv', dir: true, remote: 'Main' }, { name: 'a.txt', path: '/srv/a.txt', remote: 'Main', size: 3 }];
+      renderRows();
+    };
+    state.remotes = [{ name: 'Main', host: 'h', user: 'u' }];
+    state.remote = 'Main';
+    state.selected = new Set();
+    state.cursor = -1;
+    reset();
+    // A drag made by a page has no entries behind its files; Explorer's files and folders have.
+    const realEntry = DataTransferItem.prototype.webkitGetAsEntry;
+    DataTransferItem.prototype.webkitGetAsEntry = function entry() {
+      if (this.kind !== 'file') return null;
+      return this.getAsFile().name.startsWith('zipped') ? null : { isFile: true, isDirectory: false };
+    };
+    const posted = [];
+    const realPost = postWithObjects;
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = (m, o) => { posted.push([m, [...o].map((f) => f.name)]); return true; };
+    const dragOf = (...names) => {
+      const dt = new DataTransfer();
+      for (const n of names) dt.items.add(new File(['abc'], n));
+      return dt;
+    };
+    const textDrag = () => {
+      const dt = new DataTransfer();
+      dt.items.add('some words', 'text/plain');
+      return dt;
+    };
+    const linkDrag = () => {
+      const dt = dragOf('Example Domain.url');
+      dt.items.add('https://example.com/', 'text/uri-list');
+      dt.items.add('https://example.com/', 'text/plain');
+      return dt;
+    };
+    const inside = (el) => {
+      const r = el.getBoundingClientRect();
+      return { clientX: r.x + Math.min(20, r.width / 2), clientY: r.y + Math.min(10, r.height / 2) };
+    };
+    const fire = (el, type, dt, where = inside(el)) => {
+      const ev = new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true, ...where });
+      el.dispatchEvent(ev);
+      return ev;
+    };
+    const overlay = () => ({ shown: !$('#drop-overlay').hidden, text: $('#drop-overlay').textContent,
+      refused: $('#drop-overlay').classList.contains('refused'), marked: [...document.querySelectorAll('#rows .row.drop-target')].map((r) => Number(r.dataset.i)) });
+    const rowEl = (i) => document.querySelector(`#rows .row[data-i="${i}"]`);
+    const said = () => (state.flash && state.flash.until > Date.now() ? state.flash.text : '');
+    const quiet = () => { state.flash = null; posted.length = 0; sent.length = 0; endDropOverlay(); };
+
+    // Never the browser's own handling: every dragover and drop is taken, whatever is dragged and
+    // wherever it is (the drops here go where none is taken: nothing is posted), but text over a
+    // text field, which goes in (or moves) as it always did.
+    for (const [what, drag] of [['files', () => dragOf('a.txt')], ['text', textDrag], ['a link', linkDrag]]) {
+      quiet();
+      const evs = [fire($('#results'), 'dragenter', drag()), fire(document.body, 'dragover', drag()), fire($('#queue'), 'dragover', drag()),
+        fire($('#query'), 'dragover', drag()), fire($('#queue'), 'drop', drag())];
+      check(`drops: ${what}: dragenter, dragover and drop never left to the browser (text: but over the search box)`, evs.map((e) => e.defaultPrevented),
+        [true, true, true, what !== 'text', true]);
+      check(`drops: ${what}: nothing posted or sent`, [posted.length, sent.length], [0, 0]);
+    }
+    quiet();
+    check('drops: text into the search box or path bar: the field’s own (dragover, drop)',
+      [fire($('#query'), 'dragover', textDrag()), fire($('#query'), 'drop', textDrag()), fire($('#address'), 'drop', textDrag())].map((e) => e.defaultPrevented),
+      [false, false, false]);
+    check('drops: text or a link on a checkbox: still taken',
+      [fire($('#select-all'), 'dragover', textDrag()), fire($('#select-all'), 'drop', textDrag()), fire($('#select-all'), 'drop', linkDrag())].map((e) => e.defaultPrevented),
+      [true, true, true]);
+    check('drops: files or a link over the search box: still taken',
+      [fire($('#query'), 'dragover', dragOf('a.txt')), fire($('#query'), 'dragover', linkDrag()), fire($('#query'), 'drop', linkDrag())].map((e) => e.defaultPrevented),
+      [true, true, true]);
+    check('drops: ... nothing posted or sent', [posted.length, sent.length], [0, 0]);
+    quiet();
+
+    // Where a drop goes.
+    fire($('#results'), 'dragover', dragOf('a.txt'));
+    check('drops: over Browse: the folder open', overlay(), { shown: true, text: 'Drop to upload to Main:/srv', refused: false, marked: [] });
+    fire(rowEl(0), 'dragover', dragOf('a.txt'));
+    check('drops: over a folder row: that folder, the row highlighted', overlay(), { shown: true, text: 'Drop to upload to Main:/srv/tv', refused: false, marked: [0] });
+    fire(rowEl(1), 'dragover', dragOf('a.txt'));
+    check('drops: over a file row: the folder open', overlay(), { shown: true, text: 'Drop to upload to Main:/srv', refused: false, marked: [] });
+    const r = $('#drop-overlay').getBoundingClientRect();
+    const list = $('#results').getBoundingClientRect();
+    check('drops: the overlay covers the list', [r.x, r.y, r.width, r.height].map(Math.round), [list.x, list.y, list.width, list.height].map(Math.round));
+    fire($('#results'), 'dragover', textDrag());
+    check('drops: text: no overlay', overlay().shown, false);
+    fire($('#results'), 'dragover', linkDrag());
+    check('drops: a link: refused', overlay(), { shown: true, text: 'Drop files or folders from Explorer: grab uploads files, not links.', refused: true, marked: [] });
+    fire($('#queue'), 'dragover', dragOf('a.txt'));
+    check('drops: over Downloads: where to drop', [overlay().text, overlay().refused],
+      ['Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.', true]);
+    fire($('.bar.status'), 'dragover', dragOf('a.txt'));
+    const sr = $('#drop-overlay').getBoundingClientRect();
+    const bar = $('.bar.status').getBoundingClientRect();
+    check('drops: over the status bar: where to drop, over the bar', [overlay().text, overlay().refused, [sr.y, sr.height].map(Math.round)],
+      ['Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.', true, [bar.y, bar.height].map(Math.round)]);
+    const refusedAt = (over, el = $('#results')) => {
+      reset();
+      Object.assign(b, over);
+      renderRows();
+      fire(typeof el === 'function' ? el() : el, 'dragover', dragOf('a.txt'));
+      const o = overlay();
+      reset();
+      return [o.refused, o.text, o.marked];
+    };
+    check('drops: search results refuse', refusedAt({ under: { path: '/srv', name: 'srv' } }),
+      [true, 'Search results aren’t a folder: close the search (Esc) to upload into the folder.', []]);
+    check('drops: a folder found by a search refuses', refusedAt({ under: { path: '/srv', name: 'srv' } }, () => rowEl(0)),
+      [true, 'Uploads go into a folder you have open, not into search results: open this folder first.', []]);
+    check('drops: All servers refuses', refusedAt({ server: '' }),
+      [true, 'Open a folder of a server first: uploads go into one folder of one server.', []]);
+    check('drops: the made-up top of several roots refuses', refusedAt({ top: true, severalRoots: true, uploadable: false, path: '' }),
+      [true, 'This is the list of the server’s search roots, not a folder: open one of them first.', []]);
+    check('drops: ... but one of its roots takes a drop', refusedAt({ top: true, severalRoots: true, uploadable: false, path: '' }, () => rowEl(0)),
+      [false, 'Drop to upload to Main:/srv/tv', [0]]);
+    check('drops: a folder still opening refuses, its rows too', [refusedAt({ loading: true }), refusedAt({ loading: true }, () => rowEl(0))],
+      [[true, 'srv is still opening.', []], [true, 'srv is still opening.', []]]);
+    showModal({ title: 'other', html: '', ok: 'OK' });
+    fire($('#results'), 'dragover', dragOf('a.txt'));
+    check('drops: a dialog open: finish it first', [overlay().refused, overlay().text], [true, 'Finish the open dialog first, then drop again.']);
+    closeModal(false);
+    settings.open = true;
+    fire($('#results'), 'dragover', dragOf('a.txt'));
+    check('drops: Settings open: close it first', overlay().text, 'Close Settings first, then drop on a folder in Browse.');
+    settings.open = false;
+    // A PDF preview is a frame its drags never leave: while a drag is on, the frame lets them through
+    // to the page (hit-testing skips it), so the preview's refusal shows over it too.
+    quiet();
+    viewer.open = true;
+    $('#viewer').hidden = false;
+    const pdf = document.createElement('iframe');
+    pdf.className = 'viewer-pdf';
+    $('#viewer-body').className = 'viewer-body pdf';
+    $('#viewer-body').replaceChildren(pdf);
+    const pdfHit = () => {
+      const fr = pdf.getBoundingClientRect();
+      return [document.elementFromPoint(fr.x + fr.width / 2, fr.y + fr.height / 2) === pdf, getComputedStyle(pdf).pointerEvents];
+    };
+    check('drops: a PDF preview, no drag: the frame takes the pointer', pdfHit(), [true, 'auto']);
+    fire($('.viewer-bar'), 'dragover', dragOf('a.txt'));
+    check('drops: a file drag over the preview’s bar: refused, the PDF frame lets drags through',
+      [overlay().text, ...pdfHit()], ['Close the preview first, then drop on a folder in Browse.', false, 'none']);
+    endDropOverlay();
+    check('drops: ... and takes the pointer again when the drag is over', pdfHit(), [true, 'auto']);
+    viewer.open = false;
+    $('#viewer').hidden = true;
+    $('#viewer-body').replaceChildren();
+
+    // The overlay never stays.
+    quiet();
+    fire($('#results'), 'dragover', dragOf('a.txt'));
+    fire(rowEl(0), 'dragleave', dragOf('a.txt'));
+    check('drops: leaving a row for another: still shown', overlay().shown, true);
+    fire($('#results'), 'dragleave', dragOf('a.txt'), { clientX: 0, clientY: 0 });
+    check('drops: out of the window, or cancelled (dragleave at 0,0): gone, nothing said', [overlay().shown, said()], [false, '']);
+    fire($('#queue'), 'dragover', dragOf('a.txt'));
+    fire($('#queue'), 'dragleave', dragOf('a.txt'), { clientX: 0, clientY: 0 });
+    check('drops: let go where no drop is taken: gone, the reason stays in the footer',
+      [overlay().shown, said()], [false, 'Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.']);
+    quiet();
+    fire($('#results'), 'dragover', dragOf('a.txt'));
+    fire($('#queue'), 'drop', dragOf('a.txt'));
+    check('drops: a drop elsewhere: gone, nothing posted, said why', [overlay().shown, posted.length, said()],
+      [false, 0, 'Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.']);
+    fire($('#results'), 'dragover', dragOf('a.txt'));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    check('drops: Escape: gone', overlay(), { shown: false, text: 'Drop to upload to Main:/srv', refused: false, marked: [] });
+    const idleWas = dropIdleMs;
+    // eslint-disable-next-line no-global-assign
+    dropIdleMs = 30;
+    fire(rowEl(0), 'dragover', dragOf('a.txt'));
+    check('drops: shown while dragovers come', overlay().shown, true);
+    for (let i = 0; i < 400 && overlay().shown; i++) await new Promise((done) => setTimeout(done, 5));
+    check('drops: dragovers stopped (the drag ended outside): gone, the row too', [overlay().shown, overlay().marked], [false, []]);
+    // eslint-disable-next-line no-global-assign
+    dropIdleMs = idleWas;
+
+    // Drops: the Files beside "uploadDrop", the folder named; nothing through send().
+    quiet();
+    fire(rowEl(0), 'dragover', dragOf('a.txt', 'b.txt', 'c.txt'));
+    const d1 = fire(rowEl(0), 'drop', dragOf('a.txt', 'b.txt', 'c.txt'));
+    const [m1, o1] = posted[0] || [{}, []];
+    check('drops: 3 files on a folder row: into that folder', [d1.defaultPrevented, m1.type, m1.server, m1.dir, m1.token === upload.token && m1.token > 0, o1, sent.length, overlay().shown],
+      [true, 'uploadDrop', 'Main', '/srv/tv', true, ['a.txt', 'b.txt', 'c.txt'], 0, false]);
+    check('drops: the dialog waits for it', upload.pending, { token: m1.token, server: 'Main', dir: '/srv/tv' });
+    onUploadCheck({ type: 'uploadCheck', token: m1.token, phase: 'local', server: 'Main', dir: '/srv/tv', items: [], count: 0, files: 0, bytes: 0,
+      existing: { count: 0 } });
+    check('drops: ... the same dialog as Upload files here…', [$('#modal').hidden, $('#modal-title').textContent, $('#modal-ok').disabled],
+      [false, 'Upload to Main:/srv/tv', true]);
+    closeModal(false);
+    quiet();
+    fire($('#results'), 'drop', dragOf('holiday', 'notes.txt', 'b.png'));
+    check('drops: a folder and files on the list: into the folder open', posted.map(([m, o]) => [m.dir, o]), [['/srv', ['holiday', 'notes.txt', 'b.png']]]);
+    quiet();
+    fire($('#results'), 'drop', dragOf('zipped.png'));
+    check('drops: a file WebView2 couldn’t get (from inside a .zip): never posted, said', [posted.length, said()], [0, EXTRACT_FIRST]);
+    quiet();
+    fire($('#results'), 'drop', dragOf('a.txt', 'zipped.png'));
+    check('drops: ... not even beside others', [posted.length, said()], [0, EXTRACT_FIRST]);
+    quiet();
+    fire($('#results'), 'drop', linkDrag());
+    check('drops: a link: refused', [posted.length, said()], [0, 'Drop files or folders from Explorer: grab uploads files, not links.']);
+    quiet();
+    fire($('#results'), 'drop', textDrag());
+    check('drops: text: nothing', [posted.length, said()], [0, '']);
+    // The host refuses before looking (no paths, or only WebView2's copies of zipped files): said,
+    // no dialog.
+    quiet();
+    fire($('#results'), 'drop', dragOf('mail.png'));
+    const t2 = posted[0][0].token;
+    onUploadCheck({ type: 'uploadCheck', token: t2, phase: 'refused', server: 'Main', dir: '/srv', items: [], count: 0, why: 'Extract files from a .zip first: ...' });
+    check('drops: the host refuses: said, no dialog', [$('#modal').hidden, said(), upload.pending], [true, 'Extract files from a .zip first: ...', null]);
+    // A WebView2 that can't post objects.
+    quiet();
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = () => false;
+    fire($('#results'), 'drop', dragOf('a.txt'));
+    check('drops: no way to hand files over: said', [upload.pending, said()], [null, 'This window can’t take dropped files: use Upload files here… instead.']);
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = (m, o) => { posted.push([m, [...o].map((f) => f.name)]); return true; };
+
+    // 2,000 files at once: one post, quickly.
+    quiet();
+    const many = dragOf(...Array.from({ length: 2000 }, (_, i) => `f${i}.jpg`));
+    const t0 = performance.now();
+    fire($('#results'), 'dragover', many);
+    fire($('#results'), 'drop', many);
+    const ms = performance.now() - t0;
+    out.push(`INFO drops: 2,000 files dropped and posted in ${ms.toFixed(1)} ms`);
+    check('drops: 2,000 files: one post with all of them, under 500 ms', [posted.length, posted[0] && posted[0][1].length, ms < 500], [1, 2000, true]);
+
+    // The window opened the page again (its renderer ended): what happened, and during a drop why.
+    remember();
+    let kept = null;
+    try { kept = JSON.parse(sessionStorage.getItem('grab.paths')); } catch (e) { kept = 'no storage'; }
+    check('drops: Browse\'s folders kept for a page opened again', kept, state.browsePaths);
+    pageWas.drag = Date.now();
+    onPageRestored({ type: 'pageRestored', reason: 'ended' });
+    check('drops: a page opened again during a drop says why', [$('#banner').hidden, $('#banner').textContent.startsWith('grab’s window was ended by WebView2 and was opened again'),
+      $('#banner').textContent.includes(EXTRACT_FIRST), pageWas.drag], [false, true, true, 0]);
+    onPageRestored({ type: 'pageRestored', reason: 'error page' });
+    check('drops: ... and without a drop only what happened', [$('#banner').textContent.includes('was replaced by an error page'), $('#banner').textContent.includes('.zip')], [true, false]);
+    showBanner('');
+
+    DataTransferItem.prototype.webkitGetAsEntry = realEntry;
+    // eslint-disable-next-line no-global-assign
+    postWithObjects = realPost;
+    upload.pending = null;
+    quiet();
+    Object.assign(b, browseWas);
+    state.hits = hitsWas;
+    state.remotes = remotesWas;
+    state.remote = remoteWas;
+    renderRows();
   }
 
   panel.style.width = '1250px';

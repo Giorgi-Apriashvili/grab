@@ -88,8 +88,9 @@ public:
     // running and queued downloads go on there by themselves.
     void will_restart() { mark_for_restart(true); }
 
-    // UI thread: one message from the page.
-    void on_message(const std::string& json);
+    // UI thread: one message from the page, and the paths of the files WebView2 handed over beside
+    // it (a drop's, "uploadDrop"; never taken from the message's text).
+    void on_message(const std::string& json, std::vector<std::filesystem::path> paths = {});
 
     [[nodiscard]] bool downloads_active() const;
     [[nodiscard]] QueueSummary summary() const;
@@ -602,6 +603,12 @@ private:
     // check of what was picked and of the server folder, sent to the page as "uploadCheck" {token,
     // phase: local | server | ready | refused | cancelled, ...} for the confirm dialog.
     void pick_upload(const std::string& server, const std::string& dir, bool folders, int token);
+    // Files and folders dropped on Browse (UPLOADS.md 5.10, chunk 4): the same check and dialog as
+    // the file dialog's pick, or the refusal when WebView2 handed over no paths or only its own
+    // copies of files that have no place on disk (from inside a .zip, a mail's attachments).
+    void drop_upload(int token, const std::string& server, const std::string& dir, std::vector<std::filesystem::path> paths);
+    // "uploadCheck" {token, phase: refused, why} with nothing looked at.
+    void post_refused(int token, const std::string& server, const std::string& dir, const std::string& why) const;
     struct UploadCheck {
         int token = 0;
         upload::Check check;            // written by its thread alone; read once it is over
