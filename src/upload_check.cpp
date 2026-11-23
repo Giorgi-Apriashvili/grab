@@ -260,14 +260,14 @@ bool dropped_copy(const fs::path& path, const fs::path& temp) {
     return folder(parent) == folder(temp);
 }
 
-std::string drop_refusal(const std::vector<fs::path>& paths, const fs::path& temp) {
+std::string drop_refusal(const std::vector<fs::path>& paths, const fs::path& temp, bool url) {
     if (paths.empty()) return std::string(drop_nothing);
     // Each folder looked at once: dropped_copy opens it and `temp`, and this runs on the window's
     // thread (a drop of thousands of files from one share is one folder).
     std::unordered_set<fs::path::string_type> seen;
     for (const auto& p : paths) {
         if (!p.has_parent_path() || !seen.insert(local::key(p.parent_path())).second) continue;
-        if (dropped_copy(p, temp)) return std::string(drop_extract_first);
+        if (dropped_copy(p, temp)) return std::string(url ? drop_link : drop_extract_first);
     }
     return {};
 }

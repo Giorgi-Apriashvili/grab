@@ -102,10 +102,10 @@ void App::pick_upload(const std::string& server, const std::string& dir, bool fo
     start_check(token, server, dir, std::move(*picked));
 }
 
-void App::drop_upload(int token, const std::string& server, const std::string& dir, std::vector<std::filesystem::path> paths) {
+void App::drop_upload(int token, const std::string& server, const std::string& dir, bool url, std::vector<std::filesystem::path> paths) {
     std::error_code ec;
     const auto temp = std::filesystem::temp_directory_path(ec); // WebView2's too: it inherits grab-gui's
-    if (auto why = upload::drop_refusal(paths, ec ? std::filesystem::path() : temp); !why.empty()) {
+    if (auto why = upload::drop_refusal(paths, ec ? std::filesystem::path() : temp, url); !why.empty()) {
         return post_refused(token, server, dir, why);
     }
     start_check(token, server, dir, std::move(paths));

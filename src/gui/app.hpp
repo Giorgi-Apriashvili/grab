@@ -605,8 +605,9 @@ private:
     void pick_upload(const std::string& server, const std::string& dir, bool folders, int token);
     // Files and folders dropped on Browse (UPLOADS.md 5.10, chunk 4): the same check and dialog as
     // the file dialog's pick, or the refusal when WebView2 handed over no paths or only its own
-    // copies of files that have no place on disk (from inside a .zip, a mail's attachments).
-    void drop_upload(int token, const std::string& server, const std::string& dir, std::vector<std::filesystem::path> paths);
+    // copies of files that have no place on disk (from inside a .zip, a mail's attachments; a
+    // browser's link shortcut when `url`, a URL came with the drop).
+    void drop_upload(int token, const std::string& server, const std::string& dir, bool url, std::vector<std::filesystem::path> paths);
     // "uploadCheck" {token, phase: refused, why} with nothing looked at.
     void post_refused(int token, const std::string& server, const std::string& dir, const std::string& why) const;
     struct UploadCheck {

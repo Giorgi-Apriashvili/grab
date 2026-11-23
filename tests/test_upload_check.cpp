@@ -349,7 +349,7 @@ TEST_CASE("upload check: a picked file or folder whose name ends with a dot or a
 }
 #endif
 
-TEST_CASE("upload check: a drop of WebView2's own copies (files from inside a .zip) or of nothing is refused, others go") {
+TEST_CASE("upload check: a drop of WebView2's own copies (files from inside a .zip, a browser's link) or of nothing is refused, others go") {
     // WebView2 writes a dropped file that has no place on disk straight into its temp folder (the
     // window's): here a folder of the test's own stands for it.
     Dir temp("webview-temp");
@@ -371,19 +371,30 @@ TEST_CASE("upload check: a drop of WebView2's own copies (files from inside a .z
     CHECK(upload::dropped_copy(fs::path(LR"(C:\Nowhere-Grab\x.png)"), fs::path(LR"(c:\NOWHERE-GRAB\)")));
 #endif
 
-    CHECK(upload::drop_refusal({}, temp.path) == upload::drop_nothing);
-    CHECK(upload::drop_refusal({copy}, temp.path) == upload::drop_extract_first);
-    CHECK(upload::drop_refusal({own, copy}, temp.path) == upload::drop_extract_first); // one drag, one source
-    CHECK(upload::drop_refusal({own, mine.path / "folder", deeper}, temp.path).empty());
+    CHECK(upload::drop_refusal({}, temp.path, false) == upload::drop_nothing);
+    CHECK(upload::drop_refusal({copy}, temp.path, false) == upload::drop_extract_first);
+    CHECK(upload::drop_refusal({own, copy}, temp.path, false) == upload::drop_extract_first); // one drag, one source
+    CHECK(upload::drop_refusal({own, mine.path / "folder", deeper}, temp.path, false).empty());
     // Many from one folder (each folder is looked at once), then one copy: still refused.
     std::vector<fs::path> many;
     many.reserve(502);
     for (int i = 0; i < 500; ++i) many.push_back(mine.path / std::format("f{}.txt", i));
-    CHECK(upload::drop_refusal(many, temp.path).empty());
+    CHECK(upload::drop_refusal(many, temp.path, false).empty());
     many.push_back(copy);
-    CHECK(upload::drop_refusal(many, temp.path) == upload::drop_extract_first);
+    CHECK(upload::drop_refusal(many, temp.path, false) == upload::drop_extract_first);
     many.insert(many.begin(), temp.path / "first.png"); // the copy first, the user's own after
-    CHECK(upload::drop_refusal(many, temp.path) == upload::drop_extract_first);
+    CHECK(upload::drop_refusal(many, temp.path, false) == upload::drop_extract_first);
+
+    // A URL came with the drop (the page's `url`): WebView2's copy is a browser's link shortcut
+    // (a virtual Example Domain.url it saved), refused as a link; the user's own Internet shortcut
+    // dragged from Explorer (its URL comes along) goes like any file, beside others too.
+    const auto shortcut = put_local(temp.path, "Example Domain.url", "[InternetShortcut]\r\nURL=https://example.com/\r\n");
+    const auto kept = put_local(mine.path, "kept.url", "[InternetShortcut]\r\nURL=https://example.org/\r\n");
+    CHECK(upload::drop_refusal({shortcut}, temp.path, true) == upload::drop_link);
+    CHECK(upload::drop_refusal({kept, shortcut}, temp.path, true) == upload::drop_link);
+    CHECK(upload::drop_refusal({kept}, temp.path, true).empty());
+    CHECK(upload::drop_refusal({kept, own}, temp.path, true).empty());
+    CHECK(upload::drop_refusal({}, temp.path, true) == upload::drop_nothing);
     // The dialog's check takes such a drop as the file dialog's pick: files and folders mixed.
     const auto c = local_check({own, mine.path / "folder"});
     REQUIRE(c.items.size() == 2);

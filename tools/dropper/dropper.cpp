@@ -20,8 +20,12 @@
 //                        hands them as IStreams (Outlook), else as memory; --fail-contents never
 //                        hands them over (a .zip Explorer can't extract: WebView2 ended its page
 //                        over such a drop, UPLOADS.md chunk 4), --slow-contents only after MS
-//   link URL [TITLE]     a link as Edge drags one: text, UniformResourceLocator(W),
-//                        text/x-moz-url, and TITLE.url as a virtual file
+//   link URL [TITLE] [--address-bar]
+//                        a link as Edge drags one from a page: text, text/x-moz-url,
+//                        UniformResourceLocator(W), HTML, and TITLE.url as a virtual file that
+//                        Chromium is told to ignore (WebView2 sees text and a URL, no file);
+//                        --address-bar: a page's address dragged from Edge's address bar (WebView2
+//                        takes the .url as a dropped file too, saved as TITLE.download)
 //   text TEXT            plain text alone
 //   press SX,SY          someone else's drag: the window at screen pixels SX,SY (an Explorer window
 //                        the caller placed there) is pressed and its own drag carried to X,Y;
@@ -66,6 +70,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -358,14 +363,47 @@ std::vector<Entry> text_entries(const std::wstring& text) {
             Entry{.cf = CF_TEXT, .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = ansi_of(text)}};
 }
 
-std::vector<Entry> link_entries(const std::wstring& url, const std::wstring& title) {
+// A link as Edge 158 drags one (its formats in its order, read by a drop target of our own,
+// UPLOADS.md chunk 4 fix): from a page, the page's origin as chromium/x-renderer-taint, text,
+// text/x-moz-url, TITLE.url as a virtual file marked chromium/x-ignore-file-contents,
+// UniformResourceLocator(W) and the link as HTML; WebView2 then shows the page text/plain,
+// text/uri-list and text/html, and no file. From the address bar (`address_bar`, a page's own
+// address): no taint, text or HTML, and WebView2 takes the shortcut as a dropped file (saved as
+// TITLE.download in its temp folder).
+std::vector<Entry> link_entries(const std::wstring& url, const std::wstring& title, bool address_bar) {
     std::vector<Entry> out;
+    const auto text = text_entries(url);
+    if (!address_bar) {
+        out.push_back(Entry{.cf = format(L"chromium/x-renderer-taint"), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = std::string("file://") + '\0'});
+        out.insert(out.end(), text.begin(), text.end());
+    }
+    out.push_back(Entry{.cf = format(L"text/x-moz-url"), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = bytes_of(url + L"\n" + title)});
+    std::vector<Entry> shortcut;
+    add_virtual(shortcut, {{title + L".url", "[InternetShortcut]\r\nURL=" + utf8(url) + "\r\n"}}, TYMED_HGLOBAL);
+    out.insert(out.end(), shortcut.begin(), shortcut.end());
+    out.push_back(Entry{.cf = format(L"chromium/x-ignore-file-contents"), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = std::string(1, '\0')});
     out.push_back(Entry{.cf = format(CFSTR_INETURLW), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = bytes_of(url)});
     out.push_back(Entry{.cf = format(CFSTR_INETURLA), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = ansi_of(url)});
-    out.push_back(Entry{.cf = format(L"text/x-moz-url"), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = bytes_of(url + L"\n" + title)});
-    for (auto& e : text_entries(url)) out.push_back(std::move(e));
-    const std::string shortcut = "[InternetShortcut]\r\nURL=" + utf8(url) + "\r\n";
-    add_virtual(out, {{title + L".url", shortcut}}, TYMED_HGLOBAL);
+    if (address_bar) {
+        out.insert(out.end(), text.begin(), text.end());
+        return out;
+    }
+    // CF_HTML: the header's offsets count bytes from its start (UTF-8).
+    const std::string a = "<a href=\"" + utf8(url) + "\">" + utf8(title) + "</a>";
+    const std::string head = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\nSourceURL:" +
+                             utf8(url) + "\r\n";
+    const std::string before = "<html>\r\n<body>\r\n<!--StartFragment-->";
+    const std::string html_text = before + a + "<!--EndFragment-->\r\n</body>\r\n</html>";
+    std::string html = head + html_text;
+    const auto put = [&](std::string_view key, std::size_t value) {
+        html.replace(html.find(key) + key.size(), 10, std::format("{:010}", value));
+    };
+    put("StartHTML:", head.size());
+    put("EndHTML:", html.size());
+    put("StartFragment:", head.size() + before.size());
+    put("EndFragment:", head.size() + before.size() + a.size());
+    out.push_back(Entry{.cf = format(L"HTML Format"), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = html});
+    out.push_back(Entry{.cf = format(L"text/html"), .tymed = TYMED_HGLOBAL, .lindex = -1, .bytes = a});
     return out;
 }
 
@@ -533,7 +571,7 @@ std::optional<POINT> parse_point(const std::wstring& s) {
 int usage() {
     say("usage: dropper (--pid N | --hwnd 0xH) --at X,Y [--via X,Y]... [--from X,Y] [--hover MS] [--still] "
         "[--end drop|cancel|leave] [--leave-shown] [--raw] (files PATH... | shell PATH... | virtual NAME[=FILE]... "
-        "[--stream] [--fail-contents] [--slow-contents MS] | link URL [TITLE] | text TEXT | press SX,SY)");
+        "[--stream] [--fail-contents] [--slow-contents MS] | link URL [TITLE] [--address-bar] | text TEXT | press SX,SY)");
     say("       dropper --formats WHAT   (see the top of tools/dropper/dropper.cpp)");
     return 2;
 }
@@ -648,6 +686,7 @@ int wmain(int argc, wchar_t** argv) {
     bool raw = false;
     bool formats = false;
     bool stream = false;
+    bool address_bar = false;
     std::wstring what;
     std::vector<std::wstring> args;
     for (int i = 1; i < argc; ++i) {
@@ -667,6 +706,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (what.empty() && a == L"--still") still = true;
         else if (what.empty() && a == L"--formats") formats = true;
         else if (a == L"--stream") stream = true;
+        else if (a == L"--address-bar") address_bar = true;
         else if (a == L"--fail-contents") contents_fail = true;
         else if (a == L"--slow-contents" && more) contents_delay_ms = std::max(0, _wtoi(argv[++i]));
         else if (what.empty()) what = a;
@@ -733,7 +773,7 @@ int wmain(int argc, wchar_t** argv) {
         add_virtual(entries, files, stream ? TYMED_ISTREAM : TYMED_HGLOBAL);
         dragged = new DataObject(std::move(entries));
     } else if (what == L"link" && !args.empty()) {
-        dragged = new DataObject(link_entries(args[0], args.size() > 1 ? args[1] : L"Example Domain"));
+        dragged = new DataObject(link_entries(args[0], args.size() > 1 ? args[1] : L"Example Domain", address_bar));
     } else if (what == L"text" && !args.empty()) {
         dragged = new DataObject(text_entries(args[0]));
     } else if (what == L"press" && args.size() == 1 && parse_point(args[0]) && !formats && end != L"cancel") {

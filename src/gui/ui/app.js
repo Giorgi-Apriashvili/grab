@@ -5708,6 +5708,7 @@ let dropIdleMs = 1000; // the page tests shorten it
 // UPLOADS.md decision 7, as the host says it too (upload_check.hpp drop_extract_first).
 const EXTRACT_FIRST = 'Extract files from a .zip first: a file inside a .zip (or a mail’s attachment) isn’t on this PC ' +
   'as a file until it is extracted or saved. Then drop it from there.';
+// As the host says it too (upload_check.hpp drop_link).
 const DROP_FILES = 'Drop files or folders from Explorer: grab uploads files, not links.';
 // `shown`: the overlay is up; `place`: where a drop would go ({ server, dir, row } or { refusal,
 // area }); `idle`: the timer that takes it down when dragovers stop.
@@ -5721,12 +5722,25 @@ function postWithObjects(msg, objects) {
   return true;
 }
 
-// What a drag carries, by its types (its names can't be read before the drop): 'files', 'link'
-// (Edge drags a link as text/uri-list with a .url file) or '' (text alone, or nothing).
+// What a drag carries, by its types (its names can't be read before the drop): 'files', 'link' or
+// '' (text alone, or nothing). A link dragged from a page in Edge or Chrome comes as text with a
+// text/uri-list and no file (the .url shortcut they offer is marked for Chromium to ignore). A
+// drag with files and a URL is 'files' until the drop (linkDrop): an Internet shortcut (.url)
+// dragged from Explorer carries its URL too.
 function dragKind(dt) {
   const types = dt ? [...dt.types] : [];
-  if (!types.includes('Files')) return '';
-  return types.includes('text/uri-list') ? 'link' : 'files';
+  if (types.includes('Files')) return 'files';
+  return types.includes('text/uri-list') ? 'link' : '';
+}
+
+// Whether a drop of `files` (each a File, or null for one WebView2 couldn't get) with a URL beside
+// them is a link from a browser, not files from Explorer: Explorer's drags carry a URL only for an
+// Internet shortcut (.url), the URL WebView2 reads from it, while a page's address dragged from
+// Edge's address bar (or a link from a browser that doesn't mark its shortcut) comes with the
+// shortcut WebView2 saved for the drop, named .download. One still named .url in WebView2's temp
+// folder is told by grab (upload_check.hpp drop_refusal, the message's `url`).
+function linkDrop(dt, files) {
+  return [...dt.types].includes('text/uri-list') && !files.some((f) => f && /\.url$/i.test(f.name));
 }
 
 // Where a drop at `target` (the element under the pointer) goes: { server, dir, row } (row: the
@@ -5814,9 +5828,14 @@ function textField(target) {
 function onDragOver(ev) {
   const dt = ev.dataTransfer;
   const kind = dragKind(dt);
-  if (!kind) { // text: nothing to say, nothing to drop, but a text field takes it as it always did
+  // Text, or a link (Chromium gives any text that reads as a URL a text/uri-list too: a path like
+  // Main:/srv/tv or C:\Users\...): a text field takes it as it always did.
+  if (kind !== 'files' && textField(ev.target)) {
     if (drops.shown) endDropOverlay();
-    if (textField(ev.target)) return;
+    return;
+  }
+  if (!kind) { // text: nothing to say, nothing to drop
+    if (drops.shown) endDropOverlay();
     ev.preventDefault();
     if (dt) dt.dropEffect = 'none';
     return;
@@ -5845,7 +5864,7 @@ function onDragLeave(ev) {
 function onDrop(ev) {
   const dt = ev.dataTransfer;
   const kind = dragKind(dt);
-  if (!kind && textField(ev.target)) { // text into a text field: the field's own handling
+  if (kind !== 'files' && textField(ev.target)) { // text or a link into a text field: the field's own handling
     endDropOverlay();
     return;
   }
@@ -5853,18 +5872,19 @@ function onDrop(ev) {
   const place = kind === 'link' ? { refusal: DROP_FILES } : dropPlace(ev.target);
   endDropOverlay();
   if (!kind) return;
+  // All of it read now: the drop's data is gone once the event returns.
+  const items = [...dt.items].filter((i) => i.kind === 'file');
+  const files = items.map((i) => i.getAsFile());
+  // A link is refused wherever it is let go (not sent to Browse first).
+  if (kind === 'files' && (!items.length || linkDrop(dt, files))) {
+    flash(DROP_FILES);
+    return;
+  }
   if (place.refusal) {
     flash(place.refusal);
     return;
   }
-  // All of it read now: the drop's data is gone once the event returns.
-  const items = [...dt.items].filter((i) => i.kind === 'file');
-  const files = items.map((i) => i.getAsFile());
   const entries = items.map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
-  if (!items.length) {
-    flash(DROP_FILES);
-    return;
-  }
   // A file WebView2 couldn't get (from inside a .zip whose contents didn't come): a File with no
   // entry behind it. Never posted: WebView2 ends the page for such a File.
   if (files.some((f) => !f) || entries.some((e) => !e)) {
@@ -5878,7 +5898,10 @@ function onDrop(ev) {
   try { sessionStorage.setItem('grab.drag', String(Date.now())); } catch (e) { /* no storage */ }
   let posted = false;
   try {
-    posted = postWithObjects({ type: 'uploadDrop', token, server: place.server, dir: place.dir }, files);
+    // `url`: a URL came with the files (Explorer's .url shortcuts, or a browser's), for the host's
+    // refusal of WebView2's own copies.
+    const url = [...dt.types].includes('text/uri-list');
+    posted = postWithObjects({ type: 'uploadDrop', token, server: place.server, dir: place.dir, url }, files);
   } catch (e) { /* refused by WebView2: said below */ }
   if (!posted) {
     upload.pending = null;

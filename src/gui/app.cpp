@@ -903,11 +903,11 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
         });
     } else if (type == "uploadDrop") {
         // Files and folders dropped on Browse: their paths come from WebView2 beside the message,
-        // the page names only the server folder.
+        // the page names only the server folder and whether a URL came with them.
         const std::string server = msg->string_of("server").value_or("");
         const int token = int_of(*msg, "token");
         if (server.empty() || token <= 0) return;
-        drop_upload(token, server, msg->string_of("dir").value_or(""), std::move(paths));
+        drop_upload(token, server, msg->string_of("dir").value_or(""), bool_of(*msg, "url"), std::move(paths));
     } else if (type == "uploadCheckCancel") {
         cancel_check(int_of(*msg, "token"));
     } else if (type == "uploadStart") {

@@ -2147,10 +2147,31 @@ try {
       dt.items.add('some words', 'text/plain');
       return dt;
     };
+    // A link from a page in Edge, as WebView2 shows it (seen live, UPLOADS.md chunk 4 fix): text,
+    // its URL and its HTML, no file (Edge marks the .url it offers for Chromium to ignore).
     const linkDrag = () => {
-      const dt = dragOf('Example Domain.url');
-      dt.items.add('https://example.com/', 'text/uri-list');
+      const dt = new DataTransfer();
       dt.items.add('https://example.com/', 'text/plain');
+      dt.items.add('https://example.com/', 'text/uri-list');
+      dt.items.add('<a href="https://example.com/">up-link</a>', 'text/html');
+      return dt;
+    };
+    // A page's address dragged from Edge's address bar: text, the URL, and the .url shortcut
+    // WebView2 saved for the drop (in its temp folder), named .download.
+    const addressDrag = () => {
+      const dt = new DataTransfer();
+      dt.items.add('file:///C:/x/up-link.html', 'text/plain');
+      dt.items.add('file:///C:/x/up-link.html', 'text/uri-list');
+      dt.items.add(new File(['[InternetShortcut]\r\nURL=file:///C:/x/up-link.html\r\n'], 'up-link.download'));
+      return dt;
+    };
+    // An Internet shortcut of the user's own dragged from Explorer (first of `more` files): WebView2
+    // reads its URL into the drag, as text and a text/uri-list.
+    const shortcutDrag = (...more) => {
+      const dt = new DataTransfer();
+      dt.items.add('https://example.org/', 'text/plain');
+      dt.items.add('https://example.org/', 'text/uri-list');
+      for (const n of ['kept.url', ...more]) dt.items.add(new File(['abc'], n));
       return dt;
     };
     const inside = (el) => {
@@ -2169,14 +2190,14 @@ try {
     const quiet = () => { state.flash = null; posted.length = 0; sent.length = 0; endDropOverlay(); };
 
     // Never the browser's own handling: every dragover and drop is taken, whatever is dragged and
-    // wherever it is (the drops here go where none is taken: nothing is posted), but text over a
-    // text field, which goes in (or moves) as it always did.
+    // wherever it is (the drops here go where none is taken: nothing is posted), but text or a link
+    // over a text field, which goes in (or moves) as it always did.
     for (const [what, drag] of [['files', () => dragOf('a.txt')], ['text', textDrag], ['a link', linkDrag]]) {
       quiet();
       const evs = [fire($('#results'), 'dragenter', drag()), fire(document.body, 'dragover', drag()), fire($('#queue'), 'dragover', drag()),
         fire($('#query'), 'dragover', drag()), fire($('#queue'), 'drop', drag())];
-      check(`drops: ${what}: dragenter, dragover and drop never left to the browser (text: but over the search box)`, evs.map((e) => e.defaultPrevented),
-        [true, true, true, what !== 'text', true]);
+      check(`drops: ${what}: dragenter, dragover and drop never left to the browser (text, a link: but over the search box)`, evs.map((e) => e.defaultPrevented),
+        [true, true, true, what === 'files', true]);
       check(`drops: ${what}: nothing posted or sent`, [posted.length, sent.length], [0, 0]);
     }
     quiet();
@@ -2186,10 +2207,24 @@ try {
     check('drops: text or a link on a checkbox: still taken',
       [fire($('#select-all'), 'dragover', textDrag()), fire($('#select-all'), 'drop', textDrag()), fire($('#select-all'), 'drop', linkDrag())].map((e) => e.defaultPrevented),
       [true, true, true]);
-    check('drops: files or a link over the search box: still taken',
-      [fire($('#query'), 'dragover', dragOf('a.txt')), fire($('#query'), 'dragover', linkDrag()), fire($('#query'), 'drop', linkDrag())].map((e) => e.defaultPrevented),
-      [true, true, true]);
-    check('drops: ... nothing posted or sent', [posted.length, sent.length], [0, 0]);
+    check('drops: files over the search box: still taken', fire($('#query'), 'dragover', dragOf('a.txt')).defaultPrevented, true);
+    quiet();
+    check('drops: a link over the search box: goes in as its URL (dragover, drop)',
+      [fire($('#query'), 'dragover', linkDrag()), fire($('#query'), 'drop', linkDrag())].map((e) => e.defaultPrevented), [false, false]);
+    // Text that reads as a URL: Chromium adds a text/uri-list to it (seen live, Edge 158), so it
+    // looks like a link; a text field still takes it.
+    const urlText = (text, uri) => {
+      const dt = new DataTransfer();
+      dt.items.add(text, 'text/plain');
+      dt.items.add(uri, 'text/uri-list');
+      return dt;
+    };
+    check('drops: a path read as a URL into the path bar or the key field: the field’s own (dragover, drop)',
+      [fire($('#address'), 'dragover', urlText('Main:/srv/tv', 'main:/srv/tv')), fire($('#address'), 'drop', urlText('Main:/srv/tv', 'main:/srv/tv')),
+        fire($('#f-key'), 'dragover', urlText('C:\\Users\\you\\.ssh\\id_ed25519', 'file:///C:/Users/you/.ssh/id_ed25519')),
+        fire($('#f-key'), 'drop', urlText('C:\\Users\\you\\.ssh\\id_ed25519', 'file:///C:/Users/you/.ssh/id_ed25519'))].map((e) => e.defaultPrevented),
+      [false, false, false, false]);
+    check('drops: ... no overlay, nothing posted, sent or said', [overlay().shown, posted.length, sent.length, said()], [false, 0, 0, '']);
     quiet();
 
     // Where a drop goes.
@@ -2206,6 +2241,12 @@ try {
     check('drops: text: no overlay', overlay().shown, false);
     fire($('#results'), 'dragover', linkDrag());
     check('drops: a link: refused', overlay(), { shown: true, text: 'Drop files or folders from Explorer: grab uploads files, not links.', refused: true, marked: [] });
+    // Files with a URL: an Internet shortcut from Explorer, or a page's address from Edge's address
+    // bar; the names tell them apart, and they can't be read before the drop.
+    for (const [what, drag] of [['an Internet shortcut from Explorer', shortcutDrag], ['a page’s address from Edge’s address bar', addressDrag]]) {
+      fire($('#results'), 'dragover', drag());
+      check(`drops: ${what}: told at the drop`, overlay(), { shown: true, text: 'Drop to upload to Main:/srv', refused: false, marked: [] });
+    }
     fire($('#queue'), 'dragover', dragOf('a.txt'));
     check('drops: over Downloads: where to drop', [overlay().text, overlay().refused],
       ['Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.', true]);
@@ -2320,6 +2361,42 @@ try {
     quiet();
     fire($('#results'), 'drop', linkDrag());
     check('drops: a link: refused', [posted.length, said()], [0, 'Drop files or folders from Explorer: grab uploads files, not links.']);
+    // Edge's link let go on Browse: WebView2 has no drop for it (the page took none) but a dragleave
+    // at 0,0: said all the same.
+    quiet();
+    fire($('#results'), 'dragenter', linkDrag());
+    fire($('#results'), 'dragover', linkDrag());
+    fire($('#results'), 'dragleave', linkDrag(), { clientX: 0, clientY: 0 });
+    check('drops: a link from Edge let go on Browse (no drop, dragleave at 0,0): refused, said', [overlay().shown, posted.length, sent.length, said()],
+      [false, 0, 0, DROP_FILES]);
+    quiet();
+    fire($('#results'), 'dragover', addressDrag());
+    fire($('#results'), 'drop', addressDrag());
+    check('drops: a page’s address from Edge’s address bar: refused at the drop, nothing posted', [overlay().shown, posted.length, sent.length, said()],
+      [false, 0, 0, DROP_FILES]);
+    // Over a place that refuses drops the page takes none (dropEffect none), so WebView2 has no drop
+    // there, only a dragleave at 0,0: the place's words (the names that tell a link can't be read
+    // before a drop).
+    quiet();
+    fire($('#queue'), 'dragover', addressDrag());
+    fire($('#queue'), 'dragleave', addressDrag(), { clientX: 0, clientY: 0 });
+    check('drops: ... let go over Downloads (no drop, dragleave at 0,0): the place’s words', [overlay().shown, posted.length, sent.length, said()],
+      [false, 0, 0, 'Drop on Browse, above, to upload: into the folder it shows, or onto a folder in it.']);
+    quiet();
+    fire($('#results'), 'drop', shortcutDrag());
+    check('drops: an Internet shortcut (.url) from Explorer: a file, posted, its URL noted for the host',
+      posted.map(([m, o]) => [m.dir, m.url, o]), [['/srv', true, ['kept.url']]]);
+    quiet();
+    fire($('#results'), 'drop', shortcutDrag('a.txt', 'holiday'));
+    check('drops: ... beside other files and folders', posted.map(([m, o]) => [m.url, o]), [[true, ['kept.url', 'a.txt', 'holiday']]]);
+    quiet();
+    fire($('#results'), 'drop', dragOf('a.txt'));
+    check('drops: files alone: no URL noted', posted.map(([m]) => m.url), [false]);
+    quiet();
+    fire($('#results'), 'drop', shortcutDrag());
+    onUploadCheck({ type: 'uploadCheck', token: posted[0][0].token, phase: 'refused', server: 'Main', dir: '/srv', items: [], count: 0, why: DROP_FILES });
+    check('drops: a browser’s shortcut the host finds is WebView2’s copy: refused as a link, no dialog', [$('#modal').hidden, said(), upload.pending],
+      [true, DROP_FILES, null]);
     quiet();
     fire($('#results'), 'drop', textDrag());
     check('drops: text: nothing', [posted.length, said()], [0, '']);
