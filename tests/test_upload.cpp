@@ -745,6 +745,28 @@ TEST_CASE("upload: a folder of that name: Replace skips it with the reason, Keep
     CHECK(srv.fake.store.dirs.contains("/up/f.bin"));
 }
 
+TEST_CASE("upload: Keep both passes over the names other uploads will take, which their files then get") {
+    Server srv;
+    srv.put("/up/a.txt", "theirs");
+    Dir dir("both-reserved");
+    const fs::path a = local_file(dir, "mine a", "a.txt");
+    const fs::path a2 = local_file(dir, "mine a2", "a (2).txt");
+    auto pool = srv.fake.pool(2);
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+    // Picked together: a.txt (Keep both) goes first, "a (2).txt" (new, Skip for all) after it.
+    auto first = upload_of(a, pool, dir, "/up/a.txt", upload::Existing::keep_both);
+    first.reserved = [](std::string_view path) { return path == "/up/a (2).txt"; };
+    const auto beside = upload::run(first, connections, {}, {});
+    REQUIRE_MESSAGE(beside.outcome == upload::Outcome::done, beside.error);
+    CHECK(beside.placed == "/up/a (3).txt");
+    const auto own = upload::run(upload_of(a2, pool, dir, "/up/a (2).txt", upload::Existing::skip), connections, {}, {});
+    REQUIRE_MESSAGE(own.outcome == upload::Outcome::done, own.error);
+    CHECK(srv.file("/up/a.txt") == "theirs");
+    CHECK(srv.file("/up/a (2).txt") == "mine a2");
+    CHECK(srv.file("/up/a (3).txt") == "mine a");
+}
+
 TEST_CASE("upload: a file that appears at the name while uploading gets the upload's choice; asked, the finished temp waits for the answer") {
     // The file appears with the first acknowledgement; the rename looks right before it (LSTAT),
     // so a server whose RENAME replaces (rename_overwrites) doesn't replace it either.

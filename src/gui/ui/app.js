@@ -5,12 +5,13 @@
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, openFile, openDir, setExpanded,
 //                 resolveExisting, play, previewCancel, uploadPick, uploadDrop, uploadCheckCancel, uploadStart,
+//                 setUploadExisting,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
 //                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
-//                 updateChecked, limit, played, uploadCheck, pageRestored (from the window itself),
+//                 updateChecked, limit, played, uploadCheck, uploadExisting, pageRestored (from the window itself),
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -50,6 +51,7 @@ const state = {
   limitMiBps: 5,
   limit: {},             // the backend's "limit" message: source, until, nextMiBps
   schedule: [],          // speed schedule rules, as the backend keeps them
+  uploadExisting: 'ask', // Settings → Uploads: a file already on the server (ask, replace, different, newer, skip, both)
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing, note
   lists: [],             // the last search's sources per server: age, live, refreshing, error, notes
   updateLater: false,    // "Later": hidden until grab starts again
@@ -2096,8 +2098,8 @@ const serverChild = (dir, rel) => (!dir ? rel : dir.endsWith('/') ? `${dir}${rel
 
 // The confirm dialog's text (UPLOADS.md 5.10): what goes (each item, its files and size; links left
 // out, names too long for a server), where (a new folder, or merged into one there), whether the
-// server takes it, and the files already there, which are skipped (the full question is chunk 5's).
-function uploadHtml(m) {
+// server takes it, and the files already there with the question about them (`clash`, clashHtml).
+function uploadHtml(m, clash = null) {
   const where = `${m.server}:${m.dir || '~'}`;
   const items = m.items || [];
   let html = '<div class="up-check">';
@@ -2141,16 +2143,202 @@ function uploadHtml(m) {
   } else if (m.phase === 'refused') {
     html += `<p class="up-server up-bad">${esc(m.why || 'This can’t be uploaded.')}</p>`;
   }
-  // Files already there: skipped.
+  // The files already there, and what happens to them.
   const e = m.existing || {};
-  if (looked && e.count > 0) {
-    const parts = [[e.same, 'the same'], [e.newer, 'newer here'], [e.older, 'older here'], [e.differs, 'of another size'],
-      [e.folders, e.folders === 1 ? 'a folder there' : 'folders there']].filter(([n]) => n > 0).map(([n, w]) => `${fmtNum(n)} ${w}`);
-    html += `<p class="up-existing">${fmtNum(e.count)} already there: skipped (${esc(parts.join(', '))})</p>`;
-  } else if (looked) {
-    html += '<p class="up-existing muted">Nothing of it is there yet.</p>';
-  }
+  if (looked && e.count > 0 && clash) html += clashHtml(clash);
+  else if (looked) html += '<p class="up-existing muted">Nothing of it is there yet.</p>';
   return `${html}</div>`;
+}
+
+// ---- the files already on the server (UPLOADS.md decision 3, chunk 5) ----------------------------
+// The upload dialog's question, and the one an upload waits with when files turned up at their
+// names later: what is there and yours, how they compare, one choice for all of them (Skip first
+// under the setting Ask, else the setting) and one per file, what that does, and "Always do this",
+// which saves the choice for all as the setting. With the setting not Ask, the dialog says it and
+// its Change opens the question for this upload. Nothing there is replaced unless chosen.
+
+const UP_CHOICES = [['replace', 'Replace'], ['different', 'Replace if different'], ['newer', 'Replace if newer'],
+  ['skip', 'Skip'], ['both', 'Keep both']];
+const upChoiceName = (c) => (c === 'ask' ? 'Ask' : (UP_CHOICES.find(([k]) => k === c) || [c, c])[1]);
+const UP_KINDS = { same: 'the same', newer: 'newer here', older: 'older here', differs: 'another size', folder: 'a folder there' };
+const UP_EFFECTS = { replace: 'replaced', skip: 'skipped', both: 'second copy' };
+
+// What `choice` does to a file of `kind` (upload_existing.cpp decide): 'replace', 'skip' or
+// 'both'. A folder of that name there is never replaced.
+function upEffect(choice, kind) {
+  if (choice === 'both') return 'both';
+  if (kind === 'folder' || choice === 'skip') return 'skip';
+  if (choice === 'replace') return 'replace';
+  if (choice === 'different') return kind === 'same' ? 'skip' : 'replace';
+  if (choice === 'newer') return kind === 'newer' ? 'replace' : 'skip';
+  return 'skip';
+}
+
+// The question's state: `ex` the files there ({count, same, newer, older, differs, folders,
+// files: [first ones]}), `forAll`, `own` (a listed file's place -> its own choice), `always`, and
+// `open`: the full question shown (always under Ask; with a setting, after Change).
+function clashState(ex, server, setting) {
+  const ask = !setting || setting === 'ask';
+  return { ex, server, setting: setting || 'ask', forAll: ask ? 'skip' : setting, own: new Map(), always: false, open: ask };
+}
+
+// What the dialog's answer sends: the choice for all, the listed files' own, "Always do this".
+function clashAnswer(c) {
+  return { choice: c.forAll, overrides: Object.fromEntries(c.own), always: c.always };
+}
+
+// "37 already there: 30 the same, 5 newer here, 2 older here"
+function clashSummary(ex) {
+  const parts = [[ex.same, 'the same'], [ex.newer, 'newer here'], [ex.older, 'older here'], [ex.differs, 'of another size'],
+    [ex.folders, ex.folders === 1 ? 'a folder there' : 'folders there']].filter(([n]) => n > 0).map(([n, w]) => `${fmtNum(n)} ${w}`);
+  return `${fmtNum(ex.count)} already there${parts.length ? `: ${parts.join(', ')}` : ''}`;
+}
+
+// How many a choice for all replaces, of every file there (not only those listed).
+function replacedBy(choice, ex) {
+  const n = (k) => ex[k] || 0;
+  return { replace: ex.count - n('folders'), different: n('newer') + n('older') + n('differs'), newer: n('newer'), skip: 0,
+    both: 0 }[choice];
+}
+
+// What happens to all of them: each listed file by its own choice or the one for all, the rest by
+// the one for all, counted by their kinds less the listed ones'.
+function clashOutcome(c) {
+  const ex = c.ex;
+  const files = ex.files || [];
+  const tally = { replace: 0, skip: 0, both: 0 };
+  const rest = { same: ex.same || 0, newer: ex.newer || 0, older: ex.older || 0, differs: ex.differs || 0, folder: ex.folders || 0 };
+  files.forEach((f, i) => {
+    tally[upEffect(c.own.get(i) || c.forAll, f.kind)]++;
+    if (rest[f.kind] > 0) rest[f.kind]--;
+  });
+  for (const [kind, n] of Object.entries(rest)) tally[upEffect(c.forAll, kind)] += n;
+  const parts = [];
+  if (tally.replace) parts.push(`${fmtNum(tally.replace)} replaced`);
+  if (tally.both) parts.push(`${fmtNum(tally.both)} sent as a second copy (“name (2)”)`);
+  if (tally.skip) parts.push(`${fmtNum(tally.skip)} skipped`);
+  const none = tally.replace ? '' : `: nothing on ${c.server} is replaced`;
+  return `${parts.join(', ')}${none}`;
+}
+
+// A listed file's row: its name and how it compares, yours, the server's, its choice, what it does.
+function clashRow(c, f, i) {
+  const when = (sec) => (fmtDate(sec) ? `<span class="muted">${esc(fmtDate(sec))}</span>` : '');
+  const folder = f.kind === 'folder';
+  const own = c.own.get(i) || '';
+  const options = [['', 'As for all'], ...UP_CHOICES.filter(([k]) => !folder || k === 'skip' || k === 'both')]
+    .map(([k, label]) => `<option value="${k}"${k === own ? ' selected' : ''}>${esc(label)}</option>`).join('');
+  const effect = upEffect(own || c.forAll, f.kind);
+  return `<tr data-i="${i}"><td><span class="up-file">${esc(f.name)}</span> <span class="up-kind k-${esc(f.kind)}">${esc(UP_KINDS[f.kind] || '')}</span></td>` +
+    `<td>${esc(fmtSize(f.mineSize))}<br>${when(f.mineModified)}</td>` +
+    `<td>${folder ? '<span class="muted">a folder</span>' : `${esc(fmtSize(f.size))}<br>${when(f.modified)}`}</td>` +
+    `<td><select data-i="${i}" aria-label="${esc(`What to do with ${f.name}`)}">${options}</select></td>` +
+    `<td class="up-effect e-${effect}">${UP_EFFECTS[effect]}</td></tr>`;
+}
+
+// The question (or, with a setting and no Change yet, the setting and Change).
+function clashHtml(c) {
+  const ex = c.ex;
+  let html = `<section class="up-clash" aria-labelledby="up-clash-sum"><p id="up-clash-sum" class="up-existing">${esc(clashSummary(ex))}</p>`;
+  if (!c.open) {
+    html += `<p class="up-setting">Files already there: <b>${esc(upChoiceName(c.setting))}</b> (your setting) · ` +
+      '<button type="button" class="link" data-act="up-change" aria-expanded="false">Change</button></p>' +
+      `<p class="up-outcome muted" aria-live="polite">${esc(clashOutcome(c))}</p></section>`;
+    return html;
+  }
+  html += '<fieldset class="up-all"><legend>For all of them</legend>';
+  for (const [k, label] of UP_CHOICES) {
+    const n = replacedBy(k, ex);
+    const what = k === 'skip' ? 'nothing replaced' : k === 'both' ? 'yours as “name (2)”' : n === 0 ? 'none replaced' : `${fmtNum(n)} replaced`;
+    html += `<label><input type="radio" name="up-all" value="${k}"${k === c.forAll ? ' checked' : ''}> ${esc(label)}` +
+      ` <span class="muted">${esc(what)}</span></label>`;
+  }
+  html += '</fieldset>';
+  const files = ex.files || [];
+  if (files.length) {
+    html += `<div class="up-clash-list"><table class="existing up-clashes" aria-label="${esc(`Files already on ${c.server}`)}">` +
+      '<thead><tr><th scope="col">Name</th><th scope="col">Yours</th><th scope="col">On the server</th>' +
+      '<th scope="col">What to do</th><th scope="col"><span class="sr-only">Then</span></th></tr></thead><tbody>' +
+      files.map((f, i) => clashRow(c, f, i)).join('') + '</tbody></table></div>';
+  }
+  const more = ex.count - files.length;
+  if (more > 0) html += `<p class="muted up-more">…and ${fmtNum(more)} more, which go as for all.</p>`;
+  if (ex.folders) html += `<p class="muted up-more">A folder of that name there is never replaced: Replace skips it.</p>`;
+  html += `<p class="up-outcome" aria-live="polite">${esc(clashOutcome(c))}</p>` +
+    `<label class="up-always"><input type="checkbox" id="up-always"${c.always ? ' checked' : ''}> Always do this: ` +
+    `<span class="up-always-what">${esc(upChoiceName(c.forAll))}</span> without asking (Settings → Uploads)</label></section>`;
+  return html;
+}
+
+// A choice changed in the open question: what it does is said again where it shows.
+function onClashChange(ev) {
+  const c = modal && modal.clash;
+  const el = ev.target;
+  if (!c || !(el instanceof HTMLElement)) return;
+  if (el.name === 'up-all') {
+    c.forAll = el.value;
+    const what = $('#modal-body .up-always-what');
+    if (what) what.textContent = upChoiceName(c.forAll);
+  } else if (el.id === 'up-always') {
+    c.always = el.checked;
+    return;
+  } else if (el.tagName === 'SELECT' && el.dataset.i != null) {
+    const i = Number(el.dataset.i);
+    if (el.value) c.own.set(i, el.value); else c.own.delete(i);
+  } else {
+    return;
+  }
+  const files = c.ex.files || [];
+  for (const td of document.querySelectorAll('#modal-body .up-clashes td.up-effect')) {
+    const i = Number(td.parentElement.dataset.i);
+    const effect = upEffect(c.own.get(i) || c.forAll, files[i] && files[i].kind);
+    td.className = `up-effect e-${effect}`;
+    td.textContent = UP_EFFECTS[effect];
+  }
+  const out = $('#modal-body .up-outcome');
+  if (out) out.textContent = clashOutcome(c);
+}
+
+// Change, with the setting shown: the question for this upload, its choice for all the setting's.
+function onClashClick(ev) {
+  const c = modal && modal.clash;
+  const btn = ev.target instanceof Element ? ev.target.closest('[data-act="up-change"]') : null;
+  if (!c || !btn) return;
+  c.open = true;
+  const section = $('#modal-body .up-clash');
+  if (section) section.outerHTML = clashHtml(c);
+  $('#modal .modal').classList.add('wide');
+  const checked = $('#modal-body .up-all input:checked');
+  if (checked) checked.focus();
+}
+
+// An upload waiting with the question about files that turned up on its server after its check
+// (UPLOADS.md 5.5): the same question, starting on Skip; Resume sends the answer.
+function upLateDialog(q) {
+  const ask = q.ask;
+  const one = ask.count === 1;
+  const c = clashState(ask, q.remote, 'ask');
+  showModal({
+    title: one && ask.files.length ? `“${ask.files[0].name}” is already on ${q.remote}` : `${fmtNum(ask.count)} files are already on ${q.remote}`,
+    html: `<p>${one ? 'A file of that name is' : 'Files of those names are'} on ${esc(q.remote)} now that weren’t there when ` +
+      `the upload was checked. Nothing of ${one ? 'it' : 'theirs'} was touched: choose what happens.</p>` + clashHtml(c),
+    ok: 'Resume',
+    wide: true,
+    onOk: () => {
+      if (c.always) setUploadExisting(c.forAll, false);
+      send({ type: 'resolveExisting', id: q.id, ...clashAnswer(c) });
+    },
+  });
+  modal.clash = c;
+}
+
+// Settings → Uploads: what an upload does with a file already on the server. `tell`: the backend
+// too (it says so back with "uploadExisting").
+function setUploadExisting(choice, tell = true) {
+  state.uploadExisting = choice;
+  const sel = $('#up-existing-set');
+  if (sel && sel.value !== choice) sel.value = choice;
+  if (tell) send({ type: 'setUploadExisting', choice });
 }
 
 // The backend's check of a pick (UPLOADS.md 5.10): the dialog opens with the first, shows each
@@ -2171,19 +2359,38 @@ function onUploadCheck(msg) {
     flash(msg.why || 'This can’t be uploaded.', 12000);
     return;
   }
-  if (modal && modal.upload === msg.token) {
-    $('#modal-body').innerHTML = uploadHtml(msg);
+  const ours = modal && modal.upload === msg.token;
+  if (!ours && modal) { // another question is open: this one isn't asked over it
+    upload.pending = null;
+    send({ type: 'uploadCheckCancel', token: msg.token });
+    return;
+  }
+  // The files already there (once the server was looked at): the question, its choices kept
+  // should the check say more.
+  const ex = msg.existing || {};
+  const setting = msg.setting || state.uploadExisting;
+  let clash = ours ? modal.clash : null;
+  if (msg.phase === 'ready' && ex.count > 0 && !clash) clash = clashState(ex, msg.server, setting);
+  if (ours) {
+    $('#modal-body').innerHTML = uploadHtml(msg, clash);
   } else {
-    if (modal) { // another question is open: this one isn't asked over it
-      upload.pending = null;
-      send({ type: 'uploadCheckCancel', token: msg.token });
-      return;
-    }
-    showModal({ title: `Upload to ${msg.server}:${msg.dir || '~'}`, html: uploadHtml(msg), ok: 'Upload',
-      onOk: () => { upload.pending = null; send({ type: 'uploadStart', token: msg.token }); },
+    let dialog = null; // this dialog's modal: gone from `modal` once it closes
+    showModal({ title: `Upload to ${msg.server}:${msg.dir || '~'}`, html: uploadHtml(msg, clash), ok: 'Upload',
+      onOk: () => {
+        upload.pending = null;
+        // Nothing there now: the setting goes with it (Ask: one that turns up later is asked about).
+        const c = dialog.clash;
+        const answer = c ? clashAnswer(c) : { choice: dialog.setting, overrides: {}, always: false };
+        if (answer.always) setUploadExisting(answer.choice, false);
+        send({ type: 'uploadStart', token: msg.token, ...answer });
+      },
       onCancel: () => { upload.pending = null; send({ type: 'uploadCheckCancel', token: msg.token }); } });
+    dialog = modal;
     modal.upload = msg.token;
   }
+  modal.clash = clash;
+  modal.setting = setting;
+  $('#modal .modal').classList.toggle('wide', !!clash && clash.open);
   const ok = $('#modal-ok');
   const ready = msg.phase === 'ready';
   ok.disabled = !ready;
@@ -2312,9 +2519,10 @@ function onExisting(msg) {
   });
 }
 
-// Resume; a download waiting with that question asks it first.
+// Resume; a download waiting with that question asks it first, an upload its own (upLateDialog).
 function resumeItem(q) {
-  if (q.ask) existingDialog(q.ask, (choice) => send({ type: 'resolveExisting', id: q.id, choice }));
+  if (q.ask && isUp(q)) upLateDialog(q);
+  else if (q.ask) existingDialog(q.ask, (choice) => send({ type: 'resolveExisting', id: q.id, choice }));
   else send({ type: 'resumeItem', id: q.id });
 }
 
@@ -3029,7 +3237,7 @@ function dlView(q) {
 // all muted, the tooltip saying why.
 function fileStatus(q, c) {
   if (c.status === 'done') return { word: 'Done' };
-  if (c.status === 'skipped') return { word: 'Skipped' };
+  if (c.status === 'skipped') return c.error ? { word: 'Skipped', why: `Skipped: ${c.error}` } : { word: 'Skipped' };
   if (q.status === 'cancelled') return { word: 'Cancelled', muted: true, why: 'The folder was cancelled', over: true };
   if (c.status === 'running') return { word: isUp(q) ? 'Uploading' : 'Downloading' };
   if (c.status === 'waiting') return { word: 'Waiting', muted: true, why: WAIT_WHY };
@@ -5021,6 +5229,7 @@ function onInit(msg) {
   $('#version').textContent = `v${msg.version}`;
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
   if (typeof msg.verifyDownloads === 'boolean') $('#verify-on').checked = msg.verifyDownloads;
+  if (msg.uploadExisting) setUploadExisting(msg.uploadExisting, false);
   renderRemotes();
   renderSortHead();
   // Sent again after a server change: browse goes on where it is, if that server still exists.
@@ -5404,6 +5613,7 @@ function renderServers() {
   $('#updates-panel').hidden = !!settings.form;
   $('#schedule-panel').hidden = !!settings.form;
   $('#downloads-panel').hidden = !!settings.form;
+  $('#uploads-panel').hidden = !!settings.form;
   $('#server-form').hidden = !settings.form;
   renderStatus();
   if (settings.form) return;
@@ -5521,11 +5731,12 @@ function submitForm() {
 let modal = null; // { onOk, onCancel }
 let modalReturn = null; // where the focus goes back to (the Downloads table after Delete's question)
 
-function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [] }) {
+function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [], wide = false }) {
   if (!$('#modal').contains(document.activeElement)) modalReturn = document.activeElement;
   modal = { onOk, onCancel };
   $('#modal-title').textContent = bidiVisible(title);
   $('#modal-body').innerHTML = html;
+  $('#modal .modal').classList.toggle('wide', wide); // a table of files (the upload question's)
   $('#modal-cancel').textContent = cancel;
   const okBtn = $('#modal-ok');
   okBtn.textContent = ok;
@@ -5646,6 +5857,7 @@ if (webview) {
       case 'spaceShort': onSpaceShort(msg); break;
       case 'existing': onExisting(msg); break;
       case 'uploadCheck': onUploadCheck(msg); break;
+      case 'uploadExisting': setUploadExisting(msg.choice, false); break;
       case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;
@@ -6280,6 +6492,10 @@ $('#f-key').addEventListener('input', setSecretPlaceholder);
 $('#f-key-browse').addEventListener('click', () => send({ type: 'pickFile', current: $('#f-key').value.trim() }));
 $('#modal-ok').addEventListener('click', () => closeModal(true));
 $('#modal-cancel').addEventListener('click', () => closeModal(false));
+// The upload question's choices and its Change (clashHtml), whichever dialog shows it.
+$('#modal-body').addEventListener('change', onClashChange);
+$('#modal-body').addEventListener('click', onClashClick);
+$('#up-existing-set').addEventListener('change', (ev) => setUploadExisting(ev.target.value));
 // grab.conf may have been edited in another program ("Open grab.conf").
 window.addEventListener('focus', () => {
   if (settings.open && !settings.form && !modal) refreshServers();

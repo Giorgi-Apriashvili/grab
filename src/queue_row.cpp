@@ -30,7 +30,8 @@ bool allows(Direction direction, Act act) {
     case Act::open_folder:
     case Act::discard_local:
     case Act::resolve_existing: return direction == Direction::down;
-    case Act::discard_server: return direction == Direction::up;
+    case Act::discard_server:
+    case Act::resolve_server_existing: return direction == Direction::up;
     }
     return false;
 }

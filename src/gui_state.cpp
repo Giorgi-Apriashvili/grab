@@ -3,6 +3,7 @@
 #include "activity.hpp"
 #include "config.hpp"
 #include "json.hpp"
+#include "upload_existing.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -172,6 +173,9 @@ GuiState gui_state_from(const json::Value* doc) {
     if (const auto* on = doc->find("verifyDownloads"); on != nullptr && on->kind == json::Value::Kind::boolean) {
         s.verify_downloads = on->boolean;
     }
+    if (const auto e = upload::parse_existing(doc->string_of("uploadExisting").value_or(""))) {
+        s.upload_existing = std::string(upload::name(*e));
+    }
     if (const auto* on = doc->find("limitOn"); on != nullptr && on->kind == json::Value::Kind::boolean) {
         s.limit_on = on->boolean;
     }
@@ -259,6 +263,10 @@ std::string gui_state_to_json(const GuiState& state) {
     if (state.downloads != DownloadsView{}) root.set("downloads", downloads_view_to_json(state.downloads));
     root.set("parallel", Value::make_number(state.parallel));
     root.set("verifyDownloads", Value::make_bool(state.verify_downloads));
+    // Not the default only: a gui.json without it is Ask, as an older grab leaves it.
+    if (state.upload_existing != "ask" && upload::parse_existing(state.upload_existing)) {
+        root.set("uploadExisting", Value::make_string(state.upload_existing));
+    }
     root.set("limitOn", Value::make_bool(state.limit_on));
     root.set("limitMiBps", Value::make_number(state.limit_mibps));
     root.set("speedSchedule", schedule::to_json(state.speed_schedule));
@@ -316,6 +324,10 @@ std::optional<SavedFile> file_from(const json::Value& f) {
     if (sf.state == "failed") sf.error = f.string_of("error").value_or("");
     if (auto p = f.string_of("priority"); p == "high" || p == "low") sf.priority = *p;
     if (const auto* r = f.find("resend"); r != nullptr && r->kind == json::Value::Kind::boolean) sf.resend = r->boolean;
+    // A file's own choice; Ask is none (it follows the upload's).
+    if (const auto e = upload::parse_existing(f.string_of("choice").value_or("")); e && *e != upload::Existing::ask) {
+        sf.choice = std::string(upload::name(*e));
+    }
     return sf;
 }
 
@@ -336,6 +348,7 @@ void append_files(std::string& item, const std::vector<SavedFile>& files) {
         if (f.state == "failed" && !f.error.empty()) item += R"(,"error":)" + json::quote(f.error);
         if (f.priority == "high" || f.priority == "low") item += R"(,"priority":)" + json::quote(f.priority);
         if (f.resend) item += R"(,"resend":true)";
+        if (!f.choice.empty()) item += R"(,"choice":)" + json::quote(f.choice);
         item += '}';
     }
     item += "]}";

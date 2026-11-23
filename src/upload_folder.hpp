@@ -128,6 +128,32 @@ struct FolderJob {
 // asked (Tree::asking). Under the caller's mutex.
 void apply(const FolderJob& job, Tree& tree);
 
+// The files waiting for the user's answer (Tree::asking, those still failed for it: not skipped or
+// tried again by hand since) in the folder's order, each with what is there (Tree::clashes; a file
+// without one: what is there unknown), the first `at_most` of them; `taken` gets all of them
+// counted. Under the caller's mutex.
+struct Waiting {
+    std::size_t index = 0; // Tree::files'
+    Clash clash;
+};
+[[nodiscard]] std::vector<Waiting> asking_list(const Tree& tree, std::size_t at_most, Taken& taken);
+
+// The user's answer for the files waiting for it (Tree::asking; UPLOADS.md 5.5, a late clash):
+// each gets its own choice from `own` (by Tree::files' index), else `all`, as its Tree::choices
+// (kept with the upload, so a retry or a restart follows it), and apply() decides them now. Ask
+// decides nothing: such files keep waiting. Under the caller's mutex. A big file whose partial
+// upload is kept (the clash came at its placement) goes on from it under its own name, the choice
+// met as it is put in place.
+void answer(const FolderJob& job, Tree& tree, Existing all, const std::map<std::size_t, Existing>& own);
+
+// A new dialog's answer for an upload of the same folder to the same place that is in the list
+// already (`fresh`: the dialog's walk and look, its files' own choices): the old answer's own
+// choices give way to the new ones (matched by the files' paths), the files the old answer skipped
+// for a name taken go again, and the next run looks at the server again, so the new answer and the
+// upload's choice decide every name taken there. Files sent or sent again (Tree::resend) stay as
+// they are. Under the caller's mutex.
+void answer_again(Tree& tree, const Tree& fresh);
+
 // The server folders, then the queued files, until none is left or `stop`. Looks at the server
 // first (look, apply) when that wasn't done. Files still running at a stop are queued again; their
 // temps on the server are kept (Tree::temps) and removed at the next run. A refusal that holds for

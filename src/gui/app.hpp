@@ -234,12 +234,16 @@ private:
     enum class Phase { none, listing, checking, verifying };
     // Why a running download is being stopped.
     enum class StopReason { none, pause, cancel };
-    // A file already there that a download would replace, for the question.
+    // A file already there that a download would replace, for the question; for an upload's
+    // question, a file on the server its upload would replace (UPLOADS.md 5.5), `mine` the local
+    // file, `kind` how they compare (upload::kind_name) and `index` the folder's file it is.
     struct Asked {
         std::string name; // as shown: the file's name, or its path in the folder
         std::uint64_t size = 0;
         std::optional<std::int64_t> modified; // the server's, Unix seconds
         existing::Local mine;
+        std::string kind = {}; // uploads only
+        std::size_t index = 0; // a folder upload's file (Tree::files' index)
     };
 
     // A download, or an upload (UPLOADS.md 5.10): both share the queue, its ids, its order and the
@@ -293,9 +297,11 @@ private:
         // A different file already at a target: what to do. Answered before queuing, or when a
         // folder was listed; ask = not answered (it then waits paused with the question).
         existing::Choice existing = existing::Choice::ask;
-        // An upload's file already on the server: what to do (chunk 3: Skip; the question is chunk
-        // 5's), and a file whose copy there verify found different: its retry replaces that copy,
-        // grab's own.
+        // An upload's file already on the server: what to do (the dialog's For all, or a picked
+        // file's own choice; a folder's files with their own are in tree.choices). Ask: nothing
+        // was there when the dialog looked and the setting is Ask, so a file that turns up there
+        // makes it wait with the question. And a file whose copy there verify found different:
+        // its retry replaces that copy, grab's own.
         upload::Existing up_existing = upload::Existing::skip;
         bool resend = false;
         std::filesystem::path local_name; // a file's Keep-both name, instead of the server's
@@ -303,9 +309,11 @@ private:
         // earlier Keep both kept) and its size, which Open opens. Unset otherwise, and when Skip
         // kept the user's own file there.
         std::optional<open_file::Finished> finished;
-        // Waiting for that answer: some of the files concerned, and how many there are.
+        // Waiting for that answer: some of the files concerned, and how many there are; an
+        // upload's also counted by how they compare.
         std::vector<Asked> asked;
         std::size_t asked_count = 0;
+        upload::Taken asked_taken;
         // Folders: their files once listed (under mutex_); an upload's as walked, with what it adds
         // (upload::Tree), which a download leaves empty.
         upload::Tree tree;
@@ -423,10 +431,21 @@ private:
     std::vector<Asked> conflicts_for(const json::Value& groups, const std::filesystem::path& dest, std::size_t shown,
                                      std::size_t& count,
                                      std::set<std::pair<std::string, std::string>>* covered = nullptr);
-    // The answer for a download waiting with the question: it goes on.
-    void resolve_existing(int id, existing::Choice choice);
-    // The question's files for the page: {count, files: [{name, size, modified, mineSize, mineModified}]}.
-    [[nodiscard]] static json::Value asked_json(const std::vector<Asked>& asked, std::size_t count);
+    // The answer for a download waiting with the question: it goes on. "resolveExisting" {id,
+    // choice}: a download's choice (existing.hpp's names); an upload's (upload_existing.hpp's),
+    // with `overrides` {place in its question's list: choice} and `always` (resolve_upload).
+    void resolve_existing(int id, const json::Value& msg);
+    // An upload waiting with the question about files that turned up on its server: each gets its
+    // own choice or the one for all (upload::answer for a folder), and it goes on. `always`: that
+    // one is the setting now, and the upload's own for any more that turn up.
+    void resolve_upload(Item& item, upload::Existing all, const std::map<std::size_t, upload::Existing>& own, bool always);
+    // An upload stopped by files that turned up on its server meanwhile, under Ask: it waits
+    // paused with the question, its files (the first late_shown) in `asked`. Caller holds mutex_.
+    void ask_upload(Item& item, std::vector<Asked> asked, std::size_t count, const upload::Taken& taken);
+    // The question's files for the page: {count, files: [{name, size, modified, mineSize,
+    // mineModified, kind?}]}; an upload's also counted by how they compare (`taken`).
+    [[nodiscard]] static json::Value asked_json(const std::vector<Asked>& asked, std::size_t count,
+                                                const upload::Taken* taken = nullptr);
     // Where a file download lands: its server name made safe, or its Keep-both name; an upload's
     // source (queue_row::local_of).
     [[nodiscard]] static std::filesystem::path item_target(const Item& item);
@@ -621,8 +640,14 @@ private:
     void run_check(UploadCheck& c, const std::vector<std::filesystem::path>& paths, const std::stop_token& stop);
     void post_check(const UploadCheck& c, std::string_view phase) const;
     void cancel_check(int token);
-    // "uploadStart" {token}: the checked items into the queue, each an upload.
-    void start_upload(int token);
+    // "uploadStart" {token, choice, overrides, always}: the checked items into the queue, each an
+    // upload with the answer about the files already there (upload::apply_answer): `choice` for
+    // all, `overrides` {place in the dialog's list: choice} for single files; `always` saves the
+    // choice as the setting (set_upload_existing).
+    void start_upload(int token, const upload::Answer& answer, bool always);
+    // Settings → Uploads, or a question's "Always do this" (UI thread): gui.json's uploadExisting,
+    // told to the page ("uploadExisting" {choice}).
+    void set_upload_existing(upload::Existing choice);
     void run_upload_file(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
     void run_upload_folder(const std::shared_ptr<Item>& item, const std::stop_token& item_stop);
     // An upload's folder job, without its pool and hooks: what discard and skip_file need too.
@@ -684,6 +709,8 @@ private:
     // Uploads' own, shared by every upload's streams; unlimited until chunk 6 gives it a box.
     rate::RateLimiter up_limiter_;
     std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers
+    // GuiState::upload_existing, for the upload checks' threads.
+    std::atomic<upload::Existing> upload_existing_{upload::Existing::ask};
     std::string limit_posted_;  // the last "limit" message, so only changes are sent
 
     struct LastSearch {

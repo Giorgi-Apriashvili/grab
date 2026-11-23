@@ -266,6 +266,35 @@ TEST_CASE("the page's file rows: \"files\" in chunks, \"fileDelta\" with only wh
     CHECK(json::stringify(d[2]) == "[0,3,100,0,null,2,null,1]");
 }
 
+TEST_CASE("the page's file rows: a file skipped for a reason says why; one skipped by hand says nothing") {
+    auto t = sample();
+    t.files[0].status = State::skipped;
+    t.files[0].error = "a folder of that name is there"; // an upload's Replace with a folder in the way
+    t.files[1].status = State::failed;
+    t.files[1].error = "permission denied";
+    REQUIRE(folder::skip_file(t, "C:\\dl", "/srv", 1) == std::nullopt); // a failed file skipped by hand
+    CHECK(t.files[1].error.empty());
+    const auto names = queue_view::names_of(t.files);
+    const auto snap = queue_view::snapshot(t.files);
+    REQUIRE(snap.errors.size() == 1);
+    CHECK(snap.errors.at(0) == "a folder of that name is there");
+    const auto rows = parsed(queue_view::files_message(7, 3, 0, 2, names, snap)).find("rows")->items;
+    REQUIRE(rows.size() == 2);
+    CHECK(json::stringify(rows[0]) == R"(["sub/a.bin",100,5,0,2,null,"a folder of that name is there"])");
+    CHECK(json::stringify(rows[1]) == "[\"a:b.txt\",200,5,0,2,\"a\xEF\xBC\x9A" "b.txt\"]");
+
+    // Skipped as it ran: the reason comes with the change.
+    t = sample();
+    auto shadow = queue_view::snapshot(t.files).rows;
+    t.files[2].status = State::skipped;
+    t.files[2].error = "a folder of that name is there";
+    const auto p = queue_view::pass(t.files, &shadow);
+    REQUIRE(p.changed.size() == 1);
+    CHECK(p.changed[0].error == "a folder of that name is there");
+    CHECK(json::stringify(parsed(queue_view::file_delta_message(7, 3, p.changed)).find("rows")->items[0]) ==
+          R"([2,5,0,0,null,2,"a folder of that name is there"])");
+}
+
 TEST_CASE("the page's ranges of rows become indices, each once, within the folder") {
     auto ranges = [](const char* text) {
         const auto v = json::parse(text);

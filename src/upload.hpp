@@ -165,6 +165,9 @@ struct PlaceRequest {
     std::uint64_t size = 0;  // the local file's, for the clash
     std::int64_t mtime = 0;  // seconds since 1970
     std::function<void(const std::vector<std::string>&)> on_command;
+    // Names a Keep-both copy must not take though nothing is there yet (whole paths, grab's form):
+    // other uploads' places in that folder. Unset: none.
+    std::function<bool(std::string_view)> reserved;
 };
 struct Placement {
     Outcome outcome = Outcome::done; // done, exists (the choice is to ask) or skipped
@@ -229,6 +232,8 @@ struct Upload {
     // Where the records of partial uploads are kept (gui_state's state_dir / "uploads"); empty:
     // none, every upload starts over.
     std::filesystem::path records_dir;
+    // Names a Keep-both copy must not take (PlaceRequest::reserved).
+    std::function<bool(std::string_view)> reserved;
 };
 
 struct Result {

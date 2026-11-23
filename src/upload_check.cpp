@@ -47,20 +47,6 @@ std::int64_t seconds_of(std::int64_t ns) {
     return ns >= 0 ? ns / 1'000'000'000 : -((-ns + 999'999'999) / 1'000'000'000);
 }
 
-void count(Taken& taken, const Clash& clash) {
-    ++taken.count;
-    if (clash.remote_is_dir) {
-        ++taken.folders;
-        return;
-    }
-    switch (kind(clash)) {
-    case Kind::same: ++taken.same; break;
-    case Kind::newer_here: ++taken.newer; break;
-    case Kind::older_here: ++taken.older; break;
-    case Kind::different_size: ++taken.differs; break;
-    }
-}
-
 // A file: its size and time.
 void look_at_file(Picked& p) {
     auto file = LocalFile::open(p.source);
@@ -152,7 +138,7 @@ bool look_files(Check& check, ssh::Pool& pool, const std::stop_token& stop) {
                 }
                 if (!a.there) continue;
                 p.clash = clash_with(p.name, p.bytes, seconds_of(p.mtime_ns), *a.there);
-                count(check.taken, *p.clash);
+                check.taken.add(*p.clash);
             }
         }
         return true;
@@ -237,7 +223,7 @@ void look_server(Check& check, const std::shared_ptr<ssh::Pool>& pool, fetch::Co
         }
         if (stop.stop_requested()) return;
         p.merging = p.tree->merging;
-        for (const auto& [i, clash] : p.tree->clashes) count(check.taken, clash);
+        for (const auto& [i, clash] : p.tree->clashes) check.taken.add(clash);
     }
 }
 
@@ -248,6 +234,45 @@ std::string nothing_goes(const Check& check) {
 }
 
 bool short_of_space(const Check& check) { return check.free && *check.free < check.bytes; }
+
+std::vector<Listed> taken_list(const Check& check, std::size_t at_most) {
+    std::vector<Listed> out;
+    for (std::size_t k = 0; k < check.items.size() && out.size() < at_most; ++k) {
+        const Picked& p = check.items[k];
+        if (!p.error.empty()) continue;
+        if (p.clash) {
+            out.push_back(Listed{.item = k, .file = std::nullopt, .name = p.name, .clash = *p.clash});
+            continue;
+        }
+        if (!p.tree) continue;
+        for (const auto& [i, clash] : p.tree->clashes) {
+            if (out.size() == at_most) break;
+            // Its name as it is here (grab's form only escapes what the server's name needs).
+            out.push_back(Listed{.item = k, .file = i, .name = p.name + "/" + rclone_enc::raw_path(p.tree->files[i].path), .clash = clash});
+        }
+    }
+    return out;
+}
+
+std::vector<Existing> apply_answer(Check& check, const Answer& answer) {
+    std::vector<Existing> choices(check.items.size(), answer.all);
+    if (answer.unlisted) {
+        for (std::size_t k = 0; k < check.items.size(); ++k) {
+            const Picked& p = check.items[k];
+            if (!p.clash && (!p.tree || p.tree->clashes.empty())) choices[k] = *answer.unlisted;
+        }
+    }
+    if (answer.own.empty()) return choices;
+    const std::size_t last = answer.own.rbegin()->first;
+    const auto listed = taken_list(check, last + 1);
+    for (const auto& [at, own] : answer.own) {
+        if (at >= listed.size() || own == Existing::ask) continue;
+        const Listed& l = listed[at];
+        if (!l.file) choices[l.item] = own;
+        else if (const auto& tree = check.items[l.item].tree) tree->choices[*l.file] = own;
+    }
+    return choices;
+}
 
 bool dropped_copy(const fs::path& path, const fs::path& temp) {
     if (temp.empty() || !path.has_parent_path()) return false;

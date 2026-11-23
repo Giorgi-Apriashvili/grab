@@ -6,13 +6,16 @@
 #include "conn_budget.hpp"
 #include "fake_pool.hpp"
 #include "fetch.hpp"
+#include "folder.hpp"
 #include "local_walk.hpp"
 #include "rclone_encoding.hpp"
 #include "sftp.hpp"
 #include "upload_check.hpp"
 #include "upload_existing.hpp"
+#include "upload_folder.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -223,6 +226,121 @@ TEST_CASE("upload check: the server takes it: free space, the names there by how
     upload::look_server(big, small_pool, connections);
     CHECK(big.writable == std::optional<bool>(true));
     CHECK(upload::short_of_space(big));
+}
+
+TEST_CASE("upload check: the files already there as the dialog lists them, and the answer: for all, and single files' own") {
+    Dir d("answer");
+    const fs::path same = put_local(d.path, "same.txt", "12345");
+    const fs::path fresh = put_local(d.path, "fresh.txt", "new");
+    const fs::path newer = put_local(d.path, "newer.txt", "abc", local_time + 3600);
+    const fs::path src = d.path / "photos";
+    put_local(src, "1.jpg", "one");
+    put_local(src, "2.jpg", "two", local_time - 3600);
+    put_local(src, "3.jpg", "three");
+    put_local(src, "4.jpg", "four");
+    Server srv;
+    srv.put("/up/same.txt", "12345", local_time);
+    srv.put("/up/newer.txt", "abc", local_time);
+    srv.folder("/up/photos");
+    srv.put("/up/photos/1.jpg", "one", local_time);
+    srv.put("/up/photos/2.jpg", "TWO", local_time);
+    srv.folder("/up/photos/3.jpg");
+    auto c = local_check({same, fresh, newer, src});
+    auto pool = srv.fake.pool(4);
+    fetch::Connections connections;
+    connections.configure("Fake", 4);
+    upload::look_server(c, pool, connections);
+    REQUIRE(c.writable == std::optional<bool>(true));
+    CHECK(c.taken == upload::Taken{.count = 5, .same = 2, .newer = 1, .older = 1, .differs = 0, .folders = 1});
+
+    // In the picked items' order, a folder's files in the folder's, each as the dialog names it.
+    const auto& tree = *c.items[3].tree;
+    const auto index = [&](std::string_view path) {
+        const auto it = std::ranges::find(tree.files, path, &folder::File::path);
+        REQUIRE(it != tree.files.end());
+        return static_cast<std::size_t>(it - tree.files.begin());
+    };
+    const auto listed = upload::taken_list(c, 100);
+    REQUIRE(listed.size() == 5);
+    struct Want {
+        std::size_t item;
+        std::optional<std::size_t> file;
+        std::string name;
+        std::string kind;
+    };
+    const std::vector<Want> want{{.item = 0, .file = std::nullopt, .name = "same.txt", .kind = "same"},
+                                 {.item = 2, .file = std::nullopt, .name = "newer.txt", .kind = "newer"},
+                                 {.item = 3, .file = index("1.jpg"), .name = "photos/1.jpg", .kind = "same"},
+                                 {.item = 3, .file = index("2.jpg"), .name = "photos/2.jpg", .kind = "older"},
+                                 {.item = 3, .file = index("3.jpg"), .name = "photos/3.jpg", .kind = "folder"}};
+    for (std::size_t k = 0; k < want.size(); ++k) {
+        CAPTURE(k);
+        CHECK(listed[k].item == want[k].item);
+        CHECK(listed[k].file == want[k].file);
+        CHECK(listed[k].name == want[k].name);
+        CHECK(upload::kind_name(listed[k].clash) == want[k].kind);
+    }
+    CHECK(upload::taken_list(c, 2).size() == 2); // the first part only
+    CHECK(listed[3].clash.local_size == 3);
+    CHECK(listed[3].clash.remote_mtime == std::optional<std::int64_t>(local_time));
+
+    // Skip for all; newer.txt replaced, photos/2.jpg as a second copy, the folder in 3.jpg's way
+    // under Replace if newer (still never replaced); a place past the list and Ask are no choices.
+    const upload::Answer answer{.all = upload::Existing::skip,
+                                .own = {{0, upload::Existing::ask},
+                                        {1, upload::Existing::replace},
+                                        {3, upload::Existing::keep_both},
+                                        {4, upload::Existing::newer},
+                                        {9, upload::Existing::replace}},
+                                .unlisted = std::nullopt};
+    const auto choices = upload::apply_answer(c, answer);
+    CHECK(choices == std::vector<upload::Existing>{upload::Existing::skip, upload::Existing::skip, upload::Existing::replace,
+                                                    upload::Existing::skip});
+    CHECK(tree.choices == std::map<std::size_t, upload::Existing>{{index("2.jpg"), upload::Existing::keep_both},
+                                                                  {index("3.jpg"), upload::Existing::newer}});
+    // Nothing chosen of single files: every item for all.
+    auto plain = local_check({same, newer});
+    upload::look_server(plain, pool, connections);
+    CHECK(upload::apply_answer(plain, upload::Answer{.all = upload::Existing::different, .own = {}, .unlisted = std::nullopt}) ==
+          std::vector<upload::Existing>{upload::Existing::different, upload::Existing::different});
+    // Under the setting Ask, an item the dialog listed nothing of (fresh.txt) asks about a file
+    // that turns up there later; those with files there take the answer (review, chunk 5).
+    {
+        auto mixed = local_check({same, fresh, src});
+        upload::look_server(mixed, pool, connections);
+        CHECK(upload::apply_answer(mixed, upload::Answer{.all = upload::Existing::replace, .own = {}, .unlisted = upload::Existing::ask}) ==
+              std::vector<upload::Existing>{upload::Existing::replace, upload::Existing::ask, upload::Existing::replace});
+    }
+
+    // The folder sent with that answer: nothing on the server replaced but what was chosen.
+    const auto before = srv.tree();
+    upload::FolderJob job;
+    job.connections = &connections;
+    job.server = "Fake";
+    job.id = 3;
+    job.source = src;
+    job.remote_path = "/up/photos";
+    job.existing = choices[3];
+    job.pool = pool;
+    upload::Tree& t = *c.items[3].tree;
+    std::mutex m;
+    {
+        std::lock_guard lock(m);
+        upload::apply(job, t);
+    }
+    upload::run(job, t, m, {});
+    auto after = srv.tree();
+    CHECK(after["/up/photos/1.jpg"] == "one");                       // the same: skipped
+    CHECK(after["/up/photos/2.jpg"] == "TWO");                       // the server's kept...
+    CHECK(after["/up/photos/2 (2).jpg"] == "two");                   // ...and yours beside it
+    CHECK(after["dir /up/photos/3.jpg"] == before.at("dir /up/photos/3.jpg")); // the folder stays
+    CHECK(after["/up/photos/4.jpg"] == "four");                      // nothing there: sent
+    CHECK(t.files[index("3.jpg")].status == folder::State::skipped);
+    CHECK(t.files[index("3.jpg")].error == "a folder of that name is there");
+    for (const auto& [path, content] : before) {
+        if (path.starts_with("dir ")) continue;
+        CHECK_MESSAGE(after[path] == content, path);
+    }
 }
 
 TEST_CASE("upload check: a read-only server (Box.Guest) says so plainly, and nothing more is asked of it") {

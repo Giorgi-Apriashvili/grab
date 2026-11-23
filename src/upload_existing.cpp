@@ -30,6 +30,31 @@ Kind kind(const Clash& clash) {
     return clash.local_size == clash.remote_size ? Kind::same : Kind::different_size;
 }
 
+std::string_view kind_name(const Clash& clash) {
+    if (clash.remote_is_dir) return "folder";
+    switch (kind(clash)) {
+    case Kind::same: return "same";
+    case Kind::newer_here: return "newer";
+    case Kind::older_here: return "older";
+    case Kind::different_size: break;
+    }
+    return "differs";
+}
+
+void Taken::add(const Clash& clash) {
+    ++count;
+    if (clash.remote_is_dir) {
+        ++folders;
+        return;
+    }
+    switch (kind(clash)) {
+    case Kind::same: ++same; break;
+    case Kind::newer_here: ++newer; break;
+    case Kind::older_here: ++older; break;
+    case Kind::different_size: ++differs; break;
+    }
+}
+
 Decision decide(Existing choice, const Clash& clash) {
     const auto replace = [&]() -> Decision {
         if (clash.remote_is_dir) return {.action = Action::skip, .note = "a folder of that name is there"};

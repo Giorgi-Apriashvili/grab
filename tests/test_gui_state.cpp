@@ -27,6 +27,7 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.speed_schedule = {{0x1F, 18 * 60, 0, 5}, {0x60, 22 * 60, 6 * 60, 2.5}};
     s.limit_change = schedule::Override{{false, 5}, 5, 1760003600};
     s.verify_downloads = true;
+    s.upload_existing = "newer";
     s.update_check = false;
     s.last_update_check = 1760000000;
     s.latest_version = "0.7.0";
@@ -39,6 +40,18 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     CHECK(parse_gui_state(gui_state_to_json(s)) == s);
     CHECK(parse_gui_state("{}").update_check); // on unless switched off
     CHECK_FALSE(parse_gui_state("{}").verify_downloads); // off unless switched on
+    // Files already on the server: Ask unless a choice was saved (Settings → Uploads, or a
+    // question's "Always do this"), each of the six choices kept; Ask is not written, so the file
+    // an older grab saves (which drops the key) says the same.
+    CHECK(parse_gui_state("{}").upload_existing == "ask");
+    for (const char* choice : {"replace", "different", "newer", "skip", "both"}) {
+        GuiState c;
+        c.upload_existing = choice;
+        CHECK(parse_gui_state(gui_state_to_json(c)).upload_existing == choice);
+    }
+    CHECK(gui_state_to_json(GuiState{}).find("uploadExisting") == std::string::npos);
+    CHECK(parse_gui_state(R"({"uploadExisting":"overwrite"})").upload_existing == "ask");
+    CHECK(parse_gui_state(R"({"uploadExisting":7})").upload_existing == "ask");
 
     const auto file = std::filesystem::temp_directory_path() / "grab_test_gui" / "gui.json";
     std::filesystem::remove_all(file.parent_path());
@@ -342,12 +355,15 @@ TEST_CASE("the download queue round-trips and skips incomplete entries") {
 
 TEST_CASE("unfinished uploads and what they left on servers round-trip through uploads.json; queue.json never holds one") {
     SavedFile done{.path = "sub/a.jpg", .size = 3, .modtime = "2026-11-21T10:00:00.123456789Z", .state = "done", .fetched = true,
-                   .verified = true, .local = "", .error = "", .priority = "normal", .resend = false};
+                   .verified = true, .local = "", .error = "", .priority = "normal", .resend = false, .choice = ""};
+    // Its own existing-file choice (the dialog's for it): kept, so a retry or a restart follows it (chunk 5).
     SavedFile failed{.path = "b.jpg", .size = 4, .modtime = "", .state = "failed", .fetched = false, .verified = false,
-                     .local = "", .error = "Main doesn't let this account write in /srv/x", .priority = "high", .resend = false};
+                     .local = "", .error = "Main doesn't let this account write in /srv/x", .priority = "high", .resend = false,
+                     .choice = "newer"};
     // Its server copy differed (verify): its retry replaces that copy, after a restart too (review, chunk 3).
     SavedFile differs{.path = "c.jpg", .size = 5, .modtime = "", .state = "failed", .fetched = false, .verified = false,
-                      .local = "", .error = "the server's copy differs (MD5)", .priority = "normal", .resend = true};
+                      .local = "", .error = "the server's copy differs (MD5)", .priority = "normal", .resend = true,
+                      .choice = "both"};
     SavedUploads u;
     u.uploads.push_back(SavedUpload{.pos = 1,
                                     .server = "Main",
@@ -393,6 +409,18 @@ TEST_CASE("unfinished uploads and what they left on servers round-trip through u
     const auto text = uploads_to_json(u);
     CHECK(text.starts_with(R"({"version":1,"uploads":[)"));
     CHECK(parse_uploads(text) == u);
+    // A file's own choice only when it has one; Ask, or a word grab doesn't know, is none.
+    CHECK(text.find(R"("path":"b.jpg","size":4,"modtime":"","state":"failed","error":"Main doesn't let this account write in /srv/x",)"
+                    R"("priority":"high","choice":"newer"})") != std::string::npos);
+    CHECK(text.find(R"("path":"sub/a.jpg","size":3,"modtime":"2026-11-21T10:00:00.123456789Z","state":"done","fetched":true,)"
+                    R"("verified":true})") != std::string::npos);
+    const auto choices = parse_uploads(R"({"version":1,"uploads":[{"server":"A","source":"C:\\a","path":"/a","kind":"folder",)"
+                                       R"("files":[{"path":"x","choice":"ask"},{"path":"y","choice":"overwrite"},{"path":"z","choice":"replace"}]}]})");
+    REQUIRE(choices.uploads.size() == 1);
+    REQUIRE(choices.uploads[0].files.size() == 3);
+    CHECK(choices.uploads[0].files[0].choice.empty());
+    CHECK(choices.uploads[0].files[1].choice.empty());
+    CHECK(choices.uploads[0].files[2].choice == "replace");
 
     // Bad entries are skipped; a leftover of another kind is never acted on.
     const auto partial = parse_uploads(R"({"version":1,"uploads":[{"server":"A","source":"C:\\a","path":"/a"},{"server":"B"},7],)"

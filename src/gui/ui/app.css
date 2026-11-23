@@ -969,7 +969,8 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .rule .next-day { font-size: 12px; min-width: 50px; }
 .rule .next-day.off { visibility: hidden; } /* keeps its place, so the rows line up */
 .rule .icon-btn { width: 26px; height: 26px; }
-.schedule-panel .hint, #downloads-panel .hint { margin-top: 8px; max-width: 720px; }
+.schedule-panel .hint, #downloads-panel .hint, #uploads-panel .hint { margin-top: 8px; max-width: 720px; }
+#uploads-panel select { height: 26px; font-size: 12px; }
 .server {
   padding: 10px 12px;
   background: var(--panel);
@@ -1140,6 +1141,34 @@ html.dropping .viewer-pdf { pointer-events: none; } /* a drag over the PDF reach
 .up-ok { color: var(--ok); }
 .up-warn { color: var(--warn); }
 .up-bad { color: var(--danger); }
+/* The files already on the server (UPLOADS.md chunk 5): a choice for all, a table with one per
+   file and what it does, "Always do this". Wider while the table shows. */
+.modal.wide { width: min(820px, 100%); }
+.up-clash { margin-top: 4px; }
+.up-clash .up-existing { font-weight: 600; }
+.up-all { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0 0 8px; padding: 6px 10px 8px; border: 1px solid var(--line); border-radius: 6px; }
+.up-all legend { padding: 0 4px; font-size: 12px; color: var(--muted); }
+.up-all label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.up-all .muted { font-size: 12px; }
+.up-clash-list { max-height: min(40vh, 320px); overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; }
+.up-clashes { margin: 0; font-size: 12px; }
+.up-clashes thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.up-clashes tr:first-child td { border-top: 0; }
+.up-clashes td { vertical-align: middle; font-variant-numeric: tabular-nums; }
+.up-clashes td:first-child { word-break: normal; overflow-wrap: anywhere; }
+.up-clashes select { width: 150px; height: 24px; font-size: 12px; }
+.up-file { unicode-bidi: isolate; }
+.up-kind { display: inline-block; padding: 0 5px; border-radius: 4px; font-size: 11px; color: var(--muted); background: var(--hover); white-space: nowrap; }
+.up-kind.k-newer { color: var(--ok); }
+.up-kind.k-older, .up-kind.k-differs { color: var(--warn); }
+.up-effect { font-size: 12px; white-space: nowrap; }
+.up-effect.e-replace { color: var(--warn); font-weight: 600; }
+.up-effect.e-both { color: var(--accent); }
+.up-effect.e-skip { color: var(--muted); }
+.up-more { margin: 6px 0 0; font-size: 12px; }
+.up-outcome { margin: 8px 0 6px; }
+.up-setting .link { padding: 0 2px; border: 0; background: none; color: var(--accent); cursor: pointer; text-decoration: underline; }
+.up-always input { margin: 0 6px 0 0; vertical-align: -2px; }
 /* Files dragged in from Explorer (UPLOADS.md 5.10, chunk 4): where a drop goes, or why not; the
    folder row a drop goes into. Over everything, dialogs too (a drop over one says to finish it). */
 .drop-overlay {

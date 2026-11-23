@@ -478,6 +478,265 @@ TEST_CASE("folder uploads: a file that appears on the server after the look gets
     }
 }
 
+TEST_CASE("folder uploads: files that turn up after the look wait for the answer under Ask; then each goes by its own choice or the one for all") {
+    Dir d("late-answer");
+    const fs::path src = d.path / "src";
+    put_local(src, "a.txt", "mine a");
+    put_local(src, "b.txt", "mine b");
+    put_local(src, "c.txt", "mine c");
+    put_local(src, "big.bin", content_of(std::size_t{3} << 20, 2));
+    put_local(src, "other.txt", "other");
+    Server server;
+    server.folder("/up/src");
+    Up up(server, src);
+    up.job.existing = upload::Existing::ask; // the setting Ask, and nothing there when the dialog looked
+    up.walk();
+    REQUIRE(upload::look(up.job, up.tree, up.m, {}));
+    CHECK(up.tree.clashes.empty());
+    for (const char* name : {"a.txt", "b.txt", "c.txt", "big.bin"}) server.put(std::string("/up/src/") + name, std::string("theirs ") + name);
+    up.run();
+    CHECK(up.file("other.txt").status == folder::State::done);
+    // Nothing of theirs touched: each waits, failed for the question.
+    for (const char* name : {"a.txt", "b.txt", "c.txt", "big.bin"}) {
+        CAPTURE(name);
+        CHECK(server.file(std::string("/up/src/") + name) == std::string("theirs ") + name);
+        CHECK(up.file(name).status == folder::State::failed);
+        CHECK(up.file(name).error == "a file of that name is already on Fake");
+    }
+    {
+        std::lock_guard lock(up.m);
+        upload::Taken taken;
+        const auto waiting = upload::asking_list(up.tree, 2, taken);
+        CHECK(taken.count == 4);
+        CHECK(taken.newer == 4); // the files here are newer than those that turned up
+        REQUIRE(waiting.size() == 2); // the first part, in the folder's order
+        CHECK(waiting[0].index == up.index("a.txt"));
+        CHECK(waiting[1].index == up.index("b.txt"));
+        CHECK(waiting[0].clash.remote_size == std::string("theirs a.txt").size());
+        CHECK(waiting[0].clash.local_size == 6);
+        // One skipped by hand meanwhile no longer waits.
+        CHECK(upload::skip_file(up.job, up.tree, up.index("b.txt")) == std::nullopt);
+        upload::Taken left;
+        CHECK(upload::asking_list(up.tree, 10, left).size() == 3);
+        CHECK(left.count == 3);
+        // The answer: Skip for all, a.txt replaced, c.txt beside theirs.
+        upload::answer(up.job, up.tree, upload::Existing::skip,
+                       {{up.index("a.txt"), upload::Existing::replace}, {up.index("c.txt"), upload::Existing::keep_both}});
+        CHECK(up.tree.choices.at(up.index("a.txt")) == upload::Existing::replace);
+        CHECK(up.tree.choices.at(up.index("c.txt")) == upload::Existing::keep_both);
+        CHECK(up.tree.choices.at(up.index("big.bin")) == upload::Existing::skip);
+        upload::Taken none;
+        CHECK(upload::asking_list(up.tree, 10, none).empty());
+        CHECK(up.file("a.txt").status == folder::State::queued);
+        CHECK(up.file("big.bin").status == folder::State::skipped);
+    }
+    up.run();
+    CHECK(server.file("/up/src/a.txt") == "mine a");
+    CHECK(server.file("/up/src/b.txt") == "theirs b.txt");
+    CHECK(server.file("/up/src/c.txt") == "theirs c.txt");
+    CHECK(server.file("/up/src/c (2).txt") == "mine c");
+    CHECK(server.file("/up/src/big.bin") == "theirs big.bin");
+    CHECK(up.file("a.txt").status == folder::State::done);
+    CHECK(up.file("b.txt").status == folder::State::skipped);
+    CHECK(up.file("c.txt").status == folder::State::done);
+    CHECK(up.file("big.bin").status == folder::State::skipped);
+    CHECK(up.tree.asking.empty());
+    CHECK(server.temps().empty()); // the big file's partial upload went with its Skip
+
+    // Ask for all decides nothing: they keep waiting.
+    Server again;
+    again.folder("/up/src");
+    Up up2(again, src);
+    up2.job.existing = upload::Existing::ask;
+    up2.walk();
+    REQUIRE(upload::look(up2.job, up2.tree, up2.m, {}));
+    again.put("/up/src/a.txt", "theirs");
+    up2.run();
+    std::lock_guard lock(up2.m);
+    upload::answer(up2.job, up2.tree, upload::Existing::ask, {});
+    CHECK(up2.tree.asking == std::set<std::size_t>{up2.index("a.txt")});
+    CHECK(up2.file("a.txt").status == folder::State::failed);
+    CHECK(up2.tree.choices.empty());
+    // One waiting without what is there known: queued again with its choice, which meets the file
+    // there as it is put in place.
+    up2.tree.clashes.erase(up2.index("a.txt"));
+    upload::answer(up2.job, up2.tree, upload::Existing::keep_both, {});
+    CHECK(up2.tree.asking.empty());
+    CHECK(up2.file("a.txt").status == folder::State::queued);
+    CHECK(up2.tree.choices.at(up2.index("a.txt")) == upload::Existing::keep_both);
+}
+
+TEST_CASE("folder uploads: Keep both for a big file asked about at its placement goes on from its complete temp; nothing is left behind") {
+    Dir d("late-big-both");
+    const fs::path src = d.path / "src";
+    const std::string mine = content_of(std::size_t{3} << 20, 4);
+    put_local(src, "big.bin", mine);
+    put_local(src, "other.txt", "other");
+    // answer: the answer to the question, as the window gives it; else a restart, whose look
+    // numbers the file before an answer could go on from its temp (run()'s end then removes it).
+    for (const bool answered : {true, false}) {
+        CAPTURE(answered);
+        Server server;
+        server.folder("/up/src");
+        Up up(server, src);
+        up.job.existing = upload::Existing::ask;
+        up.walk();
+        REQUIRE(upload::look(up.job, up.tree, up.m, {}));
+        // Its name taken after every byte went, right before it is put in place.
+        up.job.on_command = [&](const std::vector<std::string>& c) {
+            if (c.size() == 3 && c[1] == "stat" && c[2].find("/.big.bin.") != std::string::npos) server.put("/up/src/big.bin", "theirs");
+        };
+        up.run();
+        const std::size_t big = up.index("big.bin");
+        REQUIRE(up.file("big.bin").status == folder::State::failed);
+        CHECK(up.tree.asking.contains(big));
+        REQUIRE(upload::saved_progress(up.records, "Fake", "/up/src/big.bin"));
+        REQUIRE(server.temps().size() == 1); // complete, kept for the answer
+        up.job.on_command = {};
+        {
+            std::lock_guard lock(up.m);
+            if (answered) {
+                upload::answer(up.job, up.tree, upload::Existing::keep_both, {});
+                CHECK(up.file("big.bin").status == folder::State::queued);
+                CHECK(up.file("big.bin").local.empty()); // numbered as it is put in place
+                CHECK_FALSE(up.tree.clashes.contains(big));
+            } else {
+                up.tree.choices[big] = upload::Existing::keep_both;
+                up.tree.looked = false;
+            }
+        }
+        std::atomic<std::uint64_t> sent{0};
+        up.job.on_sent = [&](std::uint64_t n) { sent += n; };
+        up.run();
+        CHECK_MESSAGE(up.file("big.bin").status == folder::State::done, up.file("big.bin").error);
+        CHECK(server.file("/up/src/big.bin") == "theirs");
+        CHECK(server.file("/up/src/big (2).bin") == mine);
+        CHECK(upload::target_of(up.job, up.file("big.bin")) == "/up/src/big (2).bin");
+        if (answered) CHECK(sent.load() == 0); // nothing sent again
+        CHECK(server.temps().empty());
+        CHECK_FALSE(upload::saved_progress(up.records, "Fake", "/up/src/big.bin"));
+        std::error_code ec;
+        CHECK(std::distance(fs::directory_iterator(up.records, ec), fs::directory_iterator()) == 0);
+    }
+}
+
+TEST_CASE("folder uploads: Keep both at placement passes over the folder's own names, which its files then take") {
+    Dir d("late-both-own");
+    const fs::path src = d.path / "src";
+    put_local(src, "a.txt", "mine a");
+    put_local(src, "a (2).txt", "mine a2");
+    Server server;
+    server.folder("/up/src");
+    Up up(server, src);
+    up.job.existing = upload::Existing::keep_both;
+    up.walk();
+    REQUIRE(upload::look(up.job, up.tree, up.m, {}));
+    server.put("/up/src/a.txt", "theirs"); // after the look: placement numbers it
+    {
+        std::lock_guard lock(up.m);
+        folder::pause_file(up.tree, up.index("a (2).txt")); // so a.txt goes first
+    }
+    up.run();
+    CHECK(up.file("a.txt").status == folder::State::done);
+    CHECK_FALSE(server.file("/up/src/a (2).txt"));
+    {
+        std::lock_guard lock(up.m);
+        folder::resume_paused(up.tree);
+    }
+    up.run();
+    for (const auto& f : up.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    CHECK(server.file("/up/src/a.txt") == "theirs");
+    CHECK(server.file("/up/src/a (2).txt") == "mine a2");
+    CHECK(server.file("/up/src/a (3).txt") == "mine a");
+}
+
+TEST_CASE("folder uploads: a new dialog's answer for a failed upload of the same folder takes the place of the old one's") {
+    Dir d("answer-again");
+    const fs::path src = d.path / "src";
+    put_local(src, "x.jpg", "mine x");
+    put_local(src, "y.jpg", "mine y");
+    put_local(src, "z.jpg", "mine z");
+    Server server;
+    server.folder("/up/src");
+    server.put("/up/src/x.jpg", "theirs x");
+    server.put("/up/src/y.jpg", "theirs y");
+    // The first dialog: x.jpg replaced, Skip for all (y.jpg skipped); the link failed before x.jpg went.
+    Up up(server, src);
+    up.job.existing = upload::Existing::skip;
+    up.walk();
+    up.tree.choices[up.index("x.jpg")] = upload::Existing::replace;
+    REQUIRE(upload::look(up.job, up.tree, up.m, {}));
+    {
+        std::lock_guard lock(up.m);
+        upload::apply(up.job, up.tree);
+        auto& x = up.tree.files[up.index("x.jpg")];
+        REQUIRE(x.status == folder::State::queued);
+        x.status = folder::State::failed;
+        x.error = "the connection was lost";
+        REQUIRE(up.file("y.jpg").status == folder::State::skipped);
+    }
+    // The same folder picked again: the new dialog says Skip for all, y.jpg replaced.
+    upload::Tree fresh;
+    std::mutex fm;
+    REQUIRE(upload::walk(up.job, fresh, fm, {}));
+    fresh.choices[up.index("y.jpg")] = upload::Existing::replace;
+    {
+        std::lock_guard lock(up.m);
+        upload::answer_again(up.tree, fresh);
+        CHECK(up.tree.choices == std::map<std::size_t, upload::Existing>{{up.index("y.jpg"), upload::Existing::replace}});
+        CHECK_FALSE(up.tree.looked);
+        folder::retry_files(up.tree, false); // the row's Retry (App::requeue)
+    }
+    up.job.existing = upload::Existing::skip;
+    up.run();
+    CHECK(server.file("/up/src/x.jpg") == "theirs x"); // the dialog said nothing is replaced but y.jpg
+    CHECK(server.file("/up/src/y.jpg") == "mine y");
+    CHECK(server.file("/up/src/z.jpg") == "mine z");
+    CHECK(up.file("x.jpg").status == folder::State::skipped);
+    CHECK(up.file("y.jpg").status == folder::State::done);
+    CHECK(server.temps().empty());
+}
+
+TEST_CASE("folder uploads: files' own choices hold through a retry after a cancel, whose look decides again") {
+    Dir d("own-retry");
+    const fs::path src = d.path / "src";
+    put_local(src, "mine.txt", "replace me");
+    put_local(src, "theirs.txt", "keep theirs");
+    put_local(src, "both.txt", "beside");
+    Server server;
+    server.folder("/up/src");
+    server.put("/up/src/mine.txt", "old");
+    server.put("/up/src/theirs.txt", "old");
+    server.put("/up/src/both.txt", "old");
+    Up up(server, src);
+    up.job.existing = upload::Existing::skip; // the dialog's For all
+    up.walk();
+    up.tree.choices[up.index("mine.txt")] = upload::Existing::replace;
+    up.tree.choices[up.index("both.txt")] = upload::Existing::keep_both;
+    REQUIRE(upload::look(up.job, up.tree, up.m, {}));
+    {
+        std::lock_guard lock(up.m);
+        upload::apply(up.job, up.tree);
+    }
+    // Cancelled before anything was sent; Retry queues the rest again and looks at the server again.
+    std::stop_source stopped;
+    stopped.request_stop();
+    up.run(stopped.get_token());
+    CHECK(server.file("/up/src/mine.txt") == "old");
+    {
+        std::lock_guard lock(up.m);
+        folder::retry_files(up.tree, true);
+        up.tree.looked = false;
+    }
+    up.run();
+    CHECK(server.file("/up/src/mine.txt") == "replace me");
+    CHECK(server.file("/up/src/theirs.txt") == "old");
+    CHECK(server.file("/up/src/both.txt") == "old");
+    CHECK(server.file("/up/src/both (2).txt") == "beside");
+    CHECK(up.file("theirs.txt").status == folder::State::skipped);
+    CHECK(server.temps().empty());
+}
+
 TEST_CASE("folder uploads: a folder this account can't write in fails only what goes below it, saying why") {
     Dir d("readonly");
     const fs::path src = d.path / "src";

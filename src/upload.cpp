@@ -531,10 +531,13 @@ Clash clash_of(const LocalFile& file, std::string_view name, const sftp::Attrs& 
     return clash_with(name, file.size(), seconds_of(file.mtime_ns()), there);
 }
 
-// The first "name (n).ext" in the folder that nothing on the server has (Keep both).
-std::expected<std::string, sftp::Status> free_numbered(sftp::Client& c, std::string_view dir, std::string_view name) {
+// The first "name (n).ext" in the folder that nothing on the server has and isn't `reserved`
+// (Keep both).
+std::expected<std::string, sftp::Status> free_numbered(sftp::Client& c, std::string_view dir, std::string_view name,
+                                                       const std::function<bool(std::string_view)>& reserved) {
     for (int n = 2; n < 1000; ++n) {
         const std::string candidate = joined(dir, existing::numbered(name, n));
+        if (reserved && reserved(candidate)) continue;
         auto a = sftp::lstat(c, rclone_enc::raw_path(candidate));
         if (!a && a.error().code == sftp::Code::no_such_file) return candidate;
         if (!a) return std::unexpected(a.error());
@@ -600,7 +603,7 @@ std::expected<Placement, Refusal> place(sftp::Client& c, const Caps& caps, const
             return Placement{.outcome = Outcome::skipped, .placed = {}, .clash = clash, .note = d.note};
         }
         case Action::numbered: {
-            auto numbered = free_numbered(c, dir, name);
+            auto numbered = free_numbered(c, dir, name, r.reserved);
             if (!numbered) return fatal(refusal(c, caps, r.server, dir, raw_dir, numbered.error(), 0).why);
             target = *numbered;
             continue;
@@ -1455,7 +1458,8 @@ Result run(const Upload& u, fetch::Connections& connections, const std::function
                                         .existing = u.existing,
                                         .size = file.size(),
                                         .mtime = seconds_of(file.mtime_ns()),
-                                        .on_command = u.on_command},
+                                        .on_command = u.on_command,
+                                        .reserved = u.reserved},
                            renaming);
             if (!p) return trouble(p.error().fatal ? budget::Failure::fatal : budget::Failure::other, p.error().why);
             return Placed{.outcome = p->outcome, .placed = p->placed, .clash = p->clash, .note = p->note};

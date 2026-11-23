@@ -444,8 +444,27 @@ them.
     you can write there: "✓ You can write here · 120 GiB free", or the server's refusal in plain
     words with Upload disabled ("Box.Guest is read-only for this account: nothing can be
     uploaded to software"). Too little free space says so, and the button becomes Upload
-    anyway. Files whose names are already there are counted ("37 already there: skipped (30
-    the same, 5 newer here, 2 older here)") and skipped: nothing on the server is replaced.
+    anyway.
+  - **Files already on the server** are asked about in the same dialog: "37 already there: 30
+    the same, 5 newer here, 2 older here" (the same: one size, times within 2 seconds), the first
+    200 listed with yours and the server's size and time beside them. One choice for all of them
+    (Replace, Replace if different, Replace if newer, Skip, Keep both, each saying how many it
+    would replace) starts on **Skip**; each listed file can have its own instead, and the dialog
+    says what happens ("5 replaced, 32 skipped", or "nothing on Main is replaced"). Keep both
+    sends yours as "name (2).ext". A folder of that name on the server is never replaced: Replace
+    skips it. **Always do this** saves the choice for all as the setting (Settings → Uploads,
+    "When a file is already on the server": Ask, or one of the five); with a setting the dialog
+    says "Files already there: Replace if newer (your setting)", and **Change** opens the
+    question for that upload. Nothing on the server is replaced unless chosen.
+  - A file that turns up at its name after the dialog follows the upload's choice. Under Ask,
+    for a picked file or folder the dialog listed nothing of, the upload sends the rest, then
+    waits paused: "A file of that name is already on Main. Resume to choose…"; Resume asks the
+    same question for those files. A big file asked about as it was put in place keeps what it
+    sent, so its answer sends nothing again. A file skipped for a reason says it in its row's
+    tooltip ("Skipped: a folder of that name is there"). The choices for single files are kept
+    with the upload (uploads.json), so Retry and a restart follow them; picking the same folder
+    again for a failed upload of it gives that upload the new dialog's answer. An older grab saving gui.json drops the setting, which
+    then is Ask again (it never replaces anything unasked).
   - **Each file goes to a temp name of grab's** (".name.0a1b2c.grabpart") beside its target and
     takes its name only when complete, so no half-sent file ever has the real name. Folders
     are made first; an existing one is merged into. A file of 2 MiB or more is sent in pieces
@@ -726,6 +745,11 @@ them.
     "not verified" and why. The server's Test says "checksums: md5sum", or why not.
   - Files that were already there are not checked, since nothing was downloaded.
   - The `grab` command follows the same setting (see [Usage](#usage)).
+- **When a file is already on the server** (Settings → Uploads, Ask by default): what an upload
+  does with a file of the same name there. Ask lists them in the upload dialog, starting on
+  Skip; Replace, Replace if different, Replace if newer, Skip or Keep both go without asking (the
+  dialog says which, and its Change picks another for that upload). Kept in gui.json as
+  `"uploadExisting"` (absent: Ask).
 - **Speed schedule** (Settings → Speed schedule) caps the speed at set times, for example 5
   MiB/s on weekdays from 18:00 to 24:00.
   - Each time has its days, a from–to time and a speed. A time that ends at or before its

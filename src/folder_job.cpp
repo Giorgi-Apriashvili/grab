@@ -602,6 +602,7 @@ std::optional<Discard> skip_file(Tree& tree, const fs::path& dir, const std::str
     std::optional<Discard> discard;
     if (f.status == State::queued || f.status == State::paused || f.status == State::failed) {
         f.status = State::skipped;
+        f.error.clear(); // skipped by hand: a failure's reason no longer says why (queue_view shows it)
         if (f.big) discard = Discard{target_of(dir, f), child_remote_path(remote_path, f.path), {}};
     } else if (f.status == State::running && f.big) {
         if (f.stop_reason == StopReason::skip) return std::nullopt;

@@ -49,8 +49,10 @@ TEST_CASE("queue rows: every row action on an upload row acts on the upload, nev
         {Act::open_folder, {false, true}},
         {Act::discard_local, {false, true}},
         {Act::resolve_existing, {false, true}},
-        // An upload's partial uploads removed on the server on a cancel.
+        // An upload's partial uploads removed on the server on a cancel, and the answer to its
+        // question about files that turned up on the server.
         {Act::discard_server, {true, false}},
+        {Act::resolve_server_existing, {true, false}},
     };
     for (const auto& [act, applies] : table) {
         CAPTURE(static_cast<int>(act));

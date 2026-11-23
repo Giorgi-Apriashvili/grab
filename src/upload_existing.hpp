@@ -4,6 +4,7 @@
 // file being uploaded, and what the user's choice makes of it. The window asks first (decision 3:
 // always ask, comprehensive options) unless a choice was saved as the setting.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -37,6 +38,22 @@ struct Clash {
 // those with another size.
 enum class Kind { same, newer_here, older_here, different_size };
 [[nodiscard]] Kind kind(const Clash& clash);
+// How the window names it: "same", "newer", "older", "differs", or "folder" for a folder of that
+// name there.
+[[nodiscard]] std::string_view kind_name(const Clash& clash);
+
+// Names taken on the server, counted by how they compare (Kind), and those a folder has (never
+// replaced): what the window's question says of them ("37 already there: 30 the same, ...").
+struct Taken {
+    std::size_t count = 0;
+    std::size_t same = 0;
+    std::size_t newer = 0;   // newer here
+    std::size_t older = 0;   // older here
+    std::size_t differs = 0; // another size, the times saying nothing
+    std::size_t folders = 0;
+    void add(const Clash& clash);
+    bool operator==(const Taken&) const = default;
+};
 
 // What happens to the upload: it replaces the file there, is skipped, goes under a numbered name
 // (existing::numbered, the first one free on the server), or waits for the user's answer.

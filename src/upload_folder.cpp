@@ -91,6 +91,14 @@ Existing choice_of(const FolderJob& job, const Tree& tree, std::size_t i) {
 
 std::string already_there(const FolderJob& job) { return std::format("a file of that name is already on {}", job.server); }
 
+// Whether the partial upload kept for `remote` (its record) is one of the local file `local`.
+bool partial_of(const FolderJob& job, const std::string& remote, const fs::path& local) {
+    const auto text = util::read_file(record_path(job.records_dir, job.server, remote));
+    if (!text) return false;
+    const auto r = record_from_json(*text);
+    return r && r->state.rclone_remote == job.server && r->state.path == remote && r->local == util::path_to_utf8(local);
+}
+
 // The refusals of a run that hold for more than one file (Refusal::scope): the whole server's
 // (read-only, full), or a folder's (no write access, no such folder), by the folder (grab's form).
 // Under the tree's mutex.
@@ -305,9 +313,13 @@ bool prepare(const FolderJob& job, Tree& tree, std::mutex& m, const std::stop_to
     return *ready;
 }
 
+// The folder's own places on the server, which a Keep-both copy given at placement must not take
+// before their files get there (apply() numbers against them the same way).
+using Own = std::function<bool(std::string_view)>;
+
 // One big file (sched::run_big's) through upload::run: resumable, its ranges over its part of the
 // folder's connections.
-sched::BigEnd send_big(const FolderJob& job, Tree& tree, std::mutex& m, const sched::BigFile& b) {
+sched::BigEnd send_big(const FolderJob& job, Tree& tree, std::mutex& m, const Own& own, const sched::BigFile& b) {
     Upload u;
     std::string modtime;
     {
@@ -331,6 +343,7 @@ sched::BigEnd send_big(const FolderJob& job, Tree& tree, std::mutex& m, const sc
     u.on_command = job.on_command;
     u.pool = job.pool;
     u.records_dir = job.records_dir;
+    u.reserved = own;
     const Result r = run(u, *job.connections, b.on_progress, b.stop);
 
     sched::BigEnd end;
@@ -398,7 +411,7 @@ sched::BigEnd send_big(const FolderJob& job, Tree& tree, std::mutex& m, const sc
 // (folder_job.cpp): a limit switched on or lowered below what is on its way ends the turn (`cut`),
 // its files carried to the next. A file paused or skipped meanwhile has its temp removed; one left
 // by a stop or a broken connection keeps it in Tree::temps, removed at the next run.
-sched::SmallRun send_small(const FolderJob& job, Tree& tree, std::mutex& m, const Caps& caps, Refused& refused,
+sched::SmallRun send_small(const FolderJob& job, Tree& tree, std::mutex& m, const Caps& caps, Refused& refused, const Own& own,
                            std::uint32_t member, sftp::Client& c, const std::stop_token& stop, std::vector<std::size_t>& carried) {
     constexpr std::size_t max_files = 32;
     constexpr std::uint64_t max_bytes = std::uint64_t{8} << 20;
@@ -662,7 +675,8 @@ sched::SmallRun send_small(const FolderJob& job, Tree& tree, std::mutex& m, cons
                                     .existing = s.choice,
                                     .size = s.data.size(),
                                     .mtime = s.mtime,
-                                    .on_command = job.on_command},
+                                    .on_command = job.on_command,
+                                    .reserved = own},
                        s.placing);
         s.placing.clear(); // every answer came: where it went is known
         if (!p && p.error().kept_temp) {
@@ -1100,6 +1114,75 @@ void apply(const FolderJob& job, Tree& tree) {
     ++tree.requeued;
 }
 
+std::vector<Waiting> asking_list(const Tree& tree, std::size_t at_most, Taken& taken) {
+    std::vector<Waiting> out;
+    for (const std::size_t i : tree.asking) {
+        // Still waiting: not skipped (or sent again) by hand meanwhile.
+        if (i >= tree.files.size() || tree.files[i].status != State::failed) continue;
+        Clash clash;
+        if (const auto it = tree.clashes.find(i); it != tree.clashes.end()) {
+            clash = it->second;
+        } else {
+            const auto& f = tree.files[i];
+            clash = Clash{.file = std::string(split_remote(f.path).second),
+                          .local_size = f.size,
+                          .local_mtime = file_seconds(f),
+                          .remote_size = 0,
+                          .remote_mtime = std::nullopt,
+                          .remote_is_dir = false};
+        }
+        taken.add(clash);
+        if (out.size() < at_most) out.push_back(Waiting{.index = i, .clash = std::move(clash)});
+    }
+    return out;
+}
+
+void answer(const FolderJob& job, Tree& tree, Existing all, const std::map<std::size_t, Existing>& own) {
+    // Answered, and going again where they were: those without a clash apply() goes by, and big
+    // files whose partial upload is kept (complete when the clash came at their placement), which
+    // goes on from it, so a Keep-both name isn't given before (that name would send it all again
+    // and leave the kept temp behind on the server for good: review, chunk 5).
+    std::vector<std::size_t> unseen;
+    for (const std::size_t i : tree.asking) {
+        const auto it = own.find(i);
+        const Existing choice = it != own.end() && it->second != Existing::ask ? it->second : all;
+        if (choice == Existing::ask || i >= tree.files.size()) continue;
+        tree.choices[i] = choice;
+        if (!tree.clashes.contains(i) ||
+            (!job.records_dir.empty() && saved_progress(job.records_dir, job.server, target_of(job, tree.files[i])))) {
+            unseen.push_back(i);
+        }
+    }
+    // Those go again as they are: the choice meets the file there as it is put in place.
+    for (const std::size_t i : unseen) {
+        tree.asking.erase(i);
+        tree.clashes.erase(i);
+        auto& f = tree.files[i];
+        if (f.status != State::failed) continue;
+        f.status = State::queued;
+        f.error.clear();
+    }
+    apply(job, tree);
+}
+
+void answer_again(Tree& tree, const Tree& fresh) {
+    std::unordered_map<std::string_view, std::size_t> at;
+    at.reserve(tree.files.size());
+    for (std::size_t i = 0; i < tree.files.size(); ++i) at.emplace(tree.files[i].path, i);
+    tree.choices.clear();
+    for (const auto& [i, choice] : fresh.choices) {
+        if (i >= fresh.files.size()) continue;
+        if (const auto it = at.find(fresh.files[i].path); it != at.end()) tree.choices[it->second] = choice;
+    }
+    for (const auto& [i, clash] : tree.clashes) {
+        auto& f = tree.files[i];
+        if (f.status != State::skipped) continue;
+        f.status = State::queued;
+        f.error.clear();
+    }
+    tree.looked = false;
+}
+
 void run(const FolderJob& job, Tree& tree, std::mutex& m, std::stop_token stop) {
     if (!job.pool || job.connections == nullptr) return; // never set up: nothing is sent
     bool looked = false;
@@ -1128,26 +1211,45 @@ void run(const FolderJob& job, Tree& tree, std::mutex& m, std::stop_token stop) 
     Caps caps;
     Refused refused;
     if (!prepare(job, tree, m, stop, caps, refused)) return;
+    std::unordered_set<std::string> places; // the folder's own, grab's form
+    {
+        std::lock_guard lock(m);
+        places.reserve(tree.files.size() + tree.folders.size());
+        for (const auto& f : tree.files) places.insert(below(job, f.path));
+        for (const auto& rel : tree.folders) places.insert(below(job, rel));
+    }
+    const Own own = [&places](std::string_view path) { return places.contains(std::string(path)); };
     auto small_turn = [&](std::uint32_t member, sftp::Client& c, const std::stop_token& st, std::vector<std::size_t>& carried) {
-        return send_small(job, tree, m, caps, refused, member, c, st, carried);
+        return send_small(job, tree, m, caps, refused, own, member, c, st, carried);
     };
-    auto big_pass = [&] { return [&](const sched::BigFile& b) { return send_big(job, tree, m, b); }; };
+    auto big_pass = [&] { return [&](const sched::BigFile& b) { return send_big(job, tree, m, own, b); }; };
     sched::run(job, tree, m, stop, small_turn, big_pass);
     if (stop.stop_requested()) return;
     // The partial uploads of big files skipped while they waited (skip_file's, should the caller
-    // not have removed them): each temp by its record.
+    // not have removed them), and of those sent under a Keep-both name after a partial upload
+    // under their own name was kept (a restart's look numbered them before answer() could go on
+    // from it): each temp by its record.
     std::vector<std::string> skipped;
+    std::vector<std::pair<std::string, fs::path>> numbered; // own name, the local file
     bool left = false;
     {
         std::lock_guard lock(m);
         for (const auto& f : tree.files) {
             if (f.big && f.status == State::skipped) skipped.push_back(target_of(job, f));
+            if (f.big && f.status == State::done && !f.local.empty()) {
+                numbered.emplace_back(folder::child_remote_path(job.remote_path, f.path), local_walk::local_path(job.source, f.path));
+            }
         }
         left = !tree.temps.empty();
     }
     if (!job.records_dir.empty()) {
         for (const auto& t : skipped) {
             if (!saved_progress(job.records_dir, job.server, t)) continue;
+            [[maybe_unused]] auto gone = upload::discard(*job.pool, job.records_dir, job.server, t, stop);
+        }
+        // Only this file's own (another upload to that name may have one of its own).
+        for (const auto& [t, local] : numbered) {
+            if (!partial_of(job, t, local)) continue;
             [[maybe_unused]] auto gone = upload::discard(*job.pool, job.records_dir, job.server, t, stop);
         }
     }

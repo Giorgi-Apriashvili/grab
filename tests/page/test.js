@@ -97,6 +97,9 @@ try {
   check('file done: Show', fileSlots({ status: 'done' }, fileStatus(folder(), { status: 'done' })).map((x) => x && x[0]), ['show', null]);
   check('file done under a cancelled folder: Show', fileSlots({ status: 'done' }, fileStatus(folder({ status: 'cancelled' }), { status: 'done' })).map((x) => x && x[0]), ['show', null]);
   check('file skipped: none', fileSlots({ status: 'skipped' }, fileStatus(folder(), { status: 'skipped' })).map((x) => x && x[0]), [null, null]);
+  check('file skipped for a reason: the word, the reason in its tooltip',
+    [fileStatus(folder(), { status: 'skipped', error: 'a folder of that name is there' }), fileStatus(folder(), { status: 'skipped', error: '' })],
+    [{ word: 'Skipped', why: 'Skipped: a folder of that name is there' }, { word: 'Skipped' }]);
   check('file failed under a paused folder: Retry', fw('failed', { status: 'paused' }), ['Failed', false, ['retry', 'skip']]);
   check('file queued under paused folder', fw('queued', { status: 'paused' }), ['Paused', true, [null, 'skip']]);
   check('file paused under paused folder', fw('paused', { status: 'paused' }), ['Paused', false, ['resume', 'skip']]);
@@ -2009,7 +2012,7 @@ try {
     // The confirm dialog: opens with the backend's first check, Upload once the server takes it.
     const check0 = { type: 'uploadCheck', server: 'Main', dir: '/srv/tv', items: [], count: 0, errors: 0, files: 0, bytes: 0,
       skippedLinks: 0, longNames: 0, unreadable: 0, writable: null, existing: { count: 0, same: 0, newer: 0, older: 0, differs: 0, folders: 0 },
-      setting: 'skip' };
+      setting: 'ask' };
     sent.length = 0;
     pickUpload('Main', '/srv/tv', true);
     const token = sent[0].token;
@@ -2027,13 +2030,15 @@ try {
       body().includes('Checking Main…'), okBtn.disabled], [true, true, true, true, true, true, true]);
     onUploadCheck({ ...check0, token, phase: 'ready', items: [{ ...items[0], merging: true }, items[1]], count: 2, files: 1205, bytes: 3435975885,
       writable: true, free: 128849018880, existing: { count: 37, same: 30, newer: 5, older: 2, differs: 0, folders: 0 } });
-    check('up: ready: you can write, the free space, the folder merged, the files there skipped',
+    check('up: ready: you can write, the free space, the folder merged, the files there and the question, on Skip',
       [body().includes('✓ You can write here · 120.0 GiB free'), body().includes('merged into the folder “holiday” there'),
-        body().includes('37 already there: skipped (30 the same, 5 newer here, 2 older here)'), okBtn.disabled, okBtn.textContent, okBtn.classList.contains('danger')],
-      [true, true, true, false, 'Upload', false]);
+        body().includes('37 already there: 30 the same, 5 newer here, 2 older here'), $('#modal-body .up-all input:checked').value,
+        body().includes('…and 37 more, which go as for all.'), okBtn.disabled, okBtn.textContent, okBtn.classList.contains('danger')],
+      [true, true, true, 'skip', true, false, 'Upload', false]);
     sent.length = 0;
     okBtn.click();
-    check('up: Upload starts it', [sent.map((m) => JSON.stringify(m)), $('#modal').hidden], [[JSON.stringify({ type: 'uploadStart', token })], true]);
+    check('up: Upload starts it, Skip for all', [sent.map((m) => JSON.stringify(m)), $('#modal').hidden],
+      [[JSON.stringify({ type: 'uploadStart', token, choice: 'skip', overrides: {}, always: false })], true]);
     onUploadCheck({ ...check0, token, phase: 'ready', writable: true });
     check('up: a late message of a started upload opens nothing', $('#modal').hidden, true);
     // Box.Guest: read-only, said plainly, Upload disabled; Esc cancels the check.
@@ -2092,6 +2097,199 @@ try {
     onUploadCheck({ ...check0, token: t7, phase: 'local', items: [{ name: '<img src=x>', dir: false, files: 1, bytes: 1 }], count: 1 });
     check('up: a name is text', [$('#modal-body').querySelector('img'), body().includes('<img src=x>')], [null, true]);
     closeModal(false);
+
+    // The files already on the server (chunk 5): the question, on Skip under Ask; a choice for all
+    // and one per file, what each does, Always do this; the setting with Change; the late question.
+    const ex37 = { count: 37, same: 30, newer: 5, older: 1, differs: 0, folders: 1, files: [
+      { name: 'holiday/a.jpg', size: 100, modified: 1763800000, mineSize: 100, mineModified: 1763800000, kind: 'same' },
+      { name: 'holiday/b.jpg', size: 100, modified: 1763700000, mineSize: 120, mineModified: 1763800000, kind: 'newer' },
+      { name: 'holiday/c.jpg', size: 100, modified: 1763900000, mineSize: 90, mineModified: 1763800000, kind: 'older' },
+      { name: 'holiday/d', size: 0, modified: 1763800000, mineSize: 5, mineModified: 1763800000, kind: 'folder' },
+      { name: 'notes.txt', size: 2048, modified: 1763800000, mineSize: 2048, mineModified: 1763800000, kind: 'same' }] };
+    const ready = (t, over = {}) => onUploadCheck({ ...check0, token: t, phase: 'ready', items, count: 2, files: 1205, bytes: 3435975885,
+      writable: true, existing: ex37, ...over });
+    const radio = (value) => $(`#modal-body .up-all input[value="${value}"]`);
+    const pickAll = (value) => { radio(value).checked = true; radio(value).dispatchEvent(new Event('change', { bubbles: true })); };
+    const rowSel = (i) => $(`#modal-body select[data-i="${i}"]`);
+    const pickRow = (i, value) => { rowSel(i).value = value; rowSel(i).dispatchEvent(new Event('change', { bubbles: true })); };
+    const effects = () => [...document.querySelectorAll('#modal-body .up-clashes td.up-effect')].map((td) => td.textContent);
+    const outcome = () => $('#modal-body .up-outcome').textContent;
+    const wide = () => $('#modal .modal').classList.contains('wide');
+    state.uploadExisting = 'ask';
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', true);
+    const c1 = sent[0].token;
+    onUploadCheck({ ...check0, token: c1, phase: 'local' });
+    check('up ex: before the server was looked at: no question, the dialog narrow', [$('#modal-body .up-clash'), wide()], [null, false]);
+    ready(c1);
+    check('up ex: under Ask the question opens on Skip, each choice saying what it replaces',
+      [body().includes('37 already there: 30 the same, 5 newer here, 1 older here, 1 a folder there'), radio('skip').checked,
+        [...document.querySelectorAll('#modal-body .up-all label')].map((l) => l.textContent.trim()), wide()],
+      [true, true, ['Replace 36 replaced', 'Replace if different 6 replaced', 'Replace if newer 5 replaced', 'Skip nothing replaced',
+        'Keep both yours as “name (2)”'], true]);
+    const rows = [...document.querySelectorAll('#modal-body .up-clashes tbody tr')];
+    check('up ex: the first files listed: name, how they compare, yours, the server\'s, a choice each', [rows.length,
+      rows[1].cells[0].textContent, rows[1].cells[1].textContent, rows[1].cells[2].textContent, rows[3].cells[2].textContent,
+      [...rowSel(0).options].map((o) => o.value), [...rowSel(3).options].map((o) => o.textContent)],
+      [5, 'holiday/b.jpg newer here', `120 B${fmtDate(1763800000)}`, `100 B${fmtDate(1763700000)}`, 'a folder',
+        ['', 'replace', 'different', 'newer', 'skip', 'both'], ['As for all', 'Skip', 'Keep both']]);
+    check('up ex: on Skip nothing is replaced; the rest go as for all; a folder is never replaced',
+      [effects(), outcome(), body().includes('…and 32 more, which go as for all.'),
+        body().includes('A folder of that name there is never replaced: Replace skips it.'), $('#up-always').checked,
+        $('#modal-body .up-always').textContent],
+      [['skipped', 'skipped', 'skipped', 'skipped', 'skipped'], '37 skipped: nothing on Main is replaced', true, true, false,
+        ' Always do this: Skip without asking (Settings → Uploads)']);
+    check('up ex: ARIA: the section named by its summary, the choices a group, the table and each choice named, the outcome live',
+      [$('#modal-body .up-clash').getAttribute('aria-labelledby'), !!$('#up-clash-sum'), $('#modal-body .up-all legend').textContent,
+        $('#modal-body .up-clashes').getAttribute('aria-label'), document.querySelectorAll('#modal-body .up-clashes th[scope="col"]').length,
+        rowSel(0).getAttribute('aria-label'), $('#modal-body .up-outcome').getAttribute('aria-live'),
+        new Set([...document.querySelectorAll('#modal-body .up-all input')].map((r) => r.name)).size, document.activeElement.id],
+      ['up-clash-sum', true, 'For all of them', 'Files already on Main', 5, 'What to do with holiday/a.jpg', 'polite', 1, 'modal-cancel']);
+    pickAll('newer');
+    check('up ex: Replace if newer for all: those newer here replaced, the rest skipped', [effects(), outcome(),
+      $('#modal-body .up-always-what').textContent], [['skipped', 'replaced', 'skipped', 'skipped', 'skipped'], '5 replaced, 32 skipped',
+      'Replace if newer']);
+    pickRow(2, 'replace');
+    pickRow(3, 'both');
+    pickRow(1, 'skip');
+    check('up ex: a file\'s own choice beats the one for all', [effects(), outcome()],
+      [['skipped', 'skipped', 'replaced', 'second copy', 'skipped'], '5 replaced, 1 sent as a second copy (“name (2)”), 31 skipped']);
+    pickRow(1, '');
+    check('up ex: As for all again', [effects()[1], outcome()], ['replaced', '6 replaced, 1 sent as a second copy (“name (2)”), 30 skipped']);
+    pickRow(1, 'skip');
+    pickAll('both');
+    check('up ex: Keep both for all: every one beside the server\'s, the folder too', [effects(), outcome()],
+      [['second copy', 'skipped', 'replaced', 'second copy', 'second copy'], '1 replaced, 35 sent as a second copy (“name (2)”), 1 skipped']);
+    pickAll('newer');
+    $('#up-always').checked = true;
+    $('#up-always').dispatchEvent(new Event('change', { bubbles: true }));
+    sent.length = 0;
+    okBtn.click();
+    check('up ex: Upload sends the choice for all, the files\' own by their place, Always do this; the setting follows',
+      [sent.map((m) => JSON.stringify(m)), state.uploadExisting, $('#up-existing-set').value],
+      [[JSON.stringify({ type: 'uploadStart', token: c1, choice: 'newer', overrides: { 1: 'skip', 2: 'replace', 3: 'both' }, always: true })],
+        'newer', 'newer']);
+    // With a setting: said, with Change; nothing asked.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', true);
+    const c2 = sent[0].token;
+    ready(c2, { setting: 'newer' });
+    check('up ex: a setting: the files there, the setting and Change, what it does; no question',
+      [body().includes('Files already there: Replace if newer (your setting) · Change'), $('#modal-body .up-all'), outcome(), wide(),
+        $('#modal-body [data-act="up-change"]').tagName],
+      [true, null, '5 replaced, 32 skipped', false, 'BUTTON']);
+    sent.length = 0;
+    okBtn.click();
+    check('up ex: Upload goes by the setting', sent.map((m) => JSON.stringify(m)),
+      [JSON.stringify({ type: 'uploadStart', token: c2, choice: 'newer', overrides: {}, always: false })]);
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', true);
+    const c3 = sent[0].token;
+    ready(c3, { setting: 'replace' });
+    $('#modal-body [data-act="up-change"]').click();
+    check('up ex: Change opens the question for this upload at the setting\'s choice, the focus on it',
+      [radio('replace').checked, document.activeElement === radio('replace'), wide(), effects()],
+      [true, true, true, ['replaced', 'replaced', 'replaced', 'skipped', 'replaced']]);
+    pickRow(0, 'skip');
+    sent.length = 0;
+    okBtn.click();
+    check('up ex: ...and Upload sends what was chosen there', sent.map((m) => JSON.stringify(m)),
+      [JSON.stringify({ type: 'uploadStart', token: c3, choice: 'replace', overrides: { 0: 'skip' }, always: false })]);
+    // Nothing there: the setting goes with it (Ask: a file that turns up later is asked about).
+    for (const setting of ['ask', 'replace']) {
+      sent.length = 0;
+      pickUpload('Main', '/srv/tv', true);
+      const t = sent[0].token;
+      ready(t, { setting, existing: { count: 0, same: 0, newer: 0, older: 0, differs: 0, folders: 0 } });
+      const shown = body().includes('Nothing of it is there yet.');
+      sent.length = 0;
+      okBtn.click();
+      check(`up ex: nothing there under ${setting}: the setting goes with it`, [shown, sent.map((m) => JSON.stringify(m))],
+        [true, [JSON.stringify({ type: 'uploadStart', token: t, choice: setting, overrides: {}, always: false })]]);
+    }
+    // Esc cancels, the question too; names in the table are text.
+    sent.length = 0;
+    pickUpload('Main', '/srv/tv', true);
+    const c4 = sent[0].token;
+    ready(c4, { existing: { ...ex37, files: [{ ...ex37.files[0], name: '<img src=x>' }] } });
+    check('up ex: a listed name is text', [$('#modal-body').querySelector('img'), body().includes('<img src=x>')], [null, true]);
+    sent.length = 0;
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    check('up ex: Esc cancels the dialog with the question', [$('#modal').hidden, sent.map((m) => JSON.stringify(m))],
+      [true, [JSON.stringify({ type: 'uploadCheckCancel', token: c4 })]]);
+    check('up ex: the next dialog is narrow again', (() => {
+      showModal({ title: 't', html: '', ok: 'OK' });
+      const r = wide();
+      closeModal(false);
+      return r;
+    })(), false);
+
+    // The late question: an upload waiting because files turned up there after its check.
+    setUploadExisting('ask', false);
+    const lateOne = upFile(40, { status: 'paused', waiting: 'A file of that name is already on Main. Resume to choose: replace it, skip it or keep both.',
+      ask: { count: 1, same: 0, newer: 1, older: 0, differs: 0, folders: 0,
+        files: [{ name: 'u40.mkv', size: 5, modified: 1763700000, mineSize: 9, mineModified: 1763800000, kind: 'newer' }] } });
+    sent.length = 0;
+    resumeItem(lateOne);
+    check('up late: one file: its question, on Skip, Resume', [$('#modal-title').textContent, okBtn.textContent, radio('skip').checked,
+      document.querySelectorAll('#modal-body .up-clashes tbody tr').length, outcome(), wide(), sent.length],
+      ['“u40.mkv” is already on Main', 'Resume', true, 1, '1 skipped: nothing on Main is replaced', true, 0]);
+    okBtn.click();
+    check('up late: Resume answers it', sent.map((m) => JSON.stringify(m)),
+      [JSON.stringify({ type: 'resolveExisting', id: 40, choice: 'skip', overrides: {}, always: false })]);
+    const lateFiles = [{ name: 'holiday/x.jpg', size: 1, modified: 1763800000, mineSize: 1, mineModified: 1763800000, kind: 'same' },
+      { name: 'holiday/y.jpg', size: 1, modified: 1763700000, mineSize: 2, mineModified: 1763800000, kind: 'newer' },
+      { name: 'holiday/z.jpg', size: 1, modified: 1763900000, mineSize: 2, mineModified: 1763800000, kind: 'older' }];
+    const lateMany = upFolder(41, { status: 'paused', waiting: '4 files of those names are already on Main. Resume to choose: replace, skip or keep both.',
+      ask: { count: 4, same: 1, newer: 2, older: 1, differs: 0, folders: 0, files: lateFiles } });
+    sent.length = 0;
+    resumeItem(lateMany);
+    check('up late: several: the first listed, the rest as for all', [$('#modal-title').textContent,
+      body().includes('4 already there: 1 the same, 2 newer here, 1 older here'), body().includes('…and 1 more, which go as for all.')],
+      ['4 files are already on Main', true, true]);
+    pickRow(2, 'replace');
+    pickAll('newer');
+    $('#up-always').checked = true;
+    $('#up-always').dispatchEvent(new Event('change', { bubbles: true }));
+    check('up late: what happens', outcome(), '3 replaced, 1 skipped');
+    okBtn.click();
+    check('up late: the answer, per file by place; Always do this the setting now', [sent.map((m) => JSON.stringify(m)),
+      state.uploadExisting, $('#up-existing-set').value],
+      [[JSON.stringify({ type: 'resolveExisting', id: 41, choice: 'newer', overrides: { 2: 'replace' }, always: true })], 'newer', 'newer']);
+    sent.length = 0;
+    resumeItem(lateMany);
+    closeModal(false);
+    check('up late: Cancel leaves it waiting', sent.length, 0);
+    check('up late: a download\'s question stays its own', (() => {
+      resumeItem(file(42, { status: 'paused', ask: { count: 1, files: [{ name: 'x', size: 1, modified: null, mineSize: 2, mineModified: null }] } }));
+      const r = [$('#modal-ok').textContent, !!$('#modal-body .up-clash'), wide()];
+      closeModal(false);
+      return r;
+    })(), ['Replace', false, false]);
+
+    // Settings → Uploads: the six choices; a change goes to the backend; the backend's word shows.
+    check('up set: Settings → Uploads offers Ask and the five choices', [...$('#up-existing-set').options].map((o) => [o.value, o.textContent]),
+      [['ask', 'Ask'], ['replace', 'Replace'], ['different', 'Replace if different'], ['newer', 'Replace if newer'], ['skip', 'Skip'],
+        ['both', 'Keep both']]);
+    sent.length = 0;
+    $('#up-existing-set').value = 'ask';
+    $('#up-existing-set').dispatchEvent(new Event('change', { bubbles: true }));
+    check('up set: back to Ask', [sent.map((m) => JSON.stringify(m)), state.uploadExisting],
+      [[JSON.stringify({ type: 'setUploadExisting', choice: 'ask' })], 'ask']);
+    sent.length = 0;
+    setUploadExisting('different', false); // the backend's "uploadExisting"
+    check('up set: the backend\'s word shows, nothing sent back', [$('#up-existing-set').value, state.uploadExisting, sent.length],
+      ['different', 'different', 0]);
+    setUploadExisting('ask', false);
+    check('up set: the panel hides with a server form open', (() => {
+      const was = settings.form;
+      settings.form = { editing: false, name: '' };
+      renderServers();
+      const hidden = $('#uploads-panel').hidden;
+      settings.form = was;
+      renderServers();
+      return [hidden, $('#uploads-panel').hidden];
+    })(), [true, false]);
 
     Object.assign(b, browseWas);
     state.hits = [];

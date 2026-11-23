@@ -1,12 +1,14 @@
 // The window's uploads (UPLOADS.md 5.10, chunk 3): the pickers and the check before an upload,
+// the answer about the files already there (chunk 5: For all, single files' own, the setting),
 // uploads as rows of the queue beside the downloads (sharing their ids, order, At once and each
-// server's connection budget), what a cancel leaves on a server and its removal, and Browse
-// showing a folder again once an upload changed it.
+// server's connection budget), the question when files turn up there later, what a cancel leaves
+// on a server and its removal, and Browse showing a folder again once an upload changed it.
 
 #include "app.hpp"
 
 #include "browse.hpp"
 #include "engine.hpp"
+#include "existing.hpp"
 #include "fetch.hpp"
 #include "folder.hpp"
 #include "folder_job.hpp"
@@ -15,6 +17,7 @@
 #include "local_name.hpp"
 #include "queue_row.hpp"
 #include "queue_view.hpp"
+#include "rclone_encoding.hpp"
 #include "upload.hpp"
 #include "upload_check.hpp"
 #include "upload_existing.hpp"
@@ -34,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -48,6 +52,12 @@ Value num(double n) { return Value::make_number(n); }
 
 // The check's picked items the dialog lists, at most.
 constexpr std::size_t picked_shown = 50;
+// The files already on the server the dialog lists, each with a choice of its own, at most; the
+// others follow For all (UPLOADS.md 5.10). A list the page draws at once.
+constexpr std::size_t clashes_shown = 200;
+// An upload waiting with the question about files that turned up there: those its row carries, at
+// most (the row goes to the page whenever it changes).
+constexpr std::size_t late_shown = 50;
 // The check's progress while it walks the picked folders, at most this often.
 constexpr auto check_progress_gap = std::chrono::milliseconds(150);
 
@@ -58,6 +68,19 @@ std::int64_t unix_seconds() {
 // "2023-05-06T11:18:12.123456789Z": a local file's time, as verify compares it.
 std::string rfc3339_ns(std::int64_t ns) {
     return std::format("{:%FT%TZ}", std::chrono::sys_time<std::chrono::nanoseconds>{std::chrono::nanoseconds{ns}});
+}
+
+// A file already on the server, as the question lists it: the server's size and time, yours, and
+// how they compare.
+Value clash_json(const std::string& name, const upload::Clash& c) {
+    Value f = Value::make_object();
+    f.set("name", str(name));
+    f.set("size", num(static_cast<double>(c.remote_size)));
+    f.set("modified", c.remote_mtime ? num(static_cast<double>(*c.remote_mtime)) : Value{});
+    f.set("mineSize", num(static_cast<double>(c.local_size)));
+    f.set("mineModified", num(static_cast<double>(c.local_mtime)));
+    f.set("kind", str(std::string(upload::kind_name(c))));
+    return f;
 }
 
 // Tests only (UPLOADS.md chunk 3; to be removed before 0.24.0, step 7.5): with
@@ -220,9 +243,16 @@ void App::post_check(const UploadCheck& c, std::string_view phase) const {
     taken.set("older", num(static_cast<double>(k.taken.older)));
     taken.set("differs", num(static_cast<double>(k.taken.differs)));
     taken.set("folders", num(static_cast<double>(k.taken.folders)));
+    // The first of them, each with yours, for a choice of its own (upload::taken_list's order,
+    // which uploadStart's overrides name).
+    if (k.taken.count > 0) {
+        Value files = Value::make_array();
+        for (const auto& l : upload::taken_list(k, clashes_shown)) files.push(clash_json(l.name, l.clash));
+        taken.set("files", std::move(files));
+    }
     v.set("existing", std::move(taken));
-    // What happens to the files already there: Skip until the question comes (UPLOADS.md chunk 5).
-    v.set("setting", str("skip"));
+    // Settings → Uploads: Ask (the dialog asks, starting on Skip) or the choice saved.
+    v.set("setting", str(std::string(upload::name(upload_existing_.load()))));
     post(v);
 }
 
@@ -234,7 +264,7 @@ void App::cancel_check(int token) {
     std::erase_if(checks_, [](const auto& c) { return c->over.load(); });
 }
 
-void App::start_upload(int token) {
+void App::start_upload(int token, const upload::Answer& answer, bool always) {
     std::shared_ptr<UploadCheck> c;
     {
         std::scoped_lock lock(checks_mutex_);
@@ -245,10 +275,19 @@ void App::start_upload(int token) {
     }
     // Ready: its thread has only its last message to post.
     if (c->thread.joinable()) c->thread.join();
+    // "Always do this": the choice for all is the setting from now on (Ask is none: the dialog
+    // never offers it for all).
+    if (always && answer.all != upload::Existing::ask) set_upload_existing(answer.all);
+    // The answer about the files already there: each item's choice, a folder's files' own. Still
+    // under Ask, the items the dialog listed nothing of ask about a file that turns up there.
+    upload::Answer given = answer;
+    if (upload_existing_.load() == upload::Existing::ask) given.unlisted = upload::Existing::ask;
+    const auto choices = upload::apply_answer(c->check, given);
     std::vector<std::string> not_queued; // picks that would write where another row writes
     {
         std::lock_guard lock(mutex_);
-        for (auto& p : c->check.items) {
+        for (std::size_t k = 0; k < c->check.items.size(); ++k) {
+            auto& p = c->check.items[k];
             if (!p.error.empty()) continue;
             auto item = std::make_shared<Item>();
             item->id = next_id_++;
@@ -260,7 +299,7 @@ void App::start_upload(int token) {
             item->source = p.source;
             item->into = c->check.dir;
             item->total = p.bytes;
-            item->up_existing = upload::Existing::skip; // the question is chunk 5's
+            item->up_existing = choices[k];
             item->space_ok = true;
             // The same upload queued already (another pick of the same file into the same folder): no
             // second row; a failed one starts again. Another file of that name into that folder
@@ -271,12 +310,22 @@ void App::start_upload(int token) {
                                                      item->name, item->remote, item->into.empty() ? "~" : item->into,
                                                      util::path_to_utf8(twin->source.parent_path())));
                 } else if (twin->status == Status::failed) {
+                    // This dialog's answer is the latest, its files' own choices too: the old
+                    // answer's own ones go, and the server is looked at again (review, chunk 5).
+                    twin->up_existing = choices[k];
+                    if (twin->mode == Mode::folder && p.tree) upload::answer_again(twin->tree, *p.tree);
                     requeue(*twin);
+                } else if (twin->status == Status::paused && !twin->asked.empty()) {
+                    // It waits with the question already: that row's answer decides.
+                    not_queued.push_back(std::format("{} is already in the list for {}:{}, waiting for your answer about the "
+                                                     "files there: Resume that row to answer.",
+                                                     item->name, item->remote, item->into.empty() ? "~" : item->into));
                 }
                 continue;
             }
             if (p.tree) {
-                // The dialog's walk and look: each name taken there gets the upload's choice now.
+                // The dialog's walk and look: each name taken there gets its choice now (its own,
+                // in the tree's choices, else the upload's).
                 item->tree = std::move(*p.tree);
                 upload::apply(upload_job(*item), item->tree);
                 refresh_folder(*item);
@@ -296,6 +345,16 @@ void App::start_upload(int token) {
     request_save();
     queue_changed_ = true;
     flush();
+}
+
+void App::set_upload_existing(upload::Existing choice) {
+    state_.upload_existing = std::string(upload::name(choice));
+    upload_existing_ = choice;
+    save_state();
+    Value v = Value::make_object();
+    v.set("type", str("uploadExisting"));
+    v.set("choice", str(state_.upload_existing));
+    post(v);
 }
 
 // ---- running an upload -------------------------------------------------------------------------
@@ -339,6 +398,18 @@ void App::run_upload_file(const std::shared_ptr<Item>& item, const std::stop_tok
     u.local = item->source;
     u.server = item->remote;
     u.id = item->id;
+    // The places of the other uploads to that server not done yet (this dialog's other picks among
+    // them), which a Keep-both copy must not take before their files get there (review, chunk 5).
+    auto places = std::make_shared<std::unordered_set<std::string>>();
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& other : items_) {
+            if (other == item || !is_up(*other) || other->remote != item->remote) continue;
+            if (other->status == Status::done || other->status == Status::cancelled) continue;
+            places->insert(other->path);
+        }
+    }
+    u.reserved = [places](std::string_view path) { return places->contains(std::string(path)); };
     {
         std::lock_guard lock(mutex_);
         u.remote_path = item->path;
@@ -368,8 +439,27 @@ void App::run_upload_file(const std::shared_ptr<Item>& item, const std::stop_tok
     case upload::Outcome::done: break;
     case upload::Outcome::skipped:
         return set(Status::done, {}, r.note.empty() ? std::format("skipped: it is on {} already", item->remote) : r.note);
-    case upload::Outcome::exists:
-        return set(Status::failed, std::format("a file of that name is already on {}", item->remote));
+    case upload::Outcome::exists: {
+        // A file turned up at its name after the dialog, and the choice is to ask (UPLOADS.md
+        // 5.5): it waits paused with the question; nothing of the file there was touched.
+        std::lock_guard lock(mutex_);
+        if (!r.clash) {
+            item->status = Status::failed;
+            item->error = std::format("a file of that name is already on {}", item->remote);
+            return;
+        }
+        upload::Taken taken;
+        taken.add(*r.clash);
+        ask_upload(*item,
+                   {Asked{.name = item->name,
+                          .size = r.clash->remote_size,
+                          .modified = r.clash->remote_mtime,
+                          .mine = existing::Local{.size = r.clash->local_size, .modified = r.clash->local_mtime},
+                          .kind = std::string(upload::kind_name(*r.clash)),
+                          .index = 0}},
+                   1, taken);
+        return;
+    }
     case upload::Outcome::failed: return set(Status::failed, r.error, r.note);
     case upload::Outcome::stopped: {
         StopReason reason{};
@@ -526,8 +616,25 @@ void App::run_upload_folder(const std::shared_ptr<Item>& item, const std::stop_t
     std::lock_guard lock(mutex_);
     refresh_folder(*item);
     item->touched = true;
+    upload::Taken taken; // files that turned up at their names after the dialog, under Ask
+    const auto waiting = upload::asking_list(item->tree, late_shown, taken);
     if (item_stop.stop_requested()) {
         item->status = item->stop_reason == StopReason::cancel ? Status::cancelled : Status::paused;
+    } else if (taken.count > 0) {
+        // The rest went (UPLOADS.md 5.5): it waits paused with the question, nothing of those
+        // files there touched.
+        std::vector<Asked> asked;
+        asked.reserve(waiting.size());
+        for (const auto& w : waiting) {
+            const auto& c = w.clash;
+            asked.push_back(Asked{.name = item->name + "/" + rclone_enc::raw_path(item->tree.files[w.index].path),
+                                  .size = c.remote_size,
+                                  .modified = c.remote_mtime,
+                                  .mine = existing::Local{.size = c.local_size, .modified = c.local_mtime},
+                                  .kind = std::string(upload::kind_name(c)),
+                                  .index = w.index});
+        }
+        ask_upload(*item, std::move(asked), taken.count, taken);
     } else if (const auto o = folder::outcome(item->tree); o.failed > 0) {
         item->status = Status::failed;
         item->error = folder::failed_text(o, checked_note);

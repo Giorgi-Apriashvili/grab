@@ -187,6 +187,27 @@
         either side since, or a server without md5sum, is kept as "not verified".</div>
     </section>
 
+    <section id="uploads-panel" class="updates-panel">
+      <div class="updates-row">
+        <span class="section-title">Uploads</span>
+        <label for="up-existing-set">When a file is already on the server</label>
+        <select id="up-existing-set">
+          <option value="ask">Ask</option>
+          <option value="replace">Replace</option>
+          <option value="different">Replace if different</option>
+          <option value="newer">Replace if newer</option>
+          <option value="skip">Skip</option>
+          <option value="both">Keep both</option>
+        </select>
+      </div>
+      <div class="hint">Ask lists the files already there before each upload, with yours beside them, and
+        starts on Skip: choose for all of them or file by file; "Always do this" there saves the choice
+        here. Any other choice goes without asking (the upload dialog says which, and Change picks another
+        for that upload). Replace if different replaces those of another size or time, Replace if newer
+        those older than yours, Keep both sends yours as "name (2)". A folder on the server is never
+        replaced.</div>
+    </section>
+
     <section id="schedule-panel" class="updates-panel schedule-panel">
       <div class="updates-row">
         <span class="section-title">Speed schedule</span>

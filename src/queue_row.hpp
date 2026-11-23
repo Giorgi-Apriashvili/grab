@@ -47,6 +47,9 @@ enum class Act {
     discard_local,    // a cancelled download's partial files deleted on this PC
     resolve_existing, // the answer to a download's question about files already on this PC
     discard_server,   // a cancelled upload's temps and partial uploads removed on the server
+    // The answer to an upload's question about files already on its server (UPLOADS.md 5.5: they
+    // turned up there after the upload's dialog): its choices, never a download's.
+    resolve_server_existing,
 };
 // Whether `act` applies to a row of `direction`.
 [[nodiscard]] bool allows(Direction direction, Act act);

@@ -25,6 +25,10 @@ std::uint32_t error_id(std::string_view error) {
     return static_cast<std::uint32_t>(std::hash<std::string_view>{}(error)) | 1U;
 }
 
+// Whether the page is told why: a failed file, and one skipped for a reason (an upload's "a folder
+// of that name is there": live checker, chunk 5).
+bool said(const folder::File& f) { return f.status == State::failed || (f.status == State::skipped && !f.error.empty()); }
+
 int state_code(const Shadow& s) { return s.held ? held_code : static_cast<int>(s.status); }
 
 } // namespace
@@ -111,7 +115,7 @@ Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow, b
                    .verified = f.verified,
                    .held = waits};
         // Hashed on every pass: a file queued again can fail with another error between two passes.
-        if (f.status == State::failed) now.error = error_id(f.error);
+        if (said(f)) now.error = error_id(f.error);
         if (now.bytes == s.bytes && now.speed == s.speed && now.error == s.error && now.status == s.status &&
             now.weight == s.weight && now.verified == s.verified && now.held == s.held) {
             continue;
@@ -120,7 +124,7 @@ Pass pass(const std::vector<folder::File>& files, std::vector<Shadow>* shadow, b
         p.changed.push_back(Row{.index = i,
                                 .now = now,
                                 .eta = running ? f.eta : std::nullopt,
-                                .error = f.status == State::failed ? f.error : std::string()});
+                                .error = said(f) ? f.error : std::string()});
     }
     if (t.speed > 0 && t.total > t.bytes) t.eta = static_cast<double>(t.total - t.bytes) / t.speed;
     return p;
@@ -138,7 +142,7 @@ Snapshot snapshot(const std::vector<folder::File>& files, bool small_hold) {
                  .weight = static_cast<std::uint8_t>(f.weight),
                  .verified = f.verified,
                  .held = held(f, small_hold)};
-        if (f.status == State::failed) {
+        if (said(f)) {
             s.error = error_id(f.error);
             snap.errors.emplace(i, f.error);
         }
@@ -187,7 +191,7 @@ std::string file_delta_message(int id, int gen, const std::vector<Row>& rows) {
         if (r.eta && std::isfinite(*r.eta)) std::format_to(std::back_inserter(out), "{:.0f}", *r.eta);
         else out += "null";
         std::format_to(std::back_inserter(out), ",{}", s.weight);
-        if (s.status == State::failed || s.verified) out += ',' + (s.status == State::failed ? json::quote(r.error) : std::string("null"));
+        if (s.error != 0 || s.verified) out += ',' + (s.error != 0 ? json::quote(r.error) : std::string("null"));
         if (s.verified) out += ",1";
         out += ']';
     }

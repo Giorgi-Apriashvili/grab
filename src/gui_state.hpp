@@ -97,6 +97,11 @@ struct GuiState {
     // progress where nothing can be counted.
     std::map<std::string, int> timings;
     bool verify_downloads = false;                   // check each download against the server's checksum
+    // Settings → Uploads: what an upload does with a file already on the server, by
+    // upload_existing.hpp's names: "ask" (the upload dialog asks, starting on Skip) or the choice
+    // its "Always do this" saved. An older grab saving gui.json drops it: Ask again, which replaces
+    // nothing unasked.
+    std::string upload_existing = "ask";
     bool limit_on = false;                           // global download speed limit
     double limit_mibps = 5.0;                        // its value, kept while switched off
     // Outside the schedule's times the limit above applies; a change made during them holds
@@ -144,6 +149,10 @@ struct SavedFile {
     // An upload's file whose server copy verify found different: its retry replaces that copy,
     // grab's own (upload::Tree::resend). Written only when set; downloads never set it.
     bool resend = false;
+    // An upload's file with an existing-file choice of its own (upload::Tree::choices: the
+    // dialog's choice for that file, or the answer to a file that turned up there later), by
+    // upload_existing.hpp's names; "" none, it follows the upload's. Written only when set.
+    std::string choice = {};
     bool operator==(const SavedFile&) const = default;
 };
 

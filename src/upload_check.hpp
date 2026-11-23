@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -47,17 +48,6 @@ struct Picked {
     std::optional<Clash> clash; // a file whose name is taken there
 };
 
-// The names already taken on the server, by how they compare (upload_existing.hpp's Kind), and
-// those a folder has (never replaced).
-struct Taken {
-    std::size_t count = 0;
-    std::size_t same = 0;
-    std::size_t newer = 0;   // newer here
-    std::size_t older = 0;   // older here
-    std::size_t differs = 0; // another size, the times saying nothing
-    std::size_t folders = 0;
-};
-
 struct Check {
     std::string server;
     std::string dir; // the server folder, grab's form ("" the login folder)
@@ -73,8 +63,37 @@ struct Check {
     std::optional<bool> writable;
     std::string why;
     std::optional<std::uint64_t> free;
-    Taken taken;
+    Taken taken; // the names taken there, by how they compare (upload_existing.hpp)
 };
+
+// The files whose names are taken on the server as the dialog lists them (UPLOADS.md decision 3):
+// in the order of the picked items, a folder's files in the folder's order. The user's choices
+// for single files name them by their place in this list.
+struct Listed {
+    std::size_t item = 0;            // its picked item: Check::items' index
+    std::optional<std::size_t> file; // a folder's file: Tree::files' index; nullopt: the picked file
+    std::string name;                // as shown: a file's name, a folder's file as "folder/path/in/it"
+    Clash clash;
+};
+// The first `at_most` of them (items with an error have none).
+[[nodiscard]] std::vector<Listed> taken_list(const Check& check, std::size_t at_most);
+
+// The user's answer about the files already there: one choice for all of them, and single files'
+// own choices by their place in taken_list. `unlisted`: the choice of the items the dialog listed
+// nothing of (nothing of theirs was there), nullopt: `all`. Under the setting Ask that is Ask, so a
+// file that turns up there later is asked about (UPLOADS.md 5.5), never decided by an answer about
+// other items' files (review, chunk 5).
+struct Answer {
+    Existing all = Existing::skip;
+    std::map<std::size_t, Existing> own;
+    std::optional<Existing> unlisted;
+};
+// The answer into the picked items, before they are queued: a folder's files with a choice of
+// their own get it in their Tree::choices (Ask is no choice of a file's own: such entries are
+// left out). Returns each item's choice, by Check::items' index: a picked file's own, else `all`
+// (`unlisted` for an item with nothing there), which a folder's other files follow, and also a
+// file that turns up there later.
+[[nodiscard]] std::vector<Existing> apply_answer(Check& check, const Answer& answer);
 
 // The picked paths into check.items, in their order: a file looked at, a folder walked (a link
 // picked is followed, links below it never). `progress` after each one. A stop ends early.

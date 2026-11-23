@@ -27,6 +27,7 @@
 #include "ssh_read.hpp"
 #include "update.hpp"
 #include "upload.hpp"
+#include "upload_existing.hpp"
 #include "upload_folder.hpp"
 #include "util.hpp"
 #include "verify.hpp"
@@ -114,6 +115,22 @@ bool bool_of(const Value& msg, std::string_view key) {
     return v != nullptr && v->kind == Value::Kind::boolean && v->boolean;
 }
 
+// An upload question's choices for single files, "overrides" {"<place in its list>": choice}:
+// those of upload_existing.hpp's names but Ask, the rest left out.
+std::map<std::size_t, upload::Existing> own_choices(const Value& msg) {
+    std::map<std::size_t, upload::Existing> own;
+    const Value* o = msg.find("overrides");
+    if (o == nullptr || o->kind != Value::Kind::object) return own;
+    for (std::size_t k = 0; k < o->keys.size() && k < o->items.size(); ++k) {
+        const std::string& key = o->keys[k];
+        std::size_t at = 0;
+        const auto [end, ec] = std::from_chars(key.data(), key.data() + key.size(), at);
+        if (ec != std::errc{} || end != key.data() + key.size() || o->items[k].kind != Value::Kind::string) continue;
+        if (const auto e = upload::parse_existing(o->items[k].str); e && *e != upload::Existing::ask) own[at] = *e;
+    }
+    return own;
+}
+
 // Bandwidth priority names and weights (4:2:1).
 int weight_of(std::string_view priority) { return priority == "high" ? 4 : priority == "low" ? 1 : 2; }
 const char* priority_name(int weight) { return weight >= 4 ? "high" : weight <= 1 ? "low" : "normal"; }
@@ -170,6 +187,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     }
     timings_ = state_.timings;
     verify_downloads_ = state_.verify_downloads;
+    upload_existing_ = upload::parse_existing(state_.upload_existing).value_or(upload::Existing::ask);
     // The speed limit that holds now; the first tick() tells the page and drops a change that
     // no longer holds.
     if (const auto applied = current_limit(schedule::local_now()); applied.limit.on) {
@@ -911,7 +929,14 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
     } else if (type == "uploadCheckCancel") {
         cancel_check(int_of(*msg, "token"));
     } else if (type == "uploadStart") {
-        start_upload(int_of(*msg, "token"));
+        // The files already there: Skip for all unless said (UPLOADS.md decision 3); Ask only when
+        // the dialog had none to show.
+        upload::Answer answer;
+        answer.all = upload::parse_existing(msg->string_of("choice").value_or("")).value_or(upload::Existing::skip);
+        answer.own = own_choices(*msg);
+        start_upload(int_of(*msg, "token"), answer, bool_of(*msg, "always"));
+    } else if (type == "setUploadExisting") {
+        if (const auto choice = upload::parse_existing(msg->string_of("choice").value_or(""))) set_upload_existing(*choice);
     } else if (type == "cancelItem") {
         cancel_items(int_of(*msg, "id", -1));
     } else if (type == "pauseItem") {
@@ -919,9 +944,7 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
     } else if (type == "resumeItem") {
         resume_items(int_of(*msg, "id", -1));
     } else if (type == "resolveExisting") {
-        if (const auto choice = existing::parse(msg->string_of("choice").value_or(""))) {
-            resolve_existing(int_of(*msg, "id", -1), *choice);
-        }
+        resolve_existing(int_of(*msg, "id", -1), *msg);
     } else if (type == "cancelAll") {
         cancel_items(0);
     } else if (type == "pauseAll") {
@@ -1071,6 +1094,7 @@ void App::send_init() {
     init.set("version", str(GRAB_VERSION));
     init.set("updateCheck", Value::make_bool(state_.update_check));
     init.set("verifyDownloads", Value::make_bool(state_.verify_downloads));
+    init.set("uploadExisting", str(std::string(upload::name(upload_existing_.load()))));
     init.set("configPath", str(util::path_to_utf8(config_path_)));
     init.set("recent", load_recent(recent_path_));
 
@@ -2387,7 +2411,9 @@ std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::files
                    std::optional<std::int64_t> modified) {
         if (!existing::differs(local, size, seconds_to_ns(modified))) return;
         if (++count > shown) return;
-        if (const auto mine = existing::local_file(local)) found.push_back(Asked{std::move(name), size, modified, *mine});
+        if (const auto mine = existing::local_file(local)) {
+            found.push_back(Asked{.name = std::move(name), .size = size, .modified = modified, .mine = *mine, .kind = {}, .index = 0});
+        }
     };
     for (const auto& group : groups.items) {
         const std::string remote = group.string_of("remote").value_or("");
@@ -2438,13 +2464,27 @@ std::vector<App::Asked> App::conflicts_for(const Value& groups, const std::files
     return found;
 }
 
-void App::resolve_existing(int id, existing::Choice choice) {
+void App::resolve_existing(int id, const Value& msg) {
+    const std::string said = msg.string_of("choice").value_or("");
+    // An upload's answer: its own choices (upload_existing.hpp), for all and per file.
+    const auto up_choice = upload::parse_existing(said);
+    const auto own = own_choices(msg);
+    const bool always = bool_of(msg, "always");
+    const auto down_choice = existing::parse(said);
+    bool saved_setting = false;
     {
         std::lock_guard lock(mutex_);
         for (auto& item : items_) {
             if (item->id != id || item->status != Status::paused) continue;
-            if (!queue_row::allows(item->direction, queue_row::Act::resolve_existing)) continue;
-            item->existing = choice;
+            if (is_up(*item)) {
+                if (!queue_row::allows(item->direction, queue_row::Act::resolve_server_existing)) continue;
+                if (!up_choice || *up_choice == upload::Existing::ask || item->asked.empty()) continue;
+                resolve_upload(*item, *up_choice, own, always);
+                saved_setting = always;
+                continue;
+            }
+            if (!down_choice || !queue_row::allows(item->direction, queue_row::Act::resolve_existing)) continue;
+            item->existing = *down_choice;
             item->asked.clear();
             item->asked_count = 0;
             item->note.clear();
@@ -2452,13 +2492,56 @@ void App::resolve_existing(int id, existing::Choice choice) {
             item->status = Status::queued;
         }
     }
+    if (saved_setting) set_upload_existing(*up_choice);
     wake_.notify_all();
     request_save();
     dirty_ = true;
     flush();
 }
 
-Value App::asked_json(const std::vector<Asked>& asked, std::size_t count) {
+void App::resolve_upload(Item& item, upload::Existing all, const std::map<std::size_t, upload::Existing>& own, bool always) {
+    if (item.mode == Mode::folder) {
+        // By the files' places in the question's list, as the page names them.
+        std::map<std::size_t, upload::Existing> by_index;
+        for (const auto& [at, choice] : own) {
+            if (at < item.asked.size()) by_index[item.asked[at].index] = choice;
+        }
+        // "Always do this": the upload's own for files that turn up there later too.
+        if (always) item.up_existing = all;
+        upload::answer(upload_job(item), item.tree, all, by_index);
+        refresh_folder(item);
+        // Keep both gave some a numbered name: the page's rows show it.
+        item.names = std::make_shared<const queue_view::Names>(queue_view::names_of(item.tree.files));
+        item.gen = next_gen_++;
+        item.touched = true;
+    } else {
+        const auto it = own.find(0);
+        item.up_existing = it != own.end() ? it->second : all;
+    }
+    item.asked.clear();
+    item.asked_count = 0;
+    item.asked_taken = {};
+    item.note.clear();
+    item.waiting.clear();
+    item.status = Status::queued;
+}
+
+void App::ask_upload(Item& item, std::vector<Asked> asked, std::size_t count, const upload::Taken& taken) {
+    item.asked = std::move(asked);
+    item.asked_count = count;
+    item.asked_taken = taken;
+    item.status = Status::paused;
+    item.error.clear();
+    item.speed = 0;
+    item.eta.reset();
+    item.connections = 0;
+    item.waiting = count == 1 ? std::format("A file of that name is already on {}. Resume to choose: replace it, skip it or keep both.",
+                                            item.remote)
+                              : std::format("{} files of those names are already on {}. Resume to choose: replace, skip or keep both.",
+                                            count, item.remote);
+}
+
+Value App::asked_json(const std::vector<Asked>& asked, std::size_t count, const upload::Taken* taken) {
     auto time = [](std::optional<std::int64_t> t) { return t ? num(static_cast<double>(*t)) : Value{}; };
     Value files = Value::make_array();
     for (const auto& a : asked) {
@@ -2468,11 +2551,19 @@ Value App::asked_json(const std::vector<Asked>& asked, std::size_t count) {
         f.set("modified", time(a.modified));
         f.set("mineSize", num(static_cast<double>(a.mine.size)));
         f.set("mineModified", time(a.mine.modified));
+        if (!a.kind.empty()) f.set("kind", str(a.kind));
         files.push(std::move(f));
     }
     Value v = Value::make_object();
     v.set("count", num(static_cast<double>(count)));
     v.set("files", std::move(files));
+    if (taken != nullptr) {
+        v.set("same", num(static_cast<double>(taken->same)));
+        v.set("newer", num(static_cast<double>(taken->newer)));
+        v.set("older", num(static_cast<double>(taken->older)));
+        v.set("differs", num(static_cast<double>(taken->differs)));
+        v.set("folders", num(static_cast<double>(taken->folders)));
+    }
     return v;
 }
 
@@ -3079,7 +3170,14 @@ void App::run_item(const std::shared_ptr<Item>& item, std::stop_token app_stop) 
     std::stop_callback on_app_stop(app_stop, [item] { item->stop.request_stop(); });
     if (item->fake) return run_fake(*item, item_stop);
     if (is_up(*item)) {
-        // An upload (UPLOADS.md 5.10): nothing lands on this PC.
+        // An upload (UPLOADS.md 5.10): nothing lands on this PC. A question it waited with (files
+        // that turned up on the server) is asked again should they still be in its way.
+        {
+            std::lock_guard lock(mutex_);
+            item->asked.clear();
+            item->asked_count = 0;
+            item->asked_taken = {};
+        }
         const auto refusals_before = connections_.refusals(item->remote);
         if (item->mode == Mode::file) run_upload_file(item, item_stop);
         else run_upload_folder(item, item_stop);
@@ -3243,8 +3341,12 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         return set(Status::done, {}, "skipped: your file is kept");
     }
     if (result.outcome == fetch::Outcome::exists) { // not answered yet: wait for the answer
-        Asked asked{util::path_to_utf8(d.target.filename()), result.size, std::nullopt,
-                    existing::local_file(d.target).value_or(existing::Local{})};
+        Asked asked{.name = util::path_to_utf8(d.target.filename()),
+                    .size = result.size,
+                    .modified = std::nullopt,
+                    .mine = existing::local_file(d.target).value_or(existing::Local{}),
+                    .kind = {},
+                    .index = 0};
         if (const auto t = util::parse_rfc3339_seconds(result.modtime)) asked.modified = *t;
         std::lock_guard lock(mutex_);
         item->asked = {std::move(asked)};
@@ -3527,8 +3629,12 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
             std::vector<Asked> asked;
             for (const auto& c : found) {
                 if (asked.size() == 5) break;
-                asked.push_back(Asked{folder_name + "/" + c.path, c.size, util::parse_rfc3339_seconds(c.modtime),
-                                      existing::local_file(c.local).value_or(existing::Local{})});
+                asked.push_back(Asked{.name = folder_name + "/" + c.path,
+                                      .size = c.size,
+                                      .modified = util::parse_rfc3339_seconds(c.modtime),
+                                      .mine = existing::local_file(c.local).value_or(existing::Local{}),
+                                      .kind = {},
+                                      .index = 0});
             }
             std::lock_guard lock(mutex_);
             refresh_folder(*item);
@@ -3645,7 +3751,7 @@ json::Value App::queue_item(const Item& i, int position) const {
         v.set("source", str(util::path_to_utf8(i.source)));
     }
     v.set("status", str(status_name(static_cast<int>(i.status))));
-    if (!i.asked.empty()) v.set("ask", asked_json(i.asked, i.asked_count));
+    if (!i.asked.empty()) v.set("ask", asked_json(i.asked, i.asked_count, is_up(i) ? &i.asked_taken : nullptr));
     v.set("bytes", num(static_cast<double>(i.bytes)));
     v.set("total", num(static_cast<double>(i.total)));
     // As the row shows them (speed::shown, whole seconds): a change it wouldn't show isn't sent.
@@ -3826,6 +3932,10 @@ std::shared_ptr<App::Item> App::restored_upload(const SavedUpload& saved) {
             c.weight = weight_of(f.priority);
             c.local = util::path_from_utf8(f.local); // a Keep-both name on the server
             if (f.resend) item->tree.resend.insert(item->tree.files.size());
+            // Its own existing-file choice: the dialog's for it, or the answer when it turned up later.
+            if (const auto own = upload::parse_existing(f.choice); own && *own != upload::Existing::ask) {
+                item->tree.choices[item->tree.files.size()] = *own;
+            }
             item->tree.files.push_back(std::move(c));
         }
         // Big files' bytes from their records, where they go (a Keep-both name too).
@@ -3864,12 +3974,15 @@ struct SavedFiles {
     std::string times;
     std::vector<std::size_t> time_ends;
     std::vector<std::pair<std::size_t, std::string>> errors; // by index
+    std::map<std::size_t, upload::Existing> choices; // an upload's files' own existing-file choices
 };
 
-// `resend`: an upload's files whose retry replaces grab's own copy (upload::Tree::resend).
+// `resend`: an upload's files whose retry replaces grab's own copy (upload::Tree::resend); `choices`
+// its files' own existing-file choices (upload::Tree::choices).
 SavedFiles copy_files(const std::vector<folder::File>& files, const std::shared_ptr<const queue_view::Names>& names,
-                      const std::set<std::size_t>& resend = {}) {
+                      const std::set<std::size_t>& resend = {}, const std::map<std::size_t, upload::Existing>& choices = {}) {
     SavedFiles s;
+    s.choices = choices;
     const auto n = files.size();
     if (names && names->path.size() == n) {
         s.names = names;
@@ -3931,6 +4044,9 @@ std::vector<SavedFile> saved_files(const SavedFiles& s) {
             f.local = util::path_to_utf8((local++)->second);
         }
         if (error != s.errors.end() && error->first == k) f.error = (error++)->second;
+        if (const auto own = s.choices.find(k); own != s.choices.end() && own->second != upload::Existing::ask) {
+            f.choice = std::string(upload::name(own->second));
+        }
         out.push_back(std::move(f));
     }
     return out;
@@ -3979,7 +4095,7 @@ void App::save_queue() const {
                               .made = i->tree.made,
                               .temps = std::vector<std::string>(i->tree.temps.begin(), i->tree.temps.end()),
                               .resend = i->resend};
-                up_files.push_back(copy_files(i->tree.files, i->names, i->tree.resend));
+                up_files.push_back(copy_files(i->tree.files, i->names, i->tree.resend, i->tree.choices));
                 ups.uploads.push_back(std::move(u));
                 continue;
             }
