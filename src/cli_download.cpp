@@ -195,13 +195,13 @@ private:
 #endif
 };
 
-// Follows the speed schedule while downloads run: when the scheduled limit changes, the limiter
-// switches, and grab's streams follow at once.
+// Follows the speed schedule's limits for `dir` (downloads ↓, or uploads ↑) while they run: when
+// the scheduled limit changes, the limiter switches, and grab's streams follow at once.
 class ScheduleFollower {
 public:
-    ScheduleFollower(std::vector<schedule::Rule> rules, rate::RateLimiter& limiter, LiveLine& line)
-        : rules_(std::move(rules)), limiter_(limiter), line_(line),
-          current_(schedule::limit_at(rules_, schedule::local_now().minute)) {
+    ScheduleFollower(std::vector<schedule::Rule> rules, schedule::Dir dir, rate::RateLimiter& limiter, LiveLine& line)
+        : rules_(std::move(rules)), dir_(dir), limiter_(limiter), line_(line),
+          current_(schedule::limit_at(rules_, schedule::local_now().minute, dir_)) {
         if (current_) limiter_.set_rate(schedule::bytes_per_s(*current_));
         thread_ = std::jthread([this](const std::stop_token& stop) { run(stop); });
     }
@@ -220,18 +220,21 @@ private:
             }
             if (stop.stop_requested()) return;
             const auto now = schedule::local_now();
-            const auto limit = schedule::limit_at(rules_, now.minute);
+            const auto limit = schedule::limit_at(rules_, now.minute, dir_);
             if (limit == current_) continue;
             current_ = limit;
             limiter_.set_rate(limit ? schedule::bytes_per_s(*limit) : 0);
-            const auto next = schedule::next_change(rules_, now.minute);
+            const auto next = schedule::next_change(rules_, now.minute, dir_);
             const std::string until = next ? " until " + schedule::when_text(now.minute, next->minutes) : "";
-            line_.message(limit ? std::format("grab: speed schedule: limited to {}{}", schedule::speed_text(*limit), until)
-                                : std::format("grab: speed schedule: no limit{}", until));
+            const bool up = dir_ == schedule::Dir::up;
+            line_.message(limit ? std::format("grab: speed schedule: {}limited to {}{}", up ? "uploads " : "",
+                                              schedule::speed_text(*limit), until)
+                                : std::format("grab: speed schedule: no {}limit{}", up ? "upload " : "", until));
         }
     }
 
     const std::vector<schedule::Rule> rules_;
+    const schedule::Dir dir_;
     rate::RateLimiter& limiter_;
     LiveLine& line_;
     std::optional<double> current_; // the follower thread's
@@ -742,12 +745,14 @@ GuiState window_settings(const std::filesystem::path& gui_json) {
     return saved->value_or(GuiState{});
 }
 
-std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules, const schedule::Now& now) {
-    const auto limit = schedule::limit_at(rules, now.minute);
+std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules, const schedule::Now& now,
+                                         schedule::Dir dir) {
+    const auto limit = schedule::limit_at(rules, now.minute, dir);
     if (!limit) return std::nullopt;
-    const auto next = schedule::next_change(rules, now.minute);
-    return std::format("speed limited to {}{} by the speed schedule (--limit off ignores it)",
-                       schedule::speed_text(*limit), next ? " until " + schedule::when_text(now.minute, next->minutes) : "");
+    const auto next = schedule::next_change(rules, now.minute, dir);
+    return std::format("{}speed limited to {}{} by the speed schedule (--limit off ignores it)",
+                       dir == schedule::Dir::up ? "upload " : "", schedule::speed_text(*limit),
+                       next ? " until " + schedule::when_text(now.minute, next->minutes) : "");
 }
 
 
@@ -810,11 +815,16 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
     connections.configure(server, budget);
     rate::RateLimiter limiter;
     if (opts.limit) limiter.set_rate(*opts.limit);
-    // Without --limit, the speed schedule set in grab's window decides, also mid-download.
+    // Without --limit, the speed schedule set in grab's window decides, also mid-download: its
+    // download speeds (↓).
     const auto rules = opts.limit ? std::vector<schedule::Rule>{} : gui.speed_schedule;
-    if (auto note = schedule_note(rules, schedule::local_now())) std::println(stderr, "grab: {}", *note);
+    if (auto note = schedule_note(rules, schedule::local_now(), schedule::Dir::down)) {
+        std::println(stderr, "grab: {}", *note);
+    }
     std::optional<ScheduleFollower> follower;
-    if (!opts.dry_run && !rules.empty()) follower.emplace(rules, limiter, line);
+    if (!opts.dry_run && schedule::limits(rules, schedule::Dir::down)) {
+        follower.emplace(rules, schedule::Dir::down, limiter, line);
+    }
     const bool verify = opts.verify.value_or(gui.verify_downloads);
     if (verify) {
         std::println(stderr, "grab: downloads are checked against the server's checksum afterwards{}",

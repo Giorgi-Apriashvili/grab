@@ -63,9 +63,9 @@ struct DownloadTally {
 [[nodiscard]] GuiState window_settings(const std::filesystem::path& gui_json);
 
 // "speed limited to 5 MiB/s until 24:00 by the speed schedule (...)" when the speed schedule set
-// in grab's window limits the speed now.
+// in grab's window limits `dir`'s speed now ("upload speed limited to ..." for uploads).
 [[nodiscard]] std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules,
-                                                       const schedule::Now& now);
+                                                       const schedule::Now& now, schedule::Dir dir);
 
 // Downloads `paths` (picked search hits, files or folders by opts.mode) into `dest`. `sizes` and
 // `modified` (Unix seconds) are the hits', for the checks before fetching and --dry-run. `pools`:

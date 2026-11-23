@@ -197,9 +197,17 @@ void run_small(const Job& job, Tree& tree, std::mutex& m, int workers, const std
                 unclaim();
             }
         } leave_at_end{.kept = kept, .leave = member, .requeue = requeue_carried, .unclaim = unclaim};
+        // A turn a new limit cut keeps its seat (Connections) for the next login: given back, another
+        // transfer could take it and hold it until one of its ranges ended, while this worker waited
+        // with its carried files (or with none, the others sending the rest) and the folder couldn't
+        // end (UPLOADS.md 12, chunk 6).
+        bool seated = false;
         for (;;) {
-            if (stop.stop_requested() || (carried.empty() && !any_queued())) return;
-            if (!job.connections->acquire(job.server, job.id, stop, false)) return;
+            if (stop.stop_requested() || (carried.empty() && !any_queued())) {
+                if (seated) job.connections->release(job.server, job.id);
+                return;
+            }
+            if (!std::exchange(seated, false) && !job.connections->acquire(job.server, job.id, stop, false)) return;
             std::optional<ssh::Pool::Lease> lease;
             std::string why;
             auto kind = budget::Failure::other;
@@ -241,7 +249,14 @@ void run_small(const Job& job, Tree& tree, std::mutex& m, int workers, const std
             // Replies still on their way: dropped with the connection.
             if (stop.stop_requested() || run.broken || run.cut) lease->broken();
             lease.reset();
-            if (!run.yielded) job.connections->release(job.server, job.id, 1, run.worked);
+            if (!run.yielded) {
+                if (kept) { // its seat stays (above); its connection no longer works
+                    seated = true;
+                    if (run.worked) job.connections->working(job.server, job.id, -1);
+                } else {
+                    job.connections->release(job.server, job.id, 1, run.worked);
+                }
+            }
             if (run.landed > 0) failures = 0;
             if (run.cut) continue; // not a failure: its files go on over a new login
             if (run.broken && run.landed == 0 && ++failures > fetch::max_retries) return fail_queued(*run.broken);

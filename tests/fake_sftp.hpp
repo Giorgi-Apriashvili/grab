@@ -113,6 +113,10 @@ public:
     const std::map<std::string, std::uint32_t>* shared_mtimes = nullptr; // files' times instead of 1700000000
     std::chrono::milliseconds delay{0};                     // a pause before each read, as a network's
     std::chrono::milliseconds latency{0};                   // each reply comes this long after its request (a round trip)
+    // The client's send of a WRITE takes this long, as one that waits for a full SSH window does on
+    // a real link, the replies to earlier ones coming meanwhile: its WRITEs in flight never reach
+    // their caps (with no latency).
+    std::chrono::milliseconds write_pace{0};
     bool held = false;                                      // replies come only when the client waits for one (then all of them)
     bool release_one = false;                               // with held: each read hands over one reply
     int broken_after = 0;                                   // the stream breaks on this read (0: never)
@@ -169,15 +173,18 @@ public:
 
     void write(std::string_view bytes) override {
         in_ += bytes;
+        int paced = 0; // WRITEs in these bytes
         while (in_.size() >= 4) {
             std::uint32_t len = be32(in_.data());
             if (in_.size() < 4 + len) break;
+            if (len > 0 && static_cast<std::uint8_t>(in_[4]) == 6) ++paced; // WRITE
             {
                 const auto lock = locked();
                 handle(std::string_view(in_).substr(4, len));
             }
             in_.erase(0, 4 + len);
         }
+        if (write_pace.count() > 0 && paced > 0) std::this_thread::sleep_for(write_pace * paced);
     }
 
     std::size_t read(std::span<char> buffer) override {

@@ -419,8 +419,12 @@ void App::run_upload_file(const std::shared_ptr<Item>& item, const std::stop_tok
     }
     u.limiter = &up_limiter_;
     u.weight = &item->weight;
-    // Its speed and time left count the bytes the server acknowledged (flush).
-    u.on_sent = [item](std::uint64_t n) { item->received += n; };
+    // Its speed and time left, and the status bar's ↑ total, count the bytes the server
+    // acknowledged (flush).
+    u.on_sent = [this, item](std::uint64_t n) {
+        item->received += n;
+        sent_ += n;
+    };
     u.pool = pools_.get(item->remote, *target, connections_.budget(item->remote));
     u.records_dir = records_dir_;
     const auto r = upload::run(u, connections_, [&](const fetch::Progress& p) {
@@ -530,7 +534,11 @@ void App::run_upload_folder(const std::shared_ptr<Item>& item, const std::stop_t
         }
     }
     job.on_event = [this, item](folder::Event e) { folder_event(*item, e); };
-    job.on_sent = [item](std::uint64_t n) { item->received += n; };
+    // Its speed and time left, and the status bar's ↑ total, count what the server acknowledged.
+    job.on_sent = [this, item](std::uint64_t n) {
+        item->received += n;
+        sent_ += n;
+    };
     // Its files at once: what "At once" leaves of the files other transfers hold.
     job.files_at_once = [this, item] {
         std::lock_guard lock(mutex_);

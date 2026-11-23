@@ -3,9 +3,10 @@
 `test.js` checks the window's page (`src/gui/ui`: `index.html`, `app.js`, `app.css`) on its own,
 with no grab-gui and no server: the Downloads table (fixed columns, sorting, column widths, the
 keys and the treegrid ARIA), every file of a folder download, the filter and Go to running, a
-file's priority in its folder, the status bar's total speed and its graph, the speed limit's
-MiB/s box (typing sets nothing; Enter or leaving it sets, confirmed by the backend's answer: the
-pending look, the badge), Waiting files, opening finished files (double-click, Open, Ctrl+Enter,
+file's priority in its folder, the status bar's total speeds (↓ and ↑) and their graph, the two
+speed limits' MiB/s boxes (each: typing sets nothing; Enter or leaving it sets, confirmed by the
+backend's answer: the pending look, the badge; the two apart, and fitting the narrowest window),
+the speed schedule's ↓ and ↑ speeds, Waiting files, opening finished files (double-click, Open, Ctrl+Enter,
 the question before a program runs), resizing Browse and Downloads (the grip on the panel's top
 edge and the head's free space: drags, clicks, keys, double-clicks, limits, nothing in the head
 moving), the uploads in the window (their ↑ rows, the Show filter's Downloads and Uploads, the

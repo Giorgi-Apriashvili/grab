@@ -434,3 +434,33 @@ TEST_CASE("a waiting request is given up at a new rate or a stop, and goes at on
     limiter.cancel(gone);
     CHECK(limiter.ready(behind));
 }
+
+TEST_CASE("rate: two limiters share nothing: the same flow key in each, one's new rate leaves the other's alone") {
+    // What the window's ↓ and ↑ limits rely on (UPLOADS.md 5.7): a download and an upload may have
+    // the same flow key (an id each, of one numbering, but member keys alike), and a RateLimiter's
+    // set_rate touches only its own generation, rate and requests. That the window gives each
+    // direction its own limiter is the live checks' (chunk 6, L5), not this case's.
+    rate::RateLimiter down;
+    rate::RateLimiter up;
+    down.set_rate(MiB);
+    up.set_rate(MiB);
+    const auto up_generation = up.generation();
+    std::stop_source never;
+    const auto flow = rate::flow_of(7, 3);
+    const auto d = down.enqueue(128 * KiB, flow, 2);
+    const auto u = up.enqueue(128 * KiB, flow, 2);
+    REQUIRE(d != 0);
+    REQUIRE(u != 0);
+    // A lower download limit gives up the download's request, and only that.
+    down.set_rate(512 * KiB);
+    CHECK(up.generation() == up_generation);
+    CHECK(up.rate() == MiB);
+    CHECK_FALSE(down.ready(d));
+    CHECK(up.wait(u, never.get_token())); // served at its own rate, not given up
+    // Switched off on one side only: the other still limits.
+    down.set_rate(0);
+    CHECK(down.enqueue(MiB, flow, 2) == 0);
+    CHECK(up.enqueue(128 * KiB, flow, 2) != 0);
+    CHECK(down.generation() != up.generation()); // counted apart: 3 changes against 1
+    up.set_rate(0);
+}

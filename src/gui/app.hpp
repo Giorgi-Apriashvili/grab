@@ -483,16 +483,18 @@ private:
     // Queue order (`before` = another item's id, 0 = the end) and bandwidth priority.
     void move_item(int id, int before);
     void set_priority(int id, int weight);
-    // The global download speed limit (UI thread): the user's own setting, the speed schedule,
-    // or a change made while the schedule limits the speed, which holds until its next change.
-    // `token`: the page's set (setLimit), answered by the "limit" message that carries it.
-    void set_limit(bool on, double mibps, int token = 0);
+    // The global speed limits (UI thread), downloads' (↓) and uploads' (↑) apart: for each, the
+    // user's own setting, the speed schedule, or a change made while the schedule limits that
+    // direction, which holds until its next change there. `token`: the page's set (setLimit),
+    // answered by the "limit" message that carries it and the direction.
+    void set_limit(schedule::Dir dir, bool on, double mibps, int token = 0);
     void set_schedule(const json::Value& rules);
-    [[nodiscard]] schedule::Applied current_limit(const schedule::Now& now) const;
-    // Applies what holds now and tells the page about any change; with a set's `token`, always,
-    // the token in the message.
-    void update_limit(int token = 0);
-    void set_rate(std::uint64_t bytes_per_s);
+    [[nodiscard]] schedule::Applied current_limit(schedule::Dir dir, const schedule::Now& now) const;
+    // Applies what holds now for both directions and tells the page about any change; with a
+    // set's `token`, always, the token and the set's direction (`dir`) in the message.
+    void update_limit(int token = 0, schedule::Dir dir = schedule::Dir::down);
+    // A new rate for one direction's limiter: only that direction's speeds start again.
+    void set_rate(schedule::Dir dir, std::uint64_t bytes_per_s);
     [[nodiscard]] json::Value limit_message(const schedule::Now& now) const;
     // The folder picker. Its answer ("folderPicked") carries `purpose` back: "dest" for Save to,
     // "downloadTo" for the menu's Download to....
@@ -705,8 +707,9 @@ private:
     bool closed_ = false;              // UI thread: close() ran
     fetch::Connections connections_;
     ssh::Pools pools_;          // grab's own SSH connections: engine = grab servers, every server's verification
-    rate::RateLimiter limiter_; // shared by every download's streams
-    // Uploads' own, shared by every upload's streams; unlimited until chunk 6 gives it a box.
+    // The download limit (↓), shared by every download's streams, and the upload limit (↑),
+    // shared by every upload's: apart, so neither direction's flows or changes touch the other's.
+    rate::RateLimiter down_limiter_;
     rate::RateLimiter up_limiter_;
     std::atomic<bool> verify_downloads_{false}; // GuiState::verify_downloads, for the workers
     // GuiState::upload_existing, for the upload checks' threads.
@@ -779,12 +782,17 @@ private:
     bool queue_changed_ = true;      // downloads came, went or moved: the next flush sends "queue"
     std::map<int, std::string> item_sent_; // each download's row as last sent
     int parallel_sent_ = 0;
-    bool metering_ = false; // a download fetches: every flush samples its meters
-    // Everything the downloads receive, together (each Item::received's bytes too): the status bar's
-    // total speed and its graph, sent as {"type":"speed","total"} when its shown value changes.
+    bool metering_ = false; // a download or upload moves bytes: every flush samples its meters
+    bool metering_down_ = false; // a download does: the ↓ total is sampled
+    bool metering_up_ = false;   // an upload does: the ↑ total is
+    // Everything the downloads receive, together (each Item::received's bytes too), and everything
+    // the servers acknowledged of the uploads (their Item::received): the status bar's total speeds
+    // and its graph, sent as {"type":"speed","total","up"} when a shown value changes.
     std::atomic<std::uint64_t> received_{0};
+    std::atomic<std::uint64_t> sent_{0};
     speed::Meter total_meter_;
-    std::optional<std::uint64_t> total_sent_;
+    speed::Meter total_up_meter_;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> totals_posted_; // (↓, ↑) as last sent
     std::map<int, Watch> watches_; // the folders whose files the page shows, by id
     mutable std::mutex queue_file_mutex_; // one writer of queue.json at a time
     std::mutex save_mutex_;               // guards save_wanted_, save_now_, next_save_, next_urgent_save_

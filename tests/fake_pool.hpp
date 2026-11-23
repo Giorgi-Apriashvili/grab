@@ -54,6 +54,9 @@ struct FakePool {
     FakeFiles store;
     // Each session's server as these say (fake_sftp.hpp).
     std::chrono::milliseconds latency{0};
+    std::chrono::milliseconds write_pace{0};
+    bool held = false;
+    bool release_one = false;
     bool read_only = false;
     sftp::Code read_only_as = sftp::Code::permission_denied;
     std::uint64_t quota_bytes = 0;
@@ -101,6 +104,9 @@ struct FakePool {
             server.reverse = f.reverse;
             server.slice = f.slice;
             server.latency = f.latency;
+            server.write_pace = f.write_pace;
+            server.held = f.held;
+            server.release_one = f.release_one;
             server.read_only = f.read_only;
             server.read_only_as = f.read_only_as;
             server.quota_bytes = f.quota_bytes;

@@ -47,10 +47,11 @@ const state = {
   queue: [],
   parallel: 4,
   totalSpeed: 0,         // what all downloads receive now, bytes/s (the backend's 'speed')
-  limitOn: false,        // the limit that applies now: own setting, speed schedule or a change
-  limitMiBps: 5,
-  limit: {},             // the backend's "limit" message: source, until, nextMiBps
-  schedule: [],          // speed schedule rules, as the backend keeps them
+  upSpeed: 0,            // what the servers acknowledged of all uploads now (its 'up')
+  // The two limits that apply now, downloads' (↓) and uploads' (↑), as the backend's "limit"
+  // message has them: on, mibps (own setting, speed schedule or a change), source, until, nextMiBps.
+  limits: { down: { on: false, mibps: 5 }, up: { on: false, mibps: 5 } },
+  schedule: [],          // speed schedule rules, as the backend keeps them ('mibps' ↓, 'upMiBps' ↑)
   uploadExisting: 'ask', // Settings → Uploads: a file already on the server (ask, replace, different, newer, skip, both)
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing, note
   lists: [],             // the last search's sources per server: age, live, refreshing, error, notes
@@ -4883,68 +4884,142 @@ function splitZone(target) {
   new ResizeObserver(() => scheduleRows()).observe($('#results'));
 }
 
-// ---- status bar: total speed, its last minute, and the speed limit ---------------------------
+// ---- status bar: total speeds, their last minute, and the two speed limits -------------------
 
-// The total is what all downloads receive now, measured where the bytes arrive (the backend's
-// 'speed': a recent average over about 5 s), not the rows' speeds added up. The limit that
-// applies follows it while there is one, running or not: "· 12 MiB/s limit".
+// The totals are what all downloads receive now and what the servers acknowledged of all uploads,
+// measured where the bytes arrive (the backend's 'speed': recent averages over about 5 s), not the
+// rows' speeds added up. While nothing uploads and the upload limit is off, the status bar reads as
+// before uploads came: "↓ 12.3 MiB/s total · 2 running", the download limit after it ("· 12 MiB/s
+// limit"), running or not. Otherwise both directions, in one unit, each with its limit beside it
+// while that is on: "↓ 11.9 of 12 · ↑ 3.9 of 4 MiB/s · 2 running · 1 uploading"; the tooltip says
+// it in words. The text gives way (…) before the limits' controls on its right do.
 function renderTotalSpeed() {
-  // Downloads' own: uploads' bytes aren't in the total (their ↑ comes with chunk 6), only their count.
-  const running = state.queue.filter((q) => q.status === 'running' && !isUp(q));
+  const running = state.queue.filter((q) => q.status === 'running' && !isUp(q)).length;
   const uploading = state.queue.filter((q) => q.status === 'running' && isUp(q)).length;
+  const { down, up } = state.limits;
   const el = $('#total-speed');
   const limit = $('#total-limit');
-  limit.hidden = !state.limitOn;
-  limit.textContent = state.limitOn ? `· ${fmtMiBps(state.limitMiBps)} limit` : '';
-  const ups = uploading ? ` · ${uploading} uploading` : '';
-  if (!running.length) {
-    el.textContent = `No downloads running${ups}`;
-    el.classList.remove('limited');
+  const words = (what, speed, l) => `${what}: ${fmtSpeed(speed)}${l.on ? ` (limit ${fmtMiBps(l.mibps)})` : ''}`;
+  if (!uploading && !up.on) {
+    limit.hidden = !down.on;
+    limit.textContent = down.on ? `· ${fmtMiBps(down.mibps)} limit` : '';
+    if (!running) {
+      el.removeAttribute('title');
+      el.textContent = 'No downloads running';
+      el.classList.remove('limited');
+      return;
+    }
+    el.title = `${words('Downloads', state.totalSpeed, down)} · ${running} running`; // when the text gives way
+    el.textContent = `↓ ${fmtSpeed(state.totalSpeed)} total · ${running} running`;
+    el.classList.toggle('limited', down.on);
     return;
   }
-  el.textContent = `↓ ${fmtSpeed(state.totalSpeed)} total · ${running.length} running${ups}`;
-  el.classList.toggle('limited', state.limitOn);
+  el.classList.remove('limited'); // each direction's part says it
+  el.title = `${words('Downloads', state.totalSpeed, down)} · ${words('Uploads', state.upSpeed, up)}`;
+  if (!running && !uploading) {
+    // Nothing moves: the limits that are on, after it.
+    el.textContent = 'No downloads or uploads running';
+    limit.hidden = false; // the upload limit is on here
+    limit.textContent = down.on ? `· ↓ ${fmtLimit(down.mibps)} · ↑ ${fmtMiBps(up.mibps)} limits`
+      : `· ↑ ${fmtMiBps(up.mibps)} upload limit`;
+    return;
+  }
+  limit.hidden = true;
+  limit.textContent = '';
+  const speeds = sharedSpeeds([state.totalSpeed, state.upSpeed], down.on || up.on);
+  const part = (arrow, text, l) => {
+    const s = document.createElement('span');
+    s.textContent = `${arrow} ${text}${l.on ? ` of ${fmtLimit(l.mibps)}` : ''}`;
+    s.classList.toggle('limited', l.on);
+    return s;
+  };
+  const counts = `${running ? ` · ${running} running` : ''}${uploading ? ` · ${uploading} uploading` : ''}`;
+  el.replaceChildren(part('↓', speeds.texts[0], down), ' · ', part('↑', speeds.texts[1], up), ` ${speeds.unit}${counts}`);
+}
+
+// Speeds side by side in one unit, the larger one's (as fmtSpeed would show it), or MiB/s (`mib`:
+// the limits' unit, while one shows beside them): { texts, unit }.
+function sharedSpeeds(values, mib) {
+  const units = ['KiB/s', 'MiB/s', 'GiB/s', 'TiB/s', 'PiB/s'];
+  let div = 1;
+  let unit = 'B/s';
+  if (mib) {
+    div = 1048576;
+    unit = 'MiB/s';
+  } else {
+    let v = Math.max(...values.map((x) => Math.round(x)));
+    if (v >= 1024) {
+      let u = 0;
+      v /= 1024;
+      div = 1024;
+      while (v >= 1024 && u < units.length - 1) { v /= 1024; div *= 1024; ++u; }
+      unit = units[u];
+    }
+  }
+  return { texts: values.map((x) => (div === 1 ? String(Math.round(x)) : (x / div).toFixed(1))), unit };
 }
 
 function onSpeed(msg) {
   state.totalSpeed = msg.total > 0 ? msg.total : 0;
+  state.upSpeed = msg.up > 0 ? msg.up : 0;
   renderTotalSpeed();
 }
 
-// The graph left of the total: the total once a second over the last minute, the newest on the
-// right, scaled to the minute's peak. Its size is fixed and it sits before the text, so nothing in
-// the status bar moves as the numbers change; with nothing received in the last minute it is
-// blank (its place kept).
+// The graph left of the totals: each once a second over the last minute, the newest on the right,
+// scaled to the minute's peak of both: downloads in the accent colour over a shaded area, uploads
+// as a line of their own colour (only while they moved). Its size is fixed and it sits before the
+// text, so nothing in the status bar moves as the numbers change; with nothing moved in the last
+// minute it is blank (its place kept).
 const SPEED_SAMPLES = 60;
 const speedHist = [];
+const upHist = [];
 function sampleSpeed() {
   if (speedHist.length >= SPEED_SAMPLES) speedHist.shift();
+  if (upHist.length >= SPEED_SAMPLES) upHist.shift();
   speedHist.push(state.totalSpeed);
+  upHist.push(state.upSpeed);
   drawSpeedGraph();
 }
 
 function drawSpeedGraph() {
   const box = $('#speed-graph');
-  const peak = speedHist.reduce((m, v) => Math.max(m, v), 0);
+  const downPeak = speedHist.reduce((m, v) => Math.max(m, v), 0);
+  const upPeak = upHist.reduce((m, v) => Math.max(m, v), 0);
+  const peak = Math.max(downPeak, upPeak);
   box.classList.toggle('idle', !(peak > 0));
   if (!(peak > 0)) return;
-  const from = SPEED_SAMPLES - speedHist.length;
   const y = (v) => (15 - (14 * v) / peak).toFixed(1); // 1 px of room at the top
-  const line = speedHist.map((v, k) => `${k ? 'L' : 'M'}${from + k} ${y(v)}`).join('');
+  const path = (hist) => {
+    const from = SPEED_SAMPLES - hist.length;
+    return hist.map((v, k) => `${k ? 'L' : 'M'}${from + k} ${y(v)}`).join('');
+  };
+  const line = path(speedHist);
+  const from = SPEED_SAMPLES - speedHist.length;
   box.querySelector('.line').setAttribute('d', line);
   box.querySelector('.area').setAttribute('d', `${line}L${SPEED_SAMPLES - 1} 16L${from} 16Z`);
-  box.title = `Total speed over the last minute (peak ${fmtSpeed(peak)})`;
+  box.querySelector('.up-line').setAttribute('d', upPeak > 0 ? path(upHist) : '');
+  box.title = upPeak > 0
+    ? `Total speeds over the last minute: ↓ downloads (peak ${fmtSpeed(downPeak)}), ↑ uploads (peak ${fmtSpeed(upPeak)})`
+    : `Total speed over the last minute (peak ${fmtSpeed(peak)})`;
 }
 setInterval(sampleSpeed, 1000);
 
-// The speed schedule's part in the status bar: why the limit is what it is, and until when.
-function renderLimitHint() {
-  const l = state.limit;
-  const hint = $('#limit-hint');
+// The speed schedule's part in the status bar: why a limit is what it is, and until when. The
+// download limit's alone as before; the upload limit's marked ↑, both apart when they differ.
+function limitHintText(l) {
   const until = l.until ? ` until ${l.until}` : '';
-  if (l.source === 'schedule') hint.textContent = `Scheduled${until}`;
-  else if (l.source === 'change') hint.textContent = l.until ? `Schedule resumes at ${l.until}` : 'Schedule paused';
-  hint.hidden = l.source !== 'schedule' && l.source !== 'change';
+  if (l.source === 'schedule') return `Scheduled${until}`;
+  if (l.source === 'change') return l.until ? `Schedule resumes at ${l.until}` : 'Schedule paused';
+  return '';
+}
+
+function renderLimitHint() {
+  const d = limitHintText(state.limits.down);
+  const u = limitHintText(state.limits.up);
+  const hint = $('#limit-hint');
+  hint.textContent = !u ? d : !d ? `↑ ${u}` : d === u ? d : `↓ ${d} · ↑ ${u}`;
+  hint.hidden = !d && !u;
+  hint.title = `Speed schedule (Settings)${d ? `\nDownloads: ${d}` : ''}${u ? `\nUploads: ${u}` : ''}`;
 }
 
 function fmtLimit(v) {
@@ -4952,67 +5027,105 @@ function fmtLimit(v) {
 }
 
 function renderLimit() {
-  $('#limit-on').checked = state.limitOn;
-  const box = $('#limit-value');
-  box.disabled = !state.limitOn;
-  // Not over what is being typed; but a box only focused shows the speed that applies, so that
-  // leaving it doesn't set the one it showed before (a change by the schedule meanwhile).
-  if (document.activeElement !== box || !limitEdit.edited) box.value = fmtLimit(state.limitMiBps);
-  showLimitPending(); // the speed that applies may now be the one typed
+  for (const dir of LIMIT_DIRS) {
+    const c = limitCtl[dir];
+    const l = state.limits[dir];
+    c.sw.checked = l.on;
+    c.box.disabled = !l.on;
+    // Not over what is being typed; but a box only focused shows the speed that applies, so that
+    // leaving it doesn't set the one it showed before (a change by the schedule meanwhile).
+    if (document.activeElement !== c.box || !c.edited) c.box.value = fmtLimit(l.mibps);
+    showLimitPending(c); // the speed that applies may now be the one typed
+  }
   renderLimitHint();
   renderTotalSpeed();
 }
 
+// The backend's "limit": both directions' limits that apply, the rules, and with the answer to a
+// set its token and direction.
 function onLimit(msg) {
-  state.limitOn = msg.on;
-  state.limitMiBps = msg.mibps;
-  state.limit = msg;
+  for (const dir of LIMIT_DIRS) if (msg[dir]) state.limits[dir] = msg[dir];
   // Re-rendered only when they differ (by field: WebView2 hands over objects with sorted keys),
   // so the echo of an edit doesn't take the focus from the next field.
   const rules = msg.rules || [];
-  const key = (list) => JSON.stringify(list.map((r) => [r.days, r.from, r.to, r.mibps]));
+  const key = (list) => JSON.stringify(list.map((r) => [r.days, r.from, r.to, r.mibps, r.upMiBps]));
   if (key(rules) !== key(state.schedule)) {
     state.schedule = rules;
     renderSchedule();
   }
   renderLimit();
   renderScheduleNow();
-  if (msg.token !== undefined) confirmLimit(msg);
-  else {
+  for (const dir of LIMIT_DIRS) {
+    const c = limitCtl[dir];
+    if (msg.token !== undefined && (msg.dir || 'down') === dir) {
+      confirmLimit(c, msg);
+      continue;
+    }
     // Another change meanwhile (the schedule's, or an override ending): the badge would say a
     // limit that no longer applies.
-    const s = limitEdit.shown;
-    if (s && (msg.on !== s.on || (s.on && Math.abs(msg.mibps - s.mibps) > 1e-6))) endLimitBadge();
+    const s = c.shown;
+    const l = state.limits[dir];
+    if (s && (l.on !== s.on || (s.on && Math.abs(l.mibps - s.mibps) > 1e-6))) endLimitBadge(c);
   }
 }
 
-// Sets the limit to state.limitOn and limitMiBps. The backend answers with a 'limit' message that
-// carries the set's token (sent even when nothing changed), and confirmLimit shows it.
-function sendLimit() {
-  const token = ++limitEdit.token;
-  limitEdit.asked = { token, on: state.limitOn, mibps: state.limitMiBps };
-  send({ type: 'setLimit', on: state.limitOn, mibps: state.limitMiBps, token });
+// Sets a direction's limit to what state.limits has for it. The backend answers with a 'limit'
+// message that carries the set's token and direction (sent even when nothing changed), and
+// confirmLimit shows it.
+function sendLimit(c) {
+  const l = state.limits[c.dir];
+  const token = ++c.token;
+  c.asked = { token, on: l.on, mibps: l.mibps };
+  send({ type: 'setLimit', dir: c.dir, on: l.on, mibps: l.mibps, token });
 }
 
-// The MiB/s box. Typing only edits: Enter or leaving the box sets the value, and Escape puts the
-// speed that applies back and sets nothing. While the box holds a speed that isn't the one that
-// applies, it looks pending: a dashed amber border and "Enter to set" above it. One that isn't a
-// speed from 0.1 to 10000 MiB/s sets nothing, and the box says why (red, a note above it, from
-// LIMIT_NOTE_MS after typing stops: '0' on the way to '0.5' is no mistake) rather than snapping
-// back silently; leaving the box then puts the speed that applies back in it.
+// The MiB/s boxes, ↓ downloads' (#limit-*) and ↑ uploads' (#ulimit-*), each the same control
+// (limitControl) with its own switch, state and badge. Typing only edits: Enter or leaving the box
+// sets the value, and Escape puts the speed that applies back and sets nothing. While the box
+// holds a speed that isn't the one that applies, it looks pending: a dashed amber border and
+// "Enter to set" above it. One that isn't a speed from 0.1 to 10000 MiB/s sets nothing, and the
+// box says why (red, a note above it, from LIMIT_NOTE_MS after typing stops: '0' on the way to
+// '0.5' is no mistake) rather than snapping back silently; leaving the box then puts the speed
+// that applies back in it.
 // A set is confirmed only by the backend's answer to it, with the limit asked for: the box
-// flashes green with a check mark and a badge above it says "✓ Limit set · 12 MiB/s", fading
-// after LIMIT_BADGE_MS; the status bar then shows the limit for as long as it applies
-// (renderTotalSpeed). Enter on the speed that applies sets it again, for the reassurance; leaving
-// the box with it sets nothing. The switch confirms the same way ("Limit off", neutral). Changes
-// made by the speed schedule keep their own hint (renderLimitHint), no badge.
+// flashes green with a check mark and a badge above it says "✓ Download limit · 12 MiB/s" (or
+// "✓ Upload limit · 4 MiB/s"), fading after LIMIT_BADGE_MS; the status bar then shows the limit
+// for as long as it applies (renderTotalSpeed). Enter on the speed that applies sets it again, for
+// the reassurance; leaving the box with it sets nothing. The switch confirms the same way
+// ("Download limit off", neutral). Changes made by the speed schedule keep their own hint
+// (renderLimitHint), no badge.
 const LIMIT_WHY_MS = 4000;   // a refusal's note, once the box was left
 const LIMIT_NOTE_MS = 400;   // a refusal's note while typing, once typing stops
 const LIMIT_BADGE_MS = 1800; // the confirmation, before it fades
 const LIMIT_FADE_MS = 250;   // its fade (app.css .limit-badge.out)
-// `edited`: typed in since the box was focused (or since Enter or Escape). `shown`: what the
-// badge confirms ({ on, mibps }), while it shows.
-const limitEdit = { edited: false, typed: 0, why: 0, badge: 0, fade: 0, token: 0, asked: null, shown: null };
+const LIMIT_DIRS = ['down', 'up'];
+const LIMIT_WORDS = { down: 'Download', up: 'Upload' };
+
+// A direction's control: its elements, and `edited` (typed in since the box was focused, or since
+// Enter or Escape), the timers, the last set asked for and `shown` (what the badge confirms,
+// { on, mibps }, while it shows).
+function limitControl(dir) {
+  const id = (part) => $(`#${dir === 'up' ? 'ulimit' : 'limit'}-${part}`);
+  return {
+    dir,
+    word: LIMIT_WORDS[dir],
+    sw: id('on'),
+    box: id('value'),
+    wrap: id('box'),
+    why: id('why'),
+    tip: id('tip'),
+    badge: id('badge'),
+    edited: false,
+    typed: 0,
+    whyTimer: 0,
+    badgeTimer: 0,
+    fade: 0,
+    token: 0,
+    asked: null,
+    shown: null,
+  };
+}
+const limitCtl = { down: limitControl('down'), up: limitControl('up') };
 
 // The box's text as MiB/s: { mibps } or { why }.
 function limitValue(text) {
@@ -5025,96 +5138,95 @@ function limitValue(text) {
   return { mibps: v };
 }
 
-// Shows why the box's value can't be set (`why`), or nothing; `ms`: hidden again after that.
-function showLimitWhy(why, ms = 0) {
-  const note = $('#limit-why');
-  const box = $('#limit-value');
-  clearTimeout(limitEdit.why);
-  limitEdit.why = 0;
-  note.textContent = why || '';
-  note.hidden = !why;
-  box.classList.toggle('bad', !!why && document.activeElement === box);
-  box.setAttribute('aria-invalid', String(!!why && document.activeElement === box));
-  if (why && ms) limitEdit.why = setTimeout(() => showLimitWhy(''), ms);
-  showLimitPending();
+// Shows why control `c`'s box value can't be set (`why`), or nothing; `ms`: hidden again after that.
+function showLimitWhy(c, why, ms = 0) {
+  clearTimeout(c.whyTimer);
+  c.whyTimer = 0;
+  c.why.textContent = why || '';
+  c.why.hidden = !why;
+  c.box.classList.toggle('bad', !!why && document.activeElement === c.box);
+  c.box.setAttribute('aria-invalid', String(!!why && document.activeElement === c.box));
+  if (why && ms) c.whyTimer = setTimeout(() => showLimitWhy(c, ''), ms);
+  showLimitPending(c);
 }
 
 // The box's text is the speed that applies: not typed in (it shows that speed, rounded: '2.6' for
 // 2.55), or typed as that number ('12.0' for 12; '2.6' isn't 2.55).
-function isAppliedLimit(text) {
+function isAppliedLimit(c, text) {
   const v = limitValue(text);
-  return !limitEdit.edited || (v.mibps !== undefined && Math.abs(v.mibps - state.limitMiBps) < 1e-9);
+  return !c.edited || (v.mibps !== undefined && Math.abs(v.mibps - state.limits[c.dir].mibps) < 1e-9);
 }
 
 // The pending look, while the box (being edited) holds a speed other than the one that applies;
 // a note saying why a value doesn't set takes its place above the box.
-function showLimitPending() {
-  const box = $('#limit-value');
-  const pending = state.limitOn && document.activeElement === box && limitValue(box.value).mibps !== undefined &&
-    !isAppliedLimit(box.value);
-  $('#limit-box').classList.toggle('pending', pending);
-  $('#limit-tip').hidden = !pending || !$('#limit-why').hidden;
-  if (pending || !$('#limit-why').hidden) endLimitBadge();
+function showLimitPending(c) {
+  const pending = state.limits[c.dir].on && document.activeElement === c.box &&
+    limitValue(c.box.value).mibps !== undefined && !isAppliedLimit(c, c.box.value);
+  c.wrap.classList.toggle('pending', pending);
+  c.tip.hidden = !pending || !c.why.hidden;
+  if (pending || !c.why.hidden) endLimitBadge(c);
 }
 
-function onLimitTyped() {
-  limitEdit.edited = true;
-  clearTimeout(limitEdit.typed);
-  limitEdit.typed = 0;
-  const v = limitValue($('#limit-value').value);
-  if (!v.why) showLimitWhy('');
-  else if (!$('#limit-why').hidden) showLimitWhy(v.why); // saying why already: the new reason at once
+function onLimitTyped(c) {
+  c.edited = true;
+  clearTimeout(c.typed);
+  c.typed = 0;
+  const v = limitValue(c.box.value);
+  if (!v.why) showLimitWhy(c, '');
+  else if (!c.why.hidden) showLimitWhy(c, v.why); // saying why already: the new reason at once
   else {
-    limitEdit.typed = setTimeout(() => {
-      limitEdit.typed = 0;
-      showLimitWhy(v.why);
+    c.typed = setTimeout(() => {
+      c.typed = 0;
+      showLimitWhy(c, v.why);
     }, LIMIT_NOTE_MS);
-    showLimitPending();
+    showLimitPending(c);
   }
 }
 
 // Enter (`enter`) or leaving the box: a speed sets the limit (on leaving, only one typed that isn't
 // the speed that applies); one that isn't a speed is said. The speed that applies goes back in the
 // box.
-function commitLimitValue(enter) {
-  clearTimeout(limitEdit.typed);
-  limitEdit.typed = 0;
-  const box = $('#limit-value');
-  const v = limitValue(box.value);
-  if (enter || limitEdit.edited) {
+function commitLimitValue(c, enter) {
+  clearTimeout(c.typed);
+  c.typed = 0;
+  const l = state.limits[c.dir];
+  const v = limitValue(c.box.value);
+  if (enter || c.edited) {
     if (v.why) {
-      showLimitWhy(v.why, LIMIT_WHY_MS);
-    } else if (enter || !isAppliedLimit(box.value)) {
-      showLimitWhy('');
+      showLimitWhy(c, v.why, LIMIT_WHY_MS);
+    } else if (enter || !isAppliedLimit(c, c.box.value)) {
+      showLimitWhy(c, '');
       // Not typed in: the speed that applies, exactly (the box shows it rounded).
-      if (limitEdit.edited) state.limitMiBps = v.mibps;
-      sendLimit();
+      if (c.edited) l.mibps = v.mibps;
+      sendLimit(c);
     }
   }
-  limitEdit.edited = false;
-  box.value = fmtLimit(state.limitMiBps);
-  box.classList.remove('bad');
-  box.setAttribute('aria-invalid', 'false');
-  showLimitPending();
+  c.edited = false;
+  c.box.value = fmtLimit(l.mibps);
+  c.box.classList.remove('bad');
+  c.box.setAttribute('aria-invalid', 'false');
+  showLimitPending(c);
 }
 
 // Escape: the speed that applies back in the box; nothing is set.
-function cancelLimitEdit() {
-  limitEdit.edited = false;
-  clearTimeout(limitEdit.typed);
-  limitEdit.typed = 0;
-  $('#limit-value').value = fmtLimit(state.limitMiBps);
-  showLimitWhy('');
+function cancelLimitEdit(c) {
+  c.edited = false;
+  clearTimeout(c.typed);
+  c.typed = 0;
+  c.box.value = fmtLimit(state.limits[c.dir].mibps);
+  showLimitWhy(c, '');
 }
 
-// The backend's answer to a set (its token): confirmed when the limit asked for is the one that
-// applies now. An answer to an earlier set, overtaken by a later one, shows nothing.
-function confirmLimit(msg) {
-  const asked = limitEdit.asked;
+// The backend's answer to a set (its token, for this control's direction): confirmed when the
+// limit asked for is the one that applies now. An answer to an earlier set, overtaken by a later
+// one, shows nothing.
+function confirmLimit(c, msg) {
+  const asked = c.asked;
   if (!asked || msg.token !== asked.token) return;
-  limitEdit.asked = null;
-  if (msg.on !== asked.on || (asked.on && Math.abs(msg.mibps - asked.mibps) > 1e-6)) return; // not what applies
-  showLimitSet(asked.on ? msg.mibps : null);
+  c.asked = null;
+  const l = state.limits[c.dir];
+  if (l.on !== asked.on || (asked.on && Math.abs(l.mibps - asked.mibps) > 1e-6)) return; // not what applies
+  showLimitSet(c, asked.on ? l.mibps : null);
 }
 
 // The confirmation: the box flashes green with a check mark (a limit set), and the badge above it
@@ -5122,49 +5234,47 @@ function confirmLimit(msg) {
 // Another set meanwhile starts it again from the beginning. Not while a value typed meanwhile
 // waits to be set (after the switch, which puts the focus in the box): "Enter to set" has the
 // place above the box then.
-function showLimitSet(mibps) {
-  const wrap = $('#limit-box');
-  const badge = $('#limit-badge');
-  endLimitBadge();
-  showLimitWhy('');
-  if (wrap.classList.contains('pending')) return;
-  void badge.offsetWidth; // the animations start again
+function showLimitSet(c, mibps) {
+  endLimitBadge(c);
+  showLimitWhy(c, '');
+  if (c.wrap.classList.contains('pending')) return;
+  void c.badge.offsetWidth; // the animations start again
   const on = mibps !== null;
-  const shown = badge.querySelector('.shown');
+  const shown = c.badge.querySelector('.shown');
   if (on) {
     const mark = document.createElement('span');
     mark.className = 'mark';
     mark.textContent = '✓';
-    shown.replaceChildren(mark, ` Limit set · ${fmtMiBps(mibps)}`);
+    shown.replaceChildren(mark, ` ${c.word} limit · ${fmtMiBps(mibps)}`);
   } else {
-    shown.textContent = 'Limit off';
+    shown.textContent = `${c.word} limit off`;
   }
-  badge.querySelector('.said').textContent = on ? `Speed limit set to ${fmtMiBps(mibps)}` : 'Speed limit off';
-  badge.classList.toggle('off', !on);
-  badge.classList.add('show');
-  limitEdit.shown = { on, mibps };
-  wrap.classList.toggle('set', on);
-  limitEdit.badge = setTimeout(() => {
-    limitEdit.badge = 0;
-    badge.classList.add('out');
-    wrap.classList.remove('set');
-    limitEdit.fade = setTimeout(endLimitBadge, LIMIT_FADE_MS);
+  c.badge.querySelector('.said').textContent = on ? `${c.word} speed limit set to ${fmtMiBps(mibps)}`
+    : `${c.word} speed limit off`;
+  c.badge.classList.toggle('off', !on);
+  c.badge.classList.add('show');
+  c.shown = { on, mibps };
+  c.wrap.classList.toggle('set', on);
+  c.badgeTimer = setTimeout(() => {
+    c.badgeTimer = 0;
+    c.badge.classList.add('out');
+    c.wrap.classList.remove('set');
+    c.fade = setTimeout(() => endLimitBadge(c), LIMIT_FADE_MS);
   }, LIMIT_BADGE_MS);
 }
 
 // The badge and the box's flash gone, at once: at the end of the fade, or when what is typed
 // next (pending, or why it can't be set) takes the place above the box.
-function endLimitBadge() {
-  clearTimeout(limitEdit.badge);
-  clearTimeout(limitEdit.fade);
-  limitEdit.badge = 0;
-  limitEdit.fade = 0;
-  limitEdit.shown = null;
-  const badge = $('#limit-badge');
-  badge.classList.remove('show', 'out', 'off');
-  $('#limit-box').classList.remove('set');
-  badge.querySelector('.shown').textContent = '';
-  badge.querySelector('.said').textContent = '';
+function endLimitBadge(c) {
+  clearTimeout(c.badgeTimer);
+  clearTimeout(c.fade);
+  c.badgeTimer = 0;
+  c.fade = 0;
+  c.shown = null;
+  c.badge.classList.remove('show', 'out', 'off');
+  c.wrap.classList.remove('set');
+  c.badge.querySelector('.shown').textContent = '';
+  c.badge.querySelector('.said').textContent = '';
 }
 
 function renderParallel() {
@@ -5362,19 +5472,29 @@ function parseTime(text, allow24) {
 // The end as people say it: midnight is "24:00" (kept as "00:00", the way the backend does).
 function toText(to) { return to === '00:00' ? '24:00' : to; }
 
+// A rule's speeds, by their keys in the backend's JSON: downloads (↓) 'mibps', uploads (↑)
+// 'upMiBps'; a direction the rule doesn't limit has none (its box blank).
+const RULE_SPEEDS = { mibps: { arrow: '↓', what: 'Download' }, upMiBps: { arrow: '↑', what: 'Upload' } };
+function ruleSpeedText(r, field) { return r[field] === undefined ? '' : fmtLimit(r[field]); }
+
 function ruleRow(r, i) {
   const days = DAYS.map((d, k) =>
     `<button type="button" data-day="${d}" aria-pressed="${r.days.includes(d)}" title="${DAY_NAMES[k]}">${DAY_LABELS[k]}</button>`).join('');
   const nextDay = r.to !== '00:00' && r.to <= r.from;
+  const speeds = Object.entries(RULE_SPEEDS).map(([field, s]) =>
+    `<span class="rule-dir" aria-hidden="true">${s.arrow}</span>` +
+    `<input type="text" class="num" data-field="${field}" value="${ruleSpeedText(r, field)}" inputmode="decimal" placeholder="–" ` +
+    `aria-label="${s.what} speed in MiB/s" title="${s.what}s at most this fast at these times; blank: not limited by this time">`).join('');
   return `<div class="rule" data-i="${i}">` +
     `<span class="segmented days" role="group" aria-label="Days">${days}</span>` +
     `<input type="text" class="time" data-field="from" value="${r.from}" aria-label="From" spellcheck="false">` +
     '<span class="muted">–</span>' +
     `<input type="text" class="time" data-field="to" value="${toText(r.to)}" aria-label="To" spellcheck="false">` +
     `<span class="next-day muted${nextDay ? '' : ' off'}">next day</span>` +
-    `<input type="text" class="num" data-field="mibps" value="${fmtLimit(r.mibps)}" inputmode="decimal" aria-label="Speed in MiB/s">` +
+    speeds +
     '<span class="muted">MiB/s</span>' +
     '<button type="button" class="subtle icon-btn" data-act="remove" title="Remove this time" aria-label="Remove this time">✕</button>' +
+    '<span class="rule-why" role="status" hidden></span>' +
     '</div>';
 }
 
@@ -5383,35 +5503,71 @@ function renderSchedule() {
   $('#schedule-add').disabled = state.schedule.length >= MAX_RULES;
 }
 
-function renderScheduleNow() {
-  const l = state.limit;
-  const el = $('#schedule-now');
+// Where the schedule has a direction at now: the limit it sets, or none and its next. With rules for
+// downloads only, as before uploads came; otherwise each direction marked.
+function scheduleNowText(l) {
   const until = l.until ? ` until ${l.until}` : '';
+  if (l.source === 'schedule') return `Now: ${fmtMiBps(l.mibps)}${l.until ? until : ', all week'}`;
+  if (l.source === 'change') return `Now: ${l.on ? fmtMiBps(l.mibps) : 'no limit'} (your change)${until}`;
+  if (l.until && l.nextMiBps) return `No scheduled limit now; next: ${l.until} at ${fmtMiBps(l.nextMiBps)}`;
+  return 'No scheduled limit now';
+}
+
+function renderScheduleNow() {
+  const el = $('#schedule-now');
+  const has = (field) => state.schedule.some((r) => r[field] !== undefined);
+  const down = scheduleNowText(state.limits.down);
+  const up = scheduleNowText(state.limits.up);
   if (!state.schedule.length) el.textContent = '';
-  else if (l.source === 'schedule') el.textContent = `Now: ${fmtMiBps(l.mibps)}${l.until ? until : ', all week'}`;
-  else if (l.source === 'change') el.textContent = `Now: ${l.on ? fmtMiBps(l.mibps) : 'no limit'} (your change)${until}`;
-  else if (l.until && l.nextMiBps) el.textContent = `No scheduled limit now; next: ${l.until} at ${fmtMiBps(l.nextMiBps)}`;
-  else el.textContent = 'No scheduled limit now';
+  else if (!has('upMiBps')) el.textContent = down;
+  else if (!has('mibps')) el.textContent = `↑ ${up}`;
+  else el.textContent = `↓ ${down} · ↑ ${up}`;
 }
 
 function sendSchedule() {
   send({ type: 'setSchedule', rules: state.schedule });
 }
 
-// A field of a rule was edited: a valid value is kept and sent, anything else snaps back.
+// Why a rule's field didn't take what was typed: said beside the row for a while.
+function showRuleWhy(row, why) {
+  const note = row.querySelector('.rule-why');
+  clearTimeout(Number(note.dataset.timer || 0));
+  note.textContent = why;
+  note.hidden = !why;
+  if (why) note.dataset.timer = String(setTimeout(() => { note.hidden = true; note.textContent = ''; }, LIMIT_WHY_MS));
+}
+
+// A field of a rule was edited: a valid value is kept and sent, anything else snaps back (a speed
+// that isn't one says why). A blank speed box: that direction isn't limited by the rule, as long
+// as the other one is.
 function commitRuleField(input) {
-  const i = Number(input.closest('.rule').dataset.i);
+  const row = input.closest('.rule');
+  const i = Number(row.dataset.i);
   const r = state.schedule[i];
   if (!r) return;
   const field = input.dataset.field;
   let changed = false;
-  if (field === 'mibps') {
-    const v = Number(input.value.trim().replace(',', '.'));
-    if (Number.isFinite(v) && v >= 0.1 && v <= 10000) {
-      changed = Math.abs(v - r.mibps) > 1e-9;
-      r.mibps = v;
+  if (RULE_SPEEDS[field]) {
+    const other = field === 'mibps' ? 'upMiBps' : 'mibps';
+    const t = input.value.trim();
+    if (!t) {
+      if (r[field] !== undefined && r[other] === undefined) {
+        showRuleWhy(row, 'A time needs a speed: ↓ for downloads, ↑ for uploads, or both');
+      } else if (r[field] !== undefined) {
+        delete r[field];
+        changed = true;
+        showRuleWhy(row, '');
+      }
+    } else {
+      const v = limitValue(t);
+      if (v.why) showRuleWhy(row, v.why);
+      else {
+        changed = r[field] === undefined || Math.abs(v.mibps - r[field]) > 1e-9;
+        r[field] = v.mibps;
+        showRuleWhy(row, '');
+      }
     }
-    input.value = fmtLimit(r.mibps);
+    input.value = ruleSpeedText(r, field);
   } else {
     const t = parseTime(input.value, field === 'to');
     if (t) {
@@ -5464,7 +5620,7 @@ $('#schedule-rules').addEventListener('keydown', (ev) => {
   else if (ev.key === 'Escape') {
     const r = state.schedule[Number(input.closest('.rule').dataset.i)];
     const f = input.dataset.field;
-    input.value = f === 'mibps' ? fmtLimit(r.mibps) : f === 'to' ? toText(r.to) : r.from;
+    input.value = RULE_SPEEDS[f] ? ruleSpeedText(r, f) : f === 'to' ? toText(r.to) : r.from;
     input.blur();
   }
 });
@@ -6438,27 +6594,29 @@ $('#dl-show').addEventListener('change', (ev) => setDlShow(ev.target.value));
 $('#dl-go').addEventListener('click', goToRunning);
 $('#pause-all').addEventListener('click', (ev) => send({ type: ev.currentTarget.dataset.act || 'pauseAll' }));
 $('#cancel-all').addEventListener('click', cancelAll);
-$('#limit-on').addEventListener('change', (ev) => {
-  state.limitOn = ev.target.checked;
-  renderLimit();
-  sendLimit();
-  // The box focused with its text selected, so a speed typed replaces the one shown (with the
-  // caret at its start, 6 typed over 8 made 68).
-  if (state.limitOn) {
-    $('#limit-value').focus();
-    $('#limit-value').select();
-  }
-});
-$('#limit-value').addEventListener('input', onLimitTyped);
-// The window losing focus (Alt+Tab, minimized) blurs the box too but leaves it the active element:
-// the user didn't leave it, so nothing is set; the typed value and its pending look wait.
-$('#limit-value').addEventListener('blur', (ev) => {
-  if (document.activeElement !== ev.target) commitLimitValue(false);
-});
-$('#limit-value').addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter') { ev.preventDefault(); commitLimitValue(true); ev.target.blur(); }
-  else if (ev.key === 'Escape') { cancelLimitEdit(); ev.target.blur(); }
-});
+for (const c of Object.values(limitCtl)) {
+  c.sw.addEventListener('change', (ev) => {
+    state.limits[c.dir].on = ev.target.checked;
+    renderLimit();
+    sendLimit(c);
+    // The box focused with its text selected, so a speed typed replaces the one shown (with the
+    // caret at its start, 6 typed over 8 made 68).
+    if (state.limits[c.dir].on) {
+      c.box.focus();
+      c.box.select();
+    }
+  });
+  c.box.addEventListener('input', () => onLimitTyped(c));
+  // The window losing focus (Alt+Tab, minimized) blurs the box too but leaves it the active
+  // element: the user didn't leave it, so nothing is set; the typed value and its pending look wait.
+  c.box.addEventListener('blur', (ev) => {
+    if (document.activeElement !== ev.target) commitLimitValue(c, false);
+  });
+  c.box.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commitLimitValue(c, true); ev.target.blur(); }
+    else if (ev.key === 'Escape') { cancelLimitEdit(c); ev.target.blur(); }
+  });
+}
 $('#parallel-down').addEventListener('click', () => setParallel(state.parallel - 1));
 $('#parallel-up').addEventListener('click', () => setParallel(state.parallel + 1));
 

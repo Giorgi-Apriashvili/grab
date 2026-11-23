@@ -133,6 +133,46 @@ json::Value downloads_view_to_json(const DownloadsView& v) {
 
 namespace {
 
+// A limit's switch and its MiB/s ("limitOn" + "limitMiBps", or the upload limit's keys): what of
+// them is valid goes into `on` and `mibps`.
+void limit_from(const json::Value& doc, const char* on_key, const char* mibps_key, bool& on, double& mibps) {
+    if (const auto* v = doc.find(on_key); v != nullptr && v->kind == json::Value::Kind::boolean) on = v->boolean;
+    if (const auto* v = doc.find(mibps_key); v != nullptr && v->kind == json::Value::Kind::number &&
+                                             v->number >= min_limit_mibps && v->number <= max_limit_mibps) {
+        mibps = v->number;
+    }
+}
+
+// A change of a limit made during the schedule ("limitChange", "uploadLimitChange"); nullopt for
+// anything broken.
+std::optional<schedule::Override> override_from(const json::Value* c) {
+    if (c == nullptr || c->kind != json::Value::Kind::object) return std::nullopt;
+    const auto* on = c->find("on");
+    const auto* mibps = c->find("mibps");
+    const auto* scheduled = c->find("scheduled");
+    const auto* until = c->find("until");
+    auto in_range = [](const json::Value* v) {
+        return v != nullptr && v->kind == json::Value::Kind::number && v->number >= min_limit_mibps &&
+               v->number <= max_limit_mibps;
+    };
+    if (on == nullptr || on->kind != json::Value::Kind::boolean || !in_range(mibps) || !in_range(scheduled) ||
+        until == nullptr || until->kind != json::Value::Kind::number || until->number <= 0 || until->number >= 1e15) {
+        return std::nullopt;
+    }
+    return schedule::Override{.limit = {.on = on->boolean, .mibps = mibps->number},
+                              .scheduled = scheduled->number,
+                              .until = static_cast<std::int64_t>(until->number)};
+}
+
+json::Value override_to_json(const schedule::Override& o) {
+    json::Value c = json::Value::make_object();
+    c.set("on", json::Value::make_bool(o.limit.on));
+    c.set("mibps", json::Value::make_number(o.limit.mibps));
+    c.set("scheduled", json::Value::make_number(o.scheduled));
+    c.set("until", json::Value::make_number(static_cast<double>(o.until)));
+    return c;
+}
+
 GuiState gui_state_from(const json::Value* doc) {
     GuiState s;
     if (doc == nullptr || doc->kind != json::Value::Kind::object) return s;
@@ -176,29 +216,11 @@ GuiState gui_state_from(const json::Value* doc) {
     if (const auto e = upload::parse_existing(doc->string_of("uploadExisting").value_or(""))) {
         s.upload_existing = std::string(upload::name(*e));
     }
-    if (const auto* on = doc->find("limitOn"); on != nullptr && on->kind == json::Value::Kind::boolean) {
-        s.limit_on = on->boolean;
-    }
-    if (const auto* v = doc->find("limitMiBps"); v != nullptr && v->kind == json::Value::Kind::number &&
-                                                  v->number >= min_limit_mibps && v->number <= max_limit_mibps) {
-        s.limit_mibps = v->number;
-    }
+    limit_from(*doc, "limitOn", "limitMiBps", s.limit_on, s.limit_mibps);
+    limit_from(*doc, "uploadLimitOn", "uploadLimitMiBps", s.upload_limit_on, s.upload_limit_mibps);
     if (const auto* rules = doc->find("speedSchedule")) s.speed_schedule = schedule::from_json(*rules);
-    if (const auto* c = doc->find("limitChange"); c != nullptr && c->kind == json::Value::Kind::object) {
-        const auto* on = c->find("on");
-        const auto* mibps = c->find("mibps");
-        const auto* scheduled = c->find("scheduled");
-        const auto* until = c->find("until");
-        auto in_range = [](const json::Value* v) {
-            return v != nullptr && v->kind == json::Value::Kind::number && v->number >= min_limit_mibps &&
-                   v->number <= max_limit_mibps;
-        };
-        if (on != nullptr && on->kind == json::Value::Kind::boolean && in_range(mibps) && in_range(scheduled) &&
-            until != nullptr && until->kind == json::Value::Kind::number && until->number > 0 && until->number < 1e15) {
-            s.limit_change = schedule::Override{{on->boolean, mibps->number}, scheduled->number,
-                                                static_cast<std::int64_t>(until->number)};
-        }
-    }
+    s.limit_change = override_from(doc->find("limitChange"));
+    s.upload_limit_change = override_from(doc->find("uploadLimitChange"));
     if (const auto* l = doc->find("serverLimits"); l != nullptr && l->kind == json::Value::Kind::object) {
         for (std::size_t i = 0; i < l->keys.size(); ++i) {
             if (auto n = number(&l->items[i]); n && *n >= 1) s.server_limits[l->keys[i]] = *n;
@@ -270,14 +292,12 @@ std::string gui_state_to_json(const GuiState& state) {
     root.set("limitOn", Value::make_bool(state.limit_on));
     root.set("limitMiBps", Value::make_number(state.limit_mibps));
     root.set("speedSchedule", schedule::to_json(state.speed_schedule));
-    if (state.limit_change) {
-        Value c = Value::make_object();
-        c.set("on", Value::make_bool(state.limit_change->limit.on));
-        c.set("mibps", Value::make_number(state.limit_change->limit.mibps));
-        c.set("scheduled", Value::make_number(state.limit_change->scheduled));
-        c.set("until", Value::make_number(static_cast<double>(state.limit_change->until)));
-        root.set("limitChange", std::move(c));
-    }
+    if (state.limit_change) root.set("limitChange", override_to_json(*state.limit_change));
+    // The upload limit's own keys: an older grab reads the ones above as the download limit, as it
+    // wrote them.
+    root.set("uploadLimitOn", Value::make_bool(state.upload_limit_on));
+    root.set("uploadLimitMiBps", Value::make_number(state.upload_limit_mibps));
+    if (state.upload_limit_change) root.set("uploadLimitChange", override_to_json(*state.upload_limit_change));
     Value timings = Value::make_object();
     for (const auto& [step, ms] : state.timings) timings.set(step, Value::make_number(ms));
     root.set("timings", std::move(timings));

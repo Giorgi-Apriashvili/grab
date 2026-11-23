@@ -901,8 +901,16 @@ Sent send_all(const Job& job, Record& rec, const std::function<void(const fetch:
                 }
                 // While Play on this server warms up or waits for bytes, its depth (urgent).
                 const int depth = connections.read_depth(u.server, write_depth);
+                bool new_limit = false; // switched on while sending: looked at before anything more goes
                 if (seen.rate == 0) {
                     while (sending && in_flight < depth && !token.stop_requested()) {
+                        // Each WRITE's flush waits while the server's SSH window is full and takes the
+                        // replies that came meanwhile, so the caps above may never be reached: without
+                        // this look the whole range would go before a limit switched on is seen.
+                        if (u.limiter != nullptr && u.limiter->generation() != seen.generation) {
+                            new_limit = true;
+                            break;
+                        }
                         const std::uint64_t n = next_length(job.caps.write);
                         if (n == 0) {
                             sending = false;
@@ -957,6 +965,7 @@ Sent send_all(const Job& job, Record& rec, const std::function<void(const fetch:
                 if (token.stop_requested() || (in_flight == 0 && !sending) ||
                     (stepped_aside && bytes_in_flight > fetch::hand_over_max))
                     break;
+                if (new_limit) continue;
                 if (in_flight > 0) c.pump();
                 // else: waiting for its tokens ended with a new rate, looked at on the next pass
             }

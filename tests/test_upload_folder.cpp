@@ -11,9 +11,11 @@
 #include "fetch.hpp"
 #include "folder.hpp"
 #include "folder_job.hpp"
+#include "folder_sched.hpp"
 #include "local_walk.hpp"
 #include "rate.hpp"
 #include "rclone_encoding.hpp"
+#include "sftp.hpp"
 #include "ssh_pool.hpp"
 #include "upload.hpp"
 #include "upload_existing.hpp"
@@ -37,6 +39,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -887,6 +890,205 @@ TEST_CASE("folder uploads: under a speed limit, small files' WRITEs are as small
         CHECK(w.length <= fetch::limited_read(rate, 1));
         CHECK(w.out_bytes <= fetch::limited_in_flight(rate, 1)); // the client had at least this much on its way
     }
+}
+
+TEST_CASE("folder uploads: small files: a limit switched on below what a connection has on its way drops it; they land whole over a new login") {
+    // The window's upload limit (↑, UPLOADS.md 6.1) as downloads' (test_folder_grab.cpp): unlimited,
+    // a small-file connection has up to 8 MiB of WRITEs on their way, which nothing calls back. A
+    // limit switched on below that drops the connection; its files go again over a new login and
+    // land whole, no temp left.
+    Dir d("limit-cut");
+    const fs::path src = d.path / "src";
+    std::map<std::string, std::string> contents;
+    for (std::size_t i = 0; i < 24; ++i) {
+        const auto name = std::format("m{:02}.bin", i);
+        contents[name] = content_of((std::size_t{1} << 20) - 4096 * i, i); // below small_limit
+        put_local(src, name, contents[name]);
+    }
+    Server server;
+    server.fake.latency = std::chrono::milliseconds(200); // WRITEs stay on their way a while
+    Up up(server, src, "/up/src", 2);
+    rate::RateLimiter limiter; // unlimited at the start
+    up.job.limiter = &limiter;
+    std::mutex came_m;
+    std::vector<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>> came; // every acknowledgement
+    std::atomic<std::uint64_t> acked{0};
+    up.job.on_sent = [&](std::uint64_t n) {
+        std::lock_guard lock(came_m);
+        came.emplace_back(std::chrono::steady_clock::now(), n);
+        acked += n;
+    };
+    up.walk();
+    bool switched = false;
+    std::chrono::steady_clock::time_point switched_at;
+    {
+        std::jthread run([&] { up.run(); });
+        // Switched on from outside, as the window's box does, while the connections wait for
+        // acknowledgements with megabytes on their way: each looks at the new limit after the
+        // next one it reads.
+        for (int i = 0; i < 2000 && acked.load() < (std::uint64_t{2} << 20); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        switched_at = std::chrono::steady_clock::now();
+        const std::uint64_t acked_then = acked.load();
+        limiter.set_rate(std::uint64_t{1} << 20);
+        switched = true;
+        // Until some was sent under the limit (each connection looked at it before sending more).
+        for (int i = 0; i < 2000 && acked.load() < acked_then + (std::uint64_t{256} << 10); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        limiter.set_rate(0); // the rest at full speed
+    }
+    std::uint64_t first = 0; // what the server acknowledged in the first half second after the switch
+    {
+        std::lock_guard lock(came_m);
+        for (const auto& [at, n] : came) {
+            if (at > switched_at && at - switched_at < std::chrono::milliseconds(500)) first += n;
+        }
+    }
+    // Printed only: acknowledgements of WRITEs sent before the switch that had come by then are
+    // counted as the connection reads them, before it looks at the new limit.
+    MESSAGE("acknowledged in the first half second after the switch: ", first, " bytes");
+    for (const auto& f : up.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    for (const auto& [name, content] : contents) CHECK_MESSAGE(server.file("/up/src/" + name) == content, name);
+    CHECK(switched);
+    CHECK(server.temps().empty());
+    // Dropped, not charged: the WRITEs it had on its way reached the server but were never
+    // acknowledged to it, and their files went again (a connection charged instead sends each
+    // byte once; seen so with the drop taken out). Not a failure either (above). A new login isn't
+    // the sign: the pool may hand over the connection the folder was prepared on, idle by then.
+    up.close();
+    std::uint64_t total = 0;
+    for (const auto& [name, content] : contents) total += content.size();
+    std::uint64_t written = 0;
+    for (const auto& w : server.fake.writes) written += w.length;
+    MESSAGE("written ", written, " bytes for ", total);
+    CHECK(written > total);
+}
+
+TEST_CASE("folder uploads: small files: a limit switched on while each WRITE's reply comes before the next goes takes hold at once") {
+    // Live on Main (chunk 6, L6b): a flush that waits for the SSH window takes the replies that
+    // came meanwhile, so an unlimited connection never reached its 8 MiB, and a limit switched on
+    // was seen only after every file it had open was sent (many megabytes over in the first
+    // seconds). Here each WRITE's send takes a while and its reply is there at once.
+    Dir d("limit-paced");
+    const fs::path src = d.path / "src";
+    std::map<std::string, std::string> contents;
+    for (std::size_t i = 0; i < 24; ++i) {
+        const auto name = std::format("p{:02}.bin", i);
+        contents[name] = content_of((std::size_t{1} << 20) - 4096 * i, i); // below small_limit
+        put_local(src, name, contents[name]);
+    }
+    Server server;
+    server.fake.write_pace = std::chrono::milliseconds(2);
+    server.fake.max_write = std::uint32_t{1} << 20; // a file a send: far over the limit if it isn't looked at
+    Up up(server, src, "/up/src", 1);
+    rate::RateLimiter limiter; // unlimited at the start
+    up.job.limiter = &limiter;
+    constexpr std::uint64_t rate = std::uint64_t{512} << 10;
+    std::atomic<std::uint64_t> acked{0};
+    std::uint64_t acked_at_switch = 0;
+    std::chrono::steady_clock::time_point switched_at;
+    std::atomic<bool> switched{false};
+    // Switched on from the connection's own thread, between two WRITEs, as soon as 2 MiB came back.
+    up.job.on_sent = [&](std::uint64_t n) {
+        acked += n;
+        if (switched.load() || acked.load() < (std::uint64_t{2} << 20)) return;
+        acked_at_switch = acked.load();
+        switched_at = std::chrono::steady_clock::now();
+        limiter.set_rate(rate);
+        switched = true;
+    };
+    up.walk();
+    std::uint64_t after = 0;
+    double seconds = 0;
+    {
+        std::jthread run([&] { up.run(); });
+        for (int i = 0; i < 4000 && !switched.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        REQUIRE(switched.load());
+        std::this_thread::sleep_until(switched_at + std::chrono::seconds(1));
+        after = acked.load() - acked_at_switch;
+        seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - switched_at).count();
+        limiter.set_rate(0); // the rest at full speed
+    }
+    // At the limit from the switch on: its rate, the bucket's first quarter second and what the
+    // connection had on its way, a WRITE or two (kept and charged, or dropped and sent again under
+    // the limit). Not looked at, every file it had open went: up to 8 MiB.
+    MESSAGE("acknowledged in ", seconds, " s after the switch: ", after, " bytes");
+    CHECK(static_cast<double>(after) <= static_cast<double>(rate) * seconds + static_cast<double>(std::uint64_t{2} << 20));
+    for (const auto& f : up.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
+    for (const auto& [name, content] : contents) CHECK_MESSAGE(server.file("/up/src/" + name) == content, name);
+    CHECK(server.temps().empty());
+}
+
+TEST_CASE("folder uploads: a small-file turn a new limit cut keeps its connection's seat, so another transfer can't hold the folder up") {
+    // Live on Main (chunk 6, L6b): the cut turn gave its seat back, a download waiting for one took
+    // it until one of its ranges ended (minutes at its limit), and the folder stayed "Uploading"
+    // with every file done, its worker waiting for a seat. Driven through the scheduler itself: the
+    // first turn is cut while the other transfer waits; the second lands the file.
+    Server server;
+    auto pool = server.fake.pool(2);
+    fetch::Connections connections;
+    connections.configure("Fake", 2);
+    connections.join("Fake", 7);
+    connections.join("Fake", 9); // the other transfer
+    // The folder's other connection (a big file's), held throughout: with it, a seat given back
+    // goes to the other transfer first, which has none (fetch::Connections' rule).
+    REQUIRE(connections.acquire("Fake", 7, {}, false));
+    upload::FolderJob job;
+    job.connections = &connections;
+    job.server = "Fake";
+    job.id = 7;
+    job.pool = pool;
+    folder::Tree tree;
+    tree.files.push_back(folder::make_file("a.bin", 10, "2026-11-24T00:00:00Z"));
+    tree.small_claim = 1; // as sched::run sets it
+    std::mutex m;
+    std::stop_source other_stop;
+    std::atomic<bool> other_waits{false};
+    std::jthread other;
+    int turns = 0;
+    auto small_on = [&](std::uint32_t, sftp::Client&, const std::stop_token&, std::vector<std::size_t>& carried) {
+        folder::sched::SmallRun run;
+        if (++turns == 1) {
+            // The other transfer asks for a seat (all taken), holding the one it gets for 10 s.
+            other = std::jthread([&] {
+                other_waits = true;
+                if (!connections.acquire("Fake", 9, other_stop.get_token(), false)) return;
+                for (int i = 0; i < 1000 && !other_stop.stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                connections.release("Fake", 9);
+            });
+            for (int i = 0; i < 2000 && !(other_waits.load() && connections.others_present("Fake", 7)); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            {
+                std::lock_guard lock(m);
+                tree.files[0].status = folder::State::running;
+            }
+            carried.push_back(0);
+            run.cut = true;
+            return run;
+        }
+        carried.clear();
+        {
+            std::lock_guard lock(m);
+            tree.files[0].status = folder::State::done;
+        }
+        run.landed = 1;
+        return run;
+    };
+    const auto started = std::chrono::steady_clock::now();
+    folder::sched::run_small(job, tree, m, 1, std::stop_token{}, small_on);
+    const auto took = std::chrono::steady_clock::now() - started;
+    connections.release("Fake", 7);
+    other_stop.request_stop();
+    if (other.joinable()) other.join();
+    CHECK(other_waits.load());
+    CHECK(turns == 2);
+    CHECK(tree.files[0].status == folder::State::done);
+    // Given back at the cut, the seat went to the other transfer, which held it 10 s.
+    CHECK(took < std::chrono::seconds(5));
+    CHECK(tree.small_connections == 0);
 }
 
 TEST_CASE("folder uploads: cancel removes the temps and the empty folders this upload made, and nothing else") {

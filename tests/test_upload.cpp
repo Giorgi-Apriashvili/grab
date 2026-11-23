@@ -595,7 +595,11 @@ TEST_CASE("upload: the speed limit is taken before each WRITE, in small ones") {
 
 TEST_CASE("upload: a limit switched on with more on its way than it lets a connection keep drops the connection; it goes on over a new login") {
     Server srv;
-    srv.fake.latency = 200ms; // a connection's 8 MiB stay on their way a while
+    // A connection's 8 MiB stay on their way: each reply comes only as the stream waits for one,
+    // so it looks at the new limit with megabytes out (with replies taken as they come, it looks
+    // right after them, with little out: charged, the connection kept; seen so since chunk 6).
+    srv.fake.held = true;
+    srv.fake.release_one = true;
     srv.fake.max_write = 1u << 20;
     Dir dir("limit-on");
     const std::string content = test::pattern(40u << 20);
@@ -622,6 +626,58 @@ TEST_CASE("upload: a limit switched on with more on its way than it lets a conne
     REQUIRE_MESSAGE(r.outcome == upload::Outcome::done, r.error);
     CHECK(switched);
     CHECK(srv.fake.logins.load() > 2); // dropped, and logged in again: not a failure
+    CHECK(srv.file("/up/f.bin") == content);
+}
+
+TEST_CASE("upload: a limit switched on while each WRITE's reply comes before the next goes takes hold at once") {
+    // Live on Main (chunk 6, L6a): a flush that waits for the SSH window takes the replies that
+    // came meanwhile, so an unlimited stream never reached its caps and saw a limit switched on only
+    // once its whole range had gone (90 MiB at full speed). Here each WRITE's send takes a while
+    // and its reply is there at once.
+    Server srv;
+    srv.fake.write_pace = 2ms;
+    srv.fake.max_write = 1u << 20; // a megabyte a send: far over the limit if it isn't looked at
+    Dir dir("limit-on-paced");
+    const std::string content = test::pattern(24u << 20);
+    const fs::path local = local_file(dir, content);
+    auto pool = srv.fake.pool(1);
+    fetch::Connections connections;
+    connections.configure("Fake", 1);
+    rate::RateLimiter limiter; // unlimited at the start
+    auto u = upload_of(local, pool, dir);
+    u.limiter = &limiter;
+    constexpr std::uint64_t rate = 512u << 10;
+    std::atomic<std::uint64_t> sent{0};
+    std::uint64_t sent_at_switch = 0;
+    std::chrono::steady_clock::time_point switched_at;
+    std::atomic<bool> switched{false};
+    // Switched on from the stream's own thread, between two WRITEs, as soon as 2 MiB came back.
+    u.on_sent = [&](std::uint64_t n) {
+        sent += n;
+        if (switched.load() || sent.load() < (2u << 20)) return;
+        sent_at_switch = sent.load();
+        switched_at = std::chrono::steady_clock::now();
+        limiter.set_rate(rate);
+        switched = true;
+    };
+    upload::Result r;
+    std::uint64_t after = 0;
+    double seconds = 0;
+    {
+        std::jthread running([&] { r = upload::run(u, connections, {}, {}); });
+        for (int i = 0; i < 4000 && !switched.load(); ++i) std::this_thread::sleep_for(5ms);
+        REQUIRE(switched.load());
+        std::this_thread::sleep_until(switched_at + 1s);
+        after = sent.load() - sent_at_switch;
+        seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - switched_at).count();
+        limiter.set_rate(0); // the rest at full speed
+    }
+    // At the limit from the switch on: its rate, the bucket's first quarter second and what the
+    // stream had on its way, a WRITE or two (kept and charged, or dropped and sent again under the
+    // limit). Not looked at, the rest of the file went: about 20 MiB.
+    MESSAGE("acknowledged in ", seconds, " s after the switch: ", after, " bytes");
+    CHECK(static_cast<double>(after) <= static_cast<double>(rate) * seconds + static_cast<double>(2u << 20));
+    REQUIRE_MESSAGE(r.outcome == upload::Outcome::done, r.error);
     CHECK(srv.file("/up/f.bin") == content);
 }
 

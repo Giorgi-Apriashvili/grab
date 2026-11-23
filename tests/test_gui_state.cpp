@@ -24,8 +24,12 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.timings = {{"lsjson:Box.Guest", 2300}, {"update", 900}};
     s.limit_on = true;
     s.limit_mibps = 2.5;
-    s.speed_schedule = {{0x1F, 18 * 60, 0, 5}, {0x60, 22 * 60, 6 * 60, 2.5}};
+    s.speed_schedule = {{0x1F, 18 * 60, 0, 5, 1.5}, {0x60, 22 * 60, 6 * 60, 2.5, std::nullopt},
+                        {0x40, 6 * 60, 8 * 60, std::nullopt, 3}};
     s.limit_change = schedule::Override{{false, 5}, 5, 1760003600};
+    s.upload_limit_on = true;
+    s.upload_limit_mibps = 4;
+    s.upload_limit_change = schedule::Override{{true, 0.5}, 1.5, 1760003700};
     s.verify_downloads = true;
     s.upload_existing = "newer";
     s.update_check = false;
@@ -93,12 +97,62 @@ TEST_CASE("broken or partial gui state falls back to defaults field by field") {
 
     // The speed schedule keeps its valid rules; a broken change of the limit is dropped.
     CHECK(parse_gui_state(R"({"speedSchedule":[{"days":["sat"],"from":"10:00","to":"12:00","mibps":8},{"days":[]}]})")
-              .speed_schedule == std::vector<schedule::Rule>{{0x20, 10 * 60, 12 * 60, 8}});
+              .speed_schedule == std::vector<schedule::Rule>{{0x20, 10 * 60, 12 * 60, 8, std::nullopt}});
     CHECK(parse_gui_state(R"({"speedSchedule":"weekends"})").speed_schedule.empty());
     CHECK(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5,"until":1760003600}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":0,"until":1760003600}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5}})").limit_change);
     CHECK_FALSE(parse_gui_state(R"({"limitChange":{"on":false,"mibps":5,"scheduled":5,"until":1e300}})").limit_change);
+    // The upload limit's keys the same way.
+    CHECK(parse_gui_state(R"({"uploadLimitMiBps":0})").upload_limit_mibps == 5.0);
+    CHECK(parse_gui_state(R"({"uploadLimitMiBps":12.5})").upload_limit_mibps == 12.5);
+    CHECK_FALSE(parse_gui_state(R"({"uploadLimitOn":1})").upload_limit_on);
+    CHECK(parse_gui_state(R"({"uploadLimitChange":{"on":true,"mibps":2,"scheduled":1,"until":1760003600}})")
+              .upload_limit_change);
+    CHECK_FALSE(parse_gui_state(R"({"uploadLimitChange":{"on":true,"mibps":2,"until":1760003600}})").upload_limit_change);
+}
+
+TEST_CASE("gui state: the two speed limits, with grab 0.23's gui.json and for it") {
+    // A gui.json as grab 0.23 saved it: the download limit, its change during the schedule and
+    // rules of download speeds only. All of it reads as it was; the upload limit is off at 5 MiB/s.
+    const auto old = parse_gui_state(
+        R"({"limitOn":true,"limitMiBps":12,"speedSchedule":[{"days":["mon","tue","wed","thu","fri"],"from":"18:00",)"
+        R"("to":"00:00","mibps":5},{"days":["sat"],"from":"10:00","to":"12:00","mibps":8}],)"
+        R"("limitChange":{"on":false,"mibps":12,"scheduled":5,"until":1760003600},"parallel":4})");
+    CHECK(old.limit_on);
+    CHECK(old.limit_mibps == 12);
+    CHECK(old.limit_change == schedule::Override{{false, 12}, 5, 1760003600});
+    CHECK(old.speed_schedule == std::vector<schedule::Rule>{{0x1F, 18 * 60, 0, 5, std::nullopt},
+                                                            {0x20, 10 * 60, 12 * 60, 8, std::nullopt}});
+    CHECK_FALSE(old.upload_limit_on);
+    CHECK(old.upload_limit_mibps == 5.0);
+    CHECK_FALSE(old.upload_limit_change);
+    CHECK(parse_gui_state(gui_state_to_json(old)) == old);
+
+    // Saved by this grab: the download limit's keys as grab 0.23 reads them (unchanged), the upload
+    // limit's beside them; each read back on its own.
+    GuiState both;
+    both.limit_on = true;
+    both.limit_mibps = 12;
+    both.upload_limit_on = true;
+    both.upload_limit_mibps = 4;
+    both.upload_limit_change = schedule::Override{{false, 4}, 2, 1760003600};
+    const auto text = gui_state_to_json(both);
+    for (const char* key :
+         {R"("limitOn":true)", R"("limitMiBps":12)", R"("uploadLimitOn":true)", R"("uploadLimitMiBps":4)",
+          R"("uploadLimitChange":{"on":false,"mibps":4,"scheduled":2,"until":1760003600})"}) {
+        CAPTURE(key);
+        CHECK(text.find(key) != std::string::npos);
+    }
+    CHECK(text.find(R"("limitChange")") == std::string::npos); // no change of the download limit
+    const auto back = parse_gui_state(text);
+    CHECK(back == both);
+    // An older grab saving it drops the upload keys: the upload limit is off again, the download
+    // limit as it was.
+    const auto dropped = parse_gui_state(R"({"limitOn":true,"limitMiBps":12})");
+    CHECK(dropped.limit_on);
+    CHECK(dropped.limit_mibps == 12);
+    CHECK_FALSE(dropped.upload_limit_on);
 }
 
 TEST_CASE("Browse's folders are not kept: a start opens each server at its top") {

@@ -1,9 +1,9 @@
 #pragma once
 
-// The speed schedule: rules that cap the download speed at certain times of the week. They are
-// set in grab's window and followed by the window and the `grab` command. In the window, a
-// change of the speed limit made while a rule applies holds until the schedule's next change.
-// Pure, apart from local_now() and to_next_second().
+// The speed schedule: rules that cap the download speed, the upload speed or both at certain
+// times of the week. They are set in grab's window and followed by the window and the `grab`
+// command. In the window, a change of a speed limit made while a rule limits that direction holds
+// until the schedule's next change there. Pure, apart from local_now() and to_next_second().
 
 #include "json.hpp"
 
@@ -22,29 +22,39 @@ inline constexpr std::size_t max_rules = 20;
 inline constexpr int day = 24 * 60; // minutes
 inline constexpr int week = 7 * day;
 
-// From `from` to `to` (minutes since midnight, local time) on the chosen days, at most `mibps`.
-// A `to` at or before `from` runs into the next day (the days are the days it starts on);
-// equal times are a whole day.
+// The two speed limits: downloads' (↓) and uploads' (↑), each with its own switch, box and
+// scheduled speeds.
+enum class Dir { down, up };
+
+// From `from` to `to` (minutes since midnight, local time) on the chosen days, downloads at most
+// `down` MiB/s and uploads at most `up`; a direction without a speed isn't limited by the rule,
+// and a rule has at least one. A `to` at or before `from` runs into the next day (the days are
+// the days it starts on); equal times are a whole day.
 struct Rule {
     unsigned days = 0x7F; // bit 0 = Monday ... bit 6 = Sunday
     int from = 18 * 60;
     int to = 0;
-    double mibps = 5;
+    std::optional<double> down = 5;
+    std::optional<double> up = std::nullopt;
     bool operator==(const Rule&) const = default;
 };
 [[nodiscard]] bool valid(const Rule& r);
+[[nodiscard]] std::optional<double> speed_of(const Rule& r, Dir dir);
 
-// The scheduled limit in MiB/s at a minute of the week (0 = Monday 00:00): the lowest speed of
-// the rules that apply then; nullopt = none.
-[[nodiscard]] std::optional<double> limit_at(const std::vector<Rule>& rules, int minute);
+// The scheduled limit of `dir` in MiB/s at a minute of the week (0 = Monday 00:00): the lowest
+// speed for it of the rules that apply then; nullopt = none.
+[[nodiscard]] std::optional<double> limit_at(const std::vector<Rule>& rules, int minute, Dir dir);
 
-// The scheduled limit's next change after `minute`: how many minutes ahead (1 to week), and the
-// limit from then on. nullopt when it never changes (no rules, or one limit all week).
+// The scheduled limit's next change for `dir` after `minute`: how many minutes ahead (1 to
+// week), and the limit from then on. nullopt when it never changes (no rules for it, or one limit
+// all week).
 struct Change {
     int minutes = 0;
     std::optional<double> limit;
 };
-[[nodiscard]] std::optional<Change> next_change(const std::vector<Rule>& rules, int minute);
+[[nodiscard]] std::optional<Change> next_change(const std::vector<Rule>& rules, int minute, Dir dir);
+// Whether any rule limits `dir`.
+[[nodiscard]] bool limits(const std::vector<Rule>& rules, Dir dir);
 
 [[nodiscard]] std::uint64_t bytes_per_s(double mibps);
 
@@ -56,21 +66,25 @@ struct Change {
 [[nodiscard]] std::string when_text(int minute, int minutes_ahead);
 [[nodiscard]] std::string speed_text(double mibps); // "5 MiB/s", "2.5 MiB/s"
 
-// [{"days":["mon","tue"],"from":"18:00","to":"00:00","mibps":5}, ...]. Reading drops invalid
-// rules and those beyond max_rules.
+// [{"days":["mon","tue"],"from":"18:00","to":"00:00","mibps":5,"upMiBps":2}, ...]: "mibps" the
+// download speed, as grab 0.23 and older wrote it (only that), "upMiBps" the upload speed; each
+// only when the rule has it. Reading drops invalid rules (a speed there that isn't a number in
+// range too) and those beyond max_rules. A rule with only an upload speed has no "mibps", so an
+// older grab drops it rather than read it as another download limit; and saving gui.json, it
+// drops the upload speeds.
 [[nodiscard]] json::Value to_json(const std::vector<Rule>& rules);
 [[nodiscard]] std::vector<Rule> from_json(const json::Value& v);
 
-// The window's speed limit setting.
+// A direction's speed limit setting in the window.
 struct Limit {
     bool on = false;
     double mibps = 5;
     bool operator==(const Limit&) const = default;
 };
 
-// A change of the limit made while the schedule limited the speed. It holds while the schedule
-// keeps the limit it replaced, and at most until `until` (Unix seconds: the schedule's next
-// change when it was made, for a window that was closed in between).
+// A change of a direction's limit made while the schedule limited that direction. It holds while
+// the schedule keeps the limit it replaced, and at most until `until` (Unix seconds: the
+// schedule's next change there when it was made, for a window that was closed in between).
 struct Override {
     Limit limit;
     double scheduled = 0;

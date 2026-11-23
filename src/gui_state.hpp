@@ -102,12 +102,19 @@ struct GuiState {
     // its "Always do this" saved. An older grab saving gui.json drops it: Ask again, which replaces
     // nothing unasked.
     std::string upload_existing = "ask";
-    bool limit_on = false;                           // global download speed limit
+    bool limit_on = false;                           // global download speed limit (↓)
     double limit_mibps = 5.0;                        // its value, kept while switched off
-    // Outside the schedule's times the limit above applies; a change made during them holds
-    // until the schedule's next change.
+    // Outside the schedule's times for a direction the limits here apply; a change made during
+    // them holds until the schedule's next change there.
     std::vector<schedule::Rule> speed_schedule;
     std::optional<schedule::Override> limit_change;
+    // The uploads' own limit (↑), and its change during the schedule: gui.json's
+    // "uploadLimitOn", "uploadLimitMiBps" and "uploadLimitChange", beside the download limit's
+    // keys, which keep their meaning for an older grab. An older grab saving gui.json drops them
+    // (and the schedule's upload speeds): the upload limit is off again.
+    bool upload_limit_on = false;
+    double upload_limit_mibps = 5.0;
+    std::optional<schedule::Override> upload_limit_change;
     bool update_check = true;                        // look for a new release once a day
     std::int64_t last_update_check = 0;              // Unix seconds; 0 = never
     std::string latest_version;                      // the newest release seen ("0.7.0"), if any

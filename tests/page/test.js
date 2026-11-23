@@ -914,7 +914,8 @@ try {
   // rows' speeds added up.
   dlSort.key = '';
   showDlOrder();
-  state.limitOn = false;
+  state.limits.down.on = false;
+  state.limits.up.on = false;
   state.queue = [folder({ id: 95, speed: 2 * 1048576, files: counts({ total: 4 }) }), file(96, { status: 'running', speed: 1048576 })];
   renderQueue();
   onSpeed({ type: 'speed', total: 5 * 1048576 });
@@ -923,6 +924,7 @@ try {
   check('G: the total in the fixed format', $('#total-speed').textContent, '↓ 512 B/s total · 2 running');
   // The graph: the last 60 samples, scaled to their peak, before the text in a fixed box.
   speedHist.length = 0;
+  upHist.length = 0;
   drawSpeedGraph();
   const graph = $('#speed-graph');
   const boxOf = (sel) => { const r = $(sel).getBoundingClientRect(); return [r.x, r.y, r.width, r.height].map((v) => Math.round(v * 10) / 10); };
@@ -936,97 +938,178 @@ try {
   check('G: the peak at the top, nothing at the bottom', [Math.min(...ys()), Math.max(...ys())], [1, 15]);
   check('G: the peak in its tooltip', graph.title, 'Total speed over the last minute (peak 878.9 KiB/s)');
   check('G: drawn in the accent colour', getComputedStyle(graph.querySelector('.line')).stroke !== 'none', true);
+  check('G: no uploads: no upload line, the tooltip as before', [pathOf('.up-line') || '', graph.title.startsWith('Total speed over')], ['', true]);
   const barBefore = [boxOf('#speed-graph'), boxOf('#limit-value'), boxOf('#limit-on')];
   onSpeed({ type: 'speed', total: 999.9 * 1073741824 });
   state.queue = Array.from({ length: 12 }, (_, k) => file(200 + k, { status: 'running' }));
   renderQueue();
-  state.limitOn = true;
+  state.limits.down.on = true;
   renderTotalSpeed();
   const barAfter = [boxOf('#speed-graph'), boxOf('#limit-value'), boxOf('#limit-on')];
   check('G: a longer total moves nothing in the status bar', [$('#total-speed').textContent, $('#total-limit').textContent,
-    JSON.stringify(barAfter) === JSON.stringify(barBefore)], ['↓ 999.9 GiB/s total · 12 running', `· ${fmtMiBps(state.limitMiBps)} limit`, true]);
+    JSON.stringify(barAfter) === JSON.stringify(barBefore)], ['↓ 999.9 GiB/s total · 12 running', `· ${fmtMiBps(state.limits.down.mibps)} limit`, true]);
   check('G: and the graph kept its box from when it was blank', JSON.stringify(idleBox) === JSON.stringify(barBefore[0]), true);
-  state.limitOn = false;
+  state.limits.down.on = false;
   state.queue = [];
   renderQueue();
   check('G: none running', $('#total-speed').textContent, 'No downloads running');
-  onSpeed({ type: 'speed', total: 3 * 1048576 }); // for the screenshots
 
-  // ---- the MiB/s box: typing never sets it; Enter or leaving the box does, confirmed ----------
+  // ---- chunk 6 (UPLOADS.md 6.2): the totals of both directions, the graph's upload line ------------
   {
+    const up = (id, more = {}) => file(id, { dir: 'up', status: 'running', path: `/srv/tv/u${id}.mkv`, name: `u${id}.mkv`,
+      into: '/srv/tv', source: `E:\\Videos\\u${id}.mkv`, dest: '', local: `E:\\Videos\\u${id}.mkv`, ...more });
+    const tot = $('#total-speed');
+    const lim = $('#total-limit');
+    const parts = () => [...tot.querySelectorAll('span')].map((s) => [s.textContent, s.classList.contains('limited')]);
+    state.queue = [file(301, { status: 'running' }), up(302)];
+    renderQueue();
+    onSpeed({ type: 'speed', total: 11.9 * 1048576, up: 3.9 * 1048576 });
+    check('6: an upload running: both totals in one unit, both counts', [tot.textContent, lim.hidden],
+      ['↓ 11.9 · ↑ 3.9 MiB/s · 1 running · 1 uploading', true]);
+    check('6: ... no limit: neither part marked', parts(), [['↓ 11.9', false], ['↑ 3.9', false]]);
+    check('6: ... the tooltip in words', tot.title, 'Downloads: 11.9 MiB/s · Uploads: 3.9 MiB/s');
+    state.limits.down = { on: true, mibps: 12, source: 'own' };
+    state.limits.up = { on: true, mibps: 4, source: 'own' };
+    renderTotalSpeed();
+    check('6: each limit beside its total while on', [tot.textContent, parts(), lim.hidden],
+      ['↓ 11.9 of 12 · ↑ 3.9 of 4 MiB/s · 1 running · 1 uploading', [['↓ 11.9 of 12', true], ['↑ 3.9 of 4', true]], true]);
+    check('6: ... and in the tooltip', tot.title, 'Downloads: 11.9 MiB/s (limit 12 MiB/s) · Uploads: 3.9 MiB/s (limit 4 MiB/s)');
+    state.limits.down = { on: false, mibps: 12, source: 'own' };
+    renderTotalSpeed();
+    check('6: only the upload limit: only its part marked', [tot.textContent, parts()],
+      ['↓ 11.9 · ↑ 3.9 of 4 MiB/s · 1 running · 1 uploading', [['↓ 11.9', false], ['↑ 3.9 of 4', true]]]);
+    onSpeed({ type: 'speed', total: 300, up: 2.5 * 1048576 });
+    check('6: under a limit both in MiB/s (the limits\' unit)', tot.textContent, '↓ 0.0 · ↑ 2.5 of 4 MiB/s · 1 running · 1 uploading');
+    state.limits.up = { on: false, mibps: 4, source: 'own' };
+    state.queue = [up(302)];
+    renderQueue();
+    onSpeed({ type: 'speed', total: 0, up: 512 * 1024 });
+    check('6: no limit: the larger one\'s unit; only uploads running', tot.textContent, '↓ 0.0 · ↑ 512.0 KiB/s · 1 uploading');
+    state.queue = [];
+    renderQueue();
+    onSpeed({ type: 'speed', total: 0, up: 0 });
+    check('6: nothing uploads, no upload limit: as before uploads came', [tot.textContent, lim.hidden, tot.hasAttribute('title')],
+      ['No downloads running', true, false]);
+    state.limits.up = { on: true, mibps: 4, source: 'own' };
+    renderTotalSpeed();
+    check('6: the upload limit on, nothing running: said after it', [tot.textContent, lim.hidden, lim.textContent],
+      ['No downloads or uploads running', false, '· ↑ 4 MiB/s upload limit']);
+    state.limits.down = { on: true, mibps: 12, source: 'own' };
+    renderTotalSpeed();
+    check('6: ... both limits on', lim.textContent, '· ↓ 12 · ↑ 4 MiB/s limits');
+    state.limits.down = { on: false, mibps: 5 };
+    state.limits.up = { on: false, mibps: 5 };
+    renderTotalSpeed();
+    check('6: both off again: as before', [tot.textContent, lim.hidden], ['No downloads running', true]);
+
+    // The graph: an upload line beside the downloads' area, on one scale (the peak of both).
+    speedHist.length = 0;
+    upHist.length = 0;
+    for (let k = 0; k < 60; ++k) {
+      state.totalSpeed = 4 * 1048576;
+      state.upSpeed = k === 30 ? 8 * 1048576 : 2 * 1048576;
+      sampleSpeed();
+    }
+    const yOf = (cls) => pathOf(cls).split(/[ML]/).filter(Boolean).map((p) => Number(p.split(' ')[1]));
+    check('6: the upload line: 60 points', [(pathOf('.up-line').match(/[ML]/g) || []).length, pathOf('.up-line').startsWith('M0 ')], [60, true]);
+    check('6: one scale: the uploads\' peak at the top, the downloads at half', [Math.min(...yOf('.up-line')), Math.min(...yOf('.line'))], [1, 8]);
+    check('6: the tooltip names both peaks', graph.title,
+      'Total speeds over the last minute: ↓ downloads (peak 4.0 MiB/s), ↑ uploads (peak 8.0 MiB/s)');
+    const stroke = (cls) => getComputedStyle(graph.querySelector(cls)).stroke;
+    check('6: the upload line in a colour of its own', [stroke('.up-line') !== stroke('.line'), stroke('.up-line') !== 'none'], [true, true]);
+    state.upSpeed = 0;
+  }
+  onSpeed({ type: 'speed', total: 3 * 1048576, up: 0 }); // for the screenshots
+
+  // ---- the MiB/s boxes (↓ downloads', ↑ uploads': UPLOADS.md 6.2): typing never sets one; Enter or
+  // leaving it does, confirmed. The same checks for each, then the two side by side.
+  check('J: a speed read from the box', [limitValue('2').mibps, limitValue(' 2,5 ').mibps, limitValue('10000').mibps], [2, 2.5, 10000]);
+  check('J: why one is refused', [limitValue('').why, limitValue('abc').why, limitValue('0.05').why, limitValue('20000').why, limitValue('800K').why],
+    ['Type a speed in MiB/s, from 0.1 to 10000', '“abc” isn’t a number: type MiB/s, from 0.1 to 10000', 'At least 0.1 MiB/s',
+      'At most 10000 MiB/s', '“800K” isn’t a number: type MiB/s, from 0.1 to 10000']);
+  const limitBoxChecks = async (dir) => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const box = $('#limit-value');
-    const why = $('#limit-why');
-    const tip = $('#limit-tip');
-    const wrap = $('#limit-box');
-    const badge = $('#limit-badge');
-    const sets = () => sent.filter((m) => m.type === 'setLimit');
+    const c = limitCtl[dir];
+    const other = dir === 'up' ? 'down' : 'up';
+    const K = dir === 'up' ? 'K ↑' : 'K ↓';
+    const checkK = (name, got, want) => check(`${K}: ${name}`, got, want);
+    const W = c.word; // Download | Upload
+    const setText = (n) => `✓ ${W} limit · ${n} MiB/s`;
+    const setSaid = (n) => `${W} speed limit set to ${n} MiB/s`;
+    // The status bar's word for the limit when nothing runs: the download limit's as before
+    // uploads came; the upload limit's marked.
+    const barLimit = (n) => (dir === 'up' ? `· ↑ ${n} MiB/s upload limit` : `· ${n} MiB/s limit`);
+    const box = c.box;
+    const why = c.why;
+    const tip = c.tip;
+    const wrap = c.wrap;
+    const badge = c.badge;
+    const sets = () => sent.filter((m) => m.type === 'setLimit' && m.dir === dir);
     const limits = () => sets().map((m) => [m.on, m.mibps]);
     const type = (text) => { box.value = text; box.dispatchEvent(new Event('input', { bubbles: true })); };
     const key = (k) => box.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    // A "limit" message with this direction's `l`, the other's as it is.
+    const limitMsg = (l, more = {}) => ({ type: 'limit', [dir]: l, [other]: state.limits[other], rules: state.schedule, ...more });
     // The backend's answer to the last set: the limit asked for, or what `got` says applies instead.
     const echo = (got = {}) => {
       const m = sets().pop();
-      onLimit({ type: 'limit', on: m.on, mibps: m.mibps, source: 'own', rules: state.schedule, token: m.token, ...got });
+      onLimit(limitMsg({ on: m.on, mibps: m.mibps, source: 'own', ...got }, { token: m.token, dir }));
     };
     const badgeView = () => [badge.classList.contains('show'), badge.querySelector('.shown').textContent,
       badge.querySelector('.said').textContent, wrap.classList.contains('set'), badge.classList.contains('off')];
     const idle = [false, '', '', false, false];
-    const noBadge = endLimitBadge; // as at the end of its fade, for the next check
-    const bar = () => JSON.stringify([boxOf('#limit-value'), boxOf('#limit-on'), boxOf('#total-speed')]);
-    check('J: a speed read from the box', [limitValue('2').mibps, limitValue(' 2,5 ').mibps, limitValue('10000').mibps], [2, 2.5, 10000]);
-    check('J: why one is refused', [limitValue('').why, limitValue('abc').why, limitValue('0.05').why, limitValue('20000').why, limitValue('800K').why],
-      ['Type a speed in MiB/s, from 0.1 to 10000', '“abc” isn’t a number: type MiB/s, from 0.1 to 10000', 'At least 0.1 MiB/s',
-        'At most 10000 MiB/s', '“800K” isn’t a number: type MiB/s, from 0.1 to 10000']);
-    state.limitOn = true;
-    state.limitMiBps = 1;
+    const noBadge = () => endLimitBadge(c); // as at the end of its fade, for the next check
+    const bar = () => JSON.stringify([boxOf(`#${box.id}`), boxOf(`#${c.sw.id}`), boxOf('#total-speed')]);
+    state.limits[dir] = { on: true, mibps: 1, source: 'own' };
     renderLimit();
     box.focus();
     sent.length = 0;
     const barBefore = bar();
-    check('K: idle: neither pending nor set, no badge', [wrap.classList.contains('pending'), tip.hidden, badgeView()], [false, true, idle]);
+    checkK('idle: neither pending nor set, no badge', [wrap.classList.contains('pending'), tip.hidden, badgeView()], [false, true, idle]);
 
     // Typing only edits: pending, nothing sent, however long it waits.
     type('2');
-    check('K: typed: nothing sent', limits(), []);
-    check('K: pending: a dashed amber box, "Enter to set" above it',
+    checkK('typed: nothing sent', limits(), []);
+    checkK('pending: a dashed amber box, "Enter to set" above it',
       [wrap.classList.contains('pending'), tip.hidden, tip.textContent, getComputedStyle(box).borderTopStyle], [true, false, 'Enter to set', 'dashed']);
     const tipBox = tip.getBoundingClientRect();
-    check('K: the hint above the box, within the window',
+    checkK('the hint above the box, within the window',
       [tipBox.bottom <= box.getBoundingClientRect().top, tipBox.right <= innerWidth, tipBox.left >= 0], [true, true, true]);
-    check('K: the hint moves nothing in the status bar', bar() === barBefore, true);
+    checkK('the hint moves nothing in the status bar', bar() === barBefore, true);
     await wait(1700);
-    check('K: nothing sent after a pause either (chunk J set it after 0.4 s, a lower one after 1.5 s)', [limits(), state.limitMiBps, box.value],
+    checkK('nothing sent after a pause either (chunk J set it after 0.4 s, a lower one after 1.5 s)', [limits(), state.limits[dir].mibps, box.value],
       [[], 1, '2']);
     type('1');
-    check('K: the speed that applies typed back: not pending', [wrap.classList.contains('pending'), tip.hidden], [false, true]);
+    checkK('the speed that applies typed back: not pending', [wrap.classList.contains('pending'), tip.hidden], [false, true]);
 
     // Enter sets it, once; the badge comes with the backend's answer.
     type('12');
     key('Enter');
-    check('K: Enter sends it, once', limits(), [[true, 12]]);
-    check('K: ... with a token', sets()[0].token > 0, true);
-    check('K: the box shows it, left, not pending', [box.value, document.activeElement === box, wrap.classList.contains('pending'), tip.hidden],
+    checkK('Enter sends it, once', limits(), [[true, 12]]);
+    checkK('... with a token', sets()[0].token > 0, true);
+    checkK('the box shows it, left, not pending', [box.value, document.activeElement === box, wrap.classList.contains('pending'), tip.hidden],
       ['12', false, false, true]);
-    check('K: no badge before the backend answers', badgeView(), idle);
+    checkK('no badge before the backend answers', badgeView(), idle);
     echo();
-    check('K: the answer: the box flashes green and the badge says it', badgeView(),
-      [true, '✓ Limit set · 12 MiB/s', 'Speed limit set to 12 MiB/s', true, false]);
-    check('K: the badge is a polite live region', [badge.getAttribute('role'), badge.getAttribute('aria-live')], ['status', 'polite']);
-    check('K: the status bar shows the limit', [$('#total-limit').hidden, $('#total-limit').textContent], [false, '· 12 MiB/s limit']);
+    checkK('the answer: the box flashes green and the badge says it', badgeView(),
+      [true, setText(12), setSaid(12), true, false]);
+    checkK('the badge is a polite live region', [badge.getAttribute('role'), badge.getAttribute('aria-live')], ['status', 'polite']);
+    checkK('the status bar shows the limit', [$('#total-limit').hidden, $('#total-limit').textContent], [false, barLimit(12)]);
+    checkK('the other box neither sends nor shows anything', [sent.some((m) => m.type === 'setLimit' && m.dir === other),
+      limitCtl[other].badge.classList.contains('show'), limitCtl[other].wrap.classList.contains('set')], [false, false, false]);
     const badgeBox = badge.getBoundingClientRect();
     const valueBox = box.getBoundingClientRect();
-    check('K: the badge above the box, not over it, within the window',
+    checkK('the badge above the box, not over it, within the window',
       [badgeBox.bottom <= valueBox.top, badgeBox.top >= 0, badgeBox.left >= 0, badgeBox.right <= innerWidth, badgeBox.width > 60],
       [true, true, true, true, true]);
-    check('K: the badge and the flash move nothing in the status bar', bar() === barBefore, true);
+    checkK('the badge and the flash move nothing in the status bar', bar() === barBefore, true);
     sent.length = 0;
     await wait(1000);
-    check('K: a second later: still shown, the check mark in the box', [badgeView()[0], getComputedStyle($('.limit-check')).opacity], [true, '1']);
+    checkK('a second later: still shown, the check mark in the box', [badgeView()[0], getComputedStyle(wrap.querySelector('.limit-check')).opacity], [true, '1']);
     await wait(1400);
-    check('K: gone after about two seconds, the limit kept in the status bar', [...badgeView(), $('#total-limit').textContent],
-      [...idle, '· 12 MiB/s limit']);
-    check('K: nothing more sent', limits(), []);
+    checkK('gone after about two seconds, the limit kept in the status bar', [...badgeView(), $('#total-limit').textContent],
+      [...idle, barLimit(12)]);
+    checkK('nothing more sent', limits(), []);
 
     // An answer with another limit than the one asked for, or to a set overtaken by a later one:
     // no badge.
@@ -1034,7 +1117,7 @@ try {
     type('7');
     key('Enter');
     echo({ mibps: 12 });
-    check('K: the backend answered with another limit: no badge, the one that applies in the box', [badgeView(), box.value], [idle, '12']);
+    checkK('the backend answered with another limit: no badge, the one that applies in the box', [badgeView(), box.value], [idle, '12']);
     box.focus();
     type('7');
     key('Enter');
@@ -1042,10 +1125,10 @@ try {
     box.focus();
     type('8');
     key('Enter');
-    onLimit({ type: 'limit', on: true, mibps: 7, source: 'own', rules: state.schedule, token: first.token });
-    check('K: the answer to an earlier set, overtaken: no badge', badgeView(), idle);
+    onLimit(limitMsg({ on: true, mibps: 7, source: 'own' }, { token: first.token, dir }));
+    checkK('the answer to an earlier set, overtaken: no badge', badgeView(), idle);
     echo();
-    check('K: the later one\'s: the badge', badgeView()[1], '✓ Limit set · 8 MiB/s');
+    checkK('the later one\'s: the badge', badgeView()[1], setText(8));
 
     // Another set while the badge shows: it says the new one, for its whole time again.
     await wait(1000);
@@ -1053,11 +1136,11 @@ try {
     type('9');
     key('Enter');
     echo();
-    check('K: a set while the badge shows: the new one', badgeView(), [true, '✓ Limit set · 9 MiB/s', 'Speed limit set to 9 MiB/s', true, false]);
+    checkK('a set while the badge shows: the new one', badgeView(), [true, setText(9), setSaid(9), true, false]);
     await wait(1200);
-    check('K: ... shown its whole time again, not gone with the first one\'s', badgeView()[0], true);
+    checkK('... shown its whole time again, not gone with the first one\'s', badgeView()[0], true);
     await wait(1200);
-    check('K: ... then gone', badgeView(), idle);
+    checkK('... then gone', badgeView(), idle);
 
     // Leaving the box sets what it holds; unchanged, nothing. Enter on the speed that applies sets
     // it again, and confirms it.
@@ -1065,9 +1148,9 @@ try {
     box.focus();
     type('4');
     box.blur();
-    check('K: leaving the box sends it', [limits(), box.value, wrap.classList.contains('pending')], [[[true, 4]], '4', false]);
+    checkK('leaving the box sends it', [limits(), box.value, wrap.classList.contains('pending')], [[[true, 4]], '4', false]);
     echo();
-    check('K: ... confirmed the same way', badgeView()[1], '✓ Limit set · 4 MiB/s');
+    checkK('... confirmed the same way', badgeView()[1], setText(4));
     noBadge();
     sent.length = 0;
     box.focus();
@@ -1075,13 +1158,13 @@ try {
     box.focus();
     type('4.0');
     box.blur();
-    check('K: leaving the box unchanged (or the same speed typed another way) sends nothing, shows nothing',
+    checkK('leaving the box unchanged (or the same speed typed another way) sends nothing, shows nothing',
       [limits(), box.value, badgeView()], [[], '4', idle]);
     box.focus();
     key('Enter');
-    check('K: Enter on the speed that applies sends it again', limits(), [[true, 4]]);
+    checkK('Enter on the speed that applies sends it again', limits(), [[true, 4]]);
     echo();
-    check('K: ... and confirms it', badgeView(), [true, '✓ Limit set · 4 MiB/s', 'Speed limit set to 4 MiB/s', true, false]);
+    checkK('... and confirms it', badgeView(), [true, setText(4), setSaid(4), true, false]);
     noBadge();
 
     // Escape: nothing sent, the speed that applies back.
@@ -1089,49 +1172,49 @@ try {
     box.focus();
     type('9');
     key('Escape');
-    check('K: Escape sends nothing and puts back the speed that applies',
-      [limits(), box.value, state.limitMiBps, wrap.classList.contains('pending'), tip.hidden, document.activeElement === box, badgeView()],
+    checkK('Escape sends nothing and puts back the speed that applies',
+      [limits(), box.value, state.limits[dir].mibps, wrap.classList.contains('pending'), tip.hidden, document.activeElement === box, badgeView()],
       [[], '4', 4, false, true, false, idle]);
 
     // A value that isn't a speed: red and why, from a moment after typing stops; nothing sent.
     box.focus();
     type('abc');
-    check('K: not a speed: not pending, nothing said at once', [wrap.classList.contains('pending'), why.hidden, tip.hidden], [false, true, true]);
+    checkK('not a speed: not pending, nothing said at once', [wrap.classList.contains('pending'), why.hidden, tip.hidden], [false, true, true]);
     await wait(450);
-    check('K: ... said once typing stops: red, why above the box', [limits(), why.hidden, why.textContent, box.classList.contains('bad'),
+    checkK('... said once typing stops: red, why above the box', [limits(), why.hidden, why.textContent, box.classList.contains('bad'),
       box.getAttribute('aria-invalid'), tip.hidden], [[], false, '“abc” isn’t a number: type MiB/s, from 0.1 to 10000', true, 'true', true]);
-    check('K: the note moves nothing in the status bar', bar() === barBefore, true);
-    check('K: the note above the box', why.getBoundingClientRect().bottom <= box.getBoundingClientRect().top, true);
+    checkK('the note moves nothing in the status bar', bar() === barBefore, true);
+    checkK('the note above the box', why.getBoundingClientRect().bottom <= box.getBoundingClientRect().top, true);
     type('0');
-    check('K: saying why already: the new reason at once', why.textContent, 'At least 0.1 MiB/s');
+    checkK('saying why already: the new reason at once', why.textContent, 'At least 0.1 MiB/s');
     type('6');
-    check('K: a speed again: the note goes, pending instead',
+    checkK('a speed again: the note goes, pending instead',
       [why.hidden, box.classList.contains('bad'), wrap.classList.contains('pending'), tip.hidden], [true, false, true, false]);
     type('0');
     key('Enter');
-    check('K: Enter with one refused: nothing sent, the speed that applies back, the note stays a while',
+    checkK('Enter with one refused: nothing sent, the speed that applies back, the note stays a while',
       [limits(), box.value, why.hidden, why.textContent, box.classList.contains('bad'), document.activeElement === box, badgeView()],
       [[], '4', false, 'At least 0.1 MiB/s', false, false, idle]);
     await wait(450);
-    check('K: ... and nothing sent later', limits(), []);
-    showLimitWhy('');
+    checkK('... and nothing sent later', limits(), []);
+    showLimitWhy(c, '');
 
-    // The switch: off, "Limit off" (neutral, no flash); on, the speed kept, "Limit set".
-    const sw = $('#limit-on');
+    // The switch: off, "Download limit off" (neutral, no flash); on, the speed kept, its badge.
+    const sw = c.sw;
     sw.click();
-    check('K: the switch off sends it', limits(), [[false, 4]]);
-    check('K: ... no badge before the answer', badgeView(), idle);
+    checkK('the switch off sends it', limits(), [[false, 4]]);
+    checkK('... no badge before the answer', badgeView(), idle);
     echo();
-    check('K: "Limit off", neutral, no flash', badgeView(), [true, 'Limit off', 'Speed limit off', false, true]);
-    check('K: the status bar without a limit', $('#total-limit').hidden, true);
+    checkK('"... limit off", neutral, no flash', badgeView(), [true, `${W} limit off`, `${W} speed limit off`, false, true]);
+    checkK('the status bar without a limit', $('#total-limit').hidden, true);
     sw.click();
-    check('K: the switch on sends the speed kept', limits(), [[false, 4], [true, 4]]);
+    checkK('the switch on sends the speed kept', limits(), [[false, 4], [true, 4]]);
     echo();
-    check('K: "Limit set", the box flashing', badgeView(), [true, '✓ Limit set · 4 MiB/s', 'Speed limit set to 4 MiB/s', true, false]);
-    check('K: ... the box focused by the switch', document.activeElement === box, true);
-    check('K: ... its text selected, so a speed typed replaces it', [box.value, box.selectionStart, box.selectionEnd], ['4', 0, 1]);
+    checkK('set, the box flashing', badgeView(), [true, setText(4), setSaid(4), true, false]);
+    checkK('... the box focused by the switch', document.activeElement === box, true);
+    checkK('... its text selected, so a speed typed replaces it', [box.value, box.selectionStart, box.selectionEnd], ['4', 0, 1]);
     type('6');
-    check('K: typing then: the badge gives way to "Enter to set", nothing sent', [badgeView(), wrap.classList.contains('pending'), tip.hidden, limits()],
+    checkK('typing then: the badge gives way to "Enter to set", nothing sent', [badgeView(), wrap.classList.contains('pending'), tip.hidden, limits()],
       [idle, true, false, [[false, 4], [true, 4]]]);
     key('Escape');
     sw.click();
@@ -1139,7 +1222,7 @@ try {
     sw.click(); // on again, the box focused; a value typed before the answer comes
     type('7');
     echo();
-    check('K: the answer comes while a value typed waits: no badge over "Enter to set"', [badgeView(), tip.hidden, limits().length],
+    checkK('the answer comes while a value typed waits: no badge over "Enter to set"', [badgeView(), tip.hidden, limits().length],
       [idle, false, 4]);
     key('Escape');
 
@@ -1147,30 +1230,30 @@ try {
     // typed (as by the switch) it shows too, and leaving the box doesn't set the speed shown before.
     box.focus();
     sent.length = 0;
-    onLimit({ type: 'limit', on: true, mibps: 3, source: 'schedule', until: '24:00', rules: state.schedule });
-    check('K: focused, nothing typed: a change by the schedule shows in the box', [document.activeElement === box, box.value], [true, '3']);
+    onLimit(limitMsg({ on: true, mibps: 3, source: 'schedule', until: '24:00' }));
+    checkK('focused, nothing typed: a change by the schedule shows in the box', [document.activeElement === box, box.value], [true, '3']);
     box.blur();
-    check('K: ... and leaving the box sets nothing', limits(), []);
-    check('K: a change by the schedule: no badge, its hint, the limit in the status bar',
+    checkK('... and leaving the box sets nothing', limits(), []);
+    checkK('a change by the schedule: no badge, its hint, the limit in the status bar',
       [badgeView(), $('#limit-hint').hidden, $('#limit-hint').textContent, $('#total-limit').textContent],
-      [idle, false, 'Scheduled until 24:00', '· 3 MiB/s limit']);
+      [idle, false, dir === 'up' ? '↑ Scheduled until 24:00' : 'Scheduled until 24:00', barLimit(3)]);
 
     // A speed the box shows rounded (2.55 as '2.6'): Enter, nothing typed, sets it exactly (no
     // override of the schedule by '2.6'); '2.6' typed is another speed, set on leaving.
-    state.limitMiBps = 2.55;
+    state.limits[dir].mibps = 2.55;
     renderLimit();
     sent.length = 0;
     box.focus();
-    check('K: 2.55 shown rounded', box.value, '2.6');
+    checkK('2.55 shown rounded', box.value, '2.6');
     key('Enter');
-    check('K: Enter, nothing typed: the speed that applies, exactly', limits(), [[true, 2.55]]);
+    checkK('Enter, nothing typed: the speed that applies, exactly', limits(), [[true, 2.55]]);
     echo();
     noBadge();
     box.focus();
     type('2.6');
-    check('K: 2.6 typed over 2.55: pending', wrap.classList.contains('pending'), true);
+    checkK('2.6 typed over 2.55: pending', wrap.classList.contains('pending'), true);
     box.blur();
-    check('K: ... and set on leaving', limits(), [[true, 2.55], [true, 2.6]]);
+    checkK('... and set on leaving', limits(), [[true, 2.55], [true, 2.6]]);
     echo();
     noBadge();
 
@@ -1180,10 +1263,10 @@ try {
     box.focus();
     type('1');
     box.dispatchEvent(new FocusEvent('blur'));
-    check('K: the window left while typing: nothing sent, still pending', [limits(), document.activeElement === box,
+    checkK('the window left while typing: nothing sent, still pending', [limits(), document.activeElement === box,
       wrap.classList.contains('pending'), box.value], [[], true, true, '1']);
     box.blur();
-    check('K: ... leaving the box then sets it', limits(), [[true, 1]]);
+    checkK('... leaving the box then sets it', limits(), [[true, 1]]);
     echo();
     noBadge();
 
@@ -1193,16 +1276,216 @@ try {
     type('12');
     key('Enter');
     echo();
-    onLimit({ type: 'limit', on: true, mibps: 12, source: 'own', until: '23:00', rules: state.schedule });
-    check('K: the same limit again, no token: the badge stays', badgeView()[1], '✓ Limit set · 12 MiB/s');
-    onLimit({ type: 'limit', on: true, mibps: 3, source: 'schedule', until: '24:00', rules: state.schedule });
-    check('K: another limit by the schedule: the badge gone at once', badgeView(), idle);
+    onLimit(limitMsg({ on: true, mibps: 12, source: 'own', until: '23:00' }));
+    checkK('the same limit again, no token: the badge stays', badgeView()[1], setText(12));
+    onLimit(limitMsg({ on: true, mibps: 12, source: 'own', until: '22:00' }, { token: 999, dir: other }));
+    checkK('the other direction\'s answer: the badge stays', badgeView()[1], setText(12));
+    onLimit(limitMsg({ on: true, mibps: 3, source: 'schedule', until: '24:00' }));
+    checkK('another limit by the schedule: the badge gone at once', badgeView(), idle);
     sent.length = 0;
-    showLimitWhy('');
-    state.limitOn = false;
-    state.limitMiBps = 5;
-    state.limit = {};
+    showLimitWhy(c, '');
+    state.limits[dir] = { on: false, mibps: 5 };
     renderLimit();
+  };
+  await limitBoxChecks('down');
+  await limitBoxChecks('up');
+
+  // The two side by side: each its own set, token and badge; an answer for one direction never
+  // confirms the other's set, even with the same token.
+  {
+    const d = limitCtl.down;
+    const u = limitCtl.up;
+    const badgeOn = (c) => c.badge.classList.contains('show');
+    const msg = (more) => ({ type: 'limit', down: state.limits.down, up: state.limits.up, rules: state.schedule, ...more });
+    state.limits.down = { on: true, mibps: 12, source: 'own' };
+    state.limits.up = { on: true, mibps: 4, source: 'own' };
+    renderLimit();
+    check('6: both boxes show their own limit', [d.box.value, u.box.value, d.sw.checked, u.sw.checked], ['12', '4', true, true]);
+    sent.length = 0;
+    d.token = 41;
+    u.token = 41;
+    d.box.focus();
+    d.box.value = '10';
+    d.box.dispatchEvent(new Event('input', { bubbles: true }));
+    d.box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    u.box.focus();
+    u.box.value = '3';
+    u.box.dispatchEvent(new Event('input', { bubbles: true }));
+    u.box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    check('6: each box sends its own direction', sent.filter((m) => m.type === 'setLimit').map((m) => [m.dir, m.on, m.mibps, m.token]),
+      [['down', true, 10, 42], ['up', true, 3, 42]]);
+    state.limits.up = { on: true, mibps: 3, source: 'own' };
+    onLimit(msg({ down: { on: true, mibps: 12, source: 'own' }, token: 42, dir: 'up' }));
+    check('6: the upload answer (the same token): only the upload badge', [badgeOn(d), badgeOn(u), u.badge.querySelector('.shown').textContent],
+      [false, true, '✓ Upload limit · 3 MiB/s']);
+    onLimit(msg({ down: { on: true, mibps: 10, source: 'own' }, token: 42, dir: 'down' }));
+    check('6: then the download answer: its own badge, the upload one stays', [badgeOn(d), badgeOn(u), d.badge.querySelector('.shown').textContent],
+      [true, true, '✓ Download limit · 10 MiB/s']);
+    // The schedule: one hint for both, marked when they differ.
+    onLimit(msg({ down: { on: true, mibps: 5, source: 'schedule', until: '24:00' }, up: { on: true, mibps: 2, source: 'schedule', until: '24:00' } }));
+    check('6: both scheduled alike: one hint', $('#limit-hint').textContent, 'Scheduled until 24:00');
+    onLimit(msg({ down: { on: true, mibps: 5, source: 'schedule', until: '24:00' }, up: { on: false, mibps: 2, source: 'change', until: '21:30' } }));
+    check('6: apart: each marked', $('#limit-hint').textContent, '↓ Scheduled until 24:00 · ↑ Schedule resumes at 21:30');
+    check('6: ... its tooltip in words', $('#limit-hint').title,
+      'Speed schedule (Settings)\nDownloads: Scheduled until 24:00\nUploads: Schedule resumes at 21:30');
+    onLimit(msg({ down: { on: false, mibps: 12, source: 'own' }, up: { on: false, mibps: 4, source: 'own' } }));
+    check('6: no schedule: no hint', $('#limit-hint').hidden, true);
+    endLimitBadge(d);
+    endLimitBadge(u);
+
+    // At the narrowest window (760 DIP, about 744 CSS px inside; at 150 % the same CSS px) with both
+    // limits on, both directions moving, a long total and the schedule's hint for both: the bar on
+    // one line, nothing past its edge, the controls where they were whatever the totals say.
+    const footer = document.querySelector('footer.bar.status');
+    const widthWas = footer.style.width;
+    footer.style.width = '740px';
+    state.limits.down = { on: true, mibps: 10000, source: 'change', until: 'Sat 06:00' };
+    state.limits.up = { on: true, mibps: 2.5, source: 'schedule', until: '24:00' };
+    state.queue = [file(311, { status: 'running' }), file(312, { status: 'running', dir: 'up', into: '/srv', source: 'E:\\u', dest: '', local: 'E:\\u' })];
+    renderQueue();
+    renderLimit();
+    onSpeed({ type: 'speed', total: 9999.9 * 1048576, up: 2.5 * 1048576 });
+    const kids = () => [...footer.children].filter((e) => !e.hidden && getComputedStyle(e).display !== 'none');
+    const fr = footer.getBoundingClientRect();
+    const rects = () => kids().map((e) => e.getBoundingClientRect());
+    const mid = (r) => r.top + r.height / 2;
+    const ctlBoxes = () => JSON.stringify([d.box, u.box, d.sw, u.sw].map((e) => boxOf(`#${e.id}`)));
+    check('6 narrow: nothing past the bar', [footer.scrollWidth <= footer.clientWidth, rects().every((r) => r.left >= fr.left - 0.5 && r.right <= fr.right + 0.5)],
+      [true, true]);
+    const mids = rects().filter((r) => r.height > 0).map(mid);
+    check('6 narrow: one line', Math.max(...mids) - Math.min(...mids) <= 1, true);
+    check('6 narrow: the hint shows', [$('#limit-hint').hidden, $('#limit-hint').getBoundingClientRect().width > 20], [false, true]);
+    out.push(`INFO status bar at 740: ${JSON.stringify(kids().map((e) => [e.id || e.className, Math.round(e.getBoundingClientRect().width)]))}`);
+    const before = ctlBoxes();
+    onSpeed({ type: 'speed', total: 1, up: 2 });
+    check('6 narrow: the totals changing move no control', ctlBoxes() === before, true);
+    check('6 narrow: the badge within the window', (() => {
+      showLimitSet(u, 2.5);
+      const b = u.badge.getBoundingClientRect();
+      endLimitBadge(u);
+      return [b.right <= fr.right + 0.5, b.left >= 0];
+    })(), [true, true]);
+    // Downloads only (the form from before uploads), its limit after the total: the same.
+    state.limits.up = { on: false, mibps: 2.5, source: 'own' };
+    state.queue = Array.from({ length: 12 }, (_, k) => file(320 + k, { status: 'running' }));
+    renderQueue();
+    renderLimit();
+    onSpeed({ type: 'speed', total: 999.9 * 1073741824, up: 0 });
+    const narrowDown = ctlBoxes();
+    check('6 narrow, downloads only: nothing past the bar, the total in its tooltip',
+      [footer.scrollWidth <= footer.clientWidth, rects().every((r) => r.left >= fr.left - 0.5 && r.right <= fr.right + 0.5),
+        $('#total-speed').title], [true, true, 'Downloads: 999.9 GiB/s (limit 10000 MiB/s) · 12 running']);
+    onSpeed({ type: 'speed', total: 5, up: 0 });
+    check('6 narrow, downloads only: the total changing moves no control', ctlBoxes() === narrowDown, true);
+    out.push(`INFO status bar at 740, downloads only: ${JSON.stringify(kids().map((e) => [e.id || e.className, Math.round(e.getBoundingClientRect().width)]))}`);
+    // Nothing running, both limits on and the hint marked for each: the idle text with both limits
+    // gives way too (review, chunk 6: it ran 24 px past the window), and the controls stay put
+    // whatever the values.
+    const fits = () => [footer.scrollWidth <= footer.clientWidth, rects().every((r) => r.left >= fr.left - 0.5 && r.right <= fr.right + 0.5)];
+    const idle = (down, up) => {
+      state.limits.down = { on: true, mibps: down, source: 'change', until: 'Sat 06:00' };
+      state.limits.up = { on: true, mibps: up, source: 'schedule', until: 'Sun 23:00' };
+      renderLimit();
+      onSpeed({ type: 'speed', total: 0, up: 0 });
+    };
+    state.queue = [];
+    renderQueue();
+    idle(2.5, 1000);
+    check('6 narrow, nothing running, both limits: nothing past the bar', fits(), [true, true]);
+    const idleBoxes = ctlBoxes();
+    idle(5, 2);
+    check('6 narrow, nothing running, both limits: other values move no control', [fits(), ctlBoxes() === idleBoxes], [[true, true], true]);
+    // The upload limit alone, changed during its schedule.
+    state.limits.down = { on: false, mibps: 5, source: 'own' };
+    state.limits.up = { on: true, mibps: 10, source: 'change', until: 'Sat 06:00' };
+    renderLimit();
+    onSpeed({ type: 'speed', total: 0, up: 0 });
+    check('6 narrow, nothing running, the upload limit alone: nothing past the bar', [fits(), $('#limit-hint').hidden], [[true, true], false]);
+    out.push(`INFO status bar at 740, nothing running: ${JSON.stringify(kids().map((e) => [e.id || e.className, Math.round(e.getBoundingClientRect().width)]))}`);
+    footer.style.width = widthWas;
+    state.queue = [];
+    renderQueue();
+    state.limits.down = { on: false, mibps: 5 };
+    state.limits.up = { on: false, mibps: 5 };
+    renderLimit();
+    sent.length = 0;
+  }
+
+  // ---- chunk 6 (UPLOADS.md 6.3): the speed schedule's ↓ and ↑ boxes -------------------------------
+  {
+    const all = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+    const own = { on: false, mibps: 5, source: 'own' };
+    const schedules = () => sent.filter((m) => m.type === 'setSchedule').map((m) => JSON.parse(JSON.stringify(m.rules)));
+    const rows = () => [...document.querySelectorAll('#schedule-rules .rule')];
+    const speeds = () => rows().map((r) => [r.querySelector('[data-field=mibps]').value, r.querySelector('[data-field=upMiBps]').value]);
+    const whyOf = (i) => [rows()[i].querySelector('.rule-why').hidden, rows()[i].querySelector('.rule-why').textContent];
+    const edit = (i, field, text, how = 'change') => {
+      const input = rows()[i].querySelector(`[data-field=${field}]`);
+      input.value = text;
+      if (how === 'change') input.dispatchEvent(new Event('change', { bubbles: true }));
+      else input.dispatchEvent(new KeyboardEvent('keydown', { key: how, bubbles: true, cancelable: true }));
+      return input;
+    };
+    sent.length = 0;
+    onLimit({ type: 'limit', down: own, up: own, rules: [
+      { days: all, from: '18:00', to: '00:00', mibps: 5 },
+      { days: ['sat', 'sun'], from: '00:00', to: '00:00', upMiBps: 2 },
+      { days: ['mon'], from: '20:00', to: '22:00', mibps: 3, upMiBps: 1 },
+    ] });
+    check('6 schedule: a ↓ and an ↑ box per time, blank where it doesn\'t limit', speeds(), [['5', ''], ['', '2'], ['3', '1']]);
+    check('6 schedule: the boxes marked ↓ and ↑', [...rows()[0].querySelectorAll('.rule-dir')].map((e) => e.textContent), ['↓', '↑']);
+    check('6 schedule: ... and named', [...rows()[0].querySelectorAll('input.num')].map((e) => e.getAttribute('aria-label')),
+      ['Download speed in MiB/s', 'Upload speed in MiB/s']);
+    edit(0, 'upMiBps', '4');
+    check('6 schedule: an ↑ speed typed: sent beside the ↓ one', schedules().pop()[0], { days: all, from: '18:00', to: '00:00', mibps: 5, upMiBps: 4 });
+    edit(0, 'mibps', '');
+    check('6 schedule: ↓ blanked: downloads not limited by it (no speed sent)', schedules().pop()[0], { days: all, from: '18:00', to: '00:00', upMiBps: 4 });
+    check('6 schedule: ... its box blank', speeds()[0], ['', '4']);
+    sent.length = 0;
+    const lone = edit(1, 'upMiBps', '');
+    check('6 schedule: the only speed blanked: refused, why said, nothing sent', [lone.value, schedules().length, ...whyOf(1)],
+      ['2', 0, false, 'A time needs a speed: ↓ for downloads, ↑ for uploads, or both']);
+    const bad = edit(2, 'upMiBps', '0');
+    check('6 schedule: not a speed: refused with why', [bad.value, schedules().length, ...whyOf(2)], ['1', 0, false, 'At least 0.1 MiB/s']);
+    edit(2, 'upMiBps', '9', 'Escape');
+    check('6 schedule: Escape puts it back, sends nothing', [speeds()[2], schedules().length], [['3', '1'], 0]);
+    edit(1, 'mibps', '2,5', 'Enter');
+    check('6 schedule: Enter sets ↓ on an ↑-only time', [schedules().pop()[1], whyOf(1)],
+      [{ days: ['sat', 'sun'], from: '00:00', to: '00:00', upMiBps: 2, mibps: 2.5 }, [true, '']]);
+    sent.length = 0;
+    $('#schedule-add').click();
+    check('6 schedule: a new time limits downloads at 5 MiB/s, as before', [speeds().pop(), schedules().pop().pop()],
+      [['5', ''], { days: all, from: '18:00', to: '00:00', mibps: 5 }]);
+    // The backend's echo: the same rules aren't drawn again (a field being edited keeps what it
+    // holds); rules that differ only in an upload speed are.
+    const one = (up) => [{ days: all, from: '18:00', to: '00:00', mibps: 5, upMiBps: up }];
+    onLimit({ type: 'limit', down: own, up: own, rules: one(1) });
+    rows()[0].querySelector('[data-field=upMiBps]').value = '1.5'; // typed, not set yet
+    onLimit({ type: 'limit', down: own, up: own, rules: one(1) });
+    check('6 schedule: the same rules again: not drawn again', speeds(), [['5', '1.5']]);
+    onLimit({ type: 'limit', down: own, up: own, rules: one(7) });
+    check('6 schedule: only an ↑ speed differs: drawn again', speeds(), [['5', '7']]);
+
+    // "Now": with rules for downloads only, as before; otherwise each direction marked.
+    const now = (rules, down, up) => {
+      onLimit({ type: 'limit', down, up, rules });
+      return $('#schedule-now').textContent;
+    };
+    const downRule = { days: all, from: '18:00', to: '00:00', mibps: 5 };
+    const upRule = { days: ['sat'], from: '21:00', to: '23:00', upMiBps: 2 };
+    check('6 schedule: "Now", downloads only: as before', now([downRule], { on: true, mibps: 5, source: 'schedule', until: '24:00' }, own),
+      'Now: 5 MiB/s until 24:00');
+    check('6 schedule: "Now" with upload speeds: each direction',
+      now([downRule, upRule], { on: true, mibps: 5, source: 'schedule', until: '24:00' }, { ...own, until: '21:00', nextMiBps: 2 }),
+      '↓ Now: 5 MiB/s until 24:00 · ↑ No scheduled limit now; next: 21:00 at 2 MiB/s');
+    check('6 schedule: "Now", uploads only', now([upRule], own, { on: true, mibps: 2, source: 'schedule', until: '23:00' }),
+      '↑ Now: 2 MiB/s until 23:00');
+    onLimit({ type: 'limit', down: own, up: own, rules: [] });
+    check('6 schedule: no rules, no "Now"', [rows().length, $('#schedule-now').textContent], [0, '']);
+    state.limits.down = { on: false, mibps: 5 };
+    state.limits.up = { on: false, mibps: 5 };
+    renderLimit();
+    sent.length = 0;
   }
 
   // A big file that has its place but waits for the folder's small files: Waiting, muted, why in
@@ -1836,7 +2119,8 @@ try {
     onFiles({ type: 'files', id: 13, gen: 4, from: 0, total: 2, rows: [
       kidRow({ path: 'S01/a.jpg', size: 3, status: 'done', bytes: 3 }), kidRow({ path: 'b.jpg', size: 4, status: 'done', bytes: 4 })] });
     check('up: the head counts running uploads apart', $('#dl-summary').textContent, '1 running · 1 queued · 1 paused · 1 uploading');
-    check('up: the status bar: downloads\' total, uploads counted', $('#total-speed').textContent, `↓ ${fmtSpeed(state.totalSpeed)} total · 1 running · 1 uploading`);
+    onSpeed({ type: 'speed', total: 3 * 1048576, up: 1048576 });
+    check('up: the status bar: both totals, uploads counted', $('#total-speed').textContent, '↓ 3.0 · ↑ 1.0 MiB/s · 1 running · 1 uploading');
     const shows = (show) => {
       setDlShow(show);
       return state.queue.filter(dlMatches).map((q) => q.id);

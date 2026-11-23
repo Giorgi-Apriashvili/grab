@@ -683,25 +683,41 @@ them.
     - Kept in queue.json (`"priority"` on a file, only when not Normal); grab 0.21 doesn't know
       it and reads every file as Normal. The `grab` command downloads every file at Normal, in
       folder order, as before.
-- **Speed limit:** the bar below the downloads shows the total speed: everything grab receives,
+- **Speed limits:** the bar below the downloads shows the total speed: everything grab receives,
   all downloads together, measured the same way as a row's Speed ("↓ 12.3 MiB/s total · 2
-  running"), and while a limit is on, the limit after it ("· 12 MiB/s limit"), running or not.
-  Left of it, a small graph shows that total over the last minute, one point a
-  second, scaled to the minute's peak (hover for the peak); it keeps its place, blank when
-  nothing came. Once no download is fetching the total reads 0 at once. On the bar's right, "Limit speed" caps all downloads together, in MiB/s; the
-  switch keeps the value, and both are remembered.
-  - Typing in the MiB/s box sets nothing: press Enter, or leave the box (click elsewhere, Tab),
+  running"), and while the download limit is on, the limit after it ("· 12 MiB/s limit"),
+  running or not. While uploads run, or the upload limit is on, it shows both directions in one
+  unit, each with its limit beside it while that is on: "↓ 11.9 of 12 · ↑ 3.9 of 4 MiB/s · 2
+  running · 1 uploading" (uploads count what the server acknowledged; the tooltip says it in
+  words). At the window's narrowest the text gives way (…) before the controls on its right.
+  Left of it, a small graph shows the totals over the last minute, one point a second, scaled
+  to the minute's peak: downloads over a shaded area, uploads as a line of their own colour
+  (hover for the peaks); it keeps its place, blank when nothing came. Once nothing is fetching
+  (or sending) the total of that direction reads 0 at once. On the bar's right, two limits:
+  "↓ [switch] [12] MiB/s" caps all downloads together, "↑ [switch] [4] MiB/s" all uploads
+  together (off at 5 MiB/s at first). Each switch keeps its value, and all of it is remembered;
+  the two are apart, so changing one never touches the other's transfers or speeds.
+  - Typing in a MiB/s box sets nothing: press Enter, or leave the box (click elsewhere, Tab),
     to set the value; Escape puts back the limit that applies and sets nothing. While the box
     holds a value you typed that isn't set yet, it has a dashed amber border and says "Enter to
     set" above it. One that isn't a speed from 0.1 to 10000 MiB/s sets nothing: the box turns
     red and says why, and leaving it puts back the limit that applies.
   - Once grab has applied a limit, the box flashes green with a check mark and a badge above it
-    says so ("✓ Limit set · 12 MiB/s"), fading after about two seconds; screen readers hear
-    "Speed limit set to 12 MiB/s". Enter on the value that already applies sets it again and
-    says so too; leaving the box unchanged says nothing. The switch confirms the same way
-    ("Limit off" when switched off). Changes made by the speed schedule show its own note
-    instead ("Scheduled until 24:00"). With reduced motion on in Windows, the badge shows
-    without moving.
+    says so ("✓ Download limit · 12 MiB/s", "✓ Upload limit · 4 MiB/s"), fading after about two
+    seconds; screen readers hear "Download speed limit set to 12 MiB/s". Enter on the value that
+    already applies sets it again and says so too; leaving the box unchanged says nothing. The
+    switch confirms the same way ("Download limit off" when switched off). Changes made by the
+    speed schedule show its own note instead ("Scheduled until 24:00"; "↑ Scheduled until 24:00"
+    for the upload limit, both marked when they differ). With reduced motion on in Windows, the
+    badge shows without moving.
+  - Uploads follow their limit the same way as downloads below: every WRITE takes its tokens
+    before it is sent, small and big files alike, and switching the limit on or lowering it
+    drops a connection that has more on its way (the upload goes on from what the server
+    acknowledged).
+  - In gui.json the download limit keeps its keys (`limitOn`, `limitMiBps`, `limitChange`), so
+    an older grab still reads it; the upload limit's are `uploadLimitOn`, `uploadLimitMiBps` and
+    `uploadLimitChange`. An older grab saving gui.json drops them, and the schedule's upload
+    speeds: the upload limit is then off again.
   - A change applies within about a second, whether it comes from the switch, the MiB/s box or
     the speed schedule (applied right as its minute begins): the downloads' real speed is at the new limit by then, and the speeds
     shown follow it a moment later.
@@ -750,18 +766,24 @@ them.
   Skip; Replace, Replace if different, Replace if newer, Skip or Keep both go without asking (the
   dialog says which, and its Change picks another for that upload). Kept in gui.json as
   `"uploadExisting"` (absent: Ask).
-- **Speed schedule** (Settings → Speed schedule) caps the speed at set times, for example 5
-  MiB/s on weekdays from 18:00 to 24:00.
-  - Each time has its days, a from–to time and a speed. A time that ends at or before its
-    start runs into the next day ("22:00–06:00", marked "next day"), and equal times are a
-    whole day. Where times overlap, the lower speed wins.
-  - When a time starts, Limit speed switches on at its speed, and the status bar says
-    "Scheduled until 24:00". When it ends, your own Limit speed setting applies again.
-  - Changing Limit speed during a scheduled time lasts until the schedule's next change
-    ("Schedule resumes at 24:00"), also across a restart. Editing the schedule ends it.
-  - The `grab` command follows the same schedule (see [Usage](#usage)). Each program caps its
-    own downloads.
-  - At each change, downloads keep their connections and just follow the new speed.
+- **Speed schedule** (Settings → Speed schedule) caps the speeds at set times, for example
+  downloads at 5 MiB/s and uploads at 1 MiB/s on weekdays from 18:00 to 24:00.
+  - Each time has its days, a from–to time and two speeds, ↓ for downloads and ↑ for uploads;
+    a blank one leaves that direction alone at those times (a time needs at least one, and
+    says so when both would be blank). A time that ends at or before its start runs into the
+    next day ("22:00–06:00", marked "next day"), and equal times are a whole day. Where times
+    overlap, the lower speed of each direction wins.
+  - When a time starts, the limit of each direction it has a speed for switches on at that
+    speed, and the status bar says "Scheduled until 24:00". When it ends, your own setting of
+    that limit applies again.
+  - Changing a limit during a scheduled time for it lasts until the schedule's next change
+    there ("Schedule resumes at 24:00"), also across a restart; the other limit follows the
+    schedule as before. Editing the schedule ends both.
+  - The `grab` command follows the schedule's download speeds (see [Usage](#usage)). Each
+    program caps its own transfers.
+  - At each change, transfers keep their connections and just follow the new speed.
+  - An older grab reads the download speeds only (a time with only an upload speed isn't one
+    of its times), and saving its settings drops the upload speeds.
 - **Folders** are listed once and every one of their files shown as a row under the folder's row,
   folded or opened with ▸/▾ (open while the folder runs, folded once it is done; your ▸/▾ is kept,
   also across restarts).
@@ -1476,7 +1498,7 @@ The rest is grab's, with nothing to set:
 - **Files at once:** "At once" in the window's Downloads bar (1–8, default 4), which the command
   follows too; a big file's pieces spread over the server's connections, small files of a folder
   go beside them (see [GUI](#gui)).
-- **Speed:** Limit speed and the speed schedule in the window, `--limit` for a command.
+- **Speed:** the ↓ (downloads) and ↑ (uploads) limits in the window's status bar and the speed schedule in Settings; `--limit` for a command (which, without it, follows the schedule's ↓ speeds).
 - **Staying connected:** connections stay open between files, searches and downloads, and close
   by themselves after 15 to 60 seconds without use (Play keeps its own up to five minutes, see
   Previews). A command the server works on quietly (find, md5sum over a big folder) gets a

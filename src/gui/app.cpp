@@ -135,6 +135,9 @@ std::map<std::size_t, upload::Existing> own_choices(const Value& msg) {
 int weight_of(std::string_view priority) { return priority == "high" ? 4 : priority == "low" ? 1 : 2; }
 const char* priority_name(int weight) { return weight >= 4 ? "high" : weight <= 1 ? "low" : "normal"; }
 
+// The speed limits' directions as the page names them ("limit" {down, up}, setLimit's dir).
+const char* dir_key(schedule::Dir dir) { return dir == schedule::Dir::up ? "up" : "down"; }
+
 std::int64_t unix_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
@@ -188,10 +191,12 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
     timings_ = state_.timings;
     verify_downloads_ = state_.verify_downloads;
     upload_existing_ = upload::parse_existing(state_.upload_existing).value_or(upload::Existing::ask);
-    // The speed limit that holds now; the first tick() tells the page and drops a change that
-    // no longer holds.
-    if (const auto applied = current_limit(schedule::local_now()); applied.limit.on) {
-        limiter_.set_rate(schedule::bytes_per_s(applied.limit.mibps));
+    // The speed limits that hold now; the first tick() tells the page and drops a change that no
+    // longer holds.
+    for (const auto dir : {schedule::Dir::down, schedule::Dir::up}) {
+        if (const auto applied = current_limit(dir, schedule::local_now()); applied.limit.on) {
+            (dir == schedule::Dir::up ? up_limiter_ : down_limiter_).set_rate(schedule::bytes_per_s(applied.limit.mibps));
+        }
     }
     // Output of an earlier update: an installer update outlives the window that followed it. One
     // still open stays: its `grab update` (or grab-gui) still runs and writes it, and what an
@@ -831,7 +836,7 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
         // speed at the next flush.
         page_ready_ = true;
         watches_.clear();
-        total_sent_.reset();
+        totals_posted_.reset();
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
@@ -994,9 +999,13 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
     } else if (type == "setPriority") {
         set_priority(int_of(*msg, "id", -1), weight_of(msg->string_of("priority").value_or("normal")));
     } else if (type == "setLimit") {
+        // {dir: 'down' | 'up', on, mibps, token}: one of the two limits.
+        const auto dir = msg->string_of("dir") == "up" ? schedule::Dir::up : schedule::Dir::down;
         const Value* mibps = msg->find("mibps");
-        set_limit(bool_of(*msg, "on"),
-                  mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number : state_.limit_mibps,
+        set_limit(dir, bool_of(*msg, "on"),
+                  mibps != nullptr && mibps->kind == Value::Kind::number ? mibps->number
+                  : dir == schedule::Dir::up                            ? state_.upload_limit_mibps
+                                                                         : state_.limit_mibps,
                   int_of(*msg, "token"));
     } else if (type == "setRecent") {
         if (const Value* items = msg->find("items")) save_recent(recent_path_, *items);
@@ -2885,31 +2894,37 @@ void App::post_downloads_note(const std::string& text) const {
     post(v);
 }
 
-void App::set_limit(bool on, double mibps, int token) {
-    if (!(mibps >= min_limit_mibps && mibps <= max_limit_mibps)) mibps = state_.limit_mibps; // also NaN
+void App::set_limit(schedule::Dir dir, bool on, double mibps, int token) {
+    // The direction's own setting and its change during the schedule (GuiState).
+    const bool up = dir == schedule::Dir::up;
+    bool& own_on = up ? state_.upload_limit_on : state_.limit_on;
+    double& own_mibps = up ? state_.upload_limit_mibps : state_.limit_mibps;
+    auto& change = up ? state_.upload_limit_change : state_.limit_change;
+    if (!(mibps >= min_limit_mibps && mibps <= max_limit_mibps)) mibps = own_mibps; // also NaN
     const auto now = schedule::local_now();
-    const auto scheduled = schedule::limit_at(state_.speed_schedule, now.minute);
-    const schedule::Limit wanted{on, mibps};
+    const auto scheduled = schedule::limit_at(state_.speed_schedule, now.minute, dir);
+    const schedule::Limit wanted{.on = on, .mibps = mibps};
     if (!scheduled) {
-        state_.limit_on = on;
-        state_.limit_mibps = mibps;
-        state_.limit_change.reset();
-    } else if (wanted == schedule::Limit{true, *scheduled}) {
-        state_.limit_change.reset(); // back to what the schedule says
+        own_on = on;
+        own_mibps = mibps;
+        change.reset();
+    } else if (wanted == schedule::Limit{.on = true, .mibps = *scheduled}) {
+        change.reset(); // back to what the schedule says
     } else {
         // Without a next change (one limit all week) it holds for a year, i.e. until undone.
-        const auto next = schedule::next_change(state_.speed_schedule, now.minute);
+        const auto next = schedule::next_change(state_.speed_schedule, now.minute, dir);
         const std::int64_t until = next ? now.unix + std::int64_t{next->minutes} * 60 - now.second
                                         : now.unix + std::int64_t{365} * 24 * 3600;
-        state_.limit_change = schedule::Override{wanted, *scheduled, until};
+        change = schedule::Override{.limit = wanted, .scheduled = *scheduled, .until = until};
     }
     save_state();
-    update_limit(token);
+    update_limit(token, dir);
 }
 
 void App::set_schedule(const Value& rules) {
     state_.speed_schedule = schedule::from_json(rules);
-    state_.limit_change.reset(); // the new rules apply at once
+    state_.limit_change.reset(); // the new rules apply at once, to both directions
+    state_.upload_limit_change.reset();
     save_state();
     update_limit();
 }
@@ -2919,66 +2934,84 @@ void App::tick() {
     release_viewer_seats();
 }
 
-schedule::Applied App::current_limit(const schedule::Now& now) const {
-    return schedule::apply({state_.limit_on, state_.limit_mibps}, schedule::limit_at(state_.speed_schedule, now.minute),
-                           state_.limit_change, now.unix);
+schedule::Applied App::current_limit(schedule::Dir dir, const schedule::Now& now) const {
+    const bool up = dir == schedule::Dir::up;
+    const schedule::Limit own = up ? schedule::Limit{.on = state_.upload_limit_on, .mibps = state_.upload_limit_mibps}
+                                   : schedule::Limit{.on = state_.limit_on, .mibps = state_.limit_mibps};
+    return schedule::apply(own, schedule::limit_at(state_.speed_schedule, now.minute, dir),
+                           up ? state_.upload_limit_change : state_.limit_change, now.unix);
 }
 
-void App::update_limit(int token) {
+void App::update_limit(int token, schedule::Dir dir) {
     const auto now = schedule::local_now();
-    if (state_.limit_change &&
-        !schedule::holds(*state_.limit_change, schedule::limit_at(state_.speed_schedule, now.minute), now.unix)) {
-        state_.limit_change.reset();
-        save_state();
+    bool dropped = false;
+    for (const auto d : {schedule::Dir::down, schedule::Dir::up}) {
+        auto& change = d == schedule::Dir::up ? state_.upload_limit_change : state_.limit_change;
+        if (change && !schedule::holds(*change, schedule::limit_at(state_.speed_schedule, now.minute, d), now.unix)) {
+            change.reset();
+            dropped = true;
+        }
+        const auto applied = current_limit(d, now);
+        set_rate(d, applied.limit.on ? schedule::bytes_per_s(applied.limit.mibps) : 0);
     }
-    const auto applied = current_limit(now);
-    set_rate(applied.limit.on ? schedule::bytes_per_s(applied.limit.mibps) : 0);
+    if (dropped) save_state();
     Value message = limit_message(now);
     auto text = json::stringify(message);
     if (text == limit_posted_ && token == 0) return;
     limit_posted_ = std::move(text);
     // The answer to the page's set: sent even when nothing changed (the same value set again), so
-    // the page confirms it only once it applies, and only with what applies.
-    if (token != 0) message.set("token", num(token));
+    // the page confirms it only once it applies, and only with what applies; the direction says
+    // which of the two boxes asked.
+    if (token != 0) {
+        message.set("token", num(token));
+        message.set("dir", str(dir_key(dir)));
+    }
     post(message);
 }
 
-void App::set_rate(std::uint64_t bytes_per_s) {
-    if (bytes_per_s == limiter_.rate()) return;
-    limiter_.set_rate(bytes_per_s); // the streams follow the new rate at once
+void App::set_rate(schedule::Dir dir, std::uint64_t bytes_per_s) {
+    const bool up = dir == schedule::Dir::up;
+    auto& limiter = up ? up_limiter_ : down_limiter_;
+    if (bytes_per_s == limiter.rate()) return;
+    limiter.set_rate(bytes_per_s); // the streams follow the new rate at once
     // The speeds shown start again from the change, so the new limit shows within about a second
     // rather than fading in over five (speed::Meter::restart); the times left go on, and their
     // pace starts again from the new speed (speed::Pace::restart, meter): at once from the limit
-    // when it is below the speed then (speed::Meter::foreseen), for a download fetching alone
-    // (downloads side by side share the limit in a way their speeds before don't tell).
+    // when it is below the speed then (speed::Meter::foreseen), for a transfer moving alone in
+    // its direction (side by side they share the limit in a way their speeds before don't tell).
+    // The other direction has its own limit: its speeds and times left go on.
     const auto now = speed::Clock::now();
     const auto limit = static_cast<double>(bytes_per_s);
-    total_meter_.restart(now, received_.load(), limit);
+    if (up) total_up_meter_.restart(now, sent_.load(), limit);
+    else total_meter_.restart(now, received_.load(), limit);
     std::lock_guard lock(mutex_);
-    // Uploads have their own limit (up_limiter_): their meters go on.
-    const bool alone = std::ranges::count_if(items_, [](const auto& i) { return i->metered && !is_up(*i); }) == 1;
+    const bool alone = std::ranges::count_if(items_, [up](const auto& i) { return i->metered && is_up(*i) == up; }) == 1;
     for (const auto& i : items_) {
-        if (!i->metered || is_up(*i)) continue;
+        if (!i->metered || is_up(*i) != up) continue;
         i->speed_meter.restart(now, i->received.load(), alone ? limit : 0);
         i->pace.restart();
         i->countdown.restart();
     }
 }
 
-// What the status bar and Settings show: the limit that applies and why, when the schedule
-// next changes ("until") and to what, and the rules.
+// What the status bar and Settings show: for each direction, the limit that applies and why,
+// when the schedule next changes there ("until") and to what; and the rules.
 Value App::limit_message(const schedule::Now& now) const {
-    const auto applied = current_limit(now);
     Value m = Value::make_object();
     m.set("type", str("limit"));
-    m.set("on", Value::make_bool(applied.limit.on));
-    m.set("mibps", num(applied.limit.mibps));
-    m.set("source", str(applied.source == schedule::Source::schedule ? "schedule"
-                        : applied.source == schedule::Source::change ? "change"
-                                                                     : "own"));
-    if (const auto next = schedule::next_change(state_.speed_schedule, now.minute)) {
-        m.set("until", str(schedule::when_text(now.minute, next->minutes)));
-        if (next->limit) m.set("nextMiBps", num(*next->limit));
+    for (const auto dir : {schedule::Dir::down, schedule::Dir::up}) {
+        const auto applied = current_limit(dir, now);
+        Value d = Value::make_object();
+        d.set("on", Value::make_bool(applied.limit.on));
+        d.set("mibps", num(applied.limit.mibps));
+        d.set("source", str(applied.source == schedule::Source::schedule ? "schedule"
+                            : applied.source == schedule::Source::change ? "change"
+                                                                         : "own"));
+        if (const auto next = schedule::next_change(state_.speed_schedule, now.minute, dir)) {
+            d.set("until", str(schedule::when_text(now.minute, next->minutes)));
+            if (next->limit) d.set("nextMiBps", num(*next->limit));
+        }
+        m.set(dir_key(dir), std::move(d));
     }
     m.set("rules", schedule::to_json(state_.speed_schedule));
     return m;
@@ -3295,7 +3328,7 @@ void App::run_file(const std::shared_ptr<Item>& item, const std::stop_token& ite
         item->finished = open_file::Finished{.path = at, .size = size};
     };
     d.replace = choice == existing::Choice::replace;
-    d.limiter = &limiter_;
+    d.limiter = &down_limiter_;
     d.weight = &item->weight;
     // Its speed and time left, and the status bar's total, count the bytes as they come (flush).
     d.on_received = [this, item](std::uint64_t n) {
@@ -3573,7 +3606,7 @@ void App::run_folder(const std::shared_ptr<Item>& item, const std::stop_token& i
     folder::Job job;
     job.ctx = &*ctx;
     job.connections = &connections_;
-    job.limiter = &limiter_;
+    job.limiter = &down_limiter_;
     job.server = item->remote;
     job.id = item->id;
     job.weight = &item->weight;
@@ -4367,15 +4400,19 @@ void App::post_ui(std::string text) const {
 
 void App::flush() {
     if (!page_ready_) return; // its init asks for everything
-    // What the downloads receive, all together: the status bar's total, when it would show another
-    // value (speed::shown).
-    // Nothing fetching (as of the last flush): 0 at once rather than the fading of the last bytes.
+    // What the downloads receive, all together, and what the servers acknowledged of the uploads:
+    // the status bar's totals (↓, ↑), when either would show another value (speed::shown).
+    // Nothing fetching or sending in a direction (as of the last flush): its 0 at once rather than
+    // the fading of the last bytes.
     const auto now = speed::Clock::now();
-    if (metering_) total_meter_.sample(now, received_.load());
+    if (metering_down_) total_meter_.sample(now, received_.load());
     else total_meter_ = {};
-    if (const auto total = speed::shown(total_meter_.rate()); total != total_sent_) {
-        total_sent_ = total;
-        post_ui(std::format(R"({{"type":"speed","total":{}}})", total));
+    if (metering_up_) total_up_meter_.sample(now, sent_.load());
+    else total_up_meter_ = {};
+    if (const std::pair totals{speed::shown(total_meter_.rate()), speed::shown(total_up_meter_.rate())};
+        totals != totals_posted_) {
+        totals_posted_ = totals;
+        post_ui(std::format(R"({{"type":"speed","total":{},"up":{}}})", totals.first, totals.second));
     }
     const bool full = std::exchange(queue_changed_, false);
     // A download that fetches has a new speed and time left at every flush, events or not.
@@ -4395,7 +4432,8 @@ void App::flush() {
         std::lock_guard lock(mutex_);
         const auto locked = std::chrono::steady_clock::now();
         int waiting = 0;
-        bool metering = false;
+        bool metering_down = false;
+        bool metering_up = false;
         for (const auto& i : items_) {
             const bool touched = i->touched.exchange(false);
             const auto w = watches_.find(i->id);
@@ -4411,10 +4449,15 @@ void App::flush() {
                 if (!p.changed.empty()) deltas.push_back({i->id, i->gen, std::move(p.changed)});
             }
             if (watch != nullptr && !watch->send && i->names && i->gen != 0 && watch->gen != i->gen) fresh.push_back(i->id);
-            metering = meter(*i, now) || metering; // after the pass: a folder's files left
+            if (meter(*i, now)) { // after the pass: a folder's files left
+                if (is_up(*i)) metering_up = true;
+                else metering_down = true;
+            }
             rows.emplace_back(i->id, queue_item(*i, i->status == Status::queued ? ++waiting : 0));
         }
-        metering_ = metering;
+        metering_down_ = metering_down;
+        metering_up_ = metering_up;
+        metering_ = metering_down || metering_up;
         parallel = parallel_;
         held = ms_since(locked);
     }

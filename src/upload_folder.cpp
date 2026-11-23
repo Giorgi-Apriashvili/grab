@@ -908,7 +908,7 @@ sched::SmallRun send_small(const FolderJob& job, Tree& tree, std::mutex& m, cons
                 max_bytes, std::uint64_t{caps.write} * static_cast<std::uint64_t>(job.connections->read_depth(job.server, write_depth)));
             if (rate > 0) most = std::min(most, fetch::limited_in_flight(rate, 1));
             bool held = false;     // its next WRITE waits for tokens while replies are read
-            bool new_rate = false; // waiting for them ended with a new rate: looked at first
+            bool new_rate = false; // waiting for them ended with a new rate, or one came: looked at first
             for (auto it = slots.begin(); it != slots.end() && !held && !new_rate; ++it) {
                 const int id = it->first;
                 Slot& s = it->second;
@@ -916,6 +916,13 @@ sched::SmallRun send_small(const FolderJob& job, Tree& tree, std::mutex& m, cons
                 while (!s.refused && !s.dropped && s.sent < s.data.size() && !stop.stop_requested()) {
                     const auto n = static_cast<std::uint32_t>(std::min<std::uint64_t>(write_size, s.data.size() - s.sent));
                     if (writes_in_flight > 0 && bytes_in_flight + n > most) break;
+                    // Unlimited, a flush that waits for the server's SSH window takes the replies
+                    // that came meanwhile, so `most` may never be reached: a limit switched on is
+                    // looked at before each WRITE, not only once every file on the way was sent.
+                    if (rate == 0 && job.limiter != nullptr && job.limiter->generation() != seen.generation) {
+                        new_rate = true;
+                        break;
+                    }
                     if (rate > 0) {
                         // Its tokens are there now, or (with nothing on its way) it waits for them;
                         // else replies are read meanwhile and it looks again after each.

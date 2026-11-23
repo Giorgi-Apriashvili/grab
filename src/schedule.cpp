@@ -21,11 +21,13 @@ int wrap(int minute) { return ((minute % week) + week) % week; }
 
 int length_of(const Rule& r) { return r.to > r.from ? r.to - r.from : r.to + day - r.from; }
 
-// Where the rules start and end on the week, each point once, in order from Monday 00:00.
-std::vector<int> boundaries(const std::vector<Rule>& rules) {
+bool in_range(double mibps) { return mibps >= min_mibps && mibps <= max_mibps; } // also false for NaN
+
+// Where the rules for `dir` start and end on the week, each point once, in order from Monday 00:00.
+std::vector<int> boundaries(const std::vector<Rule>& rules, Dir dir) {
     std::set<int> points;
     for (const auto& r : rules) {
-        if (!valid(r)) continue;
+        if (!valid(r) || !speed_of(r, dir)) continue;
         for (int d = 0; d < 7; ++d) {
             if ((r.days & (1u << d)) == 0) continue;
             const int start = d * day + r.from;
@@ -40,18 +42,21 @@ std::vector<int> boundaries(const std::vector<Rule>& rules) {
 
 bool valid(const Rule& r) {
     return r.days != 0 && (r.days & ~0x7Fu) == 0 && r.from >= 0 && r.from < day && r.to >= 0 && r.to < day &&
-           r.mibps >= min_mibps && r.mibps <= max_mibps; // also false for NaN
+           (r.down || r.up) && (!r.down || in_range(*r.down)) && (!r.up || in_range(*r.up));
 }
 
-std::optional<double> limit_at(const std::vector<Rule>& rules, int minute) {
+std::optional<double> speed_of(const Rule& r, Dir dir) { return dir == Dir::up ? r.up : r.down; }
+
+std::optional<double> limit_at(const std::vector<Rule>& rules, int minute, Dir dir) {
     minute = wrap(minute);
     std::optional<double> lowest;
     for (const auto& r : rules) {
-        if (!valid(r)) continue;
+        const auto speed = speed_of(r, dir);
+        if (!valid(r) || !speed) continue;
         const int length = length_of(r);
         for (int d = 0; d < 7; ++d) {
             if ((r.days & (1u << d)) != 0 && wrap(minute - (d * day + r.from)) < length) {
-                lowest = std::min(lowest.value_or(r.mibps), r.mibps);
+                lowest = std::min(lowest.value_or(*speed), *speed);
                 break;
             }
         }
@@ -59,17 +64,21 @@ std::optional<double> limit_at(const std::vector<Rule>& rules, int minute) {
     return lowest;
 }
 
-std::optional<Change> next_change(const std::vector<Rule>& rules, int minute) {
+std::optional<Change> next_change(const std::vector<Rule>& rules, int minute, Dir dir) {
     minute = wrap(minute);
-    const auto now = limit_at(rules, minute);
+    const auto now = limit_at(rules, minute, dir);
     std::vector<int> ahead;
-    for (const int b : boundaries(rules)) ahead.push_back(wrap(b - minute) == 0 ? week : wrap(b - minute));
+    for (const int b : boundaries(rules, dir)) ahead.push_back(wrap(b - minute) == 0 ? week : wrap(b - minute));
     std::ranges::sort(ahead);
     for (const int a : ahead) {
         if (a == week) break; // a week on is now again
-        if (auto then = limit_at(rules, minute + a); then != now) return Change{a, then};
+        if (auto then = limit_at(rules, minute + a, dir); then != now) return Change{a, then};
     }
     return std::nullopt;
+}
+
+bool limits(const std::vector<Rule>& rules, Dir dir) {
+    return std::ranges::any_of(rules, [dir](const Rule& r) { return valid(r) && speed_of(r, dir); });
 }
 
 std::uint64_t bytes_per_s(double mibps) { return static_cast<std::uint64_t>(mibps * 1024 * 1024); }
@@ -113,7 +122,9 @@ Value to_json(const std::vector<Rule>& rules) {
         v.set("days", std::move(days));
         v.set("from", Value::make_string(time_text(r.from)));
         v.set("to", Value::make_string(time_text(r.to)));
-        v.set("mibps", Value::make_number(r.mibps));
+        // The download speed under grab 0.23's key, which reads nothing else.
+        if (r.down) v.set("mibps", Value::make_number(*r.down));
+        if (r.up) v.set("upMiBps", Value::make_number(*r.up));
         list.push(std::move(v));
     }
     return list;
@@ -122,26 +133,29 @@ Value to_json(const std::vector<Rule>& rules) {
 std::vector<Rule> from_json(const Value& v) {
     std::vector<Rule> rules;
     if (v.kind != Value::Kind::array) return rules;
+    // A speed's key: absent (or null) = that direction not limited by the rule; anything but a
+    // number there makes the rule unreadable.
+    auto speed = [](const Value& item, const char* key, std::optional<double>& out) {
+        const Value* s = item.find(key);
+        if (s == nullptr || s->kind == Value::Kind::null) return true;
+        if (s->kind != Value::Kind::number) return false;
+        out = s->number;
+        return true;
+    };
     for (const auto& item : v.items) {
         if (rules.size() == max_rules) break;
         const Value* days = item.find("days");
-        const Value* mibps = item.find("mibps");
         const auto from = parse_time(item.string_of("from").value_or(""));
         const auto to = parse_time(item.string_of("to").value_or(""));
-        if (days == nullptr || days->kind != Value::Kind::array || mibps == nullptr ||
-            mibps->kind != Value::Kind::number || !from || !to) {
-            continue;
-        }
-        Rule r;
-        r.days = 0;
+        if (days == nullptr || days->kind != Value::Kind::array || !from || !to) continue;
+        // "24:00" is midnight.
+        Rule r{.days = 0, .from = *from, .to = *to % day, .down = std::nullopt, .up = std::nullopt};
+        if (!speed(item, "mibps", r.down) || !speed(item, "upMiBps", r.up)) continue;
         for (const auto& d : days->items) {
             for (std::size_t i = 0; i < day_keys.size(); ++i) {
                 if (d.kind == Value::Kind::string && d.str == day_keys[i]) r.days |= 1u << i;
             }
         }
-        r.from = *from;
-        r.to = *to % day; // "24:00" is midnight
-        r.mibps = mibps->number;
         if (valid(r)) rules.push_back(r);
     }
     return rules;

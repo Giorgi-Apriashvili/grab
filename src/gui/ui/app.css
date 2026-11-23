@@ -17,6 +17,7 @@
   --input: #ffffff;
   --folder: #d29b1f;
   --warn: #b26a00;
+  --up-line: #0f8b8d; /* the speed graph's uploads, beside the accent's downloads */
   /* File-type icons */
   --f-video: #7c5ccf;
   --f-audio: #dd7a32;
@@ -50,6 +51,7 @@
     --input: #1f2226;
     --folder: #e3b341;
     --warn: #f0b429;
+    --up-line: #3cc6c0;
     --f-video: #a48cf0;
     --f-audio: #f0a060;
     --f-image: #4cc28a;
@@ -534,25 +536,56 @@ button.toggle[aria-pressed=true] { color: var(--accent); background: var(--sel);
 :where(.downloads-head > :not(.title, .spacer)) { cursor: auto; } /* buttons keep their own */
 html.split-drag, html.split-drag * { cursor: row-resize !important; }
 
-/* status bar: total speed and the speed limit */
+/* status bar: total speeds and the two speed limits */
 .bar.status { flex: none; padding: 4px 14px 8px; font-size: 12px; }
-/* The total's last minute: a fixed box before the text, so nothing moves as the numbers change. */
+/* The totals' last minute: a fixed box before the text, so nothing moves as the numbers change;
+   downloads over a shaded area, uploads a line of their own colour. */
 .speed-graph { flex: none; width: 72px; height: 16px; }
 .speed-graph.idle { visibility: hidden; }
 .speed-graph svg { display: block; width: 100%; height: 100%; overflow: visible; }
-.speed-graph .line { fill: none; stroke: var(--accent); stroke-width: 1.25; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.speed-graph .line, .speed-graph .up-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.25;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.speed-graph .up-line { stroke: var(--up-line); }
 .speed-graph .area { fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: none; }
-.bar.status #total-speed { font-variant-numeric: tabular-nums; }
-.bar.status #limit-value {
+/* The totals and the limits' text after them (#total-limit) give way (…) before the limits'
+   controls do: the bar never wraps nor runs past the window, at its narrowest too, and the controls
+   stay put whatever the values (#total-speed's tooltip has it all). */
+.bar.status #total-speed {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.bar.status .limit-value {
   width: 64px;
   height: 26px;
   text-align: right;
   transition: border-color 0.3s, background-color 0.3s, box-shadow 0.3s;
 }
-.bar.status #limit-value:disabled { opacity: 0.5; }
-.bar.status #limit-value.bad { border-color: var(--danger); }
-/* "· 12 MiB/s limit", right after the total as if one text (the bar's gap is 10px). */
-#total-limit { margin-left: -6px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.bar.status .limit-value:disabled { opacity: 0.5; }
+.bar.status .limit-value.bad { border-color: var(--danger); }
+/* "· 12 MiB/s limit", right after the total as if one text (the bar's gap is 10px); cut (…) with
+   the total when the bar is too narrow for both (above). */
+#total-limit {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: -6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* A limit's arrow, switch, box and unit together: "↓ [switch][12] MiB/s"; the two apart a little. */
+.limit-ctl { flex: none; display: inline-flex; align-items: center; gap: 8px; }
+.limit-ctl + .limit-ctl { margin-left: 6px; }
+.limit-ctl .switch { gap: 5px; }
+.limit-dir { font-weight: 600; color: var(--muted); }
 /* The MiB/s box (app.js, "the MiB/s box"). What floats above it (why a typed speed doesn't set,
    "Enter to set", the badge saying it was set) is out of the flow, so nothing in the bar moves,
    and right-aligned with the box, so it never reaches the window's right edge. */
@@ -573,7 +606,7 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 }
 .limit-why[hidden], .limit-tip[hidden] { display: none; }
 /* Typed and not set yet: a dashed amber box, "Enter to set" above it. */
-.bar.status .limit-box.pending #limit-value {
+.bar.status .limit-box.pending .limit-value {
   border-style: dashed;
   border-color: var(--warn);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 22%, transparent);
@@ -610,7 +643,7 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   border-radius: 6px;
   pointer-events: none;
 }
-.bar.status .limit-box.set #limit-value {
+.bar.status .limit-box.set .limit-value {
   border-color: var(--ok);
   background-color: color-mix(in srgb, var(--ok) 12%, var(--input));
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 30%, transparent);
@@ -654,8 +687,8 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
 .limit-badge.off::after { border-color: var(--line); }
 @keyframes limit-badge-in { from { opacity: 0; transform: translateY(5px) scale(0.94); } }
 @media (prefers-reduced-motion: reduce) {
-  .bar.status #limit-value, .limit-check { transition: none; }
-  .bar.status .limit-box.set #limit-value, .limit-box.set::after, .limit-box.set .limit-check,
+  .bar.status .limit-value, .limit-check { transition: none; }
+  .bar.status .limit-box.set .limit-value, .limit-box.set::after, .limit-box.set .limit-check,
   .limit-badge.show { animation: none; }
   .limit-badge.out { transform: none; transition: none; }
 }
@@ -667,7 +700,21 @@ html.split-drag, html.split-drag * { cursor: row-resize !important; }
   clip-path: inset(50%);
   white-space: nowrap;
 }
-.bar.status #limit-hint { height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); font-size: 12px; }
+/* The schedule's hint, right of the limits: never shrinking with the totals and their limits'
+   text (the controls stay put as they change), at most so wide (…, the tooltip has it all). */
+.bar.status #limit-hint {
+  flex: none;
+  max-width: 180px;
+  height: auto;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .bar.status #limit-hint:hover { text-decoration: underline; background: none; }
 .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
 .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
@@ -966,6 +1013,8 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .rule input[type=text] { height: 26px; padding: 0 6px; }
 .rule input.time { width: 56px; text-align: center; font-variant-numeric: tabular-nums; }
 .rule input.num { width: 52px; text-align: right; }
+.rule .rule-dir { font-weight: 600; color: var(--muted); margin-left: 2px; }
+.rule .rule-why { font-size: 12px; color: var(--danger); }
 .rule .next-day { font-size: 12px; min-width: 50px; }
 .rule .next-day.off { visibility: hidden; } /* keeps its place, so the rows line up */
 .rule .icon-btn { width: 26px; height: 26px; }
