@@ -187,13 +187,13 @@ void look_local(Check& check, const std::vector<fs::path>& picked, const std::fu
 }
 
 void look_server(Check& check, const std::shared_ptr<ssh::Pool>& pool, fetch::Connections& connections,
-                 std::stop_token stop) {
+                 std::stop_token stop, bool write) {
     {
         // One connection of the server's budget, as a listing takes (fetch::Listing): transfers
         // using all of it hand one back at once instead of when a range ends (review, chunk 3).
         const fetch::Listing seat(connections, check.server, stop, 1);
         if (stop.stop_requested()) return;
-        auto probed = probe(*pool, check.server, check.dir, stop);
+        auto probed = probe(*pool, check.server, check.dir, stop, write);
         if (stop.stop_requested()) return;
         if (!probed) {
             check.writable.reset();

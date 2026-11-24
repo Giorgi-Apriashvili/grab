@@ -206,6 +206,32 @@ std::expected<Walked, std::string> walk(const fs::path& root, std::stop_token st
     return out;
 }
 
+Left left_out(const fs::path& path) {
+#ifdef _WIN32
+    // Its own entry, as a folder's listing gives it: the reparse tag says a link or a junction.
+    WIN32_FIND_DATAW fd{};
+    const HANDLE h = FindFirstFileExW(readable(path).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return Left::no;
+    FindClose(h);
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 && IsReparseTagNameSurrogate(fd.dwReserved0)) return Left::link;
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return Left::no;
+#else
+    std::error_code ec;
+    const auto st = fs::symlink_status(path, ec);
+    if (ec) return Left::no;
+    if (fs::is_symlink(st)) return Left::link;
+    if (fs::is_directory(st)) return Left::no;
+#endif
+    const std::string name = util::path_to_utf8(path.filename());
+    if (name.ends_with(record_suffix)) return is_record(path) ? Left::partial : Left::no;
+    if (name.ends_with(part_suffix)) {
+        fs::path record = path;
+        record += util::path_from_utf8(record_suffix.substr(part_suffix.size()));
+        return is_record(record) ? Left::partial : Left::no;
+    }
+    return Left::no;
+}
+
 fs::path local_path(const fs::path& root, std::string_view rel) {
     fs::path p = root;
     const std::string raw = rclone_enc::raw_path(rel);

@@ -331,7 +331,7 @@ Refusal refusal(sftp::Client& client, const Caps& caps, std::string_view server,
 }
 
 std::expected<Probe, std::string> probe(ssh::Pool& pool, std::string_view server, std::string_view dir,
-                                        std::stop_token stop) {
+                                        std::stop_token stop, bool write) {
     std::optional<ssh::Pool::Lease> lease;
     try {
         lease = pool.acquire(stop, ssh::interactive_retry);
@@ -351,12 +351,29 @@ std::expected<Probe, std::string> probe(ssh::Pool& pool, std::string_view server
                 }
             }
         }
+        if (!write) {
+            // Only a look: a folder there is as far as can be seen without writing.
+            const auto there = sftp::stat(c, raw_dir.empty() ? std::string(".") : raw_dir);
+            if (there && there->is_dir()) {
+                p.writable = true;
+            } else if (!there && there.error().code != sftp::Code::no_such_file) {
+                p.why = std::format("cannot look at {} on {}: {}", shown_dir(dir), server, sftp::describe(there.error()));
+            } else {
+                p.why = std::format("there is no folder {} on {}", shown_dir(dir), server);
+            }
+            return p;
+        }
         const std::string file = in_folder(raw_dir, ".grab-probe-" + new_token());
         auto h = sftp::open_file(c, file, sftp::OpenFlags::write | sftp::OpenFlags::creat | sftp::OpenFlags::excl);
         if (!h) {
-            p.why = h.error().code == sftp::Code::no_such_file
-                        ? std::format("there is no folder {} on {}", shown_dir(dir), server)
-                        : refusal(c, caps, server, dir, raw_dir, h.error(), 1).why;
+            if (h.error().code == sftp::Code::no_such_file) {
+                p.why = std::format("there is no folder {} on {}", shown_dir(dir), server);
+                return p;
+            }
+            // A refusal in the server's own words ("Failure") names the server and the folder, as
+            // the window and the command show it on its own (review, chunk 7).
+            const std::string why = refusal(c, caps, server, dir, raw_dir, h.error(), 1).why;
+            p.why = why.starts_with(server) ? why : std::format("{} refused a file in {}: {}", server, shown_dir(dir), why);
             return p;
         }
         p.writable = true;

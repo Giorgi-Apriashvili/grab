@@ -25,6 +25,7 @@ std::string usage() {
 
 Usage:
   grab [-s|--file | -f|--folder] TARGET [DEST] [options]
+  grab upload LOCAL... [-r SERVER] REMOTE_DIR [options]
   grab config [-c PATH]
   grab server [list | add [NAME] | edit NAME | test NAME | trust NAME | remove NAME]
   grab update [--check]
@@ -38,7 +39,17 @@ Without -s or -f, grab looks for files. With several matches you pick from a num
 list: 3, 1-5,8, a = all, Enter = 1.
 DEST is the local parent directory: each item is written as DEST\<name>, created if needed.
 Without DEST, grab asks for one after you have picked (Enter = the current directory).
-`grab config` and `grab update` are commands; to search for a file named that, use -s.
+`grab config`, `grab update`, `grab server` and `grab upload` are commands; to search for a
+file or folder named that, use -s or -f (grab -f upload).
+
+`grab upload` sends files and folders from this PC into REMOTE_DIR, a folder on the server
+that must exist (absolute, or relative to the login home; . is the login home):
+`grab upload E:\Photos\holiday -r Main /srv/photos`. A folder goes in as a folder of its name,
+merged into one that is there already. * and ? in the last part of a LOCAL pick the names that
+match (E:\Photos\*.jpg). A file already on the server is asked about (--existing), one that is
+the same (size, time) is skipped unless --existing is replace. Each file takes its name only
+when complete; Ctrl+C keeps what was sent, and the same command again continues (under
+replace: with --existing different).
 
 Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
@@ -53,6 +64,8 @@ Commands:
   server test NAME     log in as downloads, searches and verification do, and list its home
   server trust NAME    fetch, confirm and pin a server's host key
   server remove NAME   delete a server from grab.conf, its saved password and host keys
+  upload LOCAL... REMOTE_DIR
+                       send files and folders to the server folder REMOTE_DIR (see above)
   update               install the latest GitHub release over this copy (Windows), after
                        verifying its SHA-256; --check only reports whether one is available.
 
@@ -62,8 +75,9 @@ Options:
   -r, --remote NAME    grab.conf section to use (default: [grab] default_remote)
   -c, --config PATH    grab.conf path (default: %APPDATA%\grab\grab.conf or $GRAB_CONFIG)
       --depth N        override max_depth for this run
-      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s), or
-                       off. Without --limit, the speed schedule set in grab's window applies
+      --limit RATE     cap the download speed (grab upload: the upload speed): 5M, 800K, 2.5
+                       (a bare number is MiB/s), or off. Without --limit, the speed schedule
+                       set in grab's window applies
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
@@ -72,12 +86,16 @@ Options:
       --min-size SIZE  only files at least this big: 700M, 1.5G, 20GiB (a bare number is MiB)
       --max-size SIZE  only files at most this big
       --fresh          fetch the server's file list now instead of using a saved one
-      --verify         check each download against the server's checksum (MD5) afterwards;
-      --no-verify      don't. Without either, the setting in grab's window applies (off at first)
+      --verify         check each download (or upload) against the server's checksum (MD5)
+      --no-verify      afterwards, or don't. Without either, the setting in grab's window
+                       applies (off at first)
       --existing WHAT  a different file already where a download goes (another size, or
                        older than the server's): replace it, both (keep yours and save the
                        new one as "name (2).ext") or skip it. Without it grab asks first, or
-                       stops when there is no console to ask on
+                       stops when there is no console to ask on. grab upload: a file already
+                       on the server: ask, replace, different (replace it if it differs),
+                       newer (if yours is newer), skip or both; without it the window's
+                       setting (Ask at first)
       --bind ADDRESS   connect from this local address, over the server's bind; a blank one
                        (--bind=) connects from any address this time
       --contimeout TIME
@@ -86,6 +104,8 @@ Options:
       --timeout TIME   the longest wait for the server once connected (1s to 24h), over its
                        io_timeout
   -n, --dry-run        resolve the target and show what would be fetched, transfer nothing
+                       (grab upload: what would go where, and what is there already; nothing
+                       is written on the server or here)
   -v, --verbose        say how grab connects and searches, and the settings' notes again
       --init           write grab.conf to the config path if absent, with the sftp remotes of
                        the standard rclone.conf as servers (rclone.conf is only read)
@@ -100,8 +120,10 @@ Downloads run over several connections at once and survive interruptions: Ctrl+C
 what is on disk, and the same command later continues from there. A file or folder file
 already on disk (same size, not older than the server's) is not fetched again.
 
-Exit codes: 0 ok, 1 usage, 2 config, 3 target not found / pick aborted, 4 remote lookup
-(search or file list) failed, 5 update failed, 6 download failed, 130 stopped by Ctrl+C.
+Exit codes: 0 ok (an upload: also nothing to send), 1 usage, 2 config, 3 target not found /
+pick aborted (upload: a LOCAL or REMOTE_DIR not found, or quit at the question), 4 remote
+lookup (search or file list) failed, 5 update failed, 6 download or upload failed (also a
+server that refuses writing), 130 stopped by Ctrl+C.
 )";
 }
 
@@ -121,6 +143,17 @@ namespace {
 constexpr auto switches = std::to_array<std::string_view>({"--file", "--folder", "--verify", "--no-verify", "--first",
                                                            "--all", "--exact", "--fresh", "--dry-run", "--verbose",
                                                            "--check", "--init", "--help", "--version"});
+
+// The search's options, which `grab upload` doesn't take.
+constexpr auto search_options = std::to_array<std::string_view>({"-s", "--file", "-f", "--folder", "--depth", "--first",
+                                                                 "--all", "--exact", "--type", "--min-size", "--max-size",
+                                                                 "--fresh"});
+
+// Whether a REMOTE_DIR as typed is a folder on this PC instead ("E:\photos", "\\nas\share").
+bool looks_local(std::string_view dir) {
+    const bool drive = dir.size() >= 2 && dir[1] == ':' && ((dir[0] >= 'A' && dir[0] <= 'Z') || (dir[0] >= 'a' && dir[0] <= 'z'));
+    return drive || dir.starts_with("\\\\");
+}
 
 // rclone's flags that grab 0.20 passed on after `--` (and its help named), which a script may
 // still put there: never taken for TARGET or DEST in this grab (RCLONE-REPLACEMENT.md, phase 9
@@ -192,8 +225,9 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     bool rclone_copy = false;         // --rclone, which is gone
     bool connect_given = false;       // --bind, --contimeout or --timeout
 
-    // `grab config` and `grab update` are subcommands only as the first argument, so a folder
-    // literally named "config" or "update" is still reachable with a mode flag first.
+    // `grab config`, `grab update`, `grab server` and `grab upload` are subcommands only as the
+    // first argument, so a file or folder literally named so is still found with a mode flag
+    // first (`grab -f upload`).
     std::size_t start = 0;
     if (!args.empty() && args[0] == "config") {
         result.action = CliAction::config;
@@ -204,7 +238,13 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
     } else if (!args.empty() && args[0] == "server") {
         result.action = CliAction::server;
         start = 1;
+    } else if (!args.empty() && args[0] == "upload") {
+        result.action = CliAction::upload;
+        start = 1;
     }
+    const bool uploading = result.action == CliAction::upload;
+    // What `grab upload` doesn't take, as given (refused below, never ignored).
+    std::vector<std::string_view> search_only;
 
     for (std::size_t i = start; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -240,6 +280,7 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
             return util::failf("option {} takes no value{}", name,
                                name == "--verify" ? " (--no-verify turns verification off)" : "");
         }
+        if (uploading && std::ranges::contains(search_options, name)) search_only.push_back(name);
 
         if (name == "-s" || name == "--file" || name == "-f" || name == "--folder") {
             const Mode m = (name == "-s" || name == "--file") ? Mode::file : Mode::folder;
@@ -290,6 +331,13 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
                 return util::failf("{} takes a size like 700M, 1.5G or 20GiB (a bare number is MiB); got '{}'", name, *v);
             }
             (name == "--min-size" ? result.opts.filter.min_size : result.opts.filter.max_size) = *bytes;
+        } else if (name == "--existing" && uploading) {
+            // A file already on the server: the upload dialog's choices, and Ask.
+            auto v = take_value();
+            if (!v) return util::fail(v.error());
+            const auto choice = upload::parse_existing(util::to_lower(util::trim(*v)));
+            if (!choice) return util::failf("--existing takes ask, replace, different, newer, skip or both; got '{}'", *v);
+            result.opts.upload_existing = *choice;
         } else if (name == "--existing") {
             auto v = take_value();
             if (!v) return util::fail(v.error());
@@ -320,6 +368,7 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         } else if (name == "--check") {
             result.opts.check = true;
         } else if (name == "--init") {
+            if (uploading) return util::fail("`grab upload` takes no --init");
             result.action = CliAction::init;
         } else if (name == "-h" || name == "--help") {
             result.action = CliAction::help;
@@ -386,6 +435,29 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         result.opts.server_args = positionals.empty() ? std::vector<std::string>{"list"} : positionals;
         return result;
     }
+    if (uploading) {
+        if (!search_only.empty()) {
+            return util::failf("`grab upload` takes no {}: it sends what LOCAL names, as it is", search_only.front());
+        }
+        if (positionals.size() < 2) {
+            return util::fail(positionals.empty() ? "expected LOCAL... REMOTE_DIR: the files or folders to upload, then the "
+                                                    "server folder they go into"
+                                                  : "expected REMOTE_DIR after LOCAL: the server folder to upload into (such "
+                                                    "as /srv/photos, or . for the login folder)");
+        }
+        const std::string& dir = positionals.back();
+        if (util::trim(dir).empty()) return util::fail("REMOTE_DIR must not be empty (. is the login folder)");
+        if (looks_local(dir)) {
+            return util::failf("REMOTE_DIR comes last, a folder on the server (such as /srv/photos); '{}' is one on this PC",
+                               dir);
+        }
+        for (std::size_t k = 0; k + 1 < positionals.size(); ++k) {
+            if (util::trim(positionals[k]).empty()) return util::fail("LOCAL must not be empty");
+            result.opts.locals.push_back(positionals[k]);
+        }
+        result.opts.remote_dir = remote_dir_of(dir);
+        return result;
+    }
     if (result.action == CliAction::init || result.action == CliAction::config ||
         result.action == CliAction::update) {
         if (!positionals.empty() || mode) {
@@ -399,6 +471,12 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
 
     if (positionals.empty()) return util::fail("expected TARGET: what to search for");
     if (positionals.size() > 2) {
+        // `grab -r Main upload E:\Photos /srv`: the server first, as the README's examples have it.
+        if (positionals[0] == "upload" && !mode) {
+            return util::failf("expected TARGET [DEST], got {} arguments; `upload` is a command only as the first word: "
+                               "grab upload LOCAL... -r SERVER REMOTE_DIR (to search for upload, use -s or -f)",
+                               positionals.size());
+        }
         return util::failf("expected TARGET [DEST], got {} arguments; quote a TARGET that has "
                            "spaces, e.g. \"lioness s03e08\"",
                            positionals.size());
@@ -428,6 +506,19 @@ std::expected<CliResult, std::string> parse_args(std::span<const std::string> ar
         result.opts.dest = util::path_from_utf8(positionals[1]);
     }
     return result;
+}
+
+std::string remote_dir_of(std::string_view typed) {
+    std::string out;
+    out.reserve(typed.size());
+    for (const char c : typed) {
+        if (c == '/' && out.ends_with('/')) continue; // "a//b" is "a/b"
+        out += c;
+    }
+    while (out.size() > 1 && out.ends_with('/')) out.pop_back();
+    while (out.starts_with("./") || out.starts_with("~/")) out.erase(0, 2);
+    if (out == "." || out == "~") out.clear();
+    return out;
 }
 
 } // namespace grab

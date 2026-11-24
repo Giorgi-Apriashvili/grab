@@ -37,6 +37,8 @@ add_library(grab_core STATIC
     src/quote.cpp
     src/ini.cpp
     src/cli.cpp
+    src/cli_console.cpp
+    src/cli_upload.cpp
     src/config.cpp
     src/remote.cpp
     src/match.cpp

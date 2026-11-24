@@ -31,7 +31,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -83,37 +82,14 @@ Value clash_json(const std::string& name, const upload::Clash& c) {
     return f;
 }
 
-// Tests only (UPLOADS.md chunk 3; to be removed before 0.24.0, step 7.5): with
-// GRAB_TEST_PICKS=<file>, the upload's file dialog isn't shown; its answer is the file's lines (one
-// path each, UTF-8; none: cancelled), so a window driven over DevTools can upload without a native
-// dialog in the way. What was asked goes to <file>.asked ("files|folders <title>").
-std::optional<std::vector<std::filesystem::path>> test_picks(bool folders, const std::string& title) {
-    const auto file = util::getenv_utf8("GRAB_TEST_PICKS");
-    if (!file || file->empty()) return std::nullopt;
-    const auto path = util::path_from_utf8(*file);
-    {
-        std::ofstream asked(util::path_from_utf8(*file + ".asked"), std::ios::app | std::ios::binary);
-        asked << (folders ? "folders " : "files ") << title << '\n';
-    }
-    std::vector<std::filesystem::path> picked;
-    const auto text = util::read_file_if_exists(path);
-    if (!text || !*text) return picked;
-    for (auto line : util::split(**text, '\n')) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-        if (!line.empty()) picked.push_back(util::path_from_utf8(line));
-    }
-    return picked;
-}
-
 } // namespace
 
 // ---- the check before an upload ------------------------------------------------------------------
 
 void App::pick_upload(const std::string& server, const std::string& dir, bool folders, int token) {
     const std::string title = std::format("Upload {} to {}:{}", folders ? "folders" : "files", server, dir.empty() ? "~" : dir);
-    auto picked = test_picks(folders, title);
-    if (!picked) picked = pick_paths(util::to_wide(title), folders, true, last_upload_dir_);
-    if (picked->empty()) {
+    auto picked = pick_paths(util::to_wide(title), folders, true, last_upload_dir_);
+    if (picked.empty()) {
         Value v = Value::make_object();
         v.set("type", str("uploadCheck"));
         v.set("token", num(token));
@@ -121,8 +97,8 @@ void App::pick_upload(const std::string& server, const std::string& dir, bool fo
         post(v);
         return;
     }
-    last_upload_dir_ = picked->front().parent_path();
-    start_check(token, server, dir, std::move(*picked));
+    last_upload_dir_ = picked.front().parent_path();
+    start_check(token, server, dir, std::move(picked));
 }
 
 void App::drop_upload(int token, const std::string& server, const std::string& dir, bool url, std::vector<std::filesystem::path> paths) {

@@ -1,8 +1,10 @@
 // grab: locate a file or folder on a Linux server by name (ssh + find), then download it with
-// grab's resumable engine (cli_download.hpp). See README.md.
+// grab's resumable engine (cli_download.hpp); `grab upload` sends files the other way
+// (cli_upload.hpp). See README.md.
 
 #include "cli.hpp"
 #include "cli_download.hpp"
+#include "cli_upload.hpp"
 #include "config.hpp"
 #include "conn_budget.hpp"
 #include "engine.hpp"
@@ -25,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <iostream>
@@ -296,8 +299,10 @@ std::expected<engine::SearchResult, std::string> search(const engine::Context& c
     return file_list::search(ctx, *fetched, req);
 }
 
-int run(const Options& opts) {
-    // 2. configuration -------------------------------------------------------------------
+// The configuration a search or an upload runs with: grab.conf and the server's section, the
+// settings' notes, and the run's own connection settings checked. The exit code when it can't
+// (said).
+std::expected<engine::Context, int> configure(const Options& opts) {
     const auto cfg_path = opts.config.value_or(default_grab_config_path());
     auto ctx = engine::load_context(cfg_path, opts.remote);
     if (!ctx) {
@@ -306,7 +311,7 @@ int run(const Options& opts) {
         if (!std::filesystem::exists(cfg_path, ec)) {
             std::println(stderr, "hint: run `grab --init` to create {}", util::path_to_utf8(cfg_path));
         }
-        return exit_config;
+        return std::unexpected(exit_config);
     }
     if (!ctx->imported.empty()) {
         std::println(stderr, "grab: moved the connection details of {} from rclone.conf into {} (one time)",
@@ -331,8 +336,22 @@ int run(const Options& opts) {
     // (RCLONE-REPLACEMENT.md, phase 9 step 7).
     if (auto reach = engine::connect_settings(ctx->settings, opts.connect); !reach) {
         error(reach.error());
-        return exit_config;
+        return std::unexpected(exit_config);
     }
+    return std::move(*ctx);
+}
+
+// `grab upload` (cli_upload.hpp).
+int run_upload_command(const Options& opts) {
+    auto ctx = configure(opts);
+    if (!ctx) return ctx.error();
+    return upload_with_grab(*ctx, opts);
+}
+
+int run(const Options& opts) {
+    // 2. configuration -------------------------------------------------------------------
+    auto ctx = configure(opts);
+    if (!ctx) return ctx.error();
 
     // destination: a given DEST is checked before the search so a typo fails fast; a missing
     // one is asked for after the pick, which needs a terminal.
@@ -492,6 +511,8 @@ int main(int argc, char** argv) {
         return update::run(parsed->opts.check);
     case CliAction::server:
         return run_server_command(parsed->opts);
+    case CliAction::upload:
+        return run_upload_command(parsed->opts);
     case CliAction::run:
         return run(parsed->opts);
     }

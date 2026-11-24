@@ -102,9 +102,11 @@ void look_local(Check& check, const std::vector<std::filesystem::path>& picked, 
 
 // The server's side through `pool`, each step on seats from `connections` (one for the probe and
 // the files' names, a listing's for a folder's look), so transfers using the server's whole budget
-// make room for it: the probe, then, where this account may write, the names taken there.
+// make room for it: the probe, then, where this account may write, the names taken there. Without
+// `write` (grab upload -n) nothing is written on the server: the probe only looks (upload::probe),
+// and `writable` says only that nothing seen refuses it.
 void look_server(Check& check, const std::shared_ptr<ssh::Pool>& pool, fetch::Connections& connections,
-                 std::stop_token stop = {});
+                 std::stop_token stop = {}, bool write = true);
 
 // Why nothing of what was picked can go: nothing was picked, or every item has an error (the
 // first one's). "" when some of it can.

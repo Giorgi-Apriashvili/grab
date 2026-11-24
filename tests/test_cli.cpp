@@ -1,4 +1,5 @@
 #include "cli.hpp"
+#include "upload_existing.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -6,8 +7,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <initializer_list>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -357,6 +360,103 @@ TEST_CASE("usage mentions both modes") {
     const auto u = usage();
     CHECK(u.find("--folder") != std::string::npos);
     CHECK(u.find("--file") != std::string::npos);
+}
+
+TEST_CASE("grab upload: LOCAL... REMOTE_DIR with -r, -n, --limit and --existing's six answers (UPLOADS.md 5.11)") {
+    auto r = parse_args(args({"upload", "E:\\Photos\\holiday", "E:\\notes.txt", "-r", "Main", "/srv/photos/", "-n",
+                              "--limit", "2", "--existing", "newer", "-v", "--verify", "--timeout", "45s", "-c", "C:\\g.conf"}));
+    REQUIRE_MESSAGE(r.has_value(), r.error_or(""));
+    CHECK(r->action == CliAction::upload);
+    CHECK(r->opts.locals == std::vector<std::string>{"E:\\Photos\\holiday", "E:\\notes.txt"});
+    CHECK(r->opts.remote_dir == "/srv/photos");
+    CHECK(r->opts.remote == "Main");
+    CHECK(r->opts.dry_run);
+    CHECK(r->opts.limit == std::optional<std::uint64_t>(2u << 20));
+    CHECK(r->opts.upload_existing == std::optional(upload::Existing::newer));
+    CHECK_FALSE(r->opts.existing.has_value()); // the download's answer stays unset
+    CHECK(r->opts.verbose);
+    CHECK(r->opts.verify == std::optional<bool>(true));
+    CHECK(r->opts.connect.io_timeout == std::optional(std::chrono::milliseconds(45'000)));
+    CHECK(util::path_to_utf8(r->opts.config.value_or("")) == "C:\\g.conf");
+    // Every answer the window has, by its name.
+    for (const auto& [typed, want] : {std::pair{"ask", upload::Existing::ask}, std::pair{"replace", upload::Existing::replace},
+                                      std::pair{"different", upload::Existing::different},
+                                      std::pair{"newer", upload::Existing::newer}, std::pair{"skip", upload::Existing::skip},
+                                      std::pair{"both", upload::Existing::keep_both}, std::pair{"Skip", upload::Existing::skip}}) {
+        CAPTURE(typed);
+        const auto a = parse_args(args({"upload", "a.txt", ".", "--existing", typed}));
+        REQUIRE_MESSAGE(a.has_value(), a.error_or(""));
+        CHECK(a->opts.upload_existing == std::optional(want));
+        CHECK(a->opts.remote_dir.empty()); // "." is the login folder
+    }
+    CHECK(parse_args(args({"upload", "a.txt", ".", "--existing", "keep"})).error_or("") ==
+          "--existing takes ask, replace, different, newer, skip or both; got 'keep'");
+    // A download's --existing is as it was.
+    CHECK(parse_args(args({"movie", "--existing", "different"})).error_or("") == "--existing takes replace, both or skip; got 'different'");
+    // LOCAL after `--` may start with '-'.
+    auto dash = parse_args(args({"upload", "--", "-notes.txt", "srv"}));
+    REQUIRE_MESSAGE(dash.has_value(), dash.error_or(""));
+    CHECK(dash->opts.locals == std::vector<std::string>{"-notes.txt"});
+    CHECK(dash->opts.remote_dir == "srv");
+}
+
+TEST_CASE("grab upload: a command only as the first word, so grab -f upload still searches for upload") {
+    auto search = parse_args(args({"-f", "upload"}));
+    REQUIRE(search.has_value());
+    CHECK(search->action == CliAction::run);
+    CHECK(search->opts.mode == Mode::folder);
+    CHECK(search->opts.target == "upload");
+    auto file = parse_args(args({"-s", "upload", "E:\\x"}));
+    REQUIRE(file.has_value());
+    CHECK(file->action == CliAction::run);
+    CHECK(file->opts.target == "upload");
+    CHECK(parse_args(args({"upload", "--help"}))->action == CliAction::help);
+    const auto help = usage();
+    CHECK(help.find("grab upload LOCAL... [-r SERVER] REMOTE_DIR") != std::string::npos);
+    CHECK(help.find("grab -f upload") != std::string::npos);
+    // The server first, as the README's examples have it: said why, not the search's quoting hint.
+    CHECK(parse_args(args({"-r", "Main", "upload", "E:\\Photos", "/srv"})).error_or("") ==
+          "expected TARGET [DEST], got 3 arguments; `upload` is a command only as the first word: grab upload LOCAL... "
+          "-r SERVER REMOTE_DIR (to search for upload, use -s or -f)");
+    CHECK(parse_args(args({"-r", "Main", "-f", "upload", "a", "b"})).error_or("").ends_with("quote a TARGET that has spaces, e.g. \"lioness s03e08\""));
+}
+
+TEST_CASE("grab upload: the search's options, a missing REMOTE_DIR or one on this PC are refused, never ignored") {
+    for (const auto& [list, why] :
+         {std::pair{args({"upload", "-f", "a", "/srv"}), "`grab upload` takes no -f: it sends what LOCAL names, as it is"},
+          std::pair{args({"upload", "a", "/srv", "--first"}), "`grab upload` takes no --first: it sends what LOCAL names, as it is"},
+          std::pair{args({"upload", "a", "/srv", "--type", "video"}), "`grab upload` takes no --type: it sends what LOCAL names, as it is"},
+          std::pair{args({"upload", "a", "/srv", "--depth", "2"}), "`grab upload` takes no --depth: it sends what LOCAL names, as it is"},
+          std::pair{args({"upload", "a", "/srv", "--fresh"}), "`grab upload` takes no --fresh: it sends what LOCAL names, as it is"},
+          std::pair{args({"upload", "a", "/srv", "--init"}), "`grab upload` takes no --init"},
+          std::pair{args({"upload", "a", "/srv", "--check"}), "--check only applies to `grab update`"},
+          std::pair{args({"upload"}), "expected LOCAL... REMOTE_DIR: the files or folders to upload, then the server folder they go into"},
+          std::pair{args({"upload", "E:\\Photos"}),
+                    "expected REMOTE_DIR after LOCAL: the server folder to upload into (such as /srv/photos, or . for the login folder)"},
+          std::pair{args({"upload", "/srv/photos", "E:\\Photos"}),
+                    "REMOTE_DIR comes last, a folder on the server (such as /srv/photos); 'E:\\Photos' is one on this PC"},
+          std::pair{args({"upload", "a", R"(\\nas\share)"}),
+                    R"(REMOTE_DIR comes last, a folder on the server (such as /srv/photos); '\\nas\share' is one on this PC)"},
+          std::pair{args({"upload", "a", " "}), "REMOTE_DIR must not be empty (. is the login folder)"},
+          std::pair{args({"upload", "", "/srv"}), "LOCAL must not be empty"}}) {
+        CAPTURE(why);
+        const auto r = parse_args(list);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == why);
+    }
+}
+
+TEST_CASE("grab upload: REMOTE_DIR in grab's form: the login folder, ~ and ./, the slashes") {
+    CHECK(remote_dir_of(".") == "");
+    CHECK(remote_dir_of("./") == "");
+    CHECK(remote_dir_of("~") == "");
+    CHECK(remote_dir_of("~/") == "");
+    CHECK(remote_dir_of("~/up/x/") == "up/x");
+    CHECK(remote_dir_of("./up") == "up");
+    CHECK(remote_dir_of("/") == "/");
+    CHECK(remote_dir_of("//srv//photos//") == "/srv/photos");
+    CHECK(remote_dir_of("/srv/~x") == "/srv/~x");
+    CHECK(remote_dir_of("Season 1") == "Season 1");
 }
 
 namespace {

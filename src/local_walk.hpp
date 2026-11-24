@@ -37,6 +37,13 @@ struct Walked {
 // folder; empty with no error when `stop` was requested.
 [[nodiscard]] std::expected<Walked, std::string> walk(const std::filesystem::path& root, std::stop_token stop = {});
 
+// Whether walk() would leave `path` out of a folder: a link or a junction (never followed), or one
+// of grab's own partial downloads (a "*.grabpart" whose record beside it parses, a
+// "*.grabpart.json" that parses). For names a pattern picked (grab upload's `*`), which the user
+// didn't name one by one.
+enum class Left { no, link, partial };
+[[nodiscard]] Left left_out(const std::filesystem::path& path);
+
 // The local path of a file or folder `rel` (Walked's form) in `root`.
 [[nodiscard]] std::filesystem::path local_path(const std::filesystem::path& root, std::string_view rel);
 

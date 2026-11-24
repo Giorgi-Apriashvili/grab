@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -69,6 +70,9 @@ struct FakePool {
     sftp::Code mkdir_existing_as = sftp::Code::failure; // what MKDIR of a name there answers
     std::set<std::string> rename_refused;        // plain RENAMEs to these answer "Permission denied"
     std::atomic<bool> break_after_rename{false}; // the next RENAME/posix-rename, on any session
+    // With `writable`: told each OPEN's path on every session as it comes, with `store` (its lock
+    // held: change it directly), so a test can put a file where an upload is about to go.
+    std::function<void(FakeFiles&, const std::string&)> on_open;
     std::mutex mutex;
     std::vector<std::pair<std::uint64_t, std::uint32_t>> reads;
     std::vector<FakeServer::Write> writes;   // every session's WRITEs, as each closed
@@ -117,6 +121,7 @@ struct FakePool {
             server.no_setstat = f.no_setstat;
             server.mkdir_existing_as = f.mkdir_existing_as;
             server.break_after_rename = &f.break_after_rename;
+            if (f.on_open && f.writable) server.on_open = [&f](const std::string& path) { f.on_open(f.store, path); };
             if (f.reads_wait_for_logins > 0) {
                 server.on_read = [&f](const std::string&, std::uint32_t) {
                     const auto until = std::chrono::steady_clock::now() + 20s;

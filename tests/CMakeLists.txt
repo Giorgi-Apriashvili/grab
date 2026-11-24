@@ -18,6 +18,7 @@ add_executable(grab_tests
     test_quote.cpp
     test_ini.cpp
     test_cli.cpp
+    test_cli_upload.cpp
     test_config.cpp
     test_remote.cpp
     test_listing.cpp

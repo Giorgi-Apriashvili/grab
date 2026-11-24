@@ -2,6 +2,7 @@
 
 #include "existing.hpp"
 #include "file_type.hpp"
+#include "upload_existing.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace grab {
@@ -31,11 +33,19 @@ struct Options {
     std::optional<std::string> remote;
     std::optional<std::filesystem::path> config;
     std::optional<int> depth;
-    // --limit: download speed cap in bytes per second; 0 = off. Without it, the speed schedule.
+    // --limit: download speed cap in bytes per second (`grab upload`: the upload speed's); 0 = off.
+    // Without it, the speed schedule.
     std::optional<std::uint64_t> limit;
     std::optional<bool> verify;      // --verify / --no-verify; without either, the window's setting
     // --existing: a different file already where a download goes; without it, grab asks.
     std::optional<existing::Choice> existing;
+    // `grab upload LOCAL... REMOTE_DIR`: the local files and folders as typed ('*' and '?' in a
+    // last part are expanded when it runs), the server folder they go into in grab's form ("" the
+    // login folder), and --existing for a file already on the server (without it, the window's
+    // setting).
+    std::vector<std::string> locals;
+    std::string remote_dir;
+    std::optional<upload::Existing> upload_existing;
     file_type::Filter filter;        // --type, --min-size, --max-size: which file hits count
     bool first = false;
     bool all = false;                // --all: take every match without asking
@@ -48,7 +58,7 @@ struct Options {
     std::vector<std::string> server_args; // `grab server SUBCOMMAND [NAME]`
 };
 
-enum class CliAction { run, help, version, init, config, update, server };
+enum class CliAction { run, help, version, init, config, update, server, upload };
 
 struct CliResult {
     CliAction action = CliAction::run;
@@ -58,7 +68,12 @@ struct CliResult {
 // `args` excludes the program name. `--` ends the options: what follows is TARGET and DEST even
 // when it starts with '-' (G117), except a word there that would become DEST, or one of the flags
 // grab 0.20 passed on to rclone after `--`, which is refused with what to write instead.
+// `config`, `update`, `server` and `upload` are commands only as the first word.
 [[nodiscard]] std::expected<CliResult, std::string> parse_args(std::span<const std::string> args);
+
+// REMOTE_DIR as typed into grab's form of a server folder: "" for the login folder (also ".",
+// "~" and "~/"), "~/x" and "./x" relative to it, the slashes at its end and doubled ones dropped.
+[[nodiscard]] std::string remote_dir_of(std::string_view typed);
 
 [[nodiscard]] std::string usage();
 

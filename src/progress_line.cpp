@@ -72,6 +72,36 @@ std::string done(std::uint64_t total, std::uint64_t fetched, double seconds, std
     return out;
 }
 
+std::string count(std::uint64_t n) {
+    std::string digits = std::to_string(n);
+    std::string out;
+    out.reserve(digits.size() + digits.size() / 3);
+    for (std::size_t i = 0; i < digits.size(); ++i) {
+        if (i > 0 && (digits.size() - i) % 3 == 0) out += ',';
+        out += digits[i];
+    }
+    return out;
+}
+
+std::string took(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0) seconds = 0;
+    if (seconds < 9.95) return std::format("{:.1f} s", seconds);
+    const auto total = static_cast<std::uint64_t>(std::llround(seconds));
+    if (total < 60) return std::format("{} s", total);
+    if (total < 600) return total % 60 == 0 ? std::format("{} min", total / 60) : std::format("{} min {} s", total / 60, total % 60);
+    const auto minutes = (total + 30) / 60;
+    if (minutes < 60) return std::format("{} min", minutes);
+    return minutes % 60 == 0 ? std::format("{} h", minutes / 60) : std::format("{} h {} min", minutes / 60, minutes % 60);
+}
+
+std::string uploaded(std::size_t files, std::uint64_t total, std::uint64_t sent, std::string_view place, double seconds) {
+    std::string out = std::format("Uploaded {} file{} ({}", count(files), files == 1 ? "" : "s", util::format_size(total));
+    if (sent > 0 && sent < total) out += std::format(", {} of it now", util::format_size(sent));
+    out += std::format(") to {} in {}", place, took(seconds));
+    if (seconds >= 0.5 && sent > 0) out += ", " + speed_text(static_cast<double>(sent) / seconds);
+    return out;
+}
+
 std::string folder_failed(std::string_view failed, std::string_view checked) {
     std::string out;
     if (!checked.empty()) out = std::format("  {}\n", checked);

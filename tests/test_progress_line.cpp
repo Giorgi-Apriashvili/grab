@@ -59,6 +59,29 @@ TEST_CASE("the line that ends a download") {
     CHECK(progress::done(0, 0, 1.0, 0) == "done: 0 files, 0 B in 0:01");
 }
 
+TEST_CASE("the line that ends an upload (grab upload): files counted with their thousands, the time in words") {
+    CHECK(progress::count(0) == "0");
+    CHECK(progress::count(999) == "999");
+    CHECK(progress::count(1204) == "1,204");
+    CHECK(progress::count(1234567) == "1,234,567");
+    CHECK(progress::took(0.43) == "0.4 s");
+    CHECK(progress::took(9.94) == "9.9 s");
+    CHECK(progress::took(9.96) == "10 s");
+    CHECK(progress::took(42.4) == "42 s");
+    CHECK(progress::took(240) == "4 min");
+    CHECK(progress::took(252) == "4 min 12 s");
+    CHECK(progress::took(38 * 60 + 20) == "38 min");
+    CHECK(progress::took(3600 + 5 * 60) == "1 h 5 min");
+    CHECK(progress::took(7200) == "2 h");
+    CHECK(progress::took(-1) == "0.0 s");
+    CHECK(progress::uploaded(1204, 3277 * MiB, 3277 * MiB, "Main:/srv/holiday-photos", 252) ==
+          "Uploaded 1,204 files (3.2 GiB) to Main:/srv/holiday-photos in 4 min 12 s, 13.0 MiB/s");
+    // went on from an earlier run: the speed is this run's
+    CHECK(progress::uploaded(1, 1024 * MiB, 412 * MiB, "Main:/srv/big.bin", 52) ==
+          "Uploaded 1 file (1.0 GiB, 412.0 MiB of it now) to Main:/srv/big.bin in 52 s, 7.9 MiB/s");
+    CHECK(progress::uploaded(1, 3, 3, "Main:a.txt", 0.2) == "Uploaded 1 file (3 B) to Main:a.txt in 0.2 s"); // too quick for a speed
+}
+
 TEST_CASE("a line is fitted to the console without wrapping") {
     CHECK(progress::fit("abc", 3) == "abc");
     CHECK(progress::fit("abcdef", 4) == "abc\xE2\x80\xA6");

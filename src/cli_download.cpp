@@ -1,5 +1,6 @@
 #include "cli_download.hpp"
 
+#include "cli_console.hpp"
 #include "conn_budget.hpp"
 #include "existing.hpp"
 #include "fetch.hpp"
@@ -8,7 +9,6 @@
 #include "local_name.hpp"
 #include "process.hpp"
 #include "progress_line.hpp"
-#include "queue_view.hpp"
 #include "quote.hpp"
 #include "rate.hpp"
 #include "remote.hpp"
@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <format>
 #include <iostream>
@@ -31,16 +30,7 @@
 #include <print>
 #include <stop_token>
 #include <system_error>
-#include <thread>
 #include <utility>
-
-#ifdef _WIN32
-#include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
-#else
-#include <csignal>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#endif
 
 namespace grab {
 
@@ -51,195 +41,6 @@ using Clock = std::chrono::steady_clock;
 double seconds_since(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
-
-// The download's progress on stderr: one line redrawn in place on a console. When stderr is a
-// file or a pipe there is no live line, only the lines that end a download. Thread-safe.
-class LiveLine {
-public:
-    LiveLine() {
-#ifdef _WIN32
-        handle_ = GetStdHandle(STD_ERROR_HANDLE);
-        DWORD mode = 0;
-        console_ = handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE && GetConsoleMode(handle_, &mode) != 0;
-#else
-        console_ = isatty(STDERR_FILENO) != 0;
-#endif
-    }
-
-    // Redraws the line, at most every 250 ms unless `now`.
-    void show(const std::string& text, bool now = false) {
-        if (!console_) return;
-        std::lock_guard lock(m_);
-        const auto t = Clock::now();
-        if (!now && t - last_ < std::chrono::milliseconds(250)) return;
-        last_ = t;
-        draw(progress::fit("  " + text, width() - 1)); // the last column would wrap
-    }
-    // Replaces the live line with `text`, kept as a normal line.
-    void finish(const std::string& text) {
-        std::lock_guard lock(m_);
-        erase();
-        std::println(stderr, "  {}", text);
-        std::fflush(stderr);
-    }
-    // Removes the live line, e.g. before an error message.
-    void clear() {
-        std::lock_guard lock(m_);
-        erase();
-        std::fflush(stderr);
-    }
-    // A line above the live one (a command line with -v, a note); the next show() redraws.
-    void message(const std::string& text) {
-        std::lock_guard lock(m_);
-        erase();
-        std::println(stderr, "{}", text);
-        std::fflush(stderr);
-        last_ = {};
-    }
-
-private:
-    [[nodiscard]] std::size_t width() const {
-#ifdef _WIN32
-        CONSOLE_SCREEN_BUFFER_INFO info{};
-        if (GetConsoleScreenBufferInfo(handle_, &info)) {
-            return static_cast<std::size_t>(std::max(info.srWindow.Right - info.srWindow.Left + 1, 20));
-        }
-#else
-        winsize ws{};
-        if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return std::max<std::size_t>(ws.ws_col, 20);
-#endif
-        return 80;
-    }
-    static std::size_t columns(std::string_view s) {
-        return static_cast<std::size_t>(std::ranges::count_if(s, [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; }));
-    }
-    void draw(const std::string& text) {
-        const std::size_t cols = columns(text);
-        std::string out = "\r" + text;
-        if (cols < shown_) out.append(shown_ - cols, ' '); // over the rest of the previous line
-        std::fputs(out.c_str(), stderr);
-        std::fflush(stderr);
-        shown_ = std::max(cols, shown_);
-    }
-    void erase() {
-        if (!console_ || shown_ == 0) return;
-        std::fputs(("\r" + std::string(shown_, ' ') + "\r").c_str(), stderr);
-        shown_ = 0;
-    }
-
-    std::mutex m_;
-    bool console_ = false;
-#ifdef _WIN32
-    HANDLE handle_ = nullptr;
-#endif
-    std::size_t shown_ = 0; // columns of the live line on screen
-    Clock::time_point last_{};
-};
-
-// While alive, Ctrl+C stops the downloads (its token) instead of ending grab, so partial files
-// and their progress stay for the next run. A second Ctrl+C ends grab at once.
-class StopOnCtrlC {
-public:
-    StopOnCtrlC() {
-        source_ = &stop_;
-        presses_ = 0;
-#ifdef _WIN32
-        // A parent can pass on "ignore Ctrl+C" (SetConsoleCtrlHandler(nullptr, TRUE) is
-        // inherited), which would keep Ctrl+C from reaching the handler at all.
-        SetConsoleCtrlHandler(nullptr, FALSE);
-        SetConsoleCtrlHandler(&handler, TRUE);
-#else
-        std::signal(SIGINT, &handler);
-        watcher_ = std::jthread([this](std::stop_token done) {
-            while (!done.stop_requested()) {
-                if (presses_.load() > 0) stop_.request_stop();
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        });
-#endif
-    }
-    ~StopOnCtrlC() {
-#ifdef _WIN32
-        SetConsoleCtrlHandler(&handler, FALSE);
-#else
-        std::signal(SIGINT, SIG_DFL);
-#endif
-        source_ = nullptr;
-    }
-    StopOnCtrlC(const StopOnCtrlC&) = delete;
-    StopOnCtrlC& operator=(const StopOnCtrlC&) = delete;
-
-    [[nodiscard]] std::stop_token token() const { return stop_.get_token(); }
-
-private:
-#ifdef _WIN32
-    static BOOL WINAPI handler(DWORD type) {
-        if (type != CTRL_C_EVENT && type != CTRL_BREAK_EVENT) return FALSE;
-        if (presses_++ > 0 || source_ == nullptr) return FALSE; // the default: end grab
-        source_->request_stop(); // the download prints how far it got
-        return TRUE;
-    }
-#else
-    static void handler(int) {
-        if (presses_++ > 0) {
-            std::signal(SIGINT, SIG_DFL);
-            std::raise(SIGINT);
-        }
-    }
-#endif
-    static inline std::atomic<int> presses_{0};
-    static inline std::stop_source* source_ = nullptr;
-    std::stop_source stop_;
-#ifndef _WIN32
-    std::jthread watcher_;
-#endif
-};
-
-// Follows the speed schedule's limits for `dir` (downloads ↓, or uploads ↑) while they run: when
-// the scheduled limit changes, the limiter switches, and grab's streams follow at once.
-class ScheduleFollower {
-public:
-    ScheduleFollower(std::vector<schedule::Rule> rules, schedule::Dir dir, rate::RateLimiter& limiter, LiveLine& line)
-        : rules_(std::move(rules)), dir_(dir), limiter_(limiter), line_(line),
-          current_(schedule::limit_at(rules_, schedule::local_now().minute, dir_)) {
-        if (current_) limiter_.set_rate(schedule::bytes_per_s(*current_));
-        thread_ = std::jthread([this](const std::stop_token& stop) { run(stop); });
-    }
-    ScheduleFollower(const ScheduleFollower&) = delete;
-    ScheduleFollower& operator=(const ScheduleFollower&) = delete;
-
-private:
-    void run(const std::stop_token& stop) {
-        std::mutex sleep_m;
-        std::condition_variable_any sleep;
-        for (;;) {
-            {
-                std::unique_lock lock(sleep_m);
-                // Just past each whole second, so a rule's minute applies within milliseconds.
-                sleep.wait_for(lock, stop, schedule::to_next_second(), [] { return false; });
-            }
-            if (stop.stop_requested()) return;
-            const auto now = schedule::local_now();
-            const auto limit = schedule::limit_at(rules_, now.minute, dir_);
-            if (limit == current_) continue;
-            current_ = limit;
-            limiter_.set_rate(limit ? schedule::bytes_per_s(*limit) : 0);
-            const auto next = schedule::next_change(rules_, now.minute, dir_);
-            const std::string until = next ? " until " + schedule::when_text(now.minute, next->minutes) : "";
-            const bool up = dir_ == schedule::Dir::up;
-            line_.message(limit ? std::format("grab: speed schedule: {}limited to {}{}", up ? "uploads " : "",
-                                              schedule::speed_text(*limit), until)
-                                : std::format("grab: speed schedule: no {}limit{}", up ? "upload " : "", until));
-        }
-    }
-
-    const std::vector<schedule::Rule> rules_;
-    const schedule::Dir dir_;
-    rate::RateLimiter& limiter_;
-    LiveLine& line_;
-    std::optional<double> current_; // the follower thread's
-    std::jthread thread_; // last: stops and joins first
-};
 
 struct Session {
     const engine::Context& ctx;
@@ -260,122 +61,6 @@ struct Session {
     bool several = false; // more than one pick: the question offers "the same for the rest"
     // Files and folders through grab's own SSH client, which verifies them too.
     std::shared_ptr<ssh::Pool> pool = nullptr;
-};
-
-// The live line while a verification runs: its text, a folder's files so far ("12 of 40"), and
-// after 5 s the time taken, redrawn every second, as md5sum says nothing until it ends.
-class VerifyLine {
-public:
-    VerifyLine(LiveLine& line, std::string text) : line_(line), text_(std::move(text)), start_(Clock::now()) {
-        draw(true);
-        thread_ = std::jthread([this](const std::stop_token& stop) {
-            std::mutex sleep_m;
-            std::condition_variable_any sleep;
-            for (;;) {
-                {
-                    std::unique_lock lock(sleep_m);
-                    sleep.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
-                }
-                if (stop.stop_requested()) return;
-                draw(true);
-            }
-        });
-    }
-    VerifyLine(const VerifyLine&) = delete;
-    VerifyLine& operator=(const VerifyLine&) = delete;
-    ~VerifyLine() = default;
-
-    void files(std::size_t done, std::size_t total) {
-        {
-            std::scoped_lock lock(m_);
-            files_ = std::format(" {} of {}", done, total);
-        }
-        draw(false);
-    }
-
-private:
-    void draw(bool now) {
-        std::string text;
-        {
-            std::scoped_lock lock(m_);
-            text = text_ + files_;
-        }
-        if (const double secs = seconds_since(start_); secs >= 5) text += std::format(" ({})", progress::duration(secs));
-        line_.show(text, now);
-    }
-
-    LiveLine& line_;
-    const std::string text_;
-    const Clock::time_point start_;
-    std::mutex m_; // files_
-    std::string files_;
-    std::jthread thread_; // last: stops and joins first
-};
-
-// The live line while a folder's files download: its files, bytes and connections, and the speed
-// and time left of the bytes that come (`received`, progress::FolderMeter), redrawn every 250 ms,
-// also while none come.
-class FolderLine {
-public:
-    FolderLine(LiveLine& line, const folder::Tree& tree, std::mutex& m, rate::RateLimiter& limiter,
-               const std::atomic<std::uint64_t>& received)
-        : line_(line), tree_(tree), m_(m), limiter_(limiter), received_(received) {
-        draw();
-        thread_ = std::jthread([this](const std::stop_token& stop) {
-            std::mutex sleep_m;
-            std::condition_variable_any sleep;
-            for (auto next = Clock::now();;) {
-                // A draw held up (a console in QuickEdit selection blocks writes) isn't caught up on.
-                next = std::max(next + std::chrono::milliseconds(250), Clock::now());
-                {
-                    std::unique_lock lock(sleep_m);
-                    sleep.wait_until(lock, stop, next, [] { return false; });
-                }
-                if (stop.stop_requested()) return;
-                draw();
-            }
-        });
-    }
-    FolderLine(const FolderLine&) = delete;
-    FolderLine& operator=(const FolderLine&) = delete;
-    ~FolderLine() = default;
-
-private:
-    void draw() {
-        queue_view::Pass p;
-        int conns = 0;
-        {
-            std::scoped_lock lock(m_);
-            p = queue_view::pass(tree_.files, nullptr);
-            conns = tree_.connections;
-        }
-        const auto finished = p.counts[static_cast<std::size_t>(folder::State::done)] +
-                              p.counts[static_cast<std::size_t>(folder::State::failed)];
-        const auto limit = limiter_.setting(); // its rate and generation together
-        meter_.sample(Clock::now(), {.received = received_.load(),
-                                     .finished = finished,
-                                     .left_files = p.left_files,
-                                     .left_bytes = p.left_bytes,
-                                     .limit_changes = limit.generation,
-                                     .limit = limit.rate});
-        const auto& t = p.totals;
-        line_.show(progress::line({.bytes = t.bytes,
-                                   .total = t.total,
-                                   .speed = meter_.speed(),
-                                   .eta = meter_.eta(),
-                                   .connections = conns,
-                                   .files_done = t.files_done,
-                                   .files = t.files}),
-                   true);
-    }
-
-    LiveLine& line_;
-    const folder::Tree& tree_;
-    std::mutex& m_; // tree_
-    rate::RateLimiter& limiter_;
-    const std::atomic<std::uint64_t>& received_;
-    progress::FolderMeter meter_; // draw()'s: the constructor's, then the thread's
-    std::jthread thread_;         // last: stops and joins first
 };
 
 // What a verification of download `id` needs from the session.
@@ -734,27 +419,6 @@ void describe(const Session& s, const std::string& path, std::optional<std::uint
 }
 
 } // namespace
-
-GuiState window_settings(const std::filesystem::path& gui_json) {
-    auto saved = read_gui_state(gui_json);
-    if (!saved) {
-        std::println(stderr, "grab: {} can't be used ({}); going on without the window's settings (Verify downloads, "
-                             "speed schedule, connection limits)", util::path_to_utf8(gui_json), saved.error());
-        return {};
-    }
-    return saved->value_or(GuiState{});
-}
-
-std::optional<std::string> schedule_note(const std::vector<schedule::Rule>& rules, const schedule::Now& now,
-                                         schedule::Dir dir) {
-    const auto limit = schedule::limit_at(rules, now.minute, dir);
-    if (!limit) return std::nullopt;
-    const auto next = schedule::next_change(rules, now.minute, dir);
-    return std::format("{}speed limited to {}{} by the speed schedule (--limit off ignores it)",
-                       dir == schedule::Dir::up ? "upload " : "", schedule::speed_text(*limit),
-                       next ? " until " + schedule::when_text(now.minute, next->minutes) : "");
-}
-
 
 std::expected<Answer, int> choose_existing(const Options& opts, const std::vector<ExistingFile>& files,
                                          std::size_t count, bool offer_all) {

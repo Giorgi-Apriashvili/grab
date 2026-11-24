@@ -145,9 +145,11 @@ struct Probe {
     std::string left;                  // the probe file, when it couldn't be removed again (grab's own name)
 };
 // The connection's failure (a login, a broken link) as the error: whether it can be written is
-// then not known.
+// then not known. Without `write` (grab upload -n) nothing is made: only what can be seen, the
+// folder looked at (STAT) and statvfs's read-only flag and free space; `writable` then says only
+// that nothing seen refuses it.
 [[nodiscard]] std::expected<Probe, std::string> probe(ssh::Pool& pool, std::string_view server, std::string_view dir,
-                                                      std::stop_token stop = {});
+                                                      std::stop_token stop = {}, bool write = true);
 
 // What is at `raw` on the server: nothing (nullopt), or its attributes, through a link (a link
 // that leads nowhere: a file of unknown size and time).

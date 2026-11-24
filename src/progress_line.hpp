@@ -1,8 +1,8 @@
 #pragma once
 
-// The text of the grab command's download progress: one line redrawn in place while a file or
-// folder downloads, and the line that replaces it at the end, with a folder's speed and time left
-// on it (FolderMeter). Pure; the console handling is in cli_download.cpp.
+// The text of the grab command's progress: one line redrawn in place while a file or folder
+// downloads or uploads, and the line that replaces it at the end, with a folder's speed and time
+// left on it (FolderMeter). Pure; the console handling is in cli_console.cpp.
 
 #include "speed.hpp"
 
@@ -75,6 +75,19 @@ private:
 // "done: 13 files, 597.0 MiB in 0:53 (11.2 MiB/s)"
 [[nodiscard]] std::string done(std::uint64_t total, std::uint64_t fetched, double seconds,
                                std::optional<std::size_t> files = std::nullopt);
+
+// A count with its thousands grouped: "1,204".
+[[nodiscard]] std::string count(std::uint64_t n);
+// A time taken, said in words: "0.4 s", "42 s", "4 min 12 s", "38 min", "1 h 5 min".
+[[nodiscard]] std::string took(double seconds);
+
+// The end of a finished upload (grab upload): `files` files of `total` bytes to `place`
+// ("Main:/srv/holiday-photos"), `sent` bytes of them sent by this run (less than `total` when it
+// went on from an earlier run) in `seconds`; the speed is what this run sent.
+// "Uploaded 1,204 files (3.2 GiB) to Main:/srv/holiday-photos in 4 min 12 s, 12.7 MiB/s"
+// "Uploaded 1 file (1.0 GiB, 412.0 MiB of it now) to Main:/srv/big.bin in 52 s, 7.9 MiB/s"
+[[nodiscard]] std::string uploaded(std::size_t files, std::uint64_t total, std::uint64_t sent, std::string_view place,
+                                   double seconds);
 
 // The end of a folder download in which files failed, each line ending in '\n': what verification
 // found of the files that came first, as a finished line (`checked`; none when it didn't run), then

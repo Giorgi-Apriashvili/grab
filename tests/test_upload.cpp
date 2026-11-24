@@ -992,8 +992,9 @@ TEST_CASE("upload: the write check says whether the folder takes files, what is 
     for (const auto& c : {Case{.read_only = true, .as = sftp::Code::failure, .statvfs = true, .dir = "/up", .why = read_only},
                           Case{.read_only = true, .as = sftp::Code::permission_denied, .statvfs = true, .dir = "/up", .why = denied},
                           Case{.read_only = true, .as = sftp::Code::permission_denied, .statvfs = false, .dir = "/up", .why = denied},
-                          // Nothing tells a read-only file system apart.
-                          Case{.read_only = true, .as = sftp::Code::failure, .statvfs = false, .dir = "/up", .why = "Failure"},
+                          // Nothing tells a read-only file system apart: the server's words, named.
+                          Case{.read_only = true, .as = sftp::Code::failure, .statvfs = false, .dir = "/up",
+                               .why = "Fake refused a file in /up: Failure"},
                           Case{.read_only = false, .as = sftp::Code::ok, .statvfs = true, .dir = "/nope",
                                .why = "there is no folder /nope on Fake"}}) {
         CAPTURE(c.why);
