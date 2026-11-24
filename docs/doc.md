@@ -817,6 +817,13 @@ them.
   usable" and why on its card (see [Servers grab won't connect to](#servers-grab-wont-connect-to)),
   and the settings' one-time notes (see [Notes about settings](#notes-about-settings)) show once
   in the notice above the search.
+  - **Appearance:** Auto (follow Windows), Light or Dark; Auto by default. A choice applies at
+    once, the title bar, scrollbars and fields too, with no restart, and the window opens in it
+    from then on. Auto follows Windows' app mode (Personalization → Colors), also when it changes
+    while grab runs. Windows' own dialogs (choosing a folder or a file, questions such as "Open a
+    link?"), the tray icon's menu and notifications keep Windows' look whatever is chosen here,
+    and the image viewer is dark in both. Kept in gui.json as `"theme"` (`"light"` or
+    `"dark"`; absent: Auto); an older grab ignores it and follows Windows.
 - **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
   only that page's messages reach grab, and nothing dragged in from outside opens in it (files and
   folders dropped on Browse are uploads, see [Uploading](#uploading)).

@@ -5,13 +5,13 @@
 //                 setParallel, setLimit, setSchedule, setVerify, moveItem, setPriority, clearFinished, openFolder, copyText,
 //                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, openFile, openDir, setExpanded,
 //                 resolveExisting, play, previewCancel, uploadPick, uploadDrop, uploadCheckCancel, uploadStart,
-//                 setUploadExisting,
+//                 setUploadExisting, setTheme,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
 //                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
-//                 updateChecked, limit, played, uploadCheck, uploadExisting, pageRestored (from the window itself),
+//                 updateChecked, limit, played, uploadCheck, uploadExisting, theme, pageRestored (from the window itself),
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -53,6 +53,7 @@ const state = {
   limits: { down: { on: false, mibps: 5 }, up: { on: false, mibps: 5 } },
   schedule: [],          // speed schedule rules, as the backend keeps them ('mibps' ↓, 'upMiBps' ↑)
   uploadExisting: 'ask', // Settings → Uploads: a file already on the server (ask, replace, different, newer, skip, both)
+  theme: 'auto',         // Settings → Appearance: auto (follow Windows), light or dark
   update: { state: '' }, // the backend's update banner: state, version, page, phase, error, completing, note
   lists: [],             // the last search's sources per server: age, live, refreshing, error, notes
   updateLater: false,    // "Later": hidden until grab starts again
@@ -5340,6 +5341,7 @@ function onInit(msg) {
   if (typeof msg.updateCheck === 'boolean') $('#update-auto').checked = msg.updateCheck;
   if (typeof msg.verifyDownloads === 'boolean') $('#verify-on').checked = msg.verifyDownloads;
   if (msg.uploadExisting) setUploadExisting(msg.uploadExisting, false);
+  setTheme(msg.theme, false);
   renderRemotes();
   renderSortHead();
   // Sent again after a server change: browse goes on where it is, if that server still exists.
@@ -5428,6 +5430,37 @@ $('#import-banner').addEventListener('click', (ev) => {
 
 $('#update-auto').addEventListener('change', (ev) => send({ type: 'setUpdateCheck', on: ev.target.checked }));
 $('#verify-on').addEventListener('change', (ev) => send({ type: 'setVerify', on: ev.target.checked }));
+
+// Settings → Appearance: Auto (follow Windows), Light or Dark, a radio group. The window applies it
+// at once (WebView2's prefers-color-scheme, which app.css's colours follow, and the title bar);
+// `tell`: the backend too (it says so back with "theme"). Anything else is Auto.
+const THEMES = ['auto', 'light', 'dark'];
+function setTheme(mode, tell = true) {
+  if (!THEMES.includes(mode)) mode = 'auto';
+  state.theme = mode;
+  for (const b of $('#theme-set').querySelectorAll('button[data-mode]')) {
+    const on = b.dataset.mode === mode;
+    b.setAttribute('aria-checked', String(on));
+    b.tabIndex = on ? 0 : -1; // one Tab stop, the chosen one; the arrows move between them
+  }
+  if (tell) send({ type: 'setTheme', mode });
+}
+$('#theme-set').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-mode]');
+  if (b && b.dataset.mode !== state.theme) setTheme(b.dataset.mode);
+});
+// A radio group's keys: ← ↑ the one before, → ↓ the next (around the ends), Home and End the first
+// and the last; each chooses as a click does. Space and Enter press the focused one.
+$('#theme-set').addEventListener('keydown', (ev) => {
+  if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
+  const at = THEMES.indexOf(state.theme);
+  const to = { ArrowLeft: at - 1, ArrowUp: at - 1, ArrowRight: at + 1, ArrowDown: at + 1, Home: 0, End: THEMES.length - 1 }[ev.key];
+  if (to === undefined) return;
+  ev.preventDefault();
+  const mode = THEMES[(to + THEMES.length) % THEMES.length];
+  if (mode !== state.theme) setTheme(mode);
+  $('#theme-set').querySelector(`[data-mode="${mode}"]`).focus();
+});
 
 $('#refresh-lists').addEventListener('click', () => {
   send({ type: 'refreshLists', remote: state.remote });
@@ -5770,6 +5803,7 @@ function renderServers() {
   $('#schedule-panel').hidden = !!settings.form;
   $('#downloads-panel').hidden = !!settings.form;
   $('#uploads-panel').hidden = !!settings.form;
+  $('#appearance-panel').hidden = !!settings.form;
   $('#server-form').hidden = !settings.form;
   renderStatus();
   if (settings.form) return;
@@ -6014,6 +6048,7 @@ if (webview) {
       case 'existing': onExisting(msg); break;
       case 'uploadCheck': onUploadCheck(msg); break;
       case 'uploadExisting': setUploadExisting(msg.choice, false); break;
+      case 'theme': setTheme(msg.mode, false); break;
       case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
       case 'folderPicked': onFolderPicked(msg); break;

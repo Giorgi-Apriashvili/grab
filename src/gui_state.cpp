@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <map>
@@ -27,6 +28,12 @@ std::filesystem::path state_dir(const std::filesystem::path& grab_conf) {
     const auto home = util::config_home() / "grab";
     const auto own = config_folder_name(grab_conf);
     return own ? home / "configs" / util::path_from_utf8(*own) : home;
+}
+
+std::string webview_profile(const std::filesystem::path& grab_conf) {
+    if (!config_folder_name(grab_conf)) return {};
+    std::error_code ec;
+    return "grab-" + config_key(std::filesystem::absolute(grab_conf, ec).parent_path());
 }
 
 namespace {
@@ -243,10 +250,20 @@ GuiState gui_state_from(const json::Value* doc) {
     }
     s.latest_version = doc->string_of("latestVersion").value_or("");
     s.latest_page = doc->string_of("latestPage").value_or("");
+    // Missing, or a word this grab doesn't know (a later grab's): Auto.
+    if (const auto theme = doc->string_of("theme"); theme && is_theme(*theme)) s.theme = *theme;
     return s;
 }
 
 } // namespace
+
+bool is_theme(std::string_view name) { return name == "auto" || name == "light" || name == "dark"; }
+
+bool theme_is_dark(std::string_view theme, bool windows_dark) {
+    if (theme == "light") return false;
+    if (theme == "dark") return true;
+    return windows_dark;
+}
 
 GuiState parse_gui_state(std::string_view json_text) {
     const auto doc = json::parse(json_text);
@@ -307,6 +324,8 @@ std::string gui_state_to_json(const GuiState& state) {
         root.set("latestVersion", Value::make_string(state.latest_version));
         root.set("latestPage", Value::make_string(state.latest_page));
     }
+    // Not Auto only: a gui.json without it is Auto, as an older grab leaves it.
+    if (state.theme != "auto" && is_theme(state.theme)) root.set("theme", Value::make_string(state.theme));
     return json::stringify(root);
 }
 

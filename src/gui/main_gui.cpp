@@ -18,6 +18,7 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
+#include <WebView2.h>
 #include <windowsx.h>
 
 #include <chrono>
@@ -88,11 +89,30 @@ bool system_uses_dark_theme() {
 // Matches the page's --bg colors so there is no white flash before it paints.
 COLORREF background_color(bool dark) { return dark ? RGB(0x1b, 0x1d, 0x21) : RGB(0xf6, 0xf7, 0xf9); }
 
+// Settings → Appearance (GuiState::theme); Auto before the App is there.
+std::string current_theme() { return g.app ? g.app->state().theme : "auto"; }
+
+// The page's prefers-color-scheme for a theme: Auto leaves it to WebView2, which follows Windows.
+COREWEBVIEW2_PREFERRED_COLOR_SCHEME color_scheme(std::string_view theme) {
+    if (theme == "light") return COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT;
+    if (theme == "dark") return COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK;
+    return COREWEBVIEW2_PREFERRED_COLOR_SCHEME_AUTO;
+}
+
+// The title bar, the window's own background (seen before the page paints) and the page follow
+// the theme: at the start, when it is chosen, and under Auto when Windows' changes.
 void apply_theme(HWND hwnd) {
-    const bool dark = system_uses_dark_theme();
+    const std::string mode = current_theme();
+    // A runtime that refused the scheme leaves the page on Windows': so is the rest then.
+    const bool system = system_uses_dark_theme();
+    const bool dark = g.webview.follows_theme() ? theme_is_dark(mode, system) : system;
     const BOOL on = dark ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &on, sizeof(on));
+    // The class's brush was made for Windows' theme, before gui.json was read.
+    const auto brush = reinterpret_cast<LONG_PTR>(CreateSolidBrush(background_color(dark)));
+    if (auto* old = reinterpret_cast<HBRUSH>(SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush))) DeleteObject(old);
     g.webview.set_background(background_color(dark));
+    g.webview.set_color_scheme(color_scheme(mode));
 }
 
 void post_to_ui(UINT msg, void* payload, auto&& destroy) {
@@ -502,6 +522,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
 
+    // Windows' theme for now: apply_theme follows Settings → Appearance once gui.json is read.
     const bool dark = system_uses_dark_theme();
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -543,6 +564,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     host.quit = [] {
         if (g.hwnd != nullptr) PostMessageW(g.hwnd, wm_quit, 0, 0);
     };
+    host.theme_changed = [] {
+        if (g.hwnd != nullptr) apply_theme(g.hwnd);
+    };
     g.app = std::make_unique<gui::App>(std::move(host), default_grab_config_path(),
                                        state_dir(default_grab_config_path()) / "gui.json");
 
@@ -573,7 +597,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
 #ifndef NDEBUG
     options.dev_tools = true;
 #endif
-    options.background = background_color(dark);
+    // The saved theme from the first paint on (apply_theme set the rest above).
+    options.background = background_color(theme_is_dark(current_theme(), system_uses_dark_theme()));
+    options.color_scheme = color_scheme(current_theme());
+    options.profile_name = util::to_wide(webview_profile(default_grab_config_path()));
     // The viewer's previews come from the app, which answers on a worker thread.
     options.on_preview = [](const std::string& url, std::function<void(gui::WebResource)> reply) {
         if (g.app) g.app->preview_request(url, std::move(reply));
@@ -589,6 +616,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
         },
         [](HRESULT hr) {
             if (FAILED(hr)) show_webview_error(g.hwnd, hr);
+            // Now it is known whether the runtime took the colour scheme (follows_theme).
+            else apply_theme(g.hwnd);
         });
 
     MSG msg{};

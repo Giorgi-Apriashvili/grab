@@ -156,6 +156,19 @@
   <div class="settings-body">
     <div id="server-list" class="server-list"></div>
 
+    <section id="appearance-panel" class="updates-panel">
+      <div class="updates-row">
+        <span id="theme-title" class="section-title">Appearance</span>
+        <div class="segmented" id="theme-set" role="radiogroup" aria-labelledby="theme-title">
+          <button type="button" data-mode="auto" role="radio" aria-checked="true" tabindex="0">Auto (follow Windows)</button>
+          <button type="button" data-mode="light" role="radio" aria-checked="false" tabindex="-1">Light</button>
+          <button type="button" data-mode="dark" role="radio" aria-checked="false" tabindex="-1">Dark</button>
+        </div>
+      </div>
+      <div class="hint">Applies at once, the title bar too. Windows' own dialogs (choosing a folder or a file,
+        questions) and the tray icon's menu keep Windows' look.</div>
+    </section>
+
     <section id="updates-panel" class="updates-panel">
       <div class="updates-row">
         <span class="section-title">Updates</span>

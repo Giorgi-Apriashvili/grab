@@ -40,6 +40,7 @@ TEST_CASE("gui state round-trips through JSON and a file") {
     s.split = 0.3125;
     s.downloads.sort = SortOrder{"progress", "desc"};
     s.downloads.widths = {{"name", 320}, {"status", 200}};
+    s.theme = "dark";
 
     CHECK(parse_gui_state(gui_state_to_json(s)) == s);
     CHECK(parse_gui_state("{}").update_check); // on unless switched off
@@ -153,6 +154,67 @@ TEST_CASE("gui state: the two speed limits, with grab 0.23's gui.json and for it
     CHECK(dropped.limit_on);
     CHECK(dropped.limit_mibps == 12);
     CHECK_FALSE(dropped.upload_limit_on);
+}
+
+TEST_CASE("the window's Appearance: Light and Dark are kept, Auto is not written, anything else is Auto") {
+    // Auto unless chosen; Light and Dark round-trip. Auto is not written, so the gui.json an older
+    // grab saves (which drops the key) says the same, and that grab follows Windows as it did.
+    CHECK(parse_gui_state("{}").theme == "auto");
+    CHECK(GuiState{}.theme == "auto");
+    for (const char* theme : {"light", "dark"}) {
+        CAPTURE(theme);
+        GuiState s;
+        s.theme = theme;
+        const auto text = gui_state_to_json(s);
+        CHECK(text.find(std::string(R"("theme":")") + theme + "\"") != std::string::npos);
+        CHECK(parse_gui_state(text).theme == theme);
+    }
+    CHECK(gui_state_to_json(GuiState{}).find("\"theme\"") == std::string::npos);
+    GuiState odd;
+    odd.theme = "sepia"; // never set so, but never written either
+    CHECK(gui_state_to_json(odd).find("\"theme\"") == std::string::npos);
+    // Missing, a later grab's word, the wrong case or not a string: Auto.
+    for (const char* text : {R"({"theme":"auto"})", R"({"theme":"sepia"})", R"({"theme":"Dark"})", R"({"theme":""})",
+                             R"({"theme":1})", R"({"theme":null})", R"({"theme":{"mode":"dark"}})"}) {
+        CAPTURE(text);
+        CHECK(parse_gui_state(text).theme == "auto");
+    }
+    CHECK(parse_gui_state(R"({"theme":"light","parallel":6})").theme == "light");
+
+    CHECK(is_theme("auto"));
+    CHECK(is_theme("light"));
+    CHECK(is_theme("dark"));
+    CHECK_FALSE(is_theme(""));
+    CHECK_FALSE(is_theme("Auto"));
+    CHECK_FALSE(is_theme("system"));
+}
+
+TEST_CASE("the window is dark under Dark, light under Light, and as Windows' apps are under Auto") {
+    // The title bar (DWMWA_USE_IMMERSIVE_DARK_MODE) and the window's background before the page
+    // paints: mode x Windows' setting.
+    for (const bool windows_dark : {false, true}) {
+        CAPTURE(windows_dark);
+        CHECK(theme_is_dark("auto", windows_dark) == windows_dark);
+        CHECK_FALSE(theme_is_dark("light", windows_dark));
+        CHECK(theme_is_dark("dark", windows_dark));
+        // Anything else is Auto, as gui.json reads it.
+        CHECK(theme_is_dark("", windows_dark) == windows_dark);
+        CHECK(theme_is_dark("sepia", windows_dark) == windows_dark);
+    }
+}
+
+TEST_CASE("each configuration's window has its own WebView2 profile; the default one keeps Default") {
+    // The colour scheme is the profile's: one profile for two configurations' windows let one's
+    // Appearance change the other's page.
+    CHECK(webview_profile(util::config_home() / "grab" / "grab.conf").empty());
+    const auto work = std::filesystem::temp_directory_path() / "grab-test-configs" / "work" / "grab.conf";
+    const std::string own = webview_profile(work);
+    CHECK(own.starts_with("grab-"));
+    CHECK(own.size() == std::string("grab-").size() + 16);
+    // A valid profile name: ASCII letters, digits and '-' only.
+    CHECK(own.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") == std::string::npos);
+    CHECK(webview_profile(work.parent_path() / "other.conf") == own); // one per folder, as the window
+    CHECK(webview_profile(work.parent_path().parent_path() / "play" / "grab.conf") != own);
 }
 
 TEST_CASE("Browse's folders are not kept: a start opens each server at its top") {

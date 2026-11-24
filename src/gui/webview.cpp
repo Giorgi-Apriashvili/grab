@@ -104,10 +104,19 @@ HRESULT WebViewHost::on_environment(HRESULT result, ICoreWebView2Environment* en
         return S_OK;
     }
     env_ = env;
-    const HRESULT hr = env_->CreateCoreWebView2Controller(
-        hwnd_, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                   [this](HRESULT r, ICoreWebView2Controller* c) { return on_controller(r, c); })
-                   .Get());
+    const auto handler = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+        [this](HRESULT r, ICoreWebView2Controller* c) { return on_controller(r, c); });
+    // A configuration's own profile, when it has one: the colour scheme is the profile's, so two
+    // configurations' windows don't set each other's (Settings → Appearance).
+    ComPtr<ICoreWebView2Environment10> env10;
+    ComPtr<ICoreWebView2ControllerOptions> controller_options;
+    const bool own_profile = !options_.profile_name.empty() && SUCCEEDED(env_.As(&env10)) &&
+                             SUCCEEDED(env10->CreateCoreWebView2ControllerOptions(&controller_options)) &&
+                             controller_options != nullptr &&
+                             SUCCEEDED(controller_options->put_ProfileName(options_.profile_name.c_str()));
+    const HRESULT hr =
+        own_profile ? env10->CreateCoreWebView2ControllerWithOptions(hwnd_, controller_options.Get(), handler.Get())
+                    : env_->CreateCoreWebView2Controller(hwnd_, handler.Get());
     if (FAILED(hr)) fail(hr);
     return S_OK;
 }
@@ -120,6 +129,7 @@ HRESULT WebViewHost::on_controller(HRESULT result, ICoreWebView2Controller* cont
     controller_ = controller;
     controller_->get_CoreWebView2(&webview_);
     set_background(options_.background);
+    set_color_scheme(options_.color_scheme); // before the page loads: its first paint is in it
 
     ComPtr<ICoreWebView2Settings> settings;
     if (SUCCEEDED(webview_->get_Settings(&settings))) {
@@ -374,6 +384,16 @@ void WebViewHost::set_background(COLORREF color) {
         controller2->put_DefaultBackgroundColor(
             COREWEBVIEW2_COLOR{255, GetRValue(color), GetGValue(color), GetBValue(color)});
     }
+}
+
+void WebViewHost::set_color_scheme(COREWEBVIEW2_PREFERRED_COLOR_SCHEME scheme) {
+    options_.color_scheme = scheme;
+    ComPtr<ICoreWebView2_13> webview13;
+    ComPtr<ICoreWebView2Profile> profile;
+    if (webview_ == nullptr) return;
+    const bool taken = SUCCEEDED(webview_.As(&webview13)) && SUCCEEDED(webview13->get_Profile(&profile)) &&
+                       profile != nullptr && SUCCEEDED(profile->put_PreferredColorScheme(scheme));
+    color_scheme_failed_ = !taken;
 }
 
 void WebViewHost::close() {

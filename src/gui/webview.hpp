@@ -33,6 +33,12 @@ public:
         std::wstring dev_ui_dir;      // non-empty: serve the UI from this folder (live edits)
         bool dev_tools = false;       // DevTools, context menu, browser accelerator keys
         COLORREF background = RGB(255, 255, 255); // shown until the page paints
+        // The page's prefers-color-scheme (Settings → Appearance), set before it loads: AUTO
+        // follows Windows.
+        COREWEBVIEW2_PREFERRED_COLOR_SCHEME color_scheme = COREWEBVIEW2_PREFERRED_COLOR_SCHEME_AUTO;
+        // The WebView2 profile in user_data_dir: empty is the Default one. A configuration other
+        // than the default gets its own, as the colour scheme belongs to the profile.
+        std::wstring profile_name;
         // Requests for https://grab.ui/preview/...: `reply` answers, later and from any thread. It
         // holds the request's id, never a WebView2 object (review G135): the request waits in the
         // host until the answer reaches the UI thread.
@@ -50,6 +56,12 @@ public:
     void post_json(const std::string& json);
     void focus();
     void set_background(COLORREF color);
+    // The page's colours, its scrollbars and form controls follow at once, with no reload. A
+    // WebView2 Runtime older than the profile's setting (ICoreWebView2_13) keeps following Windows.
+    void set_color_scheme(COREWEBVIEW2_PREFERRED_COLOR_SCHEME scheme);
+    // False once the runtime refused the colour scheme: the page follows Windows then, and so
+    // must the title bar and the background.
+    [[nodiscard]] bool follows_theme() const { return !color_scheme_failed_; }
     void close();
     [[nodiscard]] bool ready() const { return webview_ != nullptr; }
 
@@ -70,6 +82,7 @@ private:
 
     HWND hwnd_ = nullptr;
     bool asking_ = false;
+    bool color_scheme_failed_ = false; // set_color_scheme: the runtime has no ICoreWebView2_13
     std::string restored_;                                  // why the page was opened again, until it says "init"
     std::vector<std::chrono::steady_clock::time_point> restores_; // when, the last minute's
     Options options_;

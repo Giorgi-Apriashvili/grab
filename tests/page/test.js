@@ -4,7 +4,7 @@
 // to running, the performance numbers, a file's priority in its folder, the status bar's total and
 // its graph, the MiB/s box and its confirmation, Waiting files, opening finished files, the split's
 // grip and the head's free space; uploads in the window and drops from Explorer, UPLOADS.md chunks 3
-// and 4), run in headless Edge by run_page_test.ps1.
+// and 4; Settings → Appearance), run in headless Edge by run_page_test.ps1.
 const out = [];
 window.pageTestOut = out; // read by run_page_test.ps1 when test.js never finishes, to name where it stopped
 let failed = 0;
@@ -2582,6 +2582,77 @@ try {
     state.remote = remoteWas;
     clearSel();
     dl.cursor = '';
+    sent.length = 0;
+  }
+
+  // ---- Settings → Appearance: Auto (follow Windows), Light, Dark ---------------------------------
+  // A radio group: one Tab stop (the chosen one), the arrows and Home/End choose as a click does; a
+  // choice goes to the backend (setTheme), which applies it and says it back; the backend's word
+  // (init, "theme") shows and sends nothing; anything else is Auto.
+  {
+    const viewWas = $('#settings-view').hidden;
+    const openWas = settings.open;
+    $('#settings-view').hidden = false; // shown, so its buttons take focus
+    settings.open = true; // the window's keys as in Settings (Alt+← there isn't Back)
+    const group = $('#theme-set');
+    const radios = () => [...group.querySelectorAll('button')];
+    const look = () => radios().map((r) => `${r.dataset.mode}:${r.getAttribute('aria-checked')}:${r.tabIndex}`);
+    const key = (k, mods = {}) => {
+      const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...mods });
+      document.activeElement.dispatchEvent(ev);
+      return ev.defaultPrevented;
+    };
+    const focused = () => (group.contains(document.activeElement) ? document.activeElement.dataset.mode : null);
+    const sentModes = () => sent.filter((m) => m.type === 'setTheme').map((m) => m.mode);
+    setTheme('auto', false);
+    check('theme: a radio group named Appearance with its three choices',
+      [group.getAttribute('role'), $(`#${group.getAttribute('aria-labelledby')}`).textContent,
+        radios().map((r) => [r.getAttribute('role'), r.dataset.mode, r.textContent, r.type])],
+      ['radiogroup', 'Appearance', [['radio', 'auto', 'Auto (follow Windows)', 'button'], ['radio', 'light', 'Light', 'button'],
+        ['radio', 'dark', 'Dark', 'button']]]);
+    check('theme: Auto at first, the one Tab stop', look(), ['auto:true:0', 'light:false:-1', 'dark:false:-1']);
+    check('theme: the hint says Windows\' own dialogs keep Windows\' look', /Windows' own dialogs.*keep Windows' look/s.test($('#appearance-panel .hint').textContent), true);
+    sent.length = 0;
+    radios()[1].click();
+    check('theme: a click on Light sends it and checks it', [sent.map((m) => JSON.stringify(m)), state.theme, look()],
+      [[JSON.stringify({ type: 'setTheme', mode: 'light' })], 'light', ['auto:false:-1', 'light:true:0', 'dark:false:-1']]);
+    sent.length = 0;
+    radios()[1].click();
+    check('theme: a click on the chosen one sends nothing', sent.length, 0);
+    radios()[1].focus();
+    check('theme: the chosen one takes focus', focused(), 'light');
+    const keys = [];
+    for (const [k, mods] of [['ArrowRight'], ['ArrowRight'], ['ArrowLeft'], ['ArrowUp'], ['ArrowDown'], ['Home'], ['End'], ['ArrowDown']]) {
+      const prevented = key(k, mods);
+      keys.push(`${k}:${prevented}:${state.theme}:${focused()}`);
+    }
+    check('theme: arrows go around, Home and End to the ends; each chooses and moves the focus', [keys, sentModes()],
+      [['ArrowRight:true:dark:dark', 'ArrowRight:true:auto:auto', 'ArrowLeft:true:dark:dark', 'ArrowUp:true:light:light',
+        'ArrowDown:true:dark:dark', 'Home:true:auto:auto', 'End:true:dark:dark', 'ArrowDown:true:auto:auto'],
+      ['dark', 'auto', 'dark', 'light', 'dark', 'auto', 'dark', 'auto']]);
+    sent.length = 0;
+    check('theme: Home on the chosen first one sends nothing', [key('Home'), sent.length, focused()], [true, 0, 'auto']);
+    check('theme: other keys, and arrows with Ctrl or Alt, are left alone',
+      [key('Enter'), key('a'), key('ArrowRight', { ctrlKey: true }), key('ArrowLeft', { altKey: true }), sent.length, state.theme],
+      [false, false, false, false, 0, 'auto']);
+    // The backend's word: init's "theme", and its "theme" after a setTheme.
+    setTheme('dark', false);
+    check('theme: the backend\'s word shows, nothing sent back', [look(), state.theme, sent.length],
+      [['auto:false:-1', 'light:false:-1', 'dark:true:0'], 'dark', 0]);
+    for (const odd of [undefined, '', 'sepia', 7]) setTheme(odd, false);
+    check('theme: none or an unknown one is Auto', [look(), state.theme, sent.length], [['auto:true:0', 'light:false:-1', 'dark:false:-1'], 'auto', 0]);
+    check('theme: the panel hides with a server form open', (() => {
+      const was = settings.form;
+      settings.form = { editing: false, name: '' };
+      renderServers();
+      const hidden = $('#appearance-panel').hidden;
+      settings.form = was;
+      renderServers();
+      return [hidden, $('#appearance-panel').hidden];
+    })(), [true, false]);
+    document.activeElement.blur();
+    $('#settings-view').hidden = viewWas;
+    settings.open = openWas;
     sent.length = 0;
   }
 

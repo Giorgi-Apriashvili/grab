@@ -189,6 +189,8 @@ button.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(
 .segmented button { border: 0; border-radius: 0; height: 32px; background: var(--panel); }
 .segmented button + button { border-left: 1px solid var(--line); }
 .segmented button[aria-checked=true] { background: var(--sel); color: var(--text); font-weight: 600; }
+/* Inside the frame, which clips anything outside it. */
+.segmented button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .check { display: flex; align-items: center; gap: 5px; color: var(--muted); cursor: pointer; }
 
 .banner {
@@ -1018,7 +1020,7 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .rule .next-day { font-size: 12px; min-width: 50px; }
 .rule .next-day.off { visibility: hidden; } /* keeps its place, so the rows line up */
 .rule .icon-btn { width: 26px; height: 26px; }
-.schedule-panel .hint, #downloads-panel .hint, #uploads-panel .hint { margin-top: 8px; max-width: 720px; }
+.schedule-panel .hint, #downloads-panel .hint, #uploads-panel .hint, #appearance-panel .hint { margin-top: 8px; max-width: 720px; }
 #uploads-panel select { height: 26px; font-size: 12px; }
 .server {
   padding: 10px 12px;

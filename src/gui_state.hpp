@@ -119,13 +119,27 @@ struct GuiState {
     std::int64_t last_update_check = 0;              // Unix seconds; 0 = never
     std::string latest_version;                      // the newest release seen ("0.7.0"), if any
     std::string latest_page;                         // its release page
+    // Settings → Appearance: "auto" (follow Windows), "light" or "dark" (is_theme). gui.json's
+    // "theme", written only when not Auto: an older grab ignores it and follows Windows, and
+    // saving its settings drops it (Auto again).
+    std::string theme = "auto";
     bool operator==(const GuiState&) const = default;
 };
+
+// Settings → Appearance's choices: "auto", "light" or "dark".
+[[nodiscard]] bool is_theme(std::string_view name);
+// Whether the window is dark under `theme` while Windows' apps are dark (`windows_dark`, its
+// AppsUseLightTheme) or not: Light and Dark hold it, anything else is Auto and follows Windows.
+[[nodiscard]] bool theme_is_dark(std::string_view theme, bool windows_dark);
 
 // Where the window keeps gui.json, queue.json and recent for the configuration at `grab_conf`:
 // <config>/grab for the default one, <config>/grab/configs/<config_folder_name> for any other
 // (GRAB_CONFIG, --config), so two configurations' windows never share a queue (review G35).
 [[nodiscard]] std::filesystem::path state_dir(const std::filesystem::path& grab_conf);
+// The window's WebView2 profile for the configuration at `grab_conf`: empty (the Default one) for
+// the default configuration, "grab-<config_key of its folder>" for any other. The page's colour
+// scheme belongs to the profile, so two configurations' windows don't set each other's.
+[[nodiscard]] std::string webview_profile(const std::filesystem::path& grab_conf);
 
 // The window's recent searches (state_dir's "recent"): a JSON array of the page's entries, at
 // most recent_max, newest first. Sealed for the current Windows user (DPAPI), as the file lists

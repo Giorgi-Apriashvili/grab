@@ -63,6 +63,8 @@ public:
         // not called for cancelled ones.
         std::function<void(const std::string& name, bool ok, const std::string& error, bool up)> on_finished;
         std::function<void()> quit; // UI thread: close the window and exit, even with downloads running
+        // UI thread: Settings → Appearance changed (state().theme): the window follows at once.
+        std::function<void()> theme_changed;
     };
 
     struct QueueSummary {

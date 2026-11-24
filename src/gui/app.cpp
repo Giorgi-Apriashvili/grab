@@ -1013,6 +1013,20 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
         state_.verify_downloads = bool_of(*msg, "on");
         verify_downloads_ = state_.verify_downloads;
         save_state();
+    } else if (type == "setTheme") {
+        // Settings → Appearance: {mode: 'auto' | 'light' | 'dark'}, applied at once (the page's
+        // colours and the title bar) and said back; anything else changes nothing.
+        const std::string mode = msg->string_of("mode").value_or("");
+        if (!is_theme(mode)) return;
+        if (mode != state_.theme) {
+            state_.theme = mode;
+            save_state();
+            if (host_.theme_changed) host_.theme_changed();
+        }
+        Value v = Value::make_object();
+        v.set("type", str("theme"));
+        v.set("mode", str(state_.theme));
+        post(v);
     } else if (type == "setSchedule") {
         if (const Value* rules = msg->find("rules")) set_schedule(*rules);
     } else if (type == "setParallel") {
@@ -1104,6 +1118,7 @@ void App::send_init() {
     init.set("updateCheck", Value::make_bool(state_.update_check));
     init.set("verifyDownloads", Value::make_bool(state_.verify_downloads));
     init.set("uploadExisting", str(std::string(upload::name(upload_existing_.load()))));
+    init.set("theme", str(state_.theme));
     init.set("configPath", str(util::path_to_utf8(config_path_)));
     init.set("recent", load_recent(recent_path_));
 
