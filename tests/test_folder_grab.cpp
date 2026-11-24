@@ -948,12 +948,97 @@ std::uint64_t asked_between(Tree& from, std::string_view prefix, Tree::Clock::ti
     return n;
 }
 
+// The folder's (/data/ on `t`) and the single download's (/x/ on `other`) bytes of READs asked
+// for from 0.5 s to 3.5 s after `start` under `rate`, of the time both asked.
+struct BothAsked {
+    std::uint64_t folder = 0;
+    std::uint64_t single = 0;
+    double seconds = 0; // of the window's 3
+};
+
+// The limiter gives `rate` to whoever asks, so a side whose threads the machine stalls asks
+// nothing meanwhile and leaves its part to the other, as it should: the single's 4 streams wait
+// for one another's writes, and on a loaded machine stall together for a quarter second and more
+// (the folder's share of the whole window came to 0.552 on a CI runner). So only the time both
+// asked counts. At its half of the limit a side asks for a READ about every (its READs' bytes) /
+// (rate / 2), however its streams take turns: 62.5 ms for the single's 4 streams' 128 KiB, 125 ms
+// for the folder's 255 KiB. One that asked nothing for 4 of those was stalled, from its last ask
+// until one past its next (the tokens its streams were given meanwhile go out as READs together
+// as they wake), and so was each side before its first ask (a late start) and after its last.
+// (On 2 loaded CPUs a side's gaps reached 3.6 of them without a stall; the single's stalls that
+// moved the share, 5 and more.) A folder whose waiting files moved its share asks more or less
+// often while both ask, and is still seen.
+BothAsked asked_while_both_ask(Tree& t, Tree& other, Tree::Clock::time_point start, std::uint64_t rate) {
+    using Clock = Tree::Clock;
+    // Each side's asks: when after `start`, and their bytes.
+    const auto asks_of = [start](Tree& from, std::string_view prefix) {
+        std::lock_guard lock(from.mutex);
+        std::vector<std::pair<Clock::duration, std::uint32_t>> out;
+        for (const auto& a : from.asks) {
+            if (a.path.starts_with(prefix)) out.emplace_back(a.at - start, a.length);
+        }
+        std::ranges::sort(out);
+        return out;
+    };
+    const std::array sides{asks_of(t, "/data/"), asks_of(other, "/x/")};
+    // (from, to]: a side stalled.
+    std::vector<std::pair<Clock::duration, Clock::duration>> stalled;
+    for (const auto& side : sides) {
+        if (side.empty()) {
+            stalled.emplace_back(Clock::duration::min(), Clock::duration::max());
+            continue;
+        }
+        // Its READs' usual bytes: the median (a file's last READ is shorter).
+        std::vector<std::uint32_t> lengths;
+        lengths.reserve(side.size());
+        for (const auto& a : side) lengths.push_back(a.second);
+        const auto middle = lengths.begin() + static_cast<std::ptrdiff_t>(lengths.size() / 2);
+        std::ranges::nth_element(lengths, middle);
+        const auto spacing = std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(static_cast<double>(*middle) / (static_cast<double>(rate) / 2)));
+        stalled.emplace_back(Clock::duration::min(), side.front().first + spacing);
+        for (std::size_t i = 1; i < side.size(); ++i) {
+            const auto last = side[i - 1].first;
+            const auto next = side[i].first;
+            if (next - last > 4 * spacing) stalled.emplace_back(last, next + spacing);
+        }
+        stalled.emplace_back(side.back().first, Clock::duration::max());
+    }
+    const Clock::duration window_from = std::chrono::milliseconds(500);
+    const Clock::duration window_to = std::chrono::milliseconds(3500);
+    const auto in_stall = [&stalled](Clock::duration at) {
+        return std::ranges::any_of(stalled, [at](const auto& s) { return at > s.first && at <= s.second; });
+    };
+    const auto bytes = [&](const auto& side) {
+        std::uint64_t n = 0;
+        for (const auto& [at, length] : side) {
+            if (at >= window_from && at < window_to && !in_stall(at)) n += length;
+        }
+        return n;
+    };
+    // The window's time neither side stalled: what the stalls, merged, leave of it.
+    std::ranges::sort(stalled);
+    Clock::duration both = window_to - window_from;
+    Clock::duration seen_to = window_from; // the stalls so far cover the window up to here
+    for (const auto& [from, to] : stalled) {
+        const auto lo = std::max(from, seen_to);
+        const auto hi = std::min(to, window_to);
+        if (hi > lo) {
+            both -= hi - lo;
+            seen_to = hi;
+        }
+    }
+    return BothAsked{
+        .folder = bytes(sides[0]), .single = bytes(sides[1]), .seconds = std::chrono::duration<double>(both).count()};
+}
+
 // Runs `r`'s listed normal folder (on `t`) for 3.5 s under 4 MiB/s, beside a normal single
 // download of `other`'s /x/single.bin from server `server` ("Other", budget 4, or the folder's
-// own); says the folder's share of what both asked for.
+// own); says the folder's share of what both asked for while both asked (asked_while_both_ask).
 double share_beside(Tree& t, Run& r, Tree& other, const std::string& server) {
+    constexpr std::uint64_t limit = std::uint64_t{4} << 20;
     rate::RateLimiter limiter;
-    limiter.set_rate(4u << 20);
+    limiter.set_rate(limit);
     r.job.limiter = &limiter;
     if (server == "Other") r.connections.configure("Other", 4);
     fetch::Download d;
@@ -974,11 +1059,16 @@ double share_beside(Tree& t, Run& r, Tree& other, const std::string& server) {
     }
     r.job.limiter = nullptr;
     CHECK(single == fetch::Outcome::stopped);
-    const auto folder_bytes = asked_between(t, "/data/", start);
-    const auto single_bytes = asked_between(other, "/x/", start);
-    REQUIRE(folder_bytes + single_bytes > 0);
-    const double share = static_cast<double>(folder_bytes) / static_cast<double>(folder_bytes + single_bytes);
-    MESSAGE("folder ", folder_bytes, " B, single ", single_bytes, " B: the folder's share ", share);
+    const auto both = asked_while_both_ask(t, other, start, limit);
+    const auto bytes = both.folder + both.single;
+    const double share = bytes > 0 ? static_cast<double>(both.folder) / static_cast<double>(bytes) : 0;
+    MESSAGE("folder ", both.folder, " B, single ", both.single, " B, both asking ", both.seconds,
+            " s: the folder's share ", share);
+    // Stalls are short and few: on 2 loaded CPUs both asked for 2.6 s of the 3 at least. A side
+    // that gets nothing for long looks the same in its asks as one that is stalled, so a stretch
+    // that leaves both asking for less than two thirds of the window fails here (a single held
+    // twice for 0.7 s left 1.4-1.9 s; one held twice for 0.4 s, 2.1 s).
+    REQUIRE(both.seconds > 2.0);
     return share;
 }
 
