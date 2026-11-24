@@ -22,6 +22,9 @@ This is grab's full documentation; [README.md](../README.md) is the short introd
     - [Notes about settings](#notes-about-settings)
     - [Environment](#environment)
 - [Usage](#usage)
+- [Uploading](#uploading)
+  - [In the window](#in-the-window)
+  - [The command](#the-command)
 - [Lookup methods](#lookup-methods)
 - [File lists](#file-lists)
 - [Connections](#connections)
@@ -419,66 +422,10 @@ them.
     folder you run `grab` from is never started. A full path in grab.conf is used as given.
 
 - **Upload** (a side feature: grab is still for downloading): files and folders from this PC go
-  into a folder of a server.
-  - **Right-click a folder** in Browse for **Upload files here…** or **Upload folder here…**
-    (Windows' file dialog; pick one or several). Into the folder that is open: right-click the
-    list's empty part, or a file row (**Upload files to** *folder*…), or press Shift+F10 in an
-    empty folder. Uploads go into one folder of one server: on search
-    results, on All servers' list of servers and on the list of a server's search roots the
-    entries say why not (open the folder first).
-  - **Or drag files and folders from Explorer** onto Browse, mixed as you like: dropped on a
-    folder row they go into that folder, anywhere else on the list into the folder that is open;
-    while you drag, "Drop to upload to Main:/srv/tv" says where, and the same dialog asks first.
-    Search results, All servers, the list of a server's search roots and a folder still opening
-    say why not, and the Downloads table and the status bar say to drop on Browse. A file dragged
-    from inside a .zip (or a mail's attachment) isn't on this PC as a file: "Extract files from a
-    .zip first". A link dragged from a browser is refused, and dragged text does nothing. Nothing
-    dragged in ever opens in the window; should WebView2 ever end grab's page, grab opens it again
-    at once, at the folders Browse had open, and says so (a search and the selection are gone).
-    Windows doesn't let Explorer drop into a program run as administrator, so drops need grab-gui
-    started normally.
-  - **A dialog asks first** and checks before anything is sent: what goes ("holiday — 1,204
-    files, 3.2 GiB"; links and junctions inside a folder are left out and counted, never
-    followed; names over 255 bytes, which no Linux server takes, are said), where ("To
-    Main:/srv/tv", merged into a folder of the same name there or a new folder), and whether
-    you can write there: "✓ You can write here · 120 GiB free", or the server's refusal in plain
-    words with Upload disabled ("Box.Guest is read-only for this account: nothing can be
-    uploaded to software"). Too little free space says so, and the button becomes Upload
-    anyway.
-  - **Files already on the server** are asked about in the same dialog: "37 already there: 30
-    the same, 5 newer here, 2 older here" (the same: one size, times within 2 seconds), the first
-    200 listed with yours and the server's size and time beside them. One choice for all of them
-    (Replace, Replace if different, Replace if newer, Skip, Keep both, each saying how many it
-    would replace) starts on **Skip**; each listed file can have its own instead, and the dialog
-    says what happens ("5 replaced, 32 skipped", or "nothing on Main is replaced"). Keep both
-    sends yours as "name (2).ext". A folder of that name on the server is never replaced: Replace
-    skips it. **Always do this** saves the choice for all as the setting (Settings → Uploads,
-    "When a file is already on the server": Ask, or one of the five); with a setting the dialog
-    says "Files already there: Replace if newer (your setting)", and **Change** opens the
-    question for that upload. Nothing on the server is replaced unless chosen.
-  - A file that turns up at its name after the dialog follows the upload's choice. Under Ask,
-    for a picked file or folder the dialog listed nothing of, the upload sends the rest, then
-    waits paused: "A file of that name is already on Main. Resume to choose…"; Resume asks the
-    same question for those files. A big file asked about as it was put in place keeps what it
-    sent, so its answer sends nothing again. A file skipped for a reason says it in its row's
-    tooltip ("Skipped: a folder of that name is there"). The choices for single files are kept
-    with the upload (uploads.json), so Retry and a restart follow them; picking the same folder
-    again for a failed upload of it gives that upload the new dialog's answer. An older grab saving gui.json drops the setting, which
-    then is Ask again (it never replaces anything unasked).
-  - **Each file goes to a temp name of grab's** (".name.0a1b2c.grabpart") beside its target and
-    takes its name only when complete, so no half-sent file ever has the real name. Folders
-    are made first; an existing one is merged into. A file of 2 MiB or more is sent in pieces
-    over several connections and resumes after a pause, a failure or a restart from what the
-    server acknowledged; smaller ones start over. The server's copy gets your file's time.
-  - **Cancel** removes the temps and the partial uploads it left, and the folders it made once
-    they are empty; files already sent stay. What can't be reached then (the server offline) is
-    remembered and removed at the next start. Your local files are only read, never changed.
-  - **Verify** (Settings → Downloads) covers uploads too: a copy on the server that differs
-    fails the upload, "the server's copy differs (MD5)", and Retry sends it again over that
-    copy, grab's own.
-  - Uploads and downloads share each server's connections (one budget for both, At once
-    counting both); Pause all and Cancel all cover uploads too. Once an upload ends, the folder
-    it went into is listed again from the server (Browse shows it at once when it is open).
+  into a folder of a server. Right-click a folder in Browse for **Upload files here…** or
+  **Upload folder here…**, or drag files and folders from Explorer onto Browse; a dialog checks
+  and asks first, and the upload runs as a row of the Downloads table, marked ↑. All of it,
+  and the `grab upload` command, is in [Uploading](#uploading).
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
     Save to stays), Open folder location (search results), Upload files here… and Upload folder
@@ -760,12 +707,14 @@ them.
     given, or a server that takes too long leaves the download done and the copy kept, marked ⚠
     "not verified" and why. The server's Test says "checksums: md5sum", or why not.
   - Files that were already there are not checked, since nothing was downloaded.
-  - The `grab` command follows the same setting (see [Usage](#usage)).
+  - It covers uploads too, where nothing local is ever deleted (see [Uploading](#uploading)).
+  - The `grab` command and `grab upload` follow the same setting (see [Usage](#usage)).
 - **When a file is already on the server** (Settings → Uploads, Ask by default): what an upload
   does with a file of the same name there. Ask lists them in the upload dialog, starting on
   Skip; Replace, Replace if different, Replace if newer, Skip or Keep both go without asking (the
   dialog says which, and its Change picks another for that upload). Kept in gui.json as
-  `"uploadExisting"` (absent: Ask).
+  `"uploadExisting"` (absent: Ask); `grab upload` follows it too, unless given `--existing` (see
+  [Uploading](#uploading)).
 - **Speed schedule** (Settings → Speed schedule) caps the speeds at set times, for example
   downloads at 5 MiB/s and uploads at 1 MiB/s on weekdays from 18:00 to 24:00.
   - Each time has its days, a from–to time and two speeds, ↓ for downloads and ↑ for uploads;
@@ -779,8 +728,9 @@ them.
   - Changing a limit during a scheduled time for it lasts until the schedule's next change
     there ("Schedule resumes at 24:00"), also across a restart; the other limit follows the
     schedule as before. Editing the schedule ends both.
-  - The `grab` command follows the schedule's download speeds (see [Usage](#usage)). Each
-    program caps its own transfers.
+  - The `grab` command follows the schedule's download speeds (see [Usage](#usage)), and
+    `grab upload` its upload speeds (see [Uploading](#uploading)). Each program caps its own
+    transfers.
   - At each change, transfers keep their connections and just follow the new speed.
   - An older grab reads the download speeds only (a time with only an upload speed isn't one
     of its times), and saving its settings drops the upload speeds.
@@ -869,7 +819,7 @@ them.
   in the notice above the search.
 - **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
   only that page's messages reach grab, and nothing dragged in from outside opens in it (files and
-  folders dropped on Browse are uploads, above).
+  folders dropped on Browse are uploads, see [Uploading](#uploading)).
 - **Tray:** closing the window while downloads run keeps them going in the notification
   area, and grab exits by itself when they finish. When the window is idle, closing it
   quits. A notification reports each finished or failed download while the window isn't in
@@ -1240,13 +1190,15 @@ them hides one of these.
 
 ```
 grab [-s|--file | -f|--folder] TARGET [DEST] [options]
+grab upload LOCAL... [-r SERVER] REMOTE_DIR [options]
 grab config [-c PATH]
 
   -r, --remote NAME    grab.conf section to use
   -c, --config PATH    grab.conf path
       --depth N        override max_depth for this run
-      --limit RATE     cap the download speed: 5M, 800K, 2.5 (a bare number is MiB/s), or
-                       off. Without --limit, the speed schedule set in grab's window applies
+      --limit RATE     cap the download speed (grab upload: the upload speed): 5M, 800K, 2.5
+                       (a bare number is MiB/s), or off. Without --limit, the speed schedule
+                       set in grab's window applies
       --first          take the best match instead of asking
       --all            take every match instead of asking
       --exact          match TARGET as a whole name or glob, case-sensitive
@@ -1255,12 +1207,15 @@ grab config [-c PATH]
       --min-size SIZE  only files at least this big: 700M, 1.5G, 20GiB (a bare number is MiB)
       --max-size SIZE  only files at most this big
       --fresh          fetch the server's file list now instead of using a saved one
-      --verify         check each download against the server's checksum (MD5) afterwards;
-      --no-verify      don't. Without either, the setting in grab's window applies (off at first)
+      --verify         check each download (or upload) against the server's checksum (MD5)
+      --no-verify      afterwards, or don't. Without either, the setting in grab's window
+                       applies (off at first)
       --existing WHAT  a different file already where a download goes (another size, or
                        older than the server's): replace it, both (keep yours and save the
                        new one as "name (2).ext") or skip it. Without it grab asks first, or
-                       stops when there is no console to ask on
+                       stops when there is no console to ask on. grab upload: a file already
+                       on the server: ask, replace, different, newer, skip or both (see
+                       Uploading); without it the window's setting (Ask at first)
       --bind ADDRESS   connect from this local address, over the server's bind; a blank one
                        (--bind=) connects from any address this time
       --contimeout TIME
@@ -1269,7 +1224,8 @@ grab config [-c PATH]
       --timeout TIME   the longest wait for the server once connected (1s to 24h), over its
                        io_timeout
   -n, --dry-run        resolve the target and show what would be fetched; transfers nothing
-                       and creates no folders
+                       and creates no folders (grab upload: what would go where, and what is
+                       there already; nothing is written on the server or here)
   -v, --verbose        say how grab connects and searches, and the settings' notes again
       --init           write grab.conf to the config path if absent, with the sftp remotes of
                        the standard rclone.conf as servers (rclone.conf is only read)
@@ -1306,8 +1262,9 @@ grab config [-c PATH]
   means the current directory, and a pasted path in quotes is fine. With no terminal to
   ask on (piped or redirected input, scheduled tasks), a missing `DEST` is an error before
   any search runs.
-- `grab config` and `grab update` are commands. To search for a file literally named
-  `config` or `update`, add `-s`.
+- `grab config`, `grab update`, `grab server` and `grab upload` are commands, as the first word
+  only. To search for a file or folder literally named so, add `-s` or `-f` first:
+  `grab -f upload E:\Backup`.
 - `--` ends the options: what follows is `TARGET` and `DEST`, even a `TARGET` that starts with
   `-` (`grab -s -- -notes.txt E:\Docs`). grab 0.20 passed the flags after `--` on to rclone, so
   a `DEST` there that starts with `-` is refused (`grab movie -- --dry-run` would otherwise
@@ -1388,7 +1345,191 @@ grab config [-c PATH]
 Exit codes: `0` ok, `1` usage (also an option value grab can't use, `--` followed by a flag of
 grab 0.20's, and `--rclone`), `2` config (also a bind left in an old key), `3` target not found
 or pick aborted, `4` remote lookup failed (search or file list), `5` `grab update` failed, `6` a
-download failed, `130` stopped by Ctrl+C.
+download failed, `130` stopped by Ctrl+C. `grab upload`'s are under [Uploading](#uploading).
+
+## Uploading
+
+grab is for downloading; uploading is a side feature: files and folders from this PC into a
+folder of a server, from the window or with `grab upload`. Both use the same engine and follow
+the same rules.
+
+- **Nothing on the server is replaced unless you chose it.** A file of the same name there is
+  "the same" (one size, times within 2 seconds), "newer here", "older here" or of another size,
+  and gets one of five choices: **Replace**, **Replace if different** (all but the same),
+  **Replace if newer** (only those newer here; a server that gives no time isn't older),
+  **Skip** or **Keep both** (yours goes in as "name (2).ext", the first number free). A folder
+  of that name is never replaced: Replace skips it ("a folder of that name is there"). Server
+  folders are never removed, but the empty ones an upload made when it is cancelled.
+- **Each file goes to a temp name of grab's** (".name.0a1b2c.grabpart") beside its target and
+  takes its name only when complete, so no half-sent file ever has the real name; a new name is
+  taken with a rename that never replaces anything, and Replace swaps in one step where the
+  server offers it (OpenSSH's posix-rename). Folders are made first; an existing one is merged
+  into. A file of 2 MiB or more is sent in pieces over several connections and resumes after a
+  pause, a failure, a restart or Ctrl+C from what the server acknowledged (its record is in
+  `%APPDATA%\grab\uploads`); smaller ones start over. The server's copy gets your file's time;
+  its permissions are the server's default for new files.
+- **Your files are only read**, never changed, moved or deleted (they may be open in other
+  programs meanwhile; one that changes while it is sent is sent again once, then fails).
+  Links and junctions inside a folder are left out and counted, never followed; names over 255
+  bytes, which no Linux server takes, are said before anything goes.
+- **Whether you can write there** is checked first, with a file of grab's own made and removed
+  again (".grab-probe-0a1b2c"). A server that won't take files says so plainly: "Box.Guest is
+  read-only for this account: nothing can be uploaded to software", "Main doesn't let this
+  account write in /srv", or, when it runs out of room, "Main:/srv is full: 1.2 GiB free, 3.2
+  GiB needed".
+- **Verify** (Settings → Downloads, or `--verify`) covers uploads: the server's MD5 of its copy
+  against yours. A copy that differs fails the upload, "the server's copy differs (MD5)", and is
+  sent again over that copy with Retry in the window. The command lists such files with the
+  command that sends each one alone (`grab upload "E:\Photos\a.jpg" -r Main "/srv/photos"
+  --existing replace`: the run's own command with `--existing replace` would send every file of
+  it again); a second copy (Keep both) is named, as no rerun can replace it by its name. Nothing
+  local is ever deleted.
+- **Connections and speed:** uploads and downloads share each server's connection budget (one
+  budget for both; At once counts both), and the server's limit learned from refusals
+  (`limits.json`). Uploads have their own speed limit, ↑ in the status bar, and the speed
+  schedule's ↑ speeds; `grab upload --limit` sets it for one run. Measured to a VPS 96 ms away:
+  one connection 4-6 MiB/s (as `sftp.exe` and `scp.exe`), a big file over 8 connections about 13
+  MiB/s, more than four `sftp.exe` uploads at once (9.8); to a Storage Box 4.8 MiB/s on one
+  connection, 8.4 on four.
+
+### In the window
+
+- **Right-click a folder** in Browse for **Upload files here…** or **Upload folder here…**
+  (Windows' file dialog; pick one or several). Into the folder that is open: right-click the
+  list's empty part, or a file row (**Upload files to** *folder*…), or press Shift+F10 in an
+  empty folder. Uploads go into one folder of one server: on search results, on All servers'
+  list of servers and on the list of a server's search roots the entries say why not (open the
+  folder first).
+- **Or drag files and folders from Explorer** onto Browse, mixed as you like: dropped on a
+  folder row they go into that folder, anywhere else on the list into the folder that is open;
+  while you drag, "Drop to upload to Main:/srv/tv" says where, and the same dialog asks first.
+  Search results, All servers, the list of a server's search roots and a folder still opening
+  say why not, and the Downloads table and the status bar say to drop on Browse. Nothing
+  dragged in ever opens in the window; should WebView2 ever end grab's page, grab opens it again
+  at once, at the folders Browse had open, and says so (a search and the selection are gone).
+  Windows doesn't let Explorer drop into a program run as administrator, so drops need grab-gui
+  started normally.
+- **A dialog asks first** and checks before anything is sent: what goes ("holiday — 1,204
+  files, 3.2 GiB"; links left out and long names said), where ("To Main:/srv/tv", merged into a
+  folder of the same name there or a new folder), and whether you can write there: "✓ You can
+  write here · 120 GiB free", or the server's refusal in plain words with Upload disabled. Too
+  little free space says so, and the button becomes Upload anyway.
+- **Files already on the server** are asked about in the same dialog: "37 already there: 30
+  the same, 5 newer here, 2 older here", the first 200 listed with yours and the server's size
+  and time beside them. One choice for all of them (each saying how many it would replace)
+  starts on **Skip**; each listed file can have its own instead, and the dialog says what
+  happens ("5 replaced, 32 skipped", or "nothing on Main is replaced"). **Always do this** saves
+  the choice for all as the setting (Settings → Uploads, "When a file is already on the
+  server": Ask, or one of the five); with a setting the dialog says "Files already there:
+  Replace if newer (your setting)", and **Change** opens the question for that upload.
+- A file that turns up at its name after the dialog follows the upload's choice. Under Ask,
+  for a picked file or folder the dialog listed nothing of, the upload sends the rest, then
+  waits paused: "A file of that name is already on Main. Resume to choose…"; Resume asks the
+  same question for those files. A big file asked about as it was put in place keeps what it
+  sent, so its answer sends nothing again. A file skipped for a reason says it in its row's
+  tooltip ("Skipped: a folder of that name is there"). The choices for single files are kept
+  with the upload, so Retry and a restart follow them; picking the same folder again for a
+  failed upload of it gives that upload the new dialog's answer.
+- **Rows:** an upload is a row of the Downloads table, "↑ holiday → Main:/srv/tv", Uploading
+  while it runs, its speed what the server acknowledged; a folder's files are rows under it, as
+  a download's. The head adds "· 1 uploading", and Show has Downloads and Uploads (see the
+  Downloads table under [GUI](#gui)). Its menu: Pause, Resume or Retry, Cancel, Priority, the
+  moves, Show on server (Browse at the folder it goes into; also a double-click), Show in
+  Explorer, Copy server path and Copy error; nothing opens or deletes a local file. Pause all
+  and Cancel all cover uploads too. Once an upload ends, the folder it went into is listed again
+  from the server (Browse shows it at once when it is open).
+- **Cancel** removes the temps and the partial uploads it left, and the folders it made once
+  they are empty; files already sent stay. What can't be reached then (the server offline) is
+  remembered and removed at the next start.
+- **Limits and schedule:** the status bar's "↑ [switch] [4] MiB/s" caps all uploads together,
+  apart from the ↓ download limit, and the total shows both ("↓ 11.9 · ↑ 3.9 MiB/s"); each
+  time of the speed schedule has a ↓ and an ↑ speed (see Speed limits and Speed schedule under
+  [GUI](#gui)). Should a full upload link slow downloads or Play down, the ↑ limit is the remedy.
+- **Not supported:** files inside a .zip (or a mail's attachments), which aren't on this PC as
+  files until extracted: "Extract files from a .zip first"; links dragged from a browser ("grab
+  uploads files, not links"); dragged text (it does nothing). Nor are deleting, moving or
+  renaming server files, sync or delta transfer (rsync: Replace if different or if newer sends
+  only what changed, and a big file goes on from where it stopped), uploading from search
+  results or into several folders at once, server-to-server copies, and uploads from Play or the
+  viewer.
+- **An older grab** (0.23 and before) knows nothing of uploads. Unfinished uploads are kept in
+  `%APPDATA%\grab\uploads.json`, beside queue.json, which it never reads or rewrites (queue.json
+  holds downloads only, as before). In gui.json it ignores the upload limit (`uploadLimitOn`,
+  `uploadLimitMiBps`, `uploadLimitChange`), the setting for files already there
+  (`uploadExisting`) and the schedule's ↑ speeds, and saving its settings drops them: the
+  upload limit is then off again, the setting Ask again, and a time with only an ↑ speed gone.
+
+### The command
+
+```
+grab upload LOCAL... [-r SERVER] REMOTE_DIR [options]
+```
+
+- `REMOTE_DIR` is a folder on the server, absolute (`/srv/photos`) or relative to the login home
+  (`uploads`; `.` or `~` is the home itself), and must be there: "grab: error: there is no folder
+  /srv/photos on Main" (exit code `3`). It comes last; a folder of this PC there is refused.
+- `LOCAL` is one or more files and folders. A folder goes in as a folder of its name, merged into
+  one that is there already. `*` and `?` in a `LOCAL`'s last part pick the names in that folder
+  that match, ignoring case (grab expands them: neither PowerShell nor cmd does):
+  `grab upload E:\Photos\*.jpg -r Main /srv/photos`. A pattern leaves out what an upload of its
+  folder would: links and junctions, and grab's own partial downloads ("grab: E:\Downloads\*: 1
+  link and 2 partial downloads left out (name them to send them)", a partial download being its
+  .grabpart and record); a name typed in full goes as
+  it is. One that isn't there stops the run before anything connects (exit code `3`).
+- `upload` is a command only as the first word: `grab -f upload` searches for a folder named
+  upload.
+- First it looks at what goes and at the server: whether this account may write in `REMOTE_DIR`
+  (exit code `6` and the server's refusal in plain words when not), its free space (a note when
+  it's short), and the files already there.
+- **Files already there:** `--existing ask|replace|different|newer|skip|both` decides, else the
+  window's setting (Settings → Uploads; Ask at first), and grab says what it does: "3 files
+  already on Main:/srv: 3 newer here; --existing newer: 3 replaced". A file that is the same
+  (size and time) is skipped under every choice but Replace (sent before, or by a run that was
+  stopped; under Keep both too, where the window would make a second copy). Under Ask the others
+  are listed, yours and the server's, and asked about:
+  `[r]eplace, replace if [d]ifferent, replace if [n]ewer, [s]kip, [k]eep both, [o]ne by one, [q]uit`.
+  One by one asks for each file; a capital letter (`R`, `D`, `N`, `S`, `K`) answers it and the
+  rest. `q` stops before anything is sent (exit code `3`). Without a console to ask on (input
+  redirected, a scheduled task) grab stops, replaces nothing and says to add `--existing` (exit
+  code `6`). A file that turns up there while the upload runs is asked about then.
+- **`-n`** shows what would go where, with sizes and file counts, whether each folder is merged
+  into one there or new, the server folder's free space, the files already there and what the
+  choice does with each, and writes nothing, on the server or here: whether this account may
+  write there shows when it uploads (a read-only account, which the server says, is refused
+  already).
+- **Progress** is one line, redrawn in place, as a download's with ↑ before it:
+  `↑ 412.0 MiB / 898.0 MiB  45%  12.7 MiB/s  12 conns  ETA 0:38` (folders add `4/13 files`),
+  counting what the server acknowledged. Each item ends with
+  `Uploaded 1,204 files (3.2 GiB) to Main:/srv/holiday-photos in 4 min 12 s, 12.7 MiB/s`
+  ("…, 412.0 MiB of it now" when it went on from an earlier run; "; 37 already there, skipped").
+  Several `LOCAL`s go one after another, each with the server's whole connection budget, and a
+  summary follows ("grab: 2 of 3 done; failed: ..."); files picked from one folder that follow
+  each other (a pattern's) go together, many at once as a folder's do: "grab: 2,000 files from
+  E:\notes  ->  Main:/srv/notes".
+- **Ctrl+C** stops cleanly: "stopped with 12 of 40 files done; run the same command again to
+  continue" (exit code `130`). A big file's partial upload stays on the server with its record,
+  and the same command again goes on from what the server acknowledged, skipping the files that
+  got there; smaller ones start over, so their temps are removed at once. Under Replace the same
+  command would send the files that got there again, so grab says "run it again with --existing
+  different to continue". A second Ctrl+C ends grab at once.
+- `--limit RATE` caps the run's upload speed (`--limit off`: none); without it grab follows the
+  speed schedule's ↑ speeds, also mid-upload. `--verify` / `--no-verify`, `-v`, `-c`, `-r`,
+  `--bind`, `--contimeout` and `--timeout` work as for downloads, and so do the server's
+  connection budget and `limits.json`. A run and the window never upload a big file to the same
+  place at once: the second says "Main:/srv/x is being uploaded already, by another grab".
+
+```powershell
+grab upload E:\Photos\holiday -r Main /srv/photos     # a folder: Main:/srv/photos/holiday
+grab upload -n E:\Photos\holiday -r Main /srv/photos  # what would go where; nothing written
+grab upload E:\notes.txt E:\todo.txt -r Box .         # two files into the login home
+grab upload E:\Photos\*.jpg -r Main /srv/photos --existing newer --limit 4
+```
+
+Exit codes: `0` done, or nothing to send (all there already), `1` usage, `2` config (also a
+server whose login can't be made from its settings: a host key not trusted), `3` a `LOCAL` or
+`REMOTE_DIR` not found, or `q` at the question, `6` an upload failed (also a server that refuses
+writing, read-only or full, a copy that `--verify` found different, and files already there
+with no console to ask on), `130` stopped by Ctrl+C.
 
 ## Lookup methods
 
@@ -1529,8 +1670,13 @@ src/notices.*   the one-time notes about settings (notices.json)
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    a folder's listed files, their states, which files the tree shows
 src/folder_job.*    a folder download, shared by the window and the command
-src/cli_download.*  the command's downloads: live progress line, Ctrl+C
+src/cli_download.*  the command's downloads
+src/cli_upload.*    `grab upload`: LOCAL's names, the question about files there, each item in turn
+src/cli_console.*   the command's console: live progress line, Ctrl+C, the schedule followed
 src/progress_line.* that line's text
+src/upload.*    one file's resumable upload: temps, records, placing, the write check
+src/upload_folder.* a folder upload (scheduled as folder downloads, folder_sched.hpp); src/local_walk.* its files
+src/upload_check.*  the check before an upload: what goes, the server's side; src/upload_existing.* the five choices
 src/rate.*      speed limit: token bucket, --limit / --bwlimit rates
 src/schedule.*  speed schedule: rules, the limit at a time of the week, its next change
 src/verify.*    checking downloads: the server's md5sum and grab's MD5, by path; what proves a mismatch

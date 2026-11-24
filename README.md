@@ -4,7 +4,7 @@
 
 Fetch a file or folder from a Linux server **by name**. `grab` finds it over ssh, then
 downloads it over several connections at once. Downloads are resumable: Ctrl+C keeps what is
-on disk, and running the same command again continues from there.
+on disk, and running the same command again continues from there. It uploads too, on the side.
 
 ```
 grab -f releases  E:\Backup     # folder: E:\Backup\releases\...
@@ -42,7 +42,12 @@ connections, building and releasing) is in the full documentation,
   the downloads in a sortable table (status, progress, speed and time left for each download and
   every file of a folder) with pause and resume, priorities (a folder's files too: which start
   first, and how its big ones share), finished files opened with a double-click (a program asks
-  first), the total speed with a graph of its last minute, a speed limit and a speed schedule.
+  first), the total speed with a graph of its last minute, download and upload speed limits and
+  a speed schedule.
+- **Uploads, on the side.** Files and folders go the other way too: right-click a folder in the
+  window's Browse, drag them from Explorer onto it, or run `grab upload`. grab checks that you
+  can write there and asks before replacing anything; each file takes its name only when
+  complete, and big ones resume.
 
 ## Requirements
 
@@ -138,6 +143,9 @@ grab [-s|--file | -f|--folder] TARGET [DEST] [options]
   advance.
 - Without `--limit`, grab follows the speed schedule set in the window; `--limit off` downloads
   without a limit.
+- `grab upload LOCAL... [-r SERVER] REMOTE_DIR` sends files and folders the other way, into a
+  server folder that must exist. `-n` shows what would go where; files already there are asked
+  about, or `--existing` answers in advance. `grab -f upload` searches for a folder named upload.
 
 ```powershell
 grab -n -f "season 2" E:\TV                          # show what would be fetched; fetch nothing
@@ -145,11 +153,13 @@ grab --all -s "lioness s03" E:\TV                    # every match, without aski
 grab -f 'Season.0[1-3]*' E:\Backup                   # a glob
 grab "limits" --type video --min-size 50M E:\Movies  # only videos of 50 MiB and more
 grab -r box -s movie.mkv E:\Movies --limit 5M --verify
+grab upload E:\Photos\holiday -r box /srv/photos     # upload a folder: /srv/photos/holiday
 ```
 
 Exit codes: `0` ok, `1` usage, `2` config, `3` target not found or pick aborted, `4` remote
-lookup failed (search or file list), `5` `grab update` failed, `6` a download failed, `130`
-stopped by Ctrl+C. Every option, and what downloads do: [Usage](docs/doc.md#usage).
+lookup failed (search or file list), `5` `grab update` failed, `6` a download or upload failed,
+`130` stopped by Ctrl+C. Every option, and what downloads do: [Usage](docs/doc.md#usage);
+uploads: [Uploading](docs/doc.md#uploading).
 
 ## Build from source
 
@@ -186,6 +196,7 @@ PATH. More in [Build](docs/doc.md#build) and [From source](docs/doc.md#from-sour
   [Going back to 0.20](docs/doc.md#going-back-to-020) and
   [Going back to 0.19](docs/doc.md#going-back-to-019)
 - [Usage](docs/doc.md#usage): every option, matching and picking, downloads, `--`, exit codes
+- [Uploading](docs/doc.md#uploading): uploads from the window and with `grab upload`
 - [Lookup methods](docs/doc.md#lookup-methods): find, the walk over SFTP, the find check
 - [File lists](docs/doc.md#file-lists): the saved lists searches use
 - [Connections](docs/doc.md#connections): `max_connections`, `bind`, the timeouts, and what
