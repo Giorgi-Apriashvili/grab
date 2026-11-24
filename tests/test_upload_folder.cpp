@@ -906,35 +906,46 @@ TEST_CASE("folder uploads: small files: a limit switched on below what a connect
         put_local(src, name, contents[name]);
     }
     Server server;
-    server.fake.latency = std::chrono::milliseconds(200); // WRITEs stay on their way a while
+    // A connection's WRITEs stay on their way: each reply comes only as the worker waits for one,
+    // so it looks at the new limit with megabytes out. With replies taken as they come (a fixed
+    // latency, as here before), it looked right after taking them, with little out, and charged
+    // that instead of dropping the connection: 2 of 20 runs, since chunk 6's look before every
+    // WRITE (test_upload.cpp's single-file case holds its replies the same way).
+    server.fake.held = true;
+    server.fake.release_one = true;
     Up up(server, src, "/up/src", 2);
     rate::RateLimiter limiter; // unlimited at the start
     up.job.limiter = &limiter;
     std::mutex came_m;
     std::vector<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>> came; // every acknowledgement
     std::atomic<std::uint64_t> acked{0};
+    std::atomic<bool> switched{false};
+    std::atomic<std::uint64_t> acked_then{0};
+    std::chrono::steady_clock::time_point switched_at;
+    // Switched on from the worker that read the acknowledgement, with megabytes on their way, as
+    // the window's box would between two of its looks.
     up.job.on_sent = [&](std::uint64_t n) {
-        std::lock_guard lock(came_m);
-        came.emplace_back(std::chrono::steady_clock::now(), n);
-        acked += n;
+        bool now_switch = false;
+        {
+            std::lock_guard lock(came_m);
+            const auto at = std::chrono::steady_clock::now();
+            came.emplace_back(at, n);
+            acked += n;
+            if (acked.load() >= (std::uint64_t{2} << 20) && !switched.load()) {
+                switched = true;
+                switched_at = at;
+                acked_then = acked.load();
+                now_switch = true;
+            }
+        }
+        if (now_switch) limiter.set_rate(std::uint64_t{1} << 20);
     };
     up.walk();
-    bool switched = false;
-    std::chrono::steady_clock::time_point switched_at;
     {
         std::jthread run([&] { up.run(); });
-        // Switched on from outside, as the window's box does, while the connections wait for
-        // acknowledgements with megabytes on their way: each looks at the new limit after the
-        // next one it reads.
-        for (int i = 0; i < 2000 && acked.load() < (std::uint64_t{2} << 20); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        switched_at = std::chrono::steady_clock::now();
-        const std::uint64_t acked_then = acked.load();
-        limiter.set_rate(std::uint64_t{1} << 20);
-        switched = true;
+        for (int i = 0; i < 2000 && !switched.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
         // Until some was sent under the limit (each connection looked at it before sending more).
-        for (int i = 0; i < 2000 && acked.load() < acked_then + (std::uint64_t{256} << 10); ++i) {
+        for (int i = 0; i < 2000 && acked.load() < acked_then.load() + (std::uint64_t{256} << 10); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         limiter.set_rate(0); // the rest at full speed
@@ -951,7 +962,7 @@ TEST_CASE("folder uploads: small files: a limit switched on below what a connect
     MESSAGE("acknowledged in the first half second after the switch: ", first, " bytes");
     for (const auto& f : up.tree.files) CHECK_MESSAGE(f.status == folder::State::done, f.path, ": ", f.error);
     for (const auto& [name, content] : contents) CHECK_MESSAGE(server.file("/up/src/" + name) == content, name);
-    CHECK(switched);
+    CHECK(switched.load());
     CHECK(server.temps().empty());
     // Dropped, not charged: the WRITEs it had on its way reached the server but were never
     // acknowledged to it, and their files went again (a connection charged instead sends each
