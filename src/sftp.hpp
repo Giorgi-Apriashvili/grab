@@ -13,7 +13,11 @@
 // Writes (uploads, UPLOADS.md 5.1) never wait for a reply while there is room: each WRITE goes out
 // as it is queued, the replies already here are taken without waiting (pump_ready), and only at a
 // cap of WRITEs or bytes in flight does the writer wait for one (write_range).
+//
+// The server's own copies (SERVER-OPS.md): copy-data copies a file's bytes on the server, none
+// through grab; copy_range does it in pieces, so a big file shows progress and can be stopped.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -21,6 +25,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -76,11 +81,17 @@ struct Status {
 [[nodiscard]] std::string describe(const Status& status);
 
 // A file's attributes as a server sends them, and as grab sets them (SETSTAT, a new file's or
-// folder's): only those present. Setting an mtime sets the access time to it too.
+// folder's): only those present. SFTP sends the two times together and the owner with the group:
+// an mtime goes with the atime (the mtime itself when there is none), and an atime without an
+// mtime isn't sent; uid and gid go only both together (one alone isn't sent). A server changes
+// the owner only for root (OpenSSH: chown(2)), so a SETSTAT with someone else's uid fails.
 struct Attrs {
     std::optional<std::uint64_t> size;
     std::optional<std::uint32_t> permissions; // includes the file type bits (S_IFMT)
     std::optional<std::uint32_t> mtime;       // seconds since 1970
+    std::optional<std::uint32_t> uid;         // the owner's number (users_groups_by_id names it)
+    std::optional<std::uint32_t> gid;         // the group's
+    std::optional<std::uint32_t> atime;       // the last access, seconds since 1970
     [[nodiscard]] bool is_dir() const;
     [[nodiscard]] bool is_file() const;
     [[nodiscard]] bool is_link() const;
@@ -119,6 +130,17 @@ struct Limits {
     std::uint64_t packet = 0, read = 0, write = 0, handles = 0;
 };
 
+// users-groups-by-id@openssh.com's answer: the name of each number asked for, in the order asked;
+// "" for one the server knows no name for. Bytes as the server sent them, not necessarily UTF-8.
+struct IdNames {
+    std::vector<std::string> users;
+    std::vector<std::string> groups;
+};
+
+// The extensions grab's own copies and owners' names need, by the names servers offer them under.
+inline constexpr std::string_view copy_data_extension = "copy-data";
+inline constexpr std::string_view users_groups_extension = "users-groups-by-id@openssh.com";
+
 // Requests one Client keeps in flight unless told otherwise, and the largest READ: OpenSSH's
 // sftp-server answers at most 255 KiB per READ. Phase 0 measured that a Storage Box connection's
 // speed follows the bytes in flight (16 READs: about 1 MiB/s; 64: as fast as rclone).
@@ -129,6 +151,16 @@ inline constexpr std::uint32_t max_read = 255 * 1024;
 // measurements set it, section 13).
 inline constexpr std::uint32_t max_write = 255 * 1024;
 inline constexpr std::uint64_t max_unacked = std::uint64_t{8} * 1024 * 1024;
+// The most copy_range asks one copy-data for (SERVER-OPS.md, decision 1): the server answers only
+// once a piece is copied, so this sets how often progress shows and a stop is seen. A piece must
+// also be done within the connection's timeout (Target::timeout, 30 s unless set: OpenSSH's
+// sftp-server sends nothing meanwhile, and the read waiting for the answer gives up), which at
+// 256 MiB a server copying below about 8.5 MiB/s isn't: so copy_range starts with copy_first_piece
+// and sizes each next piece to the pace the last one showed (next_copy_piece), never below
+// copy_least_piece nor above this.
+inline constexpr std::uint64_t copy_piece = std::uint64_t{256} * 1024 * 1024;
+inline constexpr std::uint64_t copy_first_piece = std::uint64_t{8} * 1024 * 1024;
+inline constexpr std::uint64_t copy_least_piece = std::uint64_t{1} * 1024 * 1024;
 
 // The most entries grab takes from a server in one listing: one folder, a walk or a find (Main's
 // whole file list is about 17,000), so a broken or hostile server can't exhaust memory or keep
@@ -191,6 +223,29 @@ public:
     void limits(Done<Limits> done);
     // fsync@openssh.com: an open file's bytes onto the server's disk.
     void fsync(std::string_view handle, Done<void> done);
+    // copy-data (copy_data_extension; offered by OpenSSH's sftp-server): the server copies
+    // `length` bytes (0: up to the end of the file) of the file open as `from`, from
+    // `from_offset`, into the file open for writing as `to`, at `to_offset` (a file opened with
+    // OpenFlags::append: at its end); no byte comes through grab. OpenSSH's answers: the same
+    // handle or the same name twice, or a folder's handle, "Failure"; `to` not open for writing
+    // "no such file" (EBADF); a full disk "Failure"; the file ending before `length` bytes, EOF
+    // (what came before it is written). It copies 64 KiB at a time and counts each piece as done
+    // when it asks for it, so a write that fails, or the file ending, within the LAST 64 KiB is
+    // answered ok: look at the target's size after (copy_range does).
+    void copy_data(std::string_view from, std::uint64_t from_offset, std::uint64_t length, std::string_view to,
+                   std::uint64_t to_offset, Done<void> done);
+    // users-groups-by-id@openssh.com (users_groups_extension): the names of owners' and groups'
+    // numbers (Attrs::uid, Attrs::gid), each list sent packed as OpenSSH's sftp-server reads it.
+    void users_groups_by_id(std::span<const std::uint32_t> uids, std::span<const std::uint32_t> gids, Done<IdNames> done);
+    // READLINK: where the link at `path` points, as stored (a relative target is from the link's
+    // folder). OpenSSH answers a name that isn't a link with Code::bad_message (EINVAL).
+    void readlink(std::string_view path, Done<std::string> done);
+    // SYMLINK: a new link at `link` pointing to `target` (stored as given; an existing `link`
+    // fails it). OpenSSH's sftp-server takes the two paths in the order opposite to the SFTP
+    // draft's (linkpath, targetpath): the target first, then the link. This sends OpenSSH's order;
+    // a server keeping to the draft would make a link at `target` instead, so a caller that needs
+    // to know reads the link back (READLINK).
+    void symlink(std::string_view link, std::string_view target, Done<void> done);
 
     void flush();
     // Requests sent or queued whose replies haven't come yet.
@@ -253,6 +308,14 @@ private:
 [[nodiscard]] std::expected<Statvfs, Status> statvfs(Client& client, std::string_view path);
 [[nodiscard]] std::expected<Limits, Status> limits(Client& client);
 [[nodiscard]] std::expected<void, Status> fsync(Client& client, std::string_view handle);
+// copy-data and users-groups-by-id, sent only when the server offered them: else Code::op_unsupported
+// at once, nothing sent.
+[[nodiscard]] std::expected<void, Status> copy_data(Client& client, std::string_view from, std::uint64_t from_offset,
+                                                    std::uint64_t length, std::string_view to, std::uint64_t to_offset);
+[[nodiscard]] std::expected<IdNames, Status> users_groups_by_id(Client& client, std::span<const std::uint32_t> uids,
+                                                                std::span<const std::uint32_t> gids);
+[[nodiscard]] std::expected<std::string, Status> readlink(Client& client, std::string_view path);
+[[nodiscard]] std::expected<void, Status> symlink(Client& client, std::string_view link, std::string_view target);
 // Every entry of a folder except "." and "..", in the server's order. Past `limit` entries it
 // stops: a Status (Code::failure) saying the folder holds too many.
 [[nodiscard]] std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir,
@@ -284,5 +347,33 @@ using Acked = std::function<void(std::uint64_t offset, std::uint32_t length)>;
                                                       const Acked& acked = {}, int depth = 64,
                                                       std::uint64_t unacked = max_unacked,
                                                       std::uint32_t chunk = max_write);
+
+// The bytes copy_range has copied so far, after each piece.
+using Copied = std::function<void(std::uint64_t copied)>;
+// The time copy_range times its pieces by: steady_clock's unless a test gives its own.
+using Now = std::function<std::chrono::steady_clock::time_point()>;
+
+// The piece copy_range asks for after one of `bytes` took `took`: what the server copies in a
+// third of `budget` (the connection's timeout) at that pace, at least copy_least_piece, at most
+// `cap`. No budget (0 or less), or no time taken: `cap`.
+[[nodiscard]] std::uint64_t next_copy_piece(std::uint64_t bytes, std::chrono::nanoseconds took,
+                                            std::chrono::milliseconds budget, std::uint64_t cap);
+
+// Copies [from_offset, from_offset + length) of the file open as `from` into the file open for
+// writing (not appending) as `to`, at `to_offset`, by copy-data requests one after the other: the
+// server copies, nothing comes through grab. Each piece must be done within `budget`, the
+// connection's timeout (Target::timeout): the first is copy_first_piece, each next one sized by
+// next_copy_piece, none above `piece`; no budget (0: a Target made by hand), every piece `piece`.
+// After each piece the target's size (FSTAT) must reach where the piece ended, as OpenSSH answers
+// ok for a piece whose last 64 KiB failed (copy_data): shorter is a Status (Code::failure), and so
+// is a server that doesn't tell the size. `copied` follows each piece; `stop` is looked at before
+// each one. The bytes copied: `length`, or fewer when stopped. Only for a target with nothing past
+// where the copy writes (a new or emptied file): one longer already hides a short piece. Not
+// offered: Code::op_unsupported, nothing sent.
+[[nodiscard]] std::expected<std::uint64_t, Status> copy_range(Client& client, std::string_view from, std::uint64_t from_offset,
+                                                              std::uint64_t length, std::string_view to,
+                                                              std::uint64_t to_offset, std::chrono::milliseconds budget,
+                                                              const Copied& copied = {}, std::stop_token stop = {},
+                                                              std::uint64_t piece = copy_piece, const Now& now = {});
 
 } // namespace grab::sftp

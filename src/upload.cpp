@@ -581,7 +581,8 @@ std::expected<std::optional<sftp::Attrs>, sftp::Status> look_at(sftp::Client& c,
     }
     if (!a->is_link()) return std::optional<sftp::Attrs>(*a);
     if (auto through = sftp::stat(c, raw)) return std::optional<sftp::Attrs>(*through);
-    return std::optional<sftp::Attrs>(sftp::Attrs{.size = {}, .permissions = 0100644, .mtime = {}});
+    return std::optional<sftp::Attrs>(
+        sftp::Attrs{.size = {}, .permissions = 0100644, .mtime = {}, .uid = {}, .gid = {}, .atime = {}});
 }
 
 std::expected<Placement, Refusal> place(sftp::Client& c, const Caps& caps, const PlaceRequest& r, std::string& renaming) {
@@ -1458,7 +1459,8 @@ Result run(const Upload& u, fetch::Connections& connections, const std::function
         // The server refused to set the time (some gateways do): the file goes in place all the same.
         std::string time_kept;
         auto placed = on_connection<Placed>(u, connections, stop, true, [&](sftp::Client& c) -> std::expected<Placed, Trouble> {
-            if (auto timed = sftp::setstat(c, job.raw_temp, sftp::Attrs{.size = {}, .permissions = {}, .mtime = mtime}); !timed) {
+            const sftp::Attrs times{.size = {}, .permissions = {}, .mtime = mtime, .uid = {}, .gid = {}, .atime = {}};
+            if (auto timed = sftp::setstat(c, job.raw_temp, times); !timed) {
                 switch (timed.error().code) {
                 case sftp::Code::no_such_file: {
                     if (!renaming.empty()) {

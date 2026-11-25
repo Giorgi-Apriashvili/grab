@@ -3,6 +3,7 @@
 #include "rclone_encoding.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <format>
 #include <limits>
@@ -31,6 +32,8 @@ enum : std::uint8_t {
     fxp_realpath = 16,
     fxp_stat = 17,
     fxp_rename = 18,
+    fxp_readlink = 19,
+    fxp_symlink = 20,
     fxp_extended = 200,
     fxp_status = 101,
     fxp_handle = 102,
@@ -95,12 +98,12 @@ Attrs read_attrs(Fields& f) {
     std::uint32_t flags = f.u32();
     if (flags & attr_size) a.size = f.u64();
     if (flags & attr_uidgid) {
-        f.u32();
-        f.u32();
+        a.uid = f.u32();
+        a.gid = f.u32();
     }
     if (flags & attr_permissions) a.permissions = f.u32();
     if (flags & attr_acmodtime) {
-        f.u32(); // atime
+        a.atime = f.u32();
         a.mtime = f.u32();
     }
     if (flags & attr_extended) {
@@ -113,15 +116,27 @@ Attrs read_attrs(Fields& f) {
     return a;
 }
 
-// The attributes `a` holds, as SETSTAT, MKDIR and OPEN take them; an mtime goes as the access time too.
+// The attributes `a` holds, as SETSTAT, MKDIR and OPEN take them: uid and gid only both together,
+// the times with an mtime (the atime its own, else the mtime).
 void put_attrs(std::string& out, const Attrs& a) {
-    put_u32(out, (a.size ? attr_size : 0) | (a.permissions ? attr_permissions : 0) | (a.mtime ? attr_acmodtime : 0));
+    const bool owner = a.uid && a.gid;
+    put_u32(out, (a.size ? attr_size : 0) | (owner ? attr_uidgid : 0) | (a.permissions ? attr_permissions : 0) |
+                     (a.mtime ? attr_acmodtime : 0));
     if (a.size) put_u64(out, *a.size);
+    if (owner) {
+        put_u32(out, *a.uid);
+        put_u32(out, *a.gid);
+    }
     if (a.permissions) put_u32(out, *a.permissions);
     if (a.mtime) {
-        put_u32(out, *a.mtime);
+        put_u32(out, a.atime.value_or(*a.mtime));
         put_u32(out, *a.mtime);
     }
+}
+
+// What a blocking helper answers for an extension the server didn't offer, without sending it.
+Status not_offered(std::string_view extension) {
+    return Status{.code = Code::op_unsupported, .message = std::format("the server doesn't offer {}", extension)};
 }
 
 Status read_status(std::string_view body) {
@@ -451,6 +466,79 @@ void Client::fsync(std::string_view handle, Done<void> done) {
     request(fxp_extended, p, status_only(std::move(done)));
 }
 
+void Client::copy_data(std::string_view from, std::uint64_t from_offset, std::uint64_t length, std::string_view to,
+                       std::uint64_t to_offset, Done<void> done) {
+    std::string p;
+    put_str(p, copy_data_extension);
+    put_str(p, from);
+    put_u64(p, from_offset);
+    put_u64(p, length);
+    put_str(p, to);
+    put_u64(p, to_offset);
+    request(fxp_extended, p, status_only(std::move(done)));
+}
+
+void Client::users_groups_by_id(std::span<const std::uint32_t> uids, std::span<const std::uint32_t> gids,
+                                Done<IdNames> done) {
+    // Each list is one string holding its numbers back to back.
+    const auto packed = [](std::span<const std::uint32_t> ids) {
+        std::string s;
+        for (const std::uint32_t id : ids) put_u32(s, id);
+        return s;
+    };
+    std::string p;
+    put_str(p, users_groups_extension);
+    put_str(p, packed(uids));
+    put_str(p, packed(gids));
+    request(fxp_extended, p,
+            [done = std::move(done), users = uids.size(), groups = gids.size()](const Reply& r) mutable {
+                if (r.type == fxp_status) {
+                    Status s = read_status(r.body);
+                    if (s.code == Code::ok) throw ProtocolError("the server answered users-groups-by-id with no names");
+                    return done(std::unexpected(std::move(s)));
+                }
+                if (r.type != fxp_extended_reply) unexpected_reply(r.type);
+                // Two strings, each holding one name per number asked for (OpenSSH: "" for none).
+                const auto names = [](std::string_view list, std::size_t n) {
+                    Fields f(list);
+                    std::vector<std::string> out;
+                    out.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) out.emplace_back(f.str());
+                    return out;
+                };
+                Fields f(r.body);
+                const std::string_view user_list = f.str();
+                const std::string_view group_list = f.str();
+                done(IdNames{.users = names(user_list, users), .groups = names(group_list, groups)});
+            });
+}
+
+void Client::readlink(std::string_view path, Done<std::string> done) {
+    std::string p;
+    put_str(p, path);
+    request(fxp_readlink, p, [done = std::move(done)](const Reply& r) mutable {
+        if (r.type == fxp_status) {
+            Status s = read_status(r.body);
+            if (s.code == Code::ok) throw ProtocolError("the server answered READLINK with no name");
+            return done(std::unexpected(std::move(s)));
+        }
+        if (r.type != fxp_name) unexpected_reply(r.type);
+        Fields f(r.body);
+        if (f.u32() != 1) throw ProtocolError("the server answered READLINK with other than one name");
+        std::string target(f.str());
+        f.str();       // longname
+        read_attrs(f); // none, from OpenSSH
+        done(std::move(target));
+    });
+}
+
+void Client::symlink(std::string_view link, std::string_view target, Done<void> done) {
+    std::string p;
+    put_str(p, target); // OpenSSH's order: the target first
+    put_str(p, link);
+    request(fxp_symlink, p, status_only(std::move(done)));
+}
+
 void Client::readdir(std::string_view handle, Done<std::vector<Entry>> done) {
     std::string p;
     put_str(p, handle);
@@ -581,6 +669,29 @@ std::expected<void, Status> fsync(Client& client, std::string_view handle) {
     return wait_for<void>(client, [&](Client::Done<void> done) { client.fsync(handle, std::move(done)); });
 }
 
+std::expected<void, Status> copy_data(Client& client, std::string_view from, std::uint64_t from_offset,
+                                      std::uint64_t length, std::string_view to, std::uint64_t to_offset) {
+    if (!client.has_extension(copy_data_extension)) return std::unexpected(not_offered(copy_data_extension));
+    return wait_for<void>(client, [&](Client::Done<void> done) {
+        client.copy_data(from, from_offset, length, to, to_offset, std::move(done));
+    });
+}
+
+std::expected<IdNames, Status> users_groups_by_id(Client& client, std::span<const std::uint32_t> uids,
+                                                  std::span<const std::uint32_t> gids) {
+    if (!client.has_extension(users_groups_extension)) return std::unexpected(not_offered(users_groups_extension));
+    return wait_for<IdNames>(client,
+                             [&](Client::Done<IdNames> done) { client.users_groups_by_id(uids, gids, std::move(done)); });
+}
+
+std::expected<std::string, Status> readlink(Client& client, std::string_view path) {
+    return wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.readlink(path, std::move(done)); });
+}
+
+std::expected<void, Status> symlink(Client& client, std::string_view link, std::string_view target) {
+    return wait_for<void>(client, [&](Client::Done<void> done) { client.symlink(link, target, std::move(done)); });
+}
+
 std::expected<std::vector<Entry>, Status> list(Client& client, std::string_view dir, std::size_t limit) {
     auto handle =
         wait_for<std::string>(client, [&](Client::Done<std::string> done) { client.opendir(dir, std::move(done)); });
@@ -683,6 +794,49 @@ std::expected<void, Status> write_range(Client& client, std::string_view handle,
     }
     if (failed) return std::unexpected(std::move(*failed));
     return {};
+}
+
+std::uint64_t next_copy_piece(std::uint64_t bytes, std::chrono::nanoseconds took, std::chrono::milliseconds budget,
+                              std::uint64_t cap) {
+    cap = std::max<std::uint64_t>(cap, 1);
+    if (budget.count() <= 0 || took.count() <= 0) return cap;
+    // A third of the budget: room for a server that slows down, as a disk shared with others does.
+    const double fits = static_cast<double>(bytes) * (std::chrono::duration<double>(budget).count() / 3) /
+                        std::chrono::duration<double>(took).count();
+    const std::uint64_t n = fits >= static_cast<double>(cap) ? cap : static_cast<std::uint64_t>(fits);
+    return std::min(cap, std::max(n, copy_least_piece));
+}
+
+std::expected<std::uint64_t, Status> copy_range(Client& client, std::string_view from, std::uint64_t from_offset,
+                                                std::uint64_t length, std::string_view to, std::uint64_t to_offset,
+                                                std::chrono::milliseconds budget, const Copied& copied, std::stop_token stop,
+                                                std::uint64_t piece, const Now& now) {
+    if (!client.has_extension(copy_data_extension)) return std::unexpected(not_offered(copy_data_extension));
+    piece = std::max<std::uint64_t>(piece, 1);
+    const Now clock = now ? now : Now([] { return std::chrono::steady_clock::now(); });
+    // The server's pace isn't known yet: a first piece any server should copy within the budget.
+    std::uint64_t next = budget.count() > 0 ? std::min(piece, copy_first_piece) : piece;
+    std::uint64_t done = 0;
+    while (done < length && !stop.stop_requested()) {
+        // Never 0, which would copy up to the file's end.
+        const std::uint64_t n = std::min(next, length - done);
+        const auto started = clock();
+        if (auto r = copy_data(client, from, from_offset + done, n, to, to_offset + done); !r)
+            return std::unexpected(std::move(r.error()));
+        next = next_copy_piece(n, clock() - started, budget, piece);
+        done += n;
+        // Asked once the copy answered, not with it: a server may take requests out of order.
+        auto after = fstat(client, to);
+        if (!after) return std::unexpected(std::move(after.error()));
+        if (!after->size)
+            return std::unexpected(Status{.code = Code::failure, .message = "the server didn't tell the copy's size"});
+        if (*after->size < to_offset + done)
+            return std::unexpected(Status{.code = Code::failure,
+                                          .message = std::format("the server's copy came out short: {} of {} bytes",
+                                                                 *after->size, to_offset + done)});
+        if (copied) copied(done);
+    }
+    return done;
 }
 
 } // namespace grab::sftp

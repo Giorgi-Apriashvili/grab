@@ -126,7 +126,8 @@ bool look_files(Check& check, ssh::Pool& pool, const std::stop_token& stop) {
             for (Asked& a : asked) {
                 if (!a.there || !a.there->is_link()) continue;
                 c.stat(a.raw, [&a](std::expected<sftp::Attrs, sftp::Status> r) {
-                    a.there = r ? *r : sftp::Attrs{.size = {}, .permissions = 0100644, .mtime = {}};
+                    a.there = r ? *r
+                                : sftp::Attrs{.size = {}, .permissions = 0100644, .mtime = {}, .uid = {}, .gid = {}, .atime = {}};
                 });
             }
             while (c.pending() > 0) c.pump();

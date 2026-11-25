@@ -609,7 +609,8 @@ sched::SmallRun send_small(const FolderJob& job, Tree& tree, std::mutex& m, cons
         if (whole) {
             ++s.pending;
             // Some gateways refuse it: the file is placed all the same, with the server's own time.
-            c.fsetstat(s.handle, sftp::Attrs{.size = {}, .permissions = {}, .mtime = mtime32(s.mtime)},
+            c.fsetstat(s.handle,
+                       sftp::Attrs{.size = {}, .permissions = {}, .mtime = mtime32(s.mtime), .uid = {}, .gid = {}, .atime = {}},
                        [&, id](std::expected<void, sftp::Status>) { --slots.at(id).pending; });
         }
         ++s.pending;
