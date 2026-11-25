@@ -290,7 +290,7 @@ Caps caps_of(sftp::Client& client) {
 }
 
 Refusal refusal(sftp::Client& client, const Caps& caps, std::string_view server, std::string_view dir,
-                std::string_view raw_dir, const sftp::Status& status, std::uint64_t needed) {
+                std::string_view raw_dir, const sftp::Status& status, std::uint64_t needed, bool uploading) {
     const std::string where = shown_dir(dir);
     // OpenSSH answers every errno but a few with "Failure" (EROFS, ENOSPC, EDQUOT), and Box.Guest
     // refuses an account that may only read with it too: statvfs tells them apart.
@@ -301,7 +301,8 @@ Refusal refusal(sftp::Client& client, const Caps& caps, std::string_view server,
     const std::string said = util::to_lower(status.message);
     const bool says_read_only = said.find("read-only") != std::string::npos || said.find("read only") != std::string::npos;
     if ((fs && fs->read_only()) || (!fs && status.code == sftp::Code::failure && says_read_only)) {
-        return {.why = std::format("{} is read-only for this account: nothing can be uploaded to {}", server, where),
+        return {.why = uploading ? std::format("{} is read-only for this account: nothing can be uploaded to {}", server, where)
+                                 : std::format("{} is read-only for this account", server),
                 .fatal = true,
                 .scope = Refusal::Scope::server,
                 .kept_temp = false};

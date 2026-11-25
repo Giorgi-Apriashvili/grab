@@ -1244,7 +1244,8 @@ TEST_CASE("upload: the fake's store: sessions share it, and an open handle keeps
     cb.start();
     auto h = sftp::open_file(ca, "/up/f", sftp::OpenFlags::write | sftp::OpenFlags::creat | sftp::OpenFlags::excl);
     REQUIRE(h);
-    auto hb = sftp::open_file(cb, "/up/f", sftp::OpenFlags::write);
+    // Read back below: open for reading too, as a real server reads only such a handle.
+    auto hb = sftp::open_file(cb, "/up/f", sftp::OpenFlags::read | sftp::OpenFlags::write);
     REQUIRE(hb);
     REQUIRE(sftp::write_range(cb, *hb, 3, 3, [](std::uint64_t, std::uint32_t) { return std::string_view("def"); }));
     REQUIRE(sftp::write_range(ca, *h, 0, 3, [](std::uint64_t, std::uint32_t) { return std::string_view("abc"); }));

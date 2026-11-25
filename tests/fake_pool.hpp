@@ -70,6 +70,22 @@ struct FakePool {
     sftp::Code mkdir_existing_as = sftp::Code::failure; // what MKDIR of a name there answers
     std::set<std::string> rename_refused;        // plain RENAMEs to these answer "Permission denied"
     std::atomic<bool> break_after_rename{false}; // the next RENAME/posix-rename, on any session
+    // The server's own copies, owners' names and links (fake_sftp.hpp, SERVER-OPS.md).
+    bool copy_data = false;
+    bool users_groups = false;
+    std::map<std::uint32_t, std::string> user_names;
+    std::map<std::uint32_t, std::string> group_names;
+    std::uint32_t uid = 1000;
+    std::uint32_t gid = 1000;
+    bool symlink_refused = false;
+    std::set<std::string> mounts;                // file systems of their own: no RENAME between them
+    std::function<void(std::uint64_t)> on_copy;  // each copy-data's length, on its session's thread (a pace)
+    bool readdir_follows_links = false;          // READDIR lists a link as what it leads to
+    bool readdir_no_types = false;               // READDIR lists names without a type
+    std::string home;                            // the login folder relative paths are below
+    // An OPEN, STAT or LSTAT of a path it says yes to (on any session, its thread) breaks that
+    // session's connection after it is done, before its reply.
+    std::function<bool(const std::string&)> break_at;
     // With `writable`: told each OPEN's path on every session as it comes, with `store` (its lock
     // held: change it directly), so a test can put a file where an upload is about to go.
     std::function<void(FakeFiles&, const std::string&)> on_open;
@@ -98,6 +114,9 @@ struct FakePool {
                 server.denied = f.denied;
                 server.locked_dirs = f.locked_dirs;
                 server.rename_refused = f.rename_refused;
+                server.user_names = f.user_names;
+                server.group_names = f.group_names;
+                server.mounts = f.mounts;
                 server.listed_size = f.claimed;
                 server.break_on_close = f.break_on_close;
                 if (const auto it = f.slow.find(n); it != f.slow.end()) server.delay = it->second;
@@ -121,6 +140,16 @@ struct FakePool {
             server.no_setstat = f.no_setstat;
             server.mkdir_existing_as = f.mkdir_existing_as;
             server.break_after_rename = &f.break_after_rename;
+            server.copy_data = f.copy_data;
+            server.users_groups = f.users_groups;
+            server.uid = f.uid;
+            server.gid = f.gid;
+            server.symlink_refused = f.symlink_refused;
+            server.readdir_follows_links = f.readdir_follows_links;
+            server.readdir_no_types = f.readdir_no_types;
+            server.home = f.home;
+            if (f.on_copy) server.on_copy = [&f](std::uint64_t length) { f.on_copy(length); };
+            if (f.break_at) server.break_at = [&f](const std::string& path) { return f.break_at(path); };
             if (f.on_open && f.writable) server.on_open = [&f](const std::string& path) { f.on_open(f.store, path); };
             if (f.reads_wait_for_logins > 0) {
                 server.on_read = [&f](const std::string&, std::uint32_t) {

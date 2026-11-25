@@ -118,9 +118,16 @@ inline constexpr std::array<std::string_view, 3> sha1_commands = {"sha1sum", "sh
 // A raw path (from the login folder, or absolute) as md5sum gets it: absolute, after `home`.
 [[nodiscard]] std::string absolute_path(std::string_view home, std::string_view raw);
 
+// Which sum the commands ask for: md5sum's (verification), or sha256sum's (a file's Properties,
+// SERVER-OPS.md decision 6), which GNU coreutils and BusyBox give in the same form with 64 digits.
+// The check (hash_check) is md5sum's: where it works, the shell takes grab's quoting; a server
+// without sha256sum leaves each file unpaired, with its shell's words as the reason.
+enum class Sum { md5, sha256 };
+[[nodiscard]] std::string_view sum_command(Sum sum); // "md5sum", "sha256sum"
+
 // `md5sum [-z] '<path>' ...`: absolute paths (they can't start with '-', so no `--`) as raw bytes
 // in single quotes, which a POSIX shell takes as they are.
-[[nodiscard]] std::string hash_command(std::span<const std::string> paths, bool z);
+[[nodiscard]] std::string hash_command(std::span<const std::string> paths, bool z, Sum sum = Sum::md5);
 
 // What one md5sum command may hold.
 struct BatchLimits {
@@ -145,12 +152,12 @@ struct HashFile {
 // md5sum splits or spells differently can't pair with a name sent beside it. A file whose command
 // alone is longer than limits.command still gets one (run_hashes never sends it).
 [[nodiscard]] std::vector<std::vector<std::size_t>> plan_batches(std::span<const HashFile> files, bool z,
-                                                                 const BatchLimits& limits = {});
+                                                                 const BatchLimits& limits = {}, Sum sum = Sum::md5);
 
 // The most stdout md5sum gives for `paths` (ExecOptions::out_limit, review G168): for each, a
-// digest, two spaces and its end (36 bytes) and the name, twice its length without -z (GNU
-// escapes a backslash and a line break).
-[[nodiscard]] std::uint64_t hash_out_limit(std::span<const std::string> paths, bool z);
+// digest, two spaces and its end (36 bytes; sha256sum's 68) and the name, twice its length without
+// -z (GNU escapes a backslash and a line break).
+[[nodiscard]] std::uint64_t hash_out_limit(std::span<const std::string> paths, bool z, Sum sum = Sum::md5);
 
 // How long a command hashing `bytes` may take: `base` plus the bytes at 10 MiB/s (only a hung
 // server should reach it), and never so long that adding it to a clock overflows (review G166): 30
@@ -166,9 +173,11 @@ struct HashFile {
 // coreutils) undone. A record of another shape, a name not sent or out of order, and the cut end of
 // the output pair with nothing.
 [[nodiscard]] std::vector<std::optional<std::string>> parse_sums_in_order(std::string_view out,
-                                                                         std::span<const std::string> sent, bool z);
+                                                                         std::span<const std::string> sent, bool z,
+                                                                         Sum sum = Sum::md5);
 
 struct HashOptions {
+    Sum sum = Sum::md5;
     std::stop_token stop;
     int connections = 1; // commands at once for this run (its seats), within the pool's hashes_at_once
     // The server as rclone.conf has it: its keys (hash_blocked); on a Storage Box (its host), no name
@@ -185,8 +194,8 @@ struct HashOptions {
     std::function<void(std::span<const std::string> paths, bool z)> on_command;
 };
 
-// The server's MD5 of each of `files`, in their order: hash_blocked, then the pool's check, then
-// md5sum commands (plan_batches) on the pool's connections, each within a hash turn
+// The server's MD5 (or HashOptions::sum's) of each of `files`, in their order: hash_blocked, then
+// the pool's check, then md5sum commands (plan_batches) on the pool's connections, each within a hash turn
 // (Pool::hash_turn), a deadline (hash_deadline) and hash_out_limit. A command refused on a reused
 // connection is tried once on a new login (Pool::acquire_new); one on a reused connection that
 // breaks, on the next. A login that fails ends the run's other commands too, and the pool keeps it

@@ -37,14 +37,16 @@ namespace grab::test {
 
 using namespace std::string_literals;
 
-inline std::string md5_hex(std::string_view bytes) {
+inline std::string digest_hex(std::string_view bytes, const EVP_MD* md) {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
     unsigned int size = 0;
-    REQUIRE(EVP_Digest(bytes.data(), bytes.size(), digest.data(), &size, EVP_md5(), nullptr) == 1);
+    REQUIRE(EVP_Digest(bytes.data(), bytes.size(), digest.data(), &size, md, nullptr) == 1);
     std::string hex;
     for (unsigned int i = 0; i < size; ++i) hex += std::format("{:02x}", digest[i]);
     return hex;
 }
+inline std::string md5_hex(std::string_view bytes) { return digest_hex(bytes, EVP_md5()); }
+inline std::string sha256_hex(std::string_view bytes) { return digest_hex(bytes, EVP_sha256()); }
 
 // The words of a command as a POSIX shell takes them: single quotes, a backslash outside them.
 inline std::vector<std::string> sh_words(std::string_view command) {
@@ -97,6 +99,7 @@ struct Box {
     std::string banner;  // printed before anything (a login shell's banner)
     bool refuse = false; // every command refused (an SFTP-only account)
     bool one_channel = false; // MaxSessions 1: a command's channel refused beside a running SFTP session
+    bool sha256 = true;       // sha256sum there too, as md5sum is
     std::function<void(test::FakeCommand&, std::string_view command)> also;
     std::function<bool(int login, std::string_view command)> lose; // the connection breaks instead
     std::optional<ssh::Error> no_login;                              // logins fail
@@ -106,10 +109,11 @@ struct Box {
     std::vector<std::string> commands;
     std::atomic<int> logins{0}, running{0}, most{0};
 
-    // md5sum as the server runs `command`.
+    // md5sum (or sha256sum) as the server runs `command`.
     void md5sum(test::FakeCommand& c, std::string_view command) const {
         const auto words = shell == Shell::windows ? windows_words(command) : sh_words(command);
-        if (shell == Shell::restricted || words.empty() || words[0] != "md5sum") {
+        const bool sha = !words.empty() && words[0] == "sha256sum" && sha256;
+        if (shell == Shell::restricted || words.empty() || (words[0] != "md5sum" && !sha)) {
             c.err = shell == Shell::restricted ? "Command not found. Use 'help' to get a list of available commands.\n"
                                                : "sh: 1: " + (words.empty() ? ""s : words[0]) + ": not found\n";
             c.status = shell == Shell::restricted ? 8 : 127;
@@ -136,7 +140,8 @@ struct Box {
                 status = 1;
                 continue;
             }
-            const std::string digest = md5_hex(name == "-" ? ""s : f->second);
+            const std::string& bytes = name == "-" ? ""s : f->second;
+            const std::string digest = sha ? sha256_hex(bytes) : md5_hex(bytes);
             if (zz) {
                 out += digest + "  " + name + '\0';
             } else if (escapes && name.find_first_of("\\\n\r") != std::string::npos) {

@@ -80,6 +80,9 @@ public:
     void put(const std::string& key, Answer answer, Stamp stamp, Clock::time_point now = Clock::now());
     // Drops a server's answers (keys start with "<server>\n"): it was saved or removed.
     void forget_server(std::string_view server);
+    // Drops the answers for `path` and every path below it on `server` (grab's form): a file or
+    // folder renamed, moved, replaced or deleted there (SERVER-OPS.md).
+    void forget(std::string_view server, std::string_view path);
     [[nodiscard]] std::size_t bytes() const;
     [[nodiscard]] std::size_t size() const { return kept_.size(); }
 
@@ -113,6 +116,9 @@ public:
         // shown.
         bool ahead = false;
         bool running = false;
+        // Its file changed on the server meanwhile (Previews::forget): its answer, of the file as it
+        // was, goes to its own replies only and is never kept.
+        bool forgotten = false;
         std::vector<Reply> replies;
     };
     struct Request {
@@ -138,6 +144,9 @@ public:
     void stop_all();
     [[nodiscard]] bool ahead(const Job& job) const;
     void forget_server(std::string_view server);
+    // Cache::forget, and every job for those paths leaves the list: what it fetches answers only the
+    // requests that joined it before the change and is never kept, and a new request starts anew.
+    void forget(std::string_view server, std::string_view path);
     [[nodiscard]] std::size_t jobs() const;
     [[nodiscard]] std::size_t cached_bytes() const;
 

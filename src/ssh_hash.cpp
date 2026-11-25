@@ -20,7 +20,9 @@ namespace {
 
 constexpr std::string_view md5_of_nothing = "d41d8cd98f00b204e9800998ecf8427e";
 constexpr std::string_view sha1_of_nothing = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
-constexpr std::size_t md5_digits = 32;
+
+// The hex digits of a sum.
+constexpr std::size_t digits_of(Sum sum) { return sum == Sum::sha256 ? 64 : 32; }
 
 // A probe on `session`, its stdout in `out` (a few records' worth at most).
 std::expected<ExecResult, ExecError> run_probe(Session& session, std::string_view command, const std::stop_token& stop,
@@ -116,7 +118,7 @@ std::optional<HashCheck> ask(Pool& pool, const std::stop_token& stop, Retry retr
 }
 
 // Why `path` (absolute, raw) can't go to the server's shell, if it can't.
-std::optional<HashFailed> unsendable(std::string_view path, bool z, bool storage_box, const BatchLimits& limits) {
+std::optional<HashFailed> unsendable(std::string_view path, bool z, bool storage_box, const BatchLimits& limits, Sum sum) {
     const auto control = [](char c) {
         const auto u = static_cast<unsigned char>(c);
         return u < 0x20 || u == 0x7F;
@@ -137,7 +139,7 @@ std::optional<HashFailed> unsendable(std::string_view path, bool z, bool storage
         return HashFailed{.kind = HashFailure::unsupported, .why = "the name can't be passed to the server's shell"};
     }
     const std::string one(path);
-    if (hash_command(std::span(&one, 1), z).size() > limits.command)
+    if (hash_command(std::span(&one, 1), z, sum).size() > limits.command)
         return HashFailed{.kind = HashFailure::unsupported, .why = "the name is too long to pass to the server's shell"};
     return std::nullopt;
 }
@@ -148,16 +150,16 @@ struct Record {
     std::string name;
 };
 
-std::optional<Record> read_record(std::string_view line, bool z) {
+std::optional<Record> read_record(std::string_view line, bool z, std::size_t digits) {
     const bool escaped = !z && line.starts_with('\\');
     if (escaped) line.remove_prefix(1);
-    if (line.size() <= md5_digits + 2) return std::nullopt;
+    if (line.size() <= digits + 2) return std::nullopt;
     const auto lower_hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); };
-    if (!std::ranges::all_of(line.substr(0, md5_digits), lower_hex) || line[md5_digits] != ' ' ||
-        (line[md5_digits + 1] != ' ' && line[md5_digits + 1] != '*'))
+    if (!std::ranges::all_of(line.substr(0, digits), lower_hex) || line[digits] != ' ' ||
+        (line[digits + 1] != ' ' && line[digits + 1] != '*'))
         return std::nullopt;
-    Record r{.digest = line.substr(0, md5_digits), .name = {}};
-    const std::string_view name = line.substr(md5_digits + 2);
+    Record r{.digest = line.substr(0, digits), .name = {}};
+    const std::string_view name = line.substr(digits + 2);
     if (!escaped) {
         r.name = name;
         return r;
@@ -323,17 +325,20 @@ std::string absolute_path(std::string_view home, std::string_view raw) {
     return path;
 }
 
-std::string hash_command(std::span<const std::string> paths, bool z) {
-    std::string cmd = z ? "md5sum -z" : "md5sum";
+std::string_view sum_command(Sum sum) { return sum == Sum::sha256 ? "sha256sum" : "md5sum"; }
+
+std::string hash_command(std::span<const std::string> paths, bool z, Sum sum) {
+    std::string cmd(sum_command(sum));
+    if (z) cmd += " -z";
     for (const auto& p : paths) cmd += " " + quote::sh_single(p);
     return cmd;
 }
 
-std::vector<std::vector<std::size_t>> plan_batches(std::span<const HashFile> files, bool z, const BatchLimits& limits) {
+std::vector<std::vector<std::size_t>> plan_batches(std::span<const HashFile> files, bool z, const BatchLimits& limits, Sum sum) {
     std::vector<std::size_t> order(files.size());
     std::ranges::iota(order, std::size_t{0});
     std::ranges::stable_sort(order, [&](std::size_t a, std::size_t b) { return files[a].size > files[b].size; });
-    const std::size_t head = hash_command({}, z).size();
+    const std::size_t head = hash_command({}, z, sum).size();
     std::vector<std::vector<std::size_t>> batches;
     std::vector<std::size_t> open; // the command being filled
     std::size_t length = head;
@@ -358,9 +363,9 @@ std::vector<std::vector<std::size_t>> plan_batches(std::span<const HashFile> fil
     return batches;
 }
 
-std::uint64_t hash_out_limit(std::span<const std::string> paths, bool z) {
+std::uint64_t hash_out_limit(std::span<const std::string> paths, bool z, Sum sum) {
     std::uint64_t most = 0;
-    for (const auto& p : paths) most += 36 + (z ? 1 : 2) * std::uint64_t{p.size()};
+    for (const auto& p : paths) most += digits_of(sum) + 4 + (z ? 1 : 2) * std::uint64_t{p.size()};
     return most;
 }
 
@@ -374,14 +379,14 @@ std::chrono::milliseconds hash_deadline(std::uint64_t bytes, std::chrono::millis
 }
 
 std::vector<std::optional<std::string>> parse_sums_in_order(std::string_view out, std::span<const std::string> sent,
-                                                           bool z) {
+                                                           bool z, Sum sum) {
     std::vector<std::optional<std::string>> sums(sent.size());
     const char end = z ? '\0' : '\n';
     std::size_t next = 0; // the first path sent that no record has named or passed
     for (std::size_t at = 0; at < out.size() && next < sent.size();) {
         const std::size_t stop = out.find(end, at);
         if (stop == std::string_view::npos) break; // cut short: not a record
-        const auto record = read_record(out.substr(at, stop - at), z);
+        const auto record = read_record(out.substr(at, stop - at), z, digits_of(sum));
         at = stop + 1;
         if (!record) continue;
         for (std::size_t k = next; k < sent.size(); ++k) {
@@ -430,14 +435,14 @@ std::vector<HashResult> run_hashes(Pool& pool, std::span<const HashFile> files, 
     std::vector<std::size_t> from; // sent[k] is files[from[k]]
     for (std::size_t i = 0; i < files.size(); ++i) {
         std::string path = absolute_path(check->home, files[i].path);
-        if (auto why = unsendable(path, z, storage_box, options.batches)) {
+        if (auto why = unsendable(path, z, storage_box, options.batches, options.sum)) {
             give(i, std::unexpected(std::move(*why)));
             continue;
         }
         sent.push_back(HashFile{.path = std::move(path), .size = files[i].size});
         from.push_back(i);
     }
-    const auto batches = plan_batches(sent, z, options.batches);
+    const auto batches = plan_batches(sent, z, options.batches, options.sum);
 
     auto run_batch = [&](const std::vector<std::size_t>& batch) {
         std::vector<std::string> paths;
@@ -449,12 +454,12 @@ std::vector<HashResult> run_hashes(Pool& pool, std::span<const HashFile> files, 
         auto fail_batch = [&](const HashFailed& why) {
             for (const std::size_t k : batch) give(from[k], std::unexpected(why));
         };
-        const std::string command = hash_command(paths, z);
+        const std::string command = hash_command(paths, z, options.sum);
         std::string out;
         ExecOptions x;
         x.stop = options.stop;
         x.deadline = hash_deadline(bytes, options.deadline);
-        x.out_limit = hash_out_limit(paths, z);
+        x.out_limit = hash_out_limit(paths, z, options.sum);
         x.out = [&](std::string_view piece) {
             out += piece;
             return true;
@@ -524,17 +529,19 @@ std::vector<HashResult> run_hashes(Pool& pool, std::span<const HashFile> files, 
             case ExecFailure::stopped: fail_batch(stopped); break;
             case ExecFailure::deadline: fail_batch(HashFailed{.kind = HashFailure::deadline, .why = "the server took too long"}); break;
             case ExecFailure::too_much:
-                fail_batch(HashFailed{.kind = HashFailure::lost, .why = "the server's md5sum said more than its sums"});
+                fail_batch(HashFailed{.kind = HashFailure::lost,
+                                      .why = std::format("the server's {} said more than its sums", sum_command(options.sum))});
                 break;
             case ExecFailure::refused: fail_batch(HashFailed{.kind = HashFailure::refused, .why = ran.error().message}); break;
             }
             return;
         }
         if (!ran->signal.empty()) {
-            fail_batch(HashFailed{.kind = HashFailure::lost, .why = "md5sum on the server was ended by SIG" + ran->signal});
+            fail_batch(HashFailed{.kind = HashFailure::lost,
+                                  .why = std::format("{} on the server was ended by SIG{}", sum_command(options.sum), ran->signal)});
             return;
         }
-        const auto sums = parse_sums_in_order(out, paths, z);
+        const auto sums = parse_sums_in_order(out, paths, z, options.sum);
         for (std::size_t j = 0; j < batch.size(); ++j) {
             if (sums[j]) {
                 give(from[batch[j]], *sums[j]);

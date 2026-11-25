@@ -123,7 +123,8 @@ struct Caps {
 // `fatal`: trying again can't help. `scope`: what else it holds for: the whole server (read-only,
 // full), every new file in that folder (no write access, no such folder), or this file alone.
 // `kept_temp`: place's "the old X was removed, but the new file couldn't take its name": the temp
-// holds the only copy now, and stays.
+// holds the only copy now, and stays. Without `uploading` (a rename, delete or copy on the server,
+// SERVER-OPS.md), a read-only server is only "<Server> is read-only for this account".
 struct Refusal {
     enum class Scope { file, folder, server };
     std::string why;
@@ -132,7 +133,8 @@ struct Refusal {
     bool kept_temp = false;
 };
 [[nodiscard]] Refusal refusal(sftp::Client& client, const Caps& caps, std::string_view server, std::string_view dir,
-                              std::string_view raw_dir, const sftp::Status& status, std::uint64_t needed);
+                              std::string_view raw_dir, const sftp::Status& status, std::uint64_t needed,
+                              bool uploading = true);
 
 // The window's write check in a server folder before an upload (UPLOADS.md 5.10): a file of its
 // own made exclusively (".grab-probe-<token>"), closed and removed, and what the server offers.

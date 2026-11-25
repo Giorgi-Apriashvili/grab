@@ -155,6 +155,23 @@ void Cache::forget_server(std::string_view server) {
     std::erase_if(kept_, [&](const Kept& k) { return k.key.starts_with(prefix); });
 }
 
+namespace {
+
+// Whether the key `k` is the key `key` or one of a path below it: "<path>/..."; below "/" (or a
+// path ending in '/'): "/...".
+bool at_or_below(std::string_view k, std::string_view key) {
+    if (k == key) return true;
+    if (!k.starts_with(key)) return false;
+    return key.ends_with('/') || (k.size() > key.size() && k[key.size()] == '/');
+}
+
+} // namespace
+
+void Cache::forget(std::string_view server, std::string_view path) {
+    const std::string key = key_of(server, path);
+    std::erase_if(kept_, [&](const Kept& k) { return at_or_below(k.key, key); });
+}
+
 std::size_t Cache::bytes() const {
     std::size_t total = 0;
     for (const auto& k : kept_) total += k.answer.body ? k.answer.body->size() : 0;
@@ -216,7 +233,7 @@ void Previews::end(const std::shared_ptr<Job>& job, const Fetched& fetched) {
         if (const auto it = jobs_.find(job->key); it != jobs_.end() && it->second == job) jobs_.erase(it);
         replies = std::move(job->replies);
         job->replies.clear();
-        if (fetched.keep) cache_.put(job->key, fetched.answer, fetched.stamp);
+        if (fetched.keep && !job->forgotten) cache_.put(job->key, fetched.answer, fetched.stamp);
     }
     for (auto& reply : replies) reply(fetched.answer);
 }
@@ -256,6 +273,20 @@ bool Previews::ahead(const Job& job) const {
 void Previews::forget_server(std::string_view server) {
     std::scoped_lock lock(mutex_);
     cache_.forget_server(server);
+}
+
+void Previews::forget(std::string_view server, std::string_view path) {
+    std::scoped_lock lock(mutex_);
+    cache_.forget(server, path);
+    const std::string key = key_of(server, path);
+    for (auto it = jobs_.begin(); it != jobs_.end();) {
+        if (!at_or_below(it->first, key)) {
+            ++it;
+            continue;
+        }
+        it->second->forgotten = true;
+        it = jobs_.erase(it);
+    }
 }
 
 std::size_t Previews::jobs() const {

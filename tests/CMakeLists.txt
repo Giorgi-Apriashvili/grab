@@ -69,12 +69,14 @@ add_executable(grab_tests
     test_upload.cpp
     test_upload_folder.cpp
     test_upload_check.cpp
+    test_server_files.cpp
     test_queue_row.cpp
     test_folder_grab.cpp
     test_lookup_grab.cpp
     test_live_server.cpp
     test_live_upload.cpp
     test_live_ops.cpp
+    test_live_files.cpp
     test_guard.cpp
     test_notices.cpp
     test_ssh_keys.cpp)
