@@ -2525,7 +2525,10 @@ function askAccount(server, again = false) {
 function onFilesAccount(msg) {
   ops.asking.delete(msg.server);
   if (msg.error) ops.accounts.delete(msg.server); // asked again the next time Browse opens it
-  else ops.accounts.set(msg.server, { readOnly: !!msg.readOnly, free: msg.free ?? null });
+  else {
+    ops.accounts.set(msg.server, { readOnly: !!msg.readOnly, free: msg.free ?? null, home: msg.home || '',
+      copyData: msg.copyData !== false });
+  }
 }
 
 // Why nothing may change on `server`, or '': statvfs says its file system is read-only for this
@@ -2535,15 +2538,49 @@ function readOnlyWhy(server) {
   return a && a.readOnly ? `${server} is read-only for this account` : '';
 }
 
+// `path` (grab's form) as one spelling for its place, as server_files::canonical makes it: below
+// `home` (the login folder's real path) when it doesn't start with '/', its "." and ".." taken away
+// by their names ("a/../x" is "x").
+function serverCanonical(path, home) {
+  const whole = home && !path.startsWith('/') ? serverChild(home, path) : path;
+  const absolute = whole.startsWith('/');
+  const parts = [];
+  for (const part of whole.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..' && parts.length && parts[parts.length - 1] !== '..') parts.pop();
+    else if (part !== '..' || !absolute) parts.push(part); // ".." above "/" is "/"
+  }
+  return (absolute ? '/' : '') + parts.join('/');
+}
+
+// Why `path` of `server` can't be cut, renamed or deleted, or '': the server's top folder, the login
+// folder, or a folder holding the login folder, however each is spelled (the login folder's real
+// path from the account; the backend refuses them too).
+function topWhy(server, path) {
+  const a = ops.accounts.get(server);
+  const home = (a && a.home) || '';
+  const at = serverCanonical(path, home);
+  const login = serverCanonical('', home);
+  if (at === '/') return 'the server’s top folder can’t be renamed, moved or deleted';
+  if (at === login) return 'the login folder can’t be renamed, moved or deleted';
+  if (login.startsWith('/') && login.startsWith(`${at}/`)) return `${baseName(path)} holds the login folder, which can’t be renamed, moved or deleted`;
+  return '';
+}
+
 // Why another change can't start now, or '': one runs (the backend refuses a second too).
 function opsBusyWhy() {
   return ops.running ? `${ops.running.what} is still going: wait until it ends, or cancel it first` : '';
 }
 
-// Why the picked rows can't be cut, renamed or deleted, or '': rows of one server it may change.
+// Why the picked rows can't be cut, renamed or deleted, or '': rows of one server it may change,
+// none of them the login folder, "/" or a folder holding the login folder.
 function changeWhy(picks) {
   if (!picks.length) return 'Pick a file or folder first.';
   if (new Set(picks.map(serverOf)).size > 1) return 'Pick items of one server at a time.';
+  for (const h of picks) {
+    const top = topWhy(serverOf(h), h.path);
+    if (top) return top;
+  }
   return readOnlyWhy(serverOf(picks[0]));
 }
 
@@ -2569,7 +2606,13 @@ function pasteWhy(server) {
       note: 'not yet: copies between servers' };
   }
   const readOnly = readOnlyWhy(server);
-  return readOnly ? { why: readOnly, note: 'read-only' } : null;
+  if (readOnly) return { why: readOnly, note: 'read-only' };
+  // A copy needs the server's copy-data (OpenSSH 9.0 and later); a move is a rename, which any does.
+  const a = ops.accounts.get(server);
+  if (c.op === 'copy' && a && !a.copyData) {
+    return { why: `${server} doesn’t copy files itself (its SSH server is older than OpenSSH 9.0)`, note: 'the server can’t copy' };
+  }
+  return null;
 }
 
 // Cut, Copy, Paste, Rename and Delete for the menu of the rows `picks` (`one`: the only one).

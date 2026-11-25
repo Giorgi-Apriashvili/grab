@@ -203,6 +203,41 @@ TEST_CASE("the window is dark under Dark, light under Light, and as Windows' app
     }
 }
 
+TEST_CASE("the tray: a change to a server's files keeps grab-gui working with its window closed, and is named") {
+    const TrayStatus none;
+    CHECK(tray_tip(none) == "grab");
+    CHECK_FALSE(keeps_running(none));
+    CHECK(quit_question(none).empty());
+    // Downloads, as before.
+    const TrayStatus downloads{.running = 2, .queued = 0, .paused = 1, .bytes = 43, .total = 100, .change = {}};
+    CHECK(tray_tip(downloads) == "grab: 2 downloading, 1 paused, 43%");
+    CHECK(keeps_running(downloads));
+    CHECK(quit_question(downloads) == "Downloads are still running or queued.\n\nCancel them and quit?");
+    CHECK(tray_notice(downloads).title == "grab is still downloading");
+    CHECK(tray_notice(downloads).text ==
+          "The downloads continue in the background, and grab closes when they finish. Click the grab icon to open it again.");
+    // Paused ones alone keep nothing going.
+    const TrayStatus paused{.running = 0, .queued = 0, .paused = 3, .bytes = 0, .total = 0, .change = {}};
+    CHECK(tray_tip(paused) == "grab: 3 paused");
+    CHECK_FALSE(keeps_running(paused));
+    // A copy running after the downloads ended: grab stays until it ends, and says so.
+    const TrayStatus copying{.running = 0, .queued = 0, .paused = 0, .bytes = 0, .total = 0, .change = "Copying holiday"};
+    CHECK(keeps_running(copying));
+    CHECK(tray_tip(copying) == "grab: copying holiday");
+    CHECK(quit_question(copying) == "Copying holiday is still going.\n\nStop it and quit?");
+    CHECK(tray_notice(copying).title == "grab is still working");
+    CHECK(tray_notice(copying).text ==
+          "Copying holiday continues in the background, and grab closes when it ends. Click the grab icon to open it again.");
+    // Both.
+    const TrayStatus both{.running = 1, .queued = 2, .paused = 0, .bytes = 1, .total = 4, .change = "Deleting tv"};
+    CHECK(keeps_running(both));
+    CHECK(tray_tip(both) == "grab: 3 downloading, 25%; deleting tv");
+    CHECK(quit_question(both) == "Downloads are still running or queued, and deleting tv is still going.\n\nStop them and quit?");
+    CHECK(tray_notice(both).text ==
+          "The downloads and deleting tv continue in the background, and grab closes when they finish. Click the grab icon to "
+          "open it again.");
+}
+
 TEST_CASE("each configuration's window has its own WebView2 profile; the default one keeps Default") {
     // The colour scheme is the profile's: one profile for two configurations' windows let one's
     // Appearance change the other's page.

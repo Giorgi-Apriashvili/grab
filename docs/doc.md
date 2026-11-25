@@ -810,7 +810,11 @@ them.
   - Downloads running at that moment continue by themselves in the new version; paused ones
     stay paused.
   - Closing grab (the window with nothing running, Quit in the tray, signing out, an update)
-    saves the queue first and takes a few seconds at most, even while a server doesn't answer.
+    saves the queue first and takes a few seconds at most, even while a server doesn't answer;
+    a copy on a server still going (but for an update or signing out) gets the time to end the
+    piece it is in and clean up, with the window already gone, and what it can't clean up then is
+    removed the next time grab starts (see [Changing files on the server](#changing-files-on-the-server)).
+    Starting grab again meanwhile waits for that and then opens the window.
   - Later hides the banner until the window opens again. Settings → Updates has the daily
     check's switch and "Check now".
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
@@ -834,10 +838,11 @@ them.
 - **The window's page** is grab's own and nothing else: it only shows https://grab.ui/index.html,
   only that page's messages reach grab, and nothing dragged in from outside opens in it (files and
   folders dropped on Browse are uploads, see [Uploading](#uploading)).
-- **Tray:** closing the window while downloads run keeps them going in the notification
-  area, and grab exits by itself when they finish. When the window is idle, closing it
-  quits. A notification reports each finished or failed download while the window isn't in
-  front. Clicking it, or the tray icon, brings the window back.
+- **Tray:** closing the window while downloads or uploads run, or a change on a server (a copy,
+  move or delete from Browse), keeps them going in the notification area, and grab exits by
+  itself when they finish. When the window is idle, closing it quits. A notification reports
+  each finished or failed download while the window isn't in front. Clicking it, or the tray
+  icon, brings the window back.
 - It needs the Microsoft Edge WebView2 Runtime, which ships with Windows 11 and current
   Windows 10. Without it, grab-gui offers the download link.
 - It never prompts for a passphrase, since it has no console: grab's client takes a key file's
@@ -892,10 +897,12 @@ choose so.
     into a folder of the same name there. Each file is copied to a temporary name of grab's
     beside its place (`.name.0a1b2c.grabpart`) and takes its name only when complete; it keeps
     its modified time and permissions (rwx). Links are made again as links pointing where they
-    pointed, never followed; a server that won't make them skips them, saying so. A server
-    without copy-data (an older OpenSSH, such as Ubuntu 22.04's 8.9 or RHEL 9's 8.7) says it
-    "doesn't copy files itself (no copy-data)" and copies nothing; it says so only once Paste
-    has looked at the names taken and asked about them.
+    pointed, never followed; a server that won't make them skips them, saying so. On a server
+    without copy-data (an older OpenSSH, such as Ubuntu 22.04's 8.9 or RHEL 9's 8.7) Paste of
+    what you copied is greyed, saying "Main doesn't copy files itself (its SSH server is older
+    than OpenSSH 9.0)", and Ctrl+V says the same; nothing is looked at or asked. grab learns it
+    when Browse opens the server. A cut still pastes there: a move is a rename, which any server
+    does.
   - A copy cancelled, or ended by a failure, keeps the files it finished and removes its
     temporary files and the folders it made that are still empty.
   - A file copied and pasted in its own folder is a name taken like any other (Keep both makes
@@ -950,13 +957,21 @@ choose so.
     saying which one runs ("Copying holiday is still going: wait until it ends, or cancel it
     first"), over the progress for a few seconds. Properties, Folder size and the checksums
     aren't changes and run beside it.
-  - A change isn't kept over a restart. Quitting grab (or closing the window while no
-    downloads keep grab running in the tray) stops it and gives it only a few seconds to clean
-    up: a copy quit in the middle of a big file can leave that file's temporary
-    `.name.0a1b2c.grabpart` and the empty folders it made, and grab doesn't remove them later.
-  - Closing the window while downloads run keeps grab in the tray and the change going, but
-    only until the downloads end: grab then quits by itself, without asking, and that stops
-    the change as quitting does. Let a long copy or delete end, or cancel it, before quitting.
+  - **Closing the window** while a change runs keeps grab in the tray, as for downloads ("grab
+    is still working: Copying holiday continues in the background…"), and the change goes on;
+    grab quits by itself once it and any downloads have ended, as after the last download. The
+    tray icon names it ("grab: copying holiday"), its notification says how it ended, and the
+    tray's Quit asks first ("Copying holiday is still going. Stop it and quit?").
+  - **Quitting** stops a change, which isn't kept over a restart, with the window already gone:
+    a copy ends the piece of a big file it is in (each piece is sized to take well under the
+    connection's timeout, 30 s unless set), then removes its temporary files and the empty
+    folders it made, and grab waits for that (at most that timeout, two minutes at most, and
+    five seconds more); a rename, move or delete stops between its requests (five seconds at
+    most), and so does a copy when an update closes grab. What a copy cut off couldn't remove
+    (grab ended meanwhile, or was ended, the server out of reach) is remembered with the
+    uploads' leftovers and removed the next time grab starts: its temporary
+    `.name.0a1b2c.grabpart` files, known by their names, and the folders it made, only those
+    still empty (a folder holding a file it finished stays, with the file).
 - **Paths in use are left alone:** a file or folder that a download or upload of that server
   uses (running, queued or paused), or that Play streams, can't be changed or copied, nor a
   folder holding one, nor anything inside a folder being downloaded or uploaded (so a file an
@@ -980,12 +995,18 @@ choose so.
   ran to its end (after a cancelled or refused delete they keep its rows: search again to see
   what is left), and show renamed items by their new names, and the server's file list is fetched again, so later searches find the new names.
   A preview of a changed file is fetched anew.
+- **The login folder and `/` are kept:** the server's top folder (`/`), the login folder and a
+  folder holding the login folder (`/home` for `/home/you`) can't be cut, renamed, moved or
+  deleted, however the path is written or reached (`/home/you` from `/home`, `.`, `/home/./you`,
+  or through a linked folder, as `/home/you` with `/home` a link to `/usr/home`): their
+  entries are greyed, saying why ("the login folder can't be renamed, moved or deleted"), and
+  F2, Del and Ctrl+X say the same; grab refuses them on the server's side too, before sending
+  anything. The login folder and `/` can't be copied either (Paste says so), and
+  nothing is copied or moved into itself under another spelling. A folder inside the login
+  folder is like any other.
 - **Not supported:** copies and moves between servers (not yet), moves onto another file system
   of the server, undoing a change (there is no Ctrl+Z), changing permissions or owners, making
-  links, and changes from the command line (no `grab rm` or `grab mv`). The server's top
-  folder (`/`), and the login folder while it is the open folder, can't be renamed, moved,
-  copied or deleted. Reached by its full path (from `/home`, say) the login folder is a row
-  like any other, so take care with it there.
+  links, and changes from the command line (no `grab rm` or `grab mv`).
 
 ## Configure
 

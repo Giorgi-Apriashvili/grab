@@ -598,7 +598,9 @@ TEST_CASE("live server: the server file operations' engine, printed only (GRAB_T
                                           .pool = pool,
                                           .connections = &connections,
                                           .timeout = t.timeout,
-                                          .on_command = {}},
+                                          .on_command = {},
+                                          .home = {},
+                                          .on_undo = {}},
                  .remote = ctx->remote,
                  .dir = dir};
     const auto started = Clock::now();

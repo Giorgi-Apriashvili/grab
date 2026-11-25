@@ -4,6 +4,7 @@
 // chunk 1) on an in-memory server every login shares (fake_pool.hpp): each one byte-exact, and a
 // snapshot of the whole server showing that nothing else changed.
 
+#include "conn_budget.hpp"
 #include "fake_md5sum.hpp"
 #include "fake_pool.hpp"
 #include "fake_sftp.hpp"
@@ -16,6 +17,7 @@
 #include "ssh_pool.hpp"
 #include "upload.hpp"
 #include "upload_existing.hpp"
+#include "upload_folder.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -81,7 +83,7 @@ struct Server {
     // The pool, made once the test has set the fake's switches (each login takes them as it starts).
     server_files::Where where() {
         if (!pool) pool = fake.pool();
-        return server_files::Where{.server = "Fake", .pool = pool, .connections = &connections, .timeout = 30s, .on_command = {}};
+        return server_files::Where{.server = "Fake", .pool = pool, .connections = &connections, .timeout = 30s, .on_command = {}, .home = {}, .on_undo = {}};
     }
     void folder(const std::string& path, std::uint32_t mode = 0755) {
         std::scoped_lock lock(fake.store.mutex);
@@ -387,6 +389,137 @@ TEST_CASE("server files: rename a file and a folder; a name taken changes nothin
     CHECK(s.snap() == want);
 }
 
+TEST_CASE("server files: the login folder, / and a folder holding the login folder are refused however spelled; one inside it isn't") {
+    Server s;
+    s.fake.home = "/home/u";
+    s.folder("/home");
+    s.folder("/home/u");
+    s.folder("/home/u/d");
+    s.put("/home/u/d/in.txt", "in");
+    s.put("/home/u/x.txt", "x");
+    s.folder("/dst");
+    const Snap before = s.snap();
+    // The login folder's real path given (the window's account), or asked by each change.
+    for (const bool known : {true, false}) {
+        CAPTURE(known);
+        auto w = s.where();
+        if (known) w.home = "/home/u";
+        // Why a rename was refused ("" when it went).
+        const auto rename_why = [&](std::string_view path, std::string_view name) {
+            auto r = server_files::rename(w, path, name);
+            return r ? std::string() : r.error();
+        };
+        const auto refused = [&](const std::string& path, const std::string& name) {
+            CAPTURE(path);
+            const std::vector<std::string> one{path};
+            CHECK(rename_why(path, "v") == std::format("{} can't be renamed", name));
+            CHECK(server_files::remove(w, one).error == std::format("{} can't be deleted", name));
+            CHECK(server_files::move(w, server_files::into(one, "/dst"), Existing::replace).error == std::format("{} can't be moved", name));
+            const auto look = server_files::look(w, server_files::into(one, "/dst"), false);
+            REQUIRE_FALSE(look);
+            CHECK(look.error() == std::format("{} can't be moved", name));
+        };
+        // By its full path from its parent, with "." and "..", from itself.
+        for (const char* p : {"/home/u", "/home/./u", "//home/u", "/home/u/d/../../u", "/home/../home/u", ".", "d/.."}) {
+            refused(p, "the login folder");
+            const std::vector<std::string> one{p};
+            CHECK(server_files::copy(w, server_files::into(one, "/dst"), Existing::ask).error == "the login folder can't be copied");
+        }
+        for (const char* p : {"/", "//", "/home/..", "/..", "/home/u/../.."}) refused(p, "the server's top folder");
+        // A folder holding the login folder goes with it: refused too, with its own words; copied
+        // elsewhere it may be, but never into the login folder (into itself).
+        const std::vector<std::string> home_dir{"/home"};
+        CHECK(rename_why("/home", "h") == "/home holds the login folder, so it can't be renamed");
+        CHECK(server_files::remove(w, home_dir).error == "/home holds the login folder, so it can't be deleted");
+        CHECK(server_files::move(w, server_files::into(home_dir, "/dst"), Existing::ask).error ==
+              "/home holds the login folder, so it can't be moved");
+        CHECK(server_files::copy(w, server_files::into(home_dir, "d"), Existing::ask).error == "home can't be copied into itself");
+        // A folder copied into itself or onto itself under another spelling.
+        const std::vector<std::string> d_abs{"/home/u/d"};
+        CHECK(server_files::copy(w, server_files::into(d_abs, "d/sub"), Existing::ask).error == "d can't be copied into itself");
+        CHECK(server_files::copy(w, server_files::into(d_abs, ""), Existing::keep_both).error == "d can't be copied onto itself");
+        // A rename of the login folder spelled with a / at its end, or ".." at its end.
+        for (const char* p : {"/home/u/", "/home/u/d/..", "./"}) {
+            CAPTURE(p);
+            CHECK(rename_why(p, "v") == "the login folder can't be renamed");
+            CHECK(server_files::remove(w, std::vector<std::string>{p}).error == "the login folder can't be deleted");
+        }
+        CHECK(s.snap() == before);
+    }
+    CHECK(s.requests("RENAME") + s.requests("REMOVE") + s.requests("RMDIR") + s.requests("MKDIR") + s.requests("OPEN") == 0);
+
+    // A folder inside the login folder is an ordinary one, by either spelling.
+    const auto w = s.where();
+    auto r = server_files::rename(w, "/home/u/d", "e");
+    REQUIRE(r);
+    CHECK(r->path == "/home/u/e");
+    r = server_files::rename(w, "e", "d");
+    REQUIRE(r);
+    CHECK(r->path == "d");
+    const std::vector<std::string> x{"/home/u/x.txt"};
+    const auto moved = server_files::move(w, server_files::into(x, "/dst"), Existing::ask);
+    CHECK(moved.error.empty());
+    CHECK(moved.placed[0] == "/dst/x.txt");
+}
+
+TEST_CASE("server files: the login folder reached through a linked folder, or '..' after a link, is refused; a link to it stays a link") {
+    Server s;
+    s.fake.home = "/usr/home/u";
+    s.folder("/usr");
+    s.folder("/usr/home");
+    s.folder("/usr/home/u");
+    s.folder("/usr/home/u/sub");
+    s.put("/usr/home/u/x.txt", "x");
+    s.link("/home", "/usr/home");            // FreeBSD's /home, or one moved to a data disk
+    s.folder("/a");
+    s.link("/a/l", "/usr/home/u/sub");       // "/a/l/.." is the login folder on the server
+    s.folder("/data");
+    s.link("/data/me", "/usr/home/u");       // a link to the login folder
+    s.folder("/dst");
+    const Snap before = s.snap();
+    for (const bool known : {true, false}) {
+        CAPTURE(known);
+        auto w = s.where();
+        if (known) w.home = "/usr/home/u";
+        const auto rename_why = [&](std::string_view path) {
+            auto r = server_files::rename(w, path, "v");
+            return r ? std::string() : r.error();
+        };
+        for (const char* p : {"/home/u", "/a/l/..", "/home/u/sub/.."}) {
+            CAPTURE(p);
+            const std::vector<std::string> one{p};
+            CHECK(rename_why(p) == "the login folder can't be renamed");
+            CHECK(server_files::remove(w, one).error == "the login folder can't be deleted");
+        }
+        // Moved or copied (a name ".." can't go anywhere: into() refuses it before).
+        const std::vector<std::string> one{"/home/u"};
+        CHECK(server_files::move(w, server_files::into(one, "/dst"), Existing::ask).error == "the login folder can't be moved");
+        for (const bool copying : {false, true}) {
+            const auto look = server_files::look(w, server_files::into(one, "/dst"), copying);
+            REQUIRE_FALSE(look);
+            CHECK(look.error() == std::format("the login folder can't be {}", copying ? "copied" : "moved"));
+        }
+        CHECK(server_files::copy(w, server_files::into(one, "/dst"), Existing::ask).error == "the login folder can't be copied");
+        // Its parent reached through the link holds it.
+        const std::vector<std::string> parent{"/home/u/.."};
+        CHECK(server_files::remove(w, parent).error == "/home/u/.. holds the login folder, so it can't be deleted");
+        // A path ending in '/' would act on what a link at its end points to.
+        CHECK(rename_why("/data/me/") == "/data/me/ can't be renamed: name it without the '/' at its end");
+        CHECK(server_files::remove(w, std::vector<std::string>{"/data/me/"}).error ==
+              "/data/me/ can't be deleted: name it without the '/' at its end");
+        CHECK(s.snap() == before);
+    }
+    CHECK(s.requests("RENAME") + s.requests("REMOVE") + s.requests("RMDIR") + s.requests("MKDIR") + s.requests("OPEN") == 0);
+
+    // The link to the login folder is a link of its own: deleted, it goes alone.
+    const auto w = s.where();
+    const auto gone = server_files::remove(w, std::vector<std::string>{"/data/me"});
+    CHECK(gone.error.empty());
+    Snap want = before;
+    drop_link(want, "/data/me");
+    CHECK(s.snap() == want);
+}
+
 TEST_CASE("server files: a new folder; a name taken; a folder gone") {
     Server s;
     s.put("/srv/x", "file");
@@ -439,7 +572,7 @@ TEST_CASE("server files: move into a subfolder; links move as themselves; into i
     test::FakePool fresh;
     fresh.writable = true;
     fetch::Connections c;
-    const server_files::Where none{.server = "Fake", .pool = fresh.pool(), .connections = &c, .timeout = 30s, .on_command = {}};
+    const server_files::Where none{.server = "Fake", .pool = fresh.pool(), .connections = &c, .timeout = 30s, .on_command = {}, .home = {}, .on_undo = {}};
     for (const char* into : {"/srv/into/dir", "/srv/into/dir/x/y"}) {
         CAPTURE(into);
         const std::vector<std::string> one{"/srv/into/dir"};
@@ -606,13 +739,13 @@ TEST_CASE("server files: a move onto itself spelled another way changes nothing;
         CHECK(s.requests("REMOVE") == 0);
         CHECK(s.requests("RENAME") == 0);
         CHECK(s.snap() == before);
-        // The folder d into "/home/u/d": itself.
+        // The folder d into "/home/u/d": itself, seen with the login folder's real path before
+        // anything is sent.
         items = {{.from = "d", .to = "/home/u/d/d", .choice = {}}};
         r = server_files::move(w, items, choice);
-        CHECK(r.error.empty());
-        const Entry* e = find_entry(r, Entry::State::failed, "d");
-        REQUIRE(e != nullptr);
-        CHECK(e->why == "d can't be moved into itself");
+        CHECK(r.error == "d can't be moved into itself");
+        CHECK(r.entries.empty());
+        CHECK(s.requests("RENAME") == 0);
         CHECK(s.snap() == before);
     }
 }
@@ -892,6 +1025,94 @@ TEST_CASE("server files: a copy whose connection is lost leaves no temp and no e
     }
 }
 
+TEST_CASE("server files: a copy tells its temps and folders as they come and go; one cut off leaves them told, and the cleaner removes them") {
+    // What is still made, by the copy's own words: (kind, path).
+    using Told = std::set<std::pair<server_files::Undo::Kind, std::string>>;
+    const auto still = [](const std::vector<server_files::Undo>& told) {
+        Told out;
+        for (const auto& u : told) {
+            if (u.made) out.emplace(u.kind, u.path);
+            else out.erase({u.kind, u.path});
+        }
+        return out;
+    };
+    const auto made_count = [](const std::vector<server_files::Undo>& told, server_files::Undo::Kind kind) {
+        return std::ranges::count_if(told, [&](const server_files::Undo& u) { return u.made && u.kind == kind; });
+    };
+
+    // Run to its end: each temp told as it comes and as it is placed; each folder made, an empty one
+    // too, told and then left to the copy. Nothing still made.
+    Server s;
+    put_many(s, 2, 3);
+    s.folder("/src/many/empty");
+    s.folder("/dst");
+    auto w = s.where();
+    std::vector<server_files::Undo> told;
+    w.on_undo = [&](const server_files::Undo& u) { told.push_back(u); };
+    const std::vector<std::string> picked{"/src/many"};
+    const auto r = server_files::copy(w, server_files::into(picked, "/dst"), Existing::ask);
+    CHECK(r.error.empty());
+    CHECK(r.files == 6);
+    CHECK(made_count(told, server_files::Undo::Kind::temp) == 6);
+    CHECK(made_count(told, server_files::Undo::Kind::folder) == 4);
+    for (const auto& u : told) {
+        if (u.kind == server_files::Undo::Kind::temp) CHECK(upload::is_temp_name(rclone_enc::raw_path(leaf(u.path))));
+    }
+    CHECK(still(told).empty());
+    CHECK(s.snap().dirs.contains("/dst/many/empty")); // the copy's own: never a leftover
+
+    // Cut off: the connection lost while the first files' temps are opened, and no new login for the
+    // cleaning (as when grab quits). The temps and folders it made are still told made: the window
+    // keeps them in uploads.json, and the uploads' cleaner removes them at the next start.
+    Server t;
+    put_many(t, 4, 30);
+    t.folder("/dst");
+    std::atomic<int> opened{0};
+    t.fake.break_at = [&](const std::string& path) {
+        if (!upload::is_temp_name(leaf(path)) || ++opened != 5) return false;
+        t.fake.login_fails = budget::Failure::fatal;
+        return true;
+    };
+    auto tw = t.where();
+    told.clear();
+    tw.on_undo = [&](const server_files::Undo& u) { told.push_back(u); };
+    const Snap before = t.snap();
+    const auto cut = server_files::copy(tw, server_files::into(picked, "/dst"), Existing::ask);
+    CHECK(cut.error.starts_with("the connection to Fake was lost"));
+    const Told left = still(told);
+    REQUIRE_FALSE(t.temps().empty()); // made on the server, not removed
+    for (const auto& temp : t.temps()) CHECK(left.contains({server_files::Undo::Kind::temp, temp}));
+    const Snap after = t.snap();
+    std::size_t new_folders = 0;
+    for (const auto& [path, names] : after.dirs) {
+        if (before.dirs.contains(path)) continue;
+        ++new_folders;
+        CHECK(left.contains({server_files::Undo::Kind::folder, path}));
+    }
+    CHECK(new_folders == 5);
+    upload::Leftovers leftovers;
+    for (const auto& [kind, path] : left) (kind == server_files::Undo::Kind::temp ? leftovers.temps : leftovers.folders).push_back(path);
+    t.fake.login_fails.reset();
+    const auto still_left = upload::clean(*tw.pool, {}, "Fake", leftovers);
+    CHECK(still_left.empty());
+    CHECK(t.temps().empty());
+    CHECK(t.snap() == before);
+}
+
+TEST_CASE("server files: closing waits for a stopped change's copy-data piece, then for its cleanup") {
+    using std::chrono::milliseconds;
+    const std::vector<milliseconds> two{30'000ms, 10'000ms};
+    CHECK(server_files::close_wait(two, false, 5'000ms) == 35'000ms);
+    CHECK(server_files::close_wait(std::vector<milliseconds>{2'000ms}, false, 5'000ms) == 7'000ms);
+    // A long io_timeout (up to 24 h) or none: a hidden grab-gui lingers at most close_piece_most.
+    CHECK(server_files::close_wait(std::vector<milliseconds>{86'400'000ms}, false, 5'000ms) == server_files::close_piece_most + 5'000ms);
+    CHECK(server_files::close_wait(std::vector<milliseconds>{0ms}, false, 5'000ms) == server_files::close_piece_most + 5'000ms);
+    // No copy among the changes (a rename, move or delete stops between requests): the cleanup's time.
+    CHECK(server_files::close_wait(std::vector<milliseconds>{}, false, 5'000ms) == 5'000ms);
+    // An update closing grab-gui ends it soon after: the cleanup's time only.
+    CHECK(server_files::close_wait(two, true, 5'000ms) == 5'000ms);
+}
+
 TEST_CASE("server files: a copy that fills the server ends, its temps and its empty folders removed") {
     Server s;
     put_many(s, 4, 30, 1000);
@@ -1103,9 +1324,27 @@ TEST_CASE("server files: links on a server that makes none are skipped with the 
     Server none;
     none.fake.copy_data = false;
     none.put("/srv/a", "a");
+    none.folder("/srv/b");
     const auto nw = none.where();
     const std::vector<std::string> a{"/srv/a"};
-    CHECK(server_files::copy(nw, server_files::into(a, "/srv/b"), Existing::ask).error == "Fake doesn't copy files itself (no copy-data)");
+    const std::string said = "Fake doesn't copy files itself (its SSH server is older than OpenSSH 9.0)";
+    CHECK(server_files::no_copy_data("Fake") == said);
+    const Snap before = none.snap();
+    CHECK(server_files::copy(nw, server_files::into(a, "/srv/b"), Existing::ask).error == said);
+    // The paste's look says it before anything is looked at, so no question comes first; a move
+    // (a rename) is looked at and goes as anywhere.
+    const auto look = server_files::look(nw, server_files::into(a, "/srv/b"), true);
+    REQUIRE_FALSE(look);
+    CHECK(look.error() == said);
+    CHECK(none.requests("LSTAT") + none.requests("STAT") + none.requests("OPENDIR") == 0);
+    CHECK(none.snap() == before);
+    CHECK(server_files::look(nw, server_files::into(a, "/srv/b"), false));
+    CHECK(server_files::move(nw, server_files::into(a, "/srv/b"), Existing::ask).placed[0] == "/srv/b/a");
+    // The account says so for the window's menus.
+    const auto account = server_files::account(nw);
+    REQUIRE(account);
+    CHECK_FALSE(account->copy_data);
+    CHECK(server_files::account(s.where())->copy_data);
 }
 
 // ---- delete ----------------------------------------------------------------------------------------------
@@ -1268,7 +1507,7 @@ TEST_CASE("server files: a folder's size, never through a link; MD5 and SHA-256 
     test::Box box;
     box.files["/home/test/movie.mkv"] = "the film";
     box.files["/srv/abs.txt"] = "absolute";
-    const server_files::Where bw{.server = "Box", .pool = box.pool(), .connections = nullptr, .timeout = 30s, .on_command = {}};
+    const server_files::Where bw{.server = "Box", .pool = box.pool(), .connections = nullptr, .timeout = 30s, .on_command = {}, .home = {}, .on_undo = {}};
     CHECK(server_files::hash(bw, {}, "movie.mkv", 8, ssh::Sum::md5) == test::md5_hex("the film"));
     CHECK(server_files::hash(bw, {}, "movie.mkv", 8, ssh::Sum::sha256) == test::sha256_hex("the film"));
     CHECK(server_files::hash(bw, {}, "/srv/abs.txt", 8, ssh::Sum::sha256) == test::sha256_hex("absolute"));
@@ -1348,7 +1587,7 @@ TEST_CASE("server files: the account the window keeps: the login folder's real p
     CHECK_FALSE(a->read_only);
     CHECK_FALSE(a->free);
     // No connection: the error.
-    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}};
+    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}, .home = {}, .on_undo = {}};
     CHECK(server_files::account(none).error() == "no connection to Gone");
 }
 
@@ -1376,7 +1615,7 @@ TEST_CASE("server files: each path with its folder's real path, a link kept as i
     CHECK(server_files::busy_refusal(busy, deleting, "Fake", "/home/u") ==
           "Fake:/data/media holds /data/media/a.mkv, which is being downloaded: wait until it ends, or cancel it first");
     // No connection: each as given.
-    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}};
+    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}, .home = {}, .on_undo = {}};
     CHECK(server_files::resolved(none, paths) == paths);
 }
 
@@ -1415,7 +1654,7 @@ TEST_CASE("server files: each path REALPATHed whole, a busy link's target covere
     CHECK(server_files::busy_refusal(playing, std::vector<std::string>{"/data/f.txt"}, "Fake", "/home/u").has_value());
     CHECK(s.snap() == before);
     // No connection: each as given.
-    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}};
+    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}, .home = {}, .on_undo = {}};
     CHECK(server_files::followed(none, paths) == paths);
 }
 

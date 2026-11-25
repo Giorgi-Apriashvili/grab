@@ -10,6 +10,7 @@
 #include "browse.hpp"
 #include "engine.hpp"
 #include "file_list.hpp"
+#include "gui_state.hpp"
 #include "json.hpp"
 #include "rclone_encoding.hpp"
 #include "server_files.hpp"
@@ -219,9 +220,18 @@ void App::start_files_task(int token, bool change, std::string what, std::functi
             // The thread holds no share of its task: files_tasks_ keeps it until the thread is joined.
             FilesTask* const raw = t.get();
             files_tasks_.push_back(t);
-            t->thread = std::jthread([raw, run = std::move(run)](const std::stop_token& stop) {
+            t->thread = std::jthread([this, raw, run = std::move(run)](const std::stop_token& stop) {
                 run(stop);
+                // A change's end, for the tray: read before `over`, after which the task may go (its
+                // erase joins this thread under files_mutex_).
+                std::optional<std::pair<bool, std::string>> ended;
+                if (raw->change) {
+                    std::scoped_lock done_lock(files_mutex_);
+                    ended.emplace(raw->ok, raw->said);
+                }
+                const std::string what = raw->what;
                 raw->over = true;
+                if (ended && !files_closing_ && host_.on_change_ended) host_.on_change_ended(what, ended->first, ended->second);
             });
             return;
         }
@@ -233,11 +243,87 @@ void App::start_files_task(int token, bool change, std::string what, std::functi
     post(v);
 }
 
-void App::files_answered(int token) {
+void App::files_answered(int token, const Value& v) {
+    // In a few words: "Done", "Done; 2 skipped, 1 failed", the error, the name taken, "Cancelled".
+    const auto error = v.string_of("error");
+    const auto taken = v.string_of("taken");
+    const bool stopped = bool_of(v, "stopped");
+    const int skipped = int_of(v, "skipped");
+    const int failed = int_of(v, "failed");
+    std::string said;
+    if (error) said = *error;
+    else if (taken) said = *taken;
+    else if (stopped) said = "Cancelled";
+    else {
+        said = "Done";
+        std::vector<std::string> counts;
+        if (skipped > 0) counts.push_back(std::format("{} skipped", skipped));
+        if (failed > 0) counts.push_back(std::format("{} failed", failed));
+        if (!counts.empty()) said += "; " + util::join(counts, ", ");
+    }
     std::scoped_lock lock(files_mutex_);
     for (const auto& t : files_tasks_) {
-        if (t->change && t->token == token) t->answered = true;
+        if (!t->change || t->token != token) continue;
+        t->answered = true;
+        t->ok = !error && !taken && !stopped && failed == 0;
+        t->said = said;
     }
+}
+
+void App::files_copying(int token, std::chrono::milliseconds timeout) {
+    std::scoped_lock lock(files_mutex_);
+    for (const auto& t : files_tasks_) {
+        if (t->token != token) continue;
+        t->copying = true;
+        t->timeout = timeout;
+    }
+}
+
+std::string App::running_change() const {
+    std::scoped_lock lock(files_mutex_);
+    for (const auto& t : files_tasks_) {
+        if (t->change && !t->over) return t->what;
+    }
+    return {};
+}
+
+void App::files_undo(int token, const std::string& server, const server_files::Undo& u) {
+    {
+        std::lock_guard lock(mutex_);
+        auto& r = copy_undo_[token];
+        r.server = server;
+        auto& paths = u.kind == server_files::Undo::Kind::temp ? r.temps : r.folders;
+        if (u.made) paths.insert(u.path);
+        else paths.erase(u.path);
+    }
+    // Saved soon, so even a grab killed meanwhile leaves the next start what to undo.
+    if (u.made) request_save();
+}
+
+void App::files_undo_over(int token) {
+    std::string server;
+    bool left = false;
+    {
+        std::lock_guard lock(mutex_);
+        const auto it = copy_undo_.find(token);
+        if (it == copy_undo_.end()) return;
+        server = it->second.server;
+        const auto add = [&](std::string_view kind, const std::set<std::string>& paths) {
+            for (const auto& p : paths) {
+                SavedLeftover l{.server = server, .kind = std::string(kind), .path = p};
+                if (std::ranges::find(leftovers_, l) == leftovers_.end()) leftovers_.push_back(std::move(l));
+                left = true;
+            }
+        };
+        add("temp", it->second.temps);
+        add("folder", it->second.folders);
+        copy_undo_.erase(it);
+    }
+    // At once: an empty folder a finished copy made is its own, and mustn't look like a leftover.
+    request_save(true);
+    // The cleaner tries them now; not while the window closes (its members may be going: they
+    // wait in uploads.json for the next start).
+    if (left && !files_closing_) wake_cleaner(server);
 }
 
 std::expected<App::FilesServer, std::string> App::files_server(const std::string& server) {
@@ -250,7 +336,9 @@ std::expected<App::FilesServer, std::string> App::files_server(const std::string
                                                     .pool = pools_.get(server, *target, connections_.budget(server)),
                                                     .connections = &connections_,
                                                     .timeout = target->timeout,
-                                                    .on_command = {}},
+                                                    .on_command = {},
+                                                    .home = {},
+                                                    .on_undo = {}},
                        .remote = ctx->remote};
 }
 
@@ -279,6 +367,10 @@ void App::post_account(const std::string& server, const std::expected<server_fil
     } else {
         v.set("readOnly", Value::make_bool(account->read_only));
         if (account->free) v.set("free", num(static_cast<double>(*account->free)));
+        // The login folder's real path (the menus grey it however it is spelled), and whether a
+        // copy can be pasted there.
+        v.set("home", str(account->home));
+        v.set("copyData", Value::make_bool(account->copy_data));
     }
     post(v);
 }
@@ -441,19 +533,24 @@ void App::files_message(const std::string& type, const Value& msg) {
         FilesServer fs;
         std::string home;
     };
-    const auto begin = [this, server](Value& v, const std::stop_token& stop) -> std::optional<Begun> {
+    const auto begin = [this, server, token](Value& v, const std::stop_token& stop) -> std::optional<Begun> {
         auto fs = files_server(server);
         if (!fs) {
             v.set("error", str(fs.error()));
+            files_answered(token, v);
             post(v);
             return std::nullopt;
         }
-        // Not known (the account couldn't be asked): only the spellings given compare.
+        // Not known (the account couldn't be asked): only the spellings given compare, and each
+        // change asks the server for the login folder itself.
         auto account = files_account(server, *fs, stop, false);
-        return Begun{.fs = std::move(*fs), .home = account ? account->home : std::string()};
+        std::string home = account ? account->home : std::string();
+        fs->where.home = home;
+        return Begun{.fs = std::move(*fs), .home = std::move(home)};
     };
-    const auto fail = [this](Value& v, const std::string& why) {
+    const auto fail = [this, token](Value& v, const std::string& why) {
         v.set("error", str(why));
+        files_answered(token, v);
         post(v);
     };
 
@@ -476,11 +573,12 @@ void App::files_message(const std::string& type, const Value& msg) {
             if (!r) return fail(v, r.error());
             if (r->taken) {
                 v.set("taken", str(r->why));
+                files_answered(token, v);
                 return post(v);
             }
             v.set("ok", Value::make_bool(true));
             v.set("path", str(r->path));
-            files_answered(token);
+            files_answered(token, v);
             post(v);
             if (rename && r->path == path) return; // the same name: nothing changed
             server_files::Changed changed;
@@ -513,13 +611,16 @@ void App::files_message(const std::string& type, const Value& msg) {
             Value v = done_of(token, paste ? (copying ? "copy" : "move") : "look");
             const auto b = begin(v, stop);
             if (!b) return;
+            server_files::Where where = b->fs.where;
+            // A copy's temps and folders kept as it goes, so one cut off midway is undone later.
+            if (paste && copying) where.on_undo = [this, token, server](const server_files::Undo& u) { files_undo(token, server, u); };
             const auto items = server_files::into(paths, dir);
             std::vector<std::string> touched = paths;
             for (const auto& it : items) touched.push_back(it.to);
             std::vector<std::string> real;
             if (auto why = files_busy(b->fs, b->home, touched, real, stop)) return fail(v, *why);
             if (!paste) {
-                auto l = server_files::look(b->fs.where, items, copying, stop);
+                auto l = server_files::look(where, items, copying, stop);
                 if (stop.stop_requested()) { // Cancel: the footer's line waits for the word
                     v.set("stopped", Value::make_bool(true));
                     return post(v);
@@ -546,9 +647,13 @@ void App::files_message(const std::string& type, const Value& msg) {
                 shown = at;
                 post(progress_of(token, p));
             };
+            // Quitting from here on waits for the copy-data piece a copy is in (App::close).
+            if (copying) files_copying(token, where.timeout);
+            // What an earlier copy left there, being removed by the cleaner now: after it, as an
+            // upload waits, so nothing pasted is what it removes.
+            wait_for_cleaner(server, stop);
             const auto run = [&](std::span<const server_files::Item> some, upload::Existing choice) {
-                return copying ? server_files::copy(b->fs.where, some, choice, progress, stop)
-                               : server_files::move(b->fs.where, some, choice, stop);
+                return copying ? server_files::copy(where, some, choice, progress, stop) : server_files::move(where, some, choice, stop);
             };
             // The files the question listed with a choice of their own: the rest first, each name
             // taken left as it is (Ask); then those, each with its own choice or the one for all.
@@ -586,13 +691,15 @@ void App::files_message(const std::string& type, const Value& msg) {
                     r.error = more.error;
                 }
             }
+            // What the copy couldn't undo (its connection lost twice) to the leftovers.
+            if (copying) files_undo_over(token);
             set_report(v, r);
             if (!copying) {
                 Value gone = Value::make_array();
                 for (const auto& m : moved) gone.push(str(m));
                 v.set("moved", std::move(gone));
             }
-            files_answered(token);
+            files_answered(token, v);
             post(v);
             // What it changed: the moved ones' old places, every new one (a stopped copy's
             // folders too: Browse lists them live either way). Only those that moved leave the
@@ -668,7 +775,7 @@ void App::files_message(const std::string& type, const Value& msg) {
                 post(progress_of(token, p));
             }, stop);
             set_report(v, r);
-            files_answered(token);
+            files_answered(token, v);
             post(v);
             server_files::Changed changed;
             changed.from = paths;

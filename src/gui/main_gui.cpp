@@ -6,6 +6,7 @@
 #include "preview_jobs.hpp"
 #include "process.hpp"
 #include "schedule.hpp"
+#include "server_files.hpp"
 #include "tray.hpp"
 #include "update.hpp"
 #include "util.hpp"
@@ -49,6 +50,14 @@ constexpr UINT_PTR timer_exit = 2;        // fallback exit when a notification n
 constexpr UINT_PTR timer_flush = 3;       // every 250 ms: the queue's changes to the page (App::flush)
 constexpr UINT id_show = 1;               // tray menu
 constexpr UINT id_quit = 2;
+// The slot's value while its window is closing: this bit and the closing process's id, so a second
+// launch meanwhile waits for it to end and then starts, instead of showing a window about to go.
+// A window handle never has it (handles fit in 32 bits).
+constexpr std::uint64_t slot_closing = std::uint64_t{1} << 63;
+// The longest a closing window takes: a stopped copy's piece and cleanup (App::close, at most
+// close_piece_most and 5 s), then update::gui_exit_deadline, and a margin.
+constexpr auto closing_most = server_files::close_piece_most + std::chrono::seconds(5) + update::gui_exit_deadline +
+                              std::chrono::seconds(10);
 
 struct Globals {
     HWND hwnd = nullptr;
@@ -61,15 +70,19 @@ struct Globals {
     bool in_tray = false;         // closed while downloads ran: hidden, not quit
     bool exit_after_notice = false; // the queue drained in the tray: quit once the toast is gone
     std::uint64_t last_notice = 0;  // GetTickCount64() of the last notification
+    std::uint64_t* published = nullptr; // the instance slot (wWinMain): this window, or slot_closing
 } g;
 
 // Ignore "notification gone" events this soon after showing one: they belong to the
 // notification it replaced, and the new one has not been seen yet.
 constexpr std::uint64_t notice_min_ms = 2000;
 
+// Downloads or uploads running or queued, or a change to a server's files still going: closing
+// the window leaves grab-gui working in the tray, and it leaves by itself once none is left.
+bool keeps_running() { return g.app && grab::keeps_running(g.app->tray_status()); }
+
 bool may_exit_now() {
-    return g.exit_after_notice && g.in_tray && g.app && !g.app->downloads_active() &&
-           GetTickCount64() - g.last_notice >= notice_min_ms;
+    return g.exit_after_notice && g.in_tray && g.app && !keeps_running() && GetTickCount64() - g.last_notice >= notice_min_ms;
 }
 
 void notify(std::wstring_view title, std::wstring_view text, bool error) {
@@ -177,22 +190,20 @@ void end_by_deadline() {
 // take moments (RCLONE-REPLACEMENT.md, Phase 9 chunk E).
 void quit(HWND hwnd) {
     if (!g.in_tray) remember_placement(hwnd);
+    // A launch from now on waits for this process to end rather than asking a window that is going.
+    if (g.published != nullptr) *g.published = slot_closing | GetCurrentProcessId();
+    // A change to a server's files stopped by this may take its copy-data piece's time to end and
+    // clean up (App::close): the window goes first, so nothing looks stuck meanwhile.
+    if (g.app && !g.app->running_change().empty()) ShowWindow(hwnd, SW_HIDE);
     if (g.app) g.app->close();
     end_by_deadline();
     DestroyWindow(hwnd);
 }
 
-// "grab" or "grab: 2 downloading, 43%".
+// "grab", "grab: 2 downloading, 43%", "grab: copying holiday" (gui_state's tray_tip).
 std::wstring tray_tip() {
     if (!g.app) return L"grab";
-    const auto s = g.app->summary();
-    const int active = s.running + s.queued;
-    if (active == 0 && s.paused == 0) return L"grab";
-    std::wstring tip = L"grab:";
-    if (active > 0) tip += L" " + std::to_wstring(active) + L" downloading";
-    if (s.paused > 0) tip += std::wstring(active > 0 ? L"," : L"") + L" " + std::to_wstring(s.paused) + L" paused";
-    if (s.total > 0) tip += L", " + std::to_wstring(s.bytes * 100 / s.total) + L"%";
-    return tip;
+    return util::to_wide(grab::tray_tip(g.app->tray_status()));
 }
 
 void refresh_tray_tip() {
@@ -201,6 +212,14 @@ void refresh_tray_tip() {
         g.tip = tip;
         g.tray.set_tip(g.tip);
     }
+}
+
+// Everything is done while the window is closed: leave once the notification has been seen, or
+// after a minute if Windows never reports back (e.g. do not disturb).
+void leave_when_done(HWND hwnd) {
+    if (!g.in_tray || !g.app || keeps_running()) return;
+    g.exit_after_notice = true;
+    SetTimer(hwnd, timer_exit, 60'000, nullptr);
 }
 
 // UI thread: a download finished or failed.
@@ -212,12 +231,15 @@ void on_download_finished(HWND hwnd, const std::string& name, bool ok, const std
         notify(title, ok ? wname : wname + L"\n" + util::to_wide(error), !ok);
     }
     refresh_tray_tip();
-    if (g.in_tray && g.app && !g.app->downloads_active()) {
-        // Everything is done while the window is closed: leave once the notification has
-        // been seen, or after a minute if Windows never reports back (e.g. do not disturb).
-        g.exit_after_notice = true;
-        SetTimer(hwnd, timer_exit, 60'000, nullptr);
-    }
+    leave_when_done(hwnd);
+}
+
+// UI thread: a change to a server's files from Browse ended. In the tray it says so, and grab
+// leaves once nothing else keeps it there, as after the last download.
+void on_change_finished(HWND hwnd, const std::string& what, bool ok, const std::string& said) {
+    if (g.in_tray) notify(ok ? L"Done" : L"Failed", util::to_wide(said.empty() ? what : what + "\n" + said), !ok);
+    refresh_tray_tip();
+    leave_when_done(hwnd);
 }
 
 void show_tray_menu(HWND hwnd, POINT at) {
@@ -233,9 +255,9 @@ void show_tray_menu(HWND hwnd, POINT at) {
     if (cmd == id_show) {
         show_window(hwnd);
     } else if (cmd == id_quit) {
-        if (g.app && g.app->downloads_active() &&
-            MessageBoxW(hwnd, L"Downloads are still running or queued.\n\nCancel them and quit?", L"grab",
-                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        const std::string question = g.app ? grab::quit_question(g.app->tray_status()) : std::string();
+        if (!question.empty() &&
+            MessageBoxW(hwnd, util::to_wide(question).c_str(), L"grab", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
             return;
         }
         quit(hwnd);
@@ -338,16 +360,15 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         return 0;
     }
     case WM_CLOSE:
-        if (g.app && g.app->downloads_active()) {
-            // Downloads keep going in the tray; grab leaves by itself when they are done.
+        if (keeps_running()) {
+            // Downloads, uploads and a change to a server's files keep going in the tray; grab
+            // leaves by itself when they are done.
             remember_placement(hwnd);
             ShowWindow(hwnd, SW_HIDE);
             if (!g.in_tray) {
                 g.in_tray = true;
-                notify(L"grab is still downloading",
-                       L"The downloads continue in the background, and grab closes when they finish. "
-                       L"Click the grab icon to open it again.",
-                       false);
+                const auto notice = grab::tray_notice(g.app->tray_status());
+                notify(util::to_wide(notice.title), util::to_wide(notice.text), false);
             }
             return 0;
         }
@@ -359,7 +380,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
-        if (wparam) quit(hwnd);
+        if (wparam) {
+            if (g.app) g.app->will_end_session();
+            quit(hwnd);
+        }
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, timer_tray);
@@ -504,8 +528,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     auto* published = slot != nullptr
                           ? static_cast<std::uint64_t*>(MapViewOfFile(slot, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(std::uint64_t)))
                           : nullptr;
+    // The window there is closing (quit: a stopped copy may take up to its piece's time): wait for
+    // that process to end, then start here, as after a restart.
+    if (already_running && published != nullptr && (*published & slot_closing) != 0) {
+        const auto pid = static_cast<DWORD>(*published & 0xffff'ffffU);
+        if (HANDLE old = OpenProcess(SYNCHRONIZE, FALSE, pid); old != nullptr) {
+            const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(closing_most);
+            WaitForSingleObject(old, static_cast<DWORD>(wait.count()));
+            CloseHandle(old);
+        }
+        const DWORD waited = WaitForSingleObject(mutex, 5000);
+        already_running = waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED;
+    }
     if (already_running) {
-        if (published != nullptr && *published != 0) {
+        if (published != nullptr && *published != 0 && (*published & slot_closing) == 0) {
             HWND existing = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(*published));
             DWORD pid = 0;
             GetWindowThreadProcessId(existing, &pid);
@@ -544,6 +580,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
                              initial.height, nullptr, nullptr, instance, nullptr);
     if (g.hwnd == nullptr) return 1;
     if (published != nullptr) *published = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(g.hwnd));
+    g.published = published;
 
     gui::App::Host host;
     host.hwnd = g.hwnd;
@@ -558,6 +595,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     host.on_finished = [defer = host.defer](const std::string& name, bool ok, const std::string& error, bool up) {
         defer([name, ok, error, up] {
             if (g.hwnd != nullptr) on_download_finished(g.hwnd, name, ok, error, up);
+        });
+    };
+    host.on_change_ended = [defer = host.defer](const std::string& what, bool ok, const std::string& said) {
+        defer([what, ok, said] {
+            if (g.hwnd != nullptr) on_change_finished(g.hwnd, what, ok, said);
         });
     };
     // Posted: App's teardown must not run inside the App call that asked for it (review G138).
@@ -626,6 +668,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
         DispatchMessageW(&msg);
     }
     CoUninitialize();
+    g.published = nullptr;
     if (published != nullptr) UnmapViewOfFile(published);
     if (slot != nullptr) CloseHandle(slot);
     if (mutex != nullptr) CloseHandle(mutex);

@@ -132,6 +132,32 @@ struct GuiState {
 // AppsUseLightTheme) or not: Light and Dark hold it, anything else is Auto and follows Windows.
 [[nodiscard]] bool theme_is_dark(std::string_view theme, bool windows_dark);
 
+// What the tray icon follows: the downloads and uploads running, queued and paused, the bytes done
+// of the known sizes of those running and queued, and a change to a server's files from Browse still
+// going, by its words ("Copying holiday"; empty: none).
+struct TrayStatus {
+    int running = 0;
+    int queued = 0;
+    int paused = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t total = 0;
+    std::string change;
+};
+// The tray icon's tooltip: "grab", "grab: 2 downloading, 1 paused, 43%", "grab: copying holiday",
+// "grab: 2 downloading, 43%; copying holiday".
+[[nodiscard]] std::string tray_tip(const TrayStatus& s);
+// Whether grab-gui keeps working with its window closed (hidden in the tray, leaving by itself once
+// this turns false): downloads or uploads running or queued, or a change still going.
+[[nodiscard]] bool keeps_running(const TrayStatus& s);
+// The tray's Quit asks this first while something keeps grab-gui running (empty: nothing does).
+[[nodiscard]] std::string quit_question(const TrayStatus& s);
+// What the notification says when closing the window hides grab-gui in the tray.
+struct TrayNotice {
+    std::string title;
+    std::string text;
+};
+[[nodiscard]] TrayNotice tray_notice(const TrayStatus& s);
+
 // Where the window keeps gui.json, queue.json and recent for the configuration at `grab_conf`:
 // <config>/grab for the default one, <config>/grab/configs/<config_folder_name> for any other
 // (GRAB_CONFIG, --config), so two configurations' windows never share a queue (review G35).

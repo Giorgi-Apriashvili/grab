@@ -265,6 +265,59 @@ bool theme_is_dark(std::string_view theme, bool windows_dark) {
     return windows_dark;
 }
 
+namespace {
+
+// A change's words in the middle of a sentence: "copying holiday".
+std::string mid_sentence(std::string_view words) {
+    std::string out(words);
+    if (!out.empty() && out[0] >= 'A' && out[0] <= 'Z') out[0] = static_cast<char>(out[0] - 'A' + 'a');
+    return out;
+}
+
+bool transfers_active(const TrayStatus& s) { return s.running + s.queued > 0; }
+
+} // namespace
+
+std::string tray_tip(const TrayStatus& s) {
+    const int active = s.running + s.queued;
+    std::string transfers;
+    if (active > 0) transfers += std::format(" {} downloading", active);
+    if (s.paused > 0) transfers += std::format("{} {} paused", active > 0 ? "," : "", s.paused);
+    if (!transfers.empty() && s.total > 0) transfers += std::format(", {}%", s.bytes * 100 / s.total);
+    if (transfers.empty() && s.change.empty()) return "grab";
+    if (s.change.empty()) return "grab:" + transfers;
+    if (transfers.empty()) return std::format("grab: {}", mid_sentence(s.change));
+    return std::format("grab:{}; {}", transfers, mid_sentence(s.change));
+}
+
+bool keeps_running(const TrayStatus& s) { return transfers_active(s) || !s.change.empty(); }
+
+std::string quit_question(const TrayStatus& s) {
+    if (transfers_active(s) && !s.change.empty()) {
+        return std::format("Downloads are still running or queued, and {} is still going.\n\nStop them and quit?",
+                           mid_sentence(s.change));
+    }
+    if (transfers_active(s)) return "Downloads are still running or queued.\n\nCancel them and quit?";
+    if (!s.change.empty()) return std::format("{} is still going.\n\nStop it and quit?", s.change);
+    return {};
+}
+
+TrayNotice tray_notice(const TrayStatus& s) {
+    constexpr std::string_view again = "Click the grab icon to open it again.";
+    if (transfers_active(s) && !s.change.empty()) {
+        return TrayNotice{.title = "grab is still downloading",
+                          .text = std::format("The downloads and {} continue in the background, and grab closes when they "
+                                              "finish. {}",
+                                              mid_sentence(s.change), again)};
+    }
+    if (!s.change.empty()) {
+        return TrayNotice{.title = "grab is still working",
+                          .text = std::format("{} continues in the background, and grab closes when it ends. {}", s.change, again)};
+    }
+    return TrayNotice{.title = "grab is still downloading",
+                      .text = std::format("The downloads continue in the background, and grab closes when they finish. {}", again)};
+}
+
 GuiState parse_gui_state(std::string_view json_text) {
     const auto doc = json::parse(json_text);
     return gui_state_from(doc ? &*doc : nullptr);

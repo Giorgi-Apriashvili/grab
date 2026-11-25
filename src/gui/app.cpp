@@ -88,8 +88,9 @@ using json::Value;
 constexpr std::size_t files_chunk = 5000;
 // queue.json is saved at most this often while downloads change it (DOWNLOADS-UI.md 6.5).
 constexpr auto queue_save_gap = std::chrono::seconds(2);
-// How long closing waits for a copy or delete it stopped to remove what it made (its temps, the
-// empty folders it made) before every connection is cut.
+// How long closing waits for a change it stopped to end, and a copy to remove what it made (its
+// temps, the empty folders it made) once the copy-data piece it was in has ended
+// (server_files::close_wait), before every connection is cut.
 constexpr auto files_close_wait = std::chrono::seconds(5);
 
 Value str(std::string s) { return Value::make_string(std::move(s)); }
@@ -350,18 +351,37 @@ void App::close() {
     }
     for (auto& w : workers_) w.request_stop();
     wake_.notify_all();
-    // A copy stopped above removes its temps and the empty folders it made on its way out, over
-    // its connection: a few moments for it (files_close_wait) before they are cut.
-    for (const auto until = std::chrono::steady_clock::now() + files_close_wait; std::chrono::steady_clock::now() < until;) {
+    // A copy stopped above ends the copy-data piece it is in (sized to end within its connection's
+    // timeout), then removes its temps and the empty folders it made over its connection: the time
+    // for both (server_files::close_wait) before they are cut; another change, and any change when
+    // grab restarts or the session ends (Windows gives up on a program that takes ~30 s), stops
+    // between its requests and gets the cleanup's time only. What a copy cut here leaves is saved
+    // with the leftovers (copy_undo_) for the next start's cleaner.
+    const auto stopped_at = std::chrono::steady_clock::now();
+    bool changing = false;
+    for (;;) {
+        bool running = false;
+        std::vector<std::chrono::milliseconds> copies; // the connection timeouts of the copies running
         {
             std::scoped_lock lock(files_mutex_);
-            if (std::ranges::none_of(files_tasks_, [](const auto& t) { return t->change && !t->over; })) break;
+            for (const auto& t : files_tasks_) {
+                if (!t->change || t->over) continue;
+                running = true;
+                if (t->copying) copies.push_back(t->timeout);
+            }
         }
+        if (!running) break;
+        changing = true;
+        const auto wait = server_files::close_wait(copies, resume_after_restart_ || ending_session_, files_close_wait);
+        if (std::chrono::steady_clock::now() >= stopped_at + wait) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     // A login, read or command waiting on a server ends now; whatever is still connecting fails
     // at once. Without this a login stuck in the handshake held the exit for io_timeout, twice.
     ssh::close_all_connections();
+    // What the changes left is saved as it is now: a copy that ended removed its records, one cut
+    // above keeps them as leftovers (the saver's last save may come before its thread ends).
+    if (changing) save_queue();
 }
 
 void App::save_state() const { report_save("the window's settings", save_gui_state(state_path_, state_), state_unsaved_); }
@@ -825,15 +845,9 @@ void App::run_play(const PlayJob& job, const std::stop_token& stop) {
 
 void App::post(const Value& message) const { host_.post(json::stringify(message)); }
 
-bool App::downloads_active() const {
-    std::lock_guard lock(mutex_);
-    return std::ranges::any_of(items_, [](const auto& i) {
-        return i->status == Status::queued || i->status == Status::running;
-    });
-}
-
-App::QueueSummary App::summary() const {
-    QueueSummary s;
+TrayStatus App::tray_status() const {
+    TrayStatus s;
+    s.change = running_change();
     std::lock_guard lock(mutex_);
     for (const auto& i : items_) {
         if (i->status == Status::running) ++s.running;
@@ -4193,6 +4207,13 @@ void App::save_queue() const {
             unfinished.push_back(std::move(d));
         }
         ups.leftovers = leftovers_;
+        // A running copy's temps and folders too: cut off (grab quitting, killed), it is undone at
+        // the next start by the cleaner, which removes temps by their names and only empty folders.
+        // (One also among leftovers_ is tried twice: the second finds it gone.)
+        for (const auto& [token, u] : copy_undo_) {
+            for (const auto& p : u.temps) ups.leftovers.push_back(SavedLeftover{.server = u.server, .kind = "temp", .path = p});
+            for (const auto& p : u.folders) ups.leftovers.push_back(SavedLeftover{.server = u.server, .kind = "folder", .path = p});
+        }
         held = ms_since(locked);
     }
     for (std::size_t k = 0; k < unfinished.size(); ++k) unfinished[k].files = saved_files(files[k]);

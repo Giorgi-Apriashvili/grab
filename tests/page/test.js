@@ -3072,7 +3072,8 @@ try {
     check('ops: Browse opening a server asks its account once', sentOf('filesAccount'), [{ type: 'filesAccount', server: 'Main', again: false }]);
     onFilesAccount({ type: 'filesAccount', server: 'Main', readOnly: false, free: 1000 });
     onBrowseResult({ type: 'browseResult', id: 41, remote: 'Main', path: '/srv', top: false, items: [], uploadable: true });
-    check('ops: ... and not again once known', [sentOf('filesAccount').length, ops.accounts.get('Main')], [1, { readOnly: false, free: 1000 }]);
+    check('ops: ... and not again once known', [sentOf('filesAccount').length, ops.accounts.get('Main')],
+      [1, { readOnly: false, free: 1000, home: '', copyData: true }]);
     sent.length = 0;
     $('#browse-refresh').click();
     check('ops: Refresh asks it again', sentOf('filesAccount'), [{ type: 'filesAccount', server: 'Main', again: true }]);
@@ -3159,6 +3160,72 @@ try {
     check('ops: read-only: F2, Del, Ctrl+X, Ctrl+V, Ctrl+Shift+N say the reason in the footer, nothing sent',
       [refusedKeys, sent.length, !!modal], [Array(5).fill('Box.Guest is read-only for this account'), 0, false]);
     check('ops: the reason in red in the footer', line(), { shown: true, text: 'Box.Guest is read-only for this account', cancel: false, bad: true });
+    quiet();
+    reset();
+
+    // The login folder, "/" and a folder holding the login folder, however each is spelled: Cut,
+    // Rename and Delete greyed with the reason (the backend refuses them too), F2, Del and Ctrl+X
+    // say it; Copy works. A folder inside the login folder is an ordinary row.
+    onFilesAccount({ type: 'filesAccount', server: 'Main', readOnly: false, free: 1000, home: '/home/u', copyData: true });
+    check('ops: the account keeps the login folder and copy-data', ops.accounts.get('Main'),
+      { readOnly: false, free: 1000, home: '/home/u', copyData: true });
+    const LOGIN = 'the login folder can’t be renamed, moved or deleted';
+    const TOP = 'the server’s top folder can’t be renamed, moved or deleted';
+    const tops = [['/home/u', LOGIN], ['/home/./u/', LOGIN], ['/home/u/d/..', LOGIN], ['', LOGIN], ['.', LOGIN], ['x/..', LOGIN], ['/', TOP],
+      ['//', TOP], ['/home/..', TOP], ['/home', 'home holds the login folder, which can’t be renamed, moved or deleted'],
+      ['/home/u/d', ''], ['d', ''], ['/home/uu', ''], ['/srv/tv', '']];
+    const topRows = () => tops.map(([path]) => ({ name: path.split('/').filter(Boolean).pop() || path || '~', path, dir: true, remote: 'Main' }));
+    const whys = () => tops.map((_, i) => {
+      pick(i);
+      const m = resultMenu();
+      return [entry(m, 'Cut').why, entry(m, 'Rename…').why, entry(m, 'Delete…').why, entry(m, 'Copy').disabled];
+    });
+    state.hits = topRows();
+    renderRows();
+    check('ops: the login folder, / and a folder holding it greyed however spelled, with the reason; Copy left; one inside ordinary', whys(),
+      tops.map(([, why]) => [why, why, why, false]));
+    sent.length = 0;
+    pick(0);
+    const loginKeys = [['F2'], ['Delete'], ['x', { ctrlKey: true }]].map(([k, m]) => {
+      ops.result = null;
+      key(k, m);
+      return said();
+    });
+    check('ops: ... F2, Del and Ctrl+X on the login folder by its full path say why, nothing sent, nothing held',
+      [loginKeys, sent.length, !!modal, ops.clip], [Array(3).fill(LOGIN), 0, false, null]);
+    pick(0, 10);
+    check('ops: ... several rows with it among them: refused the same', entry(resultMenu(), 'Delete 2…').why, LOGIN);
+    // The login folder not known yet: only its spellings from itself and "/" are greyed (the backend
+    // still refuses the rest, with the real path it asks for).
+    onFilesAccount({ type: 'filesAccount', server: 'Main', readOnly: false });
+    check('ops: ... the login folder not known: "", ".", "/" still greyed', whys().map(([cut]) => cut),
+      ['', '', '', LOGIN, LOGIN, LOGIN, TOP, TOP, TOP, '', '', '', '', '']);
+    quiet();
+    reset();
+
+    // A server without copy-data (OpenSSH before 9.0): Paste of a copy greyed there with the reason,
+    // Ctrl+V says it and sends nothing; a cut pastes there (a move is a rename).
+    onFilesAccount({ type: 'filesAccount', server: 'Box', readOnly: false, home: '/home/b', copyData: false });
+    reset('Box');
+    pick(1);
+    key('c', { ctrlKey: true });
+    const NO_COPY = 'Box doesn’t copy files itself (its SSH server is older than OpenSSH 9.0)';
+    check('ops: no copy-data: Paste of a copy greyed, saying why', [entry(resultMenu(), 'Paste into srv').disabled, entry(resultMenu(), 'Paste into srv').why,
+      entry(folderMenu(), 'Paste').why, entry(folderMenu(), 'Paste').note], [true, NO_COPY, NO_COPY, 'the server can’t copy']);
+    pick(0);
+    check('ops: ... into a folder row too', entry(resultMenu(), 'Paste').why, NO_COPY);
+    sent.length = 0;
+    ops.result = null;
+    key('v', { ctrlKey: true });
+    check('ops: ... Ctrl+V says it, nothing looked at', [said(), sentOf('filesLook').length, !!modal], [NO_COPY, 0, false]);
+    pick(1);
+    key('x', { ctrlKey: true });
+    check('ops: ... a cut pastes there', [entry(folderMenu(), 'Paste').disabled, entry(resultMenu(), 'Paste into srv').disabled], [false, false]);
+    key('v', { ctrlKey: true });
+    check('ops: ... Ctrl+V looks at the move', [lastOf('filesLook') && lastOf('filesLook').op, lastOf('filesLook') && lastOf('filesLook').server],
+      ['move', 'Box']);
+    onFilesAccount({ type: 'filesAccount', server: 'Box', readOnly: false });
+    check('ops: ... copy-data taken as there when the backend doesn’t say', ops.accounts.get('Box').copyData, true);
     quiet();
     reset();
 

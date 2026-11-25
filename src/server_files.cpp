@@ -395,23 +395,88 @@ Named taken(std::string_view name, std::string_view dir) {
     return Named{.taken = true, .path = {}, .why = std::format("{} is already taken in {}", name, shown(dir))};
 }
 
-// The login folder, or the server's top: nothing renames, moves or deletes those.
-std::optional<std::string> top_folder(std::string_view path, std::string_view what) {
-    if (path.empty()) return std::format("the login folder can't be {}", what);
-    if (path == "/") return std::format("the server's top folder can't be {}", what);
+// The login folder, the server's top, or (`holding`) a folder holding the login folder, however
+// each is spelled: canonical() with `home`, the login folder's real path (empty: only its spellings
+// from the login folder itself, "", "." or "a/.."). Nothing renames, moves or deletes those. `real`:
+// the path's real spelling (real_spellings) compared instead, the words still naming `path`. A
+// path ending in '/' is refused as well: LSTAT, REMOVE and RENAME would follow a link at its end
+// (a link to the login folder, "/data/me/"), which canonical() can't tell; once `home` is known,
+// so the login folder's own spellings ("/home/u/") keep their words.
+std::optional<std::string> top_folder(std::string_view path, std::string_view what, std::string_view home, bool holding,
+                                      std::string_view real = {}) {
+    const std::string at = canonical(real.empty() ? path : real, home);
+    const std::string login = canonical("", home);
+    if (at == "/") return std::format("the server's top folder can't be {}", what);
+    if (at == login) return std::format("the login folder can't be {}", what);
+    if (holding && browse::is_below(login, at)) return std::format("{} holds the login folder, so it can't be {}", path, what);
+    if (!home.empty() && path.size() > 1 && path.ends_with('/')) {
+        return std::format("{} can't be {}: name it without the '/' at its end", path, what);
+    }
     return std::nullopt;
+}
+
+// The real spellings of `paths` (grab's form): each one's folder by its REALPATH (asked at once),
+// its own name kept, so a link that is the path's last part stays the link (RENAME and REMOVE act
+// on it alone) while a linked folder on the way, or ".." after one, leads where the server takes
+// it. One whose folder can't be resolved stays as given.
+std::vector<std::string> real_spellings(sftp::Client& c, std::span<const std::string> paths) {
+    std::vector<std::string> out(paths.begin(), paths.end());
+    for (std::size_t at = 0; at < paths.size(); at += batch) {
+        for (std::size_t i = at; i < std::min(paths.size(), at + batch); ++i) {
+            if (paths[i].empty() || paths[i] == "/") continue;
+            c.realpath(raw_of(parent_of(paths[i])), [&out, paths, i](std::expected<std::string, sftp::Status> r) {
+                if (r) out[i] = child(rclone_enc::from_raw_path(*r), name_of(paths[i]));
+            });
+        }
+        while (c.pending() > 0) c.pump();
+    }
+    return out;
+}
+
+// top_folder() of each of `paths` by its real spelling as well: the login folder reached through a
+// linked folder ("/home/u" with /home a link to /usr/home/u's parent, or "/a/l/.." with l a link
+// into it) is refused before anything is sent, as by its own spellings.
+std::optional<std::string> top_folder_really(sftp::Client& c, std::span<const std::string> paths, std::string_view what,
+                                             std::string_view home, bool holding) {
+    const std::vector<std::string> real = real_spellings(c, paths);
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        if (auto why = top_folder(paths[i], what, home, holding, real[i])) return why;
+    }
+    return std::nullopt;
+}
+
+// The sources of `items`.
+std::vector<std::string> froms(std::span<const Item> items) {
+    std::vector<std::string> out;
+    out.reserve(items.size());
+    for (const Item& it : items) out.push_back(it.from);
+    return out;
+}
+
+// The login folder's real path (grab's form): Where::home, else the server's answer to REALPATH of
+// "." (asked before any change, so the login folder is refused however it is spelled).
+std::expected<std::string, std::string> home_of(Conn& k, const Where& w) {
+    if (!w.home.empty()) return w.home;
+    auto home = sftp::realpath(*k.c, ".");
+    if (!home) return util::failf("{}: the login folder can't be looked at: {}", w.server, sftp::describe(home.error()));
+    return rclone_enc::from_raw_path(*home);
 }
 
 } // namespace
 
 std::expected<Named, std::string> rename(const Where& w, std::string_view path, std::string_view new_name, std::stop_token stop) {
-    if (auto why = top_folder(path, "renamed")) return util::fail(*why);
+    if (auto why = top_folder(path, "renamed", w.home, true)) return util::fail(*why);
     if (auto why = bad_name(new_name)) return util::fail(*why);
     const auto [dir, old] = upload::split_remote(path);
     const std::string to = child(dir, new_name); // grab's form, as every path here
     if (to == path) return Named{.taken = false, .path = to, .why = {}};
     return on_connection<Named>(w, stop, [&](Conn& k) -> std::expected<Named, std::string> {
         sftp::Client& c = *k.c;
+        auto home = home_of(k, w);
+        if (!home) return util::fail(home.error());
+        if (auto why = top_folder(path, "renamed", *home, true)) return util::fail(*why);
+        const std::string given(path);
+        if (auto why = top_folder_really(c, std::span(&given, 1), "renamed", *home, true)) return util::fail(*why);
         if (auto there = sftp::lstat(c, raw_of(to))) return taken(new_name, dir);
         else if (there.error().code != sftp::Code::no_such_file) return util::fail(refused(k, w, dir, there.error()).why);
         k.changed = true;
@@ -451,12 +516,15 @@ std::vector<Item> into(std::span<const std::string> paths, std::string_view dir)
     return items;
 }
 
-std::optional<std::string> refused_before(std::span<const Item> items, bool copying) {
+std::optional<std::string> refused_before(std::span<const Item> items, bool copying, std::string_view home) {
     const std::string_view what = copying ? "copied" : "moved";
     for (const Item& it : items) {
-        if (auto why = top_folder(it.from, what)) return why;
+        // A copy leaves its source where it is: one holding the login folder may go elsewhere.
+        if (auto why = top_folder(it.from, what, home, !copying)) return why;
         if (auto why = bad_name(name_of(it.to))) return std::format("{} can't be {} there: {}", it.from, what, *why);
-        if (browse::is_below(it.to, it.from)) return std::format("{} can't be {} into itself", name_of(it.from), what);
+        if (browse::is_below(it.to, it.from) || browse::is_below(canonical(it.to, home), canonical(it.from, home))) {
+            return std::format("{} can't be {} into itself", name_of(it.from), what);
+        }
     }
     return std::nullopt;
 }
@@ -684,7 +752,7 @@ void restart(Report& report, std::size_t entries, std::size_t items) {
 Report move(const Where& w, std::span<const Item> items, Existing existing, std::stop_token stop) {
     Report report;
     report.placed.assign(items.size(), std::string());
-    if (auto why = refused_before(items, false)) {
+    if (auto why = refused_before(items, false, w.home)) {
         report.error = *why;
         return report;
     }
@@ -694,6 +762,16 @@ Report move(const Where& w, std::span<const Item> items, Existing existing, std:
     for (const Item& it : items) reserved.insert(it.to);
     const auto ran = on_connection<bool>(w, stop, [&](Conn& k) -> std::expected<bool, std::string> {
         restart(report, before, items.size());
+        auto home = home_of(k, w);
+        if (!home) return util::fail(home.error());
+        if (auto why = refused_before(items, false, *home)) {
+            report.error = *why;
+            return true;
+        }
+        if (auto why = top_folder_really(*k.c, froms(items), "moved", *home, true)) {
+            report.error = *why;
+            return true;
+        }
         for (std::size_t i = 0; i < items.size(); ++i) {
             if (left_out[i]) continue;
             if (stop.stop_requested()) {
@@ -931,8 +1009,10 @@ bool plan_folder(Conn& k, const Where& w, Plan& p, const Item& it, std::size_t i
 }
 
 // What copying `items` takes: each item looked at, its folders walked, and the names taken in
-// their places decided by the choices. Nothing is changed.
-Plan plan_copy(Conn& k, const Where& w, std::span<const Item> items, Existing existing, Report& report, const std::stop_token& stop) {
+// their places decided by the choices. Nothing is changed. `home`: the login folder's real path,
+// for a folder copied onto itself under another spelling.
+Plan plan_copy(Conn& k, const Where& w, std::span<const Item> items, Existing existing, Report& report, const std::stop_token& stop,
+               std::string_view home) {
     sftp::Client& c = *k.c;
     Plan p;
     const auto left_out = doubles(items, report);
@@ -950,7 +1030,7 @@ Plan plan_copy(Conn& k, const Where& w, std::span<const Item> items, Existing ex
             p.entries.push_back(entry(Entry::State::failed, it.from, it.to, why));
             continue;
         }
-        if (src->is_dir() && it.to == it.from) {
+        if (src->is_dir() && (it.to == it.from || canonical(it.to, home) == canonical(it.from, home))) {
             p.refused = std::format("{} can't be copied onto itself", name_of(it.from));
             return p;
         }
@@ -1022,6 +1102,46 @@ Plan plan_copy(Conn& k, const Where& w, std::span<const Item> items, Existing ex
 
 // ---- copy: the run --------------------------------------------------------------------------------------
 
+// What a copy made that it removes when it ends early: its temps on the server not placed nor
+// removed yet (raw), and the folders it made (grab's form, parents first), each told to
+// Where::on_undo as it comes and goes (Undo). Outside the connection's step, so a connection lost on
+// the way can still be cleaned after.
+class Made {
+public:
+    explicit Made(const Where& w) : w_(w) {}
+    [[nodiscard]] const std::set<std::string>& temps() const { return temps_; }
+    [[nodiscard]] const std::vector<std::string>& folders() const { return folders_; }
+    // A temp, from just before it is asked for: a connection lost before the answer can still have
+    // made it (its random name is grab's alone, so removing it after is safe).
+    void temp(const std::string& raw) {
+        if (temps_.insert(raw).second) tell(Undo::Kind::temp, rclone_enc::from_raw_path(raw), true);
+    }
+    // Placed, removed, not made, or left for the user (the only copy of a file Replace removed).
+    void temp_gone(const std::string& raw) {
+        if (temps_.erase(raw) > 0) tell(Undo::Kind::temp, rclone_enc::from_raw_path(raw), false);
+    }
+    void folder(const std::string& path) {
+        folders_.push_back(path);
+        tell(Undo::Kind::folder, path, true);
+    }
+    void folder_gone(const std::string& path) {
+        if (std::erase(folders_, path) > 0) tell(Undo::Kind::folder, path, false);
+    }
+    // The copy is over and its folders left are its own: it ran to its end, or they hold what it
+    // placed (an empty one was removed).
+    void folders_kept() {
+        for (const std::string& f : std::exchange(folders_, {})) tell(Undo::Kind::folder, f, false);
+    }
+
+private:
+    void tell(Undo::Kind kind, std::string path, bool made) const {
+        if (w_.on_undo) w_.on_undo(Undo{.kind = kind, .path = std::move(path), .made = made});
+    }
+    const Where& w_;
+    std::set<std::string> temps_;
+    std::vector<std::string> folders_;
+};
+
 // A copy as it runs on its connection.
 struct Copying {
     const Where& w;
@@ -1030,9 +1150,7 @@ struct Copying {
     const OnProgress& on_progress;
     const std::stop_token& stop;
     Progress progress;
-    // Outside the connection's step, so a connection lost on the way can still be cleaned after.
-    std::vector<std::string>& made; // folders this copy made, grab's form, parents first
-    std::set<std::string>& temps;   // temps on the server not placed nor removed yet, raw
+    Made& made;
     std::set<std::string> reserved;  // every place the copy fills: no Keep-both copy takes one
     std::optional<std::string> fatal; // a refusal that ends the copy (the whole server's)
     std::set<std::string> blocked;    // folders that couldn't be made: nothing goes below them
@@ -1131,7 +1249,7 @@ void make_dirs(Copying& run, std::vector<CopyDir>& dirs) {
                 CopyDir& d = dirs[order[i]];
                 if (run.below_blocked(d.to)) continue;
                 if (!failed[i - at]) {
-                    run.made.push_back(d.to);
+                    run.made.folder(d.to);
                     ++run.report.folders;
                     continue;
                 }
@@ -1174,9 +1292,9 @@ void place(Copying& run, const CopyFile& f, const std::string& temp) {
     auto placed = upload::place(c, run.k.caps, request, renaming);
     if (!placed) {
         if (placed.error().kept_temp) {
-            run.temps.erase(temp_raw); // the only copy of what was there now: it stays, where the words say
+            run.made.temp_gone(temp_raw); // the only copy of what was there now: it stays, where the words say
         } else if (auto removed = sftp::remove(c, temp_raw); removed || removed.error().code == sftp::Code::no_such_file) {
-            run.temps.erase(temp_raw);
+            run.made.temp_gone(temp_raw);
         }
         if (placed.error().scope == upload::Refusal::Scope::server && !run.fatal) run.fatal = placed.error().why;
         else run.report.entries.push_back(entry(Entry::State::failed, f.from, f.to, placed.error().why));
@@ -1184,18 +1302,18 @@ void place(Copying& run, const CopyFile& f, const std::string& temp) {
     }
     switch (placed->outcome) {
     case upload::Outcome::done:
-        run.temps.erase(temp_raw);
+        run.made.temp_gone(temp_raw);
         run.done(f, placed->placed);
         return;
     case upload::Outcome::skipped: // place removed the temp
-        run.temps.erase(temp_raw);
+        run.made.temp_gone(temp_raw);
         run.report.entries.push_back(entry(Entry::State::skipped, f.from, f.to, placed->note.empty() ? "already there" : placed->note,
                                            placed->clash));
         return;
     case upload::Outcome::exists: {
         // Ask: nothing placed, the temp goes; the file waits for the user's answer.
         if (auto removed = sftp::remove(c, temp_raw); removed || removed.error().code == sftp::Code::no_such_file) {
-            run.temps.erase(temp_raw);
+            run.made.temp_gone(temp_raw);
         }
         run.report.entries.push_back(entry(Entry::State::asking, f.from, f.to, "already there", placed->clash));
         return;
@@ -1244,7 +1362,7 @@ void copy_small(Copying& run, const std::vector<const CopyFile*>& files, std::ve
         };
         const auto drop_temp = [&](const std::shared_ptr<Slot>& s) {
             c.remove(s->temp_raw, [&run, &end, s](std::expected<void, sftp::Status> r) {
-                if (r || r.error().code == sftp::Code::no_such_file) run.temps.erase(s->temp_raw);
+                if (r || r.error().code == sftp::Code::no_such_file) run.made.temp_gone(s->temp_raw);
                 end(*s);
             });
         };
@@ -1273,7 +1391,7 @@ void copy_small(Copying& run, const std::vector<const CopyFile*>& files, std::ve
             tell(run.w, {"sftp", "rename", s->temp, f.to});
             c.rename(s->temp_raw, raw_of(f.to), [&run, &later, &end, s](std::expected<void, sftp::Status> r) {
                 if (r) {
-                    run.temps.erase(s->temp_raw);
+                    run.made.temp_gone(s->temp_raw);
                     run.done(*s->f, s->f->to);
                 } else {
                     later.emplace_back(s->f, s->temp); // a name taken meanwhile, or a refusal: place says
@@ -1340,10 +1458,10 @@ void copy_small(Copying& run, const std::vector<const CopyFile*>& files, std::ve
                                    .atime = {}};
             // A temp from the moment it is asked for: a connection lost before the answer can still
             // have made it (its random name is grab's alone, so removing it after is safe).
-            run.temps.insert(s->temp_raw);
+            run.made.temp(s->temp_raw);
             c.open(s->temp_raw, sftp::OpenFlags::write | sftp::OpenFlags::creat | sftp::OpenFlags::excl, mode,
                    [&run, s, both_open](std::expected<std::string, sftp::Status> h) {
-                       if (!h) run.temps.erase(s->temp_raw); // not made: whatever is there is never removed
+                       if (!h) run.made.temp_gone(s->temp_raw); // not made: whatever is there is never removed
                        s->to = std::move(h);
                        both_open(s);
                    });
@@ -1387,10 +1505,10 @@ void copy_big(Copying& run, const CopyFile& f) {
     mode.mtime.reset();
     mode.atime.reset();
     tell(run.w, {"sftp", "copy-data", f.from, temp});
-    run.temps.insert(temp_raw); // from the moment it is asked for, as copy_small's
+    run.made.temp(temp_raw); // from the moment it is asked for, as copy_small's
     auto to = sftp::open_file(c, temp_raw, sftp::OpenFlags::write | sftp::OpenFlags::creat | sftp::OpenFlags::excl, mode);
     if (!to) {
-        run.temps.erase(temp_raw);
+        run.made.temp_gone(temp_raw);
         close_from();
         run.refused_write(f, to.error(), size);
         return;
@@ -1407,7 +1525,7 @@ void copy_big(Copying& run, const CopyFile& f) {
         c.close(*to);
         close_from();
         if (auto removed = sftp::remove(c, temp_raw); removed || removed.error().code == sftp::Code::no_such_file) {
-            run.temps.erase(temp_raw);
+            run.made.temp_gone(temp_raw);
         }
         run.progress.bytes = run.report.bytes;
     };
@@ -1448,10 +1566,10 @@ void copy_link(Copying& run, const CopyFile& f) {
     const std::string temp_raw = raw_of(temp);
     run.k.changed = true;
     tell(run.w, {"sftp", "symlink", rclone_enc::from_raw_path(f.target), temp});
-    run.temps.insert(temp_raw); // from the moment it is asked for, as copy_small's
+    run.made.temp(temp_raw); // from the moment it is asked for, as copy_small's
     auto made = sftp::symlink(c, temp_raw, f.target);
     if (!made) {
-        run.temps.erase(temp_raw);
+        run.made.temp_gone(temp_raw);
         if (made.error().code == sftp::Code::no_such_file && !sftp::lstat(c, raw_of(parent_of(f.to)))) {
             run.report.entries.push_back(entry(Entry::State::failed, f.from, f.to, gone(run.w, parent_of(f.to))));
             return;
@@ -1468,9 +1586,9 @@ void copy_link(Copying& run, const CopyFile& f) {
     auto back = sftp::readlink(c, temp_raw);
     if (!back || *back != f.target) {
         if (back) {
-            if (sftp::remove(c, temp_raw)) run.temps.erase(temp_raw);
+            if (sftp::remove(c, temp_raw)) run.made.temp_gone(temp_raw);
         } else {
-            run.temps.erase(temp_raw); // nothing at the temp's name
+            run.made.temp_gone(temp_raw); // nothing at the temp's name
             // The draft's order: a link at the target's path pointing to the temp's name, which
             // only this copy can have made.
             if (auto odd = sftp::readlink(c, f.target); odd && *odd == temp_raw) {
@@ -1489,7 +1607,7 @@ void set_dir_attrs(Copying& run, const std::vector<CopyDir>& dirs) {
     sftp::Client& c = *run.k.c;
     std::vector<const CopyDir*> mine;
     for (const CopyDir& d : dirs)
-        if (d.make && std::ranges::find(run.made, d.to) != run.made.end()) mine.push_back(&d);
+        if (d.make && std::ranges::find(run.made.folders(), d.to) != run.made.folders().end()) mine.push_back(&d);
     std::ranges::stable_sort(mine, std::greater<>(), [](const CopyDir* d) { return depth_of(d->to); });
     for (std::size_t at = 0; at < mine.size(); at += batch) {
         for (std::size_t i = at; i < std::min(mine.size(), at + batch); ++i) {
@@ -1501,25 +1619,26 @@ void set_dir_attrs(Copying& run, const std::vector<CopyDir>& dirs) {
 
 // The temps a copy left (none, unless it ended early); after a stop or a failure that ended it
 // (`ended`), also the folders it made that are still empty (RMDIR deepest first: one holding a file
-// placed meanwhile stays, as does that file).
-void clean(sftp::Client& c, const Where& w, std::set<std::string>& temps, std::vector<std::string>& made, std::size_t& folders,
-           std::set<std::string>& removed, bool ended) {
+// placed meanwhile stays, as does that file). A temp the server didn't remove stays in `made`.
+void clean(sftp::Client& c, const Where& w, Made& made, std::size_t& folders, std::set<std::string>& removed, bool ended) {
+    const std::set<std::string> temps = made.temps();
     for (const std::string& t : temps) {
         tell(w, {"sftp", "rm", rclone_enc::from_raw_path(t)});
-        c.remove(t, {});
+        c.remove(t, [&made, t](std::expected<void, sftp::Status> r) {
+            if (r || r.error().code == sftp::Code::no_such_file) made.temp_gone(t);
+        });
     }
     while (c.pending() > 0) c.pump();
-    temps.clear();
     if (!ended) return;
     std::map<std::size_t, std::vector<std::string>, std::greater<>> by_depth;
-    for (const std::string& d : made) by_depth[depth_of(d)].push_back(d);
+    for (const std::string& d : made.folders()) by_depth[depth_of(d)].push_back(d);
     for (const auto& [depth, level] : by_depth) {
         for (const std::string& d : level) {
             tell(w, {"sftp", "rmdir", d});
             c.rmdir(raw_of(d), [&folders, &made, &removed, d](std::expected<void, sftp::Status> r) {
                 if (!r) return; // not empty: what was placed in it stays
                 --folders;
-                std::erase(made, d);
+                made.folder_gone(d);
                 removed.insert(d);
             });
         }
@@ -1529,21 +1648,43 @@ void clean(sftp::Client& c, const Where& w, std::set<std::string>& temps, std::v
 
 } // namespace
 
+std::string no_copy_data(std::string_view server) {
+    return std::format("{} doesn't copy files itself (its SSH server is older than OpenSSH 9.0)", server);
+}
+
+std::chrono::milliseconds close_wait(std::span<const std::chrono::milliseconds> copies, bool restarting,
+                                     std::chrono::milliseconds cleanup) {
+    std::chrono::milliseconds piece{0};
+    if (!restarting) {
+        for (const auto t : copies) piece = std::max(piece, t > std::chrono::milliseconds{0} ? std::min(t, close_piece_most) : close_piece_most);
+    }
+    return piece + cleanup;
+}
+
 Report copy(const Where& w, std::span<const Item> items, Existing existing, const OnProgress& progress, std::stop_token stop) {
     Report report;
     report.placed.assign(items.size(), std::string());
-    if (auto why = refused_before(items, true)) {
+    if (auto why = refused_before(items, true, w.home)) {
         report.error = *why;
         return report;
     }
-    std::set<std::string> temps;
-    std::vector<std::string> made;
+    Made made(w);
     std::set<std::string> removed; // folders made, then removed again by clean
     const auto ran = on_connection<bool>(w, stop, [&](Conn& k) -> std::expected<bool, std::string> {
         restart(report, 0, items.size());
         sftp::Client& c = *k.c;
-        if (!c.has_extension(sftp::copy_data_extension)) return util::failf("{} doesn't copy files itself (no copy-data)", w.server);
-        Plan p = plan_copy(k, w, items, existing, report, stop);
+        if (!c.has_extension(sftp::copy_data_extension)) return util::fail(no_copy_data(w.server));
+        auto home = home_of(k, w);
+        if (!home) return util::fail(home.error());
+        if (auto why = refused_before(items, true, *home)) {
+            report.error = *why;
+            return true;
+        }
+        if (auto why = top_folder_really(c, froms(items), "copied", *home, false)) {
+            report.error = *why;
+            return true;
+        }
+        Plan p = plan_copy(k, w, items, existing, report, stop, *home);
         if (p.refused) {
             report.error = *p.refused;
             std::ranges::fill(report.placed, std::string());
@@ -1562,7 +1703,6 @@ Report copy(const Where& w, std::span<const Item> items, Existing existing, cons
                     .stop = stop,
                     .progress = Progress{.bytes = 0, .total_bytes = 0, .files = 0, .total_files = p.files.size()},
                     .made = made,
-                    .temps = temps,
                     .reserved = {},
                     .fatal = {},
                     .blocked = {},
@@ -1603,17 +1743,23 @@ Report copy(const Where& w, std::span<const Item> items, Existing existing, cons
         }
         if (run.fatal) report.error = *run.fatal;
         if (stop.stop_requested()) report.stopped = true;
-        if (run.ending() || !temps.empty()) clean(c, w, temps, made, report.folders, removed, run.ending());
+        if (run.ending() || !made.temps().empty()) clean(c, w, made, report.folders, removed, run.ending());
         return true;
     });
     ended(ran, stop, report);
+    bool over = ran.has_value();
     // A connection lost on the way: its temps and empty folders removed over another, once.
-    if (!ran && (!temps.empty() || !made.empty())) {
-        [[maybe_unused]] auto cleaned = on_connection<bool>(w, {}, [&](Conn& k) -> std::expected<bool, std::string> {
-            clean(*k.c, w, temps, made, report.folders, removed, true);
+    if (!ran && (!made.temps().empty() || !made.folders().empty())) {
+        const auto cleaned = on_connection<bool>(w, {}, [&](Conn& k) -> std::expected<bool, std::string> {
+            clean(*k.c, w, made, report.folders, removed, true);
             return true;
         });
+        over = cleaned.has_value();
     }
+    // The folders it made that are left are its own now: it ran to its end, or they hold what it
+    // placed. Not when the cleaning couldn't run (grab quitting, the server out of reach): then they
+    // and the temps left are what it couldn't undo (Where::on_undo has them).
+    if (over) made.folders_kept();
     // The folder items whose folders were made and then removed again (empty, after a stop).
     for (std::string& placed : report.placed)
         if (removed.contains(placed)) placed.clear();
@@ -1621,13 +1767,19 @@ Report copy(const Where& w, std::span<const Item> items, Existing existing, cons
 }
 
 std::expected<Look, std::string> look(const Where& w, std::span<const Item> items, bool copying, std::stop_token stop) {
-    if (auto why = refused_before(items, copying)) return util::fail(*why);
+    if (auto why = refused_before(items, copying, w.home)) return util::fail(*why);
     return on_connection<Look>(w, stop, [&](Conn& k) -> std::expected<Look, std::string> {
+        // Before anything is walked: the question would ask about a copy that can't run.
+        if (copying && !k.c->has_extension(sftp::copy_data_extension)) return util::fail(no_copy_data(w.server));
+        auto home = home_of(k, w);
+        if (!home) return util::fail(home.error());
+        if (auto why = refused_before(items, copying, *home)) return util::fail(*why);
+        if (auto why = top_folder_really(*k.c, froms(items), copying ? "copied" : "moved", *home, !copying)) return util::fail(*why);
         Look l;
         Report report;
         report.placed.assign(items.size(), std::string());
         if (copying) {
-            const Plan p = plan_copy(k, w, items, Existing::ask, report, stop);
+            const Plan p = plan_copy(k, w, items, Existing::ask, report, stop, *home);
             if (p.refused) return util::fail(*p.refused);
             l.files = p.total_files;
             l.folders = p.total_folders;
@@ -1675,7 +1827,7 @@ std::expected<Look, std::string> look(const Where& w, std::span<const Item> item
 Report remove(const Where& w, std::span<const std::string> paths, const OnProgress& on_progress, std::stop_token stop) {
     Report report;
     for (const std::string& p : paths) {
-        if (auto why = top_folder(p, "deleted")) {
+        if (auto why = top_folder(p, "deleted", w.home, true)) {
             report.error = *why;
             return report;
         }
@@ -1683,6 +1835,18 @@ Report remove(const Where& w, std::span<const std::string> paths, const OnProgre
     const auto ran = on_connection<bool>(w, stop, [&](Conn& k) -> std::expected<bool, std::string> {
         restart(report, 0, 0);
         sftp::Client& c = *k.c;
+        auto home = home_of(k, w);
+        if (!home) return util::fail(home.error());
+        for (const std::string& p : paths) {
+            if (auto why = top_folder(p, "deleted", *home, true)) {
+                report.error = *why;
+                return true;
+            }
+        }
+        if (auto why = top_folder_really(c, paths, "deleted", *home, true)) {
+            report.error = *why;
+            return true;
+        }
         // Every path looked at and every folder walked first: nothing is removed from a tree that
         // can't be read through.
         struct Target {
@@ -1933,7 +2097,10 @@ std::expected<Account, std::string> account(const Where& w, std::stop_token stop
         sftp::Client& c = *k.c;
         auto home = sftp::realpath(c, ".");
         if (!home) return util::failf("{}: the login folder can't be looked at: {}", w.server, sftp::describe(home.error()));
-        Account a{.home = rclone_enc::from_raw_path(*home), .read_only = false, .free = std::nullopt};
+        Account a{.home = rclone_enc::from_raw_path(*home),
+                  .read_only = false,
+                  .free = std::nullopt,
+                  .copy_data = c.has_extension(sftp::copy_data_extension)};
         if (k.caps.statvfs) {
             if (auto v = sftp::statvfs(c, *home)) {
                 a.read_only = v->read_only();

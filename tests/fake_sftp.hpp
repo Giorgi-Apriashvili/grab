@@ -405,6 +405,24 @@ private:
         }
         return path;
     }
+    // REALPATH's answer, as realpath(3): every part of an absolute path followed through links on the
+    // way, "." and ".." taken as they come. A relative one (no login folder set) is resolved whole.
+    [[nodiscard]] std::string real_of(const std::string& path) const {
+        if (!path.starts_with('/')) return resolve(path);
+        std::string at = "/";
+        for (std::size_t from = 1; from <= path.size();) {
+            const std::size_t slash = std::min(path.find('/', from), path.size());
+            const std::string part = path.substr(from, slash - from);
+            from = slash + 1;
+            if (part.empty() || part == ".") continue;
+            if (part == "..") {
+                at = at == "/" ? "/" : parent_of(at);
+                continue;
+            }
+            at = resolve(at == "/" ? "/" + part : at + "/" + part);
+        }
+        return at;
+    }
     // The owner and group in ATTRS (uid, gid), as OpenSSH sends them with everything.
     void owner(std::string& b, const std::string& path) const {
         const auto it = st().owners.find(path);
@@ -959,7 +977,7 @@ private:
             std::string path = in.str();
             std::string b;
             u32(b, 1);
-            str(b, path == "." && home.empty() ? "/home/test" : resolve(at_home(path)));
+            str(b, path == "." && home.empty() ? "/home/test" : real_of(at_home(path)));
             str(b, "");
             u32(b, 0);
             return reply(104, id, b);

@@ -66,14 +66,10 @@ public:
         std::function<void()> quit; // UI thread: close the window and exit, even with downloads running
         // UI thread: Settings → Appearance changed (state().theme): the window follows at once.
         std::function<void()> theme_changed;
-    };
-
-    struct QueueSummary {
-        int running = 0;
-        int queued = 0;
-        int paused = 0;
-        std::uint64_t bytes = 0; // of the running and queued items with a known size
-        std::uint64_t total = 0;
+        // Any thread: a change to a server's files from Browse ended (its words, "Copying holiday";
+        // ok, and what it said: "Done", the counts skipped or failed, or what went wrong). Not
+        // while the window closes.
+        std::function<void(const std::string& what, bool ok, const std::string& said)> on_change_ended;
     };
 
     App(Host host, std::filesystem::path config_path, std::filesystem::path state_path);
@@ -90,13 +86,22 @@ public:
     // UI thread: `grab update` closes the window to replace grab-gui and starts it again: the
     // running and queued downloads go on there by themselves.
     void will_restart() { mark_for_restart(true); }
+    // UI thread: Windows ends the session (signing out, shutting down, an installer's Restart
+    // Manager): closing gives a stopped copy only its cleanup's time, as for a restart. Whatever
+    // it can't remove then is saved with the leftovers for the next start.
+    void will_end_session() { ending_session_ = true; }
 
     // UI thread: one message from the page, and the paths of the files WebView2 handed over beside
     // it (a drop's, "uploadDrop"; never taken from the message's text).
     void on_message(const std::string& json, std::vector<std::filesystem::path> paths = {});
 
-    [[nodiscard]] bool downloads_active() const;
-    [[nodiscard]] QueueSummary summary() const;
+    // What the tray icon follows: the downloads and uploads, and the change to a server's files
+    // running from Browse (its words; empty: none). keeps_running() of it keeps grab-gui working
+    // in the tray with its window closed.
+    [[nodiscard]] TrayStatus tray_status() const;
+    // The change running from Browse ("Copying holiday"), empty when none: a change counts until
+    // its thread ends.
+    [[nodiscard]] std::string running_change() const;
     [[nodiscard]] GuiState& state() { return state_; }
     void save_state() const;
     void post_import_banner();
@@ -698,6 +703,15 @@ private:
         bool change = false; // renames, makes, moves, copies or deletes: one at a time
         bool answered = false; // a change's answer posted: the next may start (under files_mutex_)
         std::string what;    // a change's words, for the refusal of a second ("Copying holiday")
+        // A change's answer, under files_mutex_: whether it did what was asked, and in a few words
+        // ("Done", "Done; 2 skipped", the error), for the tray's notice when it ends there.
+        bool ok = false;
+        std::string said;
+        // A copy, from just before it starts on its server, and its connection's timeout
+        // (Where::timeout), under files_mutex_: close() waits that long (at most
+        // server_files::close_piece_most) for the copy-data piece it may be in.
+        bool copying = false;
+        std::chrono::milliseconds timeout{0};
         std::atomic<bool> over{false};
         std::jthread thread; // last: joined before the rest goes
     };
@@ -726,9 +740,19 @@ private:
     // (search results keep no deleted or renamed file). Any thread.
     void files_changed(const std::string& server, const std::string& home, const server_files::Changed& changed,
                        const std::vector<std::string>& went);
-    // The change task `token` has posted its answer: the one-change slot is free for the next,
-    // while it follows up (files_changed). close() still waits for it to end.
-    void files_answered(int token);
+    // The change task `token` has posted its answer `v` (filesDone): the one-change slot is free for
+    // the next, while it follows up (files_changed); what it said is kept for the tray (ok, said).
+    // close() still waits for it to end.
+    void files_answered(int token, const json::Value& v);
+    // The change task `token` copies now, on a connection with this timeout (close_wait's piece).
+    void files_copying(int token, std::chrono::milliseconds timeout);
+    // A copy's temps and folders as they come and go (server_files::Undo): kept in copy_undo_,
+    // saved with the leftovers (uploads.json), so a copy cut off midway (grab quitting, killed) is
+    // undone at the next start by the cleaner. Any thread.
+    void files_undo(int token, const std::string& server, const server_files::Undo& u);
+    // The copy task `token` is over: what it couldn't undo (copy_undo_'s rest) goes to the
+    // leftovers for the cleaner, and the save follows at once.
+    void files_undo_over(int token);
     // queue.json soon, from any thread: at most once every queue_save_gap (longer after a slow
     // save), on saver_. now (a download ended): without the queue_save_gap floor, still at most
     // once every ten times the last save's duration. Closing and an update's restart save at once.
@@ -812,14 +836,15 @@ private:
     // Set while an update is about to restart grab-gui: save_queue() then saves the marked
     // downloads (Item::resume_mark) to continue by themselves after the restart.
     std::atomic<bool> resume_after_restart_{false};
+    bool ending_session_ = false; // UI thread (will_end_session)
 
     std::mutex settings_mutex_; // guards pending_
     std::optional<Pending> pending_;
     std::atomic<bool> settings_busy_{false};
     std::jthread settings_thread_;
 
-    // Guards items_, next_id_, next_gen_, parallel_, learned_, defaults_, leftovers_. Worker threads read
-    // parallel_ here rather than state_, which belongs to the UI thread.
+    // Guards items_, next_id_, next_gen_, parallel_, learned_, defaults_, leftovers_, copy_undo_.
+    // Worker threads read parallel_ here rather than state_, which belongs to the UI thread.
     mutable std::mutex mutex_;
     std::condition_variable_any wake_;
     std::vector<std::shared_ptr<Item>> items_;
@@ -829,6 +854,14 @@ private:
     std::map<std::string, int> learned_;  // as limits.json had it when last read
     std::map<std::string, int> defaults_; // each server's default budget, by its host
     std::vector<SavedLeftover> leftovers_; // what uploads left on servers to undo (uploads.json)
+    // What each copy running from Browse made and hasn't placed or removed yet, by its task's token
+    // (files_undo): saved with leftovers_, never given to the cleaner while the copy runs.
+    struct CopyUndo {
+        std::string server;
+        std::set<std::string> temps;   // grab's form
+        std::set<std::string> folders; // grab's form
+    };
+    std::map<int, CopyUndo> copy_undo_;
     // The page's view, UI thread (dirty_ any thread): what flush() sends next.
     DWORD ui_thread_ = 0;
     std::atomic<bool> dirty_{false}; // something changed: set by workers, actions, folder events
@@ -905,15 +938,6 @@ private:
     // Upload checks, one dialog's at a time; those whose thread ended are dropped at the next.
     std::mutex checks_mutex_;
     std::vector<std::shared_ptr<UploadCheck>> checks_;
-    // Browse's changes on servers and their looks (app_files.cpp): each server's account as asked
-    // this session, the servers being asked, and the tasks running, those whose thread ended
-    // dropped at the next start. All under files_mutex_.
-    std::mutex files_mutex_;
-    std::map<std::string, server_files::Account> accounts_;
-    std::set<std::string> accounts_asking_;
-    std::atomic<bool> files_closing_{false}; // close() ran: what a stopped change did isn't followed up
-    // After what its tasks use above: their threads are joined before those go.
-    std::vector<std::shared_ptr<FilesTask>> files_tasks_;
     // The cleaner: the servers whose leftovers it tries next, and the server of the pass it is
     // making ("" none), both under clean_mutex_. clean_wake_ also tells the end of a pass.
     std::mutex clean_mutex_;
@@ -924,6 +948,16 @@ private:
     // leave leftovers_ at the pass's end, or stay when the server couldn't remove them.
     std::vector<SavedLeftover> cleaning_;
     std::jthread cleaner_;
+    // Browse's changes on servers and their looks (app_files.cpp): each server's account as asked
+    // this session, the servers being asked, and the tasks running, those whose thread ended
+    // dropped at the next start. All under files_mutex_.
+    mutable std::mutex files_mutex_;
+    std::map<std::string, server_files::Account> accounts_;
+    std::set<std::string> accounts_asking_;
+    std::atomic<bool> files_closing_{false}; // close() ran: what a stopped change did isn't followed up
+    // After what its tasks use above (a paste waits for the cleaner, a copy cut off wakes it):
+    // their threads are joined before those go.
+    std::vector<std::shared_ptr<FilesTask>> files_tasks_;
     std::filesystem::path last_upload_dir_; // UI thread: where the upload dialog last picked from
 
     std::jthread saver_; // ends after workers_: the saves they asked for are made, the last at its stop
