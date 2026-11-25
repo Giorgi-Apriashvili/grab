@@ -128,6 +128,13 @@
       <span id="act-text" class="act-text"></span>
       <span id="act-more" class="act-more" hidden></span>
     </span>
+    <!-- A change on the server (SERVER-OPS.md): what runs and how far, with Cancel; then its result. -->
+    <span id="ops" class="ops" role="status" aria-live="polite" hidden>
+      <span class="spinner"></span><span id="ops-text" class="ops-text"></span>
+      <button id="ops-cancel" type="button" class="link" hidden>Cancel</button>
+    </span>
+    <!-- What Cut or Copy holds for a paste. -->
+    <span id="clip" class="clip" hidden></span>
     <span id="browse-status" class="browse-status"></span>
     <span id="list-status" class="list-status"></span>
     <button id="refresh-lists" type="button" class="link" title="Fetch the file list again now" hidden>Refresh</button>

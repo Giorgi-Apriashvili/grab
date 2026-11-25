@@ -6,12 +6,15 @@
 //                 watchFiles, unwatchFiles, fileAction, setFilePriority, showFile, openFile, openDir, setExpanded,
 //                 resolveExisting, play, previewCancel, uploadPick, uploadDrop, uploadCheckCancel, uploadStart,
 //                 setUploadExisting, setTheme,
+//                 Browse's changes on servers: filesAccount, filesRename, filesMkdir, filesLook, filesPaste,
+//                 filesSize, filesDelete, filesProps, filesHash, filesCancel,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
 //                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
 //                 updateChecked, limit, played, uploadCheck, uploadExisting, theme, pageRestored (from the window itself),
+//                 filesAccount, filesDone, filesProgress,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -78,6 +81,22 @@ const state = {
   // Browse is at or opening; `back` and `fwd` the places before and after it, nearest last. A
   // place: { remote (the server picker's choice), server, path, top, cursorKey, scroll, shown }.
   nav: { back: [], fwd: [], cur: null },
+};
+
+// Browse's changes on servers (SERVER-OPS.md, chunk 2; see "Browse's changes on a server" below).
+const ops = {
+  token: 0,
+  // Each server's account as the backend said once Browse opened it: { readOnly, free }. Absent:
+  // not asked yet, or the last ask failed (asked again the next time). `asking`: asked now.
+  accounts: new Map(),
+  asking: new Set(),
+  // What Cut or Copy holds: { server, op: 'cut' | 'copy', items: [{ path, name, dir }], keys: the
+  // cut rows' rowKey, faded until pasted }.
+  clip: null,
+  running: null,    // the change (or a paste's look) running: { token, op, what, text, progress }
+  result: null,     // the last one's result in the footer: { text, bad, title, until }
+  refusal: null,    // a refusal said while one runs, over its progress for a while: { text, until }
+  waits: new Map(), // token -> { done(msg), progress(msg) }: who takes the backend's answers
 };
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -268,6 +287,9 @@ function onSearchResult(msg) {
     state.cursor = state.hits.length ? 0 : -1;
   }
   state.anchor = state.cursor;
+  // The hits' servers' accounts, for the menus' greying (each asked once a session): an All
+  // servers search can hold hits of a server Browse hasn't opened.
+  for (const s of new Set(msg.hits.map(serverOf))) if (state.remotes.some((r) => r.name === s)) askAccount(s);
   // Before rendering: an empty result shows "No files matching …" from these.
   const n = msg.hits.length;
   const noun = `result${n === 1 ? '' : 's'}`;
@@ -332,7 +354,8 @@ function renderRows() {
     const date = fmtDate(h.modified);
     const age = now - h.modified;
     const dateTitle = date ? ` title="${fmtDate(h.modified, true)} · ${age >= 0 ? `${fmtAge(age)} ago` : `in ${fmtAge(-age)}`}"` : '';
-    html += `<div class="row${sel ? ' sel' : ''}${i === state.cursor ? ' cursor' : ''}${h.dir ? ' folder' : ''}" data-i="${i}">` +
+    const cut = ops.clip && ops.clip.keys.has(rowKey(h)); // faded until pasted
+    html += `<div class="row${sel ? ' sel' : ''}${i === state.cursor ? ' cursor' : ''}${h.dir ? ' folder' : ''}${cut ? ' cut' : ''}" data-i="${i}">` +
       `<input type="checkbox" tabindex="-1"${sel ? ' checked' : ''}${h.server ? ' disabled' : ''}>` +
       `<span class="name" title="${esc(h.path || h.name)}">${itemIcon(h.name, h.dir)}${esc(h.name)}</span>` +
       `<span class="size">${fmtSize(h.size)}</span>` +
@@ -1396,6 +1419,8 @@ function onBrowseResult(msg) {
   });
   // `ord`: the backend's order (folders first, A to Z), the default one.
   b.items = (msg.items || []).map((it, i) => ({ ...it, remote: msg.remote, ord: i }));
+  // Read-only or not, once a session per server: the menus grey what it refuses.
+  if (!msg.error) askAccount(msg.remote);
   if (!b.under) {
     showFolder({ keep: msg.update || b.keepSelection, select: b.pendingSelect });
     if (!msg.error && wasLoading) remember();
@@ -1862,6 +1887,7 @@ document.addEventListener('mouseup', (ev) => {
 }, true);
 $('#browse-refresh').addEventListener('click', () => {
   const b = state.browse;
+  if (b.server) askAccount(b.server, true); // read-only or not, asked again too
   if (b.server) browseTo(b.server, b.path, b.top, { live: true });
   else enterBrowse(); // the list of servers: built again
 });
@@ -1908,8 +1934,9 @@ $('#exact').addEventListener('click', () => {
 let menuItems = null;  // the open menu's entries
 let menuReturn = null; // where the focus goes back to
 
-// items: { label, act, key, disabled, checked } entries, '-' for a separator, { heading }.
-// `checked` true or false makes an entry one of a group (a check mark on the current one).
+// items: { label, act, key, disabled, checked, why, note } entries, '-' for a separator, { heading }.
+// `checked` true or false makes an entry one of a group (a check mark on the current one). A
+// greyed entry's `why` is its tooltip, `note` a few words of it beside its label.
 function showMenu(x, y, entries) {
   // Separators only between entries: none first, last or twice in a row (a finished download has
   // no actions before "Show in folder", say).
@@ -1922,13 +1949,20 @@ function showMenu(x, y, entries) {
   const menu = $('#menu');
   menuItems = items;
   menuReturn = document.activeElement;
+  // A heading (a read-only server's reason) describes the whole menu to a screen reader, and a
+  // greyed entry carries its own reason: the arrow keys never reach either.
+  const heading = items.findIndex((it) => it && it.heading);
+  if (heading >= 0) menu.setAttribute('aria-describedby', 'menu-heading');
+  else menu.removeAttribute('aria-describedby');
   menu.innerHTML = items.map((it, i) => {
     if (it === '-') return '<hr>';
-    if (it.heading) return `<div class="heading">${esc(it.heading)}</div>`;
+    if (it.heading) return `<div class="heading"${i === heading ? ' id="menu-heading"' : ''}>${esc(it.heading)}</div>`;
     const radio = it.checked !== undefined;
     return `<button type="button" role="${radio ? 'menuitemradio' : 'menuitem'}" data-i="${i}"` +
-      `${radio ? ` aria-checked="${it.checked}"` : ''}${it.disabled ? ' disabled' : ''}>` +
+      `${radio ? ` aria-checked="${it.checked}"` : ''}${it.disabled ? ' disabled' : ''}` +
+      `${it.disabled && it.why ? ` title="${esc(it.why)}" aria-description="${esc(it.why)}"` : ''}>` +
       `<span class="check">${it.checked ? '✓' : ''}</span><span class="text">${esc(it.label)}</span>` +
+      `${it.disabled && it.note ? `<span class="note">${esc(it.note)}</span>` : ''}` +
       `${it.key ? `<span class="key">${esc(it.key)}</span>` : ''}</button>`;
   }).join('');
   menu.hidden = false;
@@ -2025,6 +2059,8 @@ function resultMenu() {
   items.push({ label: 'Download to…', act: () => downloadTo(picks) });
   // In a folder the row is already where it lives.
   if (one && state.browse.under) items.push({ label: 'Open folder location', act: () => openHitFolder(one) });
+  // Changes on the server (SERVER-OPS.md): Cut, Copy, Paste, Rename, Delete.
+  items.push('-', ...changeEntries(picks, one));
   // Into one folder (UPLOADS.md 5.10); a search result says why not.
   if (opens) {
     items.push('-', ...uploadEntries(state.browse.server || one.remote, one.path,
@@ -2037,6 +2073,8 @@ function resultMenu() {
   items.push('-');
   items.push({ label: picks.length > 1 ? `Copy ${picks.length} paths` : 'Copy path', act: () => copyText(picks.map((h) => h.path)) });
   items.push({ label: picks.length > 1 ? `Copy ${picks.length} names` : 'Copy name', act: () => copyText(picks.map((h) => h.name)) });
+  const propsWhy = picks.length > 1 ? 'Properties shows one item at a time: pick one.' : '';
+  items.push('-', { label: 'Properties', key: 'Alt+Enter', disabled: !!propsWhy, why: propsWhy, act: () => rowProps(one) });
   return items;
 }
 
@@ -2078,10 +2116,22 @@ function uploadEntries(server, dir, why, name = '') {
   return [{ label: `Upload files ${where}…`, act: go(false) }, { label: `Upload folder ${where}…`, act: go(true) }];
 }
 
-// The open folder's menu, on the list's empty part.
+// The open folder's menu, on the list's empty part: Paste and New folder into it, its uploads, its
+// Properties.
 function folderMenu() {
   const b = state.browse;
-  return uploadEntries(b.server, b.path, uploadRefusal());
+  const items = [];
+  const readOnly = b.server && !b.under ? readOnlyWhy(b.server) : '';
+  if (readOnly) items.push({ heading: readOnly });
+  const here = hereWhy();
+  const paste = here ? { why: here, note: '' } : pasteWhy(b.server);
+  items.push({ label: 'Paste', key: 'Ctrl+V', disabled: !!paste, why: paste ? paste.why : '', note: paste ? paste.note : '',
+    act: () => pasteInto(b.server, b.path, browseHere()) });
+  items.push({ label: 'New folder…', key: 'Ctrl+Shift+N', disabled: !!here, why: here, act: () => newFolder() });
+  items.push('-', ...uploadEntries(b.server, b.path, uploadRefusal()));
+  const props = folderPropsWhy();
+  items.push('-', { label: 'Properties', key: 'Alt+Enter', disabled: !!props, why: props, act: () => folderProps() });
+  return items;
 }
 
 // The dialog's pick: its token, and the server folder. The backend opens Windows' file dialog,
@@ -2164,6 +2214,12 @@ const UP_CHOICES = [['replace', 'Replace'], ['different', 'Replace if different'
 const upChoiceName = (c) => (c === 'ask' ? 'Ask' : (UP_CHOICES.find(([k]) => k === c) || [c, c])[1]);
 const UP_KINDS = { same: 'the same', newer: 'newer here', older: 'older here', differs: 'another size', folder: 'a folder there' };
 const UP_EFFECTS = { replace: 'replaced', skip: 'skipped', both: 'second copy' };
+// The same question for a paste on the server (SERVER-OPS.md decision 4): the one copied or moved
+// against the one already there.
+const PASTE_KINDS = { ...UP_KINDS, newer: 'newer', older: 'older' };
+// How a file there is taken: a folder moved or copied onto a file of its name is never put in its
+// place, as a folder there isn't (server_files decide_whole).
+const clashKind = (f) => (f && f.fromDir ? 'folder' : f && f.kind);
 
 // What `choice` does to a file of `kind` (upload_existing.cpp decide): 'replace', 'skip' or
 // 'both'. A folder of that name there is never replaced.
@@ -2189,17 +2245,26 @@ function clashAnswer(c) {
   return { choice: c.forAll, overrides: Object.fromEntries(c.own), always: c.always };
 }
 
-// "37 already there: 30 the same, 5 newer here, 2 older here"
-function clashSummary(ex) {
-  const parts = [[ex.same, 'the same'], [ex.newer, 'newer here'], [ex.older, 'older here'], [ex.differs, 'of another size'],
+// "37 already there: 30 the same, 5 newer here, 2 older here" (a paste's: "5 newer, 2 older")
+function clashSummary(ex, paste = '') {
+  const parts = [[ex.same, 'the same'], [ex.newer, paste ? 'newer' : 'newer here'], [ex.older, paste ? 'older' : 'older here'], [ex.differs, 'of another size'],
     [ex.folders, ex.folders === 1 ? 'a folder there' : 'folders there']].filter(([n]) => n > 0).map(([n, w]) => `${fmtNum(n)} ${w}`);
   return `${fmtNum(ex.count)} already there${parts.length ? `: ${parts.join(', ')}` : ''}`;
 }
 
+// The names taken by kind as a choice meets them: a paste's folders onto a file of their name
+// (`foldersOntoFiles`, counted in their kinds too) taken out of their kinds, as 'folder' (never
+// replaced, as a folder there isn't).
+function clashKinds(ex) {
+  const o = ex.foldersOntoFiles || {};
+  const n = (k) => Math.max(0, (ex[k] || 0) - (o[k] || 0));
+  return { same: n('same'), newer: n('newer'), older: n('older'), differs: n('differs'), folder: (ex.folders || 0) + (o.count || 0) - (o.folders || 0) };
+}
+
 // How many a choice for all replaces, of every file there (not only those listed).
 function replacedBy(choice, ex) {
-  const n = (k) => ex[k] || 0;
-  return { replace: ex.count - n('folders'), different: n('newer') + n('older') + n('differs'), newer: n('newer'), skip: 0,
+  const k = clashKinds(ex);
+  return { replace: k.same + k.newer + k.older + k.differs, different: k.newer + k.older + k.differs, newer: k.newer, skip: 0,
     both: 0 }[choice];
 }
 
@@ -2209,15 +2274,16 @@ function clashOutcome(c) {
   const ex = c.ex;
   const files = ex.files || [];
   const tally = { replace: 0, skip: 0, both: 0 };
-  const rest = { same: ex.same || 0, newer: ex.newer || 0, older: ex.older || 0, differs: ex.differs || 0, folder: ex.folders || 0 };
+  const rest = clashKinds(ex);
   files.forEach((f, i) => {
-    tally[upEffect(c.own.get(i) || c.forAll, f.kind)]++;
-    if (rest[f.kind] > 0) rest[f.kind]--;
+    const kind = clashKind(f);
+    tally[upEffect(c.own.get(i) || c.forAll, kind)]++;
+    if (rest[kind] > 0) rest[kind]--;
   });
   for (const [kind, n] of Object.entries(rest)) tally[upEffect(c.forAll, kind)] += n;
   const parts = [];
   if (tally.replace) parts.push(`${fmtNum(tally.replace)} replaced`);
-  if (tally.both) parts.push(`${fmtNum(tally.both)} sent as a second copy (“name (2)”)`);
+  if (tally.both) parts.push(`${fmtNum(tally.both)} ${c.paste ? 'put beside as' : 'sent as a second copy'} (“name (2)”)`);
   if (tally.skip) parts.push(`${fmtNum(tally.skip)} skipped`);
   const none = tally.replace ? '' : `: nothing on ${c.server} is replaced`;
   return `${parts.join(', ')}${none}`;
@@ -2228,11 +2294,12 @@ function clashRow(c, f, i) {
   const when = (sec) => (fmtDate(sec) ? `<span class="muted">${esc(fmtDate(sec))}</span>` : '');
   const folder = f.kind === 'folder';
   const own = c.own.get(i) || '';
-  const options = [['', 'As for all'], ...UP_CHOICES.filter(([k]) => !folder || k === 'skip' || k === 'both')]
+  const options = [['', 'As for all'], ...UP_CHOICES.filter(([k]) => clashKind(f) !== 'folder' || k === 'skip' || k === 'both')]
     .map(([k, label]) => `<option value="${k}"${k === own ? ' selected' : ''}>${esc(label)}</option>`).join('');
-  const effect = upEffect(own || c.forAll, f.kind);
-  return `<tr data-i="${i}"><td><span class="up-file">${esc(f.name)}</span> <span class="up-kind k-${esc(f.kind)}">${esc(UP_KINDS[f.kind] || '')}</span></td>` +
-    `<td>${esc(fmtSize(f.mineSize))}<br>${when(f.mineModified)}</td>` +
+  const effect = upEffect(own || c.forAll, clashKind(f));
+  const kinds = c.paste ? PASTE_KINDS : UP_KINDS;
+  return `<tr data-i="${i}"><td><span class="up-file">${esc(f.name)}${f.fromDir ? '/' : ''}</span> <span class="up-kind k-${esc(f.kind)}">${esc(kinds[f.kind] || '')}</span></td>` +
+    `<td>${f.fromDir ? '<span class="muted">a folder</span>' : `${esc(fmtSize(f.mineSize))}<br>${when(f.mineModified)}`}</td>` +
     `<td>${folder ? '<span class="muted">a folder</span>' : `${esc(fmtSize(f.size))}<br>${when(f.modified)}`}</td>` +
     `<td><select data-i="${i}" aria-label="${esc(`What to do with ${f.name}`)}">${options}</select></td>` +
     `<td class="up-effect e-${effect}">${UP_EFFECTS[effect]}</td></tr>`;
@@ -2241,7 +2308,7 @@ function clashRow(c, f, i) {
 // The question (or, with a setting and no Change yet, the setting and Change).
 function clashHtml(c) {
   const ex = c.ex;
-  let html = `<section class="up-clash" aria-labelledby="up-clash-sum"><p id="up-clash-sum" class="up-existing">${esc(clashSummary(ex))}</p>`;
+  let html = `<section class="up-clash" aria-labelledby="up-clash-sum"><p id="up-clash-sum" class="up-existing">${esc(clashSummary(ex, c.paste))}</p>`;
   if (!c.open) {
     html += `<p class="up-setting">Files already there: <b>${esc(upChoiceName(c.setting))}</b> (your setting) · ` +
       '<button type="button" class="link" data-act="up-change" aria-expanded="false">Change</button></p>' +
@@ -2251,7 +2318,8 @@ function clashHtml(c) {
   html += '<fieldset class="up-all"><legend>For all of them</legend>';
   for (const [k, label] of UP_CHOICES) {
     const n = replacedBy(k, ex);
-    const what = k === 'skip' ? 'nothing replaced' : k === 'both' ? 'yours as “name (2)”' : n === 0 ? 'none replaced' : `${fmtNum(n)} replaced`;
+    const what = k === 'skip' ? 'nothing replaced' : k === 'both' ? `${c.paste ? 'this one' : 'yours'} as “name (2)”`
+      : n === 0 ? 'none replaced' : `${fmtNum(n)} replaced`;
     html += `<label><input type="radio" name="up-all" value="${k}"${k === c.forAll ? ' checked' : ''}> ${esc(label)}` +
       ` <span class="muted">${esc(what)}</span></label>`;
   }
@@ -2259,17 +2327,21 @@ function clashHtml(c) {
   const files = ex.files || [];
   if (files.length) {
     html += `<div class="up-clash-list"><table class="existing up-clashes" aria-label="${esc(`Files already on ${c.server}`)}">` +
-      '<thead><tr><th scope="col">Name</th><th scope="col">Yours</th><th scope="col">On the server</th>' +
+      `<thead><tr><th scope="col">Name</th><th scope="col">${c.paste ? (c.paste === 'copy' ? 'Copying' : 'Moving') : 'Yours'}</th>` +
+      `<th scope="col">${c.paste ? 'Already there' : 'On the server'}</th>` +
       '<th scope="col">What to do</th><th scope="col"><span class="sr-only">Then</span></th></tr></thead><tbody>' +
       files.map((f, i) => clashRow(c, f, i)).join('') + '</tbody></table></div>';
   }
   const more = ex.count - files.length;
   if (more > 0) html += `<p class="muted up-more">…and ${fmtNum(more)} more, which go as for all.</p>`;
   if (ex.folders) html += `<p class="muted up-more">A folder of that name there is never replaced: Replace skips it.</p>`;
-  html += `<p class="up-outcome" aria-live="polite">${esc(clashOutcome(c))}</p>` +
-    `<label class="up-always"><input type="checkbox" id="up-always"${c.always ? ' checked' : ''}> Always do this: ` +
-    `<span class="up-always-what">${esc(upChoiceName(c.forAll))}</span> without asking (Settings → Uploads)</label></section>`;
-  return html;
+  html += `<p class="up-outcome" aria-live="polite">${esc(clashOutcome(c))}</p>`;
+  // A paste has no setting to keep: it asks each time (SERVER-OPS.md decision 4).
+  if (!c.paste) {
+    html += `<label class="up-always"><input type="checkbox" id="up-always"${c.always ? ' checked' : ''}> Always do this: ` +
+      `<span class="up-always-what">${esc(upChoiceName(c.forAll))}</span> without asking (Settings → Uploads)</label>`;
+  }
+  return `${html}</section>`;
 }
 
 // A choice changed in the open question: what it does is said again where it shows.
@@ -2293,7 +2365,7 @@ function onClashChange(ev) {
   const files = c.ex.files || [];
   for (const td of document.querySelectorAll('#modal-body .up-clashes td.up-effect')) {
     const i = Number(td.parentElement.dataset.i);
-    const effect = upEffect(c.own.get(i) || c.forAll, files[i] && files[i].kind);
+    const effect = upEffect(c.own.get(i) || c.forAll, clashKind(files[i]));
     td.className = `up-effect e-${effect}`;
     td.textContent = UP_EFFECTS[effect];
   }
@@ -2421,6 +2493,836 @@ function localPath(q, st, i) {
   const base = q.local || `${q.dest.replace(/[\\/]+$/, '')}\\${q.name}`;
   if (!st) return base;
   return `${base}\\${st.local.get(i) || st.path[i].replace(/\//g, '\\')}`;
+}
+
+// ---- Browse's changes on a server (SERVER-OPS.md, chunk 2) -------------------------------------
+// Right-click entries and Explorer's keys on Browse rows and search results (each carries its
+// server and path): Cut, Copy and Paste (a move or copy by the server itself, same server only),
+// Rename (F2), Delete (Del, after a confirmation), New folder (Ctrl+Shift+N) and Properties
+// (Alt+Enter). A server whose statvfs says read-only (Box.Guest) greys every change, saying why;
+// elsewhere grab tries, and says the server's refusal. Cut and Copy fill the page's own clipboard:
+// cut rows fade until pasted, the footer says what it holds, Esc clears it, a move empties it and a
+// copy keeps it for more pastes. One change at a time: its progress in the footer with Cancel,
+// then a short result there. Rename and New folder keep their name box open for a name taken.
+
+const OPS_RESULT_MS = 8000;  // a result stays in the footer this long
+const OPS_ERROR_MS = 20000;  // a refusal or failure longer
+const OPS_SHOWN = 5;         // names a dialog lists, at most
+
+const serverOf = (h) => h.remote || state.browse.server;
+const baseName = (path) => path.slice(path.lastIndexOf('/') + 1);
+// "holiday", or "3 items": what a change of `items` ({ name }) is called.
+const itemsName = (items) => (items.length === 1 ? items[0].name : `${fmtNum(items.length)} items`);
+const serverPlace = (server, dir) => `${server}:${dir || '~'}`;
+
+// Browse opened `server` (Refresh: `again`): its account, once a session, for the menus' greying.
+function askAccount(server, again = false) {
+  if (!server || ops.asking.has(server) || (ops.accounts.has(server) && !again)) return;
+  ops.asking.add(server);
+  send({ type: 'filesAccount', server, again });
+}
+
+function onFilesAccount(msg) {
+  ops.asking.delete(msg.server);
+  if (msg.error) ops.accounts.delete(msg.server); // asked again the next time Browse opens it
+  else ops.accounts.set(msg.server, { readOnly: !!msg.readOnly, free: msg.free ?? null });
+}
+
+// Why nothing may change on `server`, or '': statvfs says its file system is read-only for this
+// account (upload::refusal's words).
+function readOnlyWhy(server) {
+  const a = ops.accounts.get(server);
+  return a && a.readOnly ? `${server} is read-only for this account` : '';
+}
+
+// Why another change can't start now, or '': one runs (the backend refuses a second too).
+function opsBusyWhy() {
+  return ops.running ? `${ops.running.what} is still going: wait until it ends, or cancel it first` : '';
+}
+
+// Why the picked rows can't be cut, renamed or deleted, or '': rows of one server it may change.
+function changeWhy(picks) {
+  if (!picks.length) return 'Pick a file or folder first.';
+  if (new Set(picks.map(serverOf)).size > 1) return 'Pick items of one server at a time.';
+  return readOnlyWhy(serverOf(picks[0]));
+}
+
+// Why nothing can go into the open folder (a paste, a new folder), or '': one folder of one server,
+// open, listed, and writable.
+function hereWhy() {
+  const b = state.browse;
+  if (!b.server) return 'Open a folder of a server first.';
+  if (b.under) return 'Search results aren’t a folder: close the search (Esc) first.';
+  if (b.loading) return `${browseHere()} is still opening.`;
+  if (b.top && b.severalRoots && !b.uploadable) return 'This is the list of the server’s search roots, not a folder: open one of them first.';
+  if (b.error || !b.uploadable) return `Nothing can go into ${browseHere()} now.`;
+  return readOnlyWhy(b.server);
+}
+
+// Why the clipboard can't be pasted on `server`, with a few words of it for the greyed entry; null
+// when it can.
+function pasteWhy(server) {
+  const c = ops.clip;
+  if (!c) return { why: 'Nothing to paste: Cut or Copy files or folders first.', note: 'nothing cut or copied' };
+  if (c.server !== server) {
+    return { why: `Not yet: copies between servers. What you cut or copied is on ${c.server}: paste it in a folder of ${c.server}.`,
+      note: 'not yet: copies between servers' };
+  }
+  const readOnly = readOnlyWhy(server);
+  return readOnly ? { why: readOnly, note: 'read-only' } : null;
+}
+
+// Cut, Copy, Paste, Rename and Delete for the menu of the rows `picks` (`one`: the only one).
+function changeEntries(picks, one) {
+  const b = state.browse;
+  const why = changeWhy(picks);
+  const readOnly = readOnlyWhy(serverOf(picks[0]));
+  const mixed = new Set(picks.map(serverOf)).size > 1 ? 'Pick items of one server at a time.' : '';
+  const items = [];
+  if (readOnly) items.push({ heading: readOnly });
+  items.push({ label: 'Cut', key: 'Ctrl+X', disabled: !!why, why, act: () => holdRows('cut', picks) });
+  items.push({ label: 'Copy', key: 'Ctrl+C', disabled: !!mixed, why: mixed, act: () => holdRows('copy', picks) });
+  // Paste: into a folder row (one you have open, not a search result), else into the open folder,
+  // named so it isn't taken for the row's (a folder whose rows fill the list has no empty part).
+  if (one && one.dir) {
+    const p = b.under ? { why: 'Paste goes into a folder you have open, not into search results: open this folder first.', note: 'open it first' }
+      : pasteWhy(serverOf(one));
+    items.push({ label: 'Paste', key: '', disabled: !!p, why: p ? p.why : '', note: p ? p.note : '', act: () => pasteInto(serverOf(one), one.path, one.name) });
+  } else if (b.server && !b.under) {
+    const here = hereWhy();
+    const p = here ? { why: here, note: '' } : pasteWhy(b.server);
+    items.push({ label: `Paste into ${browseHere()}`, key: 'Ctrl+V', disabled: !!p, why: p ? p.why : '', note: p ? p.note : '',
+      act: () => pasteInto(b.server, b.path, browseHere()) });
+  }
+  items.push('-');
+  const renameWhy = why || (picks.length > 1 ? 'Rename one item at a time.' : '');
+  items.push({ label: 'Rename…', key: 'F2', disabled: !!renameWhy, why: renameWhy, act: () => renameRow(picks[0]) });
+  items.push({ label: picks.length > 1 ? `Delete ${picks.length}…` : 'Delete…', key: 'Del', disabled: !!why, why, act: () => deleteRows(picks) });
+  return items;
+}
+
+// ---- the clipboard ----
+
+// Cut or Copy: the rows are held for a paste on their server (one server at a time).
+function holdRows(op, picks) {
+  const why = op === 'cut' ? changeWhy(picks) : (new Set(picks.map(serverOf)).size > 1 ? 'Pick items of one server at a time.' : '');
+  if (!picks.length || why) {
+    opsSay(why || 'Pick a file or folder first.', true);
+    return;
+  }
+  const server = serverOf(picks[0]);
+  ops.clip = { server, op, items: picks.map((h) => ({ path: h.path, name: h.name, dir: !!h.dir })),
+    keys: new Set(op === 'cut' ? picks.map((h) => `${server}|${h.path}`) : []) };
+  renderClip();
+  renderRows();
+}
+
+function clearClip() {
+  if (!ops.clip) return;
+  ops.clip = null;
+  renderClip();
+  renderRows();
+}
+
+// The footer's hint: "2 items ready to paste · Esc clears", the names and what Paste does on hover.
+function renderClip() {
+  const el = $('#clip');
+  const c = ops.clip;
+  el.hidden = !c;
+  if (!c) {
+    el.textContent = '';
+    el.title = '';
+    return;
+  }
+  const n = c.items.length;
+  el.textContent = `${n === 1 ? '1 item' : `${fmtNum(n)} items`} ready to paste · Esc clears`;
+  const names = c.items.slice(0, 10).map((i) => i.name).join(', ') + (n > 10 ? ` and ${fmtNum(n - 10)} more` : '');
+  el.title = bidiVisible(`${c.op === 'cut' ? 'Cut' : 'Copied'} on ${c.server}: ${names}. Paste (Ctrl+V) in a folder of ${c.server} ` +
+    `${c.op === 'cut' ? 'moves' : 'copies'} ${n === 1 ? 'it' : 'them'} there.`);
+}
+
+// ---- the footer's line: the change running, then its result ----
+
+function setRunning(r) {
+  ops.running = r;
+  ops.result = null;
+  ops.refusal = null;
+  renderOps();
+}
+
+function endRunning(token) {
+  if (!ops.running || ops.running.token !== token) return;
+  ops.running = null;
+  ops.refusal = null;
+  renderOps();
+}
+
+// A result or refusal in the footer, for a while (`title`: more on hover). A refusal while a
+// change or look runs (another change asked for meanwhile) shows over its progress for a while;
+// the progress comes back after it (the browse bar's flash hides while the list refreshes).
+function opsSay(text, bad = false, title = '') {
+  if (bad && ops.running) {
+    ops.refusal = { text, until: Date.now() + OPS_RESULT_MS };
+    renderOps();
+    setTimeout(renderOps, OPS_RESULT_MS + 50);
+    return;
+  }
+  const ms = bad ? OPS_ERROR_MS : OPS_RESULT_MS;
+  ops.result = { text, bad, title, until: Date.now() + ms };
+  renderOps();
+  setTimeout(renderOps, ms + 50);
+}
+
+// "1.2 of 3.4 GiB": the bytes done in the unit of their total.
+function fmtSizeOf(done, total) {
+  if (total < 1024) return `${done} of ${total} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let d = done / 1024, t = total / 1024, u = 0;
+  while (t >= 1024 && u < units.length - 1) { d /= 1024; t /= 1024; ++u; }
+  return `${d.toFixed(1)} of ${t.toFixed(1)} ${units[u]}`;
+}
+
+// What the change running says now: "Copying holiday to Main:/srv · 1.2 of 3.4 GiB", "Deleting
+// 1,204 of 2,000 files".
+function runningText(r) {
+  const p = r.progress;
+  if (r.op === 'delete' && p && p.totalFiles > 0) return `Deleting ${fmtNum(p.files)} of ${counted(p.totalFiles, 'file')}`;
+  if (r.op === 'copy' && p && p.totalBytes > 0) return `${r.text} · ${fmtSizeOf(p.bytes, p.totalBytes)}`;
+  if (r.op === 'copy' && p && p.totalFiles > 0) return `${r.text} · ${fmtNum(p.files)} of ${counted(p.totalFiles, 'file')}`;
+  return `${r.text}…`;
+}
+
+function renderOps() {
+  const el = $('#ops');
+  const r = ops.running;
+  const res = !r && ops.result && ops.result.until > Date.now() ? ops.result : null;
+  const no = r && ops.refusal && ops.refusal.until > Date.now() ? ops.refusal : null;
+  el.hidden = !r && !res;
+  el.classList.toggle('bad', (!!res && res.bad) || !!no);
+  el.classList.toggle('running', !!r);
+  $('#ops-cancel').hidden = !r;
+  const text = no ? no.text : r ? runningText(r) : res ? res.text : '';
+  const shown = bidiVisible(text);
+  if ($('#ops-text').textContent !== shown) $('#ops-text').textContent = shown;
+  el.title = bidiVisible(no ? `${no.text}\n${runningText(r)}` : r ? text : res ? [res.text, res.title].filter(Boolean).join('\n') : '');
+}
+
+// Cancel stops the change running. A paste's look is only a look: its answer is dropped at once
+// (one crossing the Cancel then starts nothing) and nothing changed.
+$('#ops-cancel').addEventListener('click', () => {
+  const r = ops.running;
+  if (!r) return;
+  if (r.op === 'look') {
+    dropAsk(r.token);
+    endRunning(r.token);
+    opsSay('Paste cancelled: nothing changed');
+    return;
+  }
+  send({ type: 'filesCancel', token: r.token });
+});
+
+function onFilesDone(msg) {
+  const w = ops.waits.get(msg.token);
+  if (!w) return;
+  ops.waits.delete(msg.token);
+  w.done(msg);
+}
+
+function onFilesProgress(msg) {
+  const w = ops.waits.get(msg.token);
+  if (w && w.progress) w.progress(msg);
+  if (ops.running && ops.running.token === msg.token) {
+    ops.running.progress = msg;
+    renderOps();
+  }
+}
+
+// A task's answers go to `done` (and `progress`); its token.
+function filesAsk(msg, done, progress = null) {
+  const token = ++ops.token;
+  ops.waits.set(token, { done, progress });
+  send({ ...msg, token });
+  return token;
+}
+
+// A dialog's task no longer wanted: stopped, its answer dropped.
+function dropAsk(token) {
+  if (!token || !ops.waits.has(token)) return;
+  ops.waits.delete(token);
+  send({ type: 'filesCancel', token });
+}
+
+// ---- what a change did ----
+
+// "1,204 files and 25 folders", "nothing".
+function filesAndFolders(files, folders) {
+  return [files ? counted(files, 'file') : '', folders ? counted(folders, 'folder') : ''].filter(Boolean).join(' and ') || 'nothing';
+}
+
+// The result of a move, copy or delete (`msg`: the backend's report) in a line: what it did, what
+// it skipped or couldn't do with the first reason, why it ended early; every entry on hover.
+function reportText(op, msg, job) {
+  const done = filesAndFolders(msg.files, msg.folders);
+  const to = job ? ` to ${serverPlace(job.server, job.dir)}` : '';
+  let text;
+  if (msg.error) {
+    // A delete's says what went and what is left; a copy's or move's gets what it did first.
+    text = op !== 'delete' && (msg.files || msg.folders) ? `${msg.error} (${done} ${op === 'copy' ? 'copied' : 'moved'} first)` : msg.error;
+  } else if (msg.stopped) {
+    const verb = { copy: 'Copy', move: 'Move', delete: 'Delete' }[op];
+    const did = { copy: 'copied', move: 'moved', delete: 'deleted' }[op];
+    text = `${verb} cancelled: ${done} ${did}${op === 'delete' && msg.left ? `, ${fmtNum(msg.left)} still there` : ''}`;
+  } else if (op === 'delete') {
+    text = `Deleted ${done}`;
+  } else if (op === 'copy') {
+    text = `Copied ${done}${msg.bytes ? ` (${fmtSize(msg.bytes)})` : ''}${to}`;
+  } else {
+    text = job && job.paths.length === 1 && msg.files + msg.folders === 1 ? `Moved ${job.clip.items[0].name}${to}` : `Moved ${done}${to}`;
+  }
+  const entries = msg.entries || [];
+  const first = (state) => entries.find((e) => e.state === state);
+  const said = (state, n) => {
+    const e = first(state);
+    return `; ${counted(n, 'item')} ${state}${e ? `: ${baseName(e.from)}: ${e.why}` : ''}`;
+  };
+  if (msg.skipped) text += said('skipped', msg.skipped);
+  if (msg.failed) text += said('failed', msg.failed);
+  const more = msg.skipped + msg.failed - entries.length;
+  const title = entries.map((e) => `${e.from}: ${e.state}, ${e.why}`).join('\n') + (more > 0 ? `\n…and ${fmtNum(more)} more` : '');
+  return { text, title, bad: !!msg.error || msg.failed > 0 };
+}
+
+// After a change on `server`: search results drop what went (`gone`, each with all below it) and
+// show what was renamed (`renamed`: [from, to]) by its new name. Browse's own folder comes again
+// from the backend (files_changed).
+function afterChange(server, gone, renamed = []) {
+  if (!state.browse.under) return;
+  const at = (p, g) => p === g || p.startsWith(g.endsWith('/') ? g : `${g}/`);
+  const before = state.results.length;
+  state.results = state.results.filter((h) => serverOf(h) !== server || !gone.some((g) => at(h.path, g)));
+  let changed = state.results.length !== before;
+  for (const [from, to] of renamed) {
+    for (const h of state.results) {
+      if (serverOf(h) !== server || !at(h.path, from)) continue;
+      h.path = to + h.path.slice(from.length);
+      if (h.path === to) h.name = baseName(to);
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  state.filterTotal = state.results.length;
+  refilter();
+}
+
+// ---- paste ----
+
+// The clipboard into `dir` of `server` (`name`: the folder's, for the words): the names taken
+// there looked at first; none, it goes at once (a name taken meanwhile is skipped); else the
+// uploads' question, relabelled, starting on Skip.
+function pasteInto(server, dir, name) {
+  const p = pasteWhy(server);
+  const why = (p && p.why) || opsBusyWhy();
+  if (why) {
+    opsSay(why, true);
+    return;
+  }
+  const c = ops.clip;
+  const job = { op: c.op === 'cut' ? 'move' : 'copy', server, dir, name, clip: c, paths: c.items.map((i) => i.path) };
+  const token = filesAsk({ type: 'filesLook', server, op: job.op, paths: job.paths, dir }, (msg) => onPasteLook(job, msg));
+  setRunning({ token, op: 'look', what: `Looking at ${itemsName(c.items)}`, text: `Looking at ${itemsName(c.items)} and ${name}` });
+}
+
+function onPasteLook(job, msg) {
+  endRunning(msg.token);
+  if (msg.stopped) {
+    opsSay('Paste cancelled: nothing changed');
+    return;
+  }
+  if (msg.error) {
+    opsSay(msg.error, true);
+    return;
+  }
+  const ex = msg.existing || { count: 0 };
+  if (!ex.count) {
+    startPaste(job, 'skip', []);
+    return;
+  }
+  const c = clashState(ex, job.server, 'ask');
+  c.paste = job.op;
+  for (const f of ex.files || []) f.fromDir = job.clip.items.some((i) => i.dir && i.path === f.from);
+  const verb = job.op === 'copy' ? 'Copy' : 'Move';
+  const counts = msg.folders ? `${filesAndFolders(msg.files, 0)} in ${counted(msg.folders, 'folder')}` : filesAndFolders(msg.files, 0);
+  showModal({
+    title: `${verb} ${itemsName(job.clip.items)} to ${serverPlace(job.server, job.dir)}`,
+    html: `<p>${esc(`${job.op === 'copy' ? 'Copying' : 'Moving'} ${counts}${job.op === 'copy' && msg.bytes ? `, ${fmtSize(msg.bytes)}` : ''}.`)} ` +
+      `${esc(job.server)} has some of these names in ${esc(job.name)} already: choose what happens to them.</p>` + clashHtml(c),
+    ok: verb,
+    wide: true,
+    onOk: () => startPaste(job, c.forAll, [...c.own].map(([i, choice]) => ({ from: ex.files[i].from, to: ex.files[i].to, choice }))),
+    onCancel: () => opsSay('Paste cancelled: nothing changed'),
+  });
+  modal.clash = c;
+}
+
+function startPaste(job, choice, own) {
+  const token = filesAsk({ type: 'filesPaste', server: job.server, op: job.op, paths: job.paths, dir: job.dir, choice, own },
+    (msg) => onPasteDone(job, msg));
+  const verb = job.op === 'copy' ? 'Copying' : 'Moving';
+  setRunning({ token, op: job.op, what: `${verb} ${itemsName(job.clip.items)}`,
+    text: `${verb} ${itemsName(job.clip.items)} to ${serverPlace(job.server, job.dir)}` });
+}
+
+function onPasteDone(job, msg) {
+  endRunning(msg.token);
+  if (msg.ok === undefined) { // refused before anything was looked at
+    opsSay(msg.error, true);
+    return;
+  }
+  const r = reportText(job.op, msg, job);
+  if (job.op === 'move') {
+    // Moved: what left its place goes from the results; a move that ran to its end empties the
+    // clipboard (what it skipped stays where it was).
+    afterChange(job.server, msg.moved || []);
+    if (msg.ok && ops.clip === job.clip) clearClip();
+  }
+  opsSay(r.text, r.bad, r.title);
+}
+
+// ---- rename and new folder ----
+
+// Why `name` can't be a file's or folder's name on the server, or '' (server_files::bad_name: '／'
+// is a '/' there, '␀' a NUL, '．' a '.', unless quoted by ‛).
+function badName(name) {
+  const raw = name.replace(/‛./gu, 'q').replace(/／/g, '/').replace(/␀/g, '\0').replace(/．/g, '.');
+  if (!name) return 'A name can’t be empty.';
+  if (raw === '.' || raw === '..') return `“${raw}” can’t be a name.`;
+  if (raw.includes('/')) return 'A name can’t hold a /.';
+  if (raw.includes('\0')) return 'A name can’t hold a NUL character.';
+  return '';
+}
+
+// The small dialog with a name box: bad names said as they are typed; OK (or Enter) sends
+// `message(name)`; a name taken or a refusal keeps it open and says so; Esc cancels. `after(msg)`
+// once the backend did it.
+function nameDialog({ title, ok, value, select, message, after }) {
+  const d = { token: 0 };
+  showModal({
+    title,
+    ok,
+    stay: true,
+    html: '<div class="fo-name"><label for="fo-name">Name</label>' +
+      '<input id="fo-name" type="text" spellcheck="false" autocomplete="off" aria-describedby="fo-why">' +
+      '<div id="fo-why" class="fo-why" role="alert"></div></div>',
+    onOk: () => {
+      if (d.token) return; // its answer is on its way
+      const name = $('#fo-name').value;
+      const why = badName(name);
+      if (why) {
+        showNameWhy(why);
+        return;
+      }
+      if (name === value && ok === 'Rename') { // the same name: nothing to do
+        dropModal();
+        return;
+      }
+      const busy = opsBusyWhy();
+      if (busy) {
+        showNameWhy(busy);
+        return;
+      }
+      $('#modal-ok').disabled = true;
+      $('#fo-name').disabled = true;
+      d.token = filesAsk(message(name), (msg) => {
+        d.token = 0;
+        const mine = modal && modal.name === d;
+        if (msg.ok) {
+          if (mine) dropModal();
+          after(msg);
+          return;
+        }
+        if (!mine) {
+          opsSay(msg.taken || msg.error, true);
+          return;
+        }
+        $('#fo-name').disabled = false;
+        showNameWhy(msg.taken || msg.error);
+        $('#fo-name').focus();
+        $('#fo-name').select();
+      });
+    },
+    onCancel: () => { d.token = 0; },
+  });
+  modal.name = d;
+  const input = $('#fo-name');
+  input.value = value;
+  input.focus();
+  input.setSelectionRange(0, select);
+  $('#modal-ok').disabled = !!badName(value);
+}
+
+function showNameWhy(why) {
+  const el = $('#fo-why');
+  if (!el) return;
+  el.textContent = bidiVisible(why || '');
+  $('#modal-ok').disabled = !!why;
+}
+
+$('#modal-body').addEventListener('input', (ev) => {
+  if (ev.target.id !== 'fo-name') return;
+  showNameWhy(badName(ev.target.value));
+});
+$('#modal-body').addEventListener('keydown', (ev) => {
+  if (ev.target.id !== 'fo-name' || ev.key !== 'Enter') return;
+  ev.preventDefault();
+  if (!$('#modal-ok').disabled) $('#modal-ok').click();
+});
+
+function renameRow(h) {
+  const why = changeWhy(h ? [h] : []) || opsBusyWhy();
+  if (why) {
+    opsSay(why, true);
+    return;
+  }
+  const server = serverOf(h);
+  const dot = h.dir ? -1 : h.name.lastIndexOf('.');
+  nameDialog({
+    title: `Rename ${h.name}`,
+    ok: 'Rename',
+    value: h.name,
+    select: dot > 0 ? dot : h.name.length, // a file's name without its extension, as Explorer picks it
+    message: (name) => ({ type: 'filesRename', server, path: h.path, name }),
+    after: (msg) => {
+      afterChange(server, [], [[h.path, msg.path]]);
+      const b = state.browse;
+      if (!b.under && b.server === server) b.pendingSelect = msg.path; // picked once the folder comes again
+      if (ops.clip && ops.clip.server === server && ops.clip.items.some((i) => i.path === h.path)) clearClip();
+      opsSay(`Renamed ${h.name} to ${baseName(msg.path)}`);
+    },
+  });
+}
+
+// A name for a new folder in the open folder no row has: "New folder", "New folder (2)", ...
+function freeFolderName() {
+  const taken = new Set(state.browse.items.map((it) => it.name));
+  let name = 'New folder';
+  for (let n = 2; taken.has(name); ++n) name = `New folder (${n})`;
+  return name;
+}
+
+function newFolder() {
+  const b = state.browse;
+  const why = hereWhy() || opsBusyWhy();
+  if (why) {
+    opsSay(why, true);
+    return;
+  }
+  const server = b.server;
+  const dir = b.path;
+  const name = freeFolderName();
+  nameDialog({
+    title: `New folder in ${browseHere()}`,
+    ok: 'Create',
+    value: name,
+    select: name.length,
+    message: (n) => ({ type: 'filesMkdir', server, dir, name: n }),
+    after: (msg) => {
+      const shown = state.browse;
+      if (!shown.under && shown.server === server && shown.path === dir) shown.pendingSelect = msg.path;
+      opsSay(`Made the folder ${baseName(msg.path)} in ${serverPlace(server, dir)}`);
+    },
+  });
+}
+
+// ---- delete ----
+
+// The confirmation: what goes (files, folders, the total size, the first names), for good; a red
+// Delete, the focus on Cancel. With folders, the backend counts them first (with Cancel), and
+// refuses a path a transfer or Play uses before anything is asked.
+function deleteRows(picks) {
+  const why = changeWhy(picks) || opsBusyWhy();
+  if (why) {
+    opsSay(why, true);
+    return;
+  }
+  const server = serverOf(picks[0]);
+  const d = { server, picks, counting: picks.some((h) => h.dir), counts: null, progress: null, error: '', token: 0 };
+  if (!d.counting) d.counts = { files: picks.length, folders: 0, links: 0, bytes: picks.reduce((n, h) => n + (h.size || 0), 0), unreadableCount: 0 };
+  showModal({
+    title: picks.length === 1 ? `Delete ${picks[0].name}?` : `Delete ${fmtNum(picks.length)} items?`,
+    html: deleteHtml(d),
+    ok: 'Delete',
+    danger: true,
+    onOk: () => startDelete(d),
+    onCancel: () => dropAsk(d.token),
+  });
+  modal.del = d;
+  $('#modal-ok').disabled = d.counting;
+  if (!d.counting) return;
+  d.token = filesAsk({ type: 'filesSize', server, paths: picks.map((h) => h.path), check: true }, (msg) => {
+    d.token = 0;
+    d.counting = false;
+    if (msg.error) d.error = msg.error;
+    else d.counts = msg;
+    showDelete(d);
+  }, (msg) => {
+    d.progress = msg;
+    showDelete(d);
+  });
+}
+
+function showDelete(d) {
+  if (!modal || modal.del !== d) return;
+  $('#modal-body').innerHTML = deleteHtml(d);
+  $('#modal-ok').disabled = d.counting || !!d.error || !d.counts || d.counts.unreadableCount > 0;
+}
+
+function deleteHtml(d) {
+  const shown = d.picks.slice(0, OPS_SHOWN);
+  let html = '<div class="fo-del">' +
+    `<p>${esc(`From ${d.server}, for good: a server has no Recycle Bin to bring ${d.picks.length === 1 ? 'it' : 'them'} back from.`)}</p>` +
+    '<ul class="up-what">' + shown.map((h) => `<li>${itemIcon(h.name, h.dir)}<span class="up-name">${esc(h.name)}${h.dir ? '/' : ''}</span>` +
+      `<span class="muted">${h.dir ? '' : esc(fmtSize(h.size))}</span></li>`).join('');
+  if (d.picks.length > OPS_SHOWN) html += `<li class="muted">…and ${fmtNum(d.picks.length - OPS_SHOWN)} more</li>`;
+  html += '</ul>';
+  if (d.error) {
+    html += `<p class="up-bad">${esc(d.error)}</p>`;
+  } else if (d.counting) {
+    const p = d.progress;
+    html += `<p class="fo-counts muted"><span class="spinner"></span>Counting what is in ${d.picks.length === 1 ? 'the folder' : 'the folders'}…` +
+      `${p && p.files ? ` ${esc(counted(p.files, 'file'))} so far` : ''}</p>`;
+  } else {
+    const c = d.counts;
+    const parts = [c.files ? counted(c.files, 'file') : '', c.links ? counted(c.links, 'link') : '', c.folders ? counted(c.folders, 'folder') : '']
+      .filter(Boolean);
+    const what = parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0] || 'nothing';
+    html += `<p class="fo-counts"><b>${esc(what)}</b>${c.bytes ? ` · ${esc(fmtSize(c.bytes))}` : ''}</p>`;
+    if (c.unreadableCount > 0) {
+      html += `<p class="up-warn">${esc(`${counted(c.unreadableCount, 'folder')} below can’t be read, so nothing would be deleted: ` +
+        `${(c.unreadable || [])[0] || ''}`)}</p>`;
+    }
+  }
+  return `${html}</div>`;
+}
+
+function startDelete(d) {
+  const busy = opsBusyWhy();
+  if (busy) {
+    opsSay(busy, true);
+    return;
+  }
+  const paths = d.picks.map((h) => h.path);
+  const token = filesAsk({ type: 'filesDelete', server: d.server, paths }, (msg) => {
+    endRunning(msg.token);
+    if (msg.ok === undefined) { // refused before anything was looked at
+      opsSay(msg.error, true);
+      return;
+    }
+    afterChange(d.server, msg.ok ? paths : []);
+    if (ops.clip && ops.clip.server === d.server && ops.clip.items.some((i) => paths.includes(i.path))) clearClip();
+    const r = reportText('delete', msg);
+    opsSay(r.text, r.bad, r.title);
+  });
+  setRunning({ token, op: 'delete', what: `Deleting ${itemsName(d.picks)}`, text: `Deleting ${itemsName(d.picks)}` });
+}
+
+// ---- Properties ----
+
+const KIND_WORD = { file: 'File', folder: 'Folder', link: 'Link', other: 'Other (a device, socket or pipe)' };
+
+// "rwxr-xr-x" from a mode's permission bits (set-id and sticky as ls shows them).
+function rwx(mode) {
+  const letters = 'rwxrwxrwx';
+  const s = [...letters].map((c, i) => (mode & (1 << (8 - i)) ? c : '-'));
+  if (mode & 0o4000) s[2] = mode & 0o100 ? 's' : 'S';
+  if (mode & 0o2000) s[5] = mode & 0o010 ? 's' : 'S';
+  if (mode & 0o1000) s[8] = mode & 0o001 ? 't' : 'T';
+  return s.join('');
+}
+
+function rowProps(h) {
+  if (!h || h.server) return;
+  showProps(serverOf(h), h.path, h.name);
+}
+
+// Why the open folder has no Properties, or ''.
+function folderPropsWhy() {
+  const b = state.browse;
+  if (!b.server) return 'Open a folder of a server first.';
+  if (b.under) return 'Search results aren’t a folder: close the search (Esc) first.';
+  if (b.top && b.severalRoots && !b.uploadable) return 'This is the list of the server’s search roots, not a folder: open one of them first.';
+  return '';
+}
+
+function folderProps() {
+  const why = folderPropsWhy();
+  if (why) {
+    opsSay(why, true);
+    return;
+  }
+  showProps(state.browse.server, state.browse.path, browseHere());
+}
+
+// The read-only dialog: name, where, type, size, times, permissions, owner and group, a link's
+// target, the server's free space; a folder's size and a file's MD5 or SHA-256 on buttons, each
+// with its progress and Cancel.
+function showProps(server, path, name) {
+  const p = { server, path, name, data: null, error: '', task: null, size: null, md5: null, sha256: null, token: 0 };
+  showModal({ title: `Properties of ${name}`, html: propsHtml(p), ok: 'Close', cancel: null, onOk: () => endProps(p), onCancel: () => endProps(p) });
+  modal.props = p;
+  p.token = filesAsk({ type: 'filesProps', server, path }, (msg) => {
+    p.token = 0;
+    if (msg.error) p.error = msg.error;
+    else p.data = msg;
+    showPropsAgain(p);
+  });
+}
+
+function endProps(p) {
+  dropAsk(p.token);
+  if (p.task) dropAsk(p.task.token);
+}
+
+function showPropsAgain(p) {
+  if (!modal || modal.props !== p) return;
+  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.act : '';
+  $('#modal-body').innerHTML = propsHtml(p);
+  const again = focused && $(`#modal-body [data-act="${focused}"]`);
+  (again && !again.disabled ? again : $('#modal-ok')).focus();
+}
+
+function propsHtml(p) {
+  const row = (label, value) => `<tr><th scope="row">${esc(label)}</th><td>${value}</td></tr>`;
+  let html = '<table class="fo-props"><tbody>' + row('Name', `<span class="fo-text">${esc(p.name)}</span>`) +
+    row('Where', `<span class="fo-text">${esc(serverPlace(p.server, p.path))}</span>`);
+  if (p.error) return `${html}</tbody></table><p class="up-bad">${esc(p.error)}</p>`;
+  const d = p.data;
+  if (!d) return `${html}</tbody></table><p class="muted"><span class="spinner"></span>Looking at it on ${esc(p.server)}…</p>`;
+  const t = d.target;
+  const file = d.kind === 'file' || (d.kind === 'link' && t && t.kind === 'file');
+  html += row('Type', esc(d.kind === 'link' ? `Link to ${t ? (t.kind === 'folder' ? 'a folder' : t.kind === 'file' ? 'a file' : 'something else') : 'nothing (its target is gone)'}`
+    : KIND_WORD[d.kind] || d.kind));
+  if (d.kind === 'link') html += row('Points to', `<span class="fo-text">${esc(d.link || '')}</span>`);
+  const bytes = d.kind === 'link' ? t && t.size : d.size;
+  if (file && bytes != null) html += row('Size', esc(`${fmtSize(bytes)} (${fmtNum(bytes)} bytes)`));
+  if (d.kind === 'folder') html += row('Size', sizeCell(p));
+  if (d.modified) html += row('Modified', esc(fmtDate(d.modified, true)));
+  if (d.accessed) html += row('Accessed', esc(fmtDate(d.accessed, true)));
+  if (d.mode != null) html += row('Permissions', `<code>${esc(rwx(d.mode))}</code> <span class="muted">${(d.mode & 0o7777).toString(8).padStart(3, '0')}</span>`);
+  if (d.owner) html += row('Owner', esc(d.owner));
+  if (d.group) html += row('Group', esc(d.group));
+  if (file) html += row('Checksums', sumCell(p, 'md5', 'MD5') + sumCell(p, 'sha256', 'SHA-256'));
+  if (d.free != null) html += row(`Free on ${p.server}`, esc(`${fmtSize(d.free)}${d.readOnly ? ' · read-only for this account' : ''}`));
+  else if (d.readOnly) html += row(p.server, 'Read-only for this account');
+  return `${html}</tbody></table>`;
+}
+
+// A folder's size: its button, its count running (with Cancel), or what it found.
+function sizeCell(p) {
+  const t = p.task;
+  if (t && t.kind === 'size') {
+    const pr = t.progress;
+    return `<span class="spinner"></span>Counting…${pr && pr.files ? ` ${esc(counted(pr.files, 'file'))}, ${esc(fmtSize(pr.bytes))} so far` : ''} ` +
+      '<button type="button" class="link" data-act="fo-cancel">Cancel</button>';
+  }
+  if (p.size && p.size.error) return `<span class="up-bad">${esc(p.size.error)}</span> <button type="button" data-act="fo-size">Folder size</button>`;
+  if (p.size) {
+    const s = p.size;
+    const parts = [counted(s.files, 'file'), s.links ? counted(s.links, 'link') : '', counted(s.folders, 'folder')].filter(Boolean);
+    return esc(`${fmtSize(s.bytes)} (${fmtNum(s.bytes)} bytes) · ${parts.join(', ')}`) +
+      (s.unreadableCount ? `<br><span class="up-warn">${esc(`${counted(s.unreadableCount, 'folder')} couldn’t be read: not counted`)}</span>` : '');
+  }
+  return `<button type="button" data-act="fo-size"${p.task ? ' disabled' : ''}>Folder size</button>`;
+}
+
+// A file's sum on the server: its button, the server computing it (with Cancel), or the sum.
+function sumCell(p, sum, label) {
+  const t = p.task;
+  if (t && t.kind === sum) {
+    return `<div class="fo-sum"><span class="spinner"></span>${esc(label)}: computing on ${esc(p.server)}… ` +
+      '<button type="button" class="link" data-act="fo-cancel">Cancel</button></div>';
+  }
+  const got = p[sum];
+  if (got && got.hash) return `<div class="fo-sum">${esc(label)}: <code class="fo-hash">${esc(got.hash)}</code></div>`;
+  return `<div class="fo-sum"><button type="button" data-act="fo-${sum}"${p.task ? ' disabled' : ''}>${esc(label)}</button>` +
+    `${got && got.error ? ` <span class="up-bad">${esc(got.error)}</span>` : ''}</div>`;
+}
+
+$('#modal-body').addEventListener('click', (ev) => {
+  const p = modal && modal.props;
+  const btn = ev.target instanceof Element ? ev.target.closest('button[data-act^="fo-"]') : null;
+  if (!p || !btn || btn.disabled) return;
+  const act = btn.dataset.act;
+  if (act === 'fo-cancel') {
+    if (p.task) dropAsk(p.task.token);
+    p.task = null;
+    showPropsAgain(p);
+    return;
+  }
+  if (p.task || !p.data) return;
+  const kind = act.slice(3);
+  if (kind === 'size') {
+    const task = { kind, token: 0, progress: null };
+    task.token = filesAsk({ type: 'filesSize', server: p.server, paths: [p.path] }, (msg) => {
+      if (p.task === task) p.task = null;
+      p.size = msg.error ? { error: msg.error } : msg;
+      showPropsAgain(p);
+    }, (msg) => {
+      task.progress = msg;
+      showPropsAgain(p);
+    });
+    p.task = task;
+  } else if (kind === 'md5' || kind === 'sha256') {
+    const d = p.data;
+    const bytes = d.kind === 'link' ? d.target && d.target.size : d.size;
+    const task = { kind, token: 0 };
+    task.token = filesAsk({ type: 'filesHash', server: p.server, path: p.path, size: bytes || 0, sum: kind }, (msg) => {
+      if (p.task === task) p.task = null;
+      p[kind] = msg.error ? { error: msg.error } : { hash: msg.hash };
+      showPropsAgain(p);
+    });
+    p.task = task;
+  }
+  showPropsAgain(p);
+});
+
+// ---- the keys (in the list only: never in a text field; the Downloads table and the recent
+// searches keep their own Del) ----
+
+// Explorer's keys for these in the list; whether one was taken.
+function opsKey(ev) {
+  const k = ev.key;
+  const plain = !ev.ctrlKey && !ev.altKey && !ev.metaKey;
+  const ctrl = ev.ctrlKey && !ev.altKey && !ev.metaKey;
+  const b = state.browse;
+  const picks = () => menuRows().filter((h) => !h.server);
+  if (k === 'F2' && plain && !ev.shiftKey) {
+    const p = picks();
+    if (p.length > 1) opsSay('Rename one item at a time.', true);
+    else renameRow(p[0]);
+  } else if (k === 'Delete' && plain) {
+    deleteRows(picks());
+  } else if (ctrl && !ev.shiftKey && (k === 'x' || k === 'X')) {
+    holdRows('cut', picks());
+  } else if (ctrl && !ev.shiftKey && (k === 'c' || k === 'C')) {
+    holdRows('copy', picks());
+  } else if (ctrl && !ev.shiftKey && (k === 'v' || k === 'V')) {
+    // Into the open folder, as in Explorer (a folder row's menu pastes into that folder).
+    const here = hereWhy();
+    if (here) opsSay(here, true);
+    else pasteInto(b.server, b.path, browseHere());
+  } else if (ctrl && ev.shiftKey && (k === 'n' || k === 'N')) {
+    newFolder();
+  } else if (k === 'Enter' && ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+    const p = picks();
+    if (p.length > 1) opsSay('Properties shows one item at a time: pick one.', true);
+    else if (p.length === 1) rowProps(p[0]);
+    else folderProps();
+  } else if (k === 'Escape' && plain && ops.clip && !b.under) {
+    clearClip();
+  } else {
+    return false;
+  }
+  return true;
 }
 
 // ---- downloads ---------------------------------------------------------------------------
@@ -5329,6 +6231,11 @@ function onInit(msg) {
   state.destinations = { ...msg.destinations, ...state.destinations };
   state.remotes = msg.remotes;
   state.remote = msg.remote;
+  // Sent again after a server change: each server's account is asked again as Browse opens it,
+  // and what Cut or Copy held on a server gone is let go.
+  ops.accounts.clear();
+  if (ops.clip && !state.remotes.some((r) => r.name === ops.clip.server)) clearClip();
+  if (state.browse.server && state.remotes.some((r) => r.name === state.browse.server)) askAccount(state.browse.server);
   const sort = sortFrom(msg.sort);
   if (JSON.stringify(sortToSave(sort)) !== JSON.stringify(sortToSave(state.sort))) {
     state.sort = sort;
@@ -5918,16 +6825,19 @@ function submitForm() {
 
 // ---- modal -------------------------------------------------------------------------------
 
-let modal = null; // { onOk, onCancel }
+let modal = null; // { onOk, onCancel, stay }
 let modalReturn = null; // where the focus goes back to (the Downloads table after Delete's question)
 
-function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [], wide = false }) {
+// `stay`: OK runs onOk and the dialog stays until it's closed (dropModal: Rename's answer came).
+// `cancel` null: no Cancel button (Properties' only button is OK, "Close").
+function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, onCancel, extra = [], wide = false, stay = false }) {
   if (!$('#modal').contains(document.activeElement)) modalReturn = document.activeElement;
-  modal = { onOk, onCancel };
+  modal = { onOk, onCancel, stay };
   $('#modal-title').textContent = bidiVisible(title);
   $('#modal-body').innerHTML = html;
   $('#modal .modal').classList.toggle('wide', wide); // a table of files (the upload question's)
-  $('#modal-cancel').textContent = cancel;
+  $('#modal-cancel').textContent = cancel || '';
+  $('#modal-cancel').hidden = !cancel;
   const okBtn = $('#modal-ok');
   okBtn.textContent = ok;
   okBtn.disabled = false; // the upload dialog's waits for its checks (onUploadCheck)
@@ -5949,7 +6859,7 @@ function showModal({ title, html, ok, cancel = 'Cancel', danger = false, onOk, o
     okBtn.before(b);
   }
   $('#modal').hidden = false;
-  $('#modal-cancel').focus(); // the safe choice is the default
+  (cancel ? $('#modal-cancel') : okBtn).focus(); // the safe choice is the default
 }
 
 function closeModal(accepted) {
@@ -5959,6 +6869,14 @@ function closeModal(accepted) {
   $('#modal').hidden = true;
   returnFromModal();
   if (accepted) m.onOk && m.onOk(); else m.onCancel && m.onCancel();
+}
+
+// Closes the dialog without calling its choices (one that acted already: Rename's answer came).
+function dropModal() {
+  if (!modal) return;
+  modal = null;
+  $('#modal').hidden = true;
+  returnFromModal();
 }
 
 // The focus back where it was before the dialog, as a menu does; first, so what the dialog's
@@ -6048,6 +6966,9 @@ if (webview) {
       case 'existing': onExisting(msg); break;
       case 'uploadCheck': onUploadCheck(msg); break;
       case 'uploadExisting': setUploadExisting(msg.choice, false); break;
+      case 'filesAccount': onFilesAccount(msg); break;
+      case 'filesDone': onFilesDone(msg); break;
+      case 'filesProgress': onFilesProgress(msg); break;
       case 'theme': setTheme(msg.mode, false); break;
       case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
@@ -6582,6 +7503,11 @@ $('#results').addEventListener('keydown', (ev) => {
     closeBelow();
     return;
   }
+  // Changes on the server: F2, Del, Ctrl+X/C/V, Ctrl+Shift+N, Alt+Enter, Esc (the clipboard).
+  if (opsKey(ev)) {
+    ev.preventDefault();
+    return;
+  }
   const page = Math.max(1, Math.floor($('#results').clientHeight / ROW) - 1);
   const move = { ArrowDown: 1, ArrowUp: -1, PageDown: page, PageUp: -page }[ev.key];
   if (move !== undefined) {
@@ -6683,7 +7609,10 @@ $('#f-user').addEventListener('input', setSecretPlaceholder);
 $('#f-port').addEventListener('input', setSecretPlaceholder);
 $('#f-key').addEventListener('input', setSecretPlaceholder);
 $('#f-key-browse').addEventListener('click', () => send({ type: 'pickFile', current: $('#f-key').value.trim() }));
-$('#modal-ok').addEventListener('click', () => closeModal(true));
+$('#modal-ok').addEventListener('click', () => {
+  if (modal && modal.stay) modal.onOk(); // it closes once its answer came
+  else closeModal(true);
+});
 $('#modal-cancel').addEventListener('click', () => closeModal(false));
 // The upload question's choices and its Change (clashHtml), whichever dialog shows it.
 $('#modal-body').addEventListener('change', onClashChange);

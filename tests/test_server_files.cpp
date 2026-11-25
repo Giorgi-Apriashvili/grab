@@ -1318,6 +1318,134 @@ TEST_CASE("server files: no change to a path a transfer or Play is using, nor to
     CHECK(server_files::busy_refusal(relative, std::vector<std::string>{"/home/dragon/Videos/a.mkv"}, "Main") == std::nullopt);
 }
 
+TEST_CASE("server files: the account the window keeps: the login folder's real path, read-only or not, free space") {
+    Server s;
+    s.fake.home = "/home/u";
+    s.folder("/home");
+    s.folder("/home/u");
+    auto a = server_files::account(s.where());
+    REQUIRE(a);
+    CHECK(a->home == "/home/u");
+    CHECK_FALSE(a->read_only);
+    CHECK(a->free == std::uint64_t{1} << 40); // nothing stored yet
+    // Box.Guest: statvfs says read-only; nothing is changed by asking.
+    Server ro;
+    ro.folder("/home");
+    ro.folder("/home/test");
+    ro.fake.read_only = true;
+    ro.fake.read_only_as = sftp::Code::failure;
+    const Snap before = ro.snap();
+    a = server_files::account(ro.where());
+    REQUIRE(a);
+    CHECK(a->home == "/home/test");
+    CHECK(a->read_only);
+    CHECK(ro.snap() == before);
+    // Without statvfs: taken as writable, free space unknown.
+    Server plain;
+    plain.fake.statvfs = false;
+    a = server_files::account(plain.where());
+    REQUIRE(a);
+    CHECK_FALSE(a->read_only);
+    CHECK_FALSE(a->free);
+    // No connection: the error.
+    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}};
+    CHECK(server_files::account(none).error() == "no connection to Gone");
+}
+
+TEST_CASE("server files: each path with its folder's real path, a link kept as itself") {
+    Server s;
+    s.fake.home = "/home/u";
+    s.folder("/home");
+    s.folder("/home/u");
+    s.folder("/data");
+    s.folder("/data/media");
+    s.put("/data/media/a.mkv", "film");
+    s.link("/srv/media", "/data/media");
+    const std::vector<std::string> paths{"/srv/media/a.mkv", "/srv/media", "x.txt", "", "/", "/data/media/a.mkv"};
+    CHECK(server_files::resolved(s.where(), paths) ==
+          std::vector<std::string>{"/data/media/a.mkv", "/srv/media", "/home/u/x.txt", "", "/", "/data/media/a.mkv"});
+    // A download through the link and a delete of its real folder meet in their resolved spellings.
+    using server_files::Busy;
+    const auto w = s.where();
+    const std::vector<std::string> busy_given{"/srv/media/a.mkv"};
+    const auto busy_real = server_files::resolved(w, busy_given);
+    const std::vector<Busy> busy{{.kind = Busy::Kind::download, .path = busy_given[0]},
+                                 {.kind = Busy::Kind::download, .path = busy_real[0]}};
+    const std::vector<std::string> deleting{"/data/media"};
+    CHECK(server_files::busy_refusal(std::vector<Busy>{busy[0]}, deleting, "Fake", "/home/u") == std::nullopt);
+    CHECK(server_files::busy_refusal(busy, deleting, "Fake", "/home/u") ==
+          "Fake:/data/media holds /data/media/a.mkv, which is being downloaded: wait until it ends, or cancel it first");
+    // No connection: each as given.
+    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}};
+    CHECK(server_files::resolved(none, paths) == paths);
+}
+
+TEST_CASE("server files: each path REALPATHed whole, a busy link's target covered") {
+    Server s;
+    s.fake.home = "/home/u";
+    s.folder("/home");
+    s.folder("/home/u");
+    s.folder("/data");
+    s.folder("/data/media");
+    s.put("/data/media/a.mkv", "film");
+    s.put("/data/f.txt", "text");
+    s.link("/home/u/media", "/data/media");
+    s.link("/home/u/f", "/data/f.txt");
+    const auto w = s.where();
+    const Snap before = s.snap();
+    // A link at the end followed; a name not there yet (an upload's target), "" and "/" as given.
+    const std::vector<std::string> paths{"/home/u/media", "f", "/home/u/new.txt", "", "/", "/data/media/a.mkv"};
+    CHECK(server_files::followed(w, paths) ==
+          std::vector<std::string>{"/data/media", "/data/f.txt", "/home/u/new.txt", "", "/", "/data/media/a.mkv"});
+    // A folder download of the link: a delete of a file in its target meets it only through the
+    // followed spelling (resolved keeps the link's own name).
+    using server_files::Busy;
+    const std::vector<std::string> link{"/home/u/media"};
+    CHECK(server_files::resolved(w, link) == link);
+    std::vector<Busy> busy{{.kind = Busy::Kind::download, .path = link[0]}};
+    const std::vector<std::string> deleting{"/data/media/a.mkv"};
+    CHECK(server_files::busy_refusal(busy, deleting, "Fake", "/home/u") == std::nullopt);
+    busy.push_back(Busy{.kind = Busy::Kind::download, .path = server_files::followed(w, link)[0]});
+    const auto refused = server_files::busy_refusal(busy, deleting, "Fake", "/home/u");
+    REQUIRE(refused);
+    CHECK(refused->contains("being downloaded"));
+    // Play of a link to a file: deleting its target is refused the same way.
+    const std::vector<Busy> playing{{.kind = Busy::Kind::play, .path = "f"},
+                                    {.kind = Busy::Kind::play, .path = server_files::followed(w, std::vector<std::string>{"f"})[0]}};
+    CHECK(server_files::busy_refusal(playing, std::vector<std::string>{"/data/f.txt"}, "Fake", "/home/u").has_value());
+    CHECK(s.snap() == before);
+    // No connection: each as given.
+    const server_files::Where none{.server = "Gone", .pool = nullptr, .connections = nullptr, .timeout = 30s, .on_command = {}};
+    CHECK(server_files::followed(none, paths) == paths);
+}
+
+TEST_CASE("server files: a look counts a folder whose name a file has, apart") {
+    Server s;
+    s.folder("/src");
+    s.folder("/src/sub");
+    s.put("/src/sub/in.txt", "in");
+    s.put("/src/a.txt", "abc");
+    s.folder("/dst");
+    s.put("/dst/sub", "file");
+    const Snap before = s.snap();
+    const std::vector<std::string> picked{"/src/sub", "/src/a.txt"};
+    for (const bool copying : {true, false}) {
+        CAPTURE(copying);
+        const auto l = server_files::look(s.where(), server_files::into(picked, "/dst"), copying);
+        REQUIRE(l);
+        CHECK(l->taken.count == 1);
+        CHECK(l->taken.folders == 0);
+        CHECK(l->folders_onto_files.count == 1);
+        CHECK(l->folders_onto_files.folders == 0);
+        CHECK(l->clashes.size() == 1);
+        // A copy counts what Keep both would copy of it too.
+        CHECK(l->files == (copying ? 2U : 1U));
+        CHECK(l->folders == 1);
+        CHECK(l->bytes == (copying ? 5U : 3U));
+    }
+    CHECK(s.snap() == before);
+}
+
 TEST_CASE("server files: what the window marks after a change") {
     using server_files::Mark;
     // A folder moved: its old and new places, their folders, and both forgotten in the previews.

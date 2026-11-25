@@ -259,6 +259,15 @@ public:
     [[nodiscard]] std::expected<std::string, std::string> play(File file, const Progress& on_progress,
                                                               std::stop_token stop);
 
+    // The files Play is using: a stream with a request open, its warm part coming, or its reads
+    // kept going for the player (until its data goes, free_after after the last request): the
+    // player asks for them again by path, so changes on the server leave them be (SERVER-OPS.md).
+    struct Playing {
+        std::string server;
+        std::string path; // raw bytes, as File::path
+    };
+    [[nodiscard]] std::vector<Playing> playing();
+
     // For tests: what the streams hold now.
     struct Stats {
         int streams = 0;          // remembered

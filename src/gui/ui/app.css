@@ -159,6 +159,17 @@ select:focus, input[type=text]:focus, input[type=search]:focus, input[type=passw
 .activity { transition: opacity 0.35s; }
 .activity.fading { opacity: 0; }
 .action.busy .browse-status, .action.busy .list-status, .action.busy #refresh-lists { display: none; }
+/* A change on the server (SERVER-OPS.md, chunk 2): what runs and how far with Cancel, then its
+   result (a refusal or failure in red); it stays beside an activity. What Cut or Copy holds, in
+   a word, gives way first in a narrow window. */
+.ops { display: inline-flex; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 0; font-size: 12px; color: var(--text); }
+.ops .spinner { flex: none; margin-right: 0; }
+.ops:not(.running) .spinner { display: none; }
+.ops-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ops.bad .ops-text { color: var(--danger); }
+#ops-cancel { flex: none; height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); font-size: 12px; cursor: pointer; }
+#ops-cancel:hover { text-decoration: underline; }
+.clip { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
 
 button {
   height: 30px;
@@ -297,6 +308,8 @@ svg.ico.f-disc { fill: var(--f-disc); }
 svg.ico.f-file { fill: var(--f-file); }
 svg.ico .fold { fill: var(--panel); opacity: .5; }
 svg.ico .mark { fill: var(--panel); }
+/* Cut, waiting for its paste (SERVER-OPS.md, chunk 2). */
+.row.cut > .name, .row.cut > .size, .row.cut > .modified, .row.cut > .dir { opacity: 0.5; }
 .row .go { color: inherit; cursor: pointer; }
 .row .go:hover { color: var(--accent); text-decoration: underline; }
 
@@ -1098,6 +1111,7 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .menu .check { flex: none; width: 16px; text-align: center; color: var(--accent); }
 .menu .text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu .key { flex: none; margin-left: 16px; color: var(--muted); font-size: 12px; }
+.menu .note { flex: none; margin-left: 10px; color: var(--muted); font-size: 11px; }
 .menu hr { margin: 4px 6px; border: 0; border-top: 1px solid var(--line); }
 .menu .heading { padding: 4px 10px 2px 26px; color: var(--muted); font-size: 11px; }
 
@@ -1220,6 +1234,21 @@ html.dropping .viewer-pdf { pointer-events: none; } /* a drag over the PDF reach
 .up-outcome { margin: 8px 0 6px; }
 .up-setting .link { padding: 0 2px; border: 0; background: none; color: var(--accent); cursor: pointer; text-decoration: underline; }
 .up-always input { margin: 0 6px 0 0; vertical-align: -2px; }
+/* Browse's changes on a server (SERVER-OPS.md, chunk 2): the name box of Rename and New folder,
+   the delete confirmation, Properties. */
+.fo-name label { display: block; margin-bottom: 4px; color: var(--muted); }
+.fo-name input { width: 100%; }
+.fo-why { min-height: 1.4em; margin-top: 4px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
+.fo-counts { margin-top: 2px; }
+.fo-props { width: 100%; border-collapse: collapse; margin: 0 0 4px; }
+.fo-props th { width: 120px; padding: 4px 12px 4px 0; text-align: left; font-weight: 400; color: var(--muted); vertical-align: top; white-space: nowrap; }
+.fo-props td { padding: 4px 0; vertical-align: top; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.fo-props td button { height: 26px; padding: 0 10px; }
+.fo-props td .link { height: auto; padding: 0 2px; border: 0; background: none; color: var(--accent); cursor: pointer; }
+.fo-props td .link:hover { text-decoration: underline; }
+.fo-text, .fo-hash { unicode-bidi: isolate; user-select: text; }
+.fo-hash { word-break: break-all; }
+.fo-sum + .fo-sum { margin-top: 4px; }
 /* Files dragged in from Explorer (UPLOADS.md 5.10, chunk 4): where a drop goes, or why not; the
    folder row a drop goes into. Over everything, dialogs too (a drop over one says to finish it). */
 .drop-overlay {

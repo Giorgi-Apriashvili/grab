@@ -587,11 +587,17 @@ TEST_CASE("play: an idle stream nobody waits behind keeps its connections until 
     CHECK(ask(*u, "Range: bytes=10000000-10999999\r\n").body == t.content.substr(10000000, 1000000));
     auto stats = t.server->stats();
     CHECK(stats.connected > 0);
+    // Its file is in use (Browse leaves it be: SERVER-OPS.md) while its reads are kept going.
+    const auto in_use = t.server.value().playing();
+    REQUIRE(in_use.size() == 1);
+    CHECK(in_use[0].server == t.file().server);
+    CHECK(in_use[0].path == t.file().path);
     // Nobody waits for a seat: past release_after they stay (a seek after a pause needs no login).
     std::this_thread::sleep_for(400ms);
     stats = t.server.value().stats();
     CHECK(stats.connected == 2);
     CHECK(stats.seats == 2);
+    CHECK(t.server.value().playing().size() == 1);
     // The data free_after after the last request (review G141, G145), and with it the connections
     // and seats; the id stays.
     for (int i = 0; i < 100 && (stats.with_data > 0 || stats.connected > 0 || stats.seats > 0); ++i) {
@@ -604,6 +610,7 @@ TEST_CASE("play: an idle stream nobody waits behind keeps its connections until 
     CHECK(stats.with_data == 0);
     CHECK(stats.cached == 0);
     CHECK(stats.streams == 1);
+    CHECK(t.server.value().playing().empty()); // its data gone: no longer in use, though its id stays
     const auto again = ask(*u, "Range: bytes=20000000-20999999\r\n");
     CHECK(again.status == 206);
     CHECK(again.body == t.content.substr(20000000, 1000000));

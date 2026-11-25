@@ -2255,19 +2255,20 @@ try {
     state.cursor = -1;
     $('#results').dispatchEvent(new KeyboardEvent('keydown', { key: 'F10', shiftKey: true, bubbles: true, cancelable: true }));
     check('up: Shift+F10 in an empty folder opens its menu', [$('#menu').hidden,
-      [...$('#menu').querySelectorAll('button')].map((x) => x.textContent)], [false, ['Upload files here…', 'Upload folder here…']]);
+      [...$('#menu').querySelectorAll('button')].map((x) => x.textContent).filter((t) => t.startsWith('Upload'))], [false, ['Upload files here…', 'Upload folder here…']]);
     closeMenu();
     state.hits = hitsWas;
     sent.length = 0;
-    const bg = () => folderMenu().map((m) => m.label);
+    const bg = () => folderMenu().map((m) => m.label).filter((l) => l && l.startsWith('Upload'));
+    const bgEntry = (label) => folderMenu().find((m) => m.label === label);
     check('up: the empty part: the open folder\'s', bg(), ['Upload files here…', 'Upload folder here…']);
-    folderMenu()[1].act();
+    bgEntry('Upload folder here…').act();
     check('up: into the open folder', sent.map((m) => [m.type, m.server, m.dir, m.folders]), [['uploadPick', 'Main', '/srv', true]]);
     const refused = (over) => {
       Object.assign(b, over);
       sent.length = 0;
       state.flash = null;
-      folderMenu()[0].act();
+      bgEntry('Upload files here…').act();
       const said = state.flash ? state.flash.text : '';
       Object.assign(b, { server: 'Main', path: '/srv', top: false, under: null, loading: false, error: '', uploadable: true, severalRoots: false });
       return [sent.length, said];
@@ -3001,6 +3002,587 @@ try {
     state.hits = hitsWas;
     state.remotes = remotesWas;
     state.remote = remoteWas;
+    renderRows();
+  }
+
+  // ---- Browse's changes on a server (SERVER-OPS.md, chunk 2) --------------------------------------
+  // The menus' entries on rows, folder rows, search results and the list's empty part, with their
+  // keys; a read-only server greying every change with the reason; the clipboard (cut rows faded,
+  // the hint, Esc, another server's items); Paste's look, question (relabelled, on Skip) and run;
+  // Rename's and New folder's name box; Delete's confirmation and counts; Properties with its
+  // folder size and sums; the footer's line with Cancel and the results; the keys only in the list.
+  {
+    const b = state.browse;
+    const browseWas = { ...b };
+    const hitsWas = state.hits;
+    const remotesWas = state.remotes;
+    const remoteWas = state.remote;
+    const list = $('#results');
+    const key = (k, mods = {}, el = list) => {
+      const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...mods });
+      el.dispatchEvent(ev);
+      return ev.defaultPrevented;
+    };
+    const sentOf = (type) => sent.filter((m) => m.type === type);
+    const lastOf = (type) => sentOf(type).pop();
+    const reply = (msg) => onFilesDone({ type: 'filesDone', ...msg });
+    const said = () => (ops.result && ops.result.until > Date.now() ? ops.result.text : '');
+    const line = () => ({ shown: !$('#ops').hidden, text: $('#ops-text').textContent, cancel: !$('#ops-cancel').hidden, bad: $('#ops').classList.contains('bad') });
+    const labels = (items) => items.map((m) => (m === '-' ? '-' : m.heading ? `# ${m.heading}` : `${m.label}${m.disabled ? ' (off)' : ''}`));
+    const entry = (items, label) => items.find((m) => m.label === label);
+    const pick = (...i) => {
+      state.selected = new Set(i);
+      state.cursor = i[0];
+      renderRows();
+    };
+    const items = [{ name: 'tv', path: '/srv/tv', dir: true, remote: 'Main' }, { name: 'a.txt', path: '/srv/a.txt', remote: 'Main', size: 3 },
+      { name: 'b.mkv', path: '/srv/b.mkv', remote: 'Main', size: 3435973837 }];
+    const reset = (server = 'Main') => {
+      Object.assign(b, { server, path: '/srv', top: false, under: null, loading: false, error: '', uploadable: true, severalRoots: false,
+        crumbs: [{ name: 'srv', path: '/srv' }], items: items.map((it) => ({ ...it, remote: server })), pendingSelect: null });
+      state.hits = b.items.slice();
+      state.selected = new Set();
+      state.cursor = 0;
+      renderRows();
+    };
+    const quiet = () => {
+      sent.length = 0;
+      ops.result = null;
+      ops.running = null;
+      ops.refusal = null;
+      ops.waits.clear();
+      clearClip();
+      if (modal) closeModal(false);
+      closeMenu();
+      renderOps();
+    };
+    state.remotes = [{ name: 'Main', host: 'h', user: 'u' }, { name: 'Box', host: 'b', user: 'u' }, { name: 'Box.Guest', host: 'b', user: 'g' }];
+    state.remote = 'Main';
+    ops.accounts.clear();
+    ops.asking.clear();
+    quiet();
+    reset();
+
+    // The account: asked once a session when Browse opens a server, again on Refresh; a failed ask
+    // is asked again the next time.
+    sent.length = 0;
+    b.id = 41;
+    onBrowseResult({ type: 'browseResult', id: 41, remote: 'Main', path: '/srv', top: false, items: [], uploadable: true });
+    onBrowseResult({ type: 'browseResult', id: 41, remote: 'Main', path: '/srv', top: false, items: [], uploadable: true });
+    check('ops: Browse opening a server asks its account once', sentOf('filesAccount'), [{ type: 'filesAccount', server: 'Main', again: false }]);
+    onFilesAccount({ type: 'filesAccount', server: 'Main', readOnly: false, free: 1000 });
+    onBrowseResult({ type: 'browseResult', id: 41, remote: 'Main', path: '/srv', top: false, items: [], uploadable: true });
+    check('ops: ... and not again once known', [sentOf('filesAccount').length, ops.accounts.get('Main')], [1, { readOnly: false, free: 1000 }]);
+    sent.length = 0;
+    $('#browse-refresh').click();
+    check('ops: Refresh asks it again', sentOf('filesAccount'), [{ type: 'filesAccount', server: 'Main', again: true }]);
+    onFilesAccount({ type: 'filesAccount', server: 'Main', readOnly: false });
+    sent.length = 0;
+    b.id = 42;
+    b.server = 'Box.Guest';
+    onBrowseResult({ type: 'browseResult', id: 42, remote: 'Box.Guest', path: '/srv', top: false, items: [], uploadable: true });
+    onFilesAccount({ type: 'filesAccount', server: 'Box.Guest', error: 'no route' });
+    onBrowseResult({ type: 'browseResult', id: 42, remote: 'Box.Guest', path: '/srv', top: false, items: [], uploadable: true });
+    check('ops: a failed ask is asked again the next time', sentOf('filesAccount').length, 2);
+    onFilesAccount({ type: 'filesAccount', server: 'Box.Guest', readOnly: true });
+    // An All servers search: the hits' servers Browse hasn't opened are asked too (once), a
+    // server no longer configured never.
+    sent.length = 0;
+    const searchWas = { results: state.results, lists: state.lists, searchId: state.searchId, filterTotal: state.filterTotal, resultNote: state.resultNote };
+    b.under = { query: 'a' };
+    state.searchId = 77;
+    const searchHits = () => [{ name: 'a.txt', path: '/x/a.txt', remote: 'Box' }, { name: 'a.mkv', path: '/y/a.mkv', remote: 'Main' },
+      { name: 'a.iso', path: '/z/a.iso', remote: 'Box' }, { name: 'a.bin', path: '/w/a.bin', remote: 'Gone' }];
+    onSearchResult({ type: 'searchResult', id: 77, hits: searchHits(), lists: [], elapsedMs: 10 });
+    onSearchResult({ type: 'searchResult', id: 77, hits: searchHits(), lists: [], elapsedMs: 10, update: true });
+    check('ops: search hits of a server not opened: its account asked once', sentOf('filesAccount'),
+      [{ type: 'filesAccount', server: 'Box', again: false }]);
+    b.under = null;
+    Object.assign(state, searchWas);
+    onFilesAccount({ type: 'filesAccount', server: 'Box', readOnly: false });
+    quiet();
+    reset();
+
+    // The menus: a file row, a folder row, several rows, the empty part.
+    pick(1);
+    check('ops: a file row: Cut, Copy, Paste into the open folder, Rename, Delete, Properties last', labels(resultMenu()),
+      ['Preview', 'Download', 'Download to…', '-', 'Cut', 'Copy', 'Paste into srv (off)', '-', 'Rename…', 'Delete…', '-',
+        'Upload files to srv…', 'Upload folder to srv…', '-', 'Copy path', 'Copy name', '-', 'Properties']);
+    check('ops: the keys beside them', ['Cut', 'Copy', 'Paste into srv', 'Rename…', 'Delete…', 'Properties'].map((l) => entry(resultMenu(), l).key),
+      ['Ctrl+X', 'Ctrl+C', 'Ctrl+V', 'F2', 'Del', 'Alt+Enter']);
+    check('ops: Paste greyed with nothing held, saying so', [entry(resultMenu(), 'Paste into srv').note, entry(resultMenu(), 'Paste into srv').why],
+      ['nothing cut or copied', 'Nothing to paste: Cut or Copy files or folders first.']);
+    pick(0);
+    check('ops: a folder row: Paste into that folder', labels(resultMenu()).filter((l) => l.startsWith('Paste')), ['Paste (off)']);
+    pick(1, 2);
+    const several = resultMenu();
+    check('ops: several rows: Rename and Properties greyed, saying why; Delete names how many',
+      [entry(several, 'Rename…').disabled, entry(several, 'Rename…').why, entry(several, 'Properties').why, !!entry(several, 'Delete 2…')],
+      [true, 'Rename one item at a time.', 'Properties shows one item at a time: pick one.', true]);
+    check('ops: the empty part: Paste, New folder, uploads, Properties of the open folder', labels(folderMenu()),
+      ['Paste (off)', 'New folder…', '-', 'Upload files here…', 'Upload folder here…', '-', 'Properties']);
+    // Shown: a greyed entry's reason on hover, its few words beside it.
+    closeMenu();
+    showMenu(10, 10, folderMenu());
+    const pasteBtn = $('#menu button[data-i="0"]');
+    check('ops: a greyed entry shows its few words and its reason on hover', [pasteBtn.disabled, pasteBtn.querySelector('.note').textContent,
+      pasteBtn.title, pasteBtn.querySelector('.key').textContent], [true, 'nothing cut or copied', 'Nothing to paste: Cut or Copy files or folders first.', 'Ctrl+V']);
+    closeMenu();
+
+    // A read-only server (Box.Guest): every change greyed with the reason; Copy and Properties work.
+    reset('Box.Guest');
+    pick(1);
+    const ro = resultMenu();
+    check('ops: read-only: the reason heads the entries, every change greyed', [labels(ro).filter((l) => !l.startsWith('Upload')),
+      entry(ro, 'Cut').why, entry(ro, 'Rename…').why, entry(ro, 'Delete…').why],
+    [['Preview', 'Download', 'Download to…', '-', '# Box.Guest is read-only for this account', 'Cut (off)', 'Copy', 'Paste into srv (off)', '-',
+      'Rename… (off)', 'Delete… (off)', '-', '-', 'Copy path', 'Copy name', '-', 'Properties'],
+    'Box.Guest is read-only for this account', 'Box.Guest is read-only for this account', 'Box.Guest is read-only for this account']);
+    check('ops: read-only: the empty part too, Properties left', labels(folderMenu()),
+      ['# Box.Guest is read-only for this account', 'Paste (off)', 'New folder… (off)', '-', 'Upload files here…', 'Upload folder here…', '-', 'Properties']);
+    check('ops: read-only: New folder says why', entry(folderMenu(), 'New folder…').why, 'Box.Guest is read-only for this account');
+    showMenu(10, 10, ro);
+    const cutBtn = [...$('#menu').querySelectorAll('button')].find((x) => x.querySelector('.text').textContent === 'Cut');
+    check('ops: read-only: a screen reader hears the reason (the heading describes the menu, a greyed entry its own)',
+      [$('#menu').getAttribute('aria-describedby'), $('#menu-heading').textContent, cutBtn.getAttribute('aria-description')],
+      ['menu-heading', 'Box.Guest is read-only for this account', 'Box.Guest is read-only for this account']);
+    closeMenu();
+    showMenu(10, 10, folderMenu().filter((m) => !m.heading));
+    check('ops: ... a menu without a heading has no description', $('#menu').getAttribute('aria-describedby'), null);
+    closeMenu();
+    sent.length = 0;
+    const refusedKeys = [['F2'], ['Delete'], ['x', { ctrlKey: true }], ['v', { ctrlKey: true }], ['N', { ctrlKey: true, shiftKey: true }]].map(([k, m]) => {
+      ops.result = null;
+      key(k, m);
+      return said();
+    });
+    check('ops: read-only: F2, Del, Ctrl+X, Ctrl+V, Ctrl+Shift+N say the reason in the footer, nothing sent',
+      [refusedKeys, sent.length, !!modal], [Array(5).fill('Box.Guest is read-only for this account'), 0, false]);
+    check('ops: the reason in red in the footer', line(), { shown: true, text: 'Box.Guest is read-only for this account', cancel: false, bad: true });
+    quiet();
+    reset();
+
+    // The clipboard: Ctrl+X on two rows fades them and says so; Esc clears; Ctrl+C fades nothing.
+    pick(1, 2);
+    check('ops: Ctrl+X taken', key('x', { ctrlKey: true }), true);
+    const faded = () => [...document.querySelectorAll('#rows .row.cut')].map((r) => Number(r.dataset.i));
+    check('ops: cut: held, the rows faded, the hint', [ops.clip.op, ops.clip.server, ops.clip.items.map((i) => i.path), faded(), $('#clip').hidden, $('#clip').textContent],
+      ['cut', 'Main', ['/srv/a.txt', '/srv/b.mkv'], [1, 2], false, '2 items ready to paste · Esc clears']);
+    check('ops: the hint names them and what Paste does', $('#clip').title, 'Cut on Main: a.txt, b.mkv. Paste (Ctrl+V) in a folder of Main moves them there.');
+    check('ops: Esc clears it', [key('Escape'), ops.clip, faded(), $('#clip').hidden], [true, null, [], true]);
+    pick(1);
+    key('c', { ctrlKey: true });
+    check('ops: Ctrl+C: held for a copy, nothing faded', [ops.clip.op, faded(), $('#clip').textContent], ['copy', [], '1 item ready to paste · Esc clears']);
+    // Another server's items: not yet.
+    reset('Box');
+    pick(1);
+    check('ops: another server\'s items: Paste greyed, not yet', [entry(resultMenu(), 'Paste into srv').note, entry(folderMenu(), 'Paste').note],
+      ['not yet: copies between servers', 'not yet: copies between servers']);
+    sent.length = 0;
+    key('v', { ctrlKey: true });
+    check('ops: ... Ctrl+V says it, nothing sent', [said(), sent.length],
+      ['Not yet: copies between servers. What you cut or copied is on Main: paste it in a folder of Main.', 0]);
+    quiet();
+    reset();
+
+    // Paste: the look, nothing taken there: the copy at once, Skip for anything taken meanwhile;
+    // its progress with Cancel; the result; a copy keeps the clipboard.
+    pick(1);
+    key('c', { ctrlKey: true });
+    sent.length = 0;
+    key('v', { ctrlKey: true });
+    const look = lastOf('filesLook');
+    check('ops: Ctrl+V looks first: into the open folder', [look.server, look.op, look.paths, look.dir, line()],
+      ['Main', 'copy', ['/srv/a.txt'], '/srv', { shown: true, text: 'Looking at a.txt and srv…', cancel: true, bad: false }]);
+    sent.length = 0;
+    key('F2');
+    check('ops: one change at a time: another says so in the footer, over the line, in red', [line(), sentOf('filesRename').length, !!modal],
+      [{ shown: true, text: 'Looking at a.txt is still going: wait until it ends, or cancel it first', cancel: true, bad: true }, 0, false]);
+    reply({ token: look.token, op: 'look', files: 1, folders: 0, bytes: 3, existing: { count: 0, same: 0, newer: 0, older: 0, differs: 0, folders: 0, files: [] } });
+    const paste = lastOf('filesPaste');
+    check('ops: nothing taken: pasted at once, Skip for a name taken meanwhile', [paste.op, paste.paths, paste.dir, paste.choice, paste.own, !!modal],
+      ['copy', ['/srv/a.txt'], '/srv', 'skip', [], false]);
+    onFilesProgress({ type: 'filesProgress', token: paste.token, bytes: 1288490189, totalBytes: 3650722202, files: 0, totalFiles: 1 });
+    check('ops: the progress line with Cancel', line(), { shown: true, text: 'Copying a.txt to Main:/srv · 1.2 of 3.4 GiB', cancel: true, bad: false });
+    // Del, F2 or Ctrl+Shift+N while it runs: the refusal over the progress for a while, then the
+    // progress again; the menu's entries say the same.
+    sent.length = 0;
+    key('Delete');
+    check('ops: a change asked for while one runs: refused in the footer, Cancel kept', [line(), sent.length, !!modal],
+      [{ shown: true, text: 'Copying a.txt is still going: wait until it ends, or cancel it first', cancel: true, bad: true }, 0, false]);
+    check('ops: ... the progress still on hover', $('#ops').title, 'Copying a.txt is still going: wait until it ends, or cancel it first\nCopying a.txt to Main:/srv · 1.2 of 3.4 GiB');
+    entry(resultMenu(), 'Rename…').act();
+    check('ops: ... Rename from the menu too', [line().text, !!modal], ['Copying a.txt is still going: wait until it ends, or cancel it first', false]);
+    ops.refusal.until = 0;
+    renderOps();
+    check('ops: ... then the progress again', line(), { shown: true, text: 'Copying a.txt to Main:/srv · 1.2 of 3.4 GiB', cancel: true, bad: false });
+    sent.length = 0;
+    $('#ops-cancel').click();
+    check('ops: Cancel stops it', sent, [{ type: 'filesCancel', token: paste.token }]);
+    reply({ token: paste.token, op: 'copy', ok: false, stopped: true, files: 0, folders: 0, bytes: 0, left: 0, placed: [''], entries: [], skipped: 0, failed: 0 });
+    check('ops: cancelled: said, the line ends', line(), { shown: true, text: 'Copy cancelled: nothing copied', cancel: false, bad: false });
+    check('ops: a copy keeps the clipboard for more pastes', ops.clip && ops.clip.op, 'copy');
+    // Again, done.
+    sent.length = 0;
+    pasteInto('Main', '/srv/tv', 'tv');
+    reply({ token: lastOf('filesLook').token, op: 'look', files: 1, folders: 0, bytes: 3, existing: { count: 0 } });
+    const second = lastOf('filesPaste');
+    reply({ token: second.token, op: 'copy', ok: true, stopped: false, files: 1, folders: 0, bytes: 3, left: 0, placed: ['/srv/tv/a.txt'],
+      entries: [], skipped: 0, failed: 0 });
+    check('ops: done: a short result', line(), { shown: true, text: 'Copied 1 file (3 B) to Main:/srv/tv', cancel: false, bad: false });
+
+    // Names taken: the uploads' question, relabelled, on Skip, without "Always"; own choices sent.
+    quiet();
+    reset();
+    pick(0, 1);
+    key('x', { ctrlKey: true });
+    pasteInto('Main', '/dst', 'dst');
+    const look2 = lastOf('filesLook');
+    check('ops: a cut pastes as a move', look2.op, 'move');
+    const clashes = { count: 2, same: 0, newer: 1, older: 0, differs: 1, folders: 0,
+      foldersOntoFiles: { count: 1, same: 0, newer: 0, older: 0, differs: 1, folders: 0 }, files: [
+      { name: 'tv', from: '/srv/tv', to: '/dst/tv', size: 3, modified: 1700000000, mineSize: 4096, mineModified: 1700000000, kind: 'differs' },
+      { name: 'a.txt', from: '/srv/a.txt', to: '/dst/a.txt', size: 2, modified: 1700000000, mineSize: 3, mineModified: 1800000000, kind: 'newer' }] };
+    reply({ token: look2.token, op: 'look', files: 1, folders: 1, bytes: 3, existing: clashes });
+    const heads = [...document.querySelectorAll('#modal-body thead th')].map((th) => th.textContent);
+    check('ops: the question: Moving and Already there, on Skip, no Always, OK Move', [$('#modal').hidden, $('#modal-title').textContent, heads.slice(0, 3),
+      $('#modal-body .up-all input:checked').value, !!$('#up-always'), $('#modal-ok').textContent, $('#modal-body .up-existing').textContent],
+    [false, 'Move 2 items to Main:/dst', ['Name', 'Moving', 'Already there'], 'skip', false, 'Move', '2 already there: 1 newer, 1 of another size']);
+    check('ops: each choice counts what it replaces: never the folder onto a file of its name',
+      [...document.querySelectorAll('#modal-body .up-all label')].map((l) => l.textContent.trim()).slice(0, 4),
+      ['Replace 1 replaced', 'Replace if different 1 replaced', 'Replace if newer 1 replaced', 'Skip nothing replaced']);
+    const forAll = (v) => {
+      const r = $(`#modal-body .up-all input[value="${v}"]`);
+      r.checked = true;
+      r.dispatchEvent(new Event('change', { bubbles: true }));
+      return $('#modal-body .up-outcome').textContent;
+    };
+    check('ops: ... and the outcome under the table', [forAll('replace'), forAll('different'), forAll('skip')],
+      ['1 replaced, 1 skipped', '1 replaced, 1 skipped', '2 skipped: nothing on Main is replaced']);
+    const rows = [...document.querySelectorAll('#modal-body .up-clashes tbody tr')];
+    check('ops: a folder moved onto a file: "a folder", never replaced (Skip or Keep both only)',
+      [rows[0].children[0].textContent, rows[0].children[1].textContent, [...rows[0].querySelectorAll('option')].map((o) => o.value)],
+      ['tv/ another size', 'a folder', ['', 'skip', 'both']]);
+    const own = rows[1].querySelector('select');
+    own.value = 'replace';
+    own.dispatchEvent(new Event('change', { bubbles: true }));
+    check('ops: a file\'s own choice: what it does', [rows[1].querySelector('.up-effect').textContent, $('#modal-body .up-outcome').textContent],
+      ['replaced', '1 replaced, 1 skipped']);
+    sent.length = 0;
+    $('#modal-ok').click();
+    const move = lastOf('filesPaste');
+    check('ops: Move sends Skip for all, the file\'s own choice by its paths', [move.op, move.choice, move.own, $('#modal').hidden, line().text],
+      ['move', 'skip', [{ from: '/srv/a.txt', to: '/dst/a.txt', choice: 'replace' }], true, 'Moving 2 items to Main:/dst…']);
+    reply({ token: move.token, op: 'move', ok: true, stopped: false, files: 1, folders: 0, bytes: 0, left: 0, placed: ['', '/dst/a.txt'],
+      entries: [{ state: 'skipped', from: '/srv/tv', to: '/dst/tv', why: 'a file of that name is there, and a folder doesn\'t replace it' }],
+      skipped: 1, failed: 0, moved: ['/srv/a.txt'] });
+    check('ops: moved: the result with what was skipped and why; the clipboard emptied',
+      [line().text, ops.clip, $('#ops').title.includes('/srv/tv: skipped, a file of that name is there')],
+      ['Moved 1 file to Main:/dst; 1 item skipped: tv: a file of that name is there, and a folder doesn\'t replace it', null, true]);
+    // The backend refusing (a path a download uses; another change running) is said in red.
+    reset();
+    pick(1);
+    key('x', { ctrlKey: true });
+    sent.length = 0;
+    pasteInto('Main', '/dst', 'dst');
+    reply({ token: lastOf('filesLook').token, op: 'look', error: 'Main:/srv/a.txt is being downloaded: wait until it ends, or cancel it first' });
+    check('ops: a refusal of the look in red, nothing pasted', [line(), sentOf('filesPaste').length],
+      [{ shown: true, text: 'Main:/srv/a.txt is being downloaded: wait until it ends, or cancel it first', cancel: false, bad: true }, 0]);
+    // The look cancelled from the footer: said, nothing pasted.
+    pasteInto('Main', '/dst', 'dst');
+    const look3 = lastOf('filesLook');
+    $('#ops-cancel').click();
+    check('ops: Cancel during the look stops it', lastOf('filesCancel'), { type: 'filesCancel', token: look3.token });
+    reply({ token: look3.token, op: 'look', stopped: true });
+    check('ops: ... said, nothing pasted', [line(), sentOf('filesPaste').length],
+      [{ shown: true, text: 'Paste cancelled: nothing changed', cancel: false, bad: false }, 0]);
+    // A full look answer crossing the Cancel: dropped, nothing pasted, no question.
+    pasteInto('Main', '/dst', 'dst');
+    const look4 = lastOf('filesLook');
+    sent.length = 0;
+    $('#ops-cancel').click();
+    check('ops: Cancel of a look says it at once', [line(), sent], [{ shown: true, text: 'Paste cancelled: nothing changed', cancel: false, bad: false },
+      [{ type: 'filesCancel', token: look4.token }]]);
+    reply({ token: look4.token, op: 'look', files: 1, folders: 0, bytes: 3, existing: { count: 0 } });
+    check('ops: ... a full answer after it starts nothing', [sentOf('filesPaste').length, !!modal, ops.running, line().text],
+      [0, false, null, 'Paste cancelled: nothing changed']);
+    // The question cancelled (its Cancel or Esc): the footer says so, nothing pasted.
+    pasteInto('Main', '/dst', 'dst');
+    reply({ token: lastOf('filesLook').token, op: 'look', files: 1, folders: 0, bytes: 3, existing: { count: 1, same: 1, newer: 0, older: 0, differs: 0,
+      folders: 0, files: [{ name: 'a.txt', from: '/srv/a.txt', to: '/dst/a.txt', size: 3, modified: 1700000000, mineSize: 3, mineModified: 1700000000, kind: 'same' }] } });
+    check('ops: names taken: the question, the look\'s line gone', [!!modal, line().shown], [true, false]);
+    $('#modal-cancel').click();
+    check('ops: the question cancelled: said, nothing pasted', [line(), sentOf('filesPaste').length, !!modal],
+      [{ shown: true, text: 'Paste cancelled: nothing changed', cancel: false, bad: false }, 0, false]);
+    quiet();
+    reset();
+
+    // Rename: F2; the name without its extension picked; bad names said as typed; Enter; a name
+    // taken keeps the box open; done: closed, said, the new name picked once Browse shows it again.
+    pick(1);
+    check('ops: F2 opens Rename', key('F2'), true);
+    const input = $('#fo-name');
+    check('ops: Rename: its name, without the extension picked, OK Rename', [$('#modal-title').textContent, input.value, input.selectionStart,
+      input.selectionEnd, document.activeElement === input, $('#modal-ok').textContent, $('#modal-cancel').hidden], ['Rename a.txt', 'a.txt', 0, 1, true, 'Rename', false]);
+    const typeName = (v) => {
+      const box = $('#fo-name');
+      box.value = v;
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      return [$('#fo-why').textContent, $('#modal-ok').disabled];
+    };
+    check('ops: bad names said as typed, OK off', [typeName(''), typeName('x/y'), typeName('．'), typeName('a／b'), typeName('a‛／b'), typeName('b.txt')],
+      [['A name can’t be empty.', true], ['A name can’t hold a /.', true], ['“.” can’t be a name.', true], ['A name can’t hold a /.', true], ['', false], ['', false]]);
+    sent.length = 0;
+    key('Enter', {}, input);
+    const ren = lastOf('filesRename');
+    check('ops: Enter renames', [ren.server, ren.path, ren.name, $('#modal-ok').disabled, input.disabled], ['Main', '/srv/a.txt', 'b.txt', true, true]);
+    reply({ token: ren.token, op: 'rename', taken: 'b.txt is already taken in /srv' });
+    check('ops: a name taken keeps the box open, saying so', [$('#modal').hidden, $('#fo-why').textContent, input.disabled, document.activeElement === input],
+      [false, 'b.txt is already taken in /srv', false, true]);
+    typeName('c.txt');
+    $('#modal-ok').click();
+    const ren2 = lastOf('filesRename');
+    reply({ token: ren2.token, op: 'rename', ok: true, path: '/srv/c.txt' });
+    check('ops: renamed: closed, said, the new name picked next', [$('#modal').hidden, line().text, b.pendingSelect], [true, 'Renamed a.txt to c.txt', '/srv/c.txt']);
+    b.pendingSelect = null;
+    // A refusal keeps it open too; Esc cancels with nothing sent.
+    pick(0);
+    key('F2');
+    check('ops: a folder\'s whole name picked', [$('#fo-name').selectionStart, $('#fo-name').selectionEnd], [0, 2]);
+    $('#fo-name').value = 'films';
+    $('#modal-ok').click();
+    reply({ token: lastOf('filesRename').token, op: 'rename', error: 'Main doesn’t let this account write in /srv' });
+    check('ops: a refusal: said in the box, still open', [$('#modal').hidden, $('#fo-why').textContent], [false, 'Main doesn’t let this account write in /srv']);
+    sent.length = 0;
+    key('Escape', {}, document);
+    check('ops: Esc cancels', [$('#modal').hidden, sent.length], [true, 0]);
+
+    // New folder: Ctrl+Shift+N; a name no row has; OK Create.
+    b.items = [...b.items, { name: 'New folder', path: '/srv/New folder', dir: true, remote: 'Main' }];
+    sent.length = 0;
+    key('N', { ctrlKey: true, shiftKey: true });
+    check('ops: New folder: a free name, OK Create', [$('#modal-title').textContent, $('#fo-name').value, $('#modal-ok').textContent],
+      ['New folder in srv', 'New folder (2)', 'Create']);
+    $('#modal-ok').click();
+    const mk = lastOf('filesMkdir');
+    check('ops: ... it makes it in the open folder', [mk.server, mk.dir, mk.name], ['Main', '/srv', 'New folder (2)']);
+    reply({ token: mk.token, op: 'mkdir', ok: true, path: '/srv/New folder (2)' });
+    check('ops: made: said, picked next', [$('#modal').hidden, line().text, b.pendingSelect], [true, 'Made the folder New folder (2) in Main:/srv', '/srv/New folder (2)']);
+    quiet();
+    reset();
+
+    // Delete: files: the confirmation at once; a red Delete, the focus on Cancel; its progress; the result.
+    pick(1, 2);
+    check('ops: Del asks first', key('Delete'), true);
+    check('ops: the confirmation: what goes, a red Delete, Cancel focused', [$('#modal-title').textContent, $('#modal-ok').textContent,
+      $('#modal-ok').classList.contains('danger'), $('#modal-ok').disabled, document.activeElement === $('#modal-cancel'),
+      $('#modal-body .fo-counts').textContent, [...document.querySelectorAll('#modal-body .up-name')].map((e) => e.textContent),
+      $('#modal-body').textContent.includes('From Main, for good')],
+    ['Delete 2 items?', 'Delete', true, false, true, '2 files · 3.2 GiB', ['a.txt', 'b.mkv'], true]);
+    sent.length = 0;
+    $('#modal-ok').click();
+    const del = lastOf('filesDelete');
+    check('ops: Delete sends the paths', [del.server, del.paths], ['Main', ['/srv/a.txt', '/srv/b.mkv']]);
+    onFilesProgress({ type: 'filesProgress', token: del.token, bytes: 0, totalBytes: 0, files: 1204, totalFiles: 2000 });
+    check('ops: deleting: how far, with Cancel', line(), { shown: true, text: 'Deleting 1,204 of 2,000 files', cancel: true, bad: false });
+    reply({ token: del.token, op: 'delete', ok: true, stopped: false, files: 2000, folders: 25, bytes: 9, left: 0, placed: [], entries: [], skipped: 0, failed: 0 });
+    check('ops: deleted: the result', line(), { shown: true, text: 'Deleted 2,000 files and 25 folders', cancel: false, bad: false });
+    // A folder: counted first (Delete off meanwhile, Cancel stops the count), refusals said.
+    pick(0);
+    sent.length = 0;
+    key('Delete');
+    const count = lastOf('filesSize');
+    check('ops: a folder: counted first, the busy paths refused, Delete off', [count.paths, count.check, $('#modal-ok').disabled,
+      $('#modal-body .fo-counts').textContent.startsWith('Counting what is in the folder')], [['/srv/tv'], true, true, true]);
+    onFilesProgress({ type: 'filesProgress', token: count.token, bytes: 5, totalBytes: 0, files: 1204, totalFiles: 0 });
+    check('ops: ... how far the count is', $('#modal-body .fo-counts').textContent, 'Counting what is in the folder… 1,204 files so far');
+    reply({ token: count.token, op: 'size', files: 1204, folders: 25, links: 3, bytes: 3435973837, unreadable: [], unreadableCount: 0 });
+    check('ops: counted: files, links, folders and the size; Delete on', [$('#modal-body .fo-counts').textContent, $('#modal-ok').disabled],
+      ['1,204 files, 3 links and 25 folders · 3.2 GiB', false]);
+    closeModal(false);
+    sent.length = 0;
+    key('Delete');
+    const count2 = lastOf('filesSize');
+    $('#modal-cancel').click();
+    check('ops: Cancel while counting stops the count', sentOf('filesCancel'), [{ type: 'filesCancel', token: count2.token }]);
+    key('Delete');
+    reply({ token: lastOf('filesSize').token, op: 'size', error: 'Main:/srv/tv holds /srv/tv/x.mkv, which is being downloaded: wait until it ends, or cancel it first' });
+    check('ops: a busy path: said, Delete off', [$('#modal-body .up-bad').textContent, $('#modal-ok').disabled],
+      ['Main:/srv/tv holds /srv/tv/x.mkv, which is being downloaded: wait until it ends, or cancel it first', true]);
+    closeModal(false);
+    key('Delete');
+    reply({ token: lastOf('filesSize').token, op: 'size', files: 3, folders: 2, links: 0, bytes: 9, unreadable: ['/srv/tv/x: permission denied'], unreadableCount: 1 });
+    check('ops: a folder below that can\'t be read: nothing would go, Delete off', [$('#modal-body .up-warn').textContent, $('#modal-ok').disabled],
+      ['1 folder below can’t be read, so nothing would be deleted: /srv/tv/x: permission denied', true]);
+    closeModal(false);
+    // A delete that failed partway: the engine's words in red.
+    pick(1);
+    key('Delete');
+    $('#modal-ok').click();
+    reply({ token: lastOf('filesDelete').token, op: 'delete', ok: false, stopped: false, files: 0, folders: 0, bytes: 0, left: 1, placed: [],
+      error: 'Main doesn’t let this account write in /srv; nothing was deleted', entries: [], skipped: 0, failed: 0 });
+    check('ops: a refused delete in red', line(), { shown: true, text: 'Main doesn’t let this account write in /srv; nothing was deleted', cancel: false, bad: true });
+    quiet();
+
+    // Search results: each hit's own server; Paste on a folder hit asks to open it; renames show
+    // the new name, deletes drop the rows at once.
+    reset();
+    b.under = { query: 'a', path: '/srv', all: false, whole: false, name: 'srv' };
+    state.results = [{ name: 'tv', path: '/srv/tv', dir: true, remote: 'Main', ord: 0 }, { name: 'a.txt', path: '/srv/tv/a.txt', remote: 'Main', size: 3, ord: 1 },
+      { name: 'b.txt', path: '/srv/b.txt', remote: 'Main', size: 3, ord: 2 }];
+    state.hits = state.results.slice();
+    pick(0);
+    check('ops: a folder hit: Paste asks to open it first', [entry(resultMenu(), 'Paste').note, entry(resultMenu(), 'Paste').why],
+      ['open it first', 'Paste goes into a folder you have open, not into search results: open this folder first.']);
+    pick(2);
+    check('ops: a file hit: no Paste into search results', labels(resultMenu()).filter((l) => l.startsWith('Paste')), []);
+    key('F2');
+    $('#fo-name').value = 'c.txt';
+    $('#modal-ok').click();
+    reply({ token: lastOf('filesRename').token, op: 'rename', ok: true, path: '/srv/c.txt' });
+    check('ops: a hit renamed shows its new name', state.results.map((h) => h.path), ['/srv/tv', '/srv/tv/a.txt', '/srv/c.txt']);
+    pick(0);
+    key('Delete');
+    reply({ token: lastOf('filesSize').token, op: 'size', files: 1, folders: 1, links: 0, bytes: 3, unreadable: [], unreadableCount: 0 });
+    $('#modal-ok').click();
+    reply({ token: lastOf('filesDelete').token, op: 'delete', ok: true, stopped: false, files: 1, folders: 1, bytes: 3, left: 0, placed: [], entries: [], skipped: 0, failed: 0 });
+    check('ops: a folder deleted drops it and its hits at once', state.hits.map((h) => h.path), ['/srv/c.txt']);
+    check('ops: Esc in results closes them first, as before', [key('Escape'), b.under], [true, null]);
+    quiet();
+    reset();
+
+    // Properties: one row; the dialog's only button Close; the server's answer; MD5 and SHA-256 on
+    // buttons with Cancel; a folder's size; a link's target; closing stops what runs.
+    pick(1);
+    sent.length = 0;
+    check('ops: Alt+Enter opens Properties', key('Enter', { altKey: true }), true);
+    const props = lastOf('filesProps');
+    check('ops: Properties: asked, one button Close, the focus on it', [props.path, $('#modal-title').textContent, $('#modal-cancel').hidden,
+      $('#modal-ok').textContent, document.activeElement === $('#modal-ok')], ['/srv/a.txt', 'Properties of a.txt', true, 'Close', true]);
+    reply({ token: props.token, op: 'props', kind: 'file', size: 3, modified: 1700000000, accessed: 1700000100, mode: 0o640, owner: 'giorgi',
+      group: 'staff', free: 1073741824, readOnly: false });
+    const cells = () => Object.fromEntries([...document.querySelectorAll('#modal-body .fo-props tr')].map((tr) => [tr.children[0].textContent, tr.children[1].textContent]));
+    const c0 = cells();
+    check('ops: Properties of a file', [c0.Where, c0.Type, c0.Size, c0.Modified, c0.Accessed, c0.Permissions, c0.Owner, c0.Group, c0['Free on Main'], c0.Checksums],
+      ['Main:/srv/a.txt', 'File', '3 B (3 bytes)', fmtDate(1700000000, true), fmtDate(1700000100, true), 'rw-r----- 640', 'giorgi', 'staff', '1.0 GiB', 'MD5SHA-256']);
+    sent.length = 0;
+    $('#modal-body [data-act="fo-md5"]').click();
+    const md5 = lastOf('filesHash');
+    check('ops: MD5: asked of the server with the size, computing with Cancel, SHA-256 off meanwhile',
+      [md5.sum, md5.size, md5.path, cells().Checksums.startsWith('MD5: computing on Main… Cancel'), $('#modal-body [data-act="fo-sha256"]').disabled],
+      ['md5', 3, '/srv/a.txt', true, true]);
+    reply({ token: md5.token, op: 'hash', sum: 'md5', hash: 'd41d8cd98f00b204e9800998ecf8427e' });
+    check('ops: the MD5 shown, selectable', [$('#modal-body .fo-hash').textContent, getComputedStyle($('#modal-body .fo-hash')).userSelect],
+      ['d41d8cd98f00b204e9800998ecf8427e', 'text']);
+    $('#modal-body [data-act="fo-sha256"]').click();
+    const sha = lastOf('filesHash');
+    sent.length = 0;
+    $('#modal-body [data-act="fo-cancel"]').click();
+    check('ops: Cancel stops the sum', [sent, !!$('#modal-body [data-act="fo-sha256"]')], [[{ type: 'filesCancel', token: sha.token }], true]);
+    $('#modal-body [data-act="fo-sha256"]').click();
+    const sha2 = lastOf('filesHash');
+    sent.length = 0;
+    closeModal(false);
+    check('ops: closing stops what runs', sent, [{ type: 'filesCancel', token: sha2.token }]);
+    // A folder: Folder size.
+    pick(0);
+    key('Enter', { altKey: true });
+    reply({ token: lastOf('filesProps').token, op: 'props', kind: 'folder', modified: 1700000000, mode: 0o755, owner: '1000', group: '1000' });
+    check('ops: a folder: Folder size on a button, no sums', [cells().Type, cells().Size, cells().Permissions, 'Checksums' in cells()], ['Folder', 'Folder size', 'rwxr-xr-x 755', false]);
+    $('#modal-body [data-act="fo-size"]').click();
+    const fsize = lastOf('filesSize');
+    onFilesProgress({ type: 'filesProgress', token: fsize.token, bytes: 2048, totalBytes: 0, files: 12, totalFiles: 0 });
+    check('ops: counting, with Cancel', [fsize.paths, fsize.check, cells().Size], [['/srv/tv'], undefined, 'Counting… 12 files, 2.0 KiB so far Cancel']);
+    reply({ token: fsize.token, op: 'size', files: 1204, folders: 25, links: 3, bytes: 3435973837, unreadable: [], unreadableCount: 0 });
+    check('ops: the folder size', cells().Size, '3.2 GiB (3,435,973,837 bytes) · 1,204 files, 3 links, 25 folders');
+    closeModal(false);
+    // A link, and the open folder's own.
+    pick(1);
+    key('Enter', { altKey: true });
+    reply({ token: lastOf('filesProps').token, op: 'props', kind: 'link', link: '../x.txt', target: { kind: 'file', size: 5, modified: 1 }, mode: 0o777 });
+    check('ops: a link: what it leads to, its target\'s size, sums of it', [cells().Type, cells()['Points to'], cells().Size, 'Checksums' in cells()],
+      ['Link to a file', '../x.txt', '5 B (5 bytes)', true]);
+    closeModal(false);
+    key('Enter', { altKey: true });
+    reply({ token: lastOf('filesProps').token, op: 'props', kind: 'link', link: 'nowhere', mode: 0o777 });
+    check('ops: a link leading nowhere says so', cells().Type, 'Link to nothing (its target is gone)');
+    closeModal(false);
+    sent.length = 0;
+    entry(folderMenu(), 'Properties').act();
+    check('ops: the open folder\'s Properties', [lastOf('filesProps').path, $('#modal-title').textContent], ['/srv', 'Properties of srv']);
+    closeModal(false);
+    pick(1, 2);
+    ops.result = null;
+    key('Enter', { altKey: true });
+    check('ops: Alt+Enter on several says one at a time', [said(), !!modal], ['Properties shows one item at a time: pick one.', false]);
+
+    // The keys only in the list: in a text field, the Downloads table and the recent searches they
+    // keep their own meaning.
+    quiet();
+    reset();
+    pick(1);
+    for (const [k, m] of [['Delete', {}], ['F2', {}], ['x', { ctrlKey: true }], ['v', { ctrlKey: true }], ['N', { ctrlKey: true, shiftKey: true }]]) {
+      $('#query').dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...m }));
+      $('#queue').dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...m }));
+    }
+    check('ops: no change from keys in the search box or the Downloads table', [sent.filter((m) => m.type.startsWith('files')), !!modal && $('#modal-title').textContent.startsWith('Delete 1')],
+      [[], false]);
+    if (modal) closeModal(false);
+
+    // The words: permissions, sizes, results.
+    check('ops: rwx with set-id and sticky bits', [rwx(0o755), rwx(0o4755), rwx(0o2750), rwx(0o1777), rwx(0o4644)],
+      ['rwxr-xr-x', 'rwsr-xr-x', 'rwxr-s---', 'rwxrwxrwt', 'rwSr--r--']);
+    check('ops: sizes in their total\'s unit', [fmtSizeOf(1288490189, 3650722202), fmtSizeOf(5, 900), fmtSizeOf(0, 2048)], ['1.2 of 3.4 GiB', '5 of 900 B', '0.0 of 2.0 KiB']);
+    const rep = (op, msg, job) => reportText(op, { files: 0, folders: 0, bytes: 0, left: 0, entries: [], skipped: 0, failed: 0, ...msg }, job).text;
+    const job1 = { server: 'Main', dir: '/srv', paths: ['/a'], clip: { items: [{ name: 'holiday' }] } };
+    check('ops: results in words', [rep('move', { files: 0, folders: 1 }, job1), rep('copy', { files: 1204, folders: 25, bytes: 3435973837 }, job1),
+      rep('delete', { stopped: true, files: 12, left: 30 }), rep('copy', { error: 'the connection to Main was lost: reset', files: 3 }, job1),
+      rep('copy', { files: 2, failed: 1, entries: [{ state: 'failed', from: '/a/x', to: '/b/x', why: 'refused' }] }, job1)],
+    ['Moved holiday to Main:/srv', 'Copied 1,204 files and 25 folders (3.2 GiB) to Main:/srv', 'Delete cancelled: 12 files deleted, 30 still there',
+      'the connection to Main was lost: reset (3 files copied first)', 'Copied 2 files to Main:/srv; 1 item failed: x: refused']);
+
+    // Light and dark: every colour of these is a theme token's (app.css redefines them for dark), so
+    // both themes hold: each part's colour against a probe of the token it should use.
+    const token = (name) => {
+      const probe = document.createElement('span');
+      probe.style.color = `var(--${name})`;
+      document.body.append(probe);
+      const c = getComputedStyle(probe).color;
+      probe.remove();
+      return c;
+    };
+    const colorOf = (el) => getComputedStyle(el).color;
+    reset();
+    pick(1);
+    key('c', { ctrlKey: true });
+    opsSay('x', true);
+    const colours = [colorOf($('#ops-text')) === token('danger'), colorOf($('#clip')) === token('muted'), colorOf($('#ops-cancel')) === token('accent')];
+    ops.result = null;
+    setRunning({ token: 1, op: 'copy', what: 'x', text: 'x' });
+    colours.push(colorOf($('#ops-text')) === token('text'));
+    ops.running = null;
+    clearClip();
+    showMenu(10, 10, folderMenu());
+    colours.push(colorOf($('#menu .note')) === token('muted'));
+    closeMenu();
+    key('F2');
+    typeName('');
+    colours.push(colorOf($('#fo-why')) === token('danger'));
+    closeModal(false);
+    key('Enter', { altKey: true });
+    colours.push(colorOf($('#modal-body .fo-props th')) === token('muted'));
+    closeModal(false);
+    check('ops: light and dark: the new parts take the theme\'s colours', colours, Array(colours.length).fill(true));
+
+    quiet();
+    ops.accounts.clear();
+    Object.assign(b, browseWas);
+    state.hits = hitsWas;
+    state.remotes = remotesWas;
+    state.remote = remoteWas;
+    state.results = [];
+    state.selected = new Set();
+    state.cursor = -1;
     renderRows();
   }
 

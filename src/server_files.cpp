@@ -742,6 +742,7 @@ struct Plan {
     std::vector<CopyFile> files; // files and links
     std::vector<Entry> entries;  // decided before anything is copied: skipped, failed, asking
     std::vector<Entry> taken;    // every name taken, whatever the choice (look)
+    std::vector<Entry> unwalked; // of them, the folders whose name is taken by a file (or a link): not walked
     std::optional<std::string> refused; // nothing may be copied at all
     std::size_t total_files = 0;   // walked, before the choices
     std::size_t total_folders = 0;
@@ -971,6 +972,7 @@ Plan plan_copy(Conn& k, const Where& w, std::span<const Item> items, Existing ex
             } else if (*there) {
                 const upload::Clash clash = clash_of(it.to, *src, (*there)->through);
                 p.taken.push_back(entry(Entry::State::asking, it.from, it.to, "already there", clash));
+                p.unwalked.push_back(p.taken.back());
                 const upload::Decision d = decide_whole(choice, clash, true, false);
                 if (d.action == upload::Action::ask) {
                     p.entries.push_back(entry(Entry::State::asking, it.from, it.to, "already there", clash));
@@ -1630,6 +1632,16 @@ std::expected<Look, std::string> look(const Where& w, std::span<const Item> item
             l.files = p.total_files;
             l.folders = p.total_folders;
             l.bytes = p.total_bytes;
+            // A folder whose name is taken by a file isn't walked by the plan (it goes only with
+            // Keep both): counted here, so the question's counts hold all that may be copied.
+            for (const Entry& e : p.unwalked) {
+                if (!e.clash->remote_is_dir) l.folders_onto_files.add(*e.clash);
+                auto tree = walk(*k.c, raw_of(e.from), stop);
+                if (!tree || tree->stopped) continue;
+                l.folders += 1 + tree->folders.size();
+                l.files += tree->files.size() + tree->links.size();
+                l.bytes += tree->bytes();
+            }
             for (const Entry& e : p.taken) {
                 l.taken.add(*e.clash);
                 if (l.clashes.size() < max_clashes) l.clashes.push_back(e);
@@ -1647,6 +1659,7 @@ std::expected<Look, std::string> look(const Where& w, std::span<const Item> item
                 if (!there || !*there) continue;
                 const upload::Clash clash = clash_of(it.to, *src, (*there)->through);
                 l.taken.add(clash);
+                if (src->is_dir() && !clash.remote_is_dir) l.folders_onto_files.add(clash);
                 if (l.clashes.size() < max_clashes) {
                     l.clashes.push_back(entry(Entry::State::asking, it.from, it.to, "already there", clash));
                 }
@@ -1914,6 +1927,62 @@ std::expected<std::string, std::string> hash(const Where& w, const RcloneRemote&
 }
 
 // ---- around them -----------------------------------------------------------------------------------------
+
+std::expected<Account, std::string> account(const Where& w, std::stop_token stop) {
+    return on_connection<Account>(w, stop, [&](Conn& k) -> std::expected<Account, std::string> {
+        sftp::Client& c = *k.c;
+        auto home = sftp::realpath(c, ".");
+        if (!home) return util::failf("{}: the login folder can't be looked at: {}", w.server, sftp::describe(home.error()));
+        Account a{.home = rclone_enc::from_raw_path(*home), .read_only = false, .free = std::nullopt};
+        if (k.caps.statvfs) {
+            if (auto v = sftp::statvfs(c, *home)) {
+                a.read_only = v->read_only();
+                a.free = v->free_bytes();
+            }
+        }
+        return a;
+    });
+}
+
+std::vector<std::string> resolved(const Where& w, std::span<const std::string> paths, std::stop_token stop) {
+    std::vector<std::string> out(paths.begin(), paths.end());
+    [[maybe_unused]] auto asked = on_connection<bool>(w, stop, [&](Conn& k) -> std::expected<bool, std::string> {
+        sftp::Client& c = *k.c;
+        std::vector<std::optional<std::string>> real(paths.size());
+        for (std::size_t at = 0; at < paths.size(); at += batch) {
+            for (std::size_t i = at; i < std::min(paths.size(), at + batch); ++i) {
+                if (paths[i].empty() || paths[i] == "/") continue;
+                c.realpath(raw_of(parent_of(paths[i])), [&real, i](std::expected<std::string, sftp::Status> r) {
+                    if (r) real[i] = std::move(*r);
+                });
+            }
+            while (c.pending() > 0) c.pump();
+        }
+        for (std::size_t i = 0; i < paths.size(); ++i) {
+            if (real[i]) out[i] = child(rclone_enc::from_raw_path(*real[i]), name_of(paths[i]));
+        }
+        return true;
+    });
+    return out;
+}
+
+std::vector<std::string> followed(const Where& w, std::span<const std::string> paths, std::stop_token stop) {
+    std::vector<std::string> out(paths.begin(), paths.end());
+    [[maybe_unused]] auto asked = on_connection<bool>(w, stop, [&](Conn& k) -> std::expected<bool, std::string> {
+        sftp::Client& c = *k.c;
+        for (std::size_t at = 0; at < paths.size(); at += batch) {
+            for (std::size_t i = at; i < std::min(paths.size(), at + batch); ++i) {
+                if (paths[i].empty() || paths[i] == "/") continue;
+                c.realpath(raw_of(paths[i]), [&out, i](std::expected<std::string, sftp::Status> r) {
+                    if (r) out[i] = rclone_enc::from_raw_path(*r);
+                });
+            }
+            while (c.pending() > 0) c.pump();
+        }
+        return true;
+    });
+    return out;
+}
 
 std::string canonical(std::string_view path, std::string_view home) {
     std::string whole = !home.empty() && !path.starts_with('/') ? child(home, path) : std::string(path);

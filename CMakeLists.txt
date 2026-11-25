@@ -207,6 +207,7 @@ if(WIN32 AND GRAB_BUILD_GUI)
         src/gui/main_gui.cpp
         src/gui/app.cpp
         src/gui/app_upload.cpp
+        src/gui/app_files.cpp
         src/gui/tray.cpp
         src/gui/webview.cpp
         src/gui/play_server.cpp

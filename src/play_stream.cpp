@@ -1389,6 +1389,18 @@ void Server::kick() {
     changed_.notify_all();
 }
 
+std::vector<Server::Playing> Server::playing() {
+    std::vector<Playing> out;
+    std::scoped_lock lock(mutex_);
+    for (const auto& [id, s] : streams_) {
+        std::scoped_lock stream_lock(s->m);
+        if (s->requests > 0 || (!s->abandoned && (s->running || (s->plan.warming() && !s->failure)))) {
+            out.push_back(Playing{.server = s->file.server, .path = s->file.path});
+        }
+    }
+    return out;
+}
+
 Server::Stats Server::stats() {
     Stats out;
     std::scoped_lock lock(mutex_);

@@ -153,13 +153,17 @@ struct Report {
                           const OnProgress& progress = {}, std::stop_token stop = {});
 
 // What a move or copy of `items` would meet, nothing changed: the files, folders and bytes (a copy
-// walks its folders) and the names taken (entries asking, with their clashes; the copy's files in
-// folders merged into too), or what refused_before says. For the window's question before a paste.
+// walks its folders, a folder whose name a file has too: Keep both copies it) and the names taken
+// (entries asking, with their clashes; the copy's files in folders merged into too), or what
+// refused_before says. For the window's question before a paste.
 struct Look {
     std::size_t files = 0;
     std::size_t folders = 0;
     std::uint64_t bytes = 0;
     upload::Taken taken;
+    // Of `taken`: the folders moved or copied onto a file of their name, by how they compare. Only
+    // Keep both puts them anywhere (beside it); every other choice skips them.
+    upload::Taken folders_onto_files;
     std::vector<Entry> clashes; // the first max_clashes of them
 };
 inline constexpr std::size_t max_clashes = 200;
@@ -208,6 +212,32 @@ struct Size {
                                                            std::uint64_t size, ssh::Sum sum, std::stop_token stop = {});
 
 // ---- what the window does around them ----------------------------------------------------------------
+
+// The account on a server as the window keeps it while Browse shows that server: the login folder's
+// real path (REALPATH of "."), which canonical(), busy_refusal() and invalidation() take as `home`;
+// and what statvfs says of the login folder's file system: read-only for this account (Box.Guest:
+// the window greys every change, saying why) and the bytes it may still write. A server without
+// statvfs is taken as writable: grab tries, and says the server's refusal.
+struct Account {
+    std::string home; // grab's form
+    bool read_only = false;
+    std::optional<std::uint64_t> free;
+};
+[[nodiscard]] std::expected<Account, std::string> account(const Where& w, std::stop_token stop = {});
+
+// Each of `paths` (grab's form) with its folder's real path (REALPATH of each folder, asked at
+// once) and its own name kept, so a link is still itself: the spelling the window compares and
+// marks beside the given one when a path goes through a link to a folder. One whose folder can't
+// be resolved (gone, not readable, the connection failing) stays as given; so do the login folder
+// and "/".
+[[nodiscard]] std::vector<std::string> resolved(const Where& w, std::span<const std::string> paths,
+                                                std::stop_token stop = {});
+// Each of `paths` (grab's form) REALPATHed whole, a link at its end followed too: the place a
+// transfer or Play through a link really reads or writes (a folder download of a link to a folder,
+// Play of a link to a file). One that can't be resolved (not there yet, as an upload's target; not
+// readable; the connection failing) stays as given; so do the login folder and "/".
+[[nodiscard]] std::vector<std::string> followed(const Where& w, std::span<const std::string> paths,
+                                                std::stop_token stop = {});
 
 // A path a transfer or Play is using on the server: no change may touch it, nor a folder holding it.
 struct Busy {

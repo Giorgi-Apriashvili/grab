@@ -88,6 +88,9 @@ using json::Value;
 constexpr std::size_t files_chunk = 5000;
 // queue.json is saved at most this often while downloads change it (DOWNLOADS-UI.md 6.5).
 constexpr auto queue_save_gap = std::chrono::seconds(2);
+// How long closing waits for a copy or delete it stopped to remove what it made (its temps, the
+// empty folders it made) before every connection is cut.
+constexpr auto files_close_wait = std::chrono::seconds(5);
 
 Value str(std::string s) { return Value::make_string(std::move(s)); }
 Value num(double n) { return Value::make_number(n); }
@@ -326,6 +329,13 @@ void App::close() {
         std::scoped_lock lock(checks_mutex_);
         for (const auto& c : checks_) c->thread.request_stop();
     }
+    {
+        // Browse's changes and looks stop too: a copy or delete between its files or pieces (what
+        // they changed starts no list refresh now: files_changed).
+        files_closing_ = true;
+        std::scoped_lock lock(files_mutex_);
+        for (const auto& t : files_tasks_) t->thread.request_stop();
+    }
     cleaner_.request_stop(); // what it hasn't removed yet stays in uploads.json, for the next start
     if (update_check_thread_.joinable()) update_check_thread_.request_stop();
     if (update_thread_.joinable()) update_thread_.request_stop(); // `grab update` carries on by itself
@@ -340,6 +350,15 @@ void App::close() {
     }
     for (auto& w : workers_) w.request_stop();
     wake_.notify_all();
+    // A copy stopped above removes its temps and the empty folders it made on its way out, over
+    // its connection: a few moments for it (files_close_wait) before they are cut.
+    for (const auto until = std::chrono::steady_clock::now() + files_close_wait; std::chrono::steady_clock::now() < until;) {
+        {
+            std::scoped_lock lock(files_mutex_);
+            if (std::ranges::none_of(files_tasks_, [](const auto& t) { return t->change && !t->over; })) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     // A login, read or command waiting on a server ends now; whatever is still connecting fails
     // at once. Without this a login stuck in the handshake held the exit for io_timeout, twice.
     ssh::close_all_connections();
@@ -737,10 +756,13 @@ void App::run_plays(const std::stop_token& stop) {
             job = std::move(*play_next_);
             play_next_.reset();
             play_current_ = current;
+            play_job_ = job;
         }
         // The window closing stops it as well (review G42).
         const std::stop_callback closing(stop, [&current] { current.request_stop(); });
         run_play(job, current.get_token());
+        std::scoped_lock lock(play_mutex_);
+        play_job_.reset(); // its stream says from now on whether the player uses the file
     }
 }
 
@@ -1092,6 +1114,8 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
     } else if (type == "serverTest") {
         const std::string name = msg->string_of("name").value_or("");
         settings_task([this, name](std::stop_token stop) { test_server(name, stop); });
+    } else if (type.starts_with("files")) {
+        files_message(type, *msg);
     } else if (type == "serverRemove" || type == "serverDefault") {
         const bool remove = type == "serverRemove";
         const std::string name = msg->string_of("name").value_or("");
@@ -1454,10 +1478,12 @@ void App::start_refresh(const std::string& server, bool asked) {
         walk.reset();
         if (!fetched) act.failed();
         if (fetched) (void)file_list::save(file_list::path_for(lists_dir_, server), *fetched);
+        bool again = false; // Browse changed the server meanwhile (files_changed): fetched once more
         {
             std::lock_guard inner(lists_mutex_);
             auto& slot = list_slot(server);
             slot.refreshing = false;
+            again = std::exchange(slot.again, false);
             if (stop.stop_requested()) return;
             if (fetched) {
                 slot.list = std::make_shared<const file_list::List>(std::move(*fetched));
@@ -1471,7 +1497,10 @@ void App::start_refresh(const std::string& server, bool asked) {
                 ++slot.failures;
             }
         }
-        host_.defer([this, server] { on_list_refreshed(server); });
+        host_.defer([this, server, again] {
+            on_list_refreshed(server);
+            if (again) start_refresh(server, true);
+        });
     });
 }
 
@@ -2071,6 +2100,11 @@ void App::post_host_keys(const Pending& p) const {
 
 void App::servers_changed() {
     prune_lists();
+    {
+        // Asked again when Browse opens each (the page forgets them with the init below).
+        std::scoped_lock lock(files_mutex_);
+        accounts_.clear();
+    }
     if (auto env = load_env()) post_servers(*env);
     host_.defer([this] { send_init(); }); // the search view's server list; state_ is UI-thread only
 }

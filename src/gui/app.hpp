@@ -15,6 +15,7 @@
 #include "queue_view.hpp"
 #include "rate.hpp"
 #include "schedule.hpp"
+#include "server_files.hpp"
 #include "server_ops.hpp"
 #include "servers.hpp"
 #include "speed.hpp"
@@ -398,6 +399,8 @@ private:
         std::shared_ptr<const file_list::List> list;
         std::shared_ptr<const browse::Index> index; // the list's folders, built on the first browse
         bool refreshing = false;
+        // A change on the server came while it was being fetched: fetched again once it ends.
+        bool again = false;
         std::string error; // why the last refresh failed
         int failures = 0;  // refreshes failed in a row
         std::chrono::steady_clock::time_point retry_after{}; // no automatic refresh before
@@ -678,6 +681,54 @@ private:
     // Without mutex_.
     void upload_ended(const Item& item);
     void refresh_browse(); // UI thread
+
+    // ---- changes to a server's files from Browse (app_files.cpp; SERVER-OPS.md, chunk 2) ----
+    // The page's "files…" messages: each server's account for the menus (read-only or not), a
+    // rename, a new folder, a paste (a look at the names taken there first, then the move or copy),
+    // a delete (its folders counted first), Properties with its folder size and sums. Each runs on
+    // a thread of its own (server_files: one connection and one seat of the server's budget) and
+    // answers "filesDone" {token, ...}; a copy, delete or count says how far it is
+    // ("filesProgress"), and "filesCancel" {token} stops it. One change at a time in the window:
+    // a second is refused, naming the one running. Before a change, the paths a transfer or Play
+    // is using are refused (busy_refusal); after it, Browse, the file list and the previews forget
+    // what it changed (files_changed).
+    void files_message(const std::string& type, const json::Value& msg);
+    struct FilesTask {
+        int token = 0;
+        bool change = false; // renames, makes, moves, copies or deletes: one at a time
+        bool answered = false; // a change's answer posted: the next may start (under files_mutex_)
+        std::string what;    // a change's words, for the refusal of a second ("Copying holiday")
+        std::atomic<bool> over{false};
+        std::jthread thread; // last: joined before the rest goes
+    };
+    // Runs `run` on a thread of its own as task `token`; a change while another runs is refused.
+    void start_files_task(int token, bool change, std::string what, std::function<void(const std::stop_token&)> run);
+    // A server's connections for these, and its grab.conf entry (the sums' shell keys). Any thread.
+    struct FilesServer {
+        server_files::Where where;
+        RcloneRemote remote;
+    };
+    [[nodiscard]] std::expected<FilesServer, std::string> files_server(const std::string& server);
+    // The server's account (accounts_), asked when not known or `again`; told to the page
+    // ("filesAccount"). Any thread but the UI's.
+    std::expected<server_files::Account, std::string> files_account(const std::string& server, const FilesServer& fs,
+                                                                    const std::stop_token& stop, bool again);
+    void post_account(const std::string& server, const std::expected<server_files::Account, std::string>& account) const;
+    // Why a change of `paths` on `server` may not run: a download, an upload or Play uses one of
+    // them, one holding them, or one inside them; compared as given and with their folders' real
+    // paths (server_files::resolved), so a link to a folder hides nothing. `resolved_paths`: theirs.
+    [[nodiscard]] std::optional<std::string> files_busy(const FilesServer& fs, const std::string& home,
+                                                        const std::vector<std::string>& paths,
+                                                        std::vector<std::string>& resolved_paths, const std::stop_token& stop);
+    // After a change: Browse lists the folders it changed live again (and shows the one on
+    // screen again now), the previews of its paths go, the server's file list drops `went` (the
+    // paths that surely left their places; the rest waits for the fetch) and is fetched again
+    // (search results keep no deleted or renamed file). Any thread.
+    void files_changed(const std::string& server, const std::string& home, const server_files::Changed& changed,
+                       const std::vector<std::string>& went);
+    // The change task `token` has posted its answer: the one-change slot is free for the next,
+    // while it follows up (files_changed). close() still waits for it to end.
+    void files_answered(int token);
     // queue.json soon, from any thread: at most once every queue_save_gap (longer after a slow
     // save), on saver_. now (a download ended): without the queue_save_gap floor, still at most
     // once every ten times the last save's duration. Closing and an update's restart save at once.
@@ -815,10 +866,11 @@ private:
 
     // Play's local stream server; after connections_ and pools_, which its streams use.
     play::Server play_server_{connections_};
-    std::mutex play_mutex_; // guards play_next_, play_current_
+    std::mutex play_mutex_; // guards play_next_, play_current_, play_job_
     std::condition_variable_any play_wake_;
     std::optional<PlayJob> play_next_;
     std::stop_source play_current_; // the Play preparing now
+    std::optional<PlayJob> play_job_; // its file, while it prepares (Browse leaves it be)
     std::jthread play_thread_;      // after play_server_: joined before it goes
     // The previews being fetched, by file, and the ones kept in memory (thread-safe).
     preview::Previews preview_jobs_;
@@ -853,6 +905,15 @@ private:
     // Upload checks, one dialog's at a time; those whose thread ended are dropped at the next.
     std::mutex checks_mutex_;
     std::vector<std::shared_ptr<UploadCheck>> checks_;
+    // Browse's changes on servers and their looks (app_files.cpp): each server's account as asked
+    // this session, the servers being asked, and the tasks running, those whose thread ended
+    // dropped at the next start. All under files_mutex_.
+    std::mutex files_mutex_;
+    std::map<std::string, server_files::Account> accounts_;
+    std::set<std::string> accounts_asking_;
+    std::atomic<bool> files_closing_{false}; // close() ran: what a stopped change did isn't followed up
+    // After what its tasks use above: their threads are joined before those go.
+    std::vector<std::shared_ptr<FilesTask>> files_tasks_;
     // The cleaner: the servers whose leftovers it tries next, and the server of the pass it is
     // making ("" none), both under clean_mutex_. clean_wake_ also tells the end of a pass.
     std::mutex clean_mutex_;
