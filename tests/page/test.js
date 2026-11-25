@@ -495,6 +495,43 @@ try {
   $('.dl-head .c-status').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 300, clientY: 100 }));
   $('#menu').querySelectorAll('button')[0].click();
   check('Queue order', [dlSort.key, lastPrefs().sort], ['', null]);
+  // One shaded entry at most (the focused one): none when the mouse opens a menu, then the one
+  // under the pointer, none over a greyed entry or once the pointer leaves; the keys go on from
+  // the shaded one (or from the ends with none). Opened by the keys, the first starts shaded.
+  {
+    const act = () => {};
+    const entries = [{ label: 'One', act }, { label: 'Two', act }, { label: 'Off', act, disabled: true }, '-', { label: 'Three', act }];
+    const btn = (label) => [...$('#menu').querySelectorAll('button')].find((b) => b.querySelector('.text').textContent === label);
+    const shaded = () => (document.activeElement === $('#menu') ? null
+      : document.activeElement.closest('#menu') ? document.activeElement.querySelector('.text').textContent : 'outside');
+    const move = (el) => el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true }));
+    const menuKey = (k) => document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    showMenu(10, 10, entries);
+    check('menu by the mouse: nothing shaded, the menu has the keys', shaded(), null);
+    move(btn('Two'));
+    check('menu: the entry under the pointer is shaded', shaded(), 'Two');
+    move(btn('Off'));
+    check('menu: none over a greyed entry', shaded(), null);
+    move(btn('One'));
+    $('#menu').dispatchEvent(new PointerEvent('pointerleave'));
+    check('menu: none once the pointer leaves', shaded(), null);
+    menuKey('ArrowUp');
+    check('menu: Up with none shaded: the last', shaded(), 'Three');
+    menuKey('ArrowDown');
+    check('menu: Down goes round past the greyed one', shaded(), 'One');
+    move(btn('Two'));
+    menuKey('ArrowDown');
+    check('menu: the keys go on from the hovered entry', shaded(), 'Three');
+    move(btn('Off'));
+    let ran = 0;
+    entries[0].act = () => { ran++; };
+    menuKey('Enter');
+    check('menu: Enter with none shaded does nothing', [ran, $('#menu').hidden], [0, false]);
+    closeMenu();
+    showMenu(10, 10, entries, true);
+    check('menu by the keys: the first starts shaded', shaded(), 'One');
+    closeMenu();
+  }
   // The dialog gives the focus back where it was (the table after Delete's question).
   grid.focus();
   showModal({ title: 't', html: '', ok: 'OK', onOk() {} });

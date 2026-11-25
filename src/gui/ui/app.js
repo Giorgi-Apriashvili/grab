@@ -1936,8 +1936,10 @@ let menuReturn = null; // where the focus goes back to
 
 // items: { label, act, key, disabled, checked, why, note } entries, '-' for a separator, { heading }.
 // `checked` true or false makes an entry one of a group (a check mark on the current one). A
-// greyed entry's `why` is its tooltip, `note` a few words of it beside its label.
-function showMenu(x, y, entries) {
+// greyed entry's `why` is its tooltip, `note` a few words of it beside its label. `byKeys`: opened
+// by the menu key or Shift+F10, so the first entry starts shaded for Enter; opened by the mouse,
+// nothing is shaded until the pointer is on an entry.
+function showMenu(x, y, entries, byKeys = false) {
   // Separators only between entries: none first, last or twice in a row (a finished download has
   // no actions before "Show in folder", say).
   const items = [];
@@ -1970,8 +1972,11 @@ function showMenu(x, y, entries) {
   const r = menu.getBoundingClientRect();
   menu.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 4))}px`;
   menu.style.top = `${Math.max(4, y + r.height > innerHeight - 4 ? y - r.height : y)}px`;
-  const first = menu.querySelector('button:not(:disabled)');
-  if (first) first.focus();
+  // The shaded entry is the focused one (app.css), and the focus follows the pointer (below), so
+  // only one entry is ever shaded. Opened by the mouse the menu itself has the focus: the arrow
+  // keys and Escape work, and nothing is shaded.
+  const first = byKeys ? menu.querySelector('button:not(:disabled)') : null;
+  (first || menu).focus();
 }
 
 function closeMenu(restoreFocus = false) {
@@ -1997,18 +2002,28 @@ $('#menu').addEventListener('keydown', (ev) => {
   const n = buttons.length;
   let to = -1;
   if (ev.key === 'ArrowDown') to = (at + 1) % n;
-  else if (ev.key === 'ArrowUp') to = (at + n - 1) % n;
+  else if (ev.key === 'ArrowUp') to = at < 0 ? n - 1 : (at + n - 1) % n; // nothing shaded yet: the last
   else if (ev.key === 'Home') to = 0;
   else if (ev.key === 'End') to = n - 1;
   if (to >= 0) {
     buttons[to].focus();
   } else if (ev.key === 'Escape' || ev.key === 'Tab' || (ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
     closeMenu(true);
-  } else {
-    return; // Enter and Space press the focused entry
+  } else if (at >= 0 || (ev.key !== 'Enter' && ev.key !== ' ')) {
+    return; // Enter and Space press the shaded entry; with none shaded they do nothing
   }
   ev.preventDefault();
   ev.stopPropagation(); // not also the window's keys (Escape closes Settings, say)
+});
+// The shaded entry follows the pointer: the one under it, none over a greyed entry, a line or
+// outside the menu. The keys go on from there, as in Windows' menus.
+$('#menu').addEventListener('pointermove', (ev) => {
+  const b = ev.target instanceof Element ? ev.target.closest('#menu button') : null;
+  const to = b && !b.disabled ? b : $('#menu');
+  if (document.activeElement !== to) to.focus();
+});
+$('#menu').addEventListener('pointerleave', () => {
+  if (!$('#menu').hidden && document.activeElement !== $('#menu')) $('#menu').focus();
 });
 document.addEventListener('mousedown', (ev) => { if (!ev.target.closest('#menu')) closeMenu(); }, true);
 document.addEventListener('wheel', () => closeMenu(), { passive: true });
@@ -4893,11 +4908,12 @@ function applyDlView(v) {
   head.addEventListener('contextmenu', (ev) => {
     ev.preventDefault();
     let [x, y] = [ev.clientX, ev.clientY];
-    if (!x && !y) { const box = ev.target.getBoundingClientRect(); [x, y] = [box.left, box.bottom]; } // from the keys
+    const byKeys = !x && !y;
+    if (byKeys) { const box = ev.target.getBoundingClientRect(); [x, y] = [box.left, box.bottom]; } // from the keys
     showMenu(x, y, [
       { label: 'Queue order', disabled: !dlSort.key, act: () => { dlSort.key = ''; applyDlSort(); } },
       { label: 'Reset column widths', disabled: !Object.keys(dl.widths).length, act: resetAllDlWidths },
-    ]);
+    ], byKeys);
   });
 }
 
@@ -5456,7 +5472,7 @@ function endDrag(drop) {
       dlKeepInView(dlIndexOf(key));
       renderDlBody();
       const box = dl.bound.get(key).getBoundingClientRect();
-      showMenu(box.left + 40, box.bottom, dlMenu());
+      showMenu(box.left + 40, box.bottom, dlMenu(), true);
     }
   });
   // A new order waiting for the pointer to leave the table comes once it has (5.6).
@@ -7574,13 +7590,13 @@ $('#results').addEventListener('keydown', (ev) => {
     // No row under the cursor (an empty folder): the open folder's own menu, as on the list's empty part.
     if (state.cursor < 0 || !state.hits[state.cursor]) {
       const r = $('#results').getBoundingClientRect();
-      showMenu(r.left + 40, r.top + 8, folderMenu());
+      showMenu(r.left + 40, r.top + 8, folderMenu(), true);
       return;
     }
     const row = document.querySelector(`#rows .row[data-i="${state.cursor}"]`);
     if (!row) return;
     const r = row.getBoundingClientRect();
-    showMenu(r.left + 40, r.bottom, resultMenu());
+    showMenu(r.left + 40, r.bottom, resultMenu(), true);
   } else if (ev.key === 'Enter') {
     ev.preventDefault();
     // Enter opens the folder under the cursor, unless several rows are picked.
