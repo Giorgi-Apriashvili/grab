@@ -48,6 +48,10 @@ connections, building and releasing) is in the full documentation,
   window's Browse, drag them from Explorer onto it, or run `grab upload`. grab checks that you
   can write there and asks before replacing anything; each file takes its name only when
   complete, and big ones resume.
+- **Changing files on the server.** Right-click in Browse, or use Explorer's keys (F2, Del,
+  Ctrl+X / C / V), to rename, delete, make folders, and cut, copy and paste within a server,
+  which copies the data itself; deletes are confirmed first, and Properties shows permissions,
+  owners, folder sizes and checksums.
 
 ## Requirements
 
@@ -186,7 +190,7 @@ PATH. More in [Build](docs/doc.md#build) and [From source](docs/doc.md#from-sour
 - [How it works](docs/doc.md#how-it-works): the steps of a run
 - [GUI](docs/doc.md#gui): the window's folders, search and filters, previews and Play,
   downloads, the queue, priorities, speed limit and schedule, Verify downloads, connections per
-  server, updates
+  server, updates, [changing files on the server](docs/doc.md#changing-files-on-the-server)
 - [Configure](docs/doc.md#configure): servers, logins, grab's password store and host keys,
   [grab.conf](docs/doc.md#grabconf),
   [servers grab won't connect to](docs/doc.md#servers-grab-wont-connect-to),

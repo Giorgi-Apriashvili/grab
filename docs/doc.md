@@ -12,6 +12,7 @@ This is grab's full documentation; [README.md](../README.md) is the short introd
   - [Updating](#updating)
   - [From source](#from-source)
 - [GUI](#gui)
+  - [Changing files on the server](#changing-files-on-the-server)
 - [Configure](#configure)
   - [Servers](#servers)
     - [Coming from an earlier grab](#coming-from-an-earlier-grab)
@@ -426,13 +427,19 @@ them.
   **Upload folder here…**, or drag files and folders from Explorer onto Browse; a dialog checks
   and asks first, and the upload runs as a row of the Downloads table, marked ↑. All of it,
   and the `grab upload` command, is in [Uploading](#uploading).
+- **Changing files on the server:** Cut, Copy and Paste within a server, Rename, Delete, New
+  folder and Properties, from the right-click menu or with Explorer's keys (F2, Del,
+  Ctrl+X / C / V, Ctrl+Shift+N, Alt+Enter). All of it is in
+  [Changing files on the server](#changing-files-on-the-server).
 - **Right-click menus:**
   - **On a row:** Open (folders), Download, Download to… (pick a folder for this download only;
-    Save to stays), Open folder location (search results), Upload files here… and Upload folder
-    here… (one folder; on other rows Upload files to *folder*… and Upload folder to *folder*…,
-    into the folder that is open), Copy path (the server path) and Copy name. With several rows
-    selected, they act on all of them. The list's empty part has the upload entries for the open
-    folder.
+    Save to stays), Open folder location (search results), Cut, Copy, Paste (into a folder row;
+    on a file row Paste into *the open folder*), Rename… and Delete…, Upload files here… and
+    Upload folder here… (one folder; on other rows Upload files to *folder*… and Upload folder to
+    *folder*…, into the folder that is open), Copy path (the server path), Copy name and
+    Properties. With several rows selected, they act on all of them (Rename and Properties on
+    one at a time). The list's empty part has Paste, New folder…, the upload entries and
+    Properties for the open folder.
   - **On a download:** Open (a finished file download: the file in its app) or Open folder (a
     finished folder download: its folder in Explorer), Pause, Resume or Retry, Cancel, Priority,
     Set all files to High / Normal / Low (a listed folder: its unfinished files' own priority),
@@ -842,6 +849,143 @@ them.
 
 The GUI is built with the rest (`GRAB_BUILD_GUI=ON` by default); in a source build run
 `build\<preset>\grab-gui.exe`, or `cmake --install` it with grab.
+
+### Changing files on the server
+
+Browse can change a server's own files too: rename them, make folders, move and copy them within
+the server, and delete them, from the right-click menu or with Explorer's keys. grab does only
+what you ask: nothing is deleted without a confirmation, and nothing is replaced unless you
+choose so.
+
+- **Right-click menus:**
+  - **On a row** (a file or folder of the open folder, or a search result): Cut, Copy, Paste,
+    Rename… and Delete…, and Properties at the end. On a folder row Paste goes into that folder;
+    on a file row it is **Paste into** *the open folder*. With several rows selected, Cut, Copy
+    and Delete take them all; Rename and Properties take one at a time.
+  - **On the list's empty part:** Paste and New folder… into the open folder, and its
+    Properties.
+  - **On search results** (All servers' too) Cut, Copy, Rename, Delete and Properties work, each
+    result on its own server and path; the rows picked must be of one server. Paste and New
+    folder need a folder you have open, and say so in search results.
+  - An entry that can't be used now is greyed, and hovering it says why ("Nothing to paste: Cut
+    or Copy files or folders first").
+- **Keys**, as in Explorer: **F2** renames, **Del** deletes, **Ctrl+X** cuts, **Ctrl+C** copies,
+  **Ctrl+V** pastes into the open folder, **Ctrl+Shift+N** makes a new folder and **Alt+Enter**
+  shows Properties (the open folder's when no row is picked); **Esc** lets go of what Cut or
+  Copy holds (in search results it closes them first). They work only in the file list
+  (Browse's rows and search results), never while you type in a box. Del keeps its own meaning
+  in the Downloads table (cancel or skip) and in the recent searches (remove one).
+- **Cut, Copy and Paste** move or copy files and folders within one server.
+  - Cut or Copy holds the rows in grab, not on Windows' clipboard: the status bar says "2 items
+    ready to paste · Esc clears" (hover it for their names), and cut rows show faded until they
+    are pasted. Paste in a folder of the same server moves them there (Cut) or copies them
+    (Copy). A move that ran to its end lets go of them; a copy keeps them for more pastes.
+    Files copied in Explorer don't paste here: to send files from this PC, see
+    [Uploading](#uploading).
+  - **A move is a rename on the server:** instant whatever the size, nothing copied, and a
+    folder moves whole. A folder can't go into itself or a folder below it. A folder on another
+    file system of the server (another disk; `/tmp` on many servers) refuses a move, saying so:
+    grab moves only within one file system, so copy there and delete the original instead.
+  - **A copy is made by the server itself** (SFTP's copy-data, where the server offers it:
+    OpenSSH 9.0 and later): no byte comes through your PC, so it goes at the server's disk speed,
+    not your line's. Folders are copied with everything in them, hidden files too, and merged
+    into a folder of the same name there. Each file is copied to a temporary name of grab's
+    beside its place (`.name.0a1b2c.grabpart`) and takes its name only when complete; it keeps
+    its modified time and permissions (rwx). Links are made again as links pointing where they
+    pointed, never followed; a server that won't make them skips them, saying so. A server
+    without copy-data (an older OpenSSH, such as Ubuntu 22.04's 8.9 or RHEL 9's 8.7) says it
+    "doesn't copy files itself (no copy-data)" and copies nothing; it says so only once Paste
+    has looked at the names taken and asked about them.
+  - A copy cancelled, or ended by a failure, keeps the files it finished and removes its
+    temporary files and the folders it made that are still empty.
+  - A file copied and pasted in its own folder is a name taken like any other (Keep both makes
+    "report (2).txt"); a folder can't be copied onto itself.
+  - **Copies between servers aren't supported yet:** Paste on another server is greyed, "Not
+    yet: copies between servers". Download, then upload, does it meanwhile.
+- **Names already taken:** Paste first looks at the folder it goes into ("Looking at holiday and
+  tv…" in the status bar, with Cancel). When none of the names is there, it goes at once.
+  Otherwise the uploads' question opens (see [In the window](#in-the-window) under Uploading),
+  worded for the server: "5 already there: 3 the same, 2 newer", the first 200 listed with the
+  one copied or moved beside the one already there, sizes and times. **Replace**, **Replace if
+  different**, **Replace if newer**, **Skip** or **Keep both** (put beside it as "name (2)"),
+  for all of them or file by file, starting on Skip; the dialog says what happens ("2 replaced,
+  3 skipped"). Cancel changes nothing ("Paste cancelled: nothing changed"). A paste asks each
+  time: there is no "Always do this".
+  - A folder is never replaced, and a move never merges two folders: a folder moved onto one of
+    its name is skipped ("a folder of that name is there, and folders are never replaced"), or
+    put beside it with Keep both. A copy merges into it instead, and asks about the files in it
+    that are there already.
+  - A folder pasted onto a file of its name goes only with Keep both, beside it.
+  - A name that turns up after the look follows the choice for all (skipped when nothing was
+    asked).
+- **Rename and New folder** open a small dialog with the name. Rename picks a file's name
+  without its extension, as Explorer does; New folder starts with "New folder" ("New folder
+  (2)" when that is taken), and its button is Create. A name that can't be one (empty, "." or
+  "..", or holding a /) is said as you type. A name already taken says so ("notes.txt is
+  already taken in /srv") and keeps the dialog open: Rename never replaces anything. A folder
+  renames at once, whatever it holds. Afterwards Browse picks the renamed item or the new folder.
+- **Delete** asks first: "Delete holiday?", the first names, what goes ("1,204 files, 3 links and
+  25 folders · 3.2 GiB"; folders are counted first, with their progress) and "From Main, for
+  good: a server has no Recycle Bin to bring it back from." Delete is red, and Cancel has the
+  focus.
+  - **Deleting is permanent:** a server has no Recycle Bin, and grab keeps no copy.
+  - Everything inside a folder goes, hidden files too. A link is removed itself, never what it
+    points to, and a folder is never entered through a link.
+  - Every folder is listed before anything is removed: when one below can't be read, the dialog
+    says so and nothing is deleted. A refusal midway ends the delete, saying what went and what
+    is left; Cancel stops it between files ("Delete cancelled: 1,204 files deleted, 821 still
+    there").
+- **Read-only servers:** a server that reports its storage read-only for your account (a
+  read-only Storage Box sub-account, say) has Cut, Paste, Rename, Delete and New folder greyed,
+  with the reason as a heading above them: "Box.Guest is read-only for this account". grab
+  asks when Browse opens the server, and ⟳ asks again. Elsewhere grab tries, and a refusal
+  comes in plain words: "Main doesn't let this account write in /srv", "Main:/srv/x is no
+  longer there".
+- **One change at a time**, in the status bar: "Copying holiday to Main:/srv · 1.2 of 3.4 GiB",
+  "Deleting 1,204 of 2,000 files", with **Cancel**, which stops it where it is (between files,
+  or between pieces of a big file). Then the result shows for a few seconds: "Copied 500 files
+  and 6 folders (912 KiB) to Main:/srv/tv", with what was skipped or failed and the first
+  reason (hover for each one); a failure stays longer, in red.
+  - Another change asked for meanwhile (a rename, new folder, paste or delete) is refused,
+    saying which one runs ("Copying holiday is still going: wait until it ends, or cancel it
+    first"), over the progress for a few seconds. Properties, Folder size and the checksums
+    aren't changes and run beside it.
+  - A change isn't kept over a restart. Quitting grab (or closing the window while no
+    downloads keep grab running in the tray) stops it and gives it only a few seconds to clean
+    up: a copy quit in the middle of a big file can leave that file's temporary
+    `.name.0a1b2c.grabpart` and the empty folders it made, and grab doesn't remove them later.
+  - Closing the window while downloads run keeps grab in the tray and the change going, but
+    only until the downloads end: grab then quits by itself, without asking, and that stops
+    the change as quitting does. Let a long copy or delete end, or cancel it, before quitting.
+- **Paths in use are left alone:** a file or folder that a download or upload of that server
+  uses (running, queued or paused), or that Play streams, can't be changed or copied, nor a
+  folder holding one, nor anything inside a folder being downloaded or uploaded (so a file an
+  upload is still writing is never copied half-done): "Main:/srv/tv is
+  being downloaded: wait until it ends, or cancel it first". Play holds a file until grab frees
+  it, five minutes after the player's last read ("… is playing: stop playing it first"). A path
+  reached through a link counts as the place it leads to.
+- **Properties** (one item at a time, or the open folder) shows the name and where it is, its
+  type (file, folder, a link to a file or folder, or to nothing when its target is gone), a
+  link's target as stored, a file's size, the modified and accessed times, the permissions
+  (`rwxr-xr-x` and `755`), the owner and group (by name where the server gives them, else by
+  number) and the free space this account has there. It changes nothing, and works on
+  read-only servers too. On buttons, each with Cancel:
+  - **Folder size** counts everything inside, hidden files too, never through links: "3.2 GiB
+    (3,435,973,837 bytes) · 1,204 files, 3 links, 25 folders"; folders that can't be read are
+    said and not counted.
+  - **MD5** and **SHA-256** of a file (or of a link's file), computed by the server (`md5sum`,
+    `sha256sum`) over grab's SSH connection; a server or account without them says why.
+- **Browse and search show a change at once:** the folders it changed are listed from the
+  server again, search results drop what was moved, and what was deleted when the whole delete
+  ran to its end (after a cancelled or refused delete they keep its rows: search again to see
+  what is left), and show renamed items by their new names, and the server's file list is fetched again, so later searches find the new names.
+  A preview of a changed file is fetched anew.
+- **Not supported:** copies and moves between servers (not yet), moves onto another file system
+  of the server, undoing a change (there is no Ctrl+Z), changing permissions or owners, making
+  links, and changes from the command line (no `grab rm` or `grab mv`). The server's top
+  folder (`/`), and the login folder while it is the open folder, can't be renamed, moved,
+  copied or deleted. Reached by its full path (from `/home`, say) the login folder is a row
+  like any other, so take care with it there.
 
 ## Configure
 
@@ -1454,11 +1598,12 @@ the same rules.
   [GUI](#gui)). Should a full upload link slow downloads or Play down, the ↑ limit is the remedy.
 - **Not supported:** files inside a .zip (or a mail's attachments), which aren't on this PC as
   files until extracted: "Extract files from a .zip first"; links dragged from a browser ("grab
-  uploads files, not links"); dragged text (it does nothing). Nor are deleting, moving or
-  renaming server files, sync or delta transfer (rsync: Replace if different or if newer sends
-  only what changed, and a big file goes on from where it stopped), uploading from search
-  results or into several folders at once, server-to-server copies, and uploads from Play or the
-  viewer.
+  uploads files, not links"); dragged text (it does nothing). Nor are sync or delta transfer
+  (rsync: Replace if different or if newer sends only what changed, and a big file goes on from
+  where it stopped), uploading from search results or into several folders at once,
+  server-to-server copies, and uploads from Play or the viewer. Deleting, moving and renaming
+  files on the server are in Browse: see
+  [Changing files on the server](#changing-files-on-the-server).
 - **An older grab** (0.23 and before) knows nothing of uploads. Unfinished uploads are kept in
   `%APPDATA%\grab\uploads.json`, beside queue.json, which it never reads or rewrites (queue.json
   holds downloads only, as before). In gui.json it ignores the upload limit (`uploadLimitOn`,
