@@ -4,7 +4,8 @@
 // to running, the performance numbers, a file's priority in its folder, the status bar's total and
 // its graph, the MiB/s box and its confirmation, Waiting files, opening finished files, the split's
 // grip and the head's free space; uploads in the window and drops from Explorer, UPLOADS.md chunks 3
-// and 4; Settings → Appearance), run in headless Edge by run_page_test.ps1.
+// and 4; Settings → Appearance; Browse's changes on a server; Quick access's pinned folders and the
+// address field's error, PINS.md chunk 2), run in headless Edge by run_page_test.ps1.
 const out = [];
 window.pageTestOut = out; // read by run_page_test.ps1 when test.js never finishes, to name where it stopped
 let failed = 0;
@@ -3377,12 +3378,12 @@ try {
     check('ops: several rows: Rename and Properties greyed, saying why; Delete names how many',
       [entry(several, 'Rename…').disabled, entry(several, 'Rename…').why, entry(several, 'Properties').why, !!entry(several, 'Delete 2…')],
       [true, 'Rename one item at a time.', 'Properties shows one item at a time: pick one.', true]);
-    check('ops: the empty part: Paste, New folder, uploads, Properties of the open folder', labels(folderMenu()),
-      ['Paste (off)', 'New folder…', '-', 'Upload files here…', 'Upload folder here…', '-', 'Properties']);
+    check('ops: the empty part: Quick access, Paste, New folder, uploads, Properties of the open folder', labels(folderMenu()),
+      ['Pin to Quick access', '-', 'Paste (off)', 'New folder…', '-', 'Upload files here…', 'Upload folder here…', '-', 'Properties']);
     // Shown: a greyed entry's reason on hover, its few words beside it.
     closeMenu();
     showMenu(10, 10, folderMenu());
-    const pasteBtn = $('#menu button[data-i="0"]');
+    const pasteBtn = [...$('#menu').querySelectorAll('button')].find((x) => x.querySelector('.text').textContent === 'Paste');
     check('ops: a greyed entry shows its few words and its reason on hover', [pasteBtn.disabled, pasteBtn.querySelector('.note').textContent,
       pasteBtn.title, pasteBtn.querySelector('.key').textContent], [true, 'nothing cut or copied', 'Nothing to paste: Cut or Copy files or folders first.', 'Ctrl+V']);
     closeMenu();
@@ -3396,8 +3397,9 @@ try {
     [['Preview', 'Download', 'Download to…', '-', '# Box.Guest is read-only for this account', 'Cut (off)', 'Copy', 'Paste into srv (off)', '-',
       'Rename… (off)', 'Delete… (off)', '-', '-', 'Copy path', 'Copy name', '-', 'Properties'],
     'Box.Guest is read-only for this account', 'Box.Guest is read-only for this account', 'Box.Guest is read-only for this account']);
-    check('ops: read-only: the empty part too, Properties left', labels(folderMenu()),
-      ['# Box.Guest is read-only for this account', 'Paste (off)', 'New folder… (off)', '-', 'Upload files here…', 'Upload folder here…', '-', 'Properties']);
+    check('ops: read-only: the empty part too, Quick access and Properties left', labels(folderMenu()),
+      ['Pin to Quick access', '-', '# Box.Guest is read-only for this account', 'Paste (off)', 'New folder… (off)', '-', 'Upload files here…',
+        'Upload folder here…', '-', 'Properties']);
     check('ops: read-only: New folder says why', entry(folderMenu(), 'New folder…').why, 'Box.Guest is read-only for this account');
     showMenu(10, 10, ro);
     const cutBtn = [...$('#menu').querySelectorAll('button')].find((x) => x.querySelector('.text').textContent === 'Cut');
@@ -3908,6 +3910,757 @@ try {
     state.selected = new Set();
     state.cursor = -1;
     renderRows();
+  }
+
+  // ---- Quick access (PINS.md, chunk 2) ----------------------------------------------------------------
+  // The button between Up and the address bar (filled while the open folder is pinned) and its list:
+  // per server and grouped under All servers, the empty text, the Alt+n hints, a dimmed pin, the
+  // scroll, its ARIA and keys; Pin and Unpin in the menus (rows, hits, the empty part, the crumbs) and
+  // a pin's own menu; Ctrl+D and Alt+1-9; Undo; Rename; reordering by keys and by a drag (apart from
+  // the drops from Explorer); the pins first in the address field's list; a pin that didn't open, with
+  // Unpin; the Delete confirmation and the Remove dialog naming pins; the address field's error shown
+  // while it is open (3.10); 100 pins; the theme's colours.
+  {
+    const b = state.browse;
+    const browseWas = { ...b };
+    const hitsWas = state.hits;
+    const remotesWas = state.remotes;
+    const remoteWas = state.remote;
+    const navWas = JSON.parse(JSON.stringify(state.nav));
+    const sentOf = (type) => sent.filter((m) => m.type === type);
+    const lastOf = (type) => sentOf(type).pop();
+    const said = () => (ops.result && ops.result.until > Date.now() ? ops.result.text : '');
+    const labels = (items) => items.map((m) => (m === '-' ? '-' : m.heading ? `# ${m.heading}` : `${m.label}${m.disabled ? ' (off)' : ''}`));
+    const entry = (items, label) => items.find((m) => m.label === label);
+    const key = (el, k, mods = {}) => {
+      const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...mods });
+      el.dispatchEvent(ev);
+      return ev.defaultPrevented;
+    };
+    const list = $('#pins-list');
+    const pinsMsg = (pins, extra = {}) => onPins({ type: 'pins', pins, ...extra });
+    const rowsShown = () => [...list.querySelectorAll('.opt')].map((o) => [o.querySelector('.p-name').textContent, o.querySelector('.p-path').textContent,
+      (o.querySelector('.p-key') || { textContent: '' }).textContent]);
+    const heads = () => [...list.querySelectorAll('.p-head')].map((h) => h.textContent);
+    const optEl = (i) => list.querySelector(`.opt[data-i="${i}"]`);
+    const menuShown = () => [...$('#menu').children].map((e) => (e.tagName === 'HR' ? '-' : `${e.querySelector('.text').textContent}` +
+      `${e.disabled ? ' (off)' : ''}${e.querySelector('.key') ? ` [${e.querySelector('.key').textContent}]` : ''}`));
+    const items = [{ name: 'tv', path: '/srv/tv', dir: true, remote: 'Main' }, { name: 'movies', path: '/srv/movies', dir: true, remote: 'Main' },
+      { name: 'a.txt', path: '/srv/a.txt', remote: 'Main', size: 3 }];
+    const reset = (server = 'Main', path = '/srv', more = {}) => {
+      Object.assign(b, { inited: true, server, path, top: false, under: null, loading: false, error: '', uploadable: true, severalRoots: false,
+        typed: null, crumbs: path.split('/').filter(Boolean).map((n, i, a) => ({ name: n, path: `/${a.slice(0, i + 1).join('/')}` })),
+        items: items.map((it) => ({ ...it, remote: server })), pendingSelect: null, ...more });
+      state.hits = b.items.slice();
+      state.selected = new Set();
+      state.cursor = 0;
+      state.flash = null; // an earlier test's note in the footer
+      renderRows();
+      renderBrowseBar();
+    };
+    const pick = (i) => {
+      state.selected = new Set([i]);
+      state.cursor = i;
+      renderRows();
+    };
+    const accounts = () => {
+      ops.accounts.clear();
+      ops.asking.clear();
+      ops.accounts.set('Main', { readOnly: false, free: null, home: '/home/u', copyData: true });
+      ops.accounts.set('Main2', { readOnly: false, free: null, home: '/home/u', copyData: true });
+      ops.accounts.set('Box.Guest', { readOnly: true, free: null, home: '/home/g', copyData: true });
+    };
+    const quiet = () => {
+      sent.length = 0;
+      ops.result = null;
+      ops.running = null;
+      ops.refusal = null;
+      quick.want = null;
+      closeMenu();
+      if (modal) closeModal(false);
+      closePins();
+      if (state.addr.editing) endEdit(false);
+      state.addr.error = '';
+      state.addr.unpin = null;
+      renderOps();
+    };
+    const three = () => ({ Main: [{ path: '/srv/tv' }, { path: '/data/films', name: 'Movies' }, { path: 'up/in' }], Main2: [{ path: '/m2/x' }] });
+    state.remotes = [{ name: 'Main', host: 'h', user: 'u' }, { name: 'Main2', host: 'h', user: 'u' }, { name: 'Box.Guest', host: 'b', user: 'g' }];
+    state.remote = 'Main';
+    accounts();
+    quiet();
+    reset();
+
+    // init: the pins from every init (a Remove or an Add changed them), not only the first.
+    const recentWas = state.recentLoaded;
+    const splitWas = split.loaded;
+    const defaultDestWas = state.defaultDest;
+    state.recentLoaded = true;
+    split.loaded = true;
+    const init = (pins) => onInit({ type: 'init', version: 't', remotes: state.remotes, remote: 'Main', destinations: {}, defaultDest: defaultDestWas,
+      theme: state.theme, sort: sortToSave(state.sort), pins });
+    init({ Main: [{ path: '/srv' }] });
+    check('pins: init brings the pins, the button filled for the open folder', [quick.pins, $('#pins-btn').classList.contains('on'),
+      $('#pins-btn').getAttribute('aria-label')], [{ Main: [{ path: '/srv' }] }, true, 'Quick access (this folder is pinned)']);
+    init(three());
+    check('pins: ... and every init after it replaces them', [quick.pins, $('#pins-btn').classList.contains('on'), $('#pins-btn').getAttribute('aria-label')],
+      [three(), false, 'Quick access']);
+    state.recentLoaded = recentWas;
+    split.loaded = splitWas;
+    accounts();
+    quiet();
+
+    // The button: a listbox popup, collapsed; the list opens on a click, the focus in it, nothing
+    // highlighted by the mouse.
+    const btn = $('#pins-btn');
+    check('pins: the button between Up and the address bar, its ARIA', [btn.previousElementSibling === null && btn.parentElement.previousElementSibling.id,
+      btn.parentElement.nextElementSibling.id, btn.getAttribute('aria-haspopup'), btn.getAttribute('aria-expanded'), btn.title],
+    ['browse-up', 'browse-bar', 'listbox', 'false', 'Quick access (Ctrl+D pins this folder)']);
+    btn.click();
+    check('pins: a click opens the list: its heading, names, paths and Alt+n hints, the focus in it, nothing highlighted',
+      [$('#pins').hidden, btn.getAttribute('aria-expanded'), heads(), rowsShown(), document.activeElement === list, list.getAttribute('role'),
+        list.getAttribute('aria-activedescendant'), list.querySelectorAll('[role="option"]').length],
+      [false, 'true', ['Quick access on Main'], [['tv', '/srv/tv', 'Alt+1'], ['Movies', '/data/films', 'Alt+2'], ['in', 'up/in', 'Alt+3']], true, 'listbox', null, 3]);
+    check('pins: the footer pins the open folder, with its key', [$('#pins-here').textContent, $('#pins-here').disabled], ['Pin this folderCtrl+D', false]);
+    // The keys in the list.
+    const lk = (k, mods) => key(list, k, mods);
+    lk('ArrowDown');
+    check('pins: ↓ highlights the first row (aria-activedescendant, aria-selected)', [quick.sel, list.getAttribute('aria-activedescendant'),
+      optEl(0).getAttribute('aria-selected'), optEl(0).classList.contains('on'), optEl(1).getAttribute('aria-selected')], [0, 'pin-o0', 'true', true, 'false']);
+    lk('End');
+    const atEnd = quick.sel;
+    lk('ArrowDown');
+    const pastEnd = quick.sel;
+    lk('Home');
+    const atHome = quick.sel;
+    lk('ArrowUp');
+    check('pins: End, ↓ at the end, Home, ↑ at the top', [atEnd, pastEnd, atHome, quick.sel], [2, 2, 0, 0]);
+    lk('m');
+    const typedM = quick.sel;
+    lk('I');
+    check('pins: a letter goes to the next pin whose name starts with it', [typedM, quick.sel], [1, 2]);
+    lk('Escape');
+    check('pins: Esc closes the list, the focus back on the button', [$('#pins').hidden, btn.getAttribute('aria-expanded'), document.activeElement === btn],
+      [true, 'false', true]);
+    key(btn, 'ArrowUp');
+    const upOpens = [$('#pins').hidden, quick.sel];
+    lk('Tab');
+    key(btn, 'Enter');
+    check('pins: on the button ↑ opens on the last row, Enter on the first; Tab closes', [upOpens, $('#pins').hidden, quick.sel], [[false, 2], false, 0]);
+    // A click outside closes it; one in the list doesn't.
+    optEl(1).dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    const stays = !$('#pins').hidden;
+    $('#results').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    check('pins: a press in the list keeps it, one outside closes it', [stays, $('#pins').hidden], [true, true]);
+    // The pointer highlights the row under it, and only it; leaving the rows, none.
+    btn.click();
+    optEl(2).dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 5 }));
+    const hovered = [quick.sel, list.querySelectorAll('.opt.on').length];
+    list.dispatchEvent(new PointerEvent('pointerleave'));
+    check('pins: the highlight follows the pointer: one row at most', [hovered, quick.sel, list.querySelectorAll('.opt.on').length], [[2, 1], -1, 0]);
+    // The footer shaded while the pointer is on it, until the keys move the highlight: one shaded.
+    const here = $('#pins-here');
+    here.dispatchEvent(new PointerEvent('pointerenter'));
+    const hot = here.classList.contains('hot');
+    lk('ArrowDown');
+    check('pins: the footer shaded under the pointer; the keys\' row then the only one shaded', [hot, here.classList.contains('hot'),
+      list.querySelectorAll('.opt.on').length], [true, false, 1]);
+    here.dispatchEvent(new PointerEvent('pointerleave'));
+    // The focus taken elsewhere by the keyboard closes it; so does the window losing the focus.
+    $('#query').focus();
+    const byFocus = $('#pins').hidden;
+    btn.click();
+    window.dispatchEvent(new Event('blur'));
+    check('pins: the focus going elsewhere or the window\'s blur closes the list', [byFocus, $('#pins').hidden], [true, true]);
+    quiet();
+
+    // Ctrl+D: the open folder, never unpinned; refused where no folder is open.
+    sent.length = 0;
+    key($('#results'), 'd', { ctrlKey: true });
+    check('pins: Ctrl+D pins the open folder', lastOf('pinsAdd'), { type: 'pinsAdd', server: 'Main', path: '/srv' });
+    pinsMsg({ ...three(), Main: [...three().Main, { path: '/srv' }] });
+    check('pins: ... said once the backend has it, the button filled', [said(), ops.result.bad, btn.classList.contains('on')], ['Pinned srv to Quick access', false, true]);
+    sent.length = 0;
+    key($('#results'), 'D', { ctrlKey: true });
+    check('pins: Ctrl+D on a pinned folder says so and never unpins', [said(), ops.result.bad, sent.length], ['srv is already in Quick access', true, 0]);
+    reset('Main', '', { top: true });
+    key($('#results'), 'd', { ctrlKey: true });
+    const atTop = said();
+    reset('', '', { top: true });
+    key($('#results'), 'd', { ctrlKey: true });
+    check('pins: Ctrl+D at a server\'s top and at All servers\' top: open a folder first', [atTop, said(), sent.length],
+      ['Open a folder of a server first.', 'Open a folder of a server first.', 0]);
+    reset();
+    b.under = { query: 'x', path: '/srv', all: false, whole: false, name: 'srv' };
+    key($('#results'), 'd', { ctrlKey: true });
+    check('pins: ... and in search results', [said(), sent.length], ['Open a folder of a server first.', 0]);
+    pinsMsg(three());
+    quiet();
+    reset();
+
+    // The menus: Pin or Unpin after Open on one folder row; none on a file, a server row or several.
+    pick(0); // tv: pinned
+    check('pins: a pinned folder row: Unpin after Open', labels(resultMenu()).slice(0, 3), ['Open', 'Unpin from Quick access', 'Download']);
+    pick(1); // movies: not pinned
+    check('pins: a folder row: Pin after Open, no key (Ctrl+D is the open folder\'s)', [labels(resultMenu()).slice(0, 2), entry(resultMenu(), 'Pin to Quick access').key],
+      [['Open', 'Pin to Quick access'], '']);
+    entry(resultMenu(), 'Pin to Quick access').act();
+    check('pins: ... it sends pinsAdd for that row', lastOf('pinsAdd'), { type: 'pinsAdd', server: 'Main', path: '/srv/movies' });
+    pick(2);
+    check('pins: a file row: no Quick access', labels(resultMenu()).filter((l) => l.includes('Quick access')), []);
+    state.selected = new Set([0, 1]);
+    check('pins: several rows: none', labels(resultMenu()).filter((l) => l.includes('Quick access')), []);
+    reset('', '', { top: true });
+    state.hits = [{ name: 'Main', path: '', dir: true, server: 'Main', remote: 'Main' }];
+    pick(0);
+    check('pins: a server row at All servers\' top: Open only', labels(resultMenu()), ['Open']);
+    // The roots of a top with several: folders, pinnable.
+    reset('Main', '', { top: true, severalRoots: true, uploadable: false });
+    state.hits = [{ name: '/srv/tv', path: '/srv/tv', dir: true, remote: 'Main' }];
+    pick(0);
+    check('pins: a root row of several: Unpin (it is pinned)', labels(resultMenu()).slice(0, 2), ['Open', 'Unpin from Quick access']);
+    // The login folder '~' of several roots has no path: never offered, greyed while it is open.
+    state.hits = [{ name: '~', path: '', dir: true, remote: 'Main' }, { name: '/srv/tv', path: '/srv/tv', dir: true, remote: 'Main' }];
+    pick(0);
+    const tildeRow = labels(resultMenu()).filter((l) => l.includes('Quick access'));
+    reset('Main', '', { top: false, severalRoots: true });
+    sent.length = 0;
+    key($('#results'), 'd', { ctrlKey: true });
+    check('pins: the login folder of several roots: no Pin on its row; open, Pin greyed and Ctrl+D refused',
+      [tildeRow, labels(folderMenu())[0], folderMenu()[0].why, said(), sent.length],
+      [[], 'Pin to Quick access (off)', 'Open a folder of a server first.', 'Open a folder of a server first.', 0]);
+    quiet();
+    // A folder hit: pinned on its own server.
+    reset();
+    b.under = { query: 'x', path: '/srv', all: true, whole: true, name: 'All servers' };
+    state.hits = [{ name: 'x', path: '/m2/x', dir: true, remote: 'Main2' }, { name: 'y', path: '/m2/y', dir: true, remote: 'Main2' }];
+    pick(0);
+    sent.length = 0;
+    entry(resultMenu(), 'Unpin from Quick access').act();
+    pick(1);
+    entry(resultMenu(), 'Pin to Quick access').act();
+    check('pins: folder hits: Unpin and Pin on the hit\'s own server', sent.map((m) => [m.type, m.server, m.path]),
+      [['pinsRemove', 'Main2', '/m2/x'], ['pinsAdd', 'Main2', '/m2/y']]);
+    quiet();
+    // The empty part: the open folder (Ctrl+D beside Pin), never at a top or in search results.
+    reset();
+    check('pins: the empty part: Pin with Ctrl+D, first', [labels(folderMenu()).slice(0, 2), folderMenu()[0].key], [['Pin to Quick access', '-'], 'Ctrl+D']);
+    sent.length = 0;
+    folderMenu()[0].act();
+    check('pins: ... it pins the open folder', lastOf('pinsAdd'), { type: 'pinsAdd', server: 'Main', path: '/srv' });
+    reset('Main', '/srv/tv');
+    check('pins: ... Unpin when it is pinned, no key', [labels(folderMenu())[0], folderMenu()[0].key], ['Unpin from Quick access', undefined]);
+    reset('Main', '/srv', { loading: true });
+    check('pins: ... greyed while it opens, saying so', [labels(folderMenu())[0], folderMenu()[0].why], ['Pin to Quick access (off)', 'srv is still opening.']);
+    const noPin = [];
+    reset('Main', '', { top: true });
+    noPin.push(labels(folderMenu()).filter((l) => l.includes('Quick access')).length);
+    reset('Main', '', { top: true, severalRoots: true, uploadable: false });
+    noPin.push(labels(folderMenu()).filter((l) => l.includes('Quick access')).length);
+    reset('', '', { top: true });
+    noPin.push(labels(folderMenu()).filter((l) => l.includes('Quick access')).length);
+    reset();
+    b.under = { query: 'x', path: '/srv', all: false, whole: false, name: 'srv' };
+    noPin.push(labels(folderMenu()).filter((l) => l.includes('Quick access')).length);
+    check('pins: ... none at a server\'s top, the top of several roots, All servers\' top, search results', noPin, [0, 0, 0, 0]);
+    // A read-only server: pinning is local, never greyed.
+    reset('Box.Guest', '/srv');
+    pick(0);
+    check('pins: read-only: Pin on a folder row and the empty part, not greyed', [labels(resultMenu())[1], labels(folderMenu())[0]],
+      ['Pin to Quick access', 'Pin to Quick access']);
+    quiet();
+    // The crumbs' menu: a folder's (the open one's Pin with Ctrl+D), the server's and All servers' none.
+    reset('Main', '/srv/tv');
+    const crumb = (i) => {
+      closeMenu();
+      const el = $(`#crumbs [data-menu="${i}"]`);
+      el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 50, clientY: 50 }));
+      return menuShown();
+    };
+    check('pins: a crumb\'s menu: the open folder\'s Unpin, Copy path, Edit address; a folder above: Pin; the server: Edit address',
+      [crumb(2), crumb(1), crumb(0)],
+      [['Unpin from Quick access', '-', 'Copy path', 'Edit address [Ctrl+L]'], ['Pin to Quick access', '-', 'Copy path', 'Edit address [Ctrl+L]'],
+        ['Edit address [Ctrl+L]']]);
+    reset('Main', '/srv/movies');
+    check('pins: ... the open folder unpinned: Pin with Ctrl+D', crumb(2)[0], 'Pin to Quick access [Ctrl+D]');
+    sent.length = 0;
+    menuItems.find((m) => m.label === 'Pin to Quick access').act();
+    closeMenu();
+    check('pins: ... it sends pinsAdd', lastOf('pinsAdd'), { type: 'pinsAdd', server: 'Main', path: '/srv/movies' });
+    state.remote = ALL;
+    reset('Main', '/srv/tv');
+    b.under = { query: 'x', path: '/srv/tv', all: false, whole: false, name: 'tv' };
+    renderBrowseBar();
+    check('pins: ... All servers and Search results: Edit address only', [crumb(0), crumb(4)], [['Edit address [Ctrl+L]'], ['Edit address [Ctrl+L]']]);
+    menuItems.find((m) => m.label === 'Edit address').act();
+    check('pins: ... Edit address opens the address field', state.addr.editing, true);
+    state.remote = 'Main';
+    quiet();
+
+    // Unpin: no question; "Unpinned tv · Undo" for a while; Undo pins it back with its name and place.
+    reset();
+    pick(0);
+    entry(resultMenu(), 'Unpin from Quick access').act();
+    check('pins: Unpin sends pinsRemove, says nothing before the answer', [lastOf('pinsRemove'), said(), !!modal],
+      [{ type: 'pinsRemove', server: 'Main', path: '/srv/tv' }, '', false]);
+    pinsMsg({ ...three(), Main: three().Main.slice(1) });
+    const undoLine = () => ({ text: $('#ops-text').textContent, act: $('#ops-act').hidden ? null : $('#ops-act').textContent, sep: !$('#ops-sep').hidden,
+      bad: $('#ops').classList.contains('bad') });
+    check('pins: ... then "Unpinned tv · Undo" in the footer', undoLine(), { text: 'Unpinned tv', act: 'Undo', sep: true, bad: false });
+    sent.length = 0;
+    $('#ops-act').click();
+    check('pins: Undo pins it back at its place', [sent, undoLine().act], [[{ type: 'pinsAdd', server: 'Main', path: '/srv/tv', at: 0 }], null]);
+    pinsMsg(three());
+    check('pins: ... said once back', said(), 'Pinned tv to Quick access');
+    // A pin with its own name: Undo gives it back.
+    unpinFolder('Main', '/data/films');
+    pinsMsg({ ...three(), Main: [three().Main[0], three().Main[2]] });
+    sent.length = 0;
+    $('#ops-act').click();
+    check('pins: Undo gives a pin its own name back', sent, [{ type: 'pinsAdd', server: 'Main', path: '/data/films', name: 'Movies', at: 1 }]);
+    pinsMsg(three());
+    unpinFolder('Main', 'up/in');
+    pinsMsg({ ...three(), Main: three().Main.slice(0, 2) });
+    ops.result.until = Date.now() - 1;
+    renderOps();
+    sent.length = 0;
+    $('#ops-act').click();
+    check('pins: Undo goes after its 8 s', [$('#ops-act').hidden, sent.length, OPS_RESULT_MS], [true, 0, 8000]);
+    // The backend's refusal, in red.
+    pinsMsg(three());
+    pinFolder('Main', '/srv/x');
+    pinsMsg(three(), { error: 'Quick access holds 100 folders per server: unpin one first.' });
+    check('pins: a refusal is said in red', [said(), ops.result.bad], ['Quick access holds 100 folders per server: unpin one first.', true]);
+    quiet();
+
+    // The list's own keys and menu: Del (with Undo), F2, Alt+↑/↓, a pin's menu.
+    reset();
+    btn.click();
+    lk('ArrowDown');
+    lk('Delete');
+    check('pins: Del in the list unpins the highlighted pin', lastOf('pinsRemove'), { type: 'pinsRemove', server: 'Main', path: '/srv/tv' });
+    pinsMsg({ ...three(), Main: three().Main.slice(1) });
+    check('pins: ... the list stays open with Undo in the footer', [$('#pins').hidden, rowsShown().map((r) => r[0]), $('#ops-act').textContent], [false, ['Movies', 'in'], 'Undo']);
+    pinsMsg(three());
+    quick.sel = 1;
+    sent.length = 0;
+    lk('ArrowUp', { altKey: true });
+    check('pins: Alt+↑ moves the pin up', sent, [{ type: 'pinsMove', server: 'Main', path: '/data/films', to: 0 }]);
+    pinsMsg({ Main: [three().Main[1], three().Main[0], three().Main[2]], Main2: three().Main2 });
+    check('pins: ... its row stays highlighted', [quick.sel, rowsShown().map((r) => r[0])], [0, ['Movies', 'tv', 'in']]);
+    sent.length = 0;
+    lk('ArrowUp', { altKey: true });
+    quick.sel = 2;
+    lk('ArrowDown', { altKey: true });
+    check('pins: Alt+↑ on the first and Alt+↓ on the last do nothing', sent.length, 0);
+    quick.sel = 0;
+    lk('ArrowDown', { altKey: true });
+    check('pins: Alt+↓ moves it down', lastOf('pinsMove'), { type: 'pinsMove', server: 'Main', path: '/data/films', to: 1 });
+    pinsMsg(three());
+    // A pin's menu: right-click, or Shift+F10 on the highlighted row.
+    optEl(0).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 60, clientY: 60 }));
+    check('pins: a pin\'s menu: Open, Rename, Move up and down, Copy path, Unpin; the first can\'t move up', menuShown(),
+      ['Open [Enter]', 'Rename… [F2]', '-', 'Move up (off) [Alt+↑]', 'Move down [Alt+↓]', '-', 'Copy path', '-', 'Unpin from Quick access [Del]']);
+    check('pins: ... the greyed Move up says why', [...$('#menu').querySelectorAll('button')][2].title, 'tv is first in Quick access on Main');
+    closeMenu();
+    quick.sel = 2;
+    renderPinsList();
+    list.focus();
+    lk('F10', { shiftKey: true });
+    check('pins: ... Shift+F10 opens the highlighted pin\'s, by the keys (its first entry shaded); the last can\'t move down',
+      [menuShown()[4], document.activeElement === $('#menu button')], ['Move down (off) [Alt+↓]', true]);
+    sent.length = 0;
+    const copyPath = menuItems.find((m) => m.label === 'Copy path');
+    closeMenu(true);
+    copyPath.act();
+    check('pins: ... Copy path copies the pin\'s path; the focus back in the list', [sent, document.activeElement === list],
+      [[{ type: 'copyText', text: 'up/in' }], true]);
+    optEl(1).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 60, clientY: 60 }));
+    sent.length = 0;
+    menuItems.find((m) => m.label === 'Move up').act();
+    closeMenu();
+    check('pins: ... Move up', sent, [{ type: 'pinsMove', server: 'Main', path: '/data/films', to: 0 }]);
+    // F2: the name box; only the pin's name changes; empty (or the folder's own) is the folder's name.
+    quick.sel = 1;
+    renderPinsList();
+    list.focus();
+    lk('F2');
+    const nameBox = $('#pin-name');
+    check('pins: F2: the rename dialog, its words, the name picked', [$('#modal').hidden, $('#modal-title').textContent, $('#modal-body p').textContent,
+      nameBox.value, nameBox.selectionStart, nameBox.selectionEnd, nameBox.placeholder, document.activeElement === nameBox],
+    [false, 'Rename the pin Movies', 'Only the pin’s name changes: the folder on Main keeps its name.', 'Movies', 0, 6, 'films', true]);
+    check('pins: ... the list stays open under the dialog (dimmed by it), its menus over both',
+      [!$('#pins').hidden, Number(getComputedStyle($('#pins')).zIndex) < Number(getComputedStyle($('#modal')).zIndex),
+        Number(getComputedStyle($('#menu')).zIndex) > Number(getComputedStyle($('#pins')).zIndex)], [true, true, true]);
+    const typeName = (v) => { // each dialog has a name box of its own
+      $('#pin-name').value = v;
+      $('#pin-name').dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    typeName('bad\u0007name');
+    check('pins: ... a control character: said, OK off', [$('#pin-why').textContent, $('#modal-ok').disabled],
+      ['A pin’s name can’t hold control characters.', true]);
+    typeName('Films 2');
+    sent.length = 0;
+    key(nameBox, 'Enter');
+    check('pins: ... Enter renames it, the dialog closes, the focus back in the list', [sent, $('#modal').hidden, document.activeElement === list],
+      [[{ type: 'pinsRename', server: 'Main', path: '/data/films', name: 'Films 2' }], true, true]);
+    for (const [typed, want] of [['', ''], ['films', '']]) {
+      lk('F2');
+      typeName(typed);
+      sent.length = 0;
+      $('#modal-ok').click();
+      check(`pins: ... "${typed}" is the folder's own name again`, sent, [{ type: 'pinsRename', server: 'Main', path: '/data/films', name: want }]);
+    }
+    quick.sel = 0;
+    renderPinsList();
+    lk('F2');
+    typeName('tv');
+    sent.length = 0;
+    $('#modal-ok').click();
+    check('pins: ... a pin without a name kept as its folder\'s: nothing sent', sent.length, 0);
+    quiet();
+
+    // A drag reorders within the server's pins; a press that doesn't move opens the pin. Pointer
+    // events only: the drops from Explorer never start one, nor does one show their overlay.
+    reset();
+    btn.click();
+    const ptr = (el, type, y) => el.dispatchEvent(new PointerEvent(type, { pointerId: 1, pointerType: 'mouse', isPrimary: true, bubbles: true, cancelable: true,
+      clientX: 100, clientY: y, button: type === 'pointermove' ? -1 : 0, buttons: type === 'pointerup' ? 0 : 1 }));
+    const mid = (i) => { const r = optEl(i).getBoundingClientRect(); return r.top + r.height / 2; };
+    sent.length = 0;
+    ptr(optEl(0), 'pointerdown', mid(0));
+    ptr(list, 'pointermove', mid(0) + 2);
+    const slop = [document.documentElement.classList.contains('pins-dragging'), $('#pins-drop').hidden];
+    ptr(list, 'pointermove', mid(2) + 8);
+    const dragging = [document.documentElement.classList.contains('pins-dragging'), $('#pins-drop').hidden, drops.shown];
+    const line = $('#pins-drop').getBoundingClientRect().top;
+    const lastBottom = optEl(2).getBoundingClientRect().bottom;
+    ptr(list, 'pointerup', mid(2) + 8);
+    check('pins: a drag past the slop shows the drop line (after the last row), never the drop overlay; the release moves the pin',
+      [slop, dragging, Math.abs(line + 1 - lastBottom) <= 1, sent, document.documentElement.classList.contains('pins-dragging'), $('#pins-drop').hidden],
+      [[false, true], [true, false, false], true, [{ type: 'pinsMove', server: 'Main', path: '/srv/tv', to: 2 }], false, true]);
+    sent.length = 0;
+    ptr(optEl(2), 'pointerdown', mid(2));
+    ptr(list, 'pointermove', mid(0) - 4);
+    ptr(list, 'pointerup', mid(0) - 4);
+    check('pins: ... up before the first row', sent, [{ type: 'pinsMove', server: 'Main', path: 'up/in', to: 0 }]);
+    sent.length = 0;
+    ptr(optEl(1), 'pointerdown', mid(1));
+    ptr(list, 'pointermove', mid(1) + 6);
+    ptr(list, 'pointerup', mid(1) + 6);
+    check('pins: ... dropped where it was: nothing moves', sent.length, 0);
+    ptr(optEl(1), 'pointerdown', mid(1));
+    ptr(list, 'pointermove', mid(1));
+    ptr(list, 'pointerup', mid(1));
+    check('pins: a press that doesn\'t move opens the pin: as saved, the list closed', [sent.map((m) => [m.type, m.remote, m.path, m.pin]), $('#pins').hidden],
+      [[['browse', 'Main', '/data/films', true]], true]);
+    b.typed = null;
+    b.loading = false;
+    btn.click();
+    const files = new DataTransfer();
+    files.items.add(new File(['abc'], 'up.txt'));
+    sent.length = 0;
+    optEl(0).dispatchEvent(new DragEvent('dragover', { dataTransfer: files, bubbles: true, cancelable: true, clientX: 100, clientY: mid(0) }));
+    check('pins: a drag from Explorer over the list: the drops\' overlay, never a pin\'s drag', [drops.shown, quick.drag, sent.length], [true, null, 0]);
+    endDropOverlay();
+    quiet();
+
+    // All servers: each server's pins under its name, the one on screen first, then the picker's
+    // order; servers without pins left out; Alt+n counts the list as it shows.
+    state.remote = ALL;
+    reset('Main2', '/m2');
+    btn.click();
+    check('pins: All servers: grouped, the server on screen first', [heads(), rowsShown()],
+      [['Quick access on Main2', 'Quick access on Main'], [['x', '/m2/x', 'Alt+1'], ['tv', '/srv/tv', 'Alt+2'], ['Movies', '/data/films', 'Alt+3'], ['in', 'up/in', 'Alt+4']]]);
+    reset('', '', { top: true });
+    renderPinsList();
+    check('pins: ... at All servers\' top in the picker\'s order; Pin this folder greyed, saying why',
+      [heads(), $('#pins-here').disabled, $('#pins-here').title, $('#pins-here').querySelector('.note').textContent],
+      [['Quick access on Main', 'Quick access on Main2'], true, 'Open a folder of a server first.', 'Open a folder of a server first.']);
+    sent.length = 0;
+    key($('#results'), '4', { altKey: true, code: 'Digit4' });
+    check('pins: ... Alt+4 opens the fourth as shown, staying in All servers', [lastOf('browse'), $('#pins').hidden],
+      [{ type: 'browse', id: b.id, remote: 'Main2', path: '/m2/x', pin: true }, true]);
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main2', pin: true, path: '/m2/x', top: false, items: [], crumbs: [{ name: 'm2', path: '/m2' }, { name: 'x', path: '/m2/x' }] });
+    check('pins: ... opened: the picker stays on All servers, the button filled', [state.remote, b.server, b.path, btn.classList.contains('on')],
+      [ALL, 'Main2', '/m2/x', true]);
+    pinsMsg({});
+    btn.click();
+    check('pins: ... none pinned anywhere: says how to pin', [heads(), list.textContent], [[], 'Nothing pinned yet. Right-click a folder and choose Pin to Quick access.']);
+    quiet();
+    state.remote = 'Main';
+    reset();
+    btn.click();
+    check('pins: one server with none: its heading and how to pin', [heads(), list.querySelector('.p-empty').textContent],
+      [['Quick access on Main'], 'Nothing pinned on Main yet. Right-click a folder and choose Pin to Quick access.']);
+    quiet();
+    pinsMsg(three());
+
+    // Alt+1-9: the nth pin; fewer pins, said; AltGr (Ctrl+Alt) and the numpad's Alt codes left alone.
+    reset();
+    sent.length = 0;
+    key($('#results'), '1', { altKey: true, code: 'Digit1' });
+    const alt1 = lastOf('browse');
+    b.typed = null;
+    b.loading = false;
+    key($('#results'), '&', { altKey: true, code: 'Digit2' });
+    const alt2 = lastOf('browse');
+    b.typed = null;
+    b.loading = false;
+    sent.length = 0;
+    key($('#results'), '5', { altKey: true, code: 'Digit5' });
+    const alt5 = said();
+    key($('#results'), '1', { altKey: true, ctrlKey: true, code: 'Digit1' });
+    key($('#results'), '1', { altKey: true, code: 'Numpad1' });
+    check('pins: Alt+1 opens the first pin exactly as saved, the window staying until the answer', [alt1, b.path], [{ type: 'browse', id: b.id - 1, remote: 'Main', path: '/srv/tv', pin: true }, '/srv']);
+    check('pins: Alt+2 by its key\'s place (an AZERTY Alt+2 is "&")', alt2.path, '/data/films');
+    check('pins: Alt+5 with 3 pins says so; AltGr+1 and Alt+numpad 1 open nothing', [alt5, sentOf('browse').length], ['Quick access has 3 pins on Main.', 0]);
+    quiet();
+
+    // A pin that didn't open: the window stays; the footer says why with Unpin; the pin dims.
+    reset();
+    openPin('Main', '/srv/tv');
+    const id1 = b.id;
+    check('pins: opening a pin: browse with pin, the folder on screen kept', [lastOf('browse'), b.path, b.loading],
+      [{ type: 'browse', id: id1, remote: 'Main', path: '/srv/tv', pin: true }, '/srv', true]);
+    onBrowseResult({ type: 'browseResult', id: id1, remote: 'Main', pin: true, path: '/srv/tv', top: false, error: 'Not found on Main: /srv/tv', failure: 'notFound', items: [] });
+    const status = $('#browse-status');
+    check('pins: not found: the window where it was, the footer says why with Unpin', [b.path, b.loading, status.textContent, !!status.querySelector('[data-act="unpin-gone"]'),
+      status.querySelector('.bad').textContent], ['/srv', false, 'Not found on Main: /srv/tv · Unpin', true, 'Not found on Main: /srv/tv']);
+    check('pins: ... a long message shrinks, the Unpin link stays in sight', [getComputedStyle(status).display, getComputedStyle(status.querySelector('.bad')).textOverflow,
+      getComputedStyle(status.querySelector('.tail')).flexShrink, getComputedStyle(status).flexShrink, getComputedStyle(status).minWidth !== '0px'],
+    ['flex', 'ellipsis', '0', '1', true]);
+    btn.click();
+    check('pins: ... the pin dims in the list as not found', [optEl(0).classList.contains('gone'), optEl(0).querySelector('.p-note').textContent,
+      optEl(0).getAttribute('aria-label')], [true, 'not found', 'tv, /srv/tv, not found']);
+    closePins();
+    sent.length = 0;
+    status.querySelector('[data-act="unpin-gone"]').click();
+    check('pins: ... Unpin unpins it, the message goes', [sent, status.textContent.includes('Not found')], [[{ type: 'pinsRemove', server: 'Main', path: '/srv/tv' }], false]);
+    pinsMsg(three());
+    openPin('Main', '/data/films');
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', pin: true, path: '/data/films', top: false, error: 'Main doesn\'t let you list /data/films', failure: 'denied', items: [] });
+    check('pins: can\'t be listed: said the same way, dimmed as such', [status.textContent, quick.gone.get(goneKey('Main', '/data/films'))],
+      ['Main doesn\'t let you list /data/films · Unpin', 'can’t be listed']);
+    openPin('Main', '/data/films');
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', pin: true, path: '/data/films', top: false, items: [{ name: 'f.mkv', path: '/data/films/f.mkv' }],
+      crumbs: [{ name: 'data', path: '/data' }, { name: 'films', path: '/data/films' }] });
+    check('pins: ... once it opens, no longer dimmed', [quick.gone.has(goneKey('Main', '/data/films')), b.path, status.textContent.includes('let you')], [false, '/data/films', false]);
+    reset();
+    openPin('Main', 'up/in');
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', pin: true, path: 'up/in', top: false, error: 'the connection to Main was lost', items: [] });
+    check('pins: another failure: said as Browse says it, no Unpin, not dimmed', [status.textContent, quick.gone.has(goneKey('Main', 'up/in'))],
+      ['the connection to Main was lost', false]);
+    sent.length = 0;
+    openPin('Gone', '/x');
+    check('pins: a server no longer configured: said, nothing sent', [said(), sent.length], ['Gone isn’t one of your servers any more.', 0]);
+    quiet();
+
+    // The address field's list: the pins first under "Quick access" while untouched; typing filters
+    // them (name or path, anywhere, at most 5) above the folders, 12 in all; a pin opens as saved.
+    reset();
+    startEdit();
+    const sug = () => ({ head: ($('#suggest .s-head') || {}).textContent || '', rows: [...$('#suggest').querySelectorAll('.opt')].map((o) => o.textContent),
+      shown: !$('#suggest').hidden, expanded: $('#address').getAttribute('aria-expanded') });
+    check('pins: the address field opens with the pins first, under Quick access', sug(),
+      { head: 'Quick access', rows: ['tv/srv/tv', 'Movies/data/films', 'inup/in'], shown: true, expanded: 'true' });
+    const addr = $('#address');
+    const typeAddr = (v) => {
+      addr.value = v;
+      addr.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    typeAddr('FILM');
+    check('pins: ... typing filters them, ignoring case, name or path', sug().rows, ['Movies/data/films']);
+    key(addr, 'ArrowDown');
+    check('pins: ... ↓ highlights it, the field shows its path', [addr.value, state.addr.sel], ['/data/films', 0]);
+    key(addr, 'Escape');
+    check('pins: ... Esc gives the text typed back', [addr.value, sug().shown], ['FILM', false]);
+    endEdit(false);
+    startEdit();
+    key(addr, 'ArrowDown');
+    key(addr, 'Escape');
+    check('pins: ... untouched, Esc gives the address it opened with back', addr.value, '/srv');
+    typeAddr('');
+    key(addr, 'ArrowDown');
+    key(addr, 'ArrowDown');
+    key(addr, 'Tab');
+    check('pins: ... Tab completes a pin\'s path', addr.value, '/data/films/');
+    typeAddr('');
+    const tabLeaves = key(addr, 'Tab');
+    check('pins: ... untouched, nothing highlighted: Tab leaves the field (no pin completed)', [tabLeaves, addr.value], [false, '']);
+    state.addr.cache.set('Main\n/srv/', ['music']);
+    typeAddr('/srv/');
+    const pinFirst = state.addr.shown[0] && !!state.addr.shown[0].pin;
+    key(addr, 'Tab');
+    check('pins: ... typed, a pin listed first: Tab completes the first folder, not the pin', [pinFirst, addr.value], [true, '/srv/music/']);
+    state.addr.cache.delete('Main\n/srv/');
+    typeAddr('');
+    key(addr, 'ArrowDown');
+    sent.length = 0;
+    key(addr, 'Enter');
+    check('pins: ... Enter on a pin opens it as saved (not as typed)', lastOf('browse'), { type: 'browse', id: b.id, remote: 'Main', path: '/srv/tv', pin: true });
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', pin: true, path: '/srv/tv', top: false, error: 'Not found on Main: /srv/tv', failure: 'notFound', items: [] });
+    check('pins: ... its failure shows in the field\'s list, with Unpin', [state.addr.editing, ($('#suggest .err') || {}).textContent, !!$('#suggest .err [data-act="unpin-gone"]')],
+      [true, 'Not found on Main: /srv/tv · Unpin', true]);
+    sent.length = 0;
+    $('#suggest .err [data-act="unpin-gone"]').click();
+    check('pins: ... Unpin there', [sent, !!$('#suggest .err')], [[{ type: 'pinsRemove', server: 'Main', path: '/srv/tv' }], false]);
+    pinsMsg(three());
+    typeAddr('');
+    sent.length = 0;
+    $('#suggest .opt[data-i="1"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    check('pins: ... a click on a pin opens it', lastOf('browse'), { type: 'browse', id: b.id, remote: 'Main', path: '/data/films', pin: true });
+    b.typed = null;
+    b.loading = false;
+    quiet();
+    const many = { Main: Array.from({ length: 20 }, (_, i) => ({ path: `/p/d${i}` })) };
+    pinsMsg(many);
+    reset();
+    startEdit();
+    const untouched = sug().rows.length;
+    state.addr.cache.set('Main\n/p/', Array.from({ length: 10 }, (_, i) => `f${i}`));
+    typeAddr('/p/');
+    check('pins: ... 12 at most untouched; typed, 5 pins then the folders, 12 in all', [untouched, state.addr.shown.filter((s) => s.pin).length, state.addr.shown.length],
+      [12, 5, 12]);
+    quiet();
+    pinsMsg(three());
+    state.remote = ALL;
+    reset('Main', '/srv');
+    startEdit();
+    check('pins: ... in All servers as Server:path, each server\'s', sug().rows, ['tvMain:/srv/tv', 'MoviesMain:/data/films', 'inMain:up/in', 'xMain2:/m2/x']);
+    quiet();
+    state.remote = 'Main';
+
+    // The address field's own error (PINS.md 3.10): shown in its list while it is open (the field
+    // keeps the focus after Enter), in the footer once it closes.
+    reset();
+    startEdit();
+    typeAddr('nope');
+    sent.length = 0;
+    key(addr, 'Enter');
+    check('pins: a typed path goes as typed', lastOf('browse'), { type: 'browse', id: b.id, remote: 'Main', path: 'nope', typed: true });
+    onBrowseResult({ type: 'browseResult', id: b.id, remote: 'Main', typed: true, path: 'nope', top: false, error: 'Not found on Main: nope', failure: 'notFound', items: [] });
+    check('address: a typed path\'s error shows while the field is open, described for a screen reader, no Unpin', [state.addr.editing, !$('#suggest').hidden,
+      ($('#suggest .err') || {}).textContent, addr.getAttribute('aria-describedby'), $('#address-why').getAttribute('role'), status.textContent.includes('nope')],
+    [true, true, 'Not found on Main: nope', 'address-why', 'alert', false]);
+    key(addr, 'Escape');
+    check('address: ... Esc closes the field, the error goes to the footer', [state.addr.editing, status.textContent, addr.getAttribute('aria-describedby')],
+      [false, 'Not found on Main: nope', null]);
+    startEdit();
+    check('address: ... the field opened again starts afresh', [state.addr.error, !!$('#suggest .err')], ['', false]);
+    quiet();
+    state.remote = ALL;
+    reset('', '', { top: true });
+    startEdit();
+    typeAddr('downloads');
+    key(addr, 'Enter');
+    check('address: ... at All servers\' top, a path without a server says so there too', ($('#suggest .err') || {}).textContent,
+      'Start with a server\'s name, e.g. Main:downloads');
+    quiet();
+    state.remote = 'Main';
+
+    // Delete: the confirmation names the pins that go; the result says it unpinned them.
+    pinsMsg({ Main: [{ path: '/srv/tv' }, { path: '/srv/./tv/s1', name: 'S1' }, { path: '/srv/tv2' }] });
+    reset();
+    pick(0);
+    deleteRows([state.hits[0]]);
+    check('pins: Delete of a pinned folder: its pins (and those below it, however spelled) named', $('#modal-body .fo-pins').textContent,
+      '2 of these folders are in Quick access: their pins go too.');
+    closeModal(false);
+    pinsMsg(three());
+    deleteRows([state.hits[0]]);
+    const d = modal.del;
+    check('pins: ... one: by its name', $('#modal-body .fo-pins').textContent, 'tv is in Quick access: its pin goes too.');
+    closeModal(false);
+    deleteRows([state.hits[1]]);
+    check('pins: ... none: no line', $('#modal-body .fo-pins'), null);
+    closeModal(false);
+    sent.length = 0;
+    ops.waits.clear();
+    startDelete(d);
+    onFilesDone({ type: 'filesDone', token: lastOf('filesDelete').token, ok: true, files: 0, folders: 1, bytes: 0, left: 0, entries: [], skipped: 0, failed: 0 });
+    check('pins: ... a delete that ran to its end says it unpinned it', said(), 'Deleted 1 folder; unpinned tv');
+    startDelete(d);
+    onFilesDone({ type: 'filesDone', token: lastOf('filesDelete').token, ok: false, stopped: true, files: 0, folders: 0, bytes: 0, left: 1, entries: [], skipped: 0, failed: 0 });
+    check('pins: ... one that ended early doesn\'t', said(), 'Delete cancelled: nothing deleted, 1 still there');
+    quiet();
+
+    // Remove: its pinned folders go too, said when it has some.
+    onSettingsAction('remove', 'Main');
+    const removeMain = $('#modal-body').textContent;
+    closeModal(false);
+    onSettingsAction('remove', 'Box.Guest');
+    const removeGuest = $('#modal-body').textContent;
+    closeModal(false);
+    check('pins: the Remove dialog names its pinned folders', [removeMain.includes('its file list, its pinned folders and what grab learned'),
+      removeGuest.includes('its file list and what grab learned')], [true, true]);
+
+    // 100 pins on one server: the list scrolls past about 12 rows; Alt+9 is the ninth.
+    const hundred = { Main: Array.from({ length: 100 }, (_, i) => ({ path: `/h/d${String(i).padStart(3, '0')}` })) };
+    pinsMsg(hundred);
+    reset();
+    const t0 = performance.now();
+    btn.click();
+    const openMs = performance.now() - t0;
+    check('pins: 100 pins: all listed, Alt hints on the first nine, the list scrolls (12 rows or so shown)',
+      [list.querySelectorAll('.opt').length, list.querySelectorAll('.p-key').length, list.scrollHeight > list.clientHeight, list.clientHeight <= 372, list.clientHeight >= 300],
+      [100, 9, true, true, true]);
+    const t1 = performance.now();
+    lk('End');
+    const endMs = performance.now() - t1;
+    check('pins: ... End reaches the last, scrolled into view', [quick.sel, optEl(99).getBoundingClientRect().bottom <= list.getBoundingClientRect().bottom + 1], [99, true]);
+    out.push(`INFO pins: 100 pins: the list opens in ${openMs.toFixed(1)} ms, End in ${endMs.toFixed(1)} ms`);
+    closePins();
+    sent.length = 0;
+    key($('#results'), '9', { altKey: true, code: 'Digit9' });
+    check('pins: ... Alt+9 opens the ninth', lastOf('browse').path, '/h/d008');
+    b.typed = null;
+    b.loading = false;
+    quiet();
+
+    // Light and dark: the new parts take the theme's tokens (app.css redefines them for dark).
+    const token = (name, prop = 'color') => {
+      const probe = document.createElement('span');
+      probe.style[prop] = `var(--${name})`;
+      document.body.append(probe);
+      const c = getComputedStyle(probe)[prop];
+      probe.remove();
+      return c;
+    };
+    pinsMsg(three());
+    reset('Main', '/srv/tv');
+    quick.gone.set(goneKey('Main', '/data/films'), 'not found');
+    btn.click();
+    lk('ArrowDown');
+    const colours = [getComputedStyle(btn).color === token('accent'), getComputedStyle(optEl(0)).backgroundColor === token('sel', 'backgroundColor'),
+      getComputedStyle(optEl(0).querySelector('.p-path')).color === token('muted'), getComputedStyle(optEl(1).querySelector('.p-note')).color === token('danger'),
+      getComputedStyle(list.querySelector('.p-head')).color === token('muted'), getComputedStyle($('#pins')).backgroundColor === token('panel', 'backgroundColor'),
+      getComputedStyle($('#pins-drop')).backgroundColor === token('accent', 'backgroundColor')];
+    closePins();
+    unpinFolder('Main', '/srv/tv');
+    pinsMsg({ ...three(), Main: three().Main.slice(1) });
+    colours.push(getComputedStyle($('#ops-act')).color === token('accent'), getComputedStyle($('#ops-sep')).color === token('muted'));
+    startEdit();
+    colours.push(getComputedStyle($('#suggest .s-head')).color === token('muted'), getComputedStyle($('#suggest .s-path')).color === token('muted'));
+    state.addr.error = 'x';
+    state.addr.unpin = { server: 'Main', path: '/x' };
+    renderSuggest();
+    colours.push(getComputedStyle($('#suggest .err')).color === token('danger'), getComputedStyle($('#suggest .err .link')).color === token('accent'));
+    check('pins: light and dark: the new parts take the theme\'s colours', colours, Array(colours.length).fill(true));
+
+    quiet();
+    quick.pins = {};
+    quick.gone.clear();
+    ops.accounts.clear();
+    Object.assign(b, browseWas);
+    state.nav = navWas;
+    state.hits = hitsWas;
+    state.remotes = remotesWas;
+    state.remote = remoteWas;
+    state.selected = new Set();
+    state.cursor = -1;
+    renderRows();
+    renderBrowseBar();
   }
 
   panel.style.width = '1250px';

@@ -39,6 +39,19 @@
     <button id="browse-up" type="button" class="icon-btn" title="Up a folder (Backspace)" aria-label="Up a folder">
       <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>
     </button>
+    <!-- Quick access (PINS.md): the pinned folders of the server on screen; filled while the open folder is one. -->
+    <div class="pins-wrap">
+      <button id="pins-btn" type="button" class="icon-btn" title="Quick access (Ctrl+D pins this folder)" aria-label="Quick access"
+              aria-haspopup="listbox" aria-expanded="false" aria-controls="pins-list">
+        <svg class="pin-ico" viewBox="0 0 16 16" aria-hidden="true"><path class="pin-body" d="M5.2 1.8h5.6l-.9 1.2v3.6l2.4 2.6v1.3H3.7V9.2l2.4-2.6V3z"/><path d="M8 10.5v4.2"/></svg>
+        <svg class="pin-caret" viewBox="0 0 8 8" aria-hidden="true"><path d="M1.5 3 4 5.5 6.5 3"/></svg>
+      </button>
+      <div id="pins" class="search-pop pins" hidden>
+        <div id="pins-list" class="pins-list" role="listbox" tabindex="-1" aria-label="Quick access"></div>
+        <div id="pins-drop" class="pins-drop" hidden></div>
+        <div class="pins-foot"><button id="pins-here" type="button" class="pins-here" tabindex="-1"></button></div>
+      </div>
+    </div>
     <div id="browse-bar" class="address">
       <svg class="address-ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 3.5C1 2.7 1.7 2 2.5 2h3.6l1.6 1.6h5.8c.8 0 1.5.7 1.5 1.5v7.4c0 .8-.7 1.5-1.5 1.5h-11C1.7 14 1 13.3 1 12.5z"/></svg>
       <nav id="crumbs" class="crumbs" aria-label="Folder"></nav>
@@ -132,6 +145,8 @@
     <span id="ops" class="ops" role="status" aria-live="polite" hidden>
       <span class="spinner"></span><span id="ops-text" class="ops-text"></span>
       <button id="ops-cancel" type="button" class="link" hidden>Cancel</button>
+      <!-- A result's own action for a while: Unpin's Undo. -->
+      <span id="ops-sep" class="ops-sep" aria-hidden="true" hidden>·</span><button id="ops-act" type="button" class="link" hidden></button>
     </span>
     <!-- What Cut or Copy holds for a paste. -->
     <span id="clip" class="clip" hidden></span>

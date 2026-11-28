@@ -8,13 +8,14 @@
 //                 setUploadExisting, setTheme,
 //                 Browse's changes on servers: filesAccount, filesRename, filesMkdir, filesLook, filesPaste,
 //                 filesSize, filesDelete, filesProps, filesHash, filesCancel,
+//                 Quick access: pinsAdd, pinsRemove, pinsRename, pinsMove,
 //                 updates: updateCheckNow, setUpdateCheck, updateStart, updateRestart, updateDismiss, openReleasePage,
 //                 settings: servers, serverSave, serverConfirm, serverCancel, serverTrust,
 //                 serverTest, serverRemove, serverDefault, pickFile, openConfig
 //   from backend: init, searchResult, searchError, browseResult, suggestions, activity, folderPicked, queue, queueDelta,
 //                 files, fileDelta, speed, openAsk, downloadsNote, error, update, spaceShort, existing,
 //                 updateChecked, limit, played, uploadCheck, uploadExisting, theme, pageRestored (from the window itself),
-//                 filesAccount, filesDone, filesProgress,
+//                 filesAccount, filesDone, filesProgress, pins,
 //                 settings: servers, settingsBusy, hostKeys, serverSaved, serverTested,
 //                 serverError, filePicked, importBanner
 
@@ -70,10 +71,12 @@ const state = {
     uploadable: false, // the backend's word: the folder shown takes uploads (not the made-up top of several roots)
   },
   // The path bar as a field (the address bar): `typed` the text typed (the suggestions follow
-  // it), `shown` the suggestions ({ label, text, server }), `sel` the highlighted one, `cache`
-  // the folder names per "server\nparent" (null while asked), `want` the key last needed,
-  // `error` why the last address failed.
-  addr: { editing: false, typed: '', shown: [], sel: -1, cache: new Map(), want: '', error: '' },
+  // it; '' untouched), `field` the field's own text (what was typed, or the address it opened
+  // with), `shown` the suggestions ({ label, text, server } or a pin's { label, text, where, pin:
+  // { server, path } }), `sel` the highlighted one, `cache` the folder names per "server\nparent"
+  // (null while asked), `want` the key last needed, `error` why the last address (or pin) failed,
+  // `unpin` the pin it was when it isn't there or can't be listed ({ server, path }, else null).
+  addr: { editing: false, typed: '', field: '', shown: [], sel: -1, cache: new Map(), want: '', error: '', unpin: null },
   // Browse's last folder per server while the window runs (absent: its top); '*' -> the server
   // All servers had open. Not kept across starts: each start opens a server at its top.
   browsePaths: {},
@@ -98,6 +101,17 @@ const ops = {
   refusal: null,    // a refusal said while one runs, over its progress for a while: { text, until }
   waits: new Map(), // token -> { done(msg), progress(msg) }: who takes the backend's answers
 };
+
+// Quick access (PINS.md, chunk 2; see "Quick access" below). `pins`: each server's pinned folders
+// in the user's order, as the backend keeps them ({ server: [{ path, name? }] }, grab.conf's servers
+// only); `gone`: "server\npath" -> why a pin didn't open this session ('not found', 'can’t be
+// listed'), dimmed until it opens again; `open`: the list shown, `sel` its highlighted row (-1
+// none); `drag`: a press or drag on a row; `want`: the change asked for, said in the footer once
+// the backend's list shows it done ({ done(), text, act }); `follow`: "server\npath" of a pin
+// moved, whose row stays highlighted.
+const quick = { pins: {}, gone: new Map(), open: false, sel: -1, drag: null, want: null, follow: '' };
+// Beside a pin's "Not found on Main: …" (the footer, the address field's list).
+const UNPIN_GONE = ' · <button type="button" class="link" data-act="unpin-gone">Unpin</button>';
 
 // ---- helpers -----------------------------------------------------------------------------
 
@@ -1345,6 +1359,7 @@ function browseTo(server, path, top, { select = null, live = false, keep = false
   b.typed = null;
   b.pendingScroll = scroll;
   state.addr.error = '';
+  state.addr.unpin = null;
   if (state.addr.editing) endEdit(false);
   if (!server) {
     Object.assign(b, { server: '', path: '', top: true, crumbs: [], error: '', loading: false, source: '', uploadable: false });
@@ -1391,14 +1406,24 @@ function onBrowseResult(msg) {
   const b = state.browse;
   if (msg.id !== b.id) return; // an older request
   const wasLoading = b.loading;
-  if (msg.typed) {
-    // An address typed in the path bar: a failure leaves the folder on screen as it was.
+  if (msg.typed || msg.pin) {
+    // An address typed in the path bar, or a pin opened (its path as saved): a failure leaves the
+    // folder on screen as it was, and says why there (with Unpin when the pin's folder isn't there
+    // or can't be listed: its pin dims in Quick access until it opens again).
     if (!b.typed || b.typed.server !== msg.remote) return;
+    const pin = msg.pin && typeof b.typed.pin === 'string' ? b.typed.pin : null;
     b.typed = null;
     b.loading = false;
+    if (pin !== null) {
+      const key = goneKey(msg.remote, pin);
+      if (msg.error && msg.failure) quick.gone.set(key, msg.failure === 'denied' ? 'can’t be listed' : 'not found');
+      else if (!msg.error) quick.gone.delete(key);
+    }
     if (msg.error) {
       state.addr.error = msg.error;
+      state.addr.unpin = pin !== null && msg.failure ? { server: msg.remote, path: pin } : null;
       renderBrowseBar();
+      renderSuggest();
       return;
     }
     navNote(); // the place on screen, before it goes
@@ -1561,6 +1586,7 @@ function searchBelow(query) {
   showBanner('');
   b.under = { query, path: b.path, all, whole, name: browseHere() };
   state.addr.error = ''; // a failed address is behind us
+  state.addr.unpin = null;
   recordRecent(query);
   state.results = [];
   state.filterTotal = 0;
@@ -1609,11 +1635,12 @@ function renderBrowseBar() {
   // Search results end the path, as in Explorer.
   if (b.under) steps.push({ name: `Search results for “${b.under.query}”`, results: true });
   b.steps = steps;
+  // `data-menu`: each step's right-click menu (crumbMenu).
   $('#crumbs').innerHTML = steps.map((s, i) => (s.results
-    ? `<button type="button" class="crumb here results" data-edit tabindex="-1">${esc(s.name)}</button>`
+    ? `<button type="button" class="crumb here results" data-edit data-menu="${i}" tabindex="-1">${esc(s.name)}</button>`
     : i === steps.length - 1
-    ? `<button type="button" class="crumb here" data-edit tabindex="-1" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`
-    : `<button type="button" class="crumb" data-step="${i}" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`))
+    ? `<button type="button" class="crumb here" data-edit data-menu="${i}" tabindex="-1" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`
+    : `<button type="button" class="crumb" data-step="${i}" data-menu="${i}" title="${esc(s.path ?? s.name)}">${esc(s.name)}</button>`))
     .join('<span class="sep">›</span>');
   $('#browse-up').disabled = !b.under && (!b.server || (b.top && state.remote !== ALL));
   const n = state.nav;
@@ -1627,12 +1654,19 @@ function renderBrowseBar() {
   $('#browse-refresh').hidden = !b.server || !!b.under;
   $('#browse-refresh').disabled = b.loading;
   renderSearchBox();
+  renderQuick();
   // Where the folder's rows came from, in the footer (search results have their own, beside it).
+  // An address (or pin) that didn't open says why here once the field is closed (in its list
+  // while it is open), until Browse goes somewhere.
   const status = $('#browse-status');
+  // A long error shrinks on its own: the Unpin link after it stays in sight.
+  const unpinLink = a.error && !b.under && !a.editing && !!a.unpin && !(state.flash && state.flash.until > Date.now());
+  status.classList.toggle('has-link', unpinLink);
   if (state.flash && state.flash.until > Date.now()) {
     status.textContent = bidiVisible(state.flash.text);
   } else if (a.error && !b.under && !a.editing) {
-    status.innerHTML = `<span class="bad" title="${esc(a.error)}">${esc(a.error)}</span>`;
+    status.innerHTML = `<span class="bad" title="${esc(a.error)}">${esc(a.error)}</span>` +
+      (a.unpin ? `<span class="tail">${UNPIN_GONE}</span>` : '');
   } else if (b.under) {
     status.textContent = '';
   } else if (b.loading) {
@@ -1679,31 +1713,32 @@ function parseAddress(text) {
 }
 
 // A click on the path bar's empty part or its current folder, Ctrl+L, Alt+D or F4: the path as
-// text, all of it selected.
+// text, all of it selected, and Quick access's pins listed under it.
 function startEdit() {
   if (settings.open || modal) return;
   const a = state.addr;
   const input = $('#address');
+  closePins();
   if (!a.editing) {
-    Object.assign(a, { editing: true, typed: '', shown: [], sel: -1, cache: new Map(), want: '', error: '' });
-    input.value = currentAddress();
+    Object.assign(a, { editing: true, typed: '', field: currentAddress(), shown: [], sel: -1, cache: new Map(), want: '', error: '', unpin: null });
+    input.value = a.field;
     const example = state.remotes.length ? state.remotes[0].name : 'Main';
     input.placeholder = state.remote === ALL ? `A server and a path, e.g. ${example}:downloads`
       : `Type a path on ${state.remote}`;
     renderBrowseBar();
-    renderSuggest();
+    updateSuggest();
   }
   input.focus();
   input.select();
 }
 
 // The path bar again; `focus`: the results take the keyboard (Esc, a folder opened). An error
-// shown goes with the field; one for an address still being opened shows when it comes.
+// shown in the field's list goes to the footer (PINS.md 3.10), as one for an address still being
+// opened does when it comes.
 function endEdit(focus = true) {
   const a = state.addr;
   if (!a.editing) return;
   Object.assign(a, { editing: false, shown: [], sel: -1 });
-  if (!state.browse.typed) a.error = '';
   renderSuggest();
   renderBrowseBar();
   if (focus) $('#results').focus();
@@ -1720,7 +1755,9 @@ function goAddress() {
   if (!server) {
     const example = state.remotes.length ? state.remotes[0].name : 'Main';
     a.error = `Start with a server's name, e.g. ${example}:downloads`;
+    a.unpin = null;
     renderBrowseBar();
+    renderSuggest();
     return;
   }
   const b = state.browse;
@@ -1732,6 +1769,8 @@ function goAddress() {
     return;
   }
   a.error = '';
+  a.unpin = null;
+  renderSuggest();
   b.id += 1;
   b.typed = { server };
   b.loading = true;
@@ -1739,22 +1778,42 @@ function goAddress() {
   send({ type: 'browse', id: b.id, remote: server, path, typed: true });
 }
 
-// The suggestions for the text typed: the folders of its parent that start with its last part
-// (from the list and this session's live listings, asked once per folder), up to 12; in All
-// servers' own top, the servers.
+const SUGGEST_MAX = 12;   // rows in the address field's list
+const SUGGEST_PINS = 5;   // pins among them once something is typed
+
+// Quick access's pins for the address field's list, as Quick access shows them: all of them (up
+// to SUGGEST_MAX) while nothing is typed; else those whose name or path holds the text, ignoring
+// case (up to SUGGEST_PINS). In All servers (or for another server's pin) as "Server:path".
+function addressPins(text) {
+  const t = text.trim().toLowerCase();
+  const list = pinRows().map((r) => {
+    const where = state.remote === ALL || r.server !== state.remote ? `${r.server}:${r.path}` : r.path;
+    return { label: r.name, text: where, where, pin: { server: r.server, path: r.path } };
+  });
+  if (!t) return list.slice(0, SUGGEST_MAX);
+  return list.filter((s) => [s.label, s.pin.path, s.text].some((x) => x.toLowerCase().includes(t))).slice(0, SUGGEST_PINS);
+}
+
+// The suggestions for the text typed: Quick access's pins first (addressPins), then the folders of
+// its parent that start with its last part (from the list and this session's live listings, asked
+// once per folder), up to 12 in all; in All servers' own top, the servers.
 function updateSuggest() {
   const a = state.addr;
   a.sel = -1;
   a.shown = [];
   const text = a.typed;
+  const pinned = addressPins(text);
+  if (!text.trim()) {
+    a.shown = pinned;
+    renderSuggest();
+    return;
+  }
   const colon = text.indexOf(':');
   const named = colon > 0 ? findRemote(text.slice(0, colon)) : '';
   if (!named && state.remote === ALL && !state.browse.server) {
     const word = text.trim().toLowerCase();
-    if (word) {
-      a.shown = state.remotes.filter((r) => r.name.toLowerCase().startsWith(word))
-        .map((r) => ({ label: r.name, text: `${r.name}:`, server: true }));
-    }
+    a.shown = [...pinned, ...state.remotes.filter((r) => r.name.toLowerCase().startsWith(word))
+      .map((r) => ({ label: r.name, text: `${r.name}:`, server: true }))].slice(0, SUGGEST_MAX);
     renderSuggest();
     return;
   }
@@ -1764,6 +1823,7 @@ function updateSuggest() {
   const parent = rest.slice(0, slash + 1);
   const word = rest.slice(slash + 1).toLowerCase();
   if (!server || (slash < 0 && !word)) {
+    a.shown = pinned;
     renderSuggest();
     return;
   }
@@ -1774,8 +1834,8 @@ function updateSuggest() {
     send({ type: 'suggest', remote: server, path: parent });
   }
   const prefix = named ? `${named}:` : '';
-  a.shown = (a.cache.get(key) || []).filter((n) => n.toLowerCase().startsWith(word)).slice(0, 12)
-    .map((n) => ({ label: n, text: `${prefix}${parent}${n}` }));
+  a.shown = [...pinned, ...(a.cache.get(key) || []).filter((n) => n.toLowerCase().startsWith(word)).slice(0, SUGGEST_MAX - pinned.length)
+    .map((n) => ({ label: n, text: `${prefix}${parent}${n}` }))];
   renderSuggest();
 }
 
@@ -1789,18 +1849,31 @@ function onSuggestions(msg) {
   if (msg.later) a.cache.delete(key);
 }
 
+// The field's list: the pins under "Quick access", the folders (or servers), and why the last
+// address or pin didn't open (PINS.md 3.10: the field keeps the focus after Enter, so it shows
+// here; the footer shows it once the field closes).
 function renderSuggest() {
   const a = state.addr;
   const box = $('#suggest');
-  const open = a.editing && a.shown.length > 0;
+  const input = $('#address');
+  const why = a.editing && !!a.error;
+  const open = a.editing && (a.shown.length > 0 || why);
   box.hidden = !open;
-  $('#address').setAttribute('aria-expanded', String(open));
+  input.setAttribute('aria-expanded', String(open));
+  if (why) input.setAttribute('aria-describedby', 'address-why');
+  else input.removeAttribute('aria-describedby');
   if (!open) {
     box.innerHTML = '';
     return;
   }
-  box.innerHTML = a.shown.map((s, i) => `<div class="opt${i === a.sel ? ' on' : ''}" role="option" data-i="${i}"` +
-    ` aria-selected="${i === a.sel}">${s.server ? '' : FOLDER_ICON}<span>${esc(s.label)}</span></div>`).join('');
+  const option = (s, i) => `<div class="opt${i === a.sel ? ' on' : ''}" role="option" data-i="${i}" aria-selected="${i === a.sel}"` +
+    `${s.pin ? ` title="${esc(s.where)}"` : ''}>${s.server ? '' : FOLDER_ICON}` +
+    `${s.pin ? `<span class="s-name">${esc(s.label)}</span><span class="s-path">${esc(s.where)}</span>` : `<span>${esc(s.label)}</span>`}</div>`;
+  const pins = a.shown.filter((s) => s.pin).length; // first
+  box.innerHTML = (pins ? '<div role="group" aria-labelledby="suggest-qa"><div class="s-head" id="suggest-qa">Quick access</div>' +
+    `${a.shown.slice(0, pins).map(option).join('')}</div>` : '') +
+    a.shown.slice(pins).map((s, k) => option(s, pins + k)).join('') +
+    (why ? `<div class="err" id="address-why" role="alert">${esc(a.error)}${a.unpin ? UNPIN_GONE : ''}</div>` : '');
   const on = box.querySelector('.on');
   if (on) on.scrollIntoView({ block: 'nearest' });
 }
@@ -1816,8 +1889,10 @@ $('#browse-bar').addEventListener('click', (ev) => {
 $('#address').addEventListener('input', () => {
   const a = state.addr;
   a.typed = $('#address').value;
+  a.field = a.typed;
   if (a.error) {
     a.error = '';
+    a.unpin = null;
     renderBrowseBar();
   }
   updateSuggest();
@@ -1826,14 +1901,17 @@ $('#address').addEventListener('keydown', (ev) => {
   const a = state.addr;
   const input = $('#address');
   if (ev.key === 'Enter') {
+    // A pin highlighted opens as saved; anything else as typed.
     ev.preventDefault();
-    goAddress();
+    const s = a.shown[a.sel];
+    if (s && s.pin) openPin(s.pin.server, s.pin.path);
+    else goAddress();
   } else if (ev.key === 'Escape') {
-    // The suggestions close first (the text typed comes back), then the field.
+    // The suggestions close first (the field's own text comes back), then the field.
     ev.preventDefault();
     ev.stopPropagation();
     if (a.shown.length) {
-      if (a.sel >= 0) input.value = a.typed;
+      if (a.sel >= 0) input.value = a.field;
       a.shown = [];
       a.sel = -1;
       renderSuggest();
@@ -1841,29 +1919,44 @@ $('#address').addEventListener('keydown', (ev) => {
       endEdit();
     }
   } else if ((ev.key === 'ArrowDown' || ev.key === 'ArrowUp') && a.shown.length) {
-    // Through the suggestions and back to the text typed; the field shows the one highlighted.
+    // Through the suggestions and back to the field's own text; the field shows the one highlighted.
     ev.preventDefault();
     const n = a.shown.length;
     if (ev.key === 'ArrowDown') a.sel = a.sel + 1 >= n ? -1 : a.sel + 1;
     else a.sel = a.sel < 0 ? n - 1 : a.sel - 1;
-    input.value = a.sel >= 0 ? a.shown[a.sel].text : a.typed;
+    input.value = a.sel >= 0 ? a.shown[a.sel].text : a.field;
     renderSuggest();
   } else if (ev.key === 'Tab' && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && a.shown.length) {
-    // Completes the highlighted (or first) folder and goes on into it.
+    // Completes the highlighted suggestion (a pin only when highlighted), else the first folder or
+    // server, and goes on into it; with none, Tab leaves the field as usual.
+    const pick = a.sel >= 0 ? a.shown[a.sel] : a.shown.find((s) => !s.pin);
+    if (!pick) return;
     ev.preventDefault();
-    const pick = a.shown[Math.max(a.sel, 0)];
     input.value = pick.server ? pick.text : `${pick.text}/`;
     a.typed = input.value;
+    a.field = a.typed;
     updateSuggest();
   }
 });
 $('#address').addEventListener('blur', () => endEdit(false));
 $('#suggest').addEventListener('mousedown', (ev) => ev.preventDefault()); // the field keeps the focus
 $('#suggest').addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-act="unpin-gone"]')) {
+    unpinGone();
+    return;
+  }
   const o = ev.target.closest('[data-i]');
   if (!o) return;
-  $('#address').value = state.addr.shown[Number(o.dataset.i)].text;
+  const s = state.addr.shown[Number(o.dataset.i)];
+  if (s.pin) {
+    openPin(s.pin.server, s.pin.path);
+    return;
+  }
+  $('#address').value = s.text;
   goAddress();
+});
+$('#browse-status').addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-act="unpin-gone"]')) unpinGone();
 });
 
 $('#crumbs').addEventListener('click', (ev) => {
@@ -1875,6 +1968,594 @@ $('#crumbs').addEventListener('click', (ev) => {
   else if (s.top) browseTo(s.server, '', true);
   else browseTo(s.server, s.path, false);
 });
+// A crumb's own menu, by the mouse, the menu key or Shift+F10 (on a crumb that has the focus).
+$('#crumbs').addEventListener('contextmenu', (ev) => {
+  const btn = ev.target instanceof Element ? ev.target.closest('[data-menu]') : null;
+  if (!btn) return;
+  ev.preventDefault();
+  showMenu(ev.clientX, ev.clientY, crumbMenu(state.browse.steps[Number(btn.dataset.menu)]));
+});
+$('#crumbs').addEventListener('keydown', (ev) => {
+  if (!((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu')) return;
+  const btn = ev.target instanceof Element ? ev.target.closest('[data-menu]') : null;
+  if (!btn) return;
+  ev.preventDefault();
+  const r = btn.getBoundingClientRect();
+  showMenu(r.left, r.bottom, crumbMenu(state.browse.steps[Number(btn.dataset.menu)]), true);
+});
+
+// A crumb's menu: Quick access for a folder's (not the server's top, All servers or search
+// results), its path, and the address bar to type in.
+function crumbMenu(s) {
+  const items = [];
+  const folder = !!s && !!s.server && !s.top && !s.results && !!s.path;
+  if (folder) {
+    const b = state.browse;
+    const here = !b.under && b.server === s.server && !b.top && b.path === s.path;
+    items.push(pinEntry(s.server, s.path, here), '-', { label: 'Copy path', act: () => copyText([s.path]) });
+  }
+  items.push({ label: 'Edit address', key: 'Ctrl+L', act: () => startEdit() });
+  return items;
+}
+
+// ---- Quick access: pinned folders per server (PINS.md, chunk 2) ------------------------------
+// The Quick access button between Up and the address bar opens the pins of the server on screen
+// (under All servers, every server's under its name, the one on screen first); the same pins come
+// first in the address field's list. A folder row's, a folder hit's, the list's empty part's and a
+// crumb's menus pin and unpin, as Ctrl+D pins the open folder (never unpins); Alt+1 to Alt+9 open
+// the first nine. The backend owns the list: the page asks one change at a time (pinsAdd,
+// pinsRemove, pinsRename, pinsMove) and shows what "pins" posts back, also after grab's own
+// renames, moves and deletes carried pins along. Nothing asks a server anything but opening a pin,
+// which goes as a typed address does: its folder exactly as saved, the window where it was until
+// the answer, a failure said in the footer with Unpin beside it.
+
+const pinsOf = (server) => (server && Array.isArray(quick.pins[server]) ? quick.pins[server] : []);
+const goneKey = (server, path) => `${server}\n${path}`;
+
+// The name a pin shows: its own, else its folder's last name (pins::shown_name).
+function pinName(p) {
+  if (p.name) return p.name;
+  let path = p.path;
+  while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+  return path.slice(path.lastIndexOf('/') + 1) || path;
+}
+
+// The index of `server`'s pin of `path`, -1 for none: the same spelling first, else the same folder
+// as server_files::canonical makes it with the account's home (pins::find).
+function pinIndex(server, path) {
+  const list = pinsOf(server);
+  const same = list.findIndex((p) => p.path === path);
+  if (same >= 0 || !list.length) return same;
+  const a = ops.accounts.get(server);
+  const home = (a && a.home) || '';
+  const at = serverCanonical(path, home);
+  return list.findIndex((p) => serverCanonical(p.path, home) === at);
+}
+
+// The pins as the list shows them, in groups: the server picked's; under All servers each server's
+// with any, the one on screen first, then the picker's order. A row: { server, path, name, own (its
+// own name, '' none), i (its place in its server's list), gone (why it didn't open, '' none) }.
+function pinGroups() {
+  const names = state.remotes.map((r) => r.name);
+  if (state.remote !== ALL) {
+    return names.includes(state.remote) ? [{ server: state.remote, pins: pinRowsOf(state.remote) }] : [];
+  }
+  const on = state.browse.server;
+  const order = names.includes(on) ? [on, ...names.filter((n) => n !== on)] : names;
+  return order.map((server) => ({ server, pins: pinRowsOf(server) })).filter((g) => g.pins.length);
+}
+
+function pinRowsOf(server) {
+  return pinsOf(server).map((p, i) => ({ server, path: p.path, name: pinName(p), own: p.name || '', i,
+    gone: quick.gone.get(goneKey(server, p.path)) || '' }));
+}
+
+const pinRows = () => pinGroups().flatMap((g) => g.pins);
+
+// `server`'s pins at or below `paths`, compared as server_files::canonical makes them with the
+// account's home (pins::drop_below): what a delete of `paths` unpins.
+function pinsBelow(server, paths) {
+  const a = ops.accounts.get(server);
+  const home = (a && a.home) || '';
+  const gone = paths.map((p) => serverCanonical(p, home));
+  return pinsOf(server).filter((p) => {
+    const at = serverCanonical(p.path, home);
+    return gone.some((g) => at === g || at.startsWith(g.endsWith('/') ? g : `${g}/`));
+  });
+}
+
+// Why the open folder can't be pinned now, or '': one folder of one server (not a server's top,
+// All servers' or search results, nor the login folder '~' of several roots, which has no path),
+// opened.
+function pinHereWhy() {
+  const b = state.browse;
+  if (!b.server || b.under || b.top || !b.path) return 'Open a folder of a server first.';
+  if (b.loading) return `${browseHere()} is still opening.`;
+  return '';
+}
+
+// "Pin to Quick access" or "Unpin from Quick access" for `path` of `server`, as it is now; `here`:
+// the open folder's, whose Pin is Ctrl+D (which never unpins).
+function pinEntry(server, path, here = false) {
+  if (pinIndex(server, path) >= 0) return { label: 'Unpin from Quick access', act: () => unpinFolder(server, path) };
+  const why = here ? pinHereWhy() : '';
+  return { label: 'Pin to Quick access', key: here ? 'Ctrl+D' : '', disabled: !!why, why, act: () => pinFolder(server, path) };
+}
+
+// Pins `path` of `server`, last; Undo gives the pin's own `name` and its place `at` back. Said once
+// the backend's list holds it ("Pinned tv to Quick access"); a folder pinned already says so.
+function pinFolder(server, path, { name = '', at = null } = {}) {
+  const there = pinIndex(server, path);
+  if (there >= 0) {
+    opsSay(`${pinName(pinsOf(server)[there])} is already in Quick access`, true);
+    return;
+  }
+  const msg = { type: 'pinsAdd', server, path };
+  if (name) msg.name = name;
+  if (at !== null) msg.at = at;
+  quick.want = { done: () => pinIndex(server, path) >= 0, text: `Pinned ${name || pinName({ path })} to Quick access`, act: null };
+  send(msg);
+}
+
+// Ctrl+D and the footer's "Pin this folder": the open folder.
+function pinHere() {
+  const why = pinHereWhy();
+  if (why) {
+    opsSay(why, true);
+    return;
+  }
+  pinFolder(state.browse.server, state.browse.path);
+}
+
+// Unpins without asking: "Unpinned tv · Undo" in the footer for a while, Undo pinning it back
+// with its name and place.
+function unpinFolder(server, path) {
+  const i = pinIndex(server, path);
+  if (i < 0) return;
+  const p = pinsOf(server)[i];
+  quick.gone.delete(goneKey(server, p.path));
+  quick.want = { done: () => pinIndex(server, p.path) < 0, text: `Unpinned ${pinName(p)}`,
+    act: { label: 'Undo', run: () => pinFolder(server, p.path, { name: p.name || '', at: i }) } };
+  send({ type: 'pinsRemove', server, path: p.path });
+}
+
+// Unpin beside a pin's "Not found on Main: …": that pin, and the message goes.
+function unpinGone() {
+  const a = state.addr;
+  const u = a.unpin;
+  if (!u) return;
+  a.error = '';
+  a.unpin = null;
+  unpinFolder(u.server, u.path);
+  renderBrowseBar();
+  renderSuggest();
+}
+
+// A pin one place up (-1) or down (+1) in its server's list (Alt+↑/↓, Move up/down), or to `to`
+// (a drop); its row stays highlighted.
+function movePin(r, to) {
+  if (to < 0 || to >= pinsOf(r.server).length || to === r.i) return;
+  quick.follow = goneKey(r.server, r.path);
+  send({ type: 'pinsMove', server: r.server, path: r.path, to });
+}
+
+// Opens a pin as a typed address opens (PINS.md 3.3): its folder exactly as saved, the folder on
+// screen staying until the answer (onBrowseResult); a failure leaves the window where it was.
+// Under All servers it stays there; else the server picker follows once it opened.
+function openPin(server, path) {
+  if (!state.remotes.some((r) => r.name === server)) {
+    opsSay(`${server} isn’t one of your servers any more.`, true);
+    return;
+  }
+  if (settings.open) closeSettings();
+  // From the list: the keyboard goes on in the folder, as after any folder opened.
+  if (quick.open) {
+    closePins();
+    $('#results').focus({ preventScroll: true });
+  }
+  const b = state.browse;
+  if (b.under) closeBelow();
+  const a = state.addr;
+  Object.assign(a, { error: '', unpin: null, shown: [], sel: -1 });
+  b.id += 1;
+  b.typed = { server, pin: path };
+  b.loading = true;
+  renderBrowseBar();
+  renderSuggest();
+  send({ type: 'browse', id: b.id, remote: server, path, pin: true });
+}
+
+// Alt+1 to Alt+9: the nth pin as the list shows it.
+function openNthPin(n) {
+  const rows = pinRows();
+  if (n > rows.length) {
+    const where = state.remote === ALL ? '' : ` on ${state.remote}`;
+    opsSay(`Quick access has ${rows.length ? counted(rows.length, 'pin') : 'no pins'}${where}.`, true);
+    return;
+  }
+  openPin(rows[n - 1].server, rows[n - 1].path);
+}
+
+// Alt+1 to Alt+9's digit (the top row's, whatever the layout: its code; not the numpad's, which
+// types Alt codes), else 0.
+function pinDigit(ev) {
+  const m = /^Digit([1-9])$/.exec(ev.code || '');
+  if (m) return Number(m[1]);
+  return !ev.code && /^[1-9]$/.test(ev.key) ? Number(ev.key) : 0;
+}
+
+// A pin's own menu (right-click or Shift+F10 in the list).
+function pinMenu(r) {
+  const last = pinsOf(r.server).length - 1;
+  return [
+    { label: 'Open', key: 'Enter', act: () => openPin(r.server, r.path) },
+    { label: 'Rename…', key: 'F2', act: () => renamePin(r) },
+    '-',
+    { label: 'Move up', key: 'Alt+↑', disabled: r.i === 0, why: r.i === 0 ? `${r.name} is first in Quick access on ${r.server}` : '',
+      act: () => movePin(r, r.i - 1) },
+    { label: 'Move down', key: 'Alt+↓', disabled: r.i === last, why: r.i === last ? `${r.name} is last in Quick access on ${r.server}` : '',
+      act: () => movePin(r, r.i + 1) },
+    '-',
+    { label: 'Copy path', act: () => copyText([r.path]) },
+    '-',
+    { label: 'Unpin from Quick access', key: 'Del', act: () => unpinFolder(r.server, r.path) },
+  ];
+}
+
+// Why `name` can't be a pin's own name, or '' (pins::bad_name; empty is the folder's own name).
+function pinBadName(name) {
+  if ([...name].length > 255) return 'A pin’s name can be at most 255 characters.';
+  for (const c of name) {
+    const n = c.codePointAt(0);
+    if (n < 0x20 || (n >= 0x7f && n <= 0x9f)) return 'A pin’s name can’t hold control characters.';
+  }
+  return '';
+}
+
+// Rename…: the pin's own name in the name box that Rename uses; empty (or the folder's own name)
+// is the folder's name again, which then follows the folder's renames. Only the pin changes.
+function renamePin(r) {
+  const folder = pinName({ path: r.path });
+  showModal({
+    title: `Rename the pin ${r.name}`,
+    ok: 'Rename',
+    html: `<p>${esc(`Only the pin’s name changes: the folder on ${r.server} keeps its name.`)}</p>` +
+      '<div class="fo-name"><label for="pin-name">Name</label>' +
+      '<input id="pin-name" type="text" spellcheck="false" autocomplete="off" aria-describedby="pin-why">' +
+      '<div id="pin-why" class="fo-why" role="alert"></div></div>',
+    onOk: () => {
+      const typed = $('#pin-name').value;
+      const name = typed === folder ? '' : typed;
+      if (name === r.own || pinBadName(name)) return;
+      quick.want = null;
+      send({ type: 'pinsRename', server: r.server, path: r.path, name });
+    },
+  });
+  const input = $('#pin-name');
+  input.value = r.name;
+  input.placeholder = folder;
+  input.focus();
+  input.select();
+}
+
+$('#modal-body').addEventListener('input', (ev) => {
+  if (ev.target.id !== 'pin-name') return;
+  const why = pinBadName(ev.target.value);
+  $('#pin-why').textContent = why;
+  $('#modal-ok').disabled = !!why;
+});
+$('#modal-body').addEventListener('keydown', (ev) => {
+  if (ev.target.id !== 'pin-name' || ev.key !== 'Enter') return;
+  ev.preventDefault();
+  if (!$('#modal-ok').disabled) $('#modal-ok').click();
+});
+
+// The pins as the backend has them now: in every init, and after every change ("pins"); its
+// refusal said in the footer, or the change asked for once done.
+function takePins(pins) {
+  quick.pins = pins && typeof pins === 'object' && !Array.isArray(pins) ? pins : {};
+}
+
+function onPins(msg) {
+  takePins(msg.pins);
+  const w = quick.want;
+  if (msg.error) {
+    quick.want = null;
+    opsSay(msg.error, true);
+  } else if (w && w.done()) {
+    quick.want = null;
+    opsSay(w.text, false, '', w.act);
+  }
+  if (quick.follow) {
+    const i = pinRows().findIndex((r) => goneKey(r.server, r.path) === quick.follow);
+    if (i >= 0 && quick.open) quick.sel = i;
+    quick.follow = '';
+  }
+  renderQuick();
+  // The address field's list, untouched (the pins it shows) and nothing highlighted.
+  if (state.addr.editing && state.addr.sel < 0) updateSuggest();
+}
+
+// The button (filled while the open folder is pinned) and the list, when open.
+function renderQuick() {
+  const b = state.browse;
+  const on = !!b.server && !b.under && !b.top && pinIndex(b.server, b.path) >= 0;
+  const btn = $('#pins-btn');
+  btn.classList.toggle('on', on);
+  btn.setAttribute('aria-label', on ? 'Quick access (this folder is pinned)' : 'Quick access');
+  if (quick.open && !quick.drag) renderPinsList();
+}
+
+function renderPinsList() {
+  const groups = pinGroups();
+  const rows = groups.flatMap((g) => g.pins);
+  if (quick.sel >= rows.length) quick.sel = rows.length - 1;
+  const option = (p) => {
+    const k = rows.indexOf(p);
+    const on = k === quick.sel;
+    return `<div class="opt${on ? ' on' : ''}${p.gone ? ' gone' : ''}" role="option" id="pin-o${k}" data-i="${k}" aria-selected="${on}"` +
+      ` aria-label="${esc(`${p.name}, ${p.path}${p.gone ? `, ${p.gone}` : ''}`)}"${k < 9 ? ` aria-keyshortcuts="Alt+${k + 1}"` : ''}` +
+      ` title="${esc(`${p.server}:${p.path}`)}">${FOLDER_ICON}<span class="p-name">${esc(p.name)}</span>` +
+      `<span class="p-path">${esc(p.path)}</span>${p.gone ? `<span class="p-note">${esc(p.gone)}</span>` : ''}` +
+      `${k < 9 ? `<span class="p-key">Alt+${k + 1}</span>` : ''}` +
+      `<button type="button" class="p-del" data-del="${k}" tabindex="-1" title="Unpin from Quick access" aria-hidden="true">×</button></div>`;
+  };
+  const list = $('#pins-list');
+  list.innerHTML = !groups.length
+    ? '<div class="p-empty">Nothing pinned yet. Right-click a folder and choose Pin to Quick access.</div>'
+    : groups.map((g, gi) => `<div role="group" aria-labelledby="pins-g${gi}"><div class="p-head" id="pins-g${gi}">${esc(`Quick access on ${g.server}`)}</div>` +
+      (g.pins.length ? g.pins.map(option).join('')
+        : `<div class="p-empty">${esc(`Nothing pinned on ${g.server} yet. Right-click a folder and choose Pin to Quick access.`)}</div>`) +
+      '</div>').join('');
+  if (quick.sel >= 0) list.setAttribute('aria-activedescendant', `pin-o${quick.sel}`);
+  else list.removeAttribute('aria-activedescendant');
+  // The footer: the open folder, pinned or not (greyed with the reason where none is open).
+  const b = state.browse;
+  const why = pinHereWhy();
+  const pinned = !why && pinIndex(b.server, b.path) >= 0;
+  const here = $('#pins-here');
+  here.disabled = !!why;
+  here.title = why;
+  if (why) here.setAttribute('aria-description', why);
+  else here.removeAttribute('aria-description');
+  here.innerHTML = `<span class="text">${pinned ? 'Unpin this folder' : 'Pin this folder'}</span>` +
+    `${why ? `<span class="note">${esc(why)}</span>` : ''}${pinned ? '' : '<span class="key">Ctrl+D</span>'}`;
+  const on = list.querySelector('.opt.on');
+  if (on) on.scrollIntoView({ block: 'nearest' });
+}
+
+// Opens the list (the focus in it, so its keys work) or closes it. `at`: the row highlighted,
+// 'first' or 'last' (by the keys); none by the mouse until the pointer is on a row.
+function showPins(open, at = '') {
+  quick.open = open;
+  $('#pins').hidden = !open;
+  $('#pins-btn').setAttribute('aria-expanded', String(open));
+  if (!open) {
+    endPinDrag(false);
+    quick.sel = -1;
+    return;
+  }
+  const n = pinRows().length;
+  quick.sel = !n ? -1 : at === 'first' ? 0 : at === 'last' ? n - 1 : -1;
+  renderPinsList();
+  $('#pins-list').focus({ preventScroll: true });
+}
+
+// The list closed; `focusButton`: the keyboard back on the button (Esc, Tab).
+function closePins(focusButton = false) {
+  if (!quick.open) return;
+  showPins(false);
+  if (focusButton) $('#pins-btn').focus();
+}
+
+function setPinSel(i) {
+  quick.sel = i;
+  renderPinsList();
+}
+
+// Dragging a pin within its server's pins: the pointer captured from the press, a drop line
+// between the rows; a press that doesn't move is a click, which opens the pin. Pointer events
+// only: the uploads' drops from Explorer (HTML5 drags, whose dragover the page takes) never meet it.
+const PIN_SLOP = 4; // px a press moves before it drags
+
+function pinDropAt(y) {
+  const d = quick.drag;
+  const list = $('#pins-list');
+  // Near the list's top or bottom edge it scrolls.
+  const lr = list.getBoundingClientRect();
+  if (y < lr.top + 16) list.scrollTop -= 8;
+  else if (y > lr.bottom - 16) list.scrollTop += 8;
+  const rows = pinRows();
+  const els = [...list.querySelectorAll('.opt[data-i]')].filter((el) => {
+    const r = rows[Number(el.dataset.i)];
+    return r && r.server === d.row.server;
+  });
+  if (!els.length) return;
+  const count = pinsOf(d.row.server).length;
+  // The gap before the row whose middle is below the pointer; after the last, the end.
+  let gap = count;
+  let mark = els[els.length - 1].getBoundingClientRect().bottom;
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (y < r.top + r.height / 2) {
+      gap = rows[Number(el.dataset.i)].i;
+      mark = r.top;
+      break;
+    }
+  }
+  d.to = gap > d.row.i ? gap - 1 : gap;
+  const line = $('#pins-drop');
+  line.hidden = d.to === d.row.i;
+  line.style.top = `${mark - $('#pins').getBoundingClientRect().top}px`;
+}
+
+function endPinDrag(drop) {
+  const d = quick.drag;
+  if (!d) return;
+  quick.drag = null;
+  document.documentElement.classList.remove('pins-dragging');
+  $('#pins-drop').hidden = true;
+  if (!drop) {
+    if (quick.open) renderPinsList();
+    return;
+  }
+  if (!d.moved) openPin(d.row.server, d.row.path);
+  else if (d.to !== null && d.to !== d.row.i) movePin(d.row, d.to);
+  else renderPinsList();
+}
+
+{
+  const btn = $('#pins-btn');
+  const box = $('#pins');
+  const list = $('#pins-list');
+  const rowAt = (ev) => {
+    const o = ev.target instanceof Element ? ev.target.closest('#pins-list .opt[data-i]') : null;
+    return o ? Number(o.dataset.i) : -1;
+  };
+  btn.addEventListener('click', () => (quick.open ? closePins(true) : showPins(true)));
+  // On the button: Enter, Space or ↓ open the list on its first row, ↑ on its last.
+  btn.addEventListener('keydown', (ev) => {
+    if (ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    const at = { Enter: 'first', ' ': 'first', ArrowDown: 'first', ArrowUp: 'last' }[ev.key];
+    if (!at) return;
+    ev.preventDefault();
+    showPins(true, at);
+  });
+  box.addEventListener('mousedown', (ev) => ev.preventDefault()); // the list keeps the focus
+  // A click outside closes it (not one in a pin's menu or a dialog the list opened).
+  document.addEventListener('mousedown', (ev) => {
+    if (quick.open && ev.target instanceof Element && !ev.target.closest('#pins, #pins-btn, #menu, #modal')) closePins();
+  });
+  // The keys (PINS.md 3.6): ↑/↓, Home/End, PageUp/PageDown move; Enter opens; Esc (and Tab) close,
+  // the focus back on the button; Del unpins (with Undo), F2 renames, Alt+↑/↓ move the pin; a
+  // letter goes to the next pin whose name starts with it; Shift+F10 or the menu key open its menu.
+  list.addEventListener('keydown', (ev) => {
+    const rows = pinRows();
+    const n = rows.length;
+    const r = rows[quick.sel];
+    const k = ev.key;
+    const page = 10;
+    let to = null;
+    if (ev.altKey && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey && (k === 'ArrowUp' || k === 'ArrowDown')) {
+      if (r) movePin(r, r.i + (k === 'ArrowUp' ? -1 : 1));
+    } else if (ev.altKey || ev.ctrlKey || ev.metaKey) {
+      return; // Alt+1-9, Ctrl+D and the window's keys
+    } else if (k === 'ArrowDown') {
+      to = quick.sel < 0 ? 0 : quick.sel + 1;
+    } else if (k === 'ArrowUp') {
+      to = quick.sel < 0 ? n - 1 : quick.sel - 1;
+    } else if (k === 'PageDown' || k === 'PageUp') {
+      to = Math.max(0, quick.sel) + (k === 'PageDown' ? page : -page);
+    } else if (k === 'Home' || k === 'End') {
+      to = k === 'Home' ? 0 : n - 1;
+    } else if (k === 'Enter') {
+      if (r) openPin(r.server, r.path);
+    } else if (k === 'Escape' || k === 'Tab') {
+      closePins(true);
+    } else if (k === 'Delete') {
+      if (r) unpinFolder(r.server, r.path);
+    } else if (k === 'F2' && !ev.shiftKey) {
+      if (r) renamePin(r);
+    } else if ((k === 'F10' && ev.shiftKey) || k === 'ContextMenu') {
+      const el = r && list.querySelector(`.opt[data-i="${quick.sel}"]`);
+      if (el) {
+        const box2 = el.getBoundingClientRect();
+        showMenu(box2.left + 40, box2.bottom, pinMenu(r), true);
+      }
+    } else if ([...k].length === 1 && k !== ' ' && n) {
+      // The next pin whose name starts with the letter, from the highlighted one on and around.
+      const want = k.toLowerCase();
+      for (let j = 1; j <= n; ++j) {
+        const at = (Math.max(quick.sel, -1) + j + n) % n;
+        if (rows[at].name.toLowerCase().startsWith(want)) {
+          to = at;
+          break;
+        }
+      }
+    } else {
+      return;
+    }
+    ev.preventDefault();
+    ev.stopPropagation(); // not also the window's (Esc stops a search)
+    if (to !== null && n) {
+      $('#pins-here').classList.remove('hot'); // the keys' row is the one shaded
+      setPinSel(Math.max(0, Math.min(n - 1, to)));
+    }
+  });
+  // The footer is shaded while the pointer is on it, until the keys move the highlight: one entry
+  // shaded, as in the menus.
+  $('#pins-here').addEventListener('pointerenter', (ev) => ev.currentTarget.classList.add('hot'));
+  $('#pins-here').addEventListener('pointerleave', (ev) => ev.currentTarget.classList.remove('hot'));
+  // The focus gone elsewhere by the keyboard (Ctrl+F, say), or the window left: the list closes.
+  // Not for a pin's menu or a dialog it opened, nor the button.
+  box.addEventListener('focusout', (ev) => {
+    const to = ev.relatedTarget;
+    if (quick.open && !(to instanceof Element && to.closest('#pins, #pins-btn, #menu, #modal'))) closePins();
+  });
+  window.addEventListener('blur', () => closePins());
+  // The highlighted row follows the pointer (none outside the rows), so one row is shaded at most.
+  list.addEventListener('pointermove', (ev) => {
+    const d = quick.drag;
+    if (d && ev.pointerId === d.pointerId) {
+      if (!d.moved) {
+        if (Math.abs(ev.clientY - d.y0) < PIN_SLOP) return;
+        d.moved = true;
+        document.documentElement.classList.add('pins-dragging');
+      }
+      pinDropAt(ev.clientY);
+      return;
+    }
+    const i = rowAt(ev);
+    if (i !== quick.sel) setPinSel(i);
+  });
+  list.addEventListener('pointerleave', () => {
+    if (!quick.drag && quick.sel >= 0) setPinSel(-1);
+  });
+  list.addEventListener('pointerdown', (ev) => {
+    const i = rowAt(ev);
+    const r = pinRows()[i];
+    if (!r || ev.button !== 0 || quick.drag || ev.target.closest('.p-del')) return;
+    closeMenu();
+    quick.sel = i;
+    quick.drag = { row: r, pointerId: ev.pointerId, y0: ev.clientY, moved: false, to: null };
+    list.setPointerCapture(ev.pointerId);
+  });
+  list.addEventListener('pointerup', (ev) => {
+    if (quick.drag && ev.pointerId === quick.drag.pointerId) endPinDrag(true);
+  });
+  list.addEventListener('pointercancel', (ev) => {
+    if (quick.drag && ev.pointerId === quick.drag.pointerId) endPinDrag(false);
+  });
+  list.addEventListener('lostpointercapture', (ev) => {
+    if (quick.drag && ev.pointerId === quick.drag.pointerId) endPinDrag(false);
+  });
+  // The ×: unpin. A click with no pointer behind it (a screen reader's) opens the row's pin.
+  list.addEventListener('click', (ev) => {
+    const del = ev.target instanceof Element ? ev.target.closest('[data-del]') : null;
+    const rows = pinRows();
+    if (del) {
+      const r = rows[Number(del.dataset.del)];
+      if (r) unpinFolder(r.server, r.path);
+      return;
+    }
+    const r = rows[rowAt(ev)];
+    if (r && ev.detail === 0) openPin(r.server, r.path);
+  });
+  list.addEventListener('contextmenu', (ev) => {
+    ev.preventDefault();
+    const i = rowAt(ev);
+    const r = pinRows()[i];
+    if (!r) return;
+    setPinSel(i);
+    showMenu(ev.clientX, ev.clientY, pinMenu(r));
+  });
+  $('#pins-here').addEventListener('click', () => {
+    const b = state.browse;
+    if (!pinHereWhy() && pinIndex(b.server, b.path) >= 0) unpinFolder(b.server, b.path);
+    else pinHere();
+    list.focus({ preventScroll: true });
+  });
+}
 $('#browse-up').addEventListener('click', browseUp);
 $('#browse-back').addEventListener('click', () => navGo(-1));
 $('#browse-fwd').addEventListener('click', () => navGo(1));
@@ -2067,6 +2748,9 @@ function resultMenu() {
   const opens = one && one.dir;
   const items = [];
   if (opens) items.push({ label: 'Open', key: 'Enter', act: () => openRow(one) });
+  // Quick access (PINS.md): one folder row (a search hit on its own server), pinned or not; not the
+  // login folder '~' of several roots, which has no path.
+  if (opens && one.path) items.push(pinEntry(serverOf(one), one.path));
   const kind = kindOf(one);
   if (kind) items.push({ label: plays(kind) ? 'Play' : 'Preview', key: 'Space', act: () => openFile(one) });
   items.push({ label: picks.length > 1 ? `Download ${picks.length}` : 'Download', key: opens ? '' : 'Enter',
@@ -2131,11 +2815,13 @@ function uploadEntries(server, dir, why, name = '') {
   return [{ label: `Upload files ${where}…`, act: go(false) }, { label: `Upload folder ${where}…`, act: go(true) }];
 }
 
-// The open folder's menu, on the list's empty part: Paste and New folder into it, its uploads, its
-// Properties.
+// The open folder's menu, on the list's empty part: Quick access, Paste and New folder into it,
+// its uploads, its Properties.
 function folderMenu() {
   const b = state.browse;
   const items = [];
+  // Pinned or not; never at a top or in search results, which aren't a folder to pin.
+  if (b.server && !b.under && !b.top) items.push(pinEntry(b.server, b.path, true), '-');
   const readOnly = b.server && !b.under ? readOnlyWhy(b.server) : '';
   if (readOnly) items.push({ heading: readOnly });
   const here = hereWhy();
@@ -2544,6 +3230,7 @@ function onFilesAccount(msg) {
     ops.accounts.set(msg.server, { readOnly: !!msg.readOnly, free: msg.free ?? null, home: msg.home || '',
       copyData: msg.copyData !== false });
   }
+  renderQuick(); // the login folder's real path: a pin spelled another way is the open folder too
 }
 
 // Why nothing may change on `server`, or '': statvfs says its file system is read-only for this
@@ -2718,7 +3405,8 @@ function endRunning(token) {
 // A result or refusal in the footer, for a while (`title`: more on hover). A refusal while a
 // change or look runs (another change asked for meanwhile) shows over its progress for a while;
 // the progress comes back after it (the browse bar's flash hides while the list refreshes).
-function opsSay(text, bad = false, title = '') {
+// `act`: the result's own action beside it while it shows ({ label, run }: Unpin's Undo).
+function opsSay(text, bad = false, title = '', act = null) {
   if (bad && ops.running) {
     ops.refusal = { text, until: Date.now() + OPS_RESULT_MS };
     renderOps();
@@ -2726,7 +3414,7 @@ function opsSay(text, bad = false, title = '') {
     return;
   }
   const ms = bad ? OPS_ERROR_MS : OPS_RESULT_MS;
-  ops.result = { text, bad, title, until: Date.now() + ms };
+  ops.result = { text, bad, title, until: Date.now() + ms, act };
   renderOps();
   setTimeout(renderOps, ms + 50);
 }
@@ -2759,6 +3447,10 @@ function renderOps() {
   el.classList.toggle('bad', (!!res && res.bad) || !!no);
   el.classList.toggle('running', !!r);
   $('#ops-cancel').hidden = !r;
+  const act = res && res.act;
+  $('#ops-act').hidden = !act;
+  $('#ops-sep').hidden = !act;
+  if (act && $('#ops-act').textContent !== act.label) $('#ops-act').textContent = act.label;
   const text = no ? no.text : r ? runningText(r) : res ? res.text : '';
   const shown = bidiVisible(text);
   if ($('#ops-text').textContent !== shown) $('#ops-text').textContent = shown;
@@ -2777,6 +3469,14 @@ $('#ops-cancel').addEventListener('click', () => {
     return;
   }
   send({ type: 'filesCancel', token: r.token });
+});
+// A result's action (Undo): once, while it shows.
+$('#ops-act').addEventListener('click', () => {
+  const res = ops.result;
+  if (!res || !res.act || res.until <= Date.now()) return;
+  ops.result = null;
+  renderOps();
+  res.act.run();
 });
 
 function onFilesDone(msg) {
@@ -3103,7 +3803,9 @@ function deleteRows(picks) {
     return;
   }
   const server = serverOf(picks[0]);
-  const d = { server, picks, counting: picks.some((h) => h.dir), counts: null, progress: null, error: '', token: 0 };
+  // `pins`: Quick access's pins at or below what goes, which go with it (PINS.md decision 6).
+  const d = { server, picks, counting: picks.some((h) => h.dir), counts: null, progress: null, error: '', token: 0,
+    pins: pinsBelow(server, picks.map((h) => h.path)) };
   if (!d.counting) d.counts = { files: picks.length, folders: 0, links: 0, bytes: picks.reduce((n, h) => n + (h.size || 0), 0), unreadableCount: 0 };
   showModal({
     title: picks.length === 1 ? `Delete ${picks[0].name}?` : `Delete ${fmtNum(picks.length)} items?`,
@@ -3142,6 +3844,10 @@ function deleteHtml(d) {
       `<span class="muted">${h.dir ? '' : esc(fmtSize(h.size))}</span></li>`).join('');
   if (d.picks.length > OPS_SHOWN) html += `<li class="muted">…and ${fmtNum(d.picks.length - OPS_SHOWN)} more</li>`;
   html += '</ul>';
+  if (d.pins.length) {
+    html += `<p class="fo-pins">${esc(d.pins.length === 1 ? `${pinName(d.pins[0])} is in Quick access: its pin goes too.`
+      : `${fmtNum(d.pins.length)} of these folders are in Quick access: their pins go too.`)}</p>`;
+  }
   if (d.error) {
     html += `<p class="up-bad">${esc(d.error)}</p>`;
   } else if (d.counting) {
@@ -3178,6 +3884,8 @@ function startDelete(d) {
     afterChange(d.server, msg.ok ? paths : []);
     if (ops.clip && ops.clip.server === d.server && ops.clip.items.some((i) => paths.includes(i.path))) clearClip();
     const r = reportText('delete', msg);
+    // A delete that ran to its end unpinned what it deleted (the backend's "pins" shows it).
+    if (msg.ok && d.pins.length) r.text += `; unpinned ${d.pins.length === 1 ? pinName(d.pins[0]) : counted(d.pins.length, 'folder')}`;
     opsSay(r.text, r.bad, r.title);
   });
   setRunning({ token, op: 'delete', what: `Deleting ${itemsName(d.picks)}`, text: `Deleting ${itemsName(d.picks)}` });
@@ -6290,6 +6998,8 @@ function onInit(msg) {
   state.destinations = { ...msg.destinations, ...state.destinations };
   state.remotes = msg.remotes;
   state.remote = msg.remote;
+  // Quick access's pins, from every init: a Remove or an Add changed them.
+  takePins(msg.pins);
   // Sent again after a server change: each server's account is asked again as Browse opens it,
   // and what Cut or Copy held on a server gone is let go.
   ops.accounts.clear();
@@ -6315,6 +7025,7 @@ function onInit(msg) {
   // them: after adding the first server, it opens (it stayed an empty page until a restart).
   const b = state.browse;
   if (!b.inited || !b.server || !state.remotes.some((r) => r.name === b.server)) enterBrowse();
+  renderQuick();
   renderRows();
   if (msg.configError) {
     showBanner(`${msg.configError}\n\nConfig file: ${msg.configPath}`);
@@ -7108,9 +7819,11 @@ function onSettingsAction(act, name) {
   }
   if (act === 'default') return send({ type: 'serverDefault', name });
   if (act === 'remove') {
+    // Its pins in Quick access go too (PINS.md 3.4).
+    const pinned = pinsOf(name).length > 0;
     showModal({
       title: `Remove ${name}?`,
-      html: '<p>grab forgets this server: its section in grab.conf, its saved password, its file list and ' +
+      html: `<p>grab forgets this server: its section in grab.conf, its saved password, its file list${pinned ? ', its pinned folders' : ''} and ` +
         'what grab learned about it are deleted, and its host keys too unless another server uses that address. ' +
         'Files you already downloaded stay where they are, and rclone.conf isn\'t changed.</p>',
       ok: 'Remove',
@@ -7135,6 +7848,7 @@ if (webview) {
       case 'filesAccount': onFilesAccount(msg); break;
       case 'filesDone': onFilesDone(msg); break;
       case 'filesProgress': onFilesProgress(msg); break;
+      case 'pins': onPins(msg); break;
       case 'theme': setTheme(msg.mode, false); break;
       case 'activity': onActivity(msg); break;
       case 'suggestions': onSuggestions(msg); break;
@@ -7812,6 +8526,15 @@ document.addEventListener('keydown', (ev) => {
     // To the address bar, as in Explorer.
     ev.preventDefault();
     startEdit();
+  } else if (ev.ctrlKey && !ev.altKey && !ev.shiftKey && !ev.metaKey && (ev.key === 'd' || ev.key === 'D')) {
+    // Quick access (PINS.md 3.6): pins the open folder, never unpins (as a browser's bookmark key).
+    ev.preventDefault();
+    if (!viewer.open) pinHere();
+  } else if (ev.altKey && !ev.ctrlKey && !ev.shiftKey && !ev.metaKey && pinDigit(ev)) {
+    // Alt+1 to Alt+9: the first nine pins as the list shows them. Not AltGr (Ctrl+Alt), which
+    // types characters with digits on some layouts.
+    ev.preventDefault();
+    if (!viewer.open) openNthPin(pinDigit(ev));
   } else if ((ev.altKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight')) ||
     ev.key === 'BrowserBack' || ev.key === 'BrowserForward') {
     ev.preventDefault();

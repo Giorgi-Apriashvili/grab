@@ -15,8 +15,12 @@ confirm dialog's states), drops from Explorer (no drag ever left to the browser;
 Browse, the folder row it targets, the refusals and where to drop instead; the overlay going with
 a drop, the drag leaving or cancelled, Escape and dragovers stopping; a drop's Files posted beside
 uploadDrop, never a file WebView2 couldn't get; 2,000 files at once; the page opened again by the
-window), Settings → Appearance (its radio group's keys and ARIA, setTheme, the backend's word), and
-timing budgets for 10,000 and 177,191 files. It stubs what the host would send and records what the page sends back.
+window), Settings → Appearance (its radio group's keys and ARIA, setTheme, the backend's word),
+Browse's changes on a server, Quick access's pinned folders (the button and its list per server and
+under All servers, its keys and ARIA, Pin and Unpin in every menu, Ctrl+D and Alt+1-9, Undo,
+Rename, reordering by keys and by a drag kept apart from Explorer's drops, the pins in the address
+field's list, a pin that didn't open with Unpin, the Delete and Remove dialogs' words, 100 pins),
+the address field's error shown while it is open, and timing budgets for 10,000 and 177,191 files. It stubs what the host would send and records what the page sends back.
 
 `run_page_test.ps1` copies the page into a scratch folder with `test.js` loaded after `app.js`
 (and the Content-Security-Policy meta removed: its `script-src 'self'` does not cover a `file://`
