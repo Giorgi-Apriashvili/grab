@@ -30,7 +30,9 @@ connections, building and releasing) is in the full documentation,
   connection and keeps the connections open between files, searches and downloads. Logging in
   never prompts: grab uses the keys in ssh-agent, or the password or key passphrase from its
   encrypted store. A server's host key is pinned when you add it. It connects to the server
-  directly: SOCKS and HTTP proxies and jump hosts aren't supported yet.
+  directly, or through the SOCKS5 or HTTP proxy you set for it (Tor, `ssh -D`, a company
+  proxy), which looks up the server's name; grab never goes around it. Jump hosts aren't
+  supported yet.
 - **Several connections, resumable.** A file comes in byte ranges over the server's connection
   budget (14 on Hetzner Storage Boxes, 12 elsewhere) into `<name>.grabpart`, renamed when
   complete. A folder is listed once; its files of 2 MiB and more come the same way, smaller ones

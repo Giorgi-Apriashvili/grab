@@ -15,6 +15,7 @@ This is grab's full documentation; [README.md](../README.md) is the short introd
   - [Changing files on the server](#changing-files-on-the-server)
 - [Configure](#configure)
   - [Servers](#servers)
+    - [Through a proxy](#through-a-proxy)
     - [Coming from an earlier grab](#coming-from-an-earlier-grab)
     - [Going back to 0.20](#going-back-to-020)
     - [Going back to 0.19](#going-back-to-019)
@@ -58,9 +59,12 @@ grab -f releases E:\Backup
 All of it goes through grab's own SSH client (libssh2 and OpenSSL, built in), which logs in once
 per connection and keeps the connections open between files, searches and downloads. Logging in
 never prompts: grab uses the keys in ssh-agent, or the password or key passphrase from its
-encrypted store (see [Servers](#servers)). It connects to each server directly: SOCKS and HTTP
-proxies and jump hosts (ProxyJump, ProxyCommand) aren't supported yet, and a server set up to use
-one isn't connected to at all (see [Servers grab won't connect to](#servers-grab-wont-connect-to)).
+encrypted store (see [Servers](#servers)). It connects to each server directly, or through the
+SOCKS5 or HTTP proxy set for that server, and never around it (see
+[Through a proxy](#through-a-proxy)). Jump hosts (ProxyJump, ProxyCommand) and ssh commands aren't
+supported yet; a server whose settings send it through an ssh command, or set a proxy where grab
+doesn't take one (an rclone flag or variable), isn't connected to at all (see
+[Servers grab won't connect to](#servers-grab-wont-connect-to)).
 
 grab 0.19 and before ran [rclone](https://rclone.org) and ssh.exe for all of this; 0.20 kept
 rclone as a fallback, and 0.21 has neither. Measured on a Storage Box sub-account: a 3.6 MiB file
@@ -819,13 +823,15 @@ them.
     check's switch and "Check now".
 - **Settings** (the gear, or Ctrl+,) manages servers like `grab server` does: add, edit,
   test, trust, make default and remove. Each server's search folders and depth are edited
-  there too. Adding a server, or changing its address, shows the host key fingerprints
+  there too, and its proxy: the Connect row (Directly, SOCKS5 proxy or HTTP proxy, see
+  [Through a proxy](#through-a-proxy)). Adding a server, or changing its address, shows the host key fingerprints
   and writes nothing until you trust them. A saved password stays with the user, host and port
   it was typed for: changing any of them asks for it again. A server without connection details
   (one grab couldn't import, see [Servers](#servers)) opens with Edit to fill them in. "Open
   grab.conf" covers the rarer settings: `bind`, `connect_timeout` and `io_timeout` (see
   [Connections](#connections)) and the find method. A server grab won't connect to says "Not
   usable" and why on its card (see [Servers grab won't connect to](#servers-grab-wont-connect-to)),
+  a server with a proxy says which ("· through the SOCKS5 proxy 127.0.0.1:9050"),
   and the settings' one-time notes (see [Notes about settings](#notes-about-settings)) show once
   in the notice above the search.
   - **Appearance:** Auto (follow Windows), Light or Dark; Auto by default. A choice applies at
@@ -1040,12 +1046,16 @@ auth = password
   switch it to a key file or ssh-agent.
 
 How every connection to it is made (`bind`, `connect_timeout`, `io_timeout`, `max_connections`)
-is in [Connections](#connections); which servers grab doesn't connect to, and why, in
+is in [Connections](#connections); a proxy it goes through (`proxy`) in
+[Through a proxy](#through-a-proxy); which servers grab doesn't connect to, and why, in
 [Servers grab won't connect to](#servers-grab-wont-connect-to).
 
 `grab server add` asks for:
 - the server's host, port and user
 - how to log in: a password, a key file (with an optional passphrase), or ssh-agent
+- how to connect: directly, or through a SOCKS5 or HTTP proxy, with its host and port, a user
+  name if it wants one, and that user's password through the same hidden prompt (see
+  [Through a proxy](#through-a-proxy))
 - which folders to search
 
 Then it:
@@ -1073,8 +1083,9 @@ checksum commands). A section without connection details is filled in the same w
 
 `grab server list` shows each server's login (`password saved` or `no password saved`, a key
 file's `passphrase saved`), how it is searched (`search with find or by listing folders`),
-`host key pinned` or `host key not trusted (grab server trust NAME)`, and the connection keys
-that are set (`bind 10.0.0.2`). A server grab won't connect to gets a second line saying why
+`host key pinned` or `host key not trusted (grab server trust NAME)`, the connection keys
+that are set (`bind 10.0.0.2`), and a proxy it goes through (`through the SOCKS5 proxy
+127.0.0.1:9050 (in grab.conf)`). A server grab won't connect to gets a second line saying why
 (see [Servers grab won't connect to](#servers-grab-wont-connect-to)).
 `grab server test NAME` prints what Test in Settings shows, and repeats the server's
 [notes about settings](#notes-about-settings):
@@ -1084,8 +1095,9 @@ Testing box (u123456@u123456.your-storagebox.de:23) ...
   grab: OK, home folder listed, searches by listing folders (a Storage Box has no find, so grab doesn't ask), checksums: md5sum
 ```
 
-A server grab won't connect to shows `not usable: ...` with the reason instead, and nothing is
-tried.
+A server with a proxy says so on the first line (`Testing box (u123456@u123456.your-storagebox.de:23)
+through the SOCKS5 proxy 127.0.0.1:9050 ...`). A server grab won't connect to shows
+`not usable: ...` with the reason instead, and nothing is tried.
 
 Passwords and passphrases are never shown and never put on a command line.
 - grab keeps them in its own store, `passwords` in `%APPDATA%\grab` (a configuration elsewhere
@@ -1100,12 +1112,14 @@ Passwords and passphrases are never shown and never put on a command line.
   in an environment another program sees.
 - If the store can't be read (another Windows account, a damaged file, or a Windows password an
   admin reset), downloads, searches, lists, previews, Play and Verify stop for every server of
-  that configuration and say why: the store may also hold a server's rclone settings (a proxy,
-  an ssh command, see [Coming from an earlier grab](#coming-from-an-earlier-grab)), which a
+  that configuration and say why: the store may also hold a server's proxy (a proxy's password,
+  the copy kept for older grabs, see [Through a proxy](#through-a-proxy)) or its rclone settings
+  (an ssh command, see [Coming from an earlier grab](#coming-from-an-earlier-grab)), which a
   connection must not go past. Save a server in Settings → Edit (or `grab server edit NAME`):
   for a password server, enter its password again; one that logs in with ssh-agent or a key
   file needs no change. Saving sets the whole store aside, with any proxy or ssh command a
-  server kept there, which grab can't use anyway: that server then connects directly.
+  server kept there: that server then connects directly, or through the proxy its grab.conf
+  `proxy` line gives it, whose password (if it has a user) is typed again with Edit.
   - That first change keeps the old store as `passwords.unreadable-<date>-<time>` (it may become
     readable again, e.g. once a domain controller is reachable after a reset), starts a new one
     and names the other servers whose passwords need entering again.
@@ -1118,6 +1132,133 @@ the input runs out, the command stops without changing anything.
 Every server is searched with find where it has GNU find (grab checks once a week and remembers
 the answer in `limits.json`; Test checks again), else by listing its folders, whatever its login
 (see [Lookup methods](#lookup-methods)).
+
+#### Through a proxy
+
+A server can be reached through a SOCKS5 or an HTTP proxy: Tor, an `ssh -D` tunnel, or a company
+proxy. Each server has its own; a new server connects directly until you choose one. In Settings →
+Add and Edit it is the **Connect** row: Directly, SOCKS5 proxy or HTTP proxy, then the proxy's host
+and port, a user if the proxy wants a login, and that user's password. `grab server add` and
+`grab server edit` ask the same after the login:
+
+```
+Connect  1) directly  2) through a SOCKS5 proxy  3) through an HTTP proxy [1]: 2
+Proxy host:port: 127.0.0.1:1080
+Proxy user name (Enter if none): alice
+Proxy password (not shown; Enter if none):
+```
+
+grab.conf keeps it as one line in the server's section, without the password:
+
+```ini
+[box]
+host = u123456.your-storagebox.de
+port = 23
+user = u123456
+auth = password
+proxy = socks5://alice@127.0.0.1:1080
+```
+
+- **Two kinds:** SOCKS5, with no login or with a user name and password, and HTTP CONNECT, with
+  no login or a Basic one. A password goes only with a user name.
+- **The forms `proxy =` takes:** `socks5://host:port` or `http://host:port`, with `user@` before
+  the host when the proxy wants a login (`http://alice@proxy.example.com:3128`). The port is
+  always written. An IPv6 proxy goes in brackets (`socks5://[::1]:1080`), and a user name with
+  characters other than letters, digits and `-._~` is percent-encoded (`al%40ice` for al@ice).
+  `socks5h://` is taken too and means the same as `socks5://` (in curl `socks5://` looks the name
+  up itself; in grab it never does). A blank or missing line is directly, unless grab's store
+  keeps a proxy for the server (one from rclone, or the copy for older grabs that Add and Edit
+  write, see below): then it goes through that one, with a note. To stop using a proxy, choose
+  Directly in Edit (or at `grab server edit`'s question). A line grab can't read
+  refuses the server with the reason (`[Box] proxy: give the proxy's port (socks5://host:1080)`;
+  `socks4://` and `https://` say grab can't use those yet); it never connects directly instead.
+- **The proxy looks up the server's name.** grab hands the proxy the name as written
+  (`u123456.your-storagebox.de`, an `.onion` name too) and never looks it up itself: no DNS lookup
+  of the server leaves the PC. A server written as an IP address goes as that address. A proxy
+  that can't take names says so, and grab asks for the server's IP address instead. A host with a
+  zone (`fe80::1%eth0`) can't go through a proxy.
+- **grab never goes around the proxy.** Every connection to the server goes through it:
+  downloads, uploads, searches, lists, Browse, previews, Play, Verify, changes on the server, Test,
+  Trust and the host-key check of Add and Edit. If the proxy is down, turns grab away or can't
+  reach the server, the connection fails with the reason ("can't reach the proxy 127.0.0.1:9050:
+  connection refused (is it running?)", "the proxy turned down the user name and password"); grab
+  never tries directly instead. A proxy that turns the login down, or isn't a proxy of that kind,
+  fails the connection at once, with no retries within that download, search, list or Browse; the
+  next one asks the proxy again. Previews and Play wait for Test, Trust or a save in Settings
+  before they try that server again, as for a wrong server password.
+- **The proxy's password** lives in grab's password store, never in grab.conf: a `proxy` line with
+  a password in it refuses the server ("keep the proxy's password in grab's store, not grab.conf:
+  take it out of the line, then Edit Box and type it there"). It is kept with the proxy's
+  user@host:port, so a hand edit of the proxy's address or user doesn't send it to another proxy.
+  Edit keeps it (a blank field, Enter at the prompt) while the kind, host, port and user stay the
+  same; any change asks for it again, and Directly drops it.
+- **User names and passwords reach the proxy unencrypted:** SOCKS5 and Basic logins send them as
+  they are. Use a proxy login only with a proxy on this PC or on a network you trust. What goes
+  through the proxy is SSH, encrypted end to end as always: the proxy sees which server you
+  connect to, never your server password or your files.
+- **Time:** `connect_timeout` covers the whole way: reaching the proxy, its answer, and its own
+  connection to the server. Through a proxy an unwritten `connect_timeout` is 2 min instead of
+  30 s (a first Tor connection can take a minute); a written one, or `--contimeout`, wins. With
+  `off`, reaching the proxy takes as long as TCP tries, but the proxy's answer (its connection to
+  the server included) still gets `io_timeout`, 30 s by default, so that a silent proxy can't hang
+  grab: shorter than the 2 min, so for Tor leave `connect_timeout` out or write a time. `bind` is
+  the address grab connects to the proxy from.
+- **Host keys stay the server's.** known_hosts holds the server's keys under its own name and
+  port, never the proxy's, and a proxy that answers with a key of its own is refused like any
+  changed key. When Trust, Add or Edit read a key through a proxy that isn't pinned yet, they add:
+  "Read through the SOCKS5 proxy 127.0.0.1:9050. A proxy can show its own key here; if you can,
+  compare these fingerprints with the server's owner." A key pinned before keeps being checked
+  when only the proxy changes.
+- **Where the route shows:** the server's card in Settings and `grab server list` ("through the
+  SOCKS5 proxy alice@127.0.0.1:1080"), Test and `grab server test` ("✓ Connection OK through the
+  SOCKS5 proxy ...", "Testing box (...) through the SOCKS5 proxy ..."), and `-v` ("grab: box
+  through grab's own SSH client, through the SOCKS5 proxy alice@127.0.0.1:1080 (2 min to
+  connect)"). Never a password.
+- **Only grab's own setting counts.** grab doesn't follow Windows' proxy setting (nor its
+  auto-detect or PAC scripts) or the `ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` variables for
+  servers: a server goes through a proxy only where you set one, so nothing reroutes it, or takes
+  its proxy away, behind your back. `RCLONE_SFTP_SOCKS_PROXY` and `RCLONE_SFTP_HTTP_PROXY` stop
+  every server instead (see [Servers grab won't connect to](#servers-grab-wont-connect-to)). There
+  is no `--proxy` on the command line: a server's route is in its settings, for every run.
+- **The update check isn't a server connection:** `grab update` and the window's check run
+  Windows' curl.exe, which follows curl's own variables (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`)
+  and none of the servers' proxies.
+
+Common proxies:
+- **Tor:** the Tor service listens on `127.0.0.1:9050`, Tor Browser on `127.0.0.1:9150` while it
+  is open: `proxy = socks5://127.0.0.1:9050`. A first connection can take a minute, which the
+  2 min to connect allows for.
+- **`ssh -D`:** `ssh -N -D 127.0.0.1:1080 you@gateway` makes a SOCKS5 proxy, with no login, through
+  a machine you can log in to: `proxy = socks5://127.0.0.1:1080`, while that ssh runs. When the
+  server behind it is down or its port closed, ssh just closes the connection, and grab says "the
+  proxy 127.0.0.1:1080 closed the connection before it answered grab's request for ...".
+- **A company proxy:** usually HTTP (`proxy = http://proxy.example.com:3128`, or 8080), with
+  `alice@` when it wants a login. Many let connections through only to port 443: grab then says
+  "the proxy doesn't allow connections to box.example.com:23 (company proxies often allow only port
+  443)". One that wants Windows sign-in (NTLM, Negotiate, Kerberos) needs a helper on this PC that
+  signs in for grab, such as [Px](https://github.com/genotrance/px): point grab at it
+  (`proxy = http://127.0.0.1:3128`, Px's default). grab says so when a proxy offers only that.
+
+**Servers refused since 0.21.** grab 0.21 to 0.25 couldn't use proxies, so they refused a server
+whose rclone settings, kept in grab's store by the import, sent it through one (`rclone.socks_proxy`,
+`rclone.http_proxy`). Such a server works again, through that same proxy, with a note once:
+"[Box] connects through the SOCKS5 proxy grab's store keeps for it (from rclone, or a proxy line
+since removed; shown in Settings; Edit changes it)." Its card and `grab server list` say "kept in
+grab's store"; Edit starts from it, and saving (Enter at `grab server edit`'s question) writes it
+into grab.conf as the `proxy` line. A proxy kept for another login (grab.conf's host, user or port
+changed by hand) keeps the server refused until it is saved with Edit, which offers that proxy; a
+SOCKS and an HTTP one kept together, until Edit is told which one, or Directly (see
+[Servers grab won't connect to](#servers-grab-wont-connect-to)).
+
+**Older grabs.** grab 0.21 to 0.25 don't know the `proxy` line: they ignore it with a note
+("[Box] proxy isn't a grab.conf setting (ignored)"). So that a copy of one of them, installed by
+hand, doesn't connect directly, Add and Edit also keep each server's proxy in grab's store the way
+the rclone import did (its password included, encrypted): 0.21 to 0.25 refuse that server, and
+0.20.1 goes through the same proxy with rclone (a proxy password holding `@` or `:` may not work
+there; it still never connects directly). Directly and Remove take the copy away again. A `proxy`
+line written by hand, or a server whose host, user or port was changed by hand since, has no copy
+for them until it is saved with Edit (no change needed): until then an older grab connects to it
+directly. `grab update` never goes back a version, so only a hand install meets this.
 
 #### Coming from an earlier grab
 
@@ -1137,8 +1278,9 @@ grab, the command or the window, moves each such server into grab.conf, once:
   lines) are left out with a note to use Trust.
 - Other rclone settings stay with the server: harmless ones as `rclone.<key>` lines in
   grab.conf, any that could hold a secret in the password store. grab reads them only for a
-  note on what they did (see [Notes about settings](#notes-about-settings)), and to stay off a
-  server they send through a proxy or an ssh command (see
+  note on what they did (see [Notes about settings](#notes-about-settings)), to go through a
+  SOCKS or HTTP proxy they set (see [Through a proxy](#through-a-proxy)), and to stay off a server
+  they send through an ssh command (see
   [Servers grab won't connect to](#servers-grab-wont-connect-to)).
 - `imported.json` beside the store records what was moved, so each server is moved once: one
   you remove later doesn't come back from the old files.
@@ -1174,8 +1316,11 @@ each with a note once (see [Notes about settings](#notes-about-settings)): `engi
 `rclone =` and `ssh =`, and the rclone settings that changed what rclone did. grab.conf isn't
 rewritten for any of this, so 0.20.1 still runs on it. Some old settings stop a server instead,
 saying why wherever it is used: a bind left in `common_flags`, `folder_flags` or `ssh_options`
-with no `bind` line, and the settings grab's client can't follow (a proxy, an ssh command and
-the others in [Servers grab won't connect to](#servers-grab-wont-connect-to)). On the command
+with no `bind` line, a proxy in `common_flags` or `folder_flags` (`--sftp-socks-proxy`, written
+as `proxy =` instead), and the settings grab's client can't follow (an ssh command and the others
+in [Servers grab won't connect to](#servers-grab-wont-connect-to)). A proxy the import kept in
+grab's store refused its server from 0.21 to 0.25; this grab goes through it again (see
+[Through a proxy](#through-a-proxy)). On the command
 line, `-- --bind X` is now `--bind X` (see [Usage](#usage)), and `--first` with `--all` is
 refused.
 
@@ -1189,7 +1334,12 @@ included, the three `.exe` files together) or its installer, and while you stay 
 its `rclone.exe` says that it is missing. Its notes show once more in 0.20.1, and 0.21's again
 afterwards (each keeps its own in `notices.json`); going forward, 0.21 removes 0.20.1's
 `rclone.exe` again. grab's old rclone.conf and `secrets` don't come back, and 0.20.1 doesn't
-need them for servers already in grab.conf.
+need them for servers already in grab.conf. A server with a proxy goes through the same proxy
+there, with rclone, from the copy grab keeps for older grabs; 0.21 to 0.25 refuse it. That copy
+exists once the server is saved with Add or Edit: a `proxy` line written by hand, or a server
+whose host, user or port was changed by hand since, has none until it is saved with Edit (no
+change needed), and until then 0.20.1 ignores the line and connects directly, as 0.21 to 0.25 do
+(see [Through a proxy](#through-a-proxy)).
 
 #### Going back to 0.19
 
@@ -1273,20 +1423,37 @@ Add one `[section]` per server and choose with `-r NAME`.
 
 #### Servers grab won't connect to
 
-grab connects to each server directly, with its own SSH client. Some settings ask for what it
-can't do, and connecting anyway would go around what you set up (a proxy can be the only way a
-server should see you), so grab doesn't connect to such a server at all: downloads, searches,
-lists, Browse, previews, Play, Verify, Test, Trust and the host-key check of Add and Edit are all
-refused, with the reason. SOCKS and HTTP proxy support and jump hosts may come in a later grab.
-- A SOCKS or HTTP proxy, or an ssh command in place of the SSH client; another SFTP subsystem or
-  server command; a certificate login; insecure ciphers, or cipher, key exchange, MAC or host key
-  lists that share nothing with grab's; one read at a time (`disable_concurrent_reads`) or fstat
-  in place of stat (`use_fstat`). grab looks for them in `rclone.<key>` lines, the rclone
-  settings the import kept in its store, `--sftp-*` flags in `common_flags` and `folder_flags`
-  (0.19's folder downloads ran rclone with them), and `RCLONE_SFTP_*`
-  variables in its environment (`RCLONE_SFTP_SOCKS_PROXY`, `RCLONE_SFTP_HTTP_PROXY`...), which
-  count for every server. Values decide, not names: `subsystem = sftp` or `use_fstat = false` is
-  fine.
+grab connects to each server with its own SSH client, directly or through the proxy set for it
+(see [Through a proxy](#through-a-proxy)). Some settings ask for what it can't do, or set a proxy
+where grab doesn't take one, and connecting anyway would go around what you set up (a proxy can be
+the only way a server should see you), so grab doesn't connect to such a server at all: downloads,
+searches, lists, Browse, previews, Play, Verify, Test, Trust and the host-key check of Add and
+Edit are all refused, with the reason (except Edit's check where Edit is the way out, below).
+Jump hosts may come in a later grab.
+- An ssh command in place of the SSH client; another SFTP subsystem or server command; a
+  certificate login; insecure ciphers, or cipher, key exchange, MAC or host key lists that share
+  nothing with grab's; one read at a time (`disable_concurrent_reads`) or fstat in place of stat
+  (`use_fstat`). grab looks for them in `rclone.<key>` lines, the rclone settings the import kept
+  in its store, `--sftp-*` flags in `common_flags` and `folder_flags` (0.19's folder downloads ran
+  rclone with them), and `RCLONE_SFTP_*` variables in its environment (`RCLONE_SFTP_SUBSYSTEM`,
+  `RCLONE_SFTP_USE_INSECURE_CIPHER`...), which count for every server. Values decide, not names:
+  `subsystem = sftp` or `use_fstat = false` is fine.
+- A SOCKS or HTTP proxy where grab doesn't take one: `--sftp-socks-proxy` or `--sftp-http-proxy`
+  in `common_flags` or `folder_flags`, or the `RCLONE_SFTP_SOCKS_PROXY` and
+  `RCLONE_SFTP_HTTP_PROXY` variables (every server). grab takes a proxy only from the server's own
+  setting: write it there (`proxy = socks5://HOST:PORT` or `proxy = http://HOST:PORT`, or the
+  Connect row in Settings) and take
+  the old one out.
+- A proxy grab's store keeps for the server that it won't use: one kept for another login
+  (grab.conf's host, user or port changed by hand), a SOCKS and an HTTP one together, or one grab
+  can't use (an `https://` one). Edit the server: one kept for another login is offered there and
+  Save takes it in; otherwise choose its proxy there, or Directly.
+- A `proxy` line grab can't read (no port, a password in it, `socks4://`, `https://`), or a
+  server host with a zone (`fe80::1%eth0`) together with a proxy.
+
+For a kept proxy grab won't use, or a `proxy` line it can't read, Edit is the way out, so its
+host-key check isn't refused when the Edit chooses the server's route (a proxy, or Directly): it
+goes the way the save will leave the server. Connections and Trust stay refused until that save.
 - A bind left in `common_flags` or `folder_flags` (`--bind`) or `ssh_options` (`-o
   BindAddress=`, `-b`) with no `bind` line: connecting from another address could go around a
   VPN or a firewall rule. Write it as `bind =` in the server's section and take it out of the old
@@ -1295,12 +1462,14 @@ refused, with the reason. SOCKS and HTTP proxy support and jump hosts may come i
   [Servers](#servers)).
 
 `grab server list`, the server's card in Settings, Test and `-v` say why every time, and a note
-says it once: "[Box] connects through a SOCKS proxy (rclone.socks_proxy), which grab can't, so it
-doesn't connect to Box rather than go around it: delete the rclone.socks_proxy line in [Box]
-(grab config)". Each reason names the setting, never its value, and how to clear it: delete the
-grab.conf line, take the flag out of `common_flags` or `folder_flags`, write `bind =`, clear the variable (for grab
-alone: `set RCLONE_SFTP_SOCKS_PROXY=` in that terminal before starting grab), or, for a setting
-the import kept in grab's store, remove the server and add it again.
+says it once: "[Main] has a SOCKS proxy where grab doesn't read one (common_flags'
+--sftp-socks-proxy), so grab doesn't connect to Main rather than go around it: write `proxy =
+socks5://HOST:PORT` in [Main] and take --sftp-socks-proxy out of common_flags (grab config)".
+Each reason names the setting, never its value, and how to clear it: delete the grab.conf line,
+take the flag out of `common_flags` or `folder_flags`, write `bind =` or `proxy =`, clear the
+variable (for grab alone: `set RCLONE_SFTP_SOCKS_PROXY=` in that terminal before starting grab),
+set the server's proxy again with Edit (for a proxy kept in grab's store), or, for another
+setting the import kept in grab's store, remove the server and add it again.
 
 `ssh_options`' ProxyCommand, ProxyJump and `-J` only ever routed ssh.exe's searches, never the
 downloads: grab now connects to such a server directly for searches too, as its downloads always
@@ -1333,6 +1502,10 @@ repeat a server's notes every time. A note comes again when what it says changes
   `set_env`, `set_modtime`): ignored, with what grab does. A cipher, key exchange, MAC or host
   key list that shares something with grab's is ignored too: grab offers its own list.
 - A server grab won't connect to, with the reason.
+- A server that goes through a proxy grab's store keeps for it (refused from 0.21 to 0.25):
+  "[Box] connects through the SOCKS5 proxy grab's store keeps for it (from rclone, or a proxy line
+  since removed; shown in Settings; Edit changes it)." Saving it with Edit writes the proxy into
+  grab.conf, which ends the note (see [Through a proxy](#through-a-proxy)).
 - grab's own old rclone.conf and `secrets` while they stay, with what keeps them (see
   [Coming from an earlier grab](#coming-from-an-earlier-grab)).
 - A key grab.conf doesn't know: "[Main] connect_timout isn't a grab.conf setting (ignored)."
@@ -1351,10 +1524,14 @@ them hides one of these.
 
 - `GRAB_CONFIG`: grab.conf's path, as `--config`.
 - `RCLONE_CONFIG`: the standard rclone.conf that `--init` and the import read, nothing else.
-- `RCLONE_SFTP_*` variables that ask for a proxy or another setting grab can't follow (see
-  [Servers grab won't connect to](#servers-grab-wont-connect-to)) stop every server.
-  `RCLONE_SFTP_SSH`, `_PUBKEY` and `_PUBKEY_FILE` never reached grab 0.20's rclone and don't
-  count.
+- `RCLONE_SFTP_*` variables that ask for a proxy (`RCLONE_SFTP_SOCKS_PROXY`,
+  `RCLONE_SFTP_HTTP_PROXY`) or another setting grab can't follow (see
+  [Servers grab won't connect to](#servers-grab-wont-connect-to)) stop every server: grab takes a
+  proxy only from a server's own `proxy` setting. `RCLONE_SFTP_SSH`, `_PUBKEY` and `_PUBKEY_FILE`
+  never reached grab 0.20's rclone and don't count.
+- `ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`, like Windows' proxy setting, are never
+  followed for servers (see [Through a proxy](#through-a-proxy)); the curl.exe that `grab update`
+  runs follows curl's own (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`).
 - grab-gui drops any `RCLONE_CONFIG_*` variable it inherited when it starts (a 0.19 window kept
   every server's secrets there); the media player Play starts gets no `RCLONE_*` variable at all.
 
@@ -1779,13 +1956,15 @@ sub-account's list in 3.5 s where rclone took 9.6 s.)
 ## Connections
 
 Per server in grab.conf (Open grab.conf in Settings, or `grab config`). The window has no fields
-for `bind` and the times; its server card and `grab server list` show the ones that are set.
+for `bind` and the times; its server card and `grab server list` show the ones that are set. A
+proxy has its own row in Settings → Edit, Connect.
 
 | key               | default | what |
 |-------------------|---------|------|
 | `max_connections` | blank = automatic: 14 on Storage Boxes, 12 elsewhere | how many connections downloads (and walks) may hold to the server at once, all downloads together; 1–64. Also in Settings → Edit. Automatic is lowered when the server refuses connections and raised again by clean downloads |
-| `bind`            | blank = any | the local address to connect from (one of this PC's addresses, to pick a network) |
-| `connect_timeout` | `30s`; `off` = as long as TCP tries | how long a new connection may take to reach the server |
+| `proxy`           | blank = directly, unless grab's store keeps a proxy for the server (Directly in Edit drops it) | `socks5://[user@]host:port` or `http://[user@]host:port`: every connection to the server goes through that proxy, never around it (see [Through a proxy](#through-a-proxy)) |
+| `bind`            | blank = any | the local address to connect from (one of this PC's addresses, to pick a network); with a proxy, the address grab reaches the proxy from |
+| `connect_timeout` | `30s`, `2m` through a proxy; `off` = as long as TCP tries (a proxy's answer still gets `io_timeout`) | how long a new connection may take to reach the server (through a proxy: the proxy, its answer and its connection to the server together) |
 | `io_timeout`      | `30s`; `1s` to `24h` | the longest single wait after that: the handshake, the login, each read or listing. A download's piece that waits longer fails and is tried again |
 
 Times are written as `30s`, `1m30s`, `500ms` or `2h`. A bad value stops grab before it does
@@ -1834,11 +2013,13 @@ src/servers.*   host keys, conf edits
 src/engine.*    a server's context, its connection settings, searches
 src/server_ops.* add/edit/trust/remove/test src/update.*   `grab update`, the window's check
 src/server_cli.cpp `grab server ...`: the questions, list and test lines
+src/server_prompt.* the proxy questions of `grab server add` and `edit`
 src/server_conf.* a server's grab.conf keys (host, port, user, auth...) and the checks they pass
 src/passwords.* grab's password store: DPAPI, each value bound to its user@host:port
 src/rclone_conf.* rclone.conf read as rclone reads it (for the import only)
 src/rclone_import.* the one-time move of 0.19's servers from rclone.conf into grab.conf; deleting grab's old files
-src/guard.*     settings grab's own client can't serve (a proxy, an ssh command...): refused, and why
+src/guard.*     settings grab's own client can't serve (an ssh command, a proxy where grab doesn't take one...): refused, and why; which proxy a server goes through
+src/proxy.*     proxies: the `proxy` line's forms, rclone's, and the SOCKS5 and HTTP CONNECT handshakes
 src/notices.*   the one-time notes about settings (notices.json)
 src/fetch.*     resumable ranged downloads  src/conn_budget.* per-server connection sharing
 src/folder.*    a folder's listed files, their states, which files the tree shows

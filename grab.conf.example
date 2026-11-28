@@ -55,9 +55,19 @@ max_connections =
 # Skip dot-directories such as .cache and .config while searching.
 skip_hidden = true
 # How every connection to this server is made: the local address to connect from (blank =
-# any), the time to reach the server (blank = 30s; off = as long as TCP tries) and the longest
-# wait for it after that (blank = 30s; 1s to 24h). A run's --bind, --contimeout and --timeout
-# win over them.
+# any), the time to reach the server (blank = 30s, 2m through a proxy; off = as long as TCP
+# tries, though a proxy's answer still gets io_timeout) and the longest wait for it after that
+# (blank = 30s; 1s to 24h). A run's --bind, --contimeout and --timeout win over them.
 # bind = 192.0.2.10
 # connect_timeout = 30s
 # io_timeout = 30s
+# A proxy every connection to this server goes through: socks5://host:port (socks5h:// means
+# the same) or http://host:port (HTTP CONNECT), with user@ before the host when it wants a
+# login. Blank = directly, unless grab's store keeps a proxy for the server (from rclone, or
+# the copy for older grabs): choose Directly in Edit to stop using it. The proxy's password is
+# never written here: grab keeps it in its store (`grab server edit hetzner`, or Edit in grab's
+# Settings). The proxy looks up the server's name, and grab never goes around it: if the proxy
+# fails, so does the connection. Tor is 127.0.0.1:9050 (Tor Browser 9150), `ssh -D` often
+# 1080, Squid 3128.
+# proxy = socks5://127.0.0.1:9050
+# proxy = http://alice@proxy.example.com:3128

@@ -597,7 +597,8 @@ TEST_CASE("example config parses and matches the defaults") {
     CHECK(cfg.remotes[0].find == FindMethod::auto_detect);
     CHECK(cfg.unknown_keys.empty());
     const std::string_view text = example_config;
-    for (const char* line : {"\n# bind = ", "\n# connect_timeout = 30s\n", "\n# io_timeout = 30s\n", "\nfind = auto\n"}) {
+    for (const char* line : {"\n# bind = ", "\n# connect_timeout = 30s\n", "\n# io_timeout = 30s\n",
+                             "\n# proxy = socks5://127.0.0.1:9050\n", "\nfind = auto\n"}) {
         CHECK_MESSAGE(text.find(line) != std::string_view::npos, line);
     }
     for (const char* key : {"\ncommon_flags", "\nfolder_flags", "\nfile_flags", "\nssh_options", "engine", "\nrclone =",
