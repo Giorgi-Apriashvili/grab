@@ -5,6 +5,7 @@
 #include "listing.hpp"
 #include "match.hpp"
 #include "passwords.hpp"
+#include "proxy.hpp"
 #include "rclone_encoding.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
@@ -41,7 +42,9 @@ Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Co
 
     // The guard (phase 8 step 4): the store's rclone extras for this very login, as the import
     // kept them. A store that exists but can't be read may hold a proxy or an ssh command: the
-    // guard then counts the server as routed rather than connect past one.
+    // guard then counts the server as routed rather than connect past one. A proxy it keeps that
+    // grab won't use (saved for another login, two of them) refuses the server too (PROXIES.md
+    // 3.3); one it uses is ssh_target's.
     std::vector<std::pair<std::string, std::string>> extras;
     const auto store = passwords::load(ctx.passwords);
     if (store) {
@@ -50,7 +53,13 @@ Context make_context(GrabConfig config, RemoteSettings settings, server_conf::Co
     }
     auto sources = guard::sources(ctx.settings, ctx.connection, std::move(extras));
     ctx.guard = guard::evaluate(sources);
-    if (!store) guard::add_unreadable_store(ctx.guard);
+    if (!store) {
+        guard::add_unreadable_store(ctx.guard);
+    } else if (auto route = guard::route(*store, ctx.settings.name, ctx.connection); !route) {
+        guard::add_route_problem(ctx.guard, route.error());
+    } else {
+        std::ranges::fill(route->proxy.password, '\0');
+    }
     for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
     return ctx;
 }
@@ -114,8 +123,9 @@ namespace {
 
 // grab's store of the context's server, when it has one that can be read. One that can't is an
 // error for a server that can't log in without it, with what to do about it: a change through Edit
-// sets the unreadable file aside (passwords::load_for_change) and starts a new one. (The guard
-// refuses every server of a store that can't be read before this: guard::add_unreadable_store.)
+// sets the unreadable file aside (passwords::load_for_change) and starts a new one; for any other
+// server the guard's refusal. (The guard refuses every server of a store that can't be read before
+// this: guard::add_unreadable_store.)
 std::expected<passwords::Store, std::string> server_secrets(const Context& ctx) {
     if (ctx.passwords.empty()) return passwords::Store{};
     auto store = passwords::load(ctx.passwords);
@@ -132,7 +142,12 @@ std::expected<passwords::Store, std::string> server_secrets(const Context& ctx) 
                            store.error(), server, edit);
     default: break;
     }
-    return passwords::Store{};
+    // Never an empty store in its place: it may keep the server's proxy (PROXIES.md 3.3), and
+    // without it the server would connect directly. make_context read it, so it failed since
+    // (DPAPI for a moment, a write under way): refused as the guard refuses an unreadable store.
+    guard::Settings unreadable;
+    guard::add_unreadable_store(unreadable);
+    return util::fail(guard::text(server, guard::reasons(unreadable)));
 }
 
 // "[Main] common_flags' --bind 10.0.0.2 isn't read any more: ...": `old` with no `bind` key.
@@ -196,10 +211,18 @@ std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, const Con
         target->bind_from = reach->bind_from;
     }
     if (reach->connect_timeout) target->connect_timeout = *reach->connect_timeout;
+    else if (target->proxy.kind != proxy::Kind::none) target->connect_timeout = proxy_connect_timeout;
     // io_timeout and --timeout are 1 s to 24 h (grab.conf's load, parse_args): never off, so
     // a stalled READ can't wait for ever (sftp::Client::pump doesn't look at the stop token).
     if (reach->io_timeout) target->timeout = *reach->io_timeout;
     return target;
+}
+
+std::string route_text(const ssh::Target& target) {
+    if (target.proxy.kind == proxy::Kind::none) return {};
+    const auto limit = target.connect_timeout;
+    const std::string time = limit.count() > 0 ? proxy::say_time(limit) + " to connect" : "no time limit to connect";
+    return std::format(", through {} ({})", proxy::said(target.proxy), time);
 }
 
 namespace {

@@ -152,7 +152,10 @@ std::optional<std::string> value_for(const Store& store, std::string_view server
 }
 
 std::string why_none(const Store& store, std::string_view server, std::string_view key, const Binding& login) {
-    const std::string_view what = key == password ? "password" : key == passphrase ? "key passphrase" : key;
+    const std::string_view what = key == password         ? "password"
+                                  : key == passphrase     ? "key passphrase"
+                                  : key == proxy_password ? "proxy password"
+                                                          : key;
     if (const auto* secret = find(store, server, key); secret != nullptr && secret->binding != login) {
         return std::format("the saved {} is for {}, not {}: enter it again with Edit", what, secret->binding.text(),
                            login.text());

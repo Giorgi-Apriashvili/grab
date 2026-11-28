@@ -90,12 +90,21 @@ struct ConnectSettings {
 [[nodiscard]] std::expected<ConnectSettings, std::string> connect_settings(const RemoteSettings& settings,
                                                                            const ConnectOptions& given = {});
 
+// The time to connect through a proxy when neither grab.conf's connect_timeout nor the command's
+// --contimeout says one (PROXIES.md 2, "Time"): Tor's own SocksTimeout, as a first Tor circuit can
+// take a minute; it covers reaching the proxy, its handshake and its own connection to the server.
+inline constexpr std::chrono::milliseconds proxy_connect_timeout{120'000};
+
 // How grab's own SSH client logs in to the context's server: its grab.conf section, with the
-// secrets grab's store keeps for exactly that login (ssh::target_for), once nothing keeps grab off
-// it (grab_blockers; the error names the setting and how to clear it, guard::text), its
-// connection settings are usable (connect_settings, with the command's own `given`) and
+// secrets grab's store keeps for exactly that login and its proxy (ssh::target_for, guard::route),
+// once nothing keeps grab off it (grab_blockers; the error names the setting and how to clear it,
+// guard::text), its connection settings are usable (connect_settings, with the command's own
+// `given`; through a proxy proxy_connect_timeout when neither sets connect_timeout) and
 // check_pinned passes.
 [[nodiscard]] std::expected<ssh::Target, std::string> ssh_target(const Context& ctx, const ConnectOptions& given = {});
+// The route of `target` for -v, after "Box through grab's own SSH client": "" directly, else
+// ", through the SOCKS5 proxy alice@127.0.0.1:9050 (2 min to connect)", never the password.
+[[nodiscard]] std::string route_text(const ssh::Target& target);
 
 // A search, list or Browse through grab's own SSH client: find over an exec channel where the
 // server's check says it works, else the SFTP walk (RCLONE-REPLACEMENT.md, phase 4).

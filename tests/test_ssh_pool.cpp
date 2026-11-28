@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include "conn_budget.hpp"
+#include "proxy.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
@@ -13,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -25,6 +27,8 @@ namespace {
 struct Logins {
     std::atomic<int> made{0}, now{0}, most_at_once{0}, alive{0};
     std::atomic<int> refuse_first{0};
+    // A refusal through a proxy (PROXIES.md 3.4), and the kind it is when nothing else is open.
+    std::optional<budget::Failure> proxied;
     bool fatal = false;
     std::chrono::milliseconds takes{0};
 
@@ -47,7 +51,11 @@ struct Logins {
             }
             std::this_thread::sleep_for(takes);
             --now;
-            if (refuse_first-- > 0) throw ssh::Error(budget::Failure::refused, "Failed getting banner");
+            if (refuse_first-- > 0) {
+                throw ssh::Error(budget::Failure::refused,
+                                 proxied ? "the proxy 127.0.0.1:1080 closed the connection before it answered" : "Failed getting banner",
+                                 proxied);
+            }
             if (fatal) throw ssh::Error(budget::Failure::fatal, "the password was refused");
             return std::make_unique<Fake>(*this, id);
         };
@@ -148,6 +156,145 @@ TEST_CASE("ssh pool: a turned-away login is tried again; a refused one isn't") {
         ssh::Pool pool(logins.connect(), options(2));
         CHECK_THROWS_AS((void)pool.acquire(), ssh::Error);
         CHECK(logins.made == 1);
+    }
+}
+
+TEST_CASE("ssh pool: through a proxy a refusal is a cap only while another connection is open (PROXIES.md 3.4)") {
+    using budget::Failure;
+    const auto kind_of = [](ssh::Pool& pool) -> std::optional<Failure> {
+        try {
+            (void)pool.acquire();
+        } catch (const ssh::Error& e) {
+            return e.kind;
+        }
+        return std::nullopt;
+    };
+    for (const Failure alone : {Failure::other, Failure::fatal}) {
+        CAPTURE(static_cast<int>(alone));
+        // Nothing else open: what it is alone, at once (ssh -D closes without a word for a server
+        // that is down), neither retried nor a limit to learn.
+        Logins logins;
+        logins.proxied = alone;
+        logins.refuse_first = 100;
+        ssh::Pool pool(logins.connect(), options(4));
+        CHECK(kind_of(pool) == alone);
+        CHECK(logins.made == 1);
+        // An idle connection is one open beside it (it holds the proxy's place between two files
+        // of a download): a cap, retried and then a refusal.
+        logins.refuse_first = 0;
+        REQUIRE(pool.acquire()); // given back at once
+        CHECK(pool.idle() == 1);
+        logins.refuse_first = 100;
+        try {
+            (void)pool.acquire_new();
+            FAIL("no error");
+        } catch (const ssh::Error& e) {
+            CHECK(e.kind == Failure::refused);
+            CHECK(std::string_view(e.what()).starts_with("the proxy 127.0.0.1:1080 closed"));
+        }
+        CHECK(logins.made == 6); // first try + 3 retries
+    }
+    // Another one in use: a cap, retried and then a refusal, as the server's own.
+    Logins logins;
+    logins.proxied = Failure::fatal;
+    ssh::Pool pool(logins.connect(), options(4));
+    auto held = pool.acquire();
+    REQUIRE(held);
+    logins.refuse_first = 2;
+    auto second = pool.acquire(); // refused twice, then in
+    REQUIRE(second);
+    CHECK(logins.made == 4);
+    logins.refuse_first = 100;
+    CHECK(kind_of(pool) == Failure::refused);
+    CHECK(logins.made == 8); // first try + 3 retries
+    // With it given back, alone again.
+    held.reset();
+    second.reset();
+    pool.trim_idle(0);
+    CHECK(kind_of(pool) == Failure::fatal);
+    CHECK(logins.made == 9);
+    // A refusal not through a proxy is one, alone or not.
+    Logins plain;
+    plain.refuse_first = 100;
+    ssh::Pool direct(plain.connect(), options(4));
+    CHECK(kind_of(direct) == Failure::refused);
+}
+
+TEST_CASE("ssh pool: through a proxy a refusal beside other logins under way waits for theirs (PROXIES.md 3.4)") {
+    using budget::Failure;
+    // A cold pool's walk and workers log in at once; a proxy that allows one connection turns the
+    // others away before any is in use. One of them working makes it a cap (live 14(a)); all of
+    // them turned away is the proxy's answer alone, for each, without waiting on each other.
+    for (const bool one_works : {true, false}) {
+        CAPTURE(one_works);
+        Logins logins; // for Fake
+        std::atomic<int> made{0};
+        ssh::Pool::Connect connect = [&]() -> std::unique_ptr<ssh::Session> {
+            const int id = ++made;
+            if (id == 1 && one_works) {
+                std::this_thread::sleep_for(150ms); // the one the proxy let through: a slow login
+                return std::make_unique<Logins::Fake>(logins, id);
+            }
+            std::this_thread::sleep_for(id == 1 ? 150ms : 10ms);
+            throw ssh::Error(Failure::refused, "the proxy doesn't allow connections to box.invalid:23", Failure::fatal);
+        };
+        ssh::Pool pool(std::move(connect), options(4));
+        std::atomic<int> got{0}, done{0};
+        std::atomic<bool> release{false};
+        std::array<std::optional<Failure>, 3> kinds{};
+        {
+            std::vector<std::jthread> callers;
+            for (auto& kind : kinds) {
+                callers.emplace_back([&, slot = &kind] {
+                    try {
+                        auto lease = pool.acquire();
+                        if (lease) ++got;
+                        ++done;
+                        while (!release) std::this_thread::sleep_for(5ms); // in use while the others decide
+                    } catch (const ssh::Error& e) {
+                        *slot = e.kind;
+                        ++done;
+                    }
+                });
+            }
+            for (int waited = 0; done < 3 && waited < 1000; ++waited) std::this_thread::sleep_for(5ms);
+            CHECK(done == 3);
+            release = true;
+        }
+        const auto count = [&](Failure kind) { return std::ranges::count(kinds, std::optional(kind)); };
+        if (one_works) {
+            CHECK(got == 1);
+            CHECK(count(Failure::refused) == 2); // a cap: tried again, then a refusal to learn from
+            CHECK(count(Failure::fatal) == 0);
+            CHECK(made == 1 + 2 * 4); // the others: first try + 3 retries each
+        } else {
+            CHECK(got == 0);
+            CHECK(count(Failure::fatal) == 3);
+            CHECK(made == 3); // none tried again
+        }
+    }
+}
+
+TEST_CASE("ssh pools: a server whose proxy changed gets a new pool") {
+    ssh::Pools pools;
+    ssh::Target t;
+    t.user = "u";
+    t.host = "example.invalid";
+    t.proxy = proxy::Proxy{.kind = proxy::Kind::socks5, .host = "127.0.0.1", .port = 9050, .user = {}, .password = {}};
+    CHECK_FALSE(pools.has("srv", t));
+    const auto first = pools.get("srv", t, 2);
+    CHECK(pools.has("srv", t)); // -v's route line said once per command (cli_download)
+    CHECK(pools.get("srv", t, 2) == first);
+    for (auto change : {+[](ssh::Target& x) { x.proxy.port = 9051; }, +[](ssh::Target& x) { x.proxy.user = "alice"; },
+                        +[](ssh::Target& x) { x.proxy.password = "fake-pw"; },
+                        +[](ssh::Target& x) { x.proxy.kind = proxy::Kind::http; },
+                        +[](ssh::Target& x) { x.proxy = proxy::Proxy{}; }}) {
+        auto other = t;
+        change(other);
+        CHECK_FALSE(pools.has("srv", other));
+        const auto pool = pools.get("srv", other, 2);
+        CHECK(pool != first);
+        CHECK(pools.get("srv", t, 2) != pool); // and back again: another one
     }
 }
 

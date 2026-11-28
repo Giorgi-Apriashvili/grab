@@ -10,6 +10,8 @@
 //   user = alice
 //   auth = agent | key | password | stored_key
 //   key_file = C:\Users\a\.ssh\id_ed25519   the key for `key`; beside `agent`, which agent key
+//   proxy = socks5://alice@127.0.0.1:9050   the proxy grab reaches the server through (PROXIES.md;
+//                                 http://host:port too; none: directly); its password is in the store
 //   shell_type, md5sum_command, sha1sum_command, path_override   what Test (or rclone) found there
 //   rclone.<key> = value          a non-secret rclone sftp setting (rclone_key_allowed) the import
 //                                 kept; rclone is gone, so only the guard and the notices read it
@@ -20,6 +22,7 @@
 
 #include "config.hpp"
 #include "ini.hpp"
+#include "proxy.hpp"
 
 #include <array>
 #include <expected>
@@ -47,6 +50,9 @@ struct Connection {
     std::string user;
     Auth auth = Auth::agent;
     std::optional<std::string> key_file;
+    // The `proxy` line (kind none: directly). Never its password: grab.conf doesn't hold it (the
+    // store's proxy_password does, passwords.hpp), and lines() never writes one.
+    proxy::Proxy proxy;
     std::optional<std::string> shell_type;
     std::optional<std::string> md5sum_command;
     std::optional<std::string> sha1sum_command;
@@ -56,8 +62,10 @@ struct Connection {
 };
 
 // The keys above, in the order grab writes them.
-inline constexpr std::array<std::string_view, 9> keys = {
-    "host", "port", "user", "auth", "key_file", "shell_type", "md5sum_command", "sha1sum_command", "path_override"};
+inline constexpr std::array<std::string_view, 10> keys = {"host",       "port",           "user",
+                                                          "auth",       "key_file",       "proxy",
+                                                          "shell_type", "md5sum_command", "sha1sum_command",
+                                                          "path_override"};
 
 // What an rclone setting's key starts with in a grab.conf section.
 inline constexpr std::string_view rclone_prefix = "rclone.";
@@ -88,6 +96,10 @@ inline constexpr std::string_view rclone_prefix = "rclone.";
 [[nodiscard]] std::optional<std::string> check_host(std::string_view host);
 // A user name, not starting with '-' (G5).
 [[nodiscard]] std::optional<std::string> check_user(std::string_view user);
+// A server's proxy as grab.conf can hold it: what proxy::parse reads back from its line
+// (proxy::text), so a form's or a prompt's fields get the line's checks; `server` names the
+// server in the reason ("Edit Box"). Its password isn't looked at: grab.conf never holds it.
+[[nodiscard]] std::optional<std::string> check_proxy(const proxy::Proxy& proxy, std::string_view server);
 [[nodiscard]] std::optional<std::string> check_port(int port);
 // A key file: `exists` says whether there is a file at that path (the caller looks).
 [[nodiscard]] std::optional<std::string> check_key_file(std::string_view path, bool exists);

@@ -9,6 +9,7 @@
 #include "local_name.hpp"
 #include "process.hpp"
 #include "progress_line.hpp"
+#include "proxy.hpp"
 #include "quote.hpp"
 #include "rate.hpp"
 #include "remote.hpp"
@@ -518,8 +519,13 @@ DownloadTally download_with_grab(const engine::Context& ctx, const Options& opts
         tally.failed = paths;
         return tally;
     }
+    // The route once per command: a search or file list before this said it on the pool it made
+    // (main.cpp's grab_side), when it goes through a proxy.
+    const bool said = target->proxy.kind != proxy::Kind::none && pools.has(server, *target);
     s.pool = pools.get(server, *target, budget);
-    if (opts.verbose) std::println(stderr, "grab: {} through grab's own SSH client", server);
+    if (opts.verbose && !said) {
+        std::println(stderr, "grab: {} through grab's own SSH client{}", server, engine::route_text(*target));
+    }
     const std::size_t total = paths.size();
     const auto targets = existing::pick_targets(dest, paths, opts.mode == Mode::folder);
     // A picked file's size and time (nanoseconds), when the pick list had them.

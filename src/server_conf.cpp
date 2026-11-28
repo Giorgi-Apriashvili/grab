@@ -98,6 +98,12 @@ std::expected<std::optional<Connection>, std::string> parse(const ini::Section& 
     if (c.key_file && c.auth != Auth::key && c.auth != Auth::agent) {
         return util::failf("[{}] key_file goes with auth = key or agent, not {}", name, auth_name(c.auth));
     }
+    if (auto line = nonblank(section, "proxy")) {
+        // Refused, never ignored: the server would connect directly past it.
+        auto parsed = proxy::parse(*line, name);
+        if (!parsed) return util::failf("[{}] proxy: {}", name, parsed.error());
+        c.proxy = std::move(*parsed);
+    }
     c.shell_type = nonblank(section, "shell_type");
     c.md5sum_command = nonblank(section, "md5sum_command");
     c.sha1sum_command = nonblank(section, "sha1sum_command");
@@ -124,6 +130,7 @@ std::vector<std::pair<std::string, std::string>> lines(const Connection& c) {
         if (value && !value->empty()) out.emplace_back(key, *value);
     };
     add("key_file", c.key_file);
+    if (c.proxy.kind != proxy::Kind::none) out.emplace_back("proxy", proxy::text(c.proxy)); // never its password
     add("shell_type", c.shell_type);
     add("md5sum_command", c.md5sum_command);
     add("sha1sum_command", c.sha1sum_command);
@@ -190,6 +197,16 @@ std::optional<std::string> check_user(std::string_view user) {
     return std::nullopt;
 }
 
+std::optional<std::string> check_proxy(const proxy::Proxy& p, std::string_view server) {
+    if (p.kind == proxy::Kind::none) return std::nullopt;
+    proxy::Proxy bare = p;
+    bare.password.clear();
+    auto back = proxy::parse(proxy::text(bare), server);
+    if (!back) return back.error();
+    if (*back != bare) return "write the proxy as socks5://host:port or http://host:port";
+    return std::nullopt;
+}
+
 std::optional<std::string> check_port(int port) {
     if (port < 1 || port > 65535) return "the port must be from 1 to 65535";
     return std::nullopt;
@@ -217,6 +234,11 @@ std::vector<std::string> check(std::string_view name, const Connection& c) {
     add("port", check_port(c.port));
     add("user", check_user(c.user));
     if (c.key_file) add("key_file", check_value(*c.key_file));
+    add("proxy", check_proxy(c.proxy, name));
+    // A proxy takes the server's name or address as it is: a zone means nothing to it (3.8).
+    if (c.proxy.kind != proxy::Kind::none && c.host.contains('%')) {
+        out.push_back(std::format("[{}] host {}: an address with a zone can't go through a proxy", name, c.host));
+    }
     add("shell_type", c.shell_type ? check_value(*c.shell_type) : std::nullopt);
     add("md5sum_command", c.md5sum_command ? check_value(*c.md5sum_command) : std::nullopt);
     add("sha1sum_command", c.sha1sum_command ? check_value(*c.sha1sum_command) : std::nullopt);

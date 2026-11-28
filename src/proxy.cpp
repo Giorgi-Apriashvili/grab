@@ -473,6 +473,24 @@ std::string text(const Proxy& proxy) {
     return std::format("{}://{}{}", proxy.kind == Kind::socks5 ? "socks5" : "http", user, address(proxy.host, proxy.port));
 }
 
+std::string rclone_text(const Proxy& proxy) {
+    if (proxy.kind == Kind::none) return {};
+    const std::string at = address(proxy.host, proxy.port);
+    if (proxy.kind == Kind::socks5) {
+        if (proxy.user.empty()) return at;
+        return proxy.password.empty() ? std::format("{}@{}", proxy.user, at)
+                                      : std::format("{}:{}@{}", proxy.user, proxy.password, at);
+    }
+    if (proxy.user.empty()) return "http://" + at;
+    return std::format("http://{}:{}@{}", percent_encode(proxy.user), percent_encode(proxy.password), at);
+}
+
+std::string said(const Proxy& proxy) {
+    if (proxy.kind == Kind::none) return {};
+    const std::string user = proxy.user.empty() ? std::string() : percent_encode(proxy.user) + "@";
+    return std::format("the {} proxy {}{}", kind_name(proxy.kind), user, address(proxy.host, proxy.port));
+}
+
 std::string address(std::string_view host, int port) {
     return host.contains(':') ? std::format("[{}]:{}", host, port) : std::format("{}:{}", host, port);
 }

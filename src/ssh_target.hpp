@@ -22,8 +22,10 @@ namespace grab::ssh {
 // passphrase, or the saved password; a password saved beside a key too, which rclone also tries.
 // Only what `store` keeps for exactly c's user@host:port is used (passwords::value_for): a
 // password saved for another login is refused, so a hand edit of grab.conf's host can't send it
-// elsewhere. An error when its password or key isn't saved for that login, or the key isn't
-// written as rclone reads it.
+// elsewhere. Its proxy as guard::route has it: the `proxy` line with the proxy password saved for
+// that very proxy, else one the store keeps for the login in rclone's form, else none. An error
+// when its password or key isn't saved for that login, the key isn't written as rclone reads it,
+// or the store keeps a proxy grab won't use (guard::text).
 [[nodiscard]] std::expected<Target, std::string> target_for(std::string_view name, const server_conf::Connection& c,
                                                            const passwords::Store& store,
                                                            const std::filesystem::path& known_hosts);

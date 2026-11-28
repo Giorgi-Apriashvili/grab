@@ -18,17 +18,32 @@
 //                             logins at once, then one more, which the proxy turns away
 //   GRAB_TEST_SCAN            also Trust's scan through the proxy (its last handshake fails to
 //                             agree, which fail2ban's aggressive mode counts)
+//   GRAB_TEST_APPDATA, GRAB_TEST_SEED_SERVER   with GRAB_TEST_PROXY_PASSWORD: no connection; that
+//                             server of the isolated settings in GRAB_TEST_APPDATA gets its proxy's
+//                             password saved as an Edit saves it (chunk 1a's command-line checks)
+//   GRAB_TEST_APPDATA, GRAB_TEST_STORE_KEYS   no connection: that store's keys and bindings, never
+//                             a value
 //
 // Logs in through ssh-agent. Writes only /tmp/grab-proxy-<random> on the server, removed at the
 // end. At most 2 logins at once (the cap case: the cap's and one more, at most 3).
 
+#include "config.hpp"
 #include "conn_budget.hpp"
+#include "guard.hpp"
+#include "gui_state.hpp"
 #include "live_tools.hpp"
+#include "passwords.hpp"
 #include "proxy.hpp"
+#include "server_ops.hpp"
 #include "sftp.hpp"
 #include "ssh.hpp"
 #include "util.hpp"
 
+#ifdef _WIN32
+#include "live_settings.hpp"
+#endif
+
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -251,3 +266,54 @@ TEST_CASE("proxy: live, Trust's host-key scan through the proxy (GRAB_TEST_PROXY
         say(std::format("{} {} pinned: {}", k.type, k.fingerprint, yes(known)));
     }
 }
+
+#ifdef _WIN32
+TEST_CASE("proxy: live, a server's proxy password saved as an Edit saves it (GRAB_TEST_APPDATA, GRAB_TEST_SEED_SERVER)") {
+    // For the live checker's isolated settings (PROXIES.md chunk 1a): server GRAB_TEST_SEED_SERVER
+    // of the grab.conf in GRAB_TEST_APPDATA\grab keeps its `proxy` line, and an Edit that types
+    // GRAB_TEST_PROXY_PASSWORD for it (server_ops::update_server) saves that password, bound to
+    // the proxy, and the copy for older grabs. Never run on the user's own settings.
+    const auto appdata = util::getenv_utf8("GRAB_TEST_APPDATA");
+    const auto name = util::getenv_utf8("GRAB_TEST_SEED_SERVER");
+    const auto password = util::getenv_utf8("GRAB_TEST_PROXY_PASSWORD");
+    if (!appdata || !name || !password) {
+        MESSAGE("skipped: GRAB_TEST_APPDATA / GRAB_TEST_SEED_SERVER / GRAB_TEST_PROXY_PASSWORD not set");
+        return;
+    }
+    const test::AppData isolated(util::path_from_utf8(*appdata));
+    const auto env = server_ops::load_env(default_grab_config_path());
+    REQUIRE_MESSAGE(env, env.error_or(""));
+    const auto list = server_ops::list_servers(*env);
+    const auto current = std::ranges::find(list, *name, &server_ops::ServerInfo::name);
+    REQUIRE(current != list.end());
+    REQUIRE_MESSAGE(current->error.empty(), current->error);
+    REQUIRE_MESSAGE(current->proxy_from == guard::ProxyFrom::line, "the server has no proxy line");
+    auto wanted = server_ops::edit_defaults(*current);
+    wanted.proxy = current->proxy;
+    wanted.proxy->password = *password;
+    const auto saved = server_ops::update_server(*env, wanted, std::nullopt, std::nullopt);
+    REQUIRE_MESSAGE(saved, saved.error_or(""));
+    say(std::format("{}: the password of {} saved in {}", *name, proxy::text(current->proxy),
+                    util::path_to_utf8(env->passwords)));
+}
+
+TEST_CASE("proxy: live, what an isolated store keeps, never a value (GRAB_TEST_APPDATA, GRAB_TEST_STORE_KEYS)") {
+    // Each server's keys in grab's store of the settings in GRAB_TEST_APPDATA, with the login each
+    // value is bound to: the proxy password's to its proxy, the copy for older grabs' to the
+    // server's login. Values are never printed.
+    const auto appdata = util::getenv_utf8("GRAB_TEST_APPDATA");
+    if (!appdata || !util::getenv_utf8("GRAB_TEST_STORE_KEYS")) {
+        MESSAGE("skipped: GRAB_TEST_APPDATA / GRAB_TEST_STORE_KEYS not set");
+        return;
+    }
+    const test::AppData isolated(util::path_from_utf8(*appdata));
+    const auto store = passwords::load(passwords::path_in(state_dir(default_grab_config_path())));
+    REQUIRE_MESSAGE(store, store.error_or(""));
+    for (const auto& [server, values] : *store) {
+        for (const auto& [key, secret] : values) {
+            say(std::format("{} {} bound to {}", server, key, secret.binding.text()));
+        }
+    }
+    say(std::format("{} servers in the store", store->size()));
+}
+#endif

@@ -333,7 +333,8 @@ bool not_default(std::string_view value, std::string_view program) {
 } // namespace
 
 std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig& cfg, const Extras& extras,
-                                     const Environment& environment, const Moved& moved, bool store_unreadable) {
+                                     const Environment& environment, const Moved& moved, bool store_unreadable,
+                                     const Routes& routes) {
     std::vector<Notice> out;
     std::vector<std::string> switched; // N0: moved from rclone to grab's own client
     // N10 and N14, about grab itself.
@@ -364,6 +365,8 @@ std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig&
         static const std::vector<std::pair<std::string, std::string>> none;
         const auto found = extras.find(r.name);
         const auto& kept = found != extras.end() ? found->second : none; // a reference, never a copy
+        const auto routed = routes.find(r.name);
+        const StoreRoute route = routed != routes.end() && !store_unreadable ? routed->second : StoreRoute{};
         std::vector<guard::Reason> reasons;
         if (details) {
             auto sources = guard::sources(r, *details, kept);
@@ -372,6 +375,7 @@ std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig&
             // Its copy of the extras (a proxy can hold a password), wiped as make_context does.
             for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
             if (store_unreadable) guard::add_unreadable_store(guarded);
+            if (route.problem) guard::add_route_problem(guarded, *route.problem);
             reasons = guard::reasons(guarded);
         }
         // A bind left in an old key with no `bind` key: every connection refuses the server
@@ -394,6 +398,17 @@ std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig&
         rclone_notices(b, r, details->rclone);
         // Keyed on the text (kind, where), never the value: a proxy can hold a password.
         for (const auto& reason : reasons) b.add("guard", reason.where, guard::text(r.name, std::span(&reason, 1)));
+        // Refused since 0.21 for want of proxies, it works again through the one it had (decision
+        // 4), once said; an Edit moves it into the `proxy` line, which ends this. The same value is
+        // grab's own copy for older grabs (decision 6) when a `proxy` line was deleted by hand, so
+        // the text names both.
+        if (route.kept != proxy::Kind::none && reasons.empty() && !refused_bind) {
+            const bool socks = route.kept == proxy::Kind::socks5;
+            b.add("proxy:kept", socks ? "rclone.socks_proxy in grab's store" : "rclone.http_proxy in grab's store",
+                  std::format("[{}] connects through the {} proxy grab's store keeps for it (from rclone, or a "
+                              "proxy line since removed; shown in Settings; Edit changes it).",
+                              r.name, proxy::kind_name(route.kept)));
+        }
     }
     // N0 first, once per configuration whichever servers it names then (keyed on the default
     // itself, as 0.20 keyed it, so 0.20's users don't see it again): an imported server without an
@@ -428,6 +443,7 @@ std::expected<std::vector<Notice>, std::string> for_config(const std::filesystem
     auto cfg = parse_grab_config(*doc);
     if (!cfg) return util::failf("{}: {}", util::path_to_utf8(grab_conf), cfg.error());
     Extras extras;
+    Routes routes;
     const auto store = passwords::load(passwords::path_in(state_dir(grab_conf)));
     if (store && !store->empty()) {
         for (const auto& r : cfg->remotes) {
@@ -437,6 +453,14 @@ std::expected<std::vector<Notice>, std::string> for_config(const std::filesystem
             if (!c || !*c) continue;
             const passwords::Binding login{.user = (*c)->user, .host = (*c)->host, .port = (*c)->port};
             if (auto kept = guard::store_extras(*store, r.name, login); !kept.empty()) extras[r.name] = std::move(kept);
+            // Its proxy, of which only the kind or the problem is kept.
+            auto route = guard::route(*store, r.name, **c);
+            if (!route) {
+                routes[r.name].problem = std::move(route.error());
+            } else {
+                if (route->from == guard::ProxyFrom::kept) routes[r.name].kept = route->proxy.kind;
+                std::ranges::fill(route->proxy.password, '\0');
+            }
         }
     }
     // The servers that used rclone before the switch: those the import moved.
@@ -449,7 +473,8 @@ std::expected<std::vector<Notice>, std::string> for_config(const std::filesystem
         }
     }
     auto out = settings_notices(
-        *doc, *cfg, extras, [](const std::string& name) { return util::getenv_utf8(name.c_str()); }, moved, !store);
+        *doc, *cfg, extras, [](const std::string& name) { return util::getenv_utf8(name.c_str()); }, moved, !store,
+        routes);
     for (auto& [server, kept] : extras) {
         for (auto& [key, value] : kept) std::ranges::fill(value, '\0');
     }

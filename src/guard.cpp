@@ -1,5 +1,7 @@
 #include "guard.hpp"
 
+#include "passwords.hpp"
+#include "proxy.hpp"
 #include "ssh.hpp"
 #include "util.hpp"
 
@@ -7,6 +9,7 @@
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <expected>
 #include <format>
 
 namespace grab::guard {
@@ -41,6 +44,14 @@ constexpr auto options = std::to_array<Option>({
 // rclone runs (0.20's rclone_flags::kept_variable), as they would have replaced the server's own
 // settings. They never routed a server, so they don't count now either.
 constexpr auto unseen_variables = std::to_array<std::string_view>({"ssh", "pubkey", "pubkey_file"});
+
+// rclone's proxies (PROXIES.md): in grab's store a server's route (route()), anywhere else a
+// reason, as grab reads a proxy only from its own setting.
+constexpr auto proxy_keys = std::to_array<std::string_view>({"socks_proxy", "http_proxy"});
+// The key of two kept proxies' problem.
+constexpr std::string_view both_proxies = "proxies";
+
+bool proxy_reason(const Reason& r) { return std::ranges::contains(proxy_keys, r.key) || r.key == both_proxies; }
 
 const Option* option(std::string_view key) {
     const auto it = std::ranges::find(options, key, &Option::key);
@@ -161,9 +172,36 @@ std::string listed(const std::vector<std::string>& items) {
     return out;
 }
 
+// How to clear a proxy where grab doesn't take one: its own setting instead (PROXIES.md 2, the
+// other old sources), or the server's proxy set again with Edit (a kept one it won't use).
+std::string clear_proxy_text(std::string_view server, const Reason& r) {
+    const std::string line = std::format("`proxy = {}://HOST:PORT` in [{}]", r.key == "http_proxy" ? "http" : "socks5",
+                                         server);
+    switch (r.origin) {
+    case Origin::store:
+        if (r.key == both_proxies) return std::format("Edit {} and choose one of them, or Directly", server);
+        return std::format("Edit {} and set its proxy again, or choose Directly", server);
+    case Origin::line: return std::format("write {} and delete the {} line (grab config)", line, r.setting);
+    case Origin::environment:
+        return std::format("grab doesn't follow proxy variables: set the proxy per server ({}) and clear {} for grab "
+                           "(`set {}=` in that window before starting grab) or for good",
+                           line, r.setting, r.setting);
+    case Origin::common_flags:
+        return std::format("write {} and take {} out of common_flags (grab config)", line, r.setting);
+    case Origin::folder_flags:
+        return std::format("write {} and take {} out of folder_flags (grab config)", line, r.setting);
+    case Origin::ssh_options:
+    case Origin::unreadable: break;
+    }
+    return {};
+}
+
 // How to clear reason `r` for `server`; `kept`: every setting of the server the import kept in
 // grab's store, which one way out clears.
 std::string clear_text(std::string_view server, const Reason& r, const std::vector<std::string>& kept) {
+    if (proxy_reason(r)) {
+        if (auto how = clear_proxy_text(server, r); !how.empty()) return how;
+    }
     switch (r.origin) {
     case Origin::store:
         return std::format("the import kept {} in grab's store: remove {} and add it again (Remove and Add in grab's "
@@ -180,7 +218,8 @@ std::string clear_text(std::string_view server, const Reason& r, const std::vect
     case Origin::unreadable: break;
     }
     return std::format("saving {} with Edit (no change needed) sets the unreadable store aside, and with it any proxy "
-                       "or ssh command kept there: {} then connects directly",
+                       "or ssh command kept there: {} then connects directly, or through the proxy its grab.conf "
+                       "section gives it",
                        server, server);
 }
 
@@ -212,6 +251,7 @@ Sources sources(const RemoteSettings& settings, const server_conf::Connection& c
 Settings evaluate(const Sources& sources) {
     Settings settings;
     for (const auto& [key, value] : sources.extras) {
+        if (std::ranges::contains(proxy_keys, key)) continue; // the server's route (route()), never a reason
         if (const Option* o = option(key)) {
             set(settings, *o, value, Origin::store, "rclone." + key, std::format("rclone.{} in grab's store", key));
         }
@@ -254,11 +294,81 @@ std::vector<Reason> reasons(const Settings& settings) {
     return out;
 }
 
+passwords::Binding proxy_login(const proxy::Proxy& proxy) {
+    return passwords::Binding{.user = proxy.user, .host = proxy.host, .port = proxy.port};
+}
+
+std::expected<Route, RouteProblem> route(const passwords::Store& store, std::string_view server,
+                                         const server_conf::Connection& c, bool any_login) {
+    if (c.proxy.kind != proxy::Kind::none) {
+        Route out{.proxy = c.proxy, .from = ProxyFrom::line, .key = {}};
+        out.proxy.password.clear();
+        // Sent only with a user (proxy.hpp); bound to this very proxy, so a hand edit of its
+        // address or user finds none.
+        if (!out.proxy.user.empty()) {
+            out.proxy.password =
+                passwords::value_for(store, server, passwords::proxy_password, proxy_login(out.proxy)).value_or("");
+        }
+        return out;
+    }
+    std::vector<std::pair<std::string_view, const passwords::Secret*>> kept;
+    for (const std::string_view key : proxy_keys) {
+        const auto* secret = passwords::find(store, server, std::string(passwords::rclone_prefix) + std::string(key));
+        // A blank one is no proxy, as rclone read it.
+        if (secret != nullptr && !util::trim(secret->value).empty()) kept.emplace_back(key, secret);
+    }
+    if (kept.empty()) return Route{};
+    if (kept.size() > 1) {
+        const std::string both = "rclone.socks_proxy and rclone.http_proxy";
+        return std::unexpected(RouteProblem{.key = std::string(both_proxies),
+                                            .found = Found{.where = both + " in grab's store",
+                                                           .origin = Origin::store,
+                                                           .setting = both,
+                                                           .blocks = Kind::route}});
+    }
+    const auto [key, secret] = kept.front();
+    const std::string setting = std::string(passwords::rclone_prefix) + std::string(key);
+    // Never the value in the reason: it can hold a user:password.
+    auto refused = [&](std::string_view why) {
+        return std::unexpected(RouteProblem{.key = std::string(key),
+                                            .found = Found{.where = std::format("{} in grab's store, {}", setting, why),
+                                                           .origin = Origin::store,
+                                                           .setting = setting,
+                                                           .blocks = Kind::route}});
+    };
+    const passwords::Binding login{.user = c.user, .host = c.host, .port = c.port};
+    if (!any_login && secret->binding != login) return refused("saved for another login");
+    const auto value = util::trim(secret->value);
+    auto parsed = key == "socks_proxy" ? proxy::parse_rclone_socks(value) : proxy::parse_rclone_http(value);
+    if (!parsed) return refused("which grab can't use: " + parsed.error());
+    return Route{.proxy = std::move(*parsed), .from = ProxyFrom::kept, .key = std::string(key)};
+}
+
+void add_route_problem(Settings& settings, const RouteProblem& problem) {
+    // One that refuses already says enough (common_flags' --sftp-socks-proxy).
+    auto& found = settings[problem.key];
+    if (!found.blocks) found = problem.found;
+}
+
+std::string route_text(std::string_view server, const RouteProblem& problem) {
+    Settings settings;
+    add_route_problem(settings, problem);
+    return text(server, reasons(settings));
+}
+
 std::string describe(const Reason& reason) {
     const std::string_view k = reason.key;
-    const char* what = k == "socks_proxy"            ? "connects through a SOCKS proxy"
-                       : k == "http_proxy"           ? "connects through an HTTP proxy"
-                       : k == "ssh"                  ? "connects through an ssh command"
+    if (proxy_reason(reason)) {
+        const std::string_view kind = k == "socks_proxy"  ? "a SOCKS proxy"
+                                      : k == "http_proxy" ? "an HTTP proxy"
+                                                          : "both a SOCKS and an HTTP proxy";
+        switch (reason.origin) {
+        case Origin::store: return std::format("has {} ({})", kind, reason.where);
+        case Origin::environment: return std::format("has {} in a variable grab doesn't follow ({})", kind, reason.where);
+        default: return std::format("has {} where grab doesn't read one ({})", kind, reason.where);
+        }
+    }
+    const char* what = k == "ssh"                    ? "connects through an ssh command"
                        : k == "ProxyCommand"         ? "connects through a ProxyCommand"
                        : k == "ProxyJump"            ? "connects through a jump host"
                        : k == "store"                ? "may connect through a proxy or an ssh command"
@@ -281,10 +391,13 @@ std::string text(std::string_view server, std::span<const Reason> reasons) {
     std::vector<std::string> kept;
     for (const auto& r : reasons) {
         said.push_back(describe(r));
-        if (r.origin == Origin::store) kept.push_back(r.setting);
+        if (r.origin == Origin::store && !proxy_reason(r)) kept.push_back(r.setting);
     }
     const bool route = std::ranges::any_of(reasons, [](const Reason& r) { return r.kind == Kind::route; });
-    std::string out = std::format("[{}] {}, which grab can't, so it doesn't connect to {}{}", server, listed(said), server,
+    // grab can do proxies, only not from there; what an unreadable store keeps is unknown.
+    const bool cant = std::ranges::any_of(reasons, [](const Reason& r) { return !proxy_reason(r) && r.key != "store"; });
+    std::string out = std::format("[{}] {}{} doesn't connect to {}{}", server, listed(said),
+                                  cant ? ", which grab can't, so it" : ", so grab", server,
                                   route ? " rather than go around it" : "");
     // How to clear each, each way out said once.
     std::vector<std::string> clear;

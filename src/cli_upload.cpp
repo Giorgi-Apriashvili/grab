@@ -1143,7 +1143,7 @@ int upload_with_grab(const engine::Context& ctx, const Options& opts) {
     if (opts.verbose) {
         s.trace = [&line](const std::vector<std::string>& argv) { line.message("+ " + quote::display_cmdline(argv)); };
         std::println(stderr, "grab: up to {} connections to {}", budget, server);
-        std::println(stderr, "grab: {} through grab's own SSH client", server);
+        std::println(stderr, "grab: {} through grab's own SSH client{}", server, engine::route_text(*target));
     }
     const int code = run_upload(opts, *locals, s);
     // A clean run raises a learned limit by one, so a drop that wasn't the server's real limit

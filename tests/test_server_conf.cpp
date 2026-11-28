@@ -3,12 +3,15 @@
 
 #include "config.hpp"
 #include "ini.hpp"
+#include "proxy.hpp"
 #include "server_conf.hpp"
 #include "servers.hpp"
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -69,6 +72,81 @@ TEST_CASE("server_conf: a section's connection details, and the lines grab write
     CHECK(r.key_file == "C:\\keys\\id");
     CHECK_FALSE(r.key_use_agent);
     CHECK(r.known_hosts_file == "C:\\grab\\known_hosts");
+}
+
+TEST_CASE("server_conf: a section's proxy line, read with proxy::parse and written after auth and key_file") {
+    const auto read = parse_section("[s]\nshell_type = unix\nproxy = SOCKS5H://al%40ice@127.0.0.1:9050/\nhost = box.example\n"
+                                    "user = u1\nauth = agent\nkey_file = C:\\keys\\id\n");
+    REQUIRE_MESSAGE(read.has_value(), read.error_or(""));
+    REQUIRE(read->has_value());
+    const Connection& c = **read;
+    CHECK(c.proxy == proxy::Proxy{.kind = proxy::Kind::socks5, .host = "127.0.0.1", .port = 9050, .user = "al@ice",
+                                  .password = {}});
+    const auto lines = server_conf::lines(c);
+    REQUIRE(lines.size() == 7);
+    CHECK(lines[4] == std::pair<std::string, std::string>{"key_file", "C:\\keys\\id"});
+    CHECK(lines[5] == std::pair<std::string, std::string>{"proxy", "socks5://al%40ice@127.0.0.1:9050"});
+    CHECK(lines[6] == std::pair<std::string, std::string>{"shell_type", "unix"});
+    CHECK(std::ranges::find(server_conf::keys, "proxy") - server_conf::keys.begin() == 5);
+    // Written back, it reads the same; a password in the Connection is never written.
+    std::string text = "[s]\n";
+    auto with_password = c;
+    with_password.proxy.password = "fake-proxy-pw";
+    for (const auto& [key, value] : server_conf::lines(with_password)) text = servers::set_value(text, "s", key, value).value();
+    CHECK(text.find("fake-") == std::string::npos);
+    CHECK(parse_section(text) == read);
+    // Blank: directly.
+    const auto blank = parse_section("[s]\nhost = h\nuser = u\nauth = agent\nproxy =  \n");
+    REQUIRE(blank.has_value());
+    CHECK(blank->value_or(Connection{}).proxy.kind == proxy::Kind::none);
+    CHECK(server_conf::lines(blank->value_or(Connection{})).size() == 4);
+    // HTTP, IPv6 in brackets.
+    const auto http = parse_section("[s]\nhost = h\nuser = u\nauth = agent\nproxy = http://[::1]:3128\n");
+    REQUIRE(http.has_value());
+    CHECK(http->value_or(Connection{}).proxy ==
+          proxy::Proxy{.kind = proxy::Kind::http, .host = "::1", .port = 3128, .user = {}, .password = {}});
+}
+
+TEST_CASE("server_conf: a proxy line grab can't use refuses the server, never ignored") {
+    const auto error = [](std::string_view proxy_line) {
+        return parse_section(std::format("[Box]\nhost = h\nuser = u\nauth = agent\nproxy = {}\n", proxy_line), "Box")
+            .error_or("");
+    };
+    CHECK(error("socks5://alice:fake-secret@127.0.0.1:9050") ==
+          "[Box] proxy: keep the proxy's password in grab's store, not grab.conf: take it out of the line, then Edit Box "
+          "and type it there");
+    CHECK(error("socks4://127.0.0.1:9050") == "[Box] proxy: grab can't use SOCKS4 proxies yet: use socks5://");
+    CHECK(error("https://proxy.example:3128") == "[Box] proxy: grab can't use HTTPS proxies yet: use http://");
+    CHECK(error("socks5://127.0.0.1") == "[Box] proxy: give the proxy's port (socks5://host:1080)");
+    CHECK(error("127.0.0.1:9050") == "[Box] proxy: write the proxy as socks5://host:port or http://host:port");
+    CHECK(error("none") == "[Box] proxy: write the proxy as socks5://host:port or http://host:port");
+    CHECK(error("socks5://alice:fake-secret@127.0.0.1:9050").find("fake-") == std::string::npos);
+    // A server address with a zone can't go through one.
+    CHECK(parse_section("[Box]\nhost = fe80::1%eth0\nuser = u\nauth = agent\nproxy = socks5://127.0.0.1:9050\n", "Box")
+              .error_or("") == "[Box] host fe80::1%eth0: an address with a zone can't go through a proxy");
+    CHECK(parse_section("[Box]\nhost = fe80::1%eth0\nuser = u\nauth = agent\n", "Box").has_value());
+
+    // check_proxy: a form's fields as the line would hold them.
+    using server_conf::check_proxy;
+    proxy::Proxy p{.kind = proxy::Kind::http, .host = "proxy.example", .port = 3128, .user = "bob", .password = "fake-pw"};
+    CHECK_FALSE(check_proxy(p, "Box"));
+    CHECK_FALSE(check_proxy(proxy::Proxy{}, "Box"));
+    p.user = "b:ob";
+    CHECK(check_proxy(p, "Box") == "the user name for an HTTP proxy can't hold ':' (Basic login)");
+    p.user = "bob";
+    p.port = 0;
+    CHECK(check_proxy(p, "Box") == "the proxy's port must be from 1 to 65535");
+    p.port = 3128;
+    p.host = "-x";
+    CHECK(check_proxy(p, "Box") == "use a host name (letters, digits, - and .) or an IP address for the proxy");
+    p.host = "fe80::1%eth0";
+    CHECK(check_proxy(p, "Box"));
+    Connection zoned;
+    zoned.host = "fe80::1%eth0";
+    zoned.user = "u";
+    zoned.proxy = proxy::Proxy{.kind = proxy::Kind::socks5, .host = "::1", .port = 1080, .user = {}, .password = {}};
+    CHECK(server_conf::check("Box", zoned) ==
+          std::vector<std::string>{"[Box] host fe80::1%eth0: an address with a zone can't go through a proxy"});
 }
 
 TEST_CASE("server_conf: clear messages for sections with a host but odd details") {

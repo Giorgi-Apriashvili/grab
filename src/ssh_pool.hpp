@@ -202,6 +202,9 @@ public:
     // A session: an idle one, else a new login once there is room under the limit and among the
     // logins at once, else waiting for one to come back. nullopt once `stop` is requested. Throws
     // Error: a fatal one at once, a refusal after the retries (`retry_refused`, else the pool's).
+    // A refusal through a proxy (Error::proxied) is one only beside a working connection: another
+    // of the pool's open (in use or idle), or another login under way that works (it waits for
+    // those); with none it is its proxied kind at once (PROXIES.md 3.4).
     // `logins_at_once`: this caller's own cap on the pool's logins in progress (Play's burst on a
     // Storage Box, which accepted 8 at once); 0: Options::logins_at_once. Other callers keep theirs.
     [[nodiscard]] std::optional<Lease> acquire(std::stop_token stop = {}, Retry retry_refused = std::nullopt,
@@ -305,6 +308,11 @@ private:
                                               std::span<const std::chrono::milliseconds> pauses);
     void give_back(std::unique_ptr<Session> session, bool broken);
     [[nodiscard]] int open_locked() const { return leased_ + logging_in_ + static_cast<int>(idle_.size()); }
+    // Whether a refusal through a proxy came beside a working connection, which makes it a cap
+    // (log_in): another of the pool's connections open now (in use or idle), else one of the
+    // logins under way beside it that works; waits for those (until `stop`), and with none of
+    // them working it is the proxy's answer alone. Takes the lock.
+    [[nodiscard]] bool beside_working(const std::stop_token& stop);
 
     Connect connect_;
     Options options_;
@@ -313,6 +321,8 @@ private:
     std::deque<Idle> idle_; // most recently used at the back
     int leased_ = 0;
     int logging_in_ = 0;
+    int logins_worked_ = 0; // logins that worked, ever: beside_working's sign that one did
+    int deciding_ = 0;      // logins turned away through a proxy waiting in beside_working
     int hashing_ = 0; // hash turns out
     Asked<FindCheck> find_asked_;
     Asked<HashCheck> hash_asked_;
@@ -336,7 +346,8 @@ private:
 
 // The pools of the servers on grab's engine, one per server, made on first use, for a program
 // (the window, a command) to share among its downloads. A server whose login changed (a password
-// edited in Settings) gets a new pool; downloads on the old one keep it until they end.
+// edited in Settings, another proxy) gets a new pool; downloads on the old one keep it until they
+// end.
 // Thread-safe.
 class Pools {
 public:
@@ -349,6 +360,8 @@ public:
 
     // `limit`: the server's connection budget now.
     [[nodiscard]] std::shared_ptr<Pool> get(const std::string& server, const Target& target, int limit);
+    // Whether get would hand out the pool it has for the server (one for this very target).
+    [[nodiscard]] bool has(const std::string& server, const Target& target);
     // The server's pool (if any) drops its find check's answer, so its next search loads the one
     // saved since (the window's server Test asked again) instead of keeping the old one for a week.
     void forget_find_check(const std::string& server);

@@ -5,6 +5,7 @@
 // server_cli.cpp. grab writes no rclone.conf (RCLONE-REPLACEMENT.md, phase 7): servers are added,
 // changed and removed in grab.conf and grab's store (G12, G27).
 
+#include "proxy.hpp"
 #include "server_conf.hpp"
 
 #include <expected>
@@ -29,6 +30,11 @@ struct NewServer {
     std::vector<std::string> search_roots; // blank = login home
     int max_depth = 4;
     std::optional<int> max_connections; // grab-gui downloads; nullopt = automatic
+    // The proxy (PROXIES.md): nullopt keeps the server's as it is (an edit from a form that doesn't
+    // ask; a new server connects directly), kind none is directly. Its password, when one is typed,
+    // in proxy->password (memory only): empty keeps the one saved for the same proxy and user, if
+    // any, and drops one saved for another.
+    std::optional<proxy::Proxy> proxy;
 };
 
 // nullopt when usable as both a grab.conf section and an rclone remote name, else why not.

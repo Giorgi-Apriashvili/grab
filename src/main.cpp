@@ -14,6 +14,7 @@
 #include "match.hpp"
 #include "notices.hpp"
 #include "process.hpp"
+#include "proxy.hpp"
 #include "quote.hpp"
 #include "rclone_import.hpp"
 #include "remote.hpp"
@@ -255,6 +256,11 @@ std::expected<engine::GrabSide, std::string> grab_side(const engine::Context& ct
         if (!saved) std::println(stderr, "grab: {}", saved.error());
     }, old_limits);
     if (opts.verbose) {
+        // The route once per command: a download after it shares the pool.
+        if (target->proxy.kind != proxy::Kind::none) {
+            std::println(stderr, "grab: {} through grab's own SSH client{}", ctx.settings.name,
+                         engine::route_text(*target));
+        }
         side.on_lookup = [&ctx, said = std::move(said)](const ssh::Lookup& way) {
             std::println(stderr, "grab: {} {}", said, engine::lookup_text(ctx, way));
         };

@@ -20,10 +20,14 @@
 
 namespace grab::passwords {
 
-// The keys a server's values are saved under; an rclone setting is "rclone.<its key>".
+// The keys a server's values are saved under; an rclone setting is "rclone.<its key>". The
+// password of the proxy in a server's grab.conf `proxy` line (PROXIES.md 3.3) is bound to that
+// proxy's own user@host:port, not to the server's login, so a hand edit of the proxy's address
+// can't send it to another proxy; it doesn't move with the server's login either.
 inline constexpr std::string_view password = "password";
 inline constexpr std::string_view passphrase = "passphrase";
 inline constexpr std::string_view key_pem = "key_pem";
+inline constexpr std::string_view proxy_password = "proxy_password";
 inline constexpr std::string_view rclone_prefix = "rclone.";
 
 // The login a value was saved for.

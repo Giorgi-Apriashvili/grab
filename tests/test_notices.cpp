@@ -1,9 +1,12 @@
 #include "config.hpp"
+#include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "notices.hpp"
 #include "passwords.hpp"
+#include "proxy.hpp"
 #include "rclone_import.hpp"
+#include "server_conf.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -67,14 +70,14 @@ TEST_CASE("notices: the old defaults say nothing, flag by flag (grab.conf.exampl
 }
 
 TEST_CASE("notices: the switch to grab's own client, once, naming the servers it moved, without the fallback (N0)") {
-    // Main and Edge have no `engine` line; Box's proxy keeps grab off it (the guard says so), Old
+    // Main and Edge have no `engine` line; Box's ssh command keeps grab off it (the guard says so), Old
     // asked for rclone (N9 says it's ignored), Opt chose grab before, Bare has no details yet, Bound
     // has a bind left in common_flags (refused wherever it's used).
     const std::string base = "[Main]\nhost = m.example\nuser = u\nauth = agent\n"
                              "[Box]\nhost = b.example\nuser = u\nauth = password\n" +
                              section("Old", "engine = rclone\n") + section("Opt", "engine = grab\n") +
                              "[Bare]\nmax_depth = 2\n" + section("Bound", "common_flags = --bind 10.0.0.2\n");
-    notices::Extras extras{{"Box", {{"socks_proxy", "fake-user:fake-secret@127.0.0.1:9"}}}};
+    notices::Extras extras{{"Box", {{"ssh", "fake-ssh -i fake-secret jump"}}}};
     // All of them came from rclone.conf (the import moved them); New, below, was added since.
     const notices::Moved moved{"Main", "Box", "Old", "Opt", "Bare", "Edge", "Bound"};
     const std::string edge = "[Edge]\nhost = e.example\nuser = u\nauth = agent\n";
@@ -294,7 +297,7 @@ TEST_CASE("notices: grab's store that can't be read is a guard notice for every 
 }
 
 TEST_CASE("notices: what keeps grab off a server, named but never quoted") {
-    notices::Extras extras{{"Box", {{"socks_proxy", "fake-user:fake-secret@127.0.0.1:9"}}}};
+    notices::Extras extras{{"Box", {{"socks_proxy", "fake-user:fake-secret@127.0.0.1:9"}, {"ssh", "fake-ssh 127.0.0.1"}}}};
     const auto n = notices_of(section("Box", "common_flags = --sftp-http-proxy fake-secret-proxy:3128\n"), extras,
                               {{"RCLONE_SFTP_USE_FSTAT", "true"}});
     REQUIRE(n.size() == 3);
@@ -302,14 +305,69 @@ TEST_CASE("notices: what keeps grab off a server, named but never quoted") {
         CHECK(one.key == "guard");
         CHECK(one.text.find("fake-") == std::string::npos);
         CHECK(one.text.find("127.0.0.1") == std::string::npos);
-        CHECK(one.text.find("which grab can't, so it doesn't connect to Box") != std::string::npos);
+        CHECK(one.text.find("doesn't connect to Box") != std::string::npos);
         CHECK(one.text.find("engine = rclone") == std::string::npos);
         // Keyed on the text, never the value: notices.json is no guessing oracle for a proxy's password.
         CHECK(one.digest == util::sha256_hex(one.text));
     }
+    // The store's proxy is no reason (it is the server's route): its ssh command is.
     CHECK(n[0].flag == "common_flags' --sftp-http-proxy");
-    CHECK(n[1].flag == "rclone.socks_proxy in grab's store");
+    CHECK(n[1].flag == "rclone.ssh in grab's store");
     CHECK(n[2].flag == "RCLONE_SFTP_USE_FSTAT");
+}
+
+TEST_CASE("notices: a server that connects through the proxy rclone had for it again says so once (decision 4)") {
+    const auto doc = ini::parse(section("Box") + section("Web") + section("Two") + section("Lined", "proxy = http://p.example:3128\n") +
+                                section("Fstat", "rclone.use_fstat = true\n"));
+    REQUIRE(doc.has_value());
+    const auto cfg = parse_grab_config(*doc);
+    REQUIRE_MESSAGE(cfg.has_value(), cfg.error_or(""));
+    notices::Routes routes;
+    routes["Box"].kept = proxy::Kind::socks5;
+    routes["Web"].kept = proxy::Kind::http;
+    routes["Fstat"].kept = proxy::Kind::socks5; // refused for another reason: no "connects ... again"
+    passwords::Store store;
+    store["Two"]["rclone.socks_proxy"] = passwords::Secret{.binding = {.user = "u", .host = "Two.example", .port = 22},
+                                                           .value = "fake-user:fake-secret@127.0.0.1:9"};
+    store["Two"]["rclone.http_proxy"] = store["Two"]["rclone.socks_proxy"];
+    server_conf::Connection two;
+    two.host = "Two.example";
+    two.user = "u";
+    routes["Two"].problem = guard::route(store, "Two", two).error();
+    const auto none = [](const std::string&) -> std::optional<std::string> { return std::nullopt; };
+    const auto n = notices::settings_notices(*doc, *cfg, {}, none, {}, false, routes);
+    REQUIRE(n.size() == 4);
+    CHECK(n[0].server == "Box");
+    CHECK(n[0].key == "proxy:kept");
+    CHECK(n[0].flag == "rclone.socks_proxy in grab's store");
+    CHECK(n[0].text == "[Box] connects through the SOCKS5 proxy grab's store keeps for it (from rclone, or a proxy "
+                       "line since removed; shown in Settings; Edit changes it).");
+    CHECK(n[1].text == "[Web] connects through the HTTP proxy grab's store keeps for it (from rclone, or a proxy "
+                       "line since removed; shown in Settings; Edit changes it).");
+    CHECK(n[1].flag == "rclone.http_proxy in grab's store");
+    // Two kept proxies: the guard's notice instead, never a value.
+    CHECK(n[2].server == "Two");
+    CHECK(n[2].key == "guard");
+    CHECK(n[2].text.starts_with("[Two] has both a SOCKS and an HTTP proxy"));
+    CHECK(n[2].text.find("fake-") == std::string::npos);
+    CHECK(n[3].server == "Fstat");
+    CHECK(n[3].key == "guard");
+    // A store that can't be read: none of it.
+    const auto unreadable = notices::settings_notices(*doc, *cfg, {}, none, {}, true, routes);
+    CHECK(std::ranges::none_of(unreadable, [](const notices::Notice& x) { return x.key == "proxy:kept"; }));
+
+    // Once per configuration; again once an Edit moved it into the line and the line went.
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-notices-kept";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto file = notices::path_in(dir);
+    auto fresh = notices::take_new(file, n);
+    REQUIRE(fresh);
+    CHECK(fresh->size() == 4);
+    fresh = notices::take_new(file, n);
+    REQUIRE(fresh);
+    CHECK(fresh->empty());
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("notices: each shows once per configuration, again when its text changes (notices.json)") {
@@ -364,7 +422,11 @@ TEST_CASE("notices: a configuration's notices from its grab.conf, its store's ex
     const auto n = notices::for_config(conf);
     REQUIRE_MESSAGE(n, n.error_or(""));
     REQUIRE(n->size() == 1);
+    // The proxy rclone had for it, kept by the import, is its route again (PROXIES.md decision 4).
+    CHECK((*n)[0].key == "proxy:kept");
     CHECK((*n)[0].flag == "rclone.socks_proxy in grab's store");
+    CHECK((*n)[0].text == "[Box] connects through the SOCKS5 proxy grab's store keeps for it (from rclone, or a "
+                          "proxy line since removed; shown in Settings; Edit changes it).");
     // N0 names a server the import moved (imported.json), not one added in grab.conf since.
     REQUIRE(util::write_file_atomic(conf, section("Box") + "[Main]\nhost = m.example\nuser = u\nauth = agent\n" +
                                               "[New]\nhost = n.example\nuser = u\nauth = agent\n"));
@@ -378,7 +440,8 @@ TEST_CASE("notices: a configuration's notices from its grab.conf, its store's ex
     REQUIRE_MESSAGE(with, with.error_or(""));
     REQUIRE(with->size() == 2);
     CHECK((*with)[0].key == "engine");
-    CHECK((*with)[0].text.find("(Main);") != std::string::npos);
+    CHECK((*with)[0].text.find("(Box, Main);") != std::string::npos); // Box works again, through its proxy
+    CHECK((*with)[1].key == "proxy:kept");
     // Not the default configuration: grab's own old files, if any, aren't its to say.
     CHECK(std::ranges::none_of(*with, [](const notices::Notice& x) { return x.key == "old files"; }));
     std::filesystem::remove_all(passwords::path_in(state_dir(conf)).parent_path());

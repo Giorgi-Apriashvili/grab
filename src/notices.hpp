@@ -6,7 +6,8 @@
 // (N10), common_flags with what to write instead (N11), folder_flags and file_flags (N12),
 // ssh_options, with a jump route it held (N13, the user's decision 4), [grab] rclone and ssh (N14),
 // the rclone settings that changed what rclone did (N15), keys grab doesn't know (N7), what keeps
-// grab off a server (guard.hpp), and grab's own old rclone.conf and 'secrets' while they stay
+// grab off a server (guard.hpp), a server that connects through the proxy rclone had for it again
+// (PROXIES.md decision 4), and grab's own old rclone.conf and 'secrets' while they stay
 // (rclone_import::old_files_kept) and once deleted (rclone_import::Record::old_files). Only for
 // what differs from the old defaults, flag by flag: grab.conf.example's lines and `--init`'s
 // commented ones say nothing. No text quotes a value but a bind, a time or a count: a proxy, an ssh
@@ -21,7 +22,9 @@
 // id, so whoever saw it there doesn't again. `grab server test` and -v repeat a server's every time.
 
 #include "config.hpp"
+#include "guard.hpp"
 #include "ini.hpp"
+#include "proxy.hpp"
 
 #include <expected>
 #include <filesystem>
@@ -47,6 +50,15 @@ struct Notice {
 // grab's store's rclone extras per server, those saved for its login: server -> (key without
 // "rclone.", value).
 using Extras = std::map<std::string, std::vector<std::pair<std::string, std::string>>, std::less<>>;
+// What grab's store says of a server's proxy (guard::route, its `proxy` line beside): the kind of
+// the proxy it keeps in rclone's form that the server connects through again (PROXIES.md
+// decision 4; none when it has none or a `proxy` line), or the problem that refuses it. Never a
+// value.
+struct StoreRoute {
+    proxy::Kind kept = proxy::Kind::none;
+    std::optional<guard::RouteProblem> problem;
+};
+using Routes = std::map<std::string, StoreRoute, std::less<>>;
 // An inherited environment variable, or nullopt.
 using Environment = std::function<std::optional<std::string>(const std::string&)>;
 // The servers the import from rclone.conf moved into grab.conf (imported.json's names): every
@@ -57,12 +69,13 @@ using Moved = std::set<std::string, std::less<>>;
 // "engine", flag "default", keyed on the default itself so it shows once whatever it names) when
 // a server of `moved` with connection details and no `engine` line is one grab connects to; then
 // N10 (`environment`'s GRAB_ENGINE) and N14; then server by server in file order N9, N11, N12, N13
-// and, for one with connection details, N15 and the guard's reasons (with `extras` and
-// `environment`; `store_unreadable`: grab's store exists but can't be read, so every server with
-// connection details counts as routed); then N7.
+// and, for one with connection details, N15 and the guard's reasons (with `extras`, `routes`'
+// problems and `environment`; `store_unreadable`: grab's store exists but can't be read, so every
+// server with connection details counts as routed), then, for one grab connects to through a
+// proxy its store kept from rclone (`routes`), that it does so again (key "proxy:kept"); then N7.
 [[nodiscard]] std::vector<Notice> settings_notices(const ini::Document& doc, const GrabConfig& cfg, const Extras& extras,
                                                    const Environment& environment, const Moved& moved,
-                                                   bool store_unreadable = false);
+                                                   bool store_unreadable = false, const Routes& routes = {});
 
 // The notices of the configuration at `grab_conf`, read now: grab.conf, grab's store (one
 // decryption, for the extras), imported.json (no N0 when it can't be read), this process's

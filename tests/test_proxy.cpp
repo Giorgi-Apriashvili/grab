@@ -177,6 +177,32 @@ TEST_CASE("proxy: rclone's socks_proxy and http_proxy, read as rclone 1.75.1 rea
     CHECK_FALSE(proxy::parse_rclone_http("http://a:%zz@h:1"));
 }
 
+TEST_CASE("proxy: the copy for older grabs in rclone's form reads back; the said form holds no password") {
+    using P = proxy::Proxy;
+    for (const P& p : {P{.kind = Kind::socks5, .host = "127.0.0.1", .port = 9050, .user = "alice", .password = "fake-pw"},
+                       P{.kind = Kind::socks5, .host = "h", .port = 1080, .user = "alice", .password = ""},
+                       P{.kind = Kind::socks5, .host = "::1", .port = 1080, .user = "", .password = ""},
+                       P{.kind = Kind::http, .host = "proxy.example", .port = 3128, .user = "al@ice", .password = "p@ss:w/%"},
+                       P{.kind = Kind::http, .host = "2001:db8::7", .port = 8080, .user = "", .password = ""},
+                       P{.kind = Kind::http, .host = "h", .port = 3128, .user = "bob", .password = ""}}) {
+        const auto copy = proxy::rclone_text(p);
+        CAPTURE(proxy::text(p));
+        const auto back = p.kind == Kind::socks5 ? proxy::parse_rclone_socks(copy) : proxy::parse_rclone_http(copy);
+        REQUIRE(back);
+        CHECK(*back == p);
+    }
+    CHECK(proxy::rclone_text(P{.kind = Kind::socks5, .host = "h", .port = 1, .user = "a", .password = "fake-pw"}) ==
+          "a:fake-pw@h:1");
+    CHECK(proxy::rclone_text(P{.kind = Kind::http, .host = "h", .port = 1, .user = "a", .password = "f@ke"}) ==
+          "http://a:f%40ke@h:1");
+    CHECK(proxy::rclone_text(P{}).empty());
+    const P alice{.kind = Kind::socks5, .host = "127.0.0.1", .port = 9050, .user = "alice", .password = "fake-pw"};
+    CHECK(proxy::said(alice) == "the SOCKS5 proxy alice@127.0.0.1:9050");
+    CHECK(proxy::said(P{.kind = Kind::http, .host = "::1", .port = 3128, .user = {}, .password = "fake-pw"}) ==
+          "the HTTP proxy [::1]:3128");
+    CHECK(proxy::said(P{}).empty());
+}
+
 TEST_CASE("proxy: what a proxy can't be asked for is refused before anything is sent") {
     const proxy::Proxy socks{.kind = Kind::socks5, .host = "127.0.0.1", .port = 1080, .user = "", .password = ""};
     proxy::Proxy http = socks;

@@ -45,6 +45,15 @@ struct Proxy {
 // The proxy as grab.conf writes it, without the password: "socks5://alice@127.0.0.1:9050",
 // "http://[::1]:3128" (parse reads it back); empty for none.
 [[nodiscard]] std::string text(const Proxy& proxy);
+// The proxy in rclone's form, its password included, for the copy grab keeps in its store for
+// older grabs (PROXIES.md decision 6): a SOCKS5 one as `socks_proxy` (user:password@host:port,
+// user@host:port or host:port, nothing encoded, as rclone 1.75.1 splits it), an HTTP one as
+// `http_proxy` (http://user:password@host:port, user and password percent-encoded).
+// parse_rclone_socks / parse_rclone_http read it back (a SOCKS5 user or password holding '@' or
+// ':' only as rclone would split it); empty for none. A secret: never shown.
+[[nodiscard]] std::string rclone_text(const Proxy& proxy);
+// A short description for messages, without the password: "the SOCKS5 proxy alice@127.0.0.1:9050".
+[[nodiscard]] std::string said(const Proxy& proxy);
 // host:port for messages, an IPv6 address in brackets: "127.0.0.1:9050", "[::1]:1080".
 [[nodiscard]] std::string address(std::string_view host, int port);
 // "SOCKS5" or "HTTP" (empty for none).

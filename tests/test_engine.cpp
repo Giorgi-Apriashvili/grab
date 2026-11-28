@@ -4,8 +4,10 @@
 #include "file_list.hpp"
 #include "gui_state.hpp"
 #include "passwords.hpp"
+#include "proxy.hpp"
 #include "scoped_env.hpp"
 #include "server_conf.hpp"
+#include "ssh_target.hpp"
 #include "util.hpp"
 
 #include <doctest/doctest.h>
@@ -224,7 +226,7 @@ TEST_CASE("the guard: a server grab can't serve as configured is refused everywh
     std::filesystem::remove(grab_known_hosts_path());
     // A closed local port: a connection the guard failed to stop would fail fast, not hang.
     const auto c = connection("127.0.0.1", "u", server_conf::Auth::agent, 9);
-    REQUIRE(passwords::save(store, {{"Box", {{"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9", c)},
+    REQUIRE(passwords::save(store, {{"Box", {{"rclone.ssh", fake("fake-ssh -i fake-pass jump", c)},
                                              {"rclone.set_env", fake("X=1", c)}}}}));
     RemoteSettings s;
     s.name = "Box";
@@ -240,9 +242,9 @@ TEST_CASE("the guard: a server grab can't serve as configured is refused everywh
 
     // Not pinned either: the guard is said first, as Trust would be refused too.
     const auto ctx = engine::make_context(GrabConfig{}, s, c, conf);
-    const std::string reason = "[Box] connects through a SOCKS proxy (rclone.socks_proxy in grab's store), which grab "
-                               "can't, so it doesn't connect to Box rather than go around it: the import kept "
-                               "rclone.socks_proxy in grab's store: remove Box and add it again";
+    const std::string reason = "[Box] connects through an ssh command (rclone.ssh in grab's store), which grab can't, so "
+                               "it doesn't connect to Box rather than go around it: the import kept rclone.ssh in "
+                               "grab's store: remove Box and add it again";
     const auto refused = engine::ssh_target(ctx);
     REQUIRE_FALSE(refused);
     CHECK(refused.error().starts_with(reason));
@@ -269,9 +271,10 @@ TEST_CASE("the guard: a server grab can't serve as configured is refused everywh
     std::ofstream(store, std::ios::binary | std::ios::trunc) << "grab-passwords-sealed 1\nanother account's";
     const auto unreadable = engine::make_context(GrabConfig{}, s, c, conf);
     CHECK(engine::ssh_target(unreadable).error_or("") ==
-          "[Box] may connect through a proxy or an ssh command (grab's store, which can't be read), which grab can't, so "
-          "it doesn't connect to Box rather than go around it: saving Box with Edit (no change needed) sets the "
-          "unreadable store aside, and with it any proxy or ssh command kept there: Box then connects directly");
+          "[Box] may connect through a proxy or an ssh command (grab's store, which can't be read), so grab doesn't "
+          "connect to Box rather than go around it: saving Box with Edit (no change needed) sets the unreadable store "
+          "aside, and with it any proxy or ssh command kept there: Box then connects directly, or through the proxy "
+          "its grab.conf section gives it");
 #endif
     std::filesystem::remove_all(store.parent_path());
     std::filesystem::remove_all(dir);
@@ -295,7 +298,9 @@ TEST_CASE("the guard's other sources: a grab.conf line, common_flags, an inherit
     flagged.settings.common_flags = {"-P", "--sftp-socks-proxy", "fake-user:fake-pass@127.0.0.1:1080"};
     flagged = engine::make_context(GrabConfig{}, flagged.settings, c, "unused.conf");
     const auto by_flag = engine::ssh_target(flagged).error_or("");
-    CHECK(by_flag.ends_with("take --sftp-socks-proxy out of common_flags in [Main] (grab config)"));
+    CHECK(by_flag == "[Main] has a SOCKS proxy where grab doesn't read one (common_flags' --sftp-socks-proxy), so grab "
+                     "doesn't connect to Main rather than go around it: write `proxy = socks5://HOST:PORT` in [Main] and "
+                     "take --sftp-socks-proxy out of common_flags (grab config)");
     CHECK(by_flag.find("fake-") == std::string::npos);
 
     // ssh_options' ProxyCommand is no reason (decision 4): grab connects directly.
@@ -314,15 +319,126 @@ TEST_CASE("the guard's other sources: a grab.conf line, common_flags, an inherit
         const test::ScopedEnv proxy("RCLONE_SFTP_SOCKS_PROXY", "fake-user:fake-pass@127.0.0.1:1080");
         for (const char* name : {"Main", "Other"}) {
             const auto inherited = engine::ssh_target(grab_context(name, c, {}, false)).error_or("");
-            CHECK(inherited.starts_with(
-                std::format("[{}] connects through a SOCKS proxy (RCLONE_SFTP_SOCKS_PROXY)", name)));
-            CHECK(inherited.ends_with("RCLONE_SFTP_SOCKS_PROXY is set in grab's environment and covers every "
-                                      "server; clear it for grab alone (`set RCLONE_SFTP_SOCKS_PROXY=` in that "
-                                      "window before starting grab) or for good"));
+            CHECK(inherited ==
+                  std::format("[{}] has a SOCKS proxy in a variable grab doesn't follow (RCLONE_SFTP_SOCKS_PROXY), so "
+                              "grab doesn't connect to {} rather than go around it: grab doesn't follow proxy variables: "
+                              "set the proxy per server (`proxy = socks5://HOST:PORT` in [{}]) and clear "
+                              "RCLONE_SFTP_SOCKS_PROXY for grab (`set RCLONE_SFTP_SOCKS_PROXY=` in that window before "
+                              "starting grab) or for good",
+                              name, name, name));
             CHECK(inherited.find("fake-") == std::string::npos);
         }
     }
     std::filesystem::remove(grab_known_hosts_path());
+}
+
+TEST_CASE("a server's target goes through its proxy: the line with its saved password, else the one kept from rclone") {
+    const auto dir = std::filesystem::temp_directory_path() / "grab-test-proxy-target";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto conf = dir / "grab.conf";
+    const auto store = passwords::path_in(state_dir(conf));
+    std::filesystem::create_directories(store.parent_path());
+    std::filesystem::remove(grab_known_hosts_path());
+    std::filesystem::create_directories(grab_known_hosts_path().parent_path());
+    std::ofstream(grab_known_hosts_path(), std::ios::binary) << "[box.invalid]:23 ssh-ed25519 FAKEKEY\n";
+    RemoteSettings s;
+    s.name = "Box";
+    s.rclone_remote = "Box";
+    const auto target_of = [&](const server_conf::Connection& c, const RemoteSettings& settings,
+                               const ConnectOptions& given) {
+        return engine::ssh_target(engine::make_context(GrabConfig{}, settings, c, conf), given);
+    };
+    auto c = connection("box.invalid", "u", server_conf::Auth::agent, 23);
+
+    // Directly: no proxy, 30 s to connect, nothing more for -v.
+    const auto direct = target_of(c, s, {});
+    REQUIRE_MESSAGE(direct.has_value(), direct.error_or(""));
+    CHECK(direct->proxy.kind == proxy::Kind::none);
+    CHECK(direct->connect_timeout == std::chrono::seconds(30));
+    CHECK(engine::route_text(*direct).empty());
+
+    // Its line, the password saved for that very proxy: 2 min to connect when nothing says otherwise.
+    c.proxy = proxy::Proxy{.kind = proxy::Kind::socks5, .host = "127.0.0.1", .port = 9050, .user = "alice", .password = {}};
+    const passwords::Binding alice{.user = "alice", .host = "127.0.0.1", .port = 9050};
+    REQUIRE(passwords::save(store, {{"Box", {{"proxy_password", passwords::Secret{.binding = alice, .value = "fake-proxy-pw"}}}}}));
+    const auto line = target_of(c, s, {});
+    REQUIRE_MESSAGE(line.has_value(), line.error_or(""));
+    CHECK(line->host == "box.invalid");
+    CHECK(line->port == 23);
+    CHECK(line->proxy == proxy::Proxy{.kind = proxy::Kind::socks5, .host = "127.0.0.1", .port = 9050, .user = "alice",
+                                      .password = "fake-proxy-pw"});
+    CHECK(line->connect_timeout == engine::proxy_connect_timeout);
+    CHECK(engine::route_text(*line) == ", through the SOCKS5 proxy alice@127.0.0.1:9050 (2 min to connect)");
+    // A written connect_timeout wins, and so does the command's --contimeout; off is no limit.
+    auto timed = s;
+    timed.connect_timeout = std::chrono::seconds(10);
+    CHECK(target_of(c, timed, {}).value().connect_timeout == std::chrono::seconds(10));
+    ConnectOptions given;
+    given.connect_timeout = std::chrono::milliseconds(1500);
+    CHECK(target_of(c, s, given).value().connect_timeout == std::chrono::milliseconds(1500));
+    timed.connect_timeout = std::chrono::milliseconds(0);
+    const auto unlimited = target_of(c, timed, {});
+    REQUIRE(unlimited.has_value());
+    CHECK(unlimited->connect_timeout == std::chrono::milliseconds(0));
+    CHECK(engine::route_text(*unlimited) == ", through the SOCKS5 proxy alice@127.0.0.1:9050 (no time limit to connect)");
+    // Another proxy written by hand: its password isn't sent there.
+    auto other = c;
+    other.proxy.port = 9051;
+    CHECK(target_of(other, s, {}).value().proxy.password.empty());
+
+    // Kept in rclone's form for its login (decision 4): through it again, its password with it.
+    c.proxy = proxy::Proxy{};
+    REQUIRE(passwords::save(store, {{"Box", {{"rclone.http_proxy", fake("http://bob:fake-kept%3Apw@proxy.example:3128", c)}}}}));
+    const auto kept = target_of(c, s, {});
+    REQUIRE_MESSAGE(kept.has_value(), kept.error_or(""));
+    CHECK(kept->proxy == proxy::Proxy{.kind = proxy::Kind::http, .host = "proxy.example", .port = 3128, .user = "bob",
+                                      .password = "fake-kept:pw"});
+    CHECK(kept->connect_timeout == engine::proxy_connect_timeout);
+    CHECK(engine::route_text(*kept) == ", through the HTTP proxy bob@proxy.example:3128 (2 min to connect)");
+
+    // Kept for another login (grab.conf's host changed by hand): grab 0.21-0.25 skipped it and
+    // connected directly; refused now, before anything dials.
+    const auto old = connection("old.invalid", "u", server_conf::Auth::agent, 23);
+    REQUIRE(passwords::save(store, {{"Box", {{"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9050", old)}}}}));
+    const auto ctx = engine::make_context(GrabConfig{}, s, c, conf);
+    CHECK_FALSE(engine::grab_blockers(ctx).empty());
+    const auto refused = engine::ssh_target(ctx);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == "[Box] has a SOCKS proxy (rclone.socks_proxy in grab's store, saved for another login), so "
+                             "grab doesn't connect to Box rather than go around it: Edit Box and set its proxy again, or "
+                             "choose Directly");
+    // ssh::target_for says the same when the store changed after the context was made.
+    const auto loaded = passwords::load(store);
+    REQUIRE(loaded.has_value());
+    CHECK(ssh::target_for("Box", c, *loaded, grab_known_hosts_path()).error_or("") == refused.error());
+    // Two kept: refused too.
+    REQUIRE(passwords::save(store, {{"Box", {{"rclone.socks_proxy", fake("127.0.0.1:9050", c)},
+                                             {"rclone.http_proxy", fake("http://proxy.example:3128", c)}}}}));
+    CHECK(engine::ssh_target(engine::make_context(GrabConfig{}, s, c, conf)).error_or("").starts_with(
+        "[Box] has both a SOCKS and an HTTP proxy"));
+    // A line wins over all of it.
+    c.proxy = proxy::Proxy{.kind = proxy::Kind::http, .host = "10.0.0.1", .port = 8080, .user = {}, .password = {}};
+    CHECK(target_of(c, s, {}).value().proxy == c.proxy);
+
+#ifdef _WIN32
+    // The store read when the context was made, unreadable when the target is: refused, never
+    // an empty store in its place (an agent login would connect directly past the kept proxy).
+    c.proxy = proxy::Proxy{};
+    REQUIRE(passwords::save(store, {{"Box", {{"rclone.socks_proxy", fake("127.0.0.1:9050", c)}}}}));
+    const auto readable = engine::make_context(GrabConfig{}, s, c, conf);
+    REQUIRE(engine::grab_blockers(readable).empty());
+    REQUIRE(engine::ssh_target(readable).value().proxy.kind == proxy::Kind::socks5);
+    std::ofstream(store, std::ios::binary | std::ios::trunc) << "grab-passwords-sealed 1\nanother account's";
+    const auto lost = engine::ssh_target(readable);
+    REQUIRE_FALSE(lost.has_value());
+    CHECK(lost.error().starts_with("[Box] may connect through a proxy or an ssh command (grab's store, which can't be "
+                                   "read), so grab doesn't connect to Box rather than go around it"));
+#endif
+
+    std::filesystem::remove(grab_known_hosts_path());
+    std::filesystem::remove_all(store.parent_path());
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("engine = rclone and GRAB_ENGINE=rclone change nothing: every server goes through grab's own client") {

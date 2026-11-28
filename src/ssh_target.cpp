@@ -1,5 +1,6 @@
 #include "ssh_target.hpp"
 
+#include "guard.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -57,6 +58,11 @@ std::expected<Target, std::string> target_for(std::string_view name, const serve
     }
     // A password saved beside a key is tried after it, as rclone does.
     t.password = saved(passwords::password);
+    // Its proxy (PROXIES.md 3.3): one grab won't use refuses the server rather than connect
+    // directly (the guard says so before this; a store changed since says it here).
+    auto route = guard::route(store, name, c);
+    if (!route) return util::fail(guard::route_text(name, route.error()));
+    t.proxy = std::move(route->proxy);
     return t;
 }
 

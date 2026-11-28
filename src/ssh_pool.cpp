@@ -206,11 +206,24 @@ std::optional<Pool::Lease> Pool::log_in(std::unique_lock<std::mutex>& lock, cons
     lock.unlock();
     std::unique_ptr<Session> session;
     std::exception_ptr failed;
+    bool capped = false; // turned away through a proxy beside a working connection: a cap
     for (std::size_t attempt = 0;; ++attempt) {
         try {
             session = connect_();
             break;
         } catch (const Error& e) {
+            // Turned away through a proxy (PROXIES.md 3.4): a cap only beside a working
+            // connection to the server, else what it is alone (a proxy that doesn't allow the
+            // server, a server that is down: ssh -D closes without a word for a closed port or an
+            // unknown name), neither tried again nor taken for a limit to learn.
+            if (e.kind == budget::Failure::refused && e.proxied && !capped) {
+                capped = beside_working(stop);
+                if (stop.stop_requested()) break;
+                if (!capped) {
+                    failed = std::make_exception_ptr(Error(*e.proxied, e.what()));
+                    break;
+                }
+            }
             if (e.kind != budget::Failure::refused || attempt >= pauses.size()) {
                 failed = std::current_exception();
                 break;
@@ -227,6 +240,7 @@ std::optional<Pool::Lease> Pool::log_in(std::unique_lock<std::mutex>& lock, cons
     --logging_in_;
     if (session) {
         ++leased_;
+        ++logins_worked_;
         // Any caller's login that works (a download's, Browse's) is acquire_remembered's too: same
         // pool, same target.
         login_failure_.reset();
@@ -236,6 +250,21 @@ std::optional<Pool::Lease> Pool::log_in(std::unique_lock<std::mutex>& lock, cons
     if (failed) std::rethrow_exception(failed);
     if (!session) return std::nullopt;
     return Lease(this, std::move(session), false);
+}
+
+bool Pool::beside_working(const std::stop_token& stop) {
+    std::unique_lock lock(mutex_);
+    // An idle one counts: it holds the proxy's place between two files of a download.
+    auto open = [this] { return leased_ > 0 || !idle_.empty(); };
+    if (open()) return true;
+    // Other logins under way (a cold pool's walk and workers log in at once): their outcome
+    // decides. Each one turned away this way waits too, so they don't wait for each other.
+    const auto worked = logins_worked_;
+    ++deciding_;
+    changed_.notify_all();
+    changed_.wait(lock, stop, [&] { return open() || logins_worked_ != worked || logging_in_ <= deciding_; });
+    --deciding_;
+    return open() || logins_worked_ != worked;
 }
 
 void Pool::give_back(std::unique_ptr<Session> session, bool broken) {
@@ -443,6 +472,12 @@ std::shared_ptr<Pool> Pools::get(const std::string& server, const Target& target
     auto pool = std::make_shared<Pool>([target] { return open_session(target); }, std::move(options));
     pools_[server] = Entry{target, pool};
     return pool;
+}
+
+bool Pools::has(const std::string& server, const Target& target) {
+    std::scoped_lock lock(mutex_);
+    const auto it = pools_.find(server);
+    return it != pools_.end() && it->second.target == target;
 }
 
 void Pools::forget_find_check(const std::string& server) {

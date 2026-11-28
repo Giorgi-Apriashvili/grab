@@ -9,6 +9,7 @@
 
 #include "config.hpp"
 #include "guard.hpp"
+#include "proxy.hpp"
 #include "servers.hpp"
 #include "ssh.hpp"
 
@@ -73,6 +74,11 @@ struct ServerInfo {
     // The connection keys its section sets, as grab.conf has them (no window field sets them):
     // "bind 10.0.0.2, connect_timeout 10s, io_timeout 1m"; empty when none is.
     std::string connection_keys;
+    // The proxy it is reached through (guard::route; never its password) and where that comes
+    // from: its `proxy` line, or one grab's store keeps for its login in rclone's form (a kept one
+    // grab won't use is in `guard`). From the line alone when the store can't be read.
+    proxy::Proxy proxy;
+    guard::ProxyFrom proxy_from = guard::ProxyFrom::none;
 };
 
 [[nodiscard]] bool is_default_server(const GrabConfig& cfg, std::string_view name);
@@ -92,22 +98,24 @@ struct HostKeys {
 
 // The server's host keys and their fingerprints, read by grab's own client (ssh::scan_host_keys:
 // handshakes with no login, nothing written): no ssh-keyscan, ssh.exe or ssh-keygen. 10 s for each
-// handshake; `reach`: the server's bind and connect_timeout (reach_for).
+// handshake; `reach`: the server's bind, connect_timeout and proxy (reach_for).
 [[nodiscard]] std::expected<HostKeys, std::string> scan_host_keys(const std::string& host, int port,
                                                                   std::stop_token stop = {}, const ssh::Reach& reach = {});
 // How server `name`'s host-key fetch (Trust, Add, Edit) connects: its bind and connect_timeout as
-// every connection takes them (engine::connect_settings, which refuses a bind left in an old key);
-// none for a server grab.conf doesn't have yet. Refused, before anything connects, for a server the
-// guard keeps grab off (guard::text says
-// why and how to clear it; phase 9 step 6): a key pinned for a server grab won't use gains
-// nothing, and the fetch would connect past its route. A new server has only the environment's
-// guard settings (an inherited RCLONE_SFTP_SOCKS_PROXY covers every server).
+// every connection takes them (engine::connect_settings, which refuses a bind left in an old key),
+// and its proxy with the proxy's password (guard::route; through a proxy
+// engine::proxy_connect_timeout when no connect_timeout is written); none for a server grab.conf
+// doesn't have yet (Add's form gives its own). Refused, before anything connects, for a server the
+// guard keeps grab off (guard::text says why and how to clear it; phase 9 step 6): a key pinned
+// for a server grab won't use gains nothing, and the fetch would connect past its route; also
+// for a `proxy` line grab can't read. A new server has only the environment's guard settings (an
+// inherited RCLONE_SFTP_SOCKS_PROXY covers every server).
 //
 // `Purpose::edit`: the fetch of an Edit, checked against what the save leaves: the section's
-// rclone.* lines even when its details can't be read, and every rclone extra the store keeps for
-// the server whatever login it is bound to (update_server binds them all to the new login). A store
-// that can't be read doesn't count there: the save sets it aside, the way out the guard's text
-// gives.
+// rclone.* lines and `proxy` line even when its details can't be read, and every rclone extra and
+// kept proxy the store keeps for the server whatever login it is bound to (update_server binds
+// them all to the new login, and takes a kept proxy into the `proxy` line). A store that can't be
+// read doesn't count there: the save sets it aside, the way out the guard's text gives.
 enum class Purpose { trust, edit };
 [[nodiscard]] std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name,
                                                                Purpose purpose = Purpose::trust);
@@ -130,9 +138,10 @@ enum class Purpose { trust, edit };
 [[nodiscard]] std::optional<std::string> name_taken(const Env& env, const std::string& name);
 
 // Why the details of `s` can't be saved (server_conf's checks: host, user, port, the key file
-// there, search folders; G5, G28), "field: why" for the first problem; nullopt when fine.
+// there, the proxy, search folders; G5, G28), "field: why" for the first problem; nullopt when
+// fine.
 struct Problem {
-    std::string field; // "host", "port", "user", "keyFile", "roots"
+    std::string field; // "host", "port", "user", "keyFile", "proxy", "proxySecret", "roots"
     std::string why;
 };
 [[nodiscard]] std::optional<Problem> check_server(const servers::NewServer& s);
@@ -146,8 +155,12 @@ struct Problem {
 
 // Pins `keys` (in place of any for the server's host and port), saves the password (Auth::password)
 // or the key's passphrase (Auth::key) in the store, appends the grab.conf section and makes it the
-// default when there is none. If writing grab.conf fails, the store goes back to what it was, so
-// the name stays free. Returns a note, or "".
+// default when there is none. A proxy (s.proxy) goes into the section's `proxy` line, its password
+// into the store bound to the proxy's own user@host:port, and a copy of it in rclone's form
+// (rclone.socks_proxy or rclone.http_proxy, bound to the server's login), which grab 0.21-0.25
+// refuse the server for rather than connect directly past it (PROXIES.md decision 6). If writing
+// grab.conf fails, the store goes back to what it was, so the name stays free. Returns a note, or
+// "".
 [[nodiscard]] std::expected<std::string, std::string> add_server(const Env& env, const servers::NewServer& s,
                                                                  const std::optional<std::string>& secret,
                                                                  const HostKeys& keys);
@@ -174,7 +187,14 @@ struct Problem {
 // can get one here. `keys`, when given, are pinned (in place of any for the new host and port).
 // A new user, host or port drops what the old one told grab (shell_type and the sum commands,
 // asked again by the next Test), the learned connection limit and timings (G122), and the old
-// address's keys unless another server is there (review G87). Returns a note, or "".
+// address's keys unless another server is there (review G87).
+// The proxy (PROXIES.md 3.3, 3.7): `wanted.proxy` replaces it (none: directly), its password
+// typed, else the saved one while the proxy and its user stay the same; unset keeps the server's:
+// its `proxy` line (one grab can't read stops the save), else the one proxy the store keeps for
+// it in rclone's form, which moves into the line (with its password into the store's
+// proxy_password). The proxy password stays bound to the proxy, whatever the server's login does;
+// the copy for older grabs (add_server) is kept in step, bound to the new login. Returns a note,
+// or "".
 [[nodiscard]] std::expected<std::string, std::string> update_server(const Env& env, const servers::NewServer& wanted,
                                                                     const std::optional<std::string>& secret,
                                                                     const std::optional<HostKeys>& keys);
@@ -235,7 +255,7 @@ struct TestResult {
 // A test's result as `grab server add | edit | test` print it, one line:
 //   grab: OK, home folder listed, searches with find (GNU find), checksums: md5sum
 //   grab: FAILED: <why>
-//   not usable: [Box] connects through a SOCKS proxy (rclone.socks_proxy), which grab can't, ...
+//   not usable: [Box] connects through an ssh command (rclone.ssh in grab's store), which grab can't, ...
 [[nodiscard]] std::vector<std::string> test_lines(const TestResult& t);
 
 } // namespace grab::server_ops

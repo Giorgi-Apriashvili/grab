@@ -6,6 +6,7 @@
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "passwords.hpp"
+#include "proxy.hpp"
 #include "rclone_import.hpp"
 #include "server_conf.hpp"
 #include "sftp.hpp"
@@ -16,11 +17,13 @@
 #include "util.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <format>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <system_error>
 #include <tuple>
@@ -196,7 +199,8 @@ std::expected<StoreForChange, std::string> load_store(const Env& env, std::strin
     }
     out.note = std::format("grab's saved passwords couldn't be read (another Windows account's, or damaged) and were "
                            "moved aside to {}, with any proxy or ssh command a server kept there (such a server now "
-                           "connects directly)",
+                           "connects directly, or through the proxy its grab.conf section gives it, whose password "
+                           "is typed again with Edit)",
                            util::path_to_utf8(*loaded->set_aside));
     if (!typed.empty()) out.note += std::format("; enter the password of {} again with Edit", util::join(typed, ", "));
     if (!stored_key.empty()) {
@@ -241,6 +245,89 @@ server_conf::Connection connection_of(const servers::NewServer& s) {
     return c;
 }
 
+// ---- proxies (PROXIES.md 3.3) -----------------------------------------------------------------
+
+// The proxy of server `name`'s `proxy` line in `env`'s grab.conf, read whether or not the rest of
+// its section can be: kind none when it has none, the error ("[Box] proxy: ...") when grab can't
+// read it.
+std::expected<proxy::Proxy, std::string> line_proxy(const Env& env, std::string_view name) {
+    auto doc = ini::parse(env.grab_text);
+    if (!doc) return util::fail(doc.error());
+    const auto* section = doc->find(name);
+    if (section == nullptr) return proxy::Proxy{};
+    const auto line = section->get("proxy");
+    if (!line || util::trim(*line).empty()) return proxy::Proxy{};
+    auto p = proxy::parse(util::trim(*line), name);
+    if (!p) return util::failf("[{}] proxy: {}", name, p.error());
+    return p;
+}
+
+constexpr std::string_view socks_copy = "rclone.socks_proxy";
+constexpr std::string_view http_copy = "rclone.http_proxy";
+constexpr std::array<std::string_view, 3> proxy_keys{passwords::proxy_password, socks_copy, http_copy};
+
+using Values = std::map<std::string, passwords::Secret, std::less<>>;
+
+// What the store keeps of server `name`'s proxy `p` (with its password; none: directly), bound to
+// `login`, the server's: the proxy password, only with a user, bound to the proxy's own
+// user@host:port; the copy for older grabs in rclone's form (decision 6), bound to the login, as
+// the import kept one, so that 0.21-0.25 refuse the server and 0.20.1 goes through it.
+Values proxy_entries(const proxy::Proxy& p, const passwords::Binding& login) {
+    Values out;
+    if (p.kind == proxy::Kind::none) return out;
+    if (!p.user.empty() && !p.password.empty()) {
+        out.emplace(passwords::proxy_password, passwords::Secret{.binding = guard::proxy_login(p), .value = p.password});
+    }
+    out.emplace(p.kind == proxy::Kind::socks5 ? socks_copy : http_copy,
+                passwords::Secret{.binding = login, .value = proxy::rclone_text(p)});
+    return out;
+}
+
+// Whether `store` holds exactly `entries` of server `name`'s proxy keys.
+bool holds_entries(const passwords::Store& store, std::string_view name, const Values& entries) {
+    return std::ranges::all_of(proxy_keys, [&](std::string_view key) {
+        const auto* have = passwords::find(store, name, key);
+        const auto want = entries.find(key);
+        return want == entries.end() ? have == nullptr : have != nullptr && *have == want->second;
+    });
+}
+
+// Server `name`'s proxy keys in `store` replaced by `entries`.
+void set_entries(passwords::Store& store, const std::string& name, const Values& entries) {
+    auto& values = store[name];
+    for (const std::string_view key : proxy_keys) {
+        if (const auto it = values.find(key); it != values.end()) values.erase(it);
+    }
+    for (const auto& [key, secret] : entries) values.insert_or_assign(key, secret);
+    if (values.empty()) store.erase(name);
+}
+
+bool same_proxy(const proxy::Proxy& a, const proxy::Proxy& b) {
+    return a.kind == b.kind && a.host == b.host && a.port == b.port && a.user == b.user;
+}
+
+// The proxy server `wanted.name` has after an edit to `wanted`, with the password its store entries
+// then hold: the wanted one (none: directly), its password typed, else the one saved for that
+// very proxy and user; unset, its `proxy` line (`line`), else the one proxy the store keeps for it
+// in rclone's form, of any login (the edit binds it to the new one), which moves into the line
+// (3.7). nullopt: the store's proxies stay as they are (it keeps none, or ones grab won't use,
+// which go on refusing the server).
+std::optional<proxy::Proxy> proxy_after(const passwords::Store& store, const servers::NewServer& wanted,
+                                        const proxy::Proxy& line) {
+    server_conf::Connection now;
+    now.proxy = line;
+    auto current = guard::route(store, wanted.name, now, true);
+    if (wanted.proxy) {
+        proxy::Proxy p = *wanted.proxy;
+        if (p.kind == proxy::Kind::none) return proxy::Proxy{};
+        if (p.password.empty() && current && same_proxy(current->proxy, p)) p.password = current->proxy.password;
+        if (p.user.empty()) p.password.clear(); // sent only with a user
+        return p;
+    }
+    if (!current || current->from == guard::ProxyFrom::none) return std::nullopt;
+    return std::move(current->proxy);
+}
+
 } // namespace
 
 std::expected<Env, std::string> load_env(const std::filesystem::path& grab_conf) {
@@ -282,11 +369,14 @@ std::string time_text(std::chrono::milliseconds t) {
     return t.count() % 1000 == 0 ? std::format("{}s", t.count() / 1000) : std::format("{}ms", t.count());
 }
 
-// The guard's reasons and the search method of server `s` as make_context resolves them (a
-// `store` that can't be read may hold a route).
+// The guard's reasons, the proxy (without its password) and the search method of server `s` as
+// make_context and ssh_target resolve them (a `store` that can't be read may hold a route; its
+// proxy is then the line's).
 struct Resolved {
     std::vector<guard::Reason> guard;
     std::string search;
+    proxy::Proxy proxy;
+    guard::ProxyFrom proxy_from = guard::ProxyFrom::none;
 };
 Resolved resolve(const RemoteSettings& s, const server_conf::Connection& conn, const RcloneRemote& remote,
                  const std::expected<passwords::Store, std::string>& store) {
@@ -296,8 +386,19 @@ Resolved resolve(const RemoteSettings& s, const server_conf::Connection& conn, c
     auto found = guard::evaluate(sources);
     // Its copy of the extras (a proxy can hold a password), wiped as make_context does.
     for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
-    if (!store) guard::add_unreadable_store(found);
     Resolved out;
+    out.proxy = conn.proxy;
+    out.proxy_from = conn.proxy.kind == proxy::Kind::none ? guard::ProxyFrom::none : guard::ProxyFrom::line;
+    if (!store) {
+        guard::add_unreadable_store(found);
+    } else if (auto route = guard::route(*store, s.name, conn); !route) {
+        guard::add_route_problem(found, route.error());
+    } else {
+        out.proxy = std::move(route->proxy);
+        out.proxy_from = route->from;
+    }
+    std::ranges::fill(out.proxy.password, '\0');
+    out.proxy.password.clear();
     out.guard = guard::reasons(found);
     out.search = std::string(search_method(s, remote));
     return out;
@@ -360,6 +461,8 @@ std::vector<ServerInfo> list_servers(const Env& env) {
             auto resolved = resolve(s, conn, remote, store);
             info.guard = std::move(resolved.guard);
             info.search = std::move(resolved.search);
+            info.proxy = std::move(resolved.proxy);
+            info.proxy_from = resolved.proxy_from;
             if (!info.guard.empty()) {
                 info.unusable = guard::text(s.name, info.guard);
             } else if (auto reach = engine::connect_settings(s); !reach) {
@@ -408,6 +511,7 @@ std::vector<guard::Reason> guard_of(const Env& env, std::string_view name, Purpo
             }
         }
         std::vector<std::pair<std::string, std::string>> extras;
+        std::optional<guard::RouteProblem> problem;
         if (const auto store = passwords::load(env.passwords)) {
             if (const auto it = store->find(name); it != store->end()) {
                 for (const auto& [key, saved] : it->second) {
@@ -416,10 +520,15 @@ std::vector<guard::Reason> guard_of(const Env& env, std::string_view name, Purpo
                     }
                 }
             }
+            // The kept proxies of any login, unless the `proxy` line wins (one grab can't read
+            // is reach_for's to refuse).
+            lines.proxy = line_proxy(env, name).value_or(proxy::Proxy{});
+            if (auto route = guard::route(*store, name, lines, true); !route) problem = std::move(route.error());
         }
         auto sources = guard::sources(*s, lines, std::move(extras));
-        const auto found = guard::evaluate(sources);
+        auto found = guard::evaluate(sources);
         for (auto& [key, value] : sources.extras) std::ranges::fill(value, '\0');
+        if (problem) guard::add_route_problem(found, *problem);
         return guard::reasons(found);
     }
     if (s != nullptr) {
@@ -450,6 +559,33 @@ std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_vie
         out.bind_from = reach->bind_from;
     }
     out.connect_timeout = reach->connect_timeout;
+
+    // Its proxy as its connections take it (guard::route), or as an Edit leaves it; never around
+    // a `proxy` line grab can't read.
+    const auto line = line_proxy(env, name);
+    if (!line) return util::fail(line.error());
+    server_conf::Connection c;
+    const auto details = connection_in(env.grab_text, name);
+    const bool known = details && *details;
+    if (known) c = **details;
+    c.proxy = *line;
+    if (const auto store = passwords::load(env.passwords)) {
+        // Without details there is no login to match: a kept proxy of any login goes, rather than
+        // none (the guard has refused what Trust won't use before this).
+        auto route = guard::route(*store, name, c, purpose == Purpose::edit || !known);
+        if (!route) return util::fail(guard::route_text(name, route.error()));
+        out.proxy = std::move(route->proxy);
+    } else if (purpose == Purpose::edit) {
+        // An Edit sets a store that can't be read aside, and what it kept with it.
+        out.proxy = *line;
+    } else {
+        // Trust is refused for a store that can't be read (the guard), also one that failed since
+        // the guard read it: it may keep the server's proxy.
+        guard::Settings unreadable;
+        guard::add_unreadable_store(unreadable);
+        return util::fail(guard::text(name, guard::reasons(unreadable)));
+    }
+    if (!out.connect_timeout && out.proxy.kind != proxy::Kind::none) out.connect_timeout = engine::proxy_connect_timeout;
     return out;
 }
 
@@ -504,6 +640,17 @@ std::optional<Problem> check_server(const servers::NewServer& s) {
         const bool there = std::filesystem::is_regular_file(util::path_from_utf8(s.key_file), ec);
         if (auto why = server_conf::check_key_file(s.key_file, there)) return Problem{.field = "keyFile", .why = std::move(*why)};
     }
+    if (s.proxy && s.proxy->kind != proxy::Kind::none) {
+        const proxy::Proxy& p = *s.proxy;
+        if (auto why = server_conf::check_proxy(p, s.name)) return Problem{.field = "proxy", .why = std::move(*why)};
+        if (s.host.contains('%')) {
+            return Problem{.field = "host", .why = "an address with a zone can't go through a proxy"};
+        }
+        if (p.kind == proxy::Kind::socks5 && p.password.size() > 255) {
+            return Problem{.field = "proxySecret",
+                           .why = "the proxy's password is longer than SOCKS5 allows (255 bytes)"};
+        }
+    }
     for (const auto& root : s.search_roots) {
         if (auto why = server_conf::check_search_root(root)) return Problem{.field = "roots", .why = std::move(*why)};
     }
@@ -522,7 +669,11 @@ std::expected<std::string, std::string> add_server(const Env& loaded, const serv
     if (auto problem = check_server(s)) return util::failf("{}: {}", problem->field, problem->why);
     if (s.auth == servers::Auth::stored_key) return util::fail("a key kept in grab's store can only be imported");
     if (s.auth == servers::Auth::password && (!secret || secret->empty())) return util::fail("enter the password");
-    const server_conf::Connection c = connection_of(s);
+    server_conf::Connection c = connection_of(s);
+    if (s.proxy) {
+        c.proxy = *s.proxy;
+        c.proxy.password.clear(); // the store's, never grab.conf's
+    }
 
     if (auto pinned = pin_host_keys(env.known_hosts, s.host, s.port, keys.lines); !pinned) {
         return util::fail(pinned.error());
@@ -538,6 +689,12 @@ std::expected<std::string, std::string> add_server(const Env& loaded, const serv
     if (secret && !secret->empty() && (s.auth == servers::Auth::password || s.auth == servers::Auth::key)) {
         const auto key = s.auth == servers::Auth::password ? passwords::password : passwords::passphrase;
         store[s.name][std::string(key)] = passwords::Secret{.binding = login, .value = *secret};
+    }
+    // Its proxy's password and the copy for older grabs.
+    if (s.proxy) {
+        proxy::Proxy p = *s.proxy;
+        if (p.user.empty()) p.password.clear(); // sent only with a user
+        set_entries(store, s.name, proxy_entries(p, login));
     }
     if (store != before) {
         if (auto saved = passwords::save(env.passwords, store); !saved) return util::fail(saved.error());
@@ -607,12 +764,25 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     const auto read = connection_in(env.grab_text, wanted.name);
     const std::optional<server_conf::Connection> current = read ? *read : std::nullopt;
     const bool typed = secret && !secret->empty();
+    // The `proxy` line, read whatever else of the section can't be: one grab can't read stops the
+    // save unless it sets another, rather than blank it (the server would connect directly).
+    const auto line = line_proxy(env, wanted.name);
+    if (!line && !wanted.proxy) {
+        return util::failf("{}; correct the proxy line in [{}] (grab config) first", line.error(), wanted.name);
+    }
+    const auto readable = passwords::load(env.passwords);
+    // The proxy the save leaves, with the password the store then keeps for it (an unreadable
+    // store is set aside below: nothing of it is kept).
+    const auto proxy_next =
+        proxy_after(readable ? *readable : passwords::Store{}, wanted, line.value_or(proxy::Proxy{}));
 
     server_conf::Connection next = current.value_or(server_conf::Connection{});
     next.host = wanted.host;
     next.port = wanted.port;
     next.user = wanted.user;
     next.auth = wanted.auth;
+    next.proxy = proxy_next.value_or(proxy::Proxy{});
+    next.proxy.password.clear(); // the store's, never grab.conf's
     if (wanted.auth == servers::Auth::stored_key && (!current || current->auth != servers::Auth::stored_key)) {
         return util::fail("a key kept in grab's store can only be imported: choose another way to log in");
     }
@@ -650,9 +820,13 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     std::optional<passwords::Store> before;
     passwords::Store store;
     std::string store_note;
+    const passwords::Binding login{.user = next.user, .host = next.host, .port = next.port};
+    // The proxy's password and the copy for older grabs, kept in step with the line.
+    const Values entries = proxy_next ? proxy_entries(*proxy_next, login) : Values{};
+    const bool proxy_changes = proxy_next && !(readable && holds_entries(*readable, wanted.name, entries));
     const bool secret_kind = wanted.auth == servers::Auth::password || wanted.auth == servers::Auth::key;
-    const bool needs_store = method || moved || key_changed || (typed && secret_kind);
-    const bool unreadable = !passwords::load(env.passwords).has_value();
+    const bool needs_store = method || moved || key_changed || (typed && secret_kind) || proxy_changes;
+    const bool unreadable = !readable.has_value();
     std::optional<StoreForChange> loaded_store;
     if (needs_store || unreadable) {
         auto got = load_store(env, wanted.name);
@@ -663,7 +837,6 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
         store_note = std::move(loaded_store->note);
         before = loaded_store->store;
         store = std::move(loaded_store->store);
-        const passwords::Binding login{.user = next.user, .host = next.host, .port = next.port};
         if (const auto it = store.find(wanted.name); it != store.end()) {
             auto& values = it->second;
             if (method) {
@@ -675,16 +848,20 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
                 }
             }
             // A password goes only to the login it was typed for (G40); the key's passphrase, an
-            // imported key and rclone extras belong to this server wherever it moved.
+            // imported key and rclone extras belong to this server wherever it moved. The proxy's
+            // password stays bound to its proxy.
             if (moved) values.erase(std::string(passwords::password));
             if (key_changed && !typed) values.erase(std::string(passwords::passphrase));
-            for (auto& [key, saved] : values) saved.binding = login;
+            for (auto& [key, saved] : values) {
+                if (key != passwords::proxy_password) saved.binding = login;
+            }
             if (values.empty()) store.erase(it);
         }
         if (typed && secret_kind) {
             const auto key = wanted.auth == servers::Auth::password ? passwords::password : passwords::passphrase;
             store[wanted.name][std::string(key)] = passwords::Secret{.binding = login, .value = *secret};
         }
+        if (proxy_next) set_entries(store, wanted.name, entries);
         if (store != *before) {
             if (auto saved = passwords::save(env.passwords, store); !saved) return util::fail(saved.error());
         }
