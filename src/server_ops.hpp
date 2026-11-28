@@ -119,6 +119,14 @@ struct HostKeys {
 enum class Purpose { trust, edit };
 [[nodiscard]] std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_view name,
                                                                Purpose purpose = Purpose::trust);
+// The host-key fetch of an Add or an Edit that gives the proxy (`wanted.proxy`; unset:
+// reach_for's Purpose::edit): through that proxy (none: directly), with its password as typed,
+// else, for a server grab.conf has, the one saved for that very proxy and user (update_server
+// keeps it), and engine::proxy_connect_timeout when no connect_timeout is written. The guard as
+// Purpose::edit has it, but neither the proxies grab's store keeps for the server nor a `proxy`
+// line grab can't read: the save replaces them with `wanted.proxy`. A new server has only the
+// environment's guard settings.
+[[nodiscard]] std::expected<ssh::Reach, std::string> reach_for_save(const Env& env, const servers::NewServer& wanted);
 
 // Pins `lines` for host:port in known_hosts, in place of every key it held for host:port before
 // (servers::forget_host; review G87). Each line has to be one for host:port. Under the settings
@@ -169,6 +177,21 @@ struct Problem {
 // they are, its search folders, depth and connection limit. A section without details (or with
 // details grab can't read) starts from a blank host and user, port 22 and a password.
 [[nodiscard]] servers::NewServer edit_defaults(const ServerInfo& current);
+// The proxy an edit of server `name` starts from (`grab server edit`'s default): what a save
+// that leaves NewServer::proxy unset keeps (update_server): its `proxy` line, else the one proxy
+// grab's store keeps for it in rclone's form, of any login (the save takes it into the line),
+// else directly. Never its password: only whether one is saved for that very proxy and user,
+// which an edit that keeps both keeps too. A store that can't be read offers the line's, no
+// password (the save sets the store aside, with what it kept). Nothing is offered (`proxy`
+// unset, `why` says why) for a `proxy` line grab can't read, or kept proxies grab won't use (both
+// kinds, or one it can't read): the edit has to choose.
+struct ProxyOffer {
+    std::optional<proxy::Proxy> proxy; // without its password; kind none: directly
+    guard::ProxyFrom from = guard::ProxyFrom::none;
+    bool password_saved = false;
+    std::string why;
+};
+[[nodiscard]] ProxyOffer edit_proxy(const Env& env, std::string_view name);
 // Whether an edit from `current` to `wanted` must fetch and confirm the host key again: the
 // address changed, no key is pinned yet, or the section had no details to compare with.
 [[nodiscard]] bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wanted);
@@ -233,6 +256,18 @@ struct TestResult {
 [[nodiscard]] std::string login_text(const ServerInfo& s);
 // "host key pinned", or "host key not trusted (grab server trust NAME)".
 [[nodiscard]] std::string host_key_text(const ServerInfo& s);
+// The proxy `s` goes through, for `grab server list`, never its password: "through the SOCKS5
+// proxy alice@127.0.0.1:9050 (in grab.conf)", or for one grab's store keeps "... (kept in grab's
+// store: from rclone, or a proxy line since removed; grab server edit NAME writes it into
+// grab.conf)"; "" directly.
+[[nodiscard]] std::string route_text(const ServerInfo& s);
+// What the host-key fetch of Add, Edit and Trust says beside the fingerprints when it went
+// through `through` and read a key `known_hosts` (grab's) doesn't hold for host:port yet: "Read
+// through the SOCKS5 proxy 127.0.0.1:9050. A proxy can show its own key here; if you can, compare
+// these fingerprints with the server's owner." (PROXIES.md, "Host keys unchanged"); "" directly,
+// or when every key read is pinned there already. A known_hosts that can't be read holds none.
+[[nodiscard]] std::string fetch_note(const std::filesystem::path& known_hosts, std::string_view host, int port,
+                                     const HostKeys& keys, const proxy::Proxy& through);
 
 // The window's one-time notice after an import (the names rclone_import::take_banner gives):
 // whose connection details moved from rclone.conf into grab.conf, then what each of them still

@@ -467,6 +467,18 @@ std::expected<Proxy, std::string> parse_rclone_http(std::string_view text) {
     return p;
 }
 
+std::expected<Proxy, std::string> parse_address(std::string_view text) {
+    const std::string_view t = util::trim(text);
+    // A whole proxy pasted here: never read for a login, never repeated (it may hold a password).
+    if (t.contains("://") || t.contains('@'))
+        return util::fail("give the proxy's host and port alone, as 127.0.0.1:9050: its kind and user name are asked "
+                          "on their own");
+    auto hp = split_host_port(t, "127.0.0.1:9050");
+    if (!hp) return util::fail(std::move(hp.error()));
+    if (!hp->port) return util::fail("give the proxy's port too (127.0.0.1:9050)");
+    return Proxy{.kind = Kind::none, .host = std::move(hp->host), .port = *hp->port, .user = {}, .password = {}};
+}
+
 std::string text(const Proxy& proxy) {
     if (proxy.kind == Kind::none) return {};
     const std::string user = proxy.user.empty() ? std::string() : percent_encode(proxy.user) + "@";

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #include "fake_proxy.hpp"
@@ -201,6 +202,36 @@ TEST_CASE("proxy: the copy for older grabs in rclone's form reads back; the said
     CHECK(proxy::said(P{.kind = Kind::http, .host = "::1", .port = 3128, .user = {}, .password = "fake-pw"}) ==
           "the HTTP proxy [::1]:3128");
     CHECK(proxy::said(P{}).empty());
+}
+
+TEST_CASE("proxy: the address `grab server add` and `edit` ask for: host:port, an IPv6 one in brackets, the port required") {
+    using P = proxy::Proxy;
+    for (const auto& [typed, want] :
+         {std::pair{"127.0.0.1:9050", P{.kind = Kind::none, .host = "127.0.0.1", .port = 9050, .user = {}, .password = {}}},
+          std::pair{" proxy.example:3128 ", P{.kind = Kind::none, .host = "proxy.example", .port = 3128, .user = {}, .password = {}}},
+          std::pair{"[::1]:1080", P{.kind = Kind::none, .host = "::1", .port = 1080, .user = {}, .password = {}}}}) {
+        CAPTURE(typed);
+        const auto read = proxy::parse_address(typed);
+        REQUIRE_MESSAGE(read.has_value(), read.error_or(""));
+        CHECK(*read == want);
+    }
+    for (const auto& [typed, why] : {
+             std::pair{"", "give the proxy's host and port (127.0.0.1:9050)"},
+             std::pair{"127.0.0.1", "give the proxy's port too (127.0.0.1:9050)"},
+             std::pair{"127.0.0.1:0", "the proxy's port must be from 1 to 65535"},
+             std::pair{"::1:1080", "write the proxy's IPv6 address in brackets: [::1]:1080"},
+             std::pair{"a b:1", "use a host name (letters, digits, - and .) or an IP address for the proxy"},
+             // A whole proxy pasted in: never read for a login, and nothing of it quoted.
+             std::pair{"socks5://fake-user:fake-pw@127.0.0.1:1080",
+                       "give the proxy's host and port alone, as 127.0.0.1:9050: its kind and user name are asked on "
+                       "their own"},
+             std::pair{"fake-user:fake-pw@127.0.0.1:1080",
+                       "give the proxy's host and port alone, as 127.0.0.1:9050: its kind and user name are asked on "
+                       "their own"},
+         }) {
+        CAPTURE(typed);
+        CHECK(proxy::parse_address(typed).error_or("") == why);
+    }
 }
 
 TEST_CASE("proxy: what a proxy can't be asked for is refused before anything is sent") {

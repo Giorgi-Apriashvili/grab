@@ -222,6 +222,22 @@ TEST_CASE("grab server: list, add [NAME], and edit, test, trust and remove with 
     CHECK(parse_args(args({"server", "test", "--", "-odd"}))->opts.server_args == std::vector<std::string>{"test", "-odd"});
 }
 
+TEST_CASE("the help says grab server asks for a server's proxy and goes through it; no flag gives one") {
+    const auto help = usage();
+    CHECK(help.find("server add [NAME]    set up a server step by step (host, login, proxy, host key, search") !=
+          std::string::npos);
+    CHECK(help.find("A proxy is SOCKS5 or HTTP, with or without a user name; grab\n"
+                    "                       never goes around it, and the proxy looks up the server's name") !=
+          std::string::npos);
+    CHECK(help.find("proxy's while the proxy and its user stay the same") != std::string::npos);
+    CHECK(help.find("the proxy it\n                       goes through") != std::string::npos);
+    CHECK(help.find("(through its proxy),\n                       and list its home") != std::string::npos);
+    CHECK(help.find("server trust NAME    fetch (through its proxy), confirm and pin") != std::string::npos);
+    // A proxy is a server's setting (PROXIES.md decision 5): no per-run flag goes around it.
+    CHECK(help.find("--proxy") == std::string::npos);
+    CHECK_FALSE(parse_args(args({"x", "--proxy", "none"})).has_value());
+}
+
 TEST_CASE("mode defaults to file and the two mode flags are exclusive") {
     auto bare = parse_args(args({"lioness"}));
     REQUIRE(bare.has_value());

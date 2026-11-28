@@ -55,14 +55,18 @@ Commands:
   config               open grab.conf in your editor: [grab] editor, then $VISUAL, then
                        $EDITOR, else notepad. The file is created from the example if missing.
   server list          the configured servers: login, how it logs in, whether a password is
-                       saved, lookup method, whether its host key is pinned, and why grab
-                       doesn't connect to one it can't use
-  server add [NAME]    set up a server step by step (host, login, host key, search roots);
-                       writes grab.conf (a password to grab's encrypted store), then tests it
+                       saved, lookup method, whether its host key is pinned, the proxy it
+                       goes through, and why grab doesn't connect to one it can't use
+  server add [NAME]    set up a server step by step (host, login, proxy, host key, search
+                       roots); writes grab.conf (passwords to grab's encrypted store), then
+                       tests it. A proxy is SOCKS5 or HTTP, with or without a user name; grab
+                       never goes around it, and the proxy looks up the server's name
   server edit NAME     the same questions, the current answers as defaults; Enter keeps the
-                       saved password while user, host and port stay the same
-  server test NAME     log in as downloads, searches and verification do, and list its home
-  server trust NAME    fetch, confirm and pin a server's host key
+                       saved password while user, host and port stay the same, and the
+                       proxy's while the proxy and its user stay the same
+  server test NAME     log in as downloads, searches and verification do (through its proxy),
+                       and list its home
+  server trust NAME    fetch (through its proxy), confirm and pin a server's host key
   server remove NAME   delete a server from grab.conf, its saved password and host keys
   upload LOCAL... REMOTE_DIR
                        send files and folders to the server folder REMOTE_DIR (see above)

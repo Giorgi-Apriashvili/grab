@@ -311,11 +311,19 @@ bool same_proxy(const proxy::Proxy& a, const proxy::Proxy& b) {
 // very proxy and user; unset, its `proxy` line (`line`), else the one proxy the store keeps for it
 // in rclone's form, of any login (the edit binds it to the new one), which moves into the line
 // (3.7). nullopt: the store's proxies stay as they are (it keeps none, or ones grab won't use,
-// which go on refusing the server).
+// which go on refusing the server). A line that can't be read offers no saved password (Edit's
+// prompt then says Enter means none), so none is taken from the store's copy either.
 std::optional<proxy::Proxy> proxy_after(const passwords::Store& store, const servers::NewServer& wanted,
-                                        const proxy::Proxy& line) {
+                                        const std::expected<proxy::Proxy, std::string>& line) {
+    if (!line) {
+        if (!wanted.proxy) return std::nullopt; // the save refuses this (update_server)
+        if (wanted.proxy->kind == proxy::Kind::none) return proxy::Proxy{};
+        proxy::Proxy p = *wanted.proxy;
+        if (p.user.empty()) p.password.clear(); // sent only with a user
+        return p;
+    }
     server_conf::Connection now;
-    now.proxy = line;
+    now.proxy = *line;
     auto current = guard::route(store, wanted.name, now, true);
     if (wanted.proxy) {
         proxy::Proxy p = *wanted.proxy;
@@ -494,8 +502,9 @@ namespace {
 // (resolve); for a section without them, its own settings and the environment; for a server
 // grab.conf doesn't have yet, the environment alone (an inherited RCLONE_SFTP_* covers every
 // server). A store that can't be read counts only beside details: what it keeps is bound to a login.
-// For an Edit's fetch, what the save will leave (reach_for).
-std::vector<guard::Reason> guard_of(const Env& env, std::string_view name, Purpose purpose) {
+// For an Edit's fetch, what the save will leave (reach_for); `proxy_given`: the Edit gives the
+// proxy, which replaces any the store keeps (reach_for_save).
+std::vector<guard::Reason> guard_of(const Env& env, std::string_view name, Purpose purpose, bool proxy_given = false) {
     const auto* s = find_server(env.cfg, name);
     if (s != nullptr && purpose == Purpose::edit) {
         // The section's rclone.* lines as they are: set_connection keeps them, read or not.
@@ -521,9 +530,11 @@ std::vector<guard::Reason> guard_of(const Env& env, std::string_view name, Purpo
                 }
             }
             // The kept proxies of any login, unless the `proxy` line wins (one grab can't read
-            // is reach_for's to refuse).
+            // is reach_for's to refuse) or the Edit gives its own.
             lines.proxy = line_proxy(env, name).value_or(proxy::Proxy{});
-            if (auto route = guard::route(*store, name, lines, true); !route) problem = std::move(route.error());
+            if (auto route = guard::route(*store, name, lines, true); !route && !proxy_given) {
+                problem = std::move(route.error());
+            }
         }
         auto sources = guard::sources(*s, lines, std::move(extras));
         auto found = guard::evaluate(sources);
@@ -585,6 +596,33 @@ std::expected<ssh::Reach, std::string> reach_for(const Env& env, std::string_vie
         guard::add_unreadable_store(unreadable);
         return util::fail(guard::text(name, guard::reasons(unreadable)));
     }
+    if (!out.connect_timeout && out.proxy.kind != proxy::Kind::none) out.connect_timeout = engine::proxy_connect_timeout;
+    return out;
+}
+
+std::expected<ssh::Reach, std::string> reach_for_save(const Env& env, const servers::NewServer& wanted) {
+    if (!wanted.proxy) return reach_for(env, wanted.name, Purpose::edit);
+    if (const auto blocked = guard_of(env, wanted.name, Purpose::edit, true); !blocked.empty()) {
+        return util::fail(guard::text(wanted.name, blocked));
+    }
+    ssh::Reach out;
+    out.proxy = *wanted.proxy;
+    if (const auto* s = find_server(env.cfg, wanted.name)) {
+        auto reach = engine::connect_settings(*s);
+        if (!reach) return util::fail(reach.error());
+        if (reach->bind) {
+            out.bind = *reach->bind;
+            out.bind_from = reach->bind_from;
+        }
+        out.connect_timeout = reach->connect_timeout;
+        // The password as the save keeps it (proxy_after): typed, else the one saved for that
+        // very proxy and user. A store that can't be read is set aside by the save, with it.
+        if (const auto store = passwords::load(env.passwords)) {
+            out.proxy = proxy_after(*store, wanted, line_proxy(env, wanted.name)).value_or(proxy::Proxy{});
+        }
+    }
+    // A new server's name may still have what a removed one left in the store: Add never uses it.
+    if (out.proxy.user.empty()) out.proxy.password.clear(); // sent only with a user
     if (!out.connect_timeout && out.proxy.kind != proxy::Kind::none) out.connect_timeout = engine::proxy_connect_timeout;
     return out;
 }
@@ -739,6 +777,31 @@ servers::NewServer edit_defaults(const ServerInfo& current) {
     return s;
 }
 
+ProxyOffer edit_proxy(const Env& env, std::string_view name) {
+    const auto line = line_proxy(env, name);
+    if (!line) {
+        return ProxyOffer{.proxy = std::nullopt, .from = guard::ProxyFrom::none, .password_saved = false,
+                          .why = line.error()};
+    }
+    const auto from_line = line->kind == proxy::Kind::none ? guard::ProxyFrom::none : guard::ProxyFrom::line;
+    const auto store = passwords::load(env.passwords);
+    if (!store) return ProxyOffer{.proxy = *line, .from = from_line, .password_saved = false, .why = {}};
+    // As proxy_after finds it for a save that leaves the proxy unset.
+    server_conf::Connection now;
+    now.proxy = *line;
+    auto route = guard::route(*store, name, now, true);
+    if (!route) {
+        return ProxyOffer{.proxy = std::nullopt, .from = guard::ProxyFrom::none, .password_saved = false,
+                          .why = guard::route_text(name, route.error())};
+    }
+    ProxyOffer out{
+        .proxy = route->proxy, .from = route->from, .password_saved = !route->proxy.password.empty(), .why = {}};
+    std::ranges::fill(route->proxy.password, '\0');
+    std::ranges::fill(out.proxy->password, '\0');
+    out.proxy->password.clear();
+    return out;
+}
+
 bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wanted) {
     return !current.error.empty() || !current.host_key_pinned || current.host != wanted.host ||
            current.port != wanted.port;
@@ -773,8 +836,7 @@ std::expected<std::string, std::string> update_server(const Env& loaded, const s
     const auto readable = passwords::load(env.passwords);
     // The proxy the save leaves, with the password the store then keeps for it (an unreadable
     // store is set aside below: nothing of it is kept).
-    const auto proxy_next =
-        proxy_after(readable ? *readable : passwords::Store{}, wanted, line.value_or(proxy::Proxy{}));
+    const auto proxy_next = proxy_after(readable ? *readable : passwords::Store{}, wanted, line);
 
     server_conf::Connection next = current.value_or(server_conf::Connection{});
     next.host = wanted.host;
@@ -1017,6 +1079,57 @@ std::string login_text(const ServerInfo& s) {
 std::string host_key_text(const ServerInfo& s) {
     return s.host_key_pinned ? std::string("host key pinned")
                              : std::format("host key not trusted (grab server trust {})", s.name);
+}
+
+std::string route_text(const ServerInfo& s) {
+    if (s.proxy.kind == proxy::Kind::none) return {};
+    if (s.proxy_from == guard::ProxyFrom::kept) {
+        return std::format("through {} (kept in grab's store: from rclone, or a proxy line since removed; grab server "
+                           "edit {} writes it into grab.conf)",
+                           proxy::said(s.proxy), s.name);
+    }
+    return std::format("through {} (in grab.conf)", proxy::said(s.proxy));
+}
+
+namespace {
+
+// The keys known_hosts text `text` pins for host:port, each as "type key" (markers and comments
+// aside, as server_conf::pinned reads them).
+std::vector<std::string> pinned_keys(std::string_view host, int port, std::string_view text) {
+    std::vector<std::string> out;
+    for (const auto& raw : util::split(text, '\n')) {
+        const auto line = util::trim(raw);
+        if (line.empty() || line.front() == '#' || line.front() == '@') continue;
+        const auto names_end = line.find_first_of(" \t");
+        if (names_end == std::string_view::npos) continue;
+        const auto names = util::split(line.substr(0, names_end), ',');
+        const auto names_it = [&](const std::string& n) { return servers::names_host(n, host, port); };
+        if (std::ranges::none_of(names, names_it)) continue;
+        const auto rest = util::trim(line.substr(names_end));
+        const auto type_end = rest.find_first_of(" \t");
+        if (type_end == std::string_view::npos) continue;
+        const auto key = util::trim(rest.substr(type_end));
+        out.push_back(std::format("{} {}", rest.substr(0, type_end), key.substr(0, key.find_first_of(" \t"))));
+    }
+    return out;
+}
+
+} // namespace
+
+std::string fetch_note(const std::filesystem::path& known_hosts, std::string_view host, int port, const HostKeys& keys,
+                       const proxy::Proxy& through) {
+    if (through.kind == proxy::Kind::none) return {};
+    const std::string text = util::read_file_if_exists(known_hosts).value_or(std::nullopt).value_or("");
+    const auto pinned = pinned_keys(host, port, text);
+    // A fetched line is "name type key" (ssh::known_host_line).
+    const bool known = std::ranges::all_of(keys.lines, [&](const std::string& line) {
+        const auto read = pinned_keys(host, port, line);
+        return !read.empty() && std::ranges::contains(pinned, read.front());
+    });
+    if (known) return {};
+    return std::format("Read through {}. A proxy can show its own key here; if you can, compare these fingerprints "
+                       "with the server's owner.",
+                       proxy::said(through));
 }
 
 std::string import_banner(const std::vector<std::string>& names, const std::vector<ServerInfo>& servers,

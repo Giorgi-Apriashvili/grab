@@ -1,11 +1,15 @@
 #include "server_cli.hpp"
 
 #include "config.hpp"
+#include "guard.hpp"
 #include "gui_state.hpp"
 #include "notices.hpp"
+#include "proxy.hpp"
 #include "server_conf.hpp"
 #include "server_ops.hpp"
+#include "server_prompt.hpp"
 #include "servers.hpp"
+#include "ssh.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -49,12 +53,18 @@ bool confirm(std::string_view prompt) {
     return lower == "y" || lower == "yes";
 }
 
+// " through the SOCKS5 proxy alice@127.0.0.1:9050" (never its password), or "" directly.
+std::string through(const proxy::Proxy& p) {
+    return p.kind == proxy::Kind::none ? std::string() : " through " + proxy::said(p);
+}
+
 // Scans the server's host keys, shows their fingerprints and asks to trust them. Nothing is
-// written before the yes. `reach`: the server's bind and connect time (server_ops::reach_for, which
-// refuses a server grab doesn't connect to).
-std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::string& host, int port,
+// written before the yes. `reach`: the server's bind, connect time and proxy
+// (server_ops::reach_for, reach_for_save, which refuse a server grab doesn't connect to); a key
+// read through a proxy that grab's known_hosts doesn't hold yet gets the note to compare it.
+std::expected<server_ops::HostKeys, std::string> fetch_host_key(const Env& env, const std::string& host, int port,
                                                                 const ssh::Reach& reach) {
-    std::println(stderr, "Fetching the host key of {}:{} ...", host, port);
+    std::println(stderr, "Fetching the host key of {}:{}{} ...", host, port, through(reach.proxy));
     auto keys = server_ops::scan_host_keys(host, port, {}, reach);
     if (!keys) return keys;
 
@@ -62,6 +72,9 @@ std::expected<server_ops::HostKeys, std::string> fetch_host_key(const std::strin
     for (const auto& f : keys->fingerprints) std::println(stderr, "  {:<8} {}", f.type, f.hash);
     std::println(stderr, "Compare with the fingerprint your provider shows, or run on the server:");
     std::println(stderr, "  ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub\n");
+    if (const auto note = server_ops::fetch_note(env.known_hosts, host, port, *keys, reach.proxy); !note.empty()) {
+        std::println(stderr, "{}\n", note);
+    }
     if (!confirm("Trust this server?")) return util::fail("host key not trusted; nothing was changed");
     return keys;
 }
@@ -96,9 +109,11 @@ int server_list(const Env& env) {
         const char* search = s.search == "find"   ? "search with find"
                              : s.search == "walk" ? "search by listing folders"
                                                   : "search with find or by listing folders";
-        std::println("{} {:<14} {}@{}:{}  {}, {}, {}{}", mark, s.name, s.user, s.host, s.port, server_ops::login_text(s),
-                     search, server_ops::host_key_text(s),
-                     s.connection_keys.empty() ? std::string() : ", " + s.connection_keys);
+        const std::string route = server_ops::route_text(s);
+        std::println("{} {:<14} {}@{}:{}  {}, {}, {}{}{}", mark, s.name, s.user, s.host, s.port,
+                     server_ops::login_text(s), search, server_ops::host_key_text(s),
+                     s.connection_keys.empty() ? std::string() : ", " + s.connection_keys,
+                     route.empty() ? std::string() : ", " + route);
         if (!s.unusable.empty()) std::println("  {:<14} not usable: {}", "", s.unusable);
     }
     return exit_ok;
@@ -134,12 +149,24 @@ std::optional<std::string> ask_secret(std::string_view prompt) {
     return util::read_secret_line();
 }
 
+// The console for server_prompt's questions: this file's own prompts.
+server_prompt::Console console() {
+    return server_prompt::Console{
+        .ask = [](std::string_view prompt, std::string_view def) { return ask(prompt, def); },
+        .secret = [](std::string_view prompt) { return ask_secret(prompt); },
+        .say = [](std::string_view line) { std::println(stderr, "{}", line); },
+    };
+}
+
 // The questions `grab server add` and `edit` share, from the host to the search depth, with `s`
-// as the defaults; the answers go into `s`, a password or passphrase typed into `secret`.
-// `current` is the server being edited (nullptr for a new one): Enter keeps its saved password
-// only while user, host and port stay the same (server_ops::edit_needs_password), and its saved
-// passphrase while it logs in with a key file. False when the input ran out.
-bool ask_details(servers::NewServer& s, std::optional<std::string>& secret, const server_ops::ServerInfo* current) {
+// as the defaults; the answers go into `s`, a password or passphrase typed into `secret`, the
+// proxy (with its password, typed) into s.proxy. `current` is the server being edited (nullptr
+// for a new one): Enter keeps its saved password only while user, host and port stay the same
+// (server_ops::edit_needs_password), and its saved passphrase while it logs in with a key file.
+// `proxy`: the proxy offered (server_ops::edit_proxy; directly for a new server). False when the
+// input ran out.
+bool ask_details(servers::NewServer& s, std::optional<std::string>& secret, const server_ops::ServerInfo* current,
+                 const server_ops::ProxyOffer& proxy) {
     using servers::Auth;
     auto host = ask_until("Host name or IP", s.host, [](const std::string& v) { return server_conf::check_host(v); });
     if (!host) return false;
@@ -201,6 +228,10 @@ bool ask_details(servers::NewServer& s, std::optional<std::string>& secret, cons
         if (!pass->empty()) secret = std::move(*pass);
     }
 
+    // The route, as the window's form asks it (PROXIES.md decision 5).
+    s.proxy = server_prompt::ask_proxy(console(), proxy, s);
+    if (!s.proxy) return false;
+
     auto roots = ask_until(current != nullptr ? "Folders to search, comma-separated (~ = the login home)"
                                               : "Folders to search, comma-separated (Enter = the login home)",
                            search_roots_value(s.search_roots),
@@ -230,12 +261,15 @@ int print_test(const Env& env, const std::string& name) {
 
 // After a change: the test, with the configuration read again so that it sees what was written.
 int test_saved(const Env& env, const std::string& name) {
-    std::println(stderr, "Testing the connection ...");
     auto fresh = server_ops::load_env(env.grab_conf);
     if (!fresh) {
         error(fresh.error());
         return exit_config;
     }
+    // The route as it was saved.
+    const auto saved = server_ops::list_servers(*fresh);
+    const auto s = std::ranges::find(saved, name, &server_ops::ServerInfo::name);
+    std::println(stderr, "Testing the connection{} ...", s == saved.end() ? std::string() : through(s->proxy));
     // The change may have let grab delete its own old files (the last password saved): said now.
     if (!fresh->old_files.empty()) {
         if (!fresh->old_files_recorded) std::println(stderr, "grab: note: {}", fresh->old_files);
@@ -267,16 +301,19 @@ int server_add(const Env& env, const std::string& prefill) {
     if (!name) return aborted();
     s.name = *name;
     std::optional<std::string> secret;
-    if (!ask_details(s, secret, nullptr)) return aborted();
+    const server_ops::ProxyOffer directly{
+        .proxy = proxy::Proxy{}, .from = guard::ProxyFrom::none, .password_saved = false, .why = {}};
+    if (!ask_details(s, secret, nullptr, directly)) return aborted();
 
     // Host key first: nothing is written unless the user trusts the server. Not fetched past a
-    // route grab can't take (an inherited RCLONE_SFTP_SOCKS_PROXY covers a new server too).
-    auto reach = server_ops::reach_for(env, s.name);
+    // route grab can't take (an inherited RCLONE_SFTP_SOCKS_PROXY covers a new server too); through
+    // the proxy just given.
+    auto reach = server_ops::reach_for_save(env, s);
     if (!reach) {
         error(reach.error());
         return exit_config;
     }
-    auto keys = fetch_host_key(s.host, s.port, *reach);
+    auto keys = fetch_host_key(env, s.host, s.port, *reach);
     if (!keys) {
         error(keys.error());
         return exit_config;
@@ -302,20 +339,21 @@ int server_edit(const Env& env, const std::string& name) {
     if (!current->error.empty()) std::println(stderr, "{}\n", current->error);
     servers::NewServer s = server_ops::edit_defaults(*current);
     std::optional<std::string> secret;
-    if (!ask_details(s, secret, &*current)) {
+    if (!ask_details(s, secret, &*current, server_ops::edit_proxy(env, name))) {
         std::println(stderr, "\nno more input; nothing was changed");
         return exit_usage;
     }
 
-    // A new address, or one never pinned: its host key first, as for add.
+    // A new address, or one never pinned: its host key first, as for add, through the proxy just
+    // given.
     std::optional<server_ops::HostKeys> keys;
     if (server_ops::edit_needs_host_key(*current, s)) {
-        auto reach = server_ops::reach_for(env, name, server_ops::Purpose::edit);
+        auto reach = server_ops::reach_for_save(env, s);
         if (!reach) {
             error(reach.error());
             return exit_config;
         }
-        auto fetched = fetch_host_key(s.host, s.port, *reach);
+        auto fetched = fetch_host_key(env, s.host, s.port, *reach);
         if (!fetched) {
             error(fetched.error());
             return exit_config;
@@ -340,7 +378,7 @@ int server_test(const Env& env, const std::string& name, const std::vector<std::
         error(s->error);
         return exit_config;
     }
-    std::println(stderr, "Testing {} ({}@{}:{}) ...", name, s->user, s->host, s->port);
+    std::println(stderr, "Testing {} ({}@{}:{}){} ...", name, s->user, s->host, s->port, through(s->proxy));
     const int rc = print_test(env, name);
     for (const auto& text : again) std::println(stderr, "  note: {}", text);
     if (rc == exit_ok) std::println(stderr, "\n{} works.", name);
@@ -362,7 +400,7 @@ int server_trust(const Env& env, const std::string& name) {
         error(reach.error());
         return exit_config;
     }
-    auto keys = fetch_host_key(s->host, s->port, *reach);
+    auto keys = fetch_host_key(env, s->host, s->port, *reach);
     if (!keys) {
         error(keys.error());
         return exit_config;

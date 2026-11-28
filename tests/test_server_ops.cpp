@@ -16,6 +16,7 @@
 #include "scoped_env.hpp"
 #include "server_conf.hpp"
 #include "server_ops.hpp"
+#include "server_prompt.hpp"
 #include "servers.hpp"
 #include "ssh.hpp"
 #include "ssh_pool.hpp"
@@ -1519,5 +1520,328 @@ TEST_CASE("proxies: a wrong proxy password is fatal and tried once; a dead proxy
     REQUIRE(dead.has_value());
     CHECK(dead->grab_error.find("can't reach the proxy 127.0.0.1:") != std::string::npos);
     CHECK(dead->grab_error.find("x.invalid") == std::string::npos);
+}
+#endif
+
+// ---- proxies: `grab server` (PROXIES.md, chunk 1b) --------------------------------------------
+
+TEST_CASE("proxies: an Edit offers the proxy a save keeps: the line, a kept one of any login, never two or one grab can't read") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "\n[px]\nhost = p.example\nuser = p\nauth = agent\nproxy = socks5://alice@127.0.0.1:9050\n"
+                                     "\n[nopw]\nhost = n.example\nuser = n\nauth = agent\nproxy = http://bob@[::1]:3128\n"
+                                     "\n[plain]\nhost = d.example\nuser = d\nauth = agent\n"
+                                     "\n[two]\nhost = t.example\nuser = t\nauth = agent\n"
+                                     "\n[odd]\nhost = o.example\nuser = o\nauth = agent\n"
+                                     "\n[bad]\nhost = b.example\nuser = b\nauth = agent\nproxy = socks5://127.0.0.1\n");
+    REQUIRE(passwords::save(s.store(),
+                            {{"px", {{"proxy_password", bound(socks(9050, "alice"), "fake-proxy-pw")}}},
+                             {"box", {{"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}},
+                             {"agent", {{"rclone.http_proxy", fake("http://p:1", "someone-else", "h.example.com", 22)}}},
+                             {"two", {{"rclone.http_proxy", fake("http://p:1", "t", "t.example", 22)},
+                                      {"rclone.socks_proxy", fake("q:2", "t", "t.example", 22)}}},
+                             {"odd", {{"rclone.http_proxy", fake("https://fake-user:fake-pass@p:1", "o", "o.example", 22)}}}}));
+    const auto env = s.env();
+    // The line, never its password: only that one is saved for it.
+    const auto px = server_ops::edit_proxy(env, "px");
+    CHECK(px.proxy == socks(9050, "alice"));
+    CHECK(px.from == guard::ProxyFrom::line);
+    CHECK(px.password_saved);
+    CHECK(px.why.empty());
+    const auto nopw = server_ops::edit_proxy(env, "nopw");
+    CHECK(nopw.proxy == proxy::Proxy{.kind = proxy::Kind::http, .host = "::1", .port = 3128, .user = "bob", .password = {}});
+    CHECK_FALSE(nopw.password_saved);
+    // Kept from rclone for its login (decision 4): offered, its password saved with it.
+    const auto box = server_ops::edit_proxy(env, "box");
+    CHECK(box.proxy == socks(9, "fake-user"));
+    CHECK(box.from == guard::ProxyFrom::kept);
+    CHECK(box.password_saved);
+    // Kept for another login: a save takes it in (chunk 1a), so it is what Enter keeps.
+    const auto agent = server_ops::edit_proxy(env, "agent");
+    CHECK(agent.proxy == proxy::Proxy{.kind = proxy::Kind::http, .host = "p", .port = 1, .user = {}, .password = {}});
+    CHECK(agent.from == guard::ProxyFrom::kept);
+    CHECK_FALSE(agent.password_saved);
+    // Directly.
+    const auto plain = server_ops::edit_proxy(env, "plain");
+    CHECK(plain.proxy == proxy::Proxy{});
+    CHECK(plain.from == guard::ProxyFrom::none);
+    // Nothing offered, and why: both kinds kept, one grab can't use, a line grab can't read.
+    const auto two = server_ops::edit_proxy(env, "two");
+    CHECK_FALSE(two.proxy.has_value());
+    CHECK(two.why.find("[two] has both a SOCKS and an HTTP proxy") != std::string::npos);
+    const auto odd = server_ops::edit_proxy(env, "odd");
+    CHECK_FALSE(odd.proxy.has_value());
+    CHECK(odd.why.find("which grab can't use: grab can't use HTTPS proxies yet: use http://") != std::string::npos);
+    CHECK(odd.why.find("fake-") == std::string::npos);
+    const auto bad = server_ops::edit_proxy(env, "bad");
+    CHECK_FALSE(bad.proxy.has_value());
+    CHECK(bad.why == "[bad] proxy: give the proxy's port (socks5://host:1080)");
+}
+
+TEST_CASE("proxies: the host-key fetch of grab server add and edit goes through the proxy given, its password as the save keeps it") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "\n[px]\nhost = p.example\nuser = p\nauth = agent\nconnect_timeout = 5s\n"
+                                     "proxy = socks5://alice@127.0.0.1:9050\n"
+                                     "\n[two]\nhost = t.example\nuser = t\nauth = agent\n"
+                                     "\n[bad]\nhost = b.example\nuser = b\nauth = agent\nproxy = socks5://127.0.0.1\n");
+    REQUIRE(passwords::save(s.store(), {{"px", {{"proxy_password", bound(socks(9050, "alice"), "fake-proxy-pw")}}},
+                                        {"two", {{"rclone.http_proxy", fake("http://p:1", "t", "t.example", 22)},
+                                                 {"rclone.socks_proxy", fake("q:2", "t", "t.example", 22)}}},
+                                        // What a removed server of the name a new one takes left behind.
+                                        {"fresh", {{"proxy_password", bound(socks(9050, "alice"), "fake-left-behind")}}}}));
+    const auto env = s.env();
+    // A new server: through the proxy given, its password as typed, 2 min to connect.
+    auto add = server(Auth::agent, "fresh");
+    add.proxy = socks(9050, "alice", "fake-typed");
+    auto reach = server_ops::reach_for_save(env, add);
+    REQUIRE_MESSAGE(reach.has_value(), reach.error_or(""));
+    CHECK(reach->proxy == socks(9050, "alice", "fake-typed"));
+    CHECK(reach->connect_timeout == engine::proxy_connect_timeout);
+    // Nothing typed: none, whatever the store keeps under that name (Add never uses it).
+    add.proxy = socks(9050, "alice");
+    reach = server_ops::reach_for_save(env, add);
+    REQUIRE(reach.has_value());
+    CHECK(reach->proxy == socks(9050, "alice"));
+    // No user: no password goes.
+    add.proxy = socks(9050, {}, "fake-typed");
+    CHECK(server_ops::reach_for_save(env, add).value_or(ssh::Reach{}).proxy == socks(9050));
+    // Directly: no proxy, no time of its own.
+    add.proxy = proxy::Proxy{};
+    reach = server_ops::reach_for_save(env, add);
+    REQUIRE(reach.has_value());
+    CHECK(reach->proxy == proxy::Proxy{});
+    CHECK_FALSE(reach->connect_timeout.has_value());
+
+    // An Edit: the same proxy and user, nothing typed: the saved password; another port or user:
+    // none; typed: the typed one. Its written connect_timeout wins.
+    auto px = server(Auth::agent, "px");
+    px.host = "p.example";
+    px.port = 22;
+    px.user = "p";
+    for (const auto& [given, want] : {std::pair{socks(9050, "alice"), socks(9050, "alice", "fake-proxy-pw")},
+                                      std::pair{socks(9051, "alice"), socks(9051, "alice")},
+                                      std::pair{socks(9050, "bob"), socks(9050, "bob")},
+                                      std::pair{socks(9050, "alice", "fake-typed"), socks(9050, "alice", "fake-typed")}}) {
+        px.proxy = given;
+        reach = server_ops::reach_for_save(env, px);
+        REQUIRE_MESSAGE(reach.has_value(), reach.error_or(""));
+        CHECK(reach->proxy == want);
+        CHECK(reach->connect_timeout == std::chrono::milliseconds(5'000));
+    }
+    // Unset: as reach_for's Edit has it (the line).
+    px.proxy.reset();
+    CHECK(server_ops::reach_for_save(env, px).value_or(ssh::Reach{}).proxy == socks(9050, "alice", "fake-proxy-pw"));
+
+    // What the save replaces doesn't refuse a fetch that gives the proxy: both kinds kept, a line
+    // grab can't read. Unset, they stay, and refuse.
+    auto two = server(Auth::agent, "two");
+    two.host = "t.example";
+    two.port = 22;
+    two.user = "t";
+    two.proxy = proxy::Proxy{};
+    CHECK(server_ops::reach_for_save(env, two).has_value());
+    two.proxy.reset();
+    CHECK(server_ops::reach_for_save(env, two).error_or("").find("has both a SOCKS and an HTTP proxy") != std::string::npos);
+    auto bad = server(Auth::agent, "bad");
+    bad.host = "b.example";
+    bad.port = 22;
+    bad.user = "b";
+    bad.proxy = socks(1080);
+    CHECK(server_ops::reach_for_save(env, bad).value_or(ssh::Reach{}).proxy == socks(1080));
+    bad.proxy.reset();
+    CHECK_FALSE(server_ops::reach_for_save(env, bad).has_value());
+
+    // An inherited RCLONE_SFTP_SOCKS_PROXY refuses every server, whatever proxy is given.
+    {
+        const test::ScopedEnv inherited("RCLONE_SFTP_SOCKS_PROXY", "fake-user:fake-pass@127.0.0.1:1080");
+        add.proxy = socks(9050);
+        px.proxy = socks(9050);
+        for (const NewServer* wanted : {&add, &px}) {
+            const auto refused = server_ops::reach_for_save(env, *wanted);
+            REQUIRE_FALSE(refused.has_value());
+            CHECK(refused.error().find("clear RCLONE_SFTP_SOCKS_PROXY for grab") != std::string::npos);
+            CHECK(refused.error().find("fake-") == std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("proxies: with a proxy line grab can't read, the same proxy given with no password has none, as Edit's prompt says") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "\n[bad]\nhost = b.example\nuser = b\nauth = agent\nproxy = socks5://alice@127.0.0.1\n");
+    // The copy for older grabs every saved proxy has, with its password.
+    REQUIRE(passwords::save(s.store(),
+                            {{"bad", {{"rclone.socks_proxy", fake("alice:fake-pw@127.0.0.1:9050", "b", "b.example", 22)}}}}));
+    // Edit offers nothing, so its prompt says Enter means no password.
+    const auto offer = server_ops::edit_proxy(s.env(), "bad");
+    CHECK_FALSE(offer.proxy.has_value());
+    CHECK_FALSE(offer.password_saved);
+    CHECK_FALSE(offer.why.empty());
+
+    auto bad = server(Auth::agent, "bad");
+    bad.host = "b.example";
+    bad.port = 22;
+    bad.user = "b";
+    bad.proxy = socks(9050, "alice");
+    // The fetch sends none.
+    const auto reach = server_ops::reach_for_save(s.env(), bad);
+    REQUIRE_MESSAGE(reach.has_value(), reach.error_or(""));
+    CHECK(reach->proxy == socks(9050, "alice"));
+    // The save keeps none: no proxy_password, a copy without it.
+    REQUIRE(server_ops::update_server(s.env(), bad, std::nullopt, std::nullopt));
+    CHECK(s.read("grab.conf").find("auth = agent\nproxy = socks5://alice@127.0.0.1:9050\n") != std::string::npos);
+    CHECK(s.secrets() == passwords::Store{{"bad", {{"rclone.socks_proxy", fake("alice@127.0.0.1:9050", "b", "b.example", 22)}}}});
+    // Typed: kept, as anywhere.
+    bad.proxy = socks(9050, "alice", "fake-typed");
+    REQUIRE(server_ops::update_server(s.env(), bad, std::nullopt, std::nullopt));
+    CHECK(s.secrets().at("bad").at("proxy_password") == bound(socks(9050, "alice"), "fake-typed"));
+}
+
+TEST_CASE("proxies: grab server list says the route and where it is from; the fetch's note only for a new key read through a proxy") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "\n[px]\nhost = p.example\nuser = p\nauth = agent\nproxy = socks5://alice@127.0.0.1:9050\n");
+    REQUIRE(passwords::save(s.store(), {{"px", {{"proxy_password", bound(socks(9050, "alice"), "fake-proxy-pw")}}},
+                                        {"box", {{"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}}}));
+    const auto listed = server_ops::list_servers(s.env());
+    REQUIRE(listed.size() == 3);
+    CHECK(server_ops::route_text(listed[0]) ==
+          "through the SOCKS5 proxy fake-user@127.0.0.1:9 (kept in grab's store: from rclone, or a proxy line since "
+          "removed; grab server edit box writes it into grab.conf)");
+    CHECK(server_ops::route_text(listed[1]).empty()); // agent: directly
+    CHECK(server_ops::route_text(listed[2]) == "through the SOCKS5 proxy alice@127.0.0.1:9050 (in grab.conf)");
+    for (const auto& info : listed) CHECK(server_ops::route_text(info).find("fake-p") == std::string::npos);
+
+    const server_ops::HostKeys keys{.lines = {"[x.example]:23 ssh-ed25519 KEY1", "[x.example]:23 ssh-rsa KEY2"},
+                                    .fingerprints = {}};
+    const auto known = grab_known_hosts_path();
+    const std::string note = "Read through the SOCKS5 proxy alice@127.0.0.1:9050. A proxy can show its own key here; if "
+                             "you can, compare these fingerprints with the server's owner.";
+    const auto through = socks(9050, "alice", "fake-proxy-pw");
+    // No known_hosts yet: new.
+    CHECK(server_ops::fetch_note(known, "x.example", 23, keys, through) == note);
+    // Directly: nothing to add.
+    CHECK(server_ops::fetch_note(known, "x.example", 23, keys, proxy::Proxy{}).empty());
+    // One of the two pinned: still a new one.
+    Scratch::pins("[x.example]:23 ssh-ed25519 KEY1\n");
+    CHECK(server_ops::fetch_note(known, "x.example", 23, keys, through) == note);
+    // Both pinned, in any of the forms known_hosts has: nothing new.
+    Scratch::pins("# mine\n[x.example]:23 ssh-ed25519 KEY1\nother.example,[x.example]:23 ssh-rsa KEY2 a comment\n");
+    CHECK(server_ops::fetch_note(known, "x.example", 23, keys, through).empty());
+    // The same keys pinned for another port, or only revoked: new.
+    Scratch::pins("[x.example]:24 ssh-ed25519 KEY1\n[x.example]:24 ssh-rsa KEY2\n");
+    CHECK(server_ops::fetch_note(known, "x.example", 23, keys, through) == note);
+    Scratch::pins("@revoked [x.example]:23 ssh-ed25519 KEY1\n@revoked [x.example]:23 ssh-rsa KEY2\n");
+    CHECK(server_ops::fetch_note(known, "x.example", 23, keys, through) == note);
+    // Port 22 is written without brackets.
+    Scratch::pins("x.example ssh-ed25519 KEY1\n");
+    const server_ops::HostKeys at22{.lines = {"x.example ssh-ed25519 KEY1"}, .fingerprints = {}};
+    CHECK(server_ops::fetch_note(known, "x.example", 22, at22, through).empty());
+    CHECK(server_ops::fetch_note(known, "x.example", 22, keys, through) == note);
+}
+
+TEST_CASE("proxies: grab server edit's questions with Enter throughout keep a proxy kept from rclone, which the save writes into grab.conf") {
+    Scratch s;
+    s.write("grab.conf", grab_conf);
+    REQUIRE(passwords::save(s.store(), {{"box", {{"password", fake("fake-pw")},
+                                                 {"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}}}));
+    const auto env = s.env();
+    const auto listed = server_ops::list_servers(env);
+    REQUIRE_FALSE(listed.empty());
+    auto wanted = server_ops::edit_defaults(listed[0]);
+    // Enter at every proxy question; a question asked again (no default to keep) ends the input,
+    // so a regression fails rather than asking forever.
+    std::vector<std::string> said;
+    int asked = 0;
+    const server_prompt::Console enter{
+        .ask = [&](std::string_view, std::string_view def) -> std::optional<std::string> {
+            if (++asked > 3) return std::nullopt;
+            return std::string(def);
+        },
+        .secret = [](std::string_view) -> std::optional<std::string> { return std::string(); },
+        .say = [&](std::string_view line) { said.emplace_back(line); },
+    };
+    wanted.proxy = server_prompt::ask_proxy(enter, server_ops::edit_proxy(env, "box"), wanted);
+    REQUIRE(wanted.proxy.has_value());
+    CHECK(*wanted.proxy == socks(9, "fake-user"));
+    CHECK(said.size() == 1); // that it is kept in grab's store
+    const auto done = server_ops::update_server(env, wanted, std::nullopt, std::nullopt);
+    REQUIRE_MESSAGE(done.has_value(), done.error_or(""));
+    CHECK(s.read("grab.conf").find("auth = password\nproxy = socks5://fake-user@127.0.0.1:9\n") != std::string::npos);
+    CHECK(s.secrets() ==
+          passwords::Store{{"box", {{"password", fake("fake-pw")},
+                                    {"proxy_password", bound(socks(9, "fake-user"), "fake-pass")},
+                                    {"rclone.socks_proxy", fake("fake-user:fake-pass@127.0.0.1:9")}}}});
+    const auto after = server_ops::list_servers(s.env());
+    CHECK(server_ops::route_text(after[0]) == "through the SOCKS5 proxy fake-user@127.0.0.1:9 (in grab.conf)");
+    // The next edit offers it from the line, its password saved.
+    const auto offer = server_ops::edit_proxy(s.env(), "box");
+    CHECK(offer.from == guard::ProxyFrom::line);
+    CHECK(offer.password_saved);
+}
+
+#ifdef _WIN32
+TEST_CASE("proxies: an Edit offers the line's proxy without a password when the store can't be read") {
+    Scratch s;
+    s.write("grab.conf", grab_conf + "\n[px]\nhost = p.example\nuser = p\nauth = agent\nproxy = socks5://alice@127.0.0.1:9050\n");
+    std::filesystem::create_directories(s.store().parent_path());
+    std::ofstream(s.store(), std::ios::binary) << "grab-passwords-sealed 1\nanother account's";
+    const auto env = s.env();
+    const auto px = server_ops::edit_proxy(env, "px");
+    CHECK(px.proxy == socks(9050, "alice"));
+    CHECK(px.from == guard::ProxyFrom::line);
+    CHECK_FALSE(px.password_saved); // the save sets the store aside, with it
+    const auto box = server_ops::edit_proxy(env, "box");
+    CHECK(box.proxy == proxy::Proxy{});
+}
+
+TEST_CASE("proxies: grab server add and edit fetch the host key through the proxy given, with the typed or the saved password") {
+    // x.invalid exists nowhere: only the proxy, asked for it by name, gets anywhere. It takes the
+    // login and answers "connection refused" for the server (REP 05).
+    test::ProxyScript script;
+    script.user = "alice";
+    script.password = "fake-proxy-pw";
+    script.rep = 0x05;
+    test::FakeProxy proxied(script);
+    Scratch s;
+    s.write("grab.conf", std::format("[px]\nhost = x.invalid\nport = 23\nuser = u\nauth = agent\n"
+                                     "proxy = socks5://alice@127.0.0.1:{}\n",
+                                     proxied.port));
+    REQUIRE(passwords::save(s.store(), {{"px", {{"proxy_password", bound(proxied.proxy("alice"), "fake-proxy-pw")}}}}));
+    const auto env = s.env();
+    const std::string login = std::string("\x01\x05", 2) + "alice" + "\x0D" + "fake-proxy-pw";
+    const std::string connect = std::string("\x05\x01\x00\x03\x09", 5) + "x.invalid" + std::string("\x00\x17", 2);
+    // Add: the typed password.
+    auto add = server(Auth::agent, "fresh");
+    add.host = "x.invalid";
+    add.proxy = proxied.proxy("alice", "fake-proxy-pw");
+    // Edit: Enter kept the saved one.
+    auto edit = server(Auth::agent, "px");
+    edit.host = "x.invalid";
+    edit.user = "u";
+    edit.proxy = proxied.proxy("alice");
+    std::size_t seen = 0;
+    for (const NewServer* wanted : {&add, &edit}) {
+        CAPTURE(wanted->name);
+        const auto reach = server_ops::reach_for_save(env, *wanted);
+        REQUIRE_MESSAGE(reach.has_value(), reach.error_or(""));
+        const auto keys = server_ops::scan_host_keys("x.invalid", 23, {}, *reach);
+        REQUIRE_FALSE(keys.has_value());
+        CHECK(keys.error().find("x.invalid refused the connection on port 23") != std::string::npos);
+        CHECK(keys.error().find("fake-") == std::string::npos);
+        const auto requests = proxied.requests();
+        REQUIRE(requests.size() > seen);
+        for (auto i = seen; i < requests.size(); ++i) {
+            CHECK(requests[i].login == login);
+            CHECK(requests[i].connect == connect);
+        }
+        seen = requests.size();
+    }
+    // A wrong password typed: turned down, fatal, nothing tried again.
+    add.proxy = proxied.proxy("alice", "fake-wrong-pw");
+    const auto reach = server_ops::reach_for_save(env, add);
+    REQUIRE(reach.has_value());
+    const auto keys = server_ops::scan_host_keys("x.invalid", 23, {}, *reach);
+    REQUIRE_FALSE(keys.has_value());
+    CHECK(keys.error().find("the proxy turned down the user name and password") != std::string::npos);
+    CHECK(keys.error().find("fake-") == std::string::npos);
+    CHECK(proxied.requests().size() == seen + 1);
 }
 #endif

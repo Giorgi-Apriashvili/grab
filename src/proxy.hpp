@@ -41,6 +41,10 @@ struct Proxy {
 // rclone's sftp `http_proxy`: an http:// URL whose user and password are percent-decoded; without
 // a port 80, as rclone dialled it. https:// (TLS to the proxy) is refused: grab can't do it yet.
 [[nodiscard]] std::expected<Proxy, std::string> parse_rclone_http(std::string_view text);
+// A proxy's address as `grab server add` and `edit` ask for it: host:port, an IPv6 address in
+// brackets ([::1]:1080), the port required; the kind and the user are asked on their own. Kind
+// none, no user.
+[[nodiscard]] std::expected<Proxy, std::string> parse_address(std::string_view text);
 
 // The proxy as grab.conf writes it, without the password: "socks5://alice@127.0.0.1:9050",
 // "http://[::1]:3128" (parse reads it back); empty for none.

@@ -31,6 +31,7 @@ add_executable(grab_tests
     test_gui_state.cpp
     test_servers.cpp
     test_server_ops.cpp
+    test_server_prompt.cpp
     test_fetch.cpp
     test_folder.cpp
     test_queue_view.cpp

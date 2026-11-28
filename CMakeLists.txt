@@ -52,6 +52,7 @@ add_library(grab_core STATIC
     src/gui_state.cpp
     src/servers.cpp
     src/server_ops.cpp
+    src/server_prompt.cpp
     src/server_files.cpp
     src/conn_budget.cpp
     src/fetch.cpp
