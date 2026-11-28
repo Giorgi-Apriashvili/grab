@@ -1,5 +1,6 @@
 #include "ssh.hpp"
 
+#include "proxy.hpp"
 #include "util.hpp"
 
 #ifdef _WIN32
@@ -144,13 +145,30 @@ std::int32_t ms_or_none(std::chrono::milliseconds t) {
     return ms > 0 && ms <= std::numeric_limits<std::int32_t>::max() ? static_cast<std::int32_t>(ms) : 0;
 }
 
+#ifdef _WIN32
+constexpr int connection_refused = WSAECONNREFUSED;
+#else
+constexpr int connection_refused = ECONNREFUSED;
+#endif
+
 // A TCP connection to host:port within `connect_timeout`, from the `bind` address when one is set
-// (an address of the same family as the server's).
+// (an address of the same family as the server's). Through a proxy it is one to the proxy (only
+// the proxy's name is looked up here: the proxy looks up the server's), which its handshake then
+// turns into a tunnel to host:port, all within connect_timeout from the dial; `bind` is checked
+// against the proxy's addresses. A proxy that fails fails it: nothing is tried directly.
 socket_t connect_tcp(const Target& t) {
     if (closing()) throw closing_error();
+    const proxy::Proxy& via = t.proxy;
+    const bool proxied = via.kind != proxy::Kind::none;
+    if (proxied) {
+        if (auto bad = proxy::check_request(via, t.host, t.port)) throw Error(budget::Failure::fatal, *bad);
+    }
+    const std::string proxy_at = proxied ? proxy::address(via.host, via.port) : std::string();
     Addresses found;
-    if (!found.resolve(t.host, t.port))
-        throw Error(budget::Failure::other, std::format("can't find the server {}", t.host));
+    if (!found.resolve(proxied ? via.host : t.host, proxied ? via.port : t.port)) {
+        throw Error(budget::Failure::other, proxied ? std::format("can't find the proxy {}", via.host)
+                                                    : std::format("can't find the server {}", t.host));
+    }
     Addresses local;
     if (!t.bind.empty() && !local.resolve(t.bind, 0))
         throw Error(budget::Failure::fatal, std::format("can't find the address {} to connect from ({})", t.bind, t.bind_from));
@@ -166,9 +184,13 @@ socket_t connect_tcp(const Target& t) {
         if (!any)
             throw Error(budget::Failure::fatal,
                         std::format("{} ({}) and {} have no address of the same kind (IPv4, IPv6)", t.bind, t.bind_from,
-                                    t.host));
+                                    proxied ? "the proxy " + via.host : t.host));
     }
+    const std::int32_t ms = ms_or_none(t.connect_timeout);
+    // Through a proxy one deadline covers every address tried and the proxy's handshake.
+    const auto dialled = std::chrono::steady_clock::now();
     std::string why = "no address";
+    int failed_with = 0;
     socket_t s = no_socket;
     for (addrinfo* a = found.first; a && s == no_socket; a = a->ai_next) {
         const addrinfo* from = from_for(a);
@@ -195,8 +217,7 @@ socket_t connect_tcp(const Target& t) {
                 // A quarter of a second at a time, so the program closing doesn't wait out
                 // connect_timeout. No limit: as long as the system tries. A refusal comes as an
                 // exception (Windows).
-                const std::int32_t ms = ms_or_none(t.connect_timeout);
-                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+                const auto until = (proxied ? dialled : std::chrono::steady_clock::now()) + std::chrono::milliseconds(ms);
                 int ready = 0;
                 fd_set w;
                 fd_set x;
@@ -226,27 +247,66 @@ socket_t connect_tcp(const Target& t) {
                     getsockopt(c, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
                     ok = err == 0 && FD_ISSET(c, &w);
                     why = ok ? "" : std::format("connection failed ({})", err);
+                    failed_with = err;
                 } else {
-                    why = ready < 0 ? std::format("connection failed ({})", last_socket_error()) : "no answer";
+                    failed_with = ready < 0 ? last_socket_error() : 0;
+                    why = ready < 0 ? std::format("connection failed ({})", failed_with) : "no answer";
                 }
             } else {
                 why = std::format("connection failed ({})", e);
+                failed_with = e;
             }
         }
         if (ok) {
-            set_blocking(c, true);
+            if (!proxied) set_blocking(c, true); // a proxy's handshake runs non-blocking first
             s = c;
         } else {
             close_tracked(c);
         }
     }
-    if (s == no_socket) throw Error(budget::Failure::other, std::format("can't reach {}:{}: {}", t.host, t.port, why));
+    if (s == no_socket) {
+        if (!proxied) throw Error(budget::Failure::other, std::format("can't reach {}:{}: {}", t.host, t.port, why));
+        if (why == "no answer") {
+            throw Error(budget::Failure::other, std::format("the proxy {} didn't answer within {}", proxy_at,
+                                                            proxy::say_time(std::chrono::milliseconds(ms))));
+        }
+        const std::string from = t.bind.empty() ? std::string() : std::format(" from {} ({})", t.bind, t.bind_from);
+        throw Error(budget::Failure::other,
+                    std::format("can't reach the proxy {}{}: {}", proxy_at, from,
+                                failed_with == connection_refused ? "connection refused (is it running?)" : why));
+    }
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+    if (proxied) {
+        // With connect_timeout off the handshake still gets the io timeout: the OS bounds a
+        // direct dial and libssh2 the banner's wait, but nothing would bound a silent proxy.
+        const std::int32_t handshake_ms = ms > 0 ? ms : ms_or_none(t.timeout);
+        const proxy::Wait wait{.started = ms > 0 ? dialled : std::chrono::steady_clock::now(),
+                               .limit = std::chrono::milliseconds(handshake_ms),
+                               .cancelled = [] { return closing(); }};
+        try {
+            if (via.kind == proxy::Kind::socks5) proxy::socks5_connect(s, via, t.host, t.port, wait);
+            else proxy::http_connect(s, via, t.host, t.port, wait);
+        } catch (...) {
+            close_tracked(s);
+            if (closing()) throw closing_error();
+            throw;
+        }
+        set_blocking(s, true);
+    }
     if (t.send_buffer > 0) {
         setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&t.send_buffer), sizeof t.send_buffer);
     }
     return s;
+}
+
+// Through a proxy, the tunnel closing before the server said a word: a server that is down looks
+// like that when the proxy answers success before it connects, and so does one turning grab away
+// (PROXIES.md 3.4, 3.8).
+std::string closed_before_banner(const Target& t) {
+    return std::format("the proxy connected, then the connection closed before {} said anything: is the server up on "
+                       "port {}?",
+                       t.host, t.port);
 }
 
 std::string last_error(LIBSSH2_SESSION* s) {
@@ -581,7 +641,12 @@ std::expected<std::string, ShakeError> read_host_key(const Target& t, std::strin
             // No algorithm in common; with the same key exchanges and ciphers as the first
             // handshake, that is the host key types asked for.
             const bool no_match = rc == LIBSSH2_ERROR_KEX_FAILURE || rc == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED;
-            result = std::unexpected(ShakeError{.no_match = no_match, .message = last_error(session)});
+            // Through a proxy, closed before the server's banner (a scan is the first contact).
+            const bool silent = t.proxy.kind != proxy::Kind::none && libssh2_session_banner_get(session) == nullptr &&
+                                (rc == LIBSSH2_ERROR_SOCKET_DISCONNECT || rc == LIBSSH2_ERROR_SOCKET_RECV ||
+                                 rc == LIBSSH2_ERROR_BANNER_RECV);
+            result = std::unexpected(
+                ShakeError{.no_match = no_match, .message = silent ? closed_before_banner(t) : last_error(session)});
         } else if (const char* key = libssh2_session_hostkey(session, &len, &type); key && len > 0) {
             result = std::string(key, len);
         } else {
@@ -657,6 +722,7 @@ std::expected<std::vector<HostKey>, std::string> scan_host_keys(const std::strin
     t.timeout = timeout;
     t.bind = reach.bind;
     t.bind_from = reach.bind_from;
+    t.proxy = reach.proxy;
     const Shake shake = [&t](std::string_view offer) { return read_host_key(t, offer); };
     return scan_host_keys(shake, std::format("{}:{}", host, port), stop);
 }
@@ -765,6 +831,8 @@ void Connection::open(const Target& target) {
         // (MaxStartups, a full Storage Box); libssh2 reports a drop during the key exchange as a
         // key exchange failure, so the link's own state tells the two apart.
         const bool lost = link_lost_;
+        if (lost && target.proxy.kind != proxy::Kind::none && received_.load(std::memory_order_relaxed) == 0)
+            throw Error(budget::Failure::refused, closed_before_banner(target), budget::Failure::other);
         // No common algorithm can't get better by trying again.
         bool hopeless = !lost && (rc == LIBSSH2_ERROR_KEX_FAILURE || rc == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED);
         bool slow = rc == LIBSSH2_ERROR_TIMEOUT;

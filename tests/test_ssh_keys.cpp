@@ -1,9 +1,11 @@
 // grab's own client logging in with keys, against a real SSH server on this PC: the test rclone's
 // `serve sftp` (skipped without build\<preset>\test-tools\rclone.exe or Windows' ssh-keygen),
-// with throwaway keys made for the run and a made-up login. Nothing leaves 127.0.0.1.
+// with throwaway keys made for the run and a made-up login, directly and through fake proxies.
+// Nothing leaves 127.0.0.1.
 
 #include "passwords.hpp"
 #include "process.hpp"
+#include "proxy.hpp"
 #include "quote.hpp"
 #include "server_conf.hpp"
 #include "sftp.hpp"
@@ -25,6 +27,8 @@
 #include <vector>
 
 #ifdef _WIN32
+#include "fake_proxy.hpp"
+
 #include <winsock2.h> // IWYU pragma: keep (the socket API)
 
 #include <windows.h> // IWYU pragma: keep (umbrella header for the Win32 API)
@@ -223,6 +227,84 @@ TEST_CASE("ssh: a key kept in grab's store logs in from memory, with and without
     REQUIRE_FALSE(wrong);
     CHECK(wrong.error().find("refused the login: it refused the key kept in grab's store") != std::string::npos);
     CHECK(wrong.error().find("fake-") == std::string::npos);
+    server.reset();
+    fs::remove_all(dir, ec);
+    CHECK_FALSE(fs::exists(dir));
+}
+
+// PROXIES.md chunk 0: a real SSH server through SOCKS5 and HTTP CONNECT, each with a login, under
+// a name nothing here can look up (sftp.invalid): Trust's scan reads its key through the proxy,
+// then a login lists its folder, every connection asked of the proxy by that name.
+TEST_CASE("ssh: Trust's scan, a key login and SFTP through SOCKS5 and HTTP proxies (rclone serve sftp)") {
+    const auto rclone = test::test_rclone();
+    const auto keygen = ssh_keygen();
+    if (!rclone || !keygen) {
+        MESSAGE(test::no_test_rclone << ", or no ssh-keygen.exe; skipped");
+        return;
+    }
+    const auto dir = fs::temp_directory_path() / "grab-test-ssh-proxy";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "served");
+    REQUIRE(util::write_file_atomic(dir / "served" / "hello.txt", "hello\n"));
+    make_key(*keygen, dir / "host", {"-t", "ed25519"}, "");
+    make_key(*keygen, dir / "user", {"-t", "ed25519"}, "");
+    REQUIRE(util::write_file_atomic(dir / "authorized_keys", util::read_file(dir / "user.pub").value_or("")));
+    const int port = free_port();
+    REQUIRE(port > 0);
+    std::optional<Server> server;
+    server.emplace(*rclone,
+                   std::vector<std::string>{"serve", "sftp", util::path_to_utf8(dir / "served"), "--addr",
+                                            std::format("127.0.0.1:{}", port), "--key", util::path_to_utf8(dir / "host"),
+                                            "--authorized-keys", util::path_to_utf8(dir / "authorized_keys"), "--config",
+                                            "NUL"},
+                   dir);
+    REQUIRE(server->started());
+    for (int i = 0; i < 150 && !answers(port); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    REQUIRE_MESSAGE(answers(port), util::read_file(dir / "serve.log").value_or(""));
+    const auto host_pub = util::split(util::trim(util::read_file(dir / "host.pub").value_or("")), ' ');
+    REQUIRE(host_pub.size() >= 2);
+    const auto known_hosts = dir / "known_hosts";
+    REQUIRE(util::write_file_atomic(known_hosts, std::format("[sftp.invalid]:{} {} {}\n", port, host_pub[0], host_pub[1])));
+
+    ssh::Target t;
+    t.host = "sftp.invalid";
+    t.port = port;
+    t.user = "tester";
+    t.key_file = dir / "user";
+    t.known_hosts = known_hosts;
+    t.connect_timeout = std::chrono::seconds(10);
+    t.timeout = std::chrono::seconds(10);
+    for (const proxy::Kind kind : {proxy::Kind::socks5, proxy::Kind::http}) {
+        CAPTURE(proxy::kind_name(kind));
+        test::ProxyScript script;
+        script.kind = kind;
+        script.user = "alice";
+        script.password = "fake-proxy-pw";
+        script.relay_port = port;
+        test::FakeProxy fake(script);
+        t.proxy = fake.proxy("alice", "fake-proxy-pw");
+        const ssh::Reach reach{.bind = "", .bind_from = "--bind", .connect_timeout = std::nullopt, .proxy = t.proxy};
+        const auto keys = ssh::scan_host_keys(t.host, t.port, std::chrono::seconds(10), {}, reach);
+        REQUIRE_MESSAGE(keys, keys.error_or(""));
+        REQUIRE(keys->size() == 1);
+        CHECK(keys->front().key == host_pub[1]);
+        const int scanned = fake.connections();
+        CHECK(scanned == 2); // the key, then a handshake that can't agree on another type
+        try {
+            const auto session = ssh::open_session(t);
+            const auto listed = sftp::list(session->sftp(), ".");
+            REQUIRE_MESSAGE(listed, sftp::describe(listed.error()));
+            CHECK(listed->size() == 1);
+        } catch (const ssh::Error& e) {
+            FAIL(e.what());
+        }
+        CHECK(fake.connections() == scanned + 1);
+        for (const auto& asked : fake.requests()) {
+            if (kind == proxy::Kind::socks5) CHECK(asked.connect.find("\x0csftp.invalid") != std::string::npos);
+            else CHECK(asked.header.starts_with(std::format("CONNECT sftp.invalid:{} HTTP/1.1\r\n", port)));
+        }
+    }
     server.reset();
     fs::remove_all(dir, ec);
     CHECK_FALSE(fs::exists(dir));

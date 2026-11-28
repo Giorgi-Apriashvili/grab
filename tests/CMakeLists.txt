@@ -57,6 +57,7 @@ add_executable(grab_tests
     test_window_size.cpp
     test_update.cpp
     test_ssh.cpp
+    test_proxy.cpp
     test_sftp.cpp
     test_ssh_pool.cpp
     test_ssh_find.cpp
@@ -77,6 +78,7 @@ add_executable(grab_tests
     test_live_upload.cpp
     test_live_ops.cpp
     test_live_files.cpp
+    test_live_proxy.cpp
     test_guard.cpp
     test_notices.cpp
     test_ssh_keys.cpp)

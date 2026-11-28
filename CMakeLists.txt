@@ -82,6 +82,7 @@ add_library(grab_core STATIC
     src/ui_origin.cpp
     src/window_size.cpp
     src/sftp.cpp
+    src/proxy.cpp
     src/ssh.cpp
     src/ssh_pool.cpp
     src/ssh_find.cpp

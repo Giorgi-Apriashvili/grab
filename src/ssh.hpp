@@ -11,6 +11,7 @@
 // Blocking: one thread per Connection, which no other thread touches.
 
 #include "conn_budget.hpp"
+#include "proxy.hpp"
 #include "sftp.hpp"
 
 #include <array>
@@ -61,6 +62,11 @@ struct Target {
     // The socket's send buffer (SO_SNDBUF) in bytes; 0: the system's, which Windows grows as the
     // link needs. Set only by the upload checks (UPLOADS.md chunk 0), which compare the two.
     int send_buffer = 0;
+    // The proxy the server is reached through (PROXIES.md; none: directly). Its password stays in
+    // memory as the login's does. `bind` then applies to the connection to the proxy, and
+    // connect_timeout covers the proxy's handshake and its own connection to the server too. A
+    // proxy that fails fails the connection: nothing is tried directly.
+    proxy::Proxy proxy;
     bool operator==(const Target&) const = default;
 };
 
@@ -68,8 +74,16 @@ struct Target {
 // before the login: MaxStartups, a full Storage Box; try again later), fatal (trying again can't
 // help: unknown or changed host key, login refused), other (network, timeouts).
 struct Error : std::runtime_error {
-    Error(budget::Failure kind, const std::string& what) : std::runtime_error(what), kind(kind) {}
+    Error(budget::Failure kind, const std::string& what, std::optional<budget::Failure> proxied = std::nullopt)
+        : std::runtime_error(what), kind(kind), proxied(proxied) {}
     budget::Failure kind;
+    // Set on a `refused` that came through a proxy (PROXIES.md 3.4): the proxy turned grab away
+    // (SOCKS 02, HTTP 403/405), or closed the connection before it answered, or the tunnel closed
+    // before the server said anything. A proxy or a server behind it that caps its connections
+    // looks like that, and so does a server that is down (ssh -D answers success before it
+    // connects): refused while another connection to the server is open, else this kind (fatal
+    // for a proxy that doesn't allow the server, other for a closed connection).
+    std::optional<budget::Failure> proxied;
 };
 
 // A command's result: what it wrote to stdout and stderr (each cut at the limit given, `cut`
@@ -276,11 +290,13 @@ struct ShakeError {
 using Shake = std::function<std::expected<std::string, ShakeError>(std::string_view offer)>;
 
 // How a scan reaches the server: from the server's `bind` address (empty: any; `bind_from` names
-// the setting in messages) within its connect_timeout (nullopt: the scan's own time).
+// the setting in messages) within its connect_timeout (nullopt: the scan's own time), through its
+// proxy (none: directly), as its connections do.
 struct Reach {
     std::string bind;
     std::string bind_from = "--bind";
     std::optional<std::chrono::milliseconds> connect_timeout;
+    proxy::Proxy proxy;
 };
 
 // Every host key `host`:`port` has of the types grab checks (scan_algorithms), read without a
