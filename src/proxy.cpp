@@ -9,7 +9,7 @@
 #include <ws2tcpip.h> // IWYU pragma: keep
 #else
 #include <arpa/inet.h>
-#include <cerrno>
+#include <cerrno> // IWYU pragma: keep (errno, on POSIX only)
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>

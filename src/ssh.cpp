@@ -797,7 +797,7 @@ void Connection::close() {
         close_tracked(static_cast<socket_t>(socket_));
         socket_ = ~std::uintptr_t{0};
     }
-    std::fill(password_.begin(), password_.end(), '\0');
+    std::ranges::fill(password_, '\0');
 }
 
 void Connection::open(const Target& target) {
@@ -907,7 +907,7 @@ void Connection::log_in(const Target& target) {
             const char* passphrase = target.key_passphrase.empty() ? nullptr : target.key_passphrase.c_str();
             int rc = libssh2_userauth_publickey_frommemory(session_, user, target.user.size(), nullptr, 0,
                                                            key.data(), key.size(), passphrase);
-            std::fill(key.begin(), key.end(), '\0');
+            std::ranges::fill(key, '\0');
             if (rc == 0) return;
             tried.push_back("it refused the key file (" + last_error(session_) + ")");
         } else {
