@@ -219,3 +219,14 @@ TEST_CASE("a typed or pinned path that can't be listed says so in the window's w
     CHECK_FALSE(failure("x", K::other));
     CHECK_FALSE(failure("x", K::file));
 }
+
+TEST_CASE("a folder the list shows empty is listed live once: only a listing that couldn't say leaves it empty") {
+    using K = browse::ListError::Kind;
+    const auto stands = [](K kind) { return browse::empty_stands(browse::ListError{.kind = kind, .message = "the server's words"}); };
+    // B6: find lists a folder it can't go into (chmod 000), so the list shows it empty.
+    CHECK_FALSE(stands(K::denied));
+    CHECK_FALSE(stands(K::not_found));
+    CHECK_FALSE(stands(K::file));
+    // No connection, a timeout, stopped: the list's empty rows, as before.
+    CHECK(stands(K::other));
+}

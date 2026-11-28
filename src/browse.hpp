@@ -121,10 +121,18 @@ struct ListError {
     std::string message; // ready to show
     bool operator==(const ListError&) const = default;
 };
-// What a typed or pinned path that can't be listed says, in the window's words: "Not found on
-// Main: downloads/tv", "Main doesn't let you list downloads/tv" ("~" for the login folder);
-// nullopt for any other failure, which shows as the server's.
+// What a folder that can't be listed says, in the window's words, however it was opened (a typed
+// or pinned path, a click): "Not found on Main: downloads/tv", "Main doesn't let you list
+// downloads/tv" ("~" for the login folder); nullopt for any other failure, which shows as the
+// server's.
 [[nodiscard]] std::optional<std::string> asked_failure(std::string_view server, std::string_view folder, const ListError& e);
+
+// The file list shows a folder empty, as it also shows one the account can't read (find lists the
+// folder but can't go in), so Browse lists it live once (PINS.md, B6). Whether the list's empty
+// rows still stand after that listing failed with `e`: they do for a failure that says nothing of
+// the folder (no connection, a timeout), never for one that isn't there, can't be listed or is a
+// file.
+[[nodiscard]] bool empty_stands(const ListError& e);
 
 // Lists one folder live: its SFTP listing on one of the server's pooled connections (`grab`;
 // OPENDIR and READDIRs, a STAT for each link, whose target decides as the walk decides; a broken

@@ -108,6 +108,8 @@ std::optional<std::string> asked_failure(std::string_view server, std::string_vi
     return std::nullopt;
 }
 
+bool empty_stands(const ListError& e) { return e.kind == ListError::Kind::other; }
+
 std::optional<std::string> root_of(const std::vector<std::string>& roots, std::string_view path) {
     std::optional<std::string> best;
     for (const auto& r : roots) {

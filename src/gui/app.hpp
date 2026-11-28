@@ -855,10 +855,15 @@ private:
     // After the lists: the search thread uses them and starts refreshes, so it ends first.
     std::jthread search_thread_;
     std::atomic<bool> search_replaced_{false}; // a stopped search is being replaced: no "cancelled"
-    mutable std::mutex browse_mutex_; // guards last_browse_, shown_browse_, live_folders_ and changed_folders_
+    // Guards last_browse_, shown_browse_, live_folders_, changed_folders_ and unreachable_.
+    mutable std::mutex browse_mutex_;
     LastBrowse last_browse_;  // the last request, again after a list refresh
     LastBrowse shown_browse_; // the folder the window shows: where a failed typed path leaves it
     std::map<std::pair<std::string, std::string>, LiveFolder> live_folders_; // (server, folder)
+    // When a server last couldn't list a folder the file list shows empty (Unix seconds): for a
+    // minute after that, such folders open from the list at once instead of waiting on another
+    // connect (PINS.md, B6).
+    std::map<std::string, std::int64_t> unreachable_;
     // Folders uploads changed (server, folder): the end of the last upload there, and whether the
     // folders below it changed too (a folder upload's own). A listing older than that, the file
     // list's or a live one, isn't shown: the folder is listed live instead. Kept in uploads.json,

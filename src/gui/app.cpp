@@ -1880,11 +1880,13 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             post(v);
         };
         // A typed path or a pin that fails leaves the window where it was, and so does a list
-        // refresh after it; any other failure is shown as the folder's.
-        auto fail = [&](const std::string& error) {
+        // refresh after it; any other failure is shown as the folder's. `failure`: "notFound" or
+        // "denied" when the folder isn't there or can't be listed (a pin's then dims, with Unpin).
+        auto fail = [&](const std::string& error, std::string_view failure = {}) {
             v.set("path", str(path));
             v.set("top", Value::make_bool(top));
             v.set("error", str(error));
+            if (!failure.empty()) v.set("failure", str(std::string(failure)));
             v.set("uploadable", Value::make_bool(false));
             {
                 std::lock_guard lock(browse_mutex_);
@@ -1903,11 +1905,13 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
         const auto now = unix_now();
         const auto view = list_view(remote, *ctx);
         if (!update && (!view.list || !file_list::fresh(*view.list, now))) start_refresh(remote);
+        bool list_failed = false; // the list's last refresh failed: the server may be out of reach
         {
             std::lock_guard lock(lists_mutex_);
             const auto& s = list_slot(remote);
             v.set("refreshing", Value::make_bool(s.refreshing));
             if (!s.error.empty()) v.set("listError", str(s.error));
+            list_failed = !s.error.empty();
         }
 
         // A typed path as browse uses it, a pin's exactly as saved; a server's one root is its top.
@@ -1943,9 +1947,21 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             // A live listing made after the list was fetched is newer; otherwise the list wins,
             // which also knows the sub-folders' item counts.
             if (cached && (!from_list || cached->listed > view.list->fetched)) {
-                return Rows{std::move(cached->items), "live", cached->listed};
+                return Rows{.items = std::move(cached->items), .source = "live", .listed = cached->listed, .new_listing = false};
             }
-            if (from_list) return Rows{std::move(*from_list), "list", view.list->fetched};
+            // The list's rows, unless it shows the folder empty: one the account can't read looks
+            // the same there, so it is listed live once (PINS.md, B6). Not while the server seems
+            // out of reach (its list's refresh failed, or such a listing did in the last minute):
+            // the folder then opens from the list at once rather than wait on a connect.
+            bool out_of_reach = list_failed;
+            if (from_list && from_list->empty() && !out_of_reach) {
+                std::lock_guard lock(browse_mutex_);
+                const auto it = unreachable_.find(remote);
+                out_of_reach = it != unreachable_.end() && now - it->second < 60;
+            }
+            if (from_list && (!from_list->empty() || out_of_reach)) {
+                return Rows{.items = std::move(*from_list), .source = "list", .listed = view.list->fetched, .new_listing = false};
+            }
             proc::RunOptions run;
             run.stop = stop;
             run.detached = true;
@@ -1954,18 +1970,32 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             // One connection of the server's budget (fetch::Listing, review G191).
             std::optional<fetch::Listing> seat;
             auto side = grab_side(*ctx, remote, seat, stop);
-            if (!side) {
-                act.failed();
-                return std::unexpected(browse::ListError{.kind = browse::ListError::Kind::other, .message = side.error()});
+            std::expected<std::vector<browse::Item>, browse::ListError> got;
+            if (side) {
+                got = browse::list_live(*ctx, at, run, [&](const std::vector<std::string>& argv) {
+                    act.detail(quote::display_cmdline(argv));
+                }, *side);
+            } else {
+                got = std::unexpected(browse::ListError{.kind = browse::ListError::Kind::other, .message = side.error()});
             }
-            auto got = browse::list_live(*ctx, at, run, [&](const std::vector<std::string>& argv) {
-                act.detail(quote::display_cmdline(argv));
-            }, *side);
             if (!got) {
                 act.failed();
+                // The list's empty folder stands when the listing couldn't say (no connection), and
+                // the server counts as out of reach for a minute.
+                if (from_list && browse::empty_stands(got.error())) {
+                    if (!stop.stop_requested()) { // a stopped listing says nothing of the server
+                        std::lock_guard lock(browse_mutex_);
+                        unreachable_[remote] = unix_now();
+                    }
+                    return Rows{.items = std::move(*from_list), .source = "list", .listed = view.list->fetched, .new_listing = false};
+                }
                 return std::unexpected(got.error());
             }
-            return Rows{std::move(*got), "live", now, true};
+            if (from_list) {
+                std::lock_guard lock(browse_mutex_);
+                unreachable_.erase(remote);
+            }
+            return Rows{.items = std::move(*got), .source = "live", .listed = now, .new_listing = true};
         };
 
         std::vector<browse::Item> items;
@@ -2002,11 +2032,27 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
                 }
                 if (stop.stop_requested()) return;
             }
-            if (!rows) {
-                if (asked) {
-                    if (auto said = browse::asked_failure(remote, folder, rows.error())) return fail(*said);
+            // The address bar's crumbs: also for a folder that failed to open where the window
+            // shows it, so the bar names the folder whose error is shown.
+            auto set_crumbs = [&] {
+                Value crumbs = Value::make_array();
+                for (const auto& c : browse::crumbs(roots, folder)) {
+                    Value cv = Value::make_object();
+                    cv.set("name", str(c.name));
+                    cv.set("path", str(c.path));
+                    crumbs.push(std::move(cv));
                 }
-                return fail(rows.error().message);
+                v.set("crumbs", std::move(crumbs));
+            };
+            if (!rows) {
+                if (!asked) set_crumbs();
+                // A folder that isn't there or can't be listed, in the window's words on every
+                // route (an unreadable one the list showed empty too, B6).
+                const auto& e = rows.error();
+                if (auto said = browse::asked_failure(remote, folder, e)) {
+                    return fail(*said, e.kind == browse::ListError::Kind::denied ? "denied" : "notFound");
+                }
+                return fail(e.message);
             }
             if (rows->new_listing) {
                 std::lock_guard lock(browse_mutex_);
@@ -2015,14 +2061,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             items = std::move(rows->items);
             source = std::move(rows->source);
             listed = rows->listed;
-            Value crumbs = Value::make_array();
-            for (const auto& c : browse::crumbs(roots, folder)) {
-                Value cv = Value::make_object();
-                cv.set("name", str(c.name));
-                cv.set("path", str(c.path));
-                crumbs.push(std::move(cv));
-            }
-            v.set("crumbs", std::move(crumbs));
+            set_crumbs();
         }
         const std::string at = roots_top ? std::string() : folder;
         {
