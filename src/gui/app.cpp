@@ -7,6 +7,7 @@
 #include "engine.hpp"
 #include "file_list.hpp"
 #include "folder.hpp"
+#include "guard.hpp"
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "listing.hpp"
@@ -16,6 +17,7 @@
 #include "play_server.hpp"
 #include "preview.hpp"
 #include "process.hpp"
+#include "proxy.hpp"
 #include "queue_view.hpp"
 #include "quote.hpp"
 #include "rclone_encoding.hpp"
@@ -117,6 +119,50 @@ int int_of(const Value& msg, std::string_view key, int fallback = 0) {
 bool bool_of(const Value& msg, std::string_view key) {
     const Value* v = msg.find(key);
     return v != nullptr && v->kind == Value::Kind::boolean && v->boolean;
+}
+
+// The route the server form gives (PROXIES.md 3.5): "proxyKind" none (directly), socks5 or http,
+// with "proxyHost", "proxyPort" and "proxyUser" as typed; its password ("proxySecret") is read
+// apart. nullopt: no kind chosen (an Edit whose proxy grab can't offer has to choose one).
+std::optional<proxy::Proxy> proxy_of(const Value& msg) {
+    const std::string kind = msg.string_of("proxyKind").value_or("");
+    if (kind == "none") return proxy::Proxy{};
+    if (kind != "socks5" && kind != "http") return std::nullopt;
+    return proxy::Proxy{.kind = kind == "socks5" ? proxy::Kind::socks5 : proxy::Kind::http,
+                        .host = std::string(util::trim(msg.string_of("proxyHost").value_or(""))),
+                        .port = int_of(msg, "proxyPort"),
+                        .user = std::string(util::trim(msg.string_of("proxyUser").value_or(""))),
+                        .password = {}};
+}
+
+// A server change with its proxy's password, typed in the form, put back for the one call that
+// needs it (the checks, the host-key fetch, the save); wiped when it goes.
+class WithProxyPassword {
+public:
+    WithProxyPassword(servers::NewServer s, const std::string& password) : s_(std::move(s)) {
+        if (s_.proxy) s_.proxy->password = password;
+    }
+    ~WithProxyPassword() {
+        if (s_.proxy) SecureZeroMemory(s_.proxy->password.data(), s_.proxy->password.size());
+    }
+    WithProxyPassword(const WithProxyPassword&) = delete;
+    WithProxyPassword& operator=(const WithProxyPassword&) = delete;
+    WithProxyPassword(WithProxyPassword&&) = delete;
+    WithProxyPassword& operator=(WithProxyPassword&&) = delete;
+    [[nodiscard]] const servers::NewServer& get() const { return s_; }
+
+private:
+    servers::NewServer s_;
+};
+
+// "socks5", "http", or "none".
+const char* proxy_kind_name(proxy::Kind kind) {
+    return kind == proxy::Kind::socks5 ? "socks5" : kind == proxy::Kind::http ? "http" : "none";
+}
+
+// "line" (grab.conf's `proxy` line), "kept" (grab's store, in rclone's form), or "" (directly).
+const char* proxy_from_name(guard::ProxyFrom from) {
+    return from == guard::ProxyFrom::line ? "line" : from == guard::ProxyFrom::kept ? "kept" : "";
 }
 
 // An upload question's choices for single files, "overrides" {"<place in its list>": choice}:
@@ -1109,10 +1155,12 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
             auto it = std::ranges::find(list, name, &server_ops::ServerInfo::name);
             if (it == list.end()) return settings_error("no server called " + name);
             if (!it->error.empty()) return settings_error(it->error);
-            // Refused for a server grab doesn't connect to, before anything dials.
+            // Refused for a server grab doesn't connect to, before anything dials; through its
+            // proxy, if it has one.
             auto reach = server_ops::reach_for(*env, name);
             if (!reach) return settings_error(reach.error());
             auto keys = server_ops::scan_host_keys(it->host, it->port, stop, *reach);
+            SecureZeroMemory(reach->proxy.password.data(), reach->proxy.password.size());
             if (stop.stop_requested()) return;
             if (!keys) return settings_error(keys.error());
             Pending p;
@@ -1121,6 +1169,7 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
             p.server.host = it->host;
             p.server.port = it->port;
             p.keys = std::move(*keys);
+            p.note = server_ops::fetch_note(env->known_hosts, it->host, it->port, p.keys, reach->proxy);
             post_host_keys(p);
             std::lock_guard lock(settings_mutex_);
             pending_ = std::move(p);
@@ -2047,6 +2096,8 @@ std::expected<server_ops::Env, std::string> App::load_env() const {
 
 void App::post_servers(const server_ops::Env& env) const {
     const auto learned = load_learned_limits(limits_path_);
+    // Read once for every server's Edit offer below, not once per server.
+    const auto store = passwords::load(env.passwords);
     Value items = Value::make_array();
     for (const auto& s : server_ops::list_servers(env)) {
         Value v = Value::make_object();
@@ -2080,6 +2131,27 @@ void App::post_servers(const server_ops::Env& env) const {
         // Whether its password (passphrase, stored key) is saved for this login; null for ssh-agent
         // or a store that can't be read. Never the value.
         v.set("secretSaved", s.secret_saved ? Value::make_bool(*s.secret_saved) : Value{});
+        // The proxy its connections go through (guard::route), never its password: "the SOCKS5
+        // proxy alice@127.0.0.1:9050", "" directly; and where it comes from ("line", "kept").
+        v.set("route", str(proxy::said(s.proxy)));
+        v.set("routeFrom", str(proxy_from_name(s.proxy_from)));
+        // What Edit starts from (server_ops::edit_proxy, as `grab server edit` offers it): the
+        // proxy a save that keeps it leaves, and only whether a password is saved for it; null
+        // with "proxyWhy" when the Edit has to choose.
+        const auto offer = server_ops::edit_proxy(env, s.name, store);
+        Value o;
+        if (offer.proxy) {
+            o = Value::make_object();
+            o.set("kind", str(proxy_kind_name(offer.proxy->kind)));
+            o.set("host", str(offer.proxy->host));
+            o.set("port", num(offer.proxy->port));
+            o.set("user", str(offer.proxy->user));
+            o.set("said", str(proxy::said(*offer.proxy)));
+            o.set("from", str(proxy_from_name(offer.from)));
+            o.set("passwordSaved", Value::make_bool(offer.password_saved));
+        }
+        v.set("proxyOffer", std::move(o));
+        v.set("proxyWhy", str(offer.why));
         items.push(std::move(v));
     }
     Value msg = Value::make_object();
@@ -2109,6 +2181,8 @@ void App::post_host_keys(const Pending& p) const {
         for (const auto& l : p.keys.lines) lines.push(str(l));
     }
     msg.set("lines", std::move(lines));
+    // Read through a proxy, and one of them isn't pinned yet: compare them with the owner's.
+    msg.set("note", str(p.note));
     post(msg);
 }
 
@@ -2143,6 +2217,11 @@ void App::save_server(const Value& msg) {
     }
     // Shared so the task below stays copyable; wiped whichever way this ends.
     auto secret = std::make_shared<Secret>(msg.string_of("secret").value_or(""));
+    // The route, always given (PROXIES.md decision 5, as `grab server` asks it); its password apart
+    // from `s`, which is copied around.
+    s.proxy = proxy_of(msg);
+    auto proxy_secret = std::make_shared<Secret>(msg.string_of("proxySecret").value_or(""));
+    if (!s.proxy || s.proxy->kind == proxy::Kind::none || s.proxy->user.empty()) proxy_secret->wipe(); // sent only with a user
 
     auto invalid = [this](const char* field, const std::string& message) {
         Value v = Value::make_object();
@@ -2154,20 +2233,25 @@ void App::save_server(const Value& msg) {
     if (!editing) {
         if (auto why = servers::validate_name(s.name)) return invalid("name", *why);
     }
-    // The checks grab.conf's details get everywhere (G5, G28).
-    if (auto problem = server_ops::check_server(s)) return invalid(problem->field.c_str(), problem->why);
+    // The checks grab.conf's details get everywhere (G5, G28), the proxy's password's length
+    // included.
+    if (auto problem = server_ops::check_server(WithProxyPassword(s, proxy_secret->value()).get())) {
+        return invalid(problem->field.c_str(), problem->why);
+    }
+    if (!s.proxy) return invalid("connect", "choose how grab connects to it: Directly, SOCKS5 proxy or HTTP proxy");
     if (s.max_depth < 1 || s.max_depth > 64) return invalid("depth", "a number from 1 to 64");
     if (const int conns = int_of(msg, "connections"); conns != 0) { // 0 or missing: automatic
         if (conns < 1 || conns > 64) return invalid("connections", "a number from 1 to 64, or blank for automatic");
         s.max_connections = conns;
     }
 
-    settings_task([this, editing, s, secret, invalid](std::stop_token stop) {
+    settings_task([this, editing, s, secret, proxy_secret, invalid](std::stop_token stop) {
         auto env = load_env();
         if (!env) return settings_error(env.error());
         Pending p;
         p.server = s;
         p.secret = std::move(*secret);
+        p.proxy_secret = std::move(*proxy_secret);
         bool need_keys = true;
         if (editing) {
             p.kind = Pending::Kind::edit;
@@ -2188,16 +2272,19 @@ void App::save_server(const Value& msg) {
         }
         if (!need_keys) return apply_pending(std::move(p), stop);
 
-        // The server's bind and connect time; refused for a server grab doesn't connect to (an
-        // inherited RCLONE_SFTP_SOCKS_PROXY covers a new one too), before anything dials. An Edit
-        // sets an unreadable store aside, so that doesn't stop its fetch.
-        const auto purpose = editing ? server_ops::Purpose::edit : server_ops::Purpose::trust;
-        auto reach = server_ops::reach_for(*env, s.name, purpose);
+        // The server's bind and connect time, through the proxy the form gives with the password
+        // typed (else, for an Edit, the one saved for that very proxy and user); refused for a
+        // server grab doesn't connect to (an inherited RCLONE_SFTP_SOCKS_PROXY covers a new one
+        // too), before anything dials. An Edit sets an unreadable store aside, so that doesn't
+        // stop its fetch.
+        auto reach = server_ops::reach_for_save(*env, WithProxyPassword(p.server, p.proxy_secret.value()).get());
         if (!reach) return settings_error(reach.error());
         auto keys = server_ops::scan_host_keys(s.host, s.port, stop, *reach);
+        SecureZeroMemory(reach->proxy.password.data(), reach->proxy.password.size());
         if (stop.stop_requested()) return;
         if (!keys) return settings_error(keys.error());
         p.keys = std::move(*keys);
+        p.note = server_ops::fetch_note(env->known_hosts, s.host, s.port, p.keys, reach->proxy);
         post_host_keys(p);
         std::lock_guard lock(settings_mutex_);
         pending_ = std::move(p);
@@ -2212,17 +2299,23 @@ void App::apply_pending(Pending p, std::stop_token stop) {
     if (!p.secret.empty()) secret = p.secret.value();
     p.secret.wipe();
     std::expected<std::string, std::string> done; // a note to show, when it worked
-    switch (p.kind) {
-    case Pending::Kind::add:
-        done = server_ops::add_server(*env, p.server, secret, p.keys);
-        break;
-    case Pending::Kind::edit:
-        done = server_ops::update_server(*env, p.server, secret,
-                                         p.keys.lines.empty() ? std::nullopt : std::optional(p.keys));
-        break;
-    case Pending::Kind::trust:
-        done = server_ops::trust_server(*env, p.server.name, p.keys).transform([] { return std::string{}; });
-        break;
+    {
+        // The proxy's password too, typed or not: empty keeps the one saved for the same proxy
+        // and user.
+        const WithProxyPassword wanted(p.server, p.proxy_secret.value());
+        p.proxy_secret.wipe();
+        switch (p.kind) {
+        case Pending::Kind::add:
+            done = server_ops::add_server(*env, wanted.get(), secret, p.keys);
+            break;
+        case Pending::Kind::edit:
+            done = server_ops::update_server(*env, wanted.get(), secret,
+                                             p.keys.lines.empty() ? std::nullopt : std::optional(p.keys));
+            break;
+        case Pending::Kind::trust:
+            done = server_ops::trust_server(*env, p.server.name, p.keys).transform([] { return std::string{}; });
+            break;
+        }
     }
     if (secret) std::fill(secret->begin(), secret->end(), '\0');
     if (!done) return settings_error(done.error());
@@ -2277,6 +2370,8 @@ void App::test_server(const std::string& name, std::stop_token stop) {
         v.set("unusable", str(result->unusable));
         v.set("grabSearch", str(result->grab_search));
         v.set("checksums", str(result->checksums));
+        // The proxy the login went through (never its password): "the SOCKS5 proxy 127.0.0.1:9050".
+        v.set("through", str(proxy::said(result->proxy)));
     }
     post(v);
 }

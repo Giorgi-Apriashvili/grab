@@ -1077,6 +1077,7 @@ html.dl-dragging, html.dl-dragging * { cursor: grabbing !important; }
 .inline .grow { flex: 1; min-width: 0; }
 .inner-label { padding-top: 6px; color: var(--muted); }
 .hint { margin-top: 3px; font-size: 12px; color: var(--muted); }
+.hint.warn { color: var(--warn); } /* a hint that has to be acted on, such as Edit's "choose one" for a proxy */
 .inline-hint { margin-left: 8px; }
 .field-error { font-size: 12px; color: var(--danger); }
 .field-error:empty { display: none; }
@@ -1196,6 +1197,13 @@ html.dropping .viewer-pdf { pointer-events: none; } /* a drag over the PDF reach
 .fingerprints td { padding: 5px 8px; border-top: 1px solid var(--line); vertical-align: top; }
 .fingerprints td:first-child { width: 80px; color: var(--muted); white-space: nowrap; }
 .fingerprints code { word-break: break-all; font-size: 12.5px; }
+/* Trust's keys read through a proxy, one not pinned yet: compare them (PROXIES.md, "Host keys unchanged"). */
+.proxy-note {
+  padding: 6px 10px;
+  border-left: 3px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  color: var(--text);
+}
 /* The upload dialog (UPLOADS.md 5.10): what goes, where, the server's word, the files there already. */
 .up-what { list-style: none; max-height: 9.5em; margin: 0 0 10px; padding: 0; overflow-y: auto; }
 .up-what li { display: flex; align-items: center; gap: 8px; padding: 2px 0; }

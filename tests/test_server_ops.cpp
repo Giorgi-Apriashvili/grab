@@ -1336,7 +1336,7 @@ TEST_CASE("proxies: an Edit keeps the proxy unless it sets one; its password sta
     edit.proxy = socks(9050, "alice", std::string(256, 'x'));
     CHECK(server_ops::check_server(edit).value_or(server_ops::Problem{}).field == "proxySecret");
     edit.proxy = socks(0);
-    CHECK(server_ops::check_server(edit).value_or(server_ops::Problem{}).field == "proxy");
+    CHECK(server_ops::check_server(edit).value_or(server_ops::Problem{}).field == "proxyPort");
     edit.proxy = socks(1080);
     edit.host = "fe80::1%eth0";
     CHECK(server_ops::check_server(edit).value_or(server_ops::Problem{}).field == "host");
@@ -1453,6 +1453,8 @@ TEST_CASE("proxies: every way grab reaches a server dials its proxy: Test, Trust
     REQUIRE(tested.has_value());
     CHECK(tested->grab_ok == false);
     dialled("Test", tested->grab_error);
+    // The window's test line says the proxy the login went through, never its password.
+    CHECK(tested->proxy == proxied.proxy("alice"));
     // Trust's host-key scan, and an Edit's.
     for (const auto purpose : {server_ops::Purpose::trust, server_ops::Purpose::edit}) {
         const auto reach = server_ops::reach_for(env, "px", purpose);
@@ -1488,6 +1490,7 @@ TEST_CASE("proxies: every way grab reaches a server dials its proxy: Test, Trust
     const auto through_kept = server_ops::test_connection(env, "kp");
     REQUIRE(through_kept.has_value());
     CHECK(through_kept->grab_error.find("k.invalid refused the connection on port 23") != std::string::npos);
+    CHECK(through_kept->proxy == kept.proxy());
     REQUIRE(kept.requests().size() == 1);
     CHECK(kept.requests()[0].connect == std::string("\x05\x01\x00\x03\x09", 5) + "k.invalid" + std::string("\x00\x17", 2));
 }
@@ -1575,6 +1578,23 @@ TEST_CASE("proxies: an Edit offers the proxy a save keeps: the line, a kept one 
     const auto bad = server_ops::edit_proxy(env, "bad");
     CHECK_FALSE(bad.proxy.has_value());
     CHECK(bad.why == "[bad] proxy: give the proxy's port (socks5://host:1080)");
+    // The window loads the store once for every server's offer: the same answers.
+    const auto store = passwords::load(env.passwords);
+    REQUIRE(store.has_value());
+    for (const auto& [name, alone] : {std::pair{"px", px}, std::pair{"nopw", nopw}, std::pair{"box", box}, std::pair{"agent", agent},
+                                      std::pair{"plain", plain}, std::pair{"two", two}, std::pair{"odd", odd}, std::pair{"bad", bad}}) {
+        CAPTURE(name);
+        const auto shared = server_ops::edit_proxy(env, name, store);
+        CHECK(shared.proxy == alone.proxy);
+        CHECK(shared.from == alone.from);
+        CHECK(shared.password_saved == alone.password_saved);
+        CHECK(shared.why == alone.why);
+    }
+    // A store that couldn't be read: the line's proxy, no password said saved.
+    const std::expected<passwords::Store, std::string> unread = std::unexpected(std::string("fake unreadable"));
+    const auto blind = server_ops::edit_proxy(env, "px", unread);
+    CHECK(blind.proxy == socks(9050, "alice"));
+    CHECK_FALSE(blind.password_saved);
 }
 
 TEST_CASE("proxies: the host-key fetch of grab server add and edit goes through the proxy given, its password as the save keeps it") {
@@ -1845,3 +1865,50 @@ TEST_CASE("proxies: grab server add and edit fetch the host key through the prox
     CHECK(proxied.requests().size() == seen + 1);
 }
 #endif
+
+// ---- proxies: the window's form (PROXIES.md, chunk 2) -------------------------------------------
+
+TEST_CASE("proxies: the form's proxy fields are checked one by one, each problem said for its field, the host never quoted") {
+    auto s = server(Auth::agent, "px");
+    const auto checked = [&](proxy::Kind kind, std::string host, int port, std::string user = {}, std::string password = {}) {
+        s.proxy = proxy::Proxy{.kind = kind, .host = std::move(host), .port = port, .user = std::move(user),
+                               .password = std::move(password)};
+        const auto problem = server_ops::check_server(s);
+        return problem ? problem->field + ": " + problem->why : std::string("fine");
+    };
+    using proxy::Kind;
+    // The host.
+    CHECK(checked(Kind::socks5, "", 1080) == "proxy: enter the proxy's host: a name or an IP address");
+    CHECK(checked(Kind::socks5, "  ", 1080) == "proxy: enter the proxy's host: a name or an IP address");
+    const std::string alone = "proxy: give the proxy's host alone: its kind, port and user name have their own fields";
+    CHECK(checked(Kind::socks5, "socks5://alice:fake-pw@127.0.0.1:1080", 1080) == alone);
+    CHECK(checked(Kind::http, "alice:fake-pw@127.0.0.1", 3128) == alone);
+    CHECK(checked(Kind::socks5, "127.0.0.1:9050", 1080) == "proxy: give the proxy's port in its own field");
+    CHECK(checked(Kind::socks5, "bad host", 1080) ==
+          "proxy: use a host name (letters, digits, - and .) or an IP address for the proxy");
+    CHECK(checked(Kind::socks5, "::1", 1080) == "fine");
+    CHECK(checked(Kind::http, "proxy.example", 3128) == "fine");
+    // The port.
+    CHECK(checked(Kind::socks5, "127.0.0.1", 0) == "proxyPort: give the proxy's port (Tor 9050, ssh -D often 1080, Squid 3128)");
+    CHECK(checked(Kind::socks5, "127.0.0.1", -1) == "proxyPort: the proxy's port must be from 1 to 65535");
+    CHECK(checked(Kind::http, "127.0.0.1", 65536) == "proxyPort: the proxy's port must be from 1 to 65535");
+    // The user: rclone's user:password form never taken (nor quoted), the line's own checks.
+    const auto colon = checked(Kind::socks5, "127.0.0.1", 1080, "alice:fake-pw");
+    CHECK(colon == "proxyUser: a proxy user name can't hold ':' here: its password has a field of its own (the copy for "
+                   "older grabs can't hold it either)");
+    CHECK(colon.find("fake-") == std::string::npos);
+    CHECK(checked(Kind::http, "127.0.0.1", 3128, "bob:x") ==
+          "proxyUser: the user name for an HTTP proxy can't hold ':' (Basic login)");
+    CHECK(checked(Kind::socks5, "127.0.0.1", 1080, "a b") ==
+          "proxyUser: the proxy's user name can't hold spaces or control characters");
+    CHECK(checked(Kind::socks5, "127.0.0.1", 1080, std::string(256, 'u')) ==
+          "proxyUser: the proxy's user name is longer than SOCKS5 allows (255 bytes)");
+    CHECK(checked(Kind::http, "127.0.0.1", 3128, "user@corp") == "fine");
+    // The password: SOCKS5's 255 bytes; HTTP has no such limit.
+    CHECK(checked(Kind::socks5, "127.0.0.1", 1080, "alice", std::string(256, 'p')) ==
+          "proxySecret: the proxy's password is longer than SOCKS5 allows (255 bytes)");
+    CHECK(checked(Kind::http, "127.0.0.1", 3128, "alice", std::string(300, 'p')) == "fine");
+    CHECK(checked(Kind::socks5, "127.0.0.1", 9050, "alice", "fake-proxy-pw") == "fine");
+    // Directly: the fields aren't looked at.
+    CHECK(checked(Kind::none, "socks5://junk", -1, "a b") == "fine");
+}

@@ -669,6 +669,41 @@ std::optional<std::string> name_taken(const Env& env, const std::string& name) {
     return server_conf::check_new_name(name, section_names(env));
 }
 
+namespace {
+
+// A proxy's host, port and user each checked on its own, so that the window says a problem beside
+// its field ("proxy" the host, "proxyPort", "proxyUser"), then the grab.conf line's checks on the
+// whole (server_conf::check_proxy). What the host field holds is never quoted: a whole proxy
+// pasted there may hold a password.
+std::optional<Problem> check_proxy_fields(const proxy::Proxy& p, std::string_view server) {
+    const auto problem = [](std::string field, std::string why) {
+        return Problem{.field = std::move(field), .why = std::move(why)};
+    };
+    if (p.host.contains("://") || p.host.contains('@')) {
+        return problem("proxy", "give the proxy's host alone: its kind, port and user name have their own fields");
+    }
+    if (util::trim(p.host).empty()) return problem("proxy", "enter the proxy's host: a name or an IP address");
+    // host:port typed together (an IPv6 address has two ':' at least).
+    if (std::ranges::count(p.host, ':') == 1) return problem("proxy", "give the proxy's port in its own field");
+    if (p.port == 0) return problem("proxyPort", "give the proxy's port (Tor 9050, ssh -D often 1080, Squid 3128)");
+    if (server_conf::check_port(p.port)) return problem("proxyPort", "the proxy's port must be from 1 to 65535");
+    proxy::Proxy bare = p;
+    bare.user.clear();
+    bare.password.clear();
+    if (auto why = server_conf::check_proxy(bare, server)) return problem("proxy", std::move(*why));
+    // rclone's "user:password" form: the password would land in grab.conf and in messages, and the
+    // copy for older grabs splits at the ':' (an HTTP user is refused it by check_proxy, for Basic).
+    if (p.kind == proxy::Kind::socks5 && p.user.contains(':')) {
+        return problem("proxyUser", "a proxy user name can't hold ':' here: its password has a field of its own "
+                                    "(the copy for older grabs can't hold it either)");
+    }
+    bare.user = p.user;
+    if (auto why = server_conf::check_proxy(bare, server)) return problem("proxyUser", std::move(*why));
+    return std::nullopt;
+}
+
+} // namespace
+
 std::optional<Problem> check_server(const servers::NewServer& s) {
     if (auto why = server_conf::check_host(s.host)) return Problem{.field = "host", .why = std::move(*why)};
     if (auto why = server_conf::check_port(s.port)) return Problem{.field = "port", .why = std::move(*why)};
@@ -680,7 +715,7 @@ std::optional<Problem> check_server(const servers::NewServer& s) {
     }
     if (s.proxy && s.proxy->kind != proxy::Kind::none) {
         const proxy::Proxy& p = *s.proxy;
-        if (auto why = server_conf::check_proxy(p, s.name)) return Problem{.field = "proxy", .why = std::move(*why)};
+        if (auto problem = check_proxy_fields(p, s.name)) return problem;
         if (s.host.contains('%')) {
             return Problem{.field = "host", .why = "an address with a zone can't go through a proxy"};
         }
@@ -778,13 +813,16 @@ servers::NewServer edit_defaults(const ServerInfo& current) {
 }
 
 ProxyOffer edit_proxy(const Env& env, std::string_view name) {
+    return edit_proxy(env, name, passwords::load(env.passwords));
+}
+
+ProxyOffer edit_proxy(const Env& env, std::string_view name, const std::expected<passwords::Store, std::string>& store) {
     const auto line = line_proxy(env, name);
     if (!line) {
         return ProxyOffer{.proxy = std::nullopt, .from = guard::ProxyFrom::none, .password_saved = false,
                           .why = line.error()};
     }
     const auto from_line = line->kind == proxy::Kind::none ? guard::ProxyFrom::none : guard::ProxyFrom::line;
-    const auto store = passwords::load(env.passwords);
     if (!store) return ProxyOffer{.proxy = *line, .from = from_line, .password_saved = false, .why = {}};
     // As proxy_after finds it for a save that leaves the proxy unset.
     server_conf::Connection now;
@@ -1225,6 +1263,10 @@ void test_grab(const Env& env, engine::Context& ctx, const std::filesystem::path
     };
     auto target = engine::ssh_target(ctx);
     if (!target) return failed(target.error());
+    // The route the test takes, said with its result (the window's "through the ... proxy").
+    result.proxy = target->proxy;
+    std::ranges::fill(result.proxy.password, '\0');
+    result.proxy.password.clear();
     ssh::Pool::Options options;
     options.limit = 1;
     options.idle_timer = false;

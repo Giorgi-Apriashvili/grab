@@ -230,9 +230,13 @@ private:
     // A server change waiting for the user to trust the host key.
     struct Pending {
         enum class Kind { add, edit, trust } kind = Kind::add;
-        servers::NewServer server;
+        servers::NewServer server; // its proxy's password left out: in proxy_secret
         Secret secret;
+        Secret proxy_secret; // the proxy's password as typed in the form
         server_ops::HostKeys keys;
+        // Beside the fingerprints: the keys were read through a proxy and one isn't pinned yet
+        // (server_ops::fetch_note).
+        std::string note;
         bool moved = false; // an edit to another user, host or port
     };
     enum class Status { queued, running, paused, done, failed, cancelled, skipped };

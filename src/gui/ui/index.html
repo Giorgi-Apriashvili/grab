@@ -285,6 +285,39 @@
           <div class="hint" id="secret-hint"></div>
           <div class="field-error" data-for="secret"></div></div>
 
+        <!-- The route (PROXIES.md 3.5): directly, or through a SOCKS5 or HTTP proxy grab never goes
+             around. An Edit starts from what a save would keep (the backend's proxyOffer). -->
+        <span class="grid-label" id="proxy-label">Connect</span>
+        <div>
+          <div class="segmented" id="f-proxy" role="radiogroup" aria-labelledby="proxy-label">
+            <button type="button" data-proxy="none" role="radio">Directly</button>
+            <button type="button" data-proxy="socks5" role="radio">SOCKS5 proxy</button>
+            <button type="button" data-proxy="http" role="radio">HTTP proxy</button>
+          </div>
+          <div class="hint proxy-from" id="proxy-from" hidden></div>
+          <div class="field-error" data-for="connect"></div>
+        </div>
+
+        <label for="f-proxy-host" data-proxy-only>Proxy</label>
+        <div class="inline" data-proxy-only>
+          <div class="grow"><input id="f-proxy-host" type="text" spellcheck="false" placeholder="127.0.0.1 or proxy.example.com">
+            <div class="field-error" data-for="proxy"></div></div>
+          <label for="f-proxy-port" class="inner-label">Port</label>
+          <div><input id="f-proxy-port" type="text" inputmode="numeric" class="num">
+            <div class="field-error" data-for="proxyPort"></div></div>
+        </div>
+
+        <label for="f-proxy-user" data-proxy-only>Proxy user</label>
+        <div data-proxy-only><input id="f-proxy-user" type="text" spellcheck="false" placeholder="Only if the proxy wants a login">
+          <div class="field-error" data-for="proxyUser"></div></div>
+
+        <label for="f-proxy-secret" data-proxy-only>Proxy password</label>
+        <div data-proxy-only><input id="f-proxy-secret" type="password" spellcheck="false">
+          <div class="hint" id="proxy-hint">grab never goes around the proxy: if it fails, so does the connection. The proxy
+            looks up the server's name. User names and passwords reach the proxy unencrypted: use them only with a
+            proxy on this PC or a network you trust. Ports: Tor 9050, <code>ssh -D</code> often 1080, Squid 3128.</div>
+          <div class="field-error" data-for="proxySecret"></div></div>
+
         <label for="f-roots">Search in</label>
         <div><textarea id="f-roots" rows="3" spellcheck="false" placeholder="One folder per line, e.g. /srv/media or downloads. Blank = the login home."></textarea></div>
 

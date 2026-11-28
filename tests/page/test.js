@@ -2694,6 +2694,226 @@ try {
     sent.length = 0;
   }
 
+  // ---- Settings → a server's route: directly or through a proxy (PROXIES.md 3.5, chunk 2) --------
+  // The cards say the proxy each server goes through (never a password: the backend sends none)
+  // and where a kept one comes from; a test says the proxy its login went through; the form's
+  // Connect row (Directly, SOCKS5 proxy, HTTP proxy) with the proxy's host, port, user and password,
+  // its keep/none rule as the backend's, its errors beside each field; Edit starts from the
+  // backend's offer, or has to choose; Trust's note for keys read through a proxy.
+  {
+    const viewWas = $('#settings-view').hidden;
+    const openWas = settings.open;
+    const serversWas = settings.servers;
+    $('#settings-view').hidden = false; // shown, so its fields take focus
+    settings.open = true;
+    const direct = { kind: 'none', host: '', port: 0, user: '', said: '', from: '', passwordSaved: false };
+    const srv = (over) => ({ name: 'px', isDefault: false, roots: [], depth: 4, maxConnections: null, autoConnections: 12,
+      error: '', host: 'x.example', user: 'u', port: 23, auth: 'agent', keyFile: '', search: 'probe', pinned: true, guard: '',
+      connectionKeys: '', secretSaved: null, route: '', routeFrom: '', proxyOffer: direct, proxyWhy: '', ...over });
+    const socksLine = { kind: 'socks5', host: '127.0.0.1', port: 9050, user: 'alice', said: 'the SOCKS5 proxy alice@127.0.0.1:9050',
+      from: 'line', passwordSaved: true };
+    const kept = { kind: 'socks5', host: '127.0.0.1', port: 9, user: 'fake-user', said: 'the SOCKS5 proxy fake-user@127.0.0.1:9',
+      from: 'kept', passwordSaved: true };
+    const twoWhy = '[two] has both a SOCKS and an HTTP proxy (rclone.socks_proxy and rclone.http_proxy in grab\'s store), so ' +
+      'grab doesn\'t connect to two rather than go around it: Edit two and choose one of them, or Directly';
+    settings.servers = [
+      srv({ name: 'px', route: socksLine.said, routeFrom: 'line', proxyOffer: socksLine }),
+      srv({ name: 'kp', route: kept.said, routeFrom: 'kept', proxyOffer: kept }),
+      srv({ name: 'plain' }),
+      srv({ name: 'two', guard: twoWhy, proxyOffer: null, proxyWhy: twoWhy }),
+    ];
+    settings.tests = {};
+    settings.form = null;
+    renderServers();
+    const card = (name) => [...document.querySelectorAll('#server-list .server')].find((c) => c.querySelector('.server-name').textContent === name);
+    const meta = (name) => card(name).querySelector('.server-meta').textContent;
+    const statusOf = (name) => card(name).querySelector('.server-status').textContent;
+    const kindOn = () => [...$('#f-proxy').querySelectorAll('button')].filter((x) => x.getAttribute('aria-checked') === 'true').map((x) => x.dataset.proxy);
+    const proxyShown = () => [...document.querySelectorAll('[data-proxy-only]')].map((el) => !el.hidden);
+    const type = (id, v) => { $(id).value = v; $(id).dispatchEvent(new Event('input', { bubbles: true })); };
+    const lastSave = () => { const m = sent.filter((x) => x.type === 'serverSave'); return m[m.length - 1]; };
+    const routeOf = (m) => m && [m.proxyKind, m.proxyHost, m.proxyPort, m.proxyUser, m.proxySecret];
+    const token = (name) => {
+      const probe = document.createElement('span');
+      probe.style.color = `var(--${name})`;
+      document.body.append(probe);
+      const c = getComputedStyle(probe).color;
+      probe.remove();
+      return c;
+    };
+
+    check('route: a card says the proxy it goes through after the login\'s address; directly says nothing',
+      [meta('px').startsWith('u@x.example:23 · through the SOCKS5 proxy alice@127.0.0.1:9050 · ssh-agent · '), meta('plain').includes('through')],
+      [true, false]);
+    check('route: one kept in grab\'s store says where it comes from, and that Edit writes it into grab.conf',
+      meta('kp').includes(' · through the SOCKS5 proxy fake-user@127.0.0.1:9 (kept in grab\'s store: from rclone, or a proxy line since ' +
+        'removed; Edit writes it into grab.conf) · '), true);
+    openForm('two');
+    const twoForm = [kindOn(), $('#proxy-from').hidden, $('#proxy-from').textContent,
+      getComputedStyle($('#proxy-from')).color === token('warn')];
+    closeForm();
+    check('route: a server refused for its proxies says why as refusals do, offers no Trust, and its Edit has to choose',
+      [statusOf('two'), !!card('two').querySelector('[data-act="trust"]'), !!card('two').querySelector('[data-act="edit"]'), twoForm],
+      [`✗ Not usable: ${twoWhy}`, false, true, [[], false, `${twoWhy}. Choose Directly, SOCKS5 proxy or HTTP proxy.`, true]]);
+
+    settings.tests = { px: { pending: true }, plain: { pending: true } };
+    renderServers();
+    check('route: a test under way says the proxy it goes through', [statusOf('px'), statusOf('plain')],
+      ['✓ Host key pinnedTesting the connection through the SOCKS5 proxy alice@127.0.0.1:9050…', '✓ Host key pinnedTesting the connection…']);
+    const tested = (over) => ({ type: 'serverTested', ok: true, grabOk: true, grabError: '', unusable: '', grabSearch: 'with find',
+      checksums: 'checksums: md5sum', through: '', ...over });
+    settings.tests = {
+      px: tested({ name: 'px', through: socksLine.said }),
+      kp: tested({ name: 'kp', ok: false, grabOk: false, grabError: 'the proxy turned down the user name and password', grabSearch: '',
+        checksums: '', through: kept.said }),
+      plain: tested({ name: 'plain' }),
+    };
+    renderServers();
+    check('route: a test\'s result says the proxy its login went through, and the proxy\'s refusal plainly',
+      [statusOf('px'), statusOf('kp'), statusOf('plain')],
+      ['✓ Host key pinned✓ Connection OK through the SOCKS5 proxy alice@127.0.0.1:9050 · home folder listed · searches with find · checksums: md5sum',
+        '✓ Host key pinned✗ Connection through the SOCKS5 proxy fake-user@127.0.0.1:9 failed: the proxy turned down the user name and password',
+        '✓ Host key pinned✓ Connection OK · home folder listed · searches with find · checksums: md5sum']);
+    settings.tests = {};
+
+    // Add: directly unless a proxy is chosen.
+    openForm(null);
+    check('form: a new server connects directly, the proxy\'s fields hidden', [kindOn(), proxyShown().some(Boolean), $('#proxy-from').hidden],
+      [['none'], false, true]);
+    check('form: Connect is a radio group named by its label', [$('#f-proxy').getAttribute('role'), $(`#${$('#f-proxy').getAttribute('aria-labelledby')}`).textContent,
+      [...$('#f-proxy').querySelectorAll('button')].map((x) => [x.getAttribute('role'), x.textContent])],
+    ['radiogroup', 'Connect', [['radio', 'Directly'], ['radio', 'SOCKS5 proxy'], ['radio', 'HTTP proxy']]]);
+    $('#f-name').value = 'np';
+    $('#f-host').value = 'x.example';
+    $('#f-user').value = 'u';
+    $('#f-auth button[data-auth="agent"]').click();
+    $('#f-proxy button[data-proxy="socks5"]').click();
+    check('form: SOCKS5 proxy shows its host, port, user and password, and the hint', [kindOn(), proxyShown().every(Boolean),
+      /never goes around the proxy.*looks up the server's name.*unencrypted/s.test($('#proxy-hint').textContent)], [['socks5'], true, true]);
+    check('form: the proxy password waits for a user', [$('#f-proxy-secret').disabled, $('#f-proxy-secret').placeholder], [true, 'Only with a proxy user']);
+    type('#f-proxy-host', ' [::1] ');
+    type('#f-proxy-port', '1080');
+    type('#f-proxy-user', ' alice ');
+    check('form: with a user, its password may be typed', [$('#f-proxy-secret').disabled, $('#f-proxy-secret').placeholder], [false, 'Only if the proxy wants one']);
+    $('#f-proxy-secret').value = 'fake-typed-pw';
+    sent.length = 0;
+    submitForm();
+    check('form: Save sends the route: its kind, the host without brackets, the port, the user and the password typed',
+      routeOf(lastSave()), ['socks5', '::1', 1080, 'alice', 'fake-typed-pw']);
+    check('form: the typed passwords go with the message, the fields are emptied', [$('#f-proxy-secret').value, $('#f-secret').value], ['', '']);
+    check('form: the status says the host key is read through the proxy', settings.status, 'Checking the host key through the SOCKS5 proxy…');
+    setStatus('');
+    type('#f-proxy-port', '');
+    submitForm();
+    const blankPort = lastSave().proxyPort;
+    type('#f-proxy-port', 'abc');
+    submitForm();
+    check('form: a blank port goes as 0, one that isn\'t a number as -1: the backend names the field', [blankPort, lastSave().proxyPort], [0, -1]);
+    $('#f-proxy button[data-proxy="http"]').click();
+    type('#f-proxy-port', '3128');
+    $('#f-proxy-secret').value = 'fake-typed-pw';
+    type('#f-proxy-user', '');
+    submitForm();
+    check('form: HTTP without a user: no password goes', [routeOf(lastSave()), $('#f-proxy-secret').disabled], [['http', '::1', 3128, '', ''], true]);
+    type('#f-proxy-user', 'alice');
+    $('#f-proxy-secret').value = 'fake-typed-pw';
+    $('#f-proxy button[data-proxy="none"]').click();
+    submitForm();
+    check('form: Directly: nothing of the proxy\'s fields goes, and they hide', [routeOf(lastSave()), proxyShown().some(Boolean)],
+      [['none', '', 0, '', ''], false]);
+    setStatus('');
+
+    // The backend's errors beside their fields, the field focused.
+    $('#f-proxy button[data-proxy="socks5"]').click();
+    const besides = [];
+    for (const [field, input] of [['proxy', '#f-proxy-host'], ['proxyPort', '#f-proxy-port'], ['proxyUser', '#f-proxy-user'],
+      ['proxySecret', '#f-proxy-secret'], ['connect', '#f-proxy button']]) {
+      clearFieldErrors();
+      onServerError({ type: 'serverError', field, message: `fake ${field} problem` });
+      besides.push([$(`.field-error[data-for="${field}"]`).textContent, document.activeElement === $(input)]);
+    }
+    check('form: each of the route\'s problems is said beside its field, which takes the focus', besides,
+      [['fake proxy problem', true], ['fake proxyPort problem', true], ['fake proxyUser problem', true], ['fake proxySecret problem', true],
+        ['fake connect problem', true]]);
+    clearFieldErrors();
+    closeForm();
+
+    // Edit: the proxy as saved; its password kept only for the same kind, host, port and user.
+    openForm('px');
+    check('edit: the proxy as saved is filled in, never a password', [kindOn(), $('#f-proxy-host').value, $('#f-proxy-port').value, $('#f-proxy-user').value,
+      $('#f-proxy-secret').value, $('#f-proxy-secret').placeholder, $('#proxy-from').hidden],
+    [['socks5'], '127.0.0.1', '9050', 'alice', '', 'Leave blank to keep the saved password', true]);
+    const holds = [];
+    for (const [id, v, back] of [['#f-proxy-port', '9051', '9050'], ['#f-proxy-user', 'bob', 'alice'], ['#f-proxy-host', '127.0.0.2', '127.0.0.1']]) {
+      type(id, v);
+      holds.push($('#f-proxy-secret').placeholder);
+      type(id, back);
+    }
+    $('#f-proxy button[data-proxy="http"]').click();
+    holds.push($('#f-proxy-secret').placeholder);
+    $('#f-proxy button[data-proxy="socks5"]').click();
+    holds.push($('#f-proxy-secret').placeholder);
+    const again = 'Type it again for this proxy and user, or leave blank for none';
+    check('edit: another port, user, host or kind: the saved password stays with the one it was typed for', holds,
+      [again, again, again, again, 'Leave blank to keep the saved password']);
+    sent.length = 0;
+    submitForm();
+    check('edit: Save with nothing typed: the same route, no password (the backend keeps the saved one)',
+      [lastSave().editing, lastSave().name, routeOf(lastSave())], [true, 'px', ['socks5', '127.0.0.1', 9050, 'alice', '']]);
+    setStatus('');
+    closeForm();
+    // Even an offer that carried a password (the backend sends none) never fills it in.
+    settings.servers[0] = srv({ name: 'px', route: socksLine.said, routeFrom: 'line', proxyOffer: { ...socksLine, password: 'fake-never-shown' } });
+    openForm('px');
+    check('edit: no saved password ever reaches a field', [$('#f-proxy-secret').value, $('#server-form').innerHTML.includes('fake-never'),
+      [...$('#server-form').querySelectorAll('input')].some((i) => i.value.includes('fake-never'))], ['', false, false]);
+    closeForm();
+    openForm('kp');
+    check('edit: a proxy kept in grab\'s store is filled in, and where it comes from said',
+      [kindOn(), $('#f-proxy-host').value, $('#f-proxy-port').value, $('#f-proxy-user').value, $('#proxy-from').hidden, $('#proxy-from').textContent,
+        getComputedStyle($('#proxy-from')).color === token('muted')],
+      [['socks5'], '127.0.0.1', '9', 'fake-user', false, 'kp goes through the SOCKS5 proxy fake-user@127.0.0.1:9, kept in grab\'s store (from ' +
+        'rclone, or a proxy line since removed): Save writes it into grab.conf.', true]);
+    closeForm();
+    openForm('two');
+    sent.length = 0;
+    submitForm();
+    check('edit: Save with no Connect chosen is refused beside it, nothing sent',
+      [sent.length, $('.field-error[data-for="connect"]').textContent, document.activeElement === $('#f-proxy button')],
+      [0, 'choose how grab connects to it: Directly, SOCKS5 proxy or HTTP proxy', true]);
+    $('#f-proxy button[data-proxy="none"]').click();
+    submitForm();
+    check('edit: once chosen it goes', routeOf(lastSave()), ['none', '', 0, '', '']);
+    setStatus('');
+    closeForm();
+
+    // Trust: the note when the keys were read through a proxy and one isn't pinned yet.
+    const note = 'Read through the SOCKS5 proxy 127.0.0.1:9050. A proxy can show its own key here; if you can, compare these ' +
+      'fingerprints with the server\'s owner.';
+    const keysMsg = (over) => ({ type: 'hostKeys', kind: 'add', name: 'np', host: 'x.example', port: 23,
+      fingerprints: [{ type: 'ED25519', hash: 'SHA256:fake' }], lines: [], note: '', ...over });
+    onHostKeys(keysMsg({ note }));
+    const shown = $('#modal-body .proxy-note');
+    const paragraphs = [...$('#modal-body').querySelectorAll('p')].map((p) => p.className);
+    check('trust: keys read through a proxy, one new: the note after the fingerprints, in the warning colour',
+      [!$('#modal').hidden, shown && shown.textContent, paragraphs, shown && getComputedStyle(shown).borderLeftColor === token('warn')],
+      [true, note, ['', 'muted', 'proxy-note', 'muted'], true]);
+    closeModal(false);
+    onHostKeys(keysMsg({ kind: 'trust', name: 'px' }));
+    check('trust: directly, or every key pinned already: no note', !!$('#modal-body .proxy-note'), false);
+    closeModal(false);
+
+    settings.servers = serversWas;
+    settings.tests = {};
+    settings.form = null;
+    renderServers();
+    document.activeElement.blur();
+    $('#settings-view').hidden = viewWas;
+    settings.open = openWas;
+    setStatus('');
+    sent.length = 0;
+  }
+
   // ---- drops from Explorer (UPLOADS.md 5.10, chunk 4) ---------------------------------------------
   // Every drag is kept from navigating the window; over Browse the overlay says where a drop goes
   // (the folder row under the pointer, else the folder open), Browse's refusals and the places

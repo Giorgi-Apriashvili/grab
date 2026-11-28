@@ -6637,6 +6637,9 @@ const settings = {
   servers: [],
   form: null,     // null, or { editing, name, origAuth, ... } while the add/edit form is shown
   auth: 'password',
+  // The form's Connect choice (PROXIES.md 3.5): 'none' (directly), 'socks5', 'http', or null while
+  // an Edit whose proxy grab can't offer (proxyWhy) has to choose.
+  proxy: 'none',
   tests: {},      // server name -> serverTested message, or { pending: true }
   busy: false,
   status: '',
@@ -6699,19 +6702,33 @@ function closeSettings() {
   $('#query').focus();
 }
 
-function testLine(t) {
+// `route`: the proxy the server's card says it goes through ("the SOCKS5 proxy 127.0.0.1:9050"),
+// for a test still running; a result says the one its login went through (`through`).
+function testLine(t, route = '') {
   if (!t) return '';
-  if (t.pending) return '<span class="muted"><span class="spinner"></span>Testing the connection…</span>';
+  if (t.pending) {
+    return `<span class="muted"><span class="spinner"></span>Testing the connection${route ? ` through ${esc(route)}` : ''}…</span>`;
+  }
   if (t.error) return `<span><span class="bad">✗ Test failed:</span> <span class="detail">${esc(t.error)}</span></span>`;
   // A server grab doesn't connect to: why, and nothing tried.
   if (t.unusable) return `<span><span class="bad">✗ Not usable:</span> <span class="detail">${esc(t.unusable)}</span></span>`;
+  const via = t.through ? ` through ${esc(t.through)}` : '';
   // As `grab server test` says it: grab's login listed the home folder.
   if (t.ok) {
     const how = ' · home folder listed' + (t.grabSearch ? ` · searches ${esc(t.grabSearch)}` : '') +
       (t.checksums ? ` · ${esc(t.checksums)}` : '');
-    return `<span class="good">✓ Connection OK</span><span class="muted">${how}</span>`;
+    return `<span class="good">✓ Connection OK${via}</span><span class="muted">${how}</span>`;
   }
-  return `<span><span class="bad">✗ Connection failed:</span> <span class="detail">${esc(t.grabError || 'failed')}</span></span>`;
+  return `<span><span class="bad">✗ Connection${via} failed:</span> <span class="detail">${esc(t.grabError || 'failed')}</span></span>`;
+}
+
+// The proxy a server goes through, never its password, and where a kept one comes from:
+// " · through the SOCKS5 proxy alice@127.0.0.1:9050"; '' directly.
+function routeText(s) {
+  if (!s.route) return '';
+  const kept = s.routeFrom === 'kept'
+    ? ' (kept in grab\'s store: from rclone, or a proxy line since removed; Edit writes it into grab.conf)' : '';
+  return ` · through ${esc(s.route)}${kept}`;
 }
 
 // How a server logs in, and whether what it needs is saved (never the value): "password
@@ -6742,7 +6759,7 @@ function serverCard(s) {
   const where = s.roots.length ? s.roots.join(', ') : '~';
   const meta = s.error
     ? `<span class="bad">${esc(s.error)}</span>`
-    : `${esc(s.user)}@${esc(s.host)}:${s.port} · ${loginText(s)}` +
+    : `${esc(s.user)}@${esc(s.host)}:${s.port}${routeText(s)} · ${loginText(s)}` +
       ` · searched ${SEARCHED_TEXT[s.search] || SEARCHED_TEXT.probe} in ${esc(where)}, depth ${s.depth}` +
       ` · up to ${s.maxConnections || s.autoConnections} download connections${s.maxConnections ? '' : ' (automatic)'}` +
       (s.connectionKeys ? ` · ${esc(s.connectionKeys)}` : '');
@@ -6753,7 +6770,7 @@ function serverCard(s) {
   }
   // Why grab doesn't connect to it at all (a proxy, an ssh command...), and how to change that.
   if (!s.error && s.guard) status.push(`<span class="bad">✗ Not usable: ${esc(s.guard)}</span>`);
-  const test = testLine(settings.tests[s.name]);
+  const test = testLine(settings.tests[s.name], s.route);
   return `<div class="server">` +
     `<div class="server-top"><span class="server-name">${esc(s.name)}</span>` +
     `${s.isDefault ? '<span class="badge">default</span>' : ''}` +
@@ -6817,6 +6834,68 @@ function setAuth(auth) {
   }[auth];
 }
 
+// ---- the route (PROXIES.md 3.5) ----------------------------------------------------------------
+// Connect: Directly, or through a SOCKS5 or HTTP proxy with its host, port, user and password, as
+// `grab server add` asks. An Edit starts from the backend's proxyOffer (what a save that keeps it
+// leaves: its `proxy` line, else one grab's store keeps for it, said where from), never a saved
+// password, only that one is saved; with none offered (proxyWhy) no choice is on until one is made.
+
+const PROXY_KIND = { socks5: 'SOCKS5', http: 'HTTP' };
+
+// The proxy's host as typed, an IPv6 address without its brackets (grab.conf's form).
+function proxyHostOf() {
+  return $('#f-proxy-host').value.trim().replace(/^\[(.*)\]$/, '$1');
+}
+
+function setProxyKind(kind) {
+  settings.proxy = kind;
+  for (const b of $('#f-proxy').querySelectorAll('button')) b.setAttribute('aria-checked', String(b.dataset.proxy === kind));
+  const via = kind === 'socks5' || kind === 'http';
+  for (const el of document.querySelectorAll('[data-proxy-only]')) el.hidden = !via;
+  setProxySecretPlaceholder();
+}
+
+// The proxy's saved password stays only with the proxy and user it was typed for (as the backend
+// keeps it: the same kind, host, port and user as offered); otherwise blank means none.
+function keepsProxySecret() {
+  const f = settings.form;
+  const o = f && f.proxyOffer;
+  if (!f || !f.editing || !o || !o.passwordSaved) return false;
+  return settings.proxy === o.kind && proxyHostOf() === o.host && intOf('#f-proxy-port') === o.port &&
+    $('#f-proxy-user').value.trim() === o.user;
+}
+
+// The password goes to the proxy only with a user (as the backend sends it).
+function setProxySecretPlaceholder() {
+  const f = settings.form;
+  const input = $('#f-proxy-secret');
+  const user = $('#f-proxy-user').value.trim() !== '';
+  input.disabled = !user;
+  if (!user) input.value = '';
+  input.placeholder = !user ? 'Only with a proxy user'
+    : keepsProxySecret() ? 'Leave blank to keep the saved password'
+    : f && f.editing && f.proxyOffer && f.proxyOffer.passwordSaved ? 'Type it again for this proxy and user, or leave blank for none'
+    : 'Only if the proxy wants one';
+}
+
+// Under Connect: why an Edit has to choose (no proxy offered), or where an offered one comes from.
+function renderProxyFrom() {
+  const f = settings.form;
+  const el = $('#proxy-from');
+  const o = f && f.proxyOffer;
+  const choose = !!(f && f.editing && !o);
+  let text = '';
+  if (choose) {
+    text = `${f.proxyWhy ? `${f.proxyWhy.replace(/\.$/, '')}. ` : ''}Choose Directly, SOCKS5 proxy or HTTP proxy.`;
+  } else if (o && o.from === 'kept') {
+    text = `${f.name} goes through ${o.said}, kept in grab's store (from rclone, or a proxy line since removed): ` +
+      'Save writes it into grab.conf.';
+  }
+  el.textContent = bidiVisible(text);
+  el.hidden = !text;
+  el.classList.toggle('warn', choose);
+}
+
 function clearFieldErrors() {
   for (const el of document.querySelectorAll('.field-error')) el.textContent = '';
 }
@@ -6827,7 +6906,9 @@ function openForm(name) {
   const known = s && !s.error;
   settings.form = { editing: !!s, name: s ? s.name : '', origAuth: known ? s.auth : null,
     origHost: known ? s.host : '', origUser: known ? s.user : '', origPort: known ? s.port : 22,
-    origKey: known ? (s.keyFile || '') : '', secretSaved: !!known && s.secretSaved === true };
+    origKey: known ? (s.keyFile || '') : '', secretSaved: !!known && s.secretSaved === true,
+    // What Connect starts from: a new server connects directly (PROXIES.md decision 2).
+    proxyOffer: s ? s.proxyOffer || null : null, proxyWhy: s ? s.proxyWhy || '' : '' };
   $('#form-title').textContent = s ? (known ? `Edit ${s.name}` : `Fill in ${s.name}'s connection details`) : 'Add a server';
   $('#f-name').value = s ? s.name : '';
   $('#f-name').disabled = !!s;
@@ -6842,6 +6923,14 @@ function openForm(name) {
   $('#f-conns').placeholder = s ? String(s.autoConnections) : '';
   $('#conns-hint').textContent = s ? `blank = automatic (now ${s.autoConnections})` : 'blank = automatic';
   setAuth(known ? s.auth : 'password');
+  const offer = settings.form.proxyOffer;
+  const via = !!offer && offer.kind !== 'none';
+  $('#f-proxy-host').value = via ? offer.host : '';
+  $('#f-proxy-port').value = via ? offer.port : '';
+  $('#f-proxy-user').value = via ? offer.user : '';
+  $('#f-proxy-secret').value = '';
+  setProxyKind(!s ? 'none' : offer ? offer.kind : null);
+  renderProxyFrom();
   clearFieldErrors();
   showSettingsBanner('');
   renderServers();
@@ -6851,6 +6940,7 @@ function openForm(name) {
 function closeForm() {
   settings.form = null;
   $('#f-secret').value = '';
+  $('#f-proxy-secret').value = '';
   renderServers();
 }
 
@@ -6863,6 +6953,11 @@ function submitForm() {
   if (settings.busy || !settings.form) return;
   clearFieldErrors();
   showSettingsBanner('');
+  if (!settings.proxy) {
+    onServerError({ field: 'connect', message: 'choose how grab connects to it: Directly, SOCKS5 proxy or HTTP proxy' });
+    return;
+  }
+  const via = settings.proxy !== 'none';
   const msg = {
     type: 'serverSave',
     editing: settings.form.editing,
@@ -6876,10 +6971,18 @@ function submitForm() {
     roots: $('#f-roots').value.split(/\r?\n/).map((r) => r.trim()).filter(Boolean),
     depth: intOf('#f-depth'),
     connections: $('#f-conns').value.trim() === '' ? 0 : (intOf('#f-conns') || -1),
+    // The route, always given; a field left blank is the backend's to name.
+    proxyKind: settings.proxy,
+    proxyHost: via ? proxyHostOf() : '',
+    proxyPort: !via || $('#f-proxy-port').value.trim() === '' ? 0 : (intOf('#f-proxy-port') || -1),
+    proxyUser: via ? $('#f-proxy-user').value.trim() : '',
+    // Blank keeps the saved one while the proxy and its user stay the same.
+    proxySecret: via && !$('#f-proxy-secret').disabled ? $('#f-proxy-secret').value : '',
   };
   send(msg);
   $('#f-secret').value = ''; // the backend holds it until the host key is trusted
-  setStatus('Checking the host key…');
+  $('#f-proxy-secret').value = '';
+  setStatus(via ? `Checking the host key through the ${PROXY_KIND[settings.proxy]} proxy…` : 'Checking the host key…');
 }
 
 // ---- modal -------------------------------------------------------------------------------
@@ -6958,6 +7061,8 @@ function onHostKeys(msg) {
       '<p class="muted">Compare them with the fingerprints your provider shows, or run ' +
       '<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the server. ' +
       'If they differ, choose Cancel: something else may be answering at this address.</p>' +
+      // Read through a proxy, one of them new: the proxy could have shown its own.
+      (msg.note ? `<p class="proxy-note">${esc(msg.note)}</p>` : '') +
       '<p class="muted">Once trusted, searches and downloads refuse a server that presents another key.</p>',
     ok: msg.kind === 'add' ? 'Trust and add' : msg.kind === 'edit' ? 'Trust and save' : 'Trust',
     onOk: () => { setStatus('Saving…'); send({ type: 'serverConfirm', trust: true }); },
@@ -6971,7 +7076,9 @@ function onServerError(msg) {
   if (target) {
     target.textContent = bidiVisible(msg.message);
     const input = { name: '#f-name', host: '#f-host', port: '#f-port', user: '#f-user', keyFile: '#f-key',
-      secret: '#f-secret', depth: '#f-depth', connections: '#f-conns' }[msg.field];
+      secret: '#f-secret', depth: '#f-depth', connections: '#f-conns', connect: '#f-proxy button',
+      proxy: '#f-proxy-host', proxyPort: '#f-proxy-port', proxyUser: '#f-proxy-user',
+      proxySecret: '#f-proxy-secret' }[msg.field];
     if (input) $(input).focus();
   } else if (settings.open) {
     showSettingsBanner(msg.message);
@@ -7667,6 +7774,11 @@ $('#f-host').addEventListener('input', setSecretPlaceholder);
 $('#f-user').addEventListener('input', setSecretPlaceholder);
 $('#f-port').addEventListener('input', setSecretPlaceholder);
 $('#f-key').addEventListener('input', setSecretPlaceholder);
+$('#f-proxy').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-proxy]');
+  if (b) setProxyKind(b.dataset.proxy);
+});
+for (const id of ['#f-proxy-host', '#f-proxy-port', '#f-proxy-user']) $(id).addEventListener('input', setProxySecretPlaceholder);
 $('#f-key-browse').addEventListener('click', () => send({ type: 'pickFile', current: $('#f-key').value.trim() }));
 $('#modal-ok').addEventListener('click', () => {
   if (modal && modal.stay) modal.onOk(); // it closes once its answer came

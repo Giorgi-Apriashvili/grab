@@ -9,6 +9,7 @@
 
 #include "config.hpp"
 #include "guard.hpp"
+#include "passwords.hpp"
 #include "proxy.hpp"
 #include "servers.hpp"
 #include "ssh.hpp"
@@ -147,9 +148,13 @@ enum class Purpose { trust, edit };
 
 // Why the details of `s` can't be saved (server_conf's checks: host, user, port, the key file
 // there, the proxy, search folders; G5, G28), "field: why" for the first problem; nullopt when
-// fine.
+// fine. The proxy's host, port and user are checked each on its own, as the window's form has
+// them, then as grab.conf's `proxy` line is (server_conf::check_proxy); a SOCKS5 user can't hold
+// ':' (rclone's user:password form), as `grab server` asks.
 struct Problem {
-    std::string field; // "host", "port", "user", "keyFile", "proxy", "proxySecret", "roots"
+    // "host", "port", "user", "keyFile", "proxy" (the proxy's host, or the proxy as a whole),
+    // "proxyPort", "proxyUser", "proxySecret", "roots"
+    std::string field;
     std::string why;
 };
 [[nodiscard]] std::optional<Problem> check_server(const servers::NewServer& s);
@@ -192,6 +197,10 @@ struct ProxyOffer {
     std::string why;
 };
 [[nodiscard]] ProxyOffer edit_proxy(const Env& env, std::string_view name);
+// The same with grab's store as passwords::load read it, for one load to serve many servers (the
+// window's server list).
+[[nodiscard]] ProxyOffer edit_proxy(const Env& env, std::string_view name,
+                                    const std::expected<passwords::Store, std::string>& store);
 // Whether an edit from `current` to `wanted` must fetch and confirm the host key again: the
 // address changed, no key is pinned yet, or the section had no details to compare with.
 [[nodiscard]] bool edit_needs_host_key(const ServerInfo& current, const servers::NewServer& wanted);
@@ -245,6 +254,9 @@ struct TestResult {
     std::string unusable;
     std::string grab_search; // grab_ok: how searches go there ("with find (GNU find)", "by listing folders (...)")
     std::string checksums;   // grab_ok: "checksums: md5sum", or why verification can't run there
+    // The proxy the login went through (never its password; kind none: directly or nothing
+    // dialled), for the window's test line.
+    proxy::Proxy proxy;
     [[nodiscard]] bool ok() const { return grab_ok.value_or(false); }
 };
 
