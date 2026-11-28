@@ -854,7 +854,7 @@ void App::refresh_browse() {
         (!last.top && last.path != shown.path)) {
         return;
     }
-    run_browse(last.id, shown.remote, shown.path, shown.top, false, true, false);
+    run_browse(last.id, shown.remote, shown.path, shown.top, false, true, false, false);
 }
 
 } // namespace grab::gui

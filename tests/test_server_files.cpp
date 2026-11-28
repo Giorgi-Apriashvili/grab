@@ -9,6 +9,7 @@
 #include "fake_pool.hpp"
 #include "fake_sftp.hpp"
 #include "fetch.hpp"
+#include "pins.hpp"
 #include "preview_jobs.hpp"
 #include "rclone_encoding.hpp"
 #include "server_files.hpp"
@@ -1716,6 +1717,77 @@ TEST_CASE("server files: what the window marks after a change") {
                                            {.folder = "d", .below = false},
                                            {.folder = "d/y", .below = true}});
     CHECK(inv.forget == std::vector<std::string>{"x.txt", "/home/u/x.txt", "/home/u/d/y", "d/y"});
+}
+
+TEST_CASE("pins: both runs of a move carry the pins, Keep both's \"tv (2)\" from the second") {
+    Server s;
+    s.folder("/srv/a");
+    s.folder("/srv/a/tv");
+    s.folder("/srv/a/tv/S1");
+    s.put("/srv/a/f.txt", "mine", new_time);
+    s.folder("/srv/b");
+    s.folder("/srv/b/tv");
+    s.put("/srv/b/f.txt", "theirs");
+    const auto w = s.where();
+    const std::vector<std::string> picked{"/srv/a/tv", "/srv/a/f.txt"};
+    const auto items = server_files::into(picked, "/srv/b");
+    // As the window pastes when the question gave a file a choice of its own: the rest first, each
+    // name taken left as it is (Ask)...
+    const auto r = server_files::move(w, items, Existing::ask);
+    REQUIRE(find_entry(r, Entry::State::asking, "/srv/a/tv") != nullptr);
+    REQUIRE(find_entry(r, Entry::State::asking, "/srv/a/f.txt") != nullptr);
+    CHECK(pins::moved_by_paste(false, items, r.placed, {}, {}).empty());
+    // ...then those again: the file by its own choice (Skip), the folder by the one for all (Keep
+    // both), whose place only this second run knows.
+    const std::vector<server_files::Item> again{{.from = "/srv/a/f.txt", .to = "/srv/b/f.txt", .choice = Existing::skip},
+                                                {.from = "/srv/a/tv", .to = "/srv/b/tv", .choice = std::nullopt}};
+    const auto more = server_files::move(w, again, Existing::keep_both);
+    CHECK(more.error.empty());
+    CHECK(more.placed == std::vector<std::string>{"", "/srv/b/tv (2)"});
+    // As the window collects them from both runs.
+    const auto moves = pins::moved_by_paste(false, items, r.placed, again, more.placed);
+    CHECK(moves == std::vector<pins::Moved>{{.from = "/srv/a/tv", .to = "/srv/b/tv (2)"}});
+    pins::Pins p;
+    REQUIRE(pins::add(p, "Fake", "/srv/a/tv"));
+    REQUIRE(pins::add(p, "Fake", "/srv/a/tv/S1", "Season 1"));
+    REQUIRE(pins::add(p, "Fake", "/srv/b/tv"));
+    CHECK(pins::follow(p, "Fake", "", moves));
+    CHECK(p.at("Fake") == std::vector<pins::Pin>{{.path = "/srv/b/tv (2)", .name = ""},
+                                                 {.path = "/srv/b/tv (2)/S1", .name = "Season 1"},
+                                                 {.path = "/srv/b/tv", .name = ""}});
+    // A copy's places are never followed: the same runs as a copy give no moves.
+    CHECK(pins::moved_by_paste(true, items, r.placed, again, more.placed).empty());
+}
+
+TEST_CASE("pins: a delete that ran to its end unpins what it deleted; one refused partway keeps every pin") {
+    const auto pinned = [] {
+        pins::Pins p;
+        for (const char* path : {"/srv/t", "/srv/t/a", "/srv/t/b", "/srv/u"}) REQUIRE(pins::add(p, "Fake", path));
+        return p;
+    };
+    const auto tree = [](Server& s) {
+        s.folder("/srv/t");
+        s.folder("/srv/t/a");
+        s.folder("/srv/t/b");
+        s.folder("/srv/u");
+        for (const char* f : {"/srv/t/a/1", "/srv/t/b/2"}) s.put(f, f);
+    };
+    const std::vector<std::string> t{"/srv/t"};
+    Server refused;
+    tree(refused);
+    refused.fake.locked_dirs = {"/srv/t/b"};
+    auto r = server_files::remove(refused.where(), t);
+    REQUIRE_FALSE(r.error.empty()); // /srv/t/a went, /srv/t/b is left
+    pins::Pins p = pinned();
+    CHECK_FALSE(pins::deleted(p, "Fake", "", t, r));
+    CHECK(p == pinned());
+
+    Server ok;
+    tree(ok);
+    r = server_files::remove(ok.where(), t);
+    REQUIRE(r.error.empty());
+    CHECK(pins::deleted(p, "Fake", "", t, r));
+    CHECK(p.at("Fake") == std::vector<pins::Pin>{{.path = "/srv/u", .name = ""}});
 }
 
 TEST_CASE("previews: forgetting a path a fetch is running for keeps its old answer out of the cache") {

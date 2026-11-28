@@ -3,7 +3,7 @@
 // server, after a look at the names taken there), delete (after its folders are counted), and
 // Properties with its folder size and sums, each on a thread of its own over server_files. Before
 // a change the paths a download, an upload or Play uses are refused; after it Browse, the file
-// list and the previews forget what it changed.
+// list and the previews forget what it changed, and Quick access follows it (PINS.md 3.5).
 
 #include "app.hpp"
 
@@ -12,6 +12,7 @@
 #include "file_list.hpp"
 #include "gui_state.hpp"
 #include "json.hpp"
+#include "pins.hpp"
 #include "rclone_encoding.hpp"
 #include "server_files.hpp"
 #include "sftp.hpp"
@@ -585,6 +586,11 @@ void App::files_message(const std::string& type, const Value& msg) {
             if (rename) changed.from = {path, real[0]};
             changed.to = {r->path, real.back()};
             files_changed(server, b->home, changed, changed.from);
+            // A pin of the folder, and those below it, follow it.
+            if (rename) {
+                const std::vector<pins::Moved> moves{{.from = path, .to = r->path}};
+                carry_pins([&](pins::Pins& p) { return pins::follow(p, server, b->home, moves); });
+            }
         });
     } else if (type == "filesLook" || type == "filesPaste") {
         // {op: copy | move, paths, dir}: each path into the folder `dir` under its own name. A look
@@ -659,6 +665,10 @@ void App::files_message(const std::string& type, const Value& msg) {
             // taken left as it is (Ask); then those, each with its own choice or the one for all.
             auto r = run(items, own.empty() ? existing : upload::Existing::ask);
             std::vector<std::string> placed = r.placed;
+            // The second run's items and places, for the pins: those places reach only the backend
+            // (set_report sends the first run's), so Keep both's "tv (2)" is followed here.
+            std::vector<server_files::Item> again;
+            std::vector<std::string> placed_again;
             // The paths that left their places (a move's: search results drop them at once).
             std::vector<std::string> moved;
             const auto went = [&](std::span<const server_files::Item> some, const std::vector<std::string>& to) {
@@ -668,7 +678,6 @@ void App::files_message(const std::string& type, const Value& msg) {
             };
             went(items, r.placed);
             if (!own.empty()) {
-                std::vector<server_files::Item> again;
                 std::vector<Entry> rest;
                 for (auto& e : r.entries) {
                     if (e.state != Entry::State::asking) {
@@ -687,6 +696,7 @@ void App::files_message(const std::string& type, const Value& msg) {
                     std::ranges::move(more.entries, std::back_inserter(r.entries));
                     std::ranges::copy(more.placed, std::back_inserter(placed));
                     went(again, more.placed);
+                    placed_again = std::move(more.placed);
                     r.stopped = more.stopped;
                     r.error = more.error;
                 }
@@ -723,6 +733,9 @@ void App::files_message(const std::string& type, const Value& msg) {
                 if (!p.empty()) changed.to.push_back(p);
             }
             files_changed(server, b->home, changed, went_away);
+            // The pins of what moved, and those below it, follow it (a copy leaves them).
+            const auto moves = pins::moved_by_paste(copying, items, r.placed, again, placed_again);
+            if (!moves.empty()) carry_pins([&](pins::Pins& p) { return pins::follow(p, server, b->home, moves); });
         });
     } else if (type == "filesSize") {
         // {paths, check}: their files, folders, links and bytes (the delete question's counts, with
@@ -783,6 +796,9 @@ void App::files_message(const std::string& type, const Value& msg) {
             // A delete that ended early left some of them: the file list waits for its fetch.
             const bool all_went = r.error.empty() && !r.stopped;
             files_changed(server, b->home, changed, all_went ? changed.from : std::vector<std::string>{});
+            // What went is unpinned, with what is below it (PINS.md decision 6); one that ended early
+            // keeps every pin: which of them went isn't known.
+            carry_pins([&](pins::Pins& p) { return pins::deleted(p, server, b->home, changed.from, r); });
         });
     } else if (type == "filesProps") {
         // {path}: what Properties shows.

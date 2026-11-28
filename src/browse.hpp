@@ -43,6 +43,22 @@ void sort_items(std::vector<Item>& items);
 // trailing slashes go; "~" is the login home ("") and "~/x" a path in it.
 [[nodiscard]] std::string address_path(std::string_view text);
 
+// How a Browse request names its folder: a click (a row, a crumb, Back), an address typed in the
+// address bar, or a pin opened from Quick access (PINS.md 3.3).
+enum class Asked { browsed, typed, pin };
+// Where a Browse request opens: the folder (a typed address through address_path; a pin's path
+// exactly as saved, so a folder named "sp " or "~", or a path with "//", stays itself; anything else
+// as given), and whether it is the server's top: asked for, or a typed or pinned path equal to its
+// one root, whose folder it then is. Several roots make a top of their own (`roots_top`, the
+// folder "").
+struct Opening {
+    std::string folder;
+    bool top = false;
+    bool roots_top = false;
+    bool operator==(const Opening&) const = default;
+};
+[[nodiscard]] Opening opening(const std::vector<std::string>& roots, std::string_view path, bool top, Asked asked);
+
 // A server's folders as its saved file list knows them: every folder under its search roots
 // down to max_depth. A folder at max_depth is in the list, but its contents are not.
 class Index {
@@ -105,6 +121,10 @@ struct ListError {
     std::string message; // ready to show
     bool operator==(const ListError&) const = default;
 };
+// What a typed or pinned path that can't be listed says, in the window's words: "Not found on
+// Main: downloads/tv", "Main doesn't let you list downloads/tv" ("~" for the login folder);
+// nullopt for any other failure, which shows as the server's.
+[[nodiscard]] std::optional<std::string> asked_failure(std::string_view server, std::string_view folder, const ListError& e);
 
 // Lists one folder live: its SFTP listing on one of the server's pooled connections (`grab`;
 // OPENDIR and READDIRs, a STAT for each link, whose target decides as the walk decides; a broken

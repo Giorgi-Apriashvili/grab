@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace grab;
@@ -175,4 +176,46 @@ TEST_CASE("a path typed in the address bar") {
     CHECK(browse::address_path("") == "");
     CHECK(browse::address_path("~x/y") == "~x/y"); // only "~" alone or "~/" is the home
     CHECK(browse::address_path("Star Wars: A New Hope") == "Star Wars: A New Hope");
+}
+
+TEST_CASE("Browse opens a pin's path exactly as saved, a typed one as the address bar takes it") {
+    using browse::Asked;
+    using browse::Opening;
+    const std::vector<std::string> one{"downloads"};
+    // A pin: a trailing space, a folder named "~" and a "//" stay themselves (PINS.md 3.3).
+    CHECK(browse::opening(one, "sp ", false, Asked::pin) == Opening{.folder = "sp ", .top = false, .roots_top = false});
+    CHECK(browse::opening(one, "~", false, Asked::pin) == Opening{.folder = "~", .top = false, .roots_top = false});
+    CHECK(browse::opening(one, "a//b/", false, Asked::pin) == Opening{.folder = "a//b/", .top = false, .roots_top = false});
+    CHECK(browse::opening(one, " /srv ", false, Asked::pin) == Opening{.folder = " /srv ", .top = false, .roots_top = false});
+    // Typed: trimmed, "~" the login folder, slashes collapsed; a click's path as given.
+    CHECK(browse::opening(one, "sp ", false, Asked::typed).folder == "sp");
+    CHECK(browse::opening(one, " ~ ", false, Asked::typed).folder == "");
+    CHECK(browse::opening(one, "a//b/", false, Asked::typed).folder == "a/b");
+    CHECK(browse::opening(one, "a//b/", false, Asked::browsed).folder == "a//b/");
+    // The one root is the server's top, pinned or typed; a click on it opens it as a folder.
+    CHECK(browse::opening(one, "downloads", false, Asked::pin) == Opening{.folder = "downloads", .top = true, .roots_top = false});
+    CHECK(browse::opening(one, "downloads//", false, Asked::typed) == Opening{.folder = "downloads", .top = true, .roots_top = false});
+    CHECK(browse::opening(one, "downloads/", false, Asked::pin).top == false);
+    CHECK(browse::opening(one, "downloads", false, Asked::browsed).top == false);
+    CHECK(browse::opening(one, "", true, Asked::browsed) == Opening{.folder = "downloads", .top = true, .roots_top = false});
+    // Several roots: a pin of one is that folder; the top is a folder of its own.
+    const std::vector<std::string> two{"downloads", "/srv"};
+    CHECK(browse::opening(two, "/srv", false, Asked::pin) == Opening{.folder = "/srv", .top = false, .roots_top = false});
+    CHECK(browse::opening(two, "/srv", true, Asked::browsed) == Opening{.folder = "", .top = true, .roots_top = true});
+    // The login folder as the one root ("~"): a pin of a folder named "~" isn't it.
+    const std::vector<std::string> home{""};
+    CHECK(browse::opening(home, "~", false, Asked::pin) == Opening{.folder = "~", .top = false, .roots_top = false});
+    CHECK(browse::opening(home, "~", false, Asked::typed) == Opening{.folder = "", .top = true, .roots_top = false});
+}
+
+TEST_CASE("a typed or pinned path that can't be listed says so in the window's words") {
+    using K = browse::ListError::Kind;
+    const auto failure = [](std::string_view folder, K kind) {
+        return browse::asked_failure("Main", folder, browse::ListError{.kind = kind, .message = "the server's words"});
+    };
+    CHECK(failure("downloads/tv", K::not_found) == "Not found on Main: downloads/tv");
+    CHECK(failure("", K::not_found) == "Not found on Main: ~");
+    CHECK(failure("sp ", K::denied) == "Main doesn't let you list sp ");
+    CHECK_FALSE(failure("x", K::other));
+    CHECK_FALSE(failure("x", K::file));
 }

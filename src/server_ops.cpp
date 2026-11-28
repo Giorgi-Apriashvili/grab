@@ -6,6 +6,7 @@
 #include "gui_state.hpp"
 #include "ini.hpp"
 #include "passwords.hpp"
+#include "pins.hpp"
 #include "proxy.hpp"
 #include "rclone_import.hpp"
 #include "server_conf.hpp"
@@ -166,6 +167,31 @@ std::string forget_learned(const Env& env, const std::string& name) {
         }
     }
     return failed.empty() ? std::string{} : "grab couldn't forget " + util::join(failed, " and ");
+}
+
+// The window's pins of server `name` (Quick access, pins.hpp) dropped: when it is removed, and when
+// a new server takes a name whose pins an older grab's Remove left (`leftover`). An Edit keeps
+// them, as it keeps the Save-to folder. What to tell: a pins file that couldn't be read and was
+// moved aside, and why they stay; else "".
+std::string forget_pins(const Env& env, const std::string& name, bool leftover) {
+    const auto done = pins::update(pins::path_for(env.grab_conf), [&](pins::Pins& p) -> std::expected<bool, std::string> {
+        return pins::forget_server(p, name);
+    });
+    std::vector<std::string> notes;
+    if (!done.aside.empty()) {
+        notes.push_back(std::format("the window's pinned folders couldn't be read ({}) and were moved aside to {}", done.damaged,
+                                    util::path_to_utf8(done.aside)));
+    }
+    if (!done.error.empty()) {
+        if (!leftover) {
+            notes.push_back(done.error); // "grab couldn't save Quick access: <why>"
+        } else {
+            std::string_view why = done.error;
+            if (why.starts_with(pins::cant_save)) why.remove_prefix(pins::cant_save.size());
+            notes.push_back(std::format("pins an older grab left under this name could not be removed: {}", why));
+        }
+    }
+    return util::join(notes, "; ");
 }
 
 // grab's store, for a change, and what the change has to tell. One that can't be read at all is
@@ -793,7 +819,11 @@ std::expected<std::string, std::string> add_server(const Env& loaded, const serv
     }
     if (!set) return undo(set.error());
     if (auto written = write_grab_conf(env, *set); !written) return undo(written.error());
-    return note;
+    // A new server starts with no pins, whatever was left under its name.
+    std::vector<std::string> notes;
+    if (!note.empty()) notes.push_back(note);
+    if (auto why = forget_pins(env, s.name, true); !why.empty()) notes.push_back(std::move(why));
+    return util::join(notes, "; ");
 }
 
 servers::NewServer edit_defaults(const ServerInfo& current) {
@@ -1065,6 +1095,7 @@ std::expected<std::string, std::string> remove_server(const Env& loaded, std::st
         notes.push_back(std::format("its file list could not be removed: {}", ec.message()));
     }
     if (auto why = forget_learned(env, server); !why.empty()) notes.push_back(std::move(why));
+    if (auto why = forget_pins(env, server, false); !why.empty()) notes.push_back(std::move(why));
     return util::join(notes, "; ");
 }
 

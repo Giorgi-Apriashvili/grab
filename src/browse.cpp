@@ -92,6 +92,22 @@ std::string address_path(std::string_view text) {
     return out;
 }
 
+Opening opening(const std::vector<std::string>& roots, std::string_view path, bool top, Asked asked) {
+    Opening out{.folder = asked == Asked::typed ? address_path(path) : std::string(path), .top = top, .roots_top = false};
+    if (!top && asked != Asked::browsed && roots.size() == 1 && out.folder == roots.front()) out.top = true;
+    out.roots_top = out.top && roots.size() > 1;
+    if (out.roots_top) out.folder.clear();
+    else if (out.top && !roots.empty()) out.folder = roots.front();
+    return out;
+}
+
+std::optional<std::string> asked_failure(std::string_view server, std::string_view folder, const ListError& e) {
+    const std::string_view shown = folder.empty() ? "~" : folder;
+    if (e.kind == ListError::Kind::not_found) return std::format("Not found on {}: {}", server, shown);
+    if (e.kind == ListError::Kind::denied) return std::format("{} doesn't let you list {}", server, shown);
+    return std::nullopt;
+}
+
 std::optional<std::string> root_of(const std::vector<std::string>& roots, std::string_view path) {
     std::optional<std::string> best;
     for (const auto& r : roots) {

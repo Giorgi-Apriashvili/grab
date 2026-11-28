@@ -29,6 +29,7 @@ add_executable(grab_tests
     test_existing.cpp
     test_file_type.cpp
     test_gui_state.cpp
+    test_pins.cpp
     test_servers.cpp
     test_server_ops.cpp
     test_server_prompt.cpp

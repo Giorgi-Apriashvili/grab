@@ -50,6 +50,7 @@ add_library(grab_core STATIC
     src/existing.cpp
     src/file_type.cpp
     src/gui_state.cpp
+    src/pins.cpp
     src/servers.cpp
     src/server_ops.cpp
     src/server_prompt.cpp

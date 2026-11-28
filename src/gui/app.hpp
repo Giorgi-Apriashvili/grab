@@ -9,6 +9,7 @@
 #include "gui_state.hpp"
 #include "json.hpp"
 #include "open_file.hpp"
+#include "pins.hpp"
 #include "play_stream.hpp"
 #include "preview_jobs.hpp"
 #include "queue_row.hpp"
@@ -384,9 +385,11 @@ private:
     // time on browse_thread_; a new one stops the last. `top`: the server's top; `live`: list it
     // live now (Refresh); `update`: the same folder again after its list was refreshed; `typed`:
     // `path` was typed in the address bar (a file's path opens its folder; an error leaves the
-    // folder on screen as it was).
+    // folder on screen as it was); `pin`: `path` is a pin's from Quick access, taken exactly as
+    // saved, never through browse::address_path, and otherwise opened as a typed one (PINS.md 3.3).
+    // The answer says which (`typed`, `pin`).
     void run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update,
-                    bool typed);
+                    bool typed, bool pin);
     // Folder names for the address bar's suggestions, from the list and this session's live
     // listings; never from the server. Without a list it starts fetching one ("later": ask again).
     void suggest(const std::string& remote, const std::string& path);
@@ -396,6 +399,7 @@ private:
         std::string path;
         bool top = false;
         bool typed = false;
+        bool pin = false;
     };
     struct LiveFolder {
         std::vector<browse::Item> items;
@@ -528,7 +532,7 @@ private:
     [[nodiscard]] std::expected<server_ops::Env, std::string> load_env() const;
     void post_servers(const server_ops::Env& env) const;
     void post_host_keys(const Pending& p) const;
-    void servers_changed(); // settings thread: refresh the settings list and the search view
+    void servers_changed(); // settings thread: refresh the settings list, the search view and the pins
     void save_server(const json::Value& msg);
     void apply_pending(Pending pending, std::stop_token stop);
     void test_server(const std::string& name, std::stop_token stop);
@@ -757,6 +761,38 @@ private:
     // The copy task `token` is over: what it couldn't undo (copy_undo_'s rest) goes to the
     // leftovers for the cleaner, and the save follows at once.
     void files_undo_over(int token);
+
+    // ---- Quick access: the pinned folders (pins.hpp; PINS.md, chunk 1) ----
+    // The page's pinsAdd {server, path, name?, at?} (`name` and `at`, a place in the server's list,
+    // only from Undo), pinsRemove {server, path}, pinsRename {server, path, name} ("" the folder's
+    // own name again) and pinsMove {server, path, to} (an index in the server's list): one change,
+    // checked (a server of grab.conf's; the path and name in their limits), made to the file as it
+    // is then (pins::update), and answered with the whole list ("pins"), with `error` when it was
+    // refused or couldn't be saved. The page never sends its list: a follow or a Remove made
+    // meanwhile would be undone. UI thread.
+    void pins_message(const std::string& type, const json::Value& msg);
+    // `edit` made to the pins file, pins_ replaced and posted. Any thread.
+    void change_pins(const std::function<std::expected<bool, std::string>(pins::Pins&)>& edit);
+    // grab's own rename, move or delete carried into the pins (`edit`: pins::follow or
+    // pins::deleted), when it touches one of pins_ (no read or write otherwise): written, and
+    // posted when the list or the file changed or it failed. Also while the window closes: the
+    // change was made. Any thread.
+    void carry_pins(const std::function<bool(pins::Pins&)>& edit);
+    // pins_ from the file as it is now (a page load; `grab server remove` or add, or a Remove or Add
+    // in the window, may have changed it). One that can't be read is moved aside and the list starts
+    // empty; one that can't be read at all is left where it is and pins_ stay. What to tell, else
+    // "". Caller holds pins_mutex_.
+    [[nodiscard]] std::string reload_pins();
+    // A change's outcome into pins_ (not when the file couldn't be read: they stay), a file it moved
+    // aside told. Caller holds pins_mutex_.
+    void took_pins(pins::Updated& done);
+    // `text` told once the page is open (now, if it is), as a saved file set aside is. Any thread.
+    void tell(std::string text);
+    // {type: pins, pins: {server: [{path, name?}]}, error?}: `all` of grab.conf's servers only (a
+    // server's pins whose section was renamed or deleted by hand stay in the file, hidden, and show
+    // again once a server of that name is configured). Caller holds pins_mutex_, so the lists go
+    // out in the order they were written.
+    void post_pins(const pins::Pins& all, const std::string& error) const;
     // queue.json soon, from any thread: at most once every queue_save_gap (longer after a slow
     // save), on saver_. now (a download ended): without the queue_save_gap floor, still at most
     // once every ten times the last save's duration. Closing and an update's restart save at once.
@@ -780,6 +816,13 @@ private:
     std::filesystem::path uploads_path_; // uploads.json, beside queue.json
     std::filesystem::path records_dir_;  // partial uploads' records (upload.hpp)
     std::filesystem::path recent_path_; // recent searches, sealed (gui_state.hpp)
+    std::filesystem::path pins_path_;   // Quick access, sealed (pins.hpp)
+    // Quick access as last read or written (pins.hpp); the file is the list, this its copy for the
+    // page and to skip the file for a change that touches no pin. Declared before the settings
+    // thread and the files tasks, which change it (servers_changed, carry_pins), so it outlives
+    // them both.
+    mutable std::mutex pins_mutex_; // guards pins_; held through a change's write and its post
+    pins::Pins pins_;
     std::filesystem::path limits_path_; // learned connection limits, shared with the command
     GuiState state_;
     std::vector<std::string> notices_; // UI thread: saved files set aside, told once the page is open

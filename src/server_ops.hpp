@@ -172,8 +172,9 @@ struct Problem {
 // into the store bound to the proxy's own user@host:port, and a copy of it in rclone's form
 // (rclone.socks_proxy or rclone.http_proxy, bound to the server's login), which grab 0.21-0.25
 // refuse the server for rather than connect directly past it (PROXIES.md decision 6). If writing
-// grab.conf fails, the store goes back to what it was, so the name stays free. Returns a note, or
-// "".
+// grab.conf fails, the store goes back to what it was, so the name stays free. Pins an older grab's
+// Remove left under its name (the window's Quick access, pins.hpp) go: a new server starts with
+// none. Returns a note, or "".
 [[nodiscard]] std::expected<std::string, std::string> add_server(const Env& env, const servers::NewServer& s,
                                                                  const std::optional<std::string>& secret,
                                                                  const HostKeys& keys);
@@ -219,7 +220,8 @@ struct ProxyOffer {
 // can get one here. `keys`, when given, are pinned (in place of any for the new host and port).
 // A new user, host or port drops what the old one told grab (shell_type and the sum commands,
 // asked again by the next Test), the learned connection limit and timings (G122), and the old
-// address's keys unless another server is there (review G87).
+// address's keys unless another server is there (review G87); its pinned folders stay, as its
+// Save-to folder does (pins.hpp).
 // The proxy (PROXIES.md 3.3, 3.7): `wanted.proxy` replaces it (none: directly), its password
 // typed, else the saved one while the proxy and its user stay the same; unset keeps the server's:
 // its `proxy` line (one grab can't read stops the save), else the one proxy the store keeps for
@@ -239,7 +241,8 @@ struct ProxyOffer {
 // its saved passwords, its host and port's keys unless another grab.conf section, or a remote of
 // an explicit rclone_config whose known_hosts_file is grab's, is at that address (review G87;
 // grab's old rclone.conf doesn't count), its file list, learned connection limit and timings
-// (G122). Returns a note naming what couldn't be cleaned up (the server is gone either way).
+// (G122), and its pinned folders (pins.hpp). Returns a note naming what couldn't be cleaned up
+// (the server is gone either way).
 [[nodiscard]] std::expected<std::string, std::string> remove_server(const Env& env, std::string_view name);
 
 [[nodiscard]] std::expected<void, std::string> set_default(const Env& env, std::string_view name);

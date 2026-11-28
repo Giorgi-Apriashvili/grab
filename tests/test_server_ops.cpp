@@ -12,6 +12,7 @@
 #include "ini.hpp"
 #include "notices.hpp"
 #include "passwords.hpp"
+#include "pins.hpp"
 #include "proxy.hpp"
 #include "scoped_env.hpp"
 #include "server_conf.hpp"
@@ -719,6 +720,90 @@ TEST_CASE("remove: the section, the default moved on, its password, its keys, li
     REQUIRE(server_ops::remove_server(s.env(), "agent").has_value());
     CHECK(Scratch::pins() == others);
     CHECK(s.secrets().empty());
+}
+
+TEST_CASE("pinned folders: Remove drops only that server's, Add those left under its name, Edit keeps them") {
+    Scratch s;
+    s.write("grab.conf", grab_conf); // box and agent
+    const auto file = pins::path_for(s.conf);
+    const auto pin_on = [&](const std::string& server, const std::string& path) {
+        const auto done = pins::update(file, [&](pins::Pins& p) { return pins::add(p, server, path).transform([] { return true; }); });
+        REQUIRE_MESSAGE(done.changed, done.error);
+    };
+    pin_on("box", "/home/movies/tv");
+    pin_on("box", "incoming");
+    pin_on("agent", "downloads");
+    pin_on("old", "left/by/an/older/grab"); // a server an older grab's Remove left pins of
+    const auto pinned = [&](const std::string& server) {
+        std::vector<std::string> out;
+        const auto loaded = pins::load(file).pins;
+        if (const auto it = loaded.find(server); it != loaded.end()) {
+            for (const auto& p : it->second) out.push_back(p.path);
+        }
+        return out;
+    };
+
+    // An Edit that moves box to another host keeps its pins, as it keeps the Save-to folder.
+    auto box = server(Auth::agent);
+    box.host = "box2.example.com";
+    auto edited = server_ops::update_server(s.env(), box, std::nullopt,
+                                            server_ops::HostKeys{.lines = {"[box2.example.com]:23 ssh-ed25519 BOX2"}, .fingerprints = {}});
+    REQUIRE_MESSAGE(edited.has_value(), edited.error_or(""));
+    CHECK(pinned("box") == std::vector<std::string>{"/home/movies/tv", "incoming"});
+
+    // Remove (the window's and grab server remove's): box's go, nobody else's.
+    auto removed = server_ops::remove_server(s.env(), "box");
+    REQUIRE(removed.has_value());
+    CHECK_MESSAGE(removed->empty(), *removed);
+    CHECK(pinned("box").empty());
+    CHECK(pinned("agent") == std::vector<std::string>{"downloads"});
+    CHECK(pinned("old") == std::vector<std::string>{"left/by/an/older/grab"});
+
+    // Add: a new server starts with none, whatever was left under its name; the others stay.
+    auto added = server_ops::add_server(s.env(), server(Auth::agent, "old"), std::nullopt, box_keys);
+    REQUIRE_MESSAGE(added.has_value(), added.error_or(""));
+    CHECK_MESSAGE(added->empty(), *added);
+    CHECK(pinned("old").empty());
+    CHECK(pinned("agent") == std::vector<std::string>{"downloads"});
+
+    // The last pins go with the last server that has some: no file is left.
+    REQUIRE(server_ops::remove_server(s.env(), "agent").has_value());
+    CHECK_FALSE(std::filesystem::exists(file));
+}
+
+TEST_CASE("pinned folders: Remove and Add say when the pins file was moved aside or couldn't be changed") {
+    Scratch s;
+    s.write("grab.conf", grab_conf); // box and agent
+    const auto file = pins::path_for(s.conf);
+    // Damaged: moved aside, and the note says where.
+    REQUIRE(util::write_file_atomic(file, "damaged"));
+    auto removed = server_ops::remove_server(s.env(), "box");
+    REQUIRE(removed.has_value());
+    CHECK_MESSAGE(removed->starts_with("the window's pinned folders couldn't be read (it isn't a file of grab's pins) and were "
+                                       "moved aside to "),
+                  *removed);
+    CHECK(removed->find("pins.bad-") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(file));
+
+    // Held by another program: left alone, and the note gives why once (no "Quick access" twice).
+    const auto done = pins::update(file, [](pins::Pins& p) { return pins::add(p, "box", "tv").transform([] { return true; }); });
+    REQUIRE(done.changed);
+    const auto good = util::read_file(file).value_or("");
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    auto added = server_ops::add_server(s.env(), server(Auth::agent), std::nullopt, box_keys);
+    CloseHandle(h);
+    REQUIRE_MESSAGE(added.has_value(), added.error_or(""));
+    CHECK_MESSAGE(added->starts_with("pins an older grab left under this name could not be removed: cannot open"), *added);
+    CHECK(added->find("Quick access") == std::string::npos);
+    CHECK(util::read_file(file).value_or("") == good);
+    h = CreateFileW(file.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    removed = server_ops::remove_server(s.env(), "agent");
+    CloseHandle(h);
+    REQUIRE(removed.has_value());
+    CHECK_MESSAGE(removed->starts_with("grab couldn't save Quick access: cannot open"), *removed);
+    CHECK(removed->find("its pinned folders") == std::string::npos);
 }
 
 TEST_CASE("a remote of an explicit rclone_config that uses grab's known_hosts keeps its host's keys (G87)") {

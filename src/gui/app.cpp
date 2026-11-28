@@ -14,6 +14,7 @@
 #include "local_name.hpp"
 #include "notices.hpp"
 #include "open_file.hpp"
+#include "pins.hpp"
 #include "play_server.hpp"
 #include "preview.hpp"
 #include "process.hpp"
@@ -222,6 +223,7 @@ App::App(Host host, std::filesystem::path config_path, std::filesystem::path sta
       uploads_path_(state_path_.parent_path() / "uploads.json"),
       records_dir_(state_path_.parent_path() / "uploads"),
       recent_path_(state_path_.parent_path() / "recent"),
+      pins_path_(state_path_.parent_path() / "pins"),
       limits_path_(state_path_.parent_path() / "limits.json"),
       connections_([this](const std::string& server, int budget) { on_budget_learned(server, budget); }) {
     if (auto saved = read_gui_state(state_path_); !saved) {
@@ -919,6 +921,12 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
         page_ready_ = true;
         watches_.clear();
         totals_posted_.reset();
+        {
+            // Quick access as the file has it now: another grab's `grab server remove` or add may
+            // have changed it since.
+            std::scoped_lock lock(pins_mutex_);
+            if (auto said = reload_pins(); !said.empty()) notices_.push_back(std::move(said));
+        }
         send_init();
         post_update(); // the page may have been reloaded
         maybe_check_updates();
@@ -975,7 +983,7 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
         play(*msg);
     } else if (type == "browse") {
         run_browse(int_of(*msg, "id"), msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""),
-                   bool_of(*msg, "top"), bool_of(*msg, "live"), false, bool_of(*msg, "typed"));
+                   bool_of(*msg, "top"), bool_of(*msg, "live"), false, bool_of(*msg, "typed"), bool_of(*msg, "pin"));
     } else if (type == "suggest") {
         suggest(msg->string_of("remote").value_or(""), msg->string_of("path").value_or(""));
     } else if (type == "refreshLists") {
@@ -1179,6 +1187,8 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
         settings_task([this, name](std::stop_token stop) { test_server(name, stop); });
     } else if (type.starts_with("files")) {
         files_message(type, *msg);
+    } else if (type.starts_with("pins")) {
+        pins_message(type, *msg);
     } else if (type == "serverRemove" || type == "serverDefault") {
         const bool remove = type == "serverRemove";
         const std::string name = msg->string_of("name").value_or("");
@@ -1196,6 +1206,134 @@ void App::on_message(const std::string& text, std::vector<std::filesystem::path>
             servers_changed();
         });
     }
+}
+
+// ---- Quick access: the pinned folders (PINS.md, chunk 1) ------------------------------------
+
+namespace {
+
+// The pins as the page takes them (init.pins, "pins"): {server: [{path, name?}]}, of grab.conf's
+// servers only, in its order; none while grab.conf can't be read.
+Value pins_json(const pins::Pins& all, const std::expected<GrabConfig, std::string>& cfg) {
+    Value out = Value::make_object();
+    if (!cfg) return out;
+    for (const auto& r : cfg->remotes) {
+        const auto it = all.find(r.name);
+        if (it == all.end() || out.find(r.name) != nullptr) continue;
+        Value list = Value::make_array();
+        for (const pins::Pin& p : it->second) {
+            Value e = Value::make_object();
+            e.set("path", str(p.path));
+            if (!p.name.empty()) e.set("name", str(p.name));
+            list.push(std::move(e));
+        }
+        out.set(r.name, std::move(list));
+    }
+    return out;
+}
+
+// What a pins file that couldn't be read says: moved aside (`aside`), or left where it is.
+std::string pins_unread(const std::string& why, const std::filesystem::path& aside) {
+    if (aside.empty()) {
+        return std::format("Quick access couldn't be read ({}); its file is left as it is, and no pin can be changed "
+                           "until it can be read.",
+                           why);
+    }
+    return std::format("Quick access couldn't be read ({}), so it starts empty; the old file is kept as {}.", why,
+                       util::path_to_utf8(aside));
+}
+
+} // namespace
+
+void App::pins_message(const std::string& type, const Value& msg) {
+    const std::string server = msg.string_of("server").value_or("");
+    const std::string path = msg.string_of("path").value_or("");
+    const std::string name = msg.string_of("name").value_or("");
+    if (server.empty()) return;
+    // The login folder's real path, once Browse asked it this session: one folder however spelled.
+    std::string home;
+    {
+        std::scoped_lock lock(files_mutex_);
+        if (const auto it = accounts_.find(server); it != accounts_.end()) home = it->second.home;
+    }
+    // Each change runs within change_pins below, so it takes these by reference.
+    std::optional<std::size_t> at;
+    std::ptrdiff_t index = 0;
+    std::function<std::expected<bool, std::string>(pins::Pins&)> edit;
+    if (type == "pinsAdd") {
+        if (const Value* a = msg.find("at"); a != nullptr && a->kind == Value::Kind::number && a->number >= 0) {
+            at = static_cast<std::size_t>(std::min(a->number, static_cast<double>(pins::max_per_server)));
+        }
+        edit = [&](pins::Pins& p) { return pins::add(p, server, path, name, at, home).transform([] { return true; }); };
+    } else if (type == "pinsRemove") {
+        edit = [&](pins::Pins& p) -> std::expected<bool, std::string> { return pins::remove(p, server, path, home); };
+    } else if (type == "pinsRename") {
+        edit = [&](pins::Pins& p) { return pins::rename(p, server, path, name, home); };
+    } else if (type == "pinsMove") {
+        const Value* to = msg.find("to");
+        if (to == nullptr || to->kind != Value::Kind::number) return;
+        index = static_cast<std::ptrdiff_t>(std::clamp(to->number, -1.0, static_cast<double>(pins::max_per_server)));
+        edit = [&](pins::Pins& p) -> std::expected<bool, std::string> { return pins::move(p, server, path, index, home); };
+    } else {
+        return;
+    }
+    // Only a server of grab.conf's (the UI thread's read, without the import).
+    if (const auto cfg = load_grab_config(config_path_); !cfg || !std::ranges::contains(cfg->remotes, server, &RemoteSettings::name)) {
+        std::scoped_lock lock(pins_mutex_);
+        return post_pins(pins_, std::format("{} isn't one of your servers any more.", server));
+    }
+    change_pins(edit);
+}
+
+void App::change_pins(const std::function<std::expected<bool, std::string>(pins::Pins&)>& edit) {
+    std::scoped_lock lock(pins_mutex_);
+    auto done = pins::update(pins_path_, edit);
+    took_pins(done);
+    post_pins(pins_, done.error);
+}
+
+void App::carry_pins(const std::function<bool(pins::Pins&)>& edit) {
+    std::scoped_lock lock(pins_mutex_);
+    // None of the window's pins is there: nothing to read or write (only this window adds pins).
+    if (pins::Pins mine = pins_; !edit(mine)) return;
+    auto done = pins::update(pins_path_, [&](pins::Pins& p) -> std::expected<bool, std::string> { return edit(p); });
+    const pins::Pins before = pins_;
+    took_pins(done);
+    // Also when this change was nobody's but the file had changed (a Remove or Add by `grab server`,
+    // a file moved aside): the page shows what the file has.
+    if (done.changed || !done.error.empty() || pins_ != before) post_pins(pins_, done.error);
+}
+
+std::string App::reload_pins() {
+    auto loaded = pins::load(pins_path_);
+    // Left where it is (it couldn't be read at all): what was shown stays.
+    if (!loaded.damaged.empty() && loaded.aside.empty()) return pins_unread(loaded.damaged, loaded.aside);
+    pins_ = std::move(loaded.pins);
+    return loaded.damaged.empty() ? std::string{} : pins_unread(loaded.damaged, loaded.aside);
+}
+
+void App::took_pins(pins::Updated& done) {
+    if (!done.aside.empty()) tell(pins_unread(done.damaged, done.aside));
+    if (!done.unread) pins_ = std::move(done.pins);
+}
+
+void App::tell(std::string text) {
+    host_.defer([this, text = std::move(text)] {
+        notices_.push_back(text);
+        if (!page_ready_) return; // its init tells them
+        Value v = Value::make_object();
+        v.set("type", str("error"));
+        v.set("message", str(util::join(std::exchange(notices_, {}), " ")));
+        post(v);
+    });
+}
+
+void App::post_pins(const pins::Pins& all, const std::string& error) const {
+    Value v = Value::make_object();
+    v.set("type", str("pins"));
+    v.set("pins", pins_json(all, load_grab_config(config_path_)));
+    if (!error.empty()) v.set("error", str(error));
+    post(v);
 }
 
 void App::send_init() {
@@ -1242,6 +1380,11 @@ void App::send_init() {
     }
     init.set("remotes", std::move(remotes));
     init.set("remote", str(selected));
+    {
+        // Every init's: a Remove or an Add changed them (servers_changed).
+        std::scoped_lock lock(pins_mutex_);
+        init.set("pins", pins_json(pins_, cfg));
+    }
     if (state_.sort) init.set("sort", sort_to_json(*state_.sort));
     // The page takes these from its first init only: init comes again after every server change.
     if (state_.split) init.set("split", num(*state_.split));
@@ -1582,7 +1725,7 @@ void App::on_list_refreshed(const std::string& server) {
         browsed = last_browse_;
     }
     if (browsed.id != 0 && browsed.remote == server) {
-        run_browse(browsed.id, browsed.remote, browsed.path, browsed.top, false, true, browsed.typed);
+        run_browse(browsed.id, browsed.remote, browsed.path, browsed.top, false, true, browsed.typed, browsed.pin);
     }
 }
 
@@ -1709,31 +1852,35 @@ Value item_value(const browse::Item& it) {
 } // namespace
 
 void App::run_browse(int id, const std::string& remote, const std::string& path, bool top, bool live, bool update,
-                     bool typed) {
+                     bool typed, bool pin) {
     if (browse_thread_.joinable()) {
         browse_thread_.request_stop();
         browse_thread_.join();
     }
     {
         std::lock_guard lock(browse_mutex_);
-        last_browse_ = LastBrowse{id, remote, path, top, typed};
+        last_browse_ = LastBrowse{.id = id, .remote = remote, .path = path, .top = top, .typed = typed, .pin = pin};
     }
-    browse_thread_ = std::jthread([this, id, remote, path, top, live, update, typed](std::stop_token stop) {
+    browse_thread_ = std::jthread([this, id, remote, path, top, live, update, typed, pin](std::stop_token stop) {
         const auto t0 = std::chrono::steady_clock::now();
+        // A typed address or a pin: a file's path opens its folder, and a failure leaves the
+        // window where it was.
+        const bool asked = typed || pin;
         Value v = Value::make_object();
         v.set("type", str("browseResult"));
         v.set("id", num(id));
         v.set("remote", str(remote));
         v.set("update", Value::make_bool(update));
         if (typed) v.set("typed", Value::make_bool(true));
+        if (pin) v.set("pin", Value::make_bool(true));
         auto send = [&] {
             v.set("elapsedMs", num(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                                            std::chrono::steady_clock::now() - t0)
                                                            .count())));
             post(v);
         };
-        // A typed path that fails leaves the window where it was, and so does a list refresh
-        // after it; any other failure is shown as the folder's.
+        // A typed path or a pin that fails leaves the window where it was, and so does a list
+        // refresh after it; any other failure is shown as the folder's.
         auto fail = [&](const std::string& error) {
             v.set("path", str(path));
             v.set("top", Value::make_bool(top));
@@ -1741,8 +1888,8 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             v.set("uploadable", Value::make_bool(false));
             {
                 std::lock_guard lock(browse_mutex_);
-                if (!typed) {
-                    shown_browse_ = LastBrowse{id, remote, path, top, false};
+                if (!asked) {
+                    shown_browse_ = LastBrowse{.id = id, .remote = remote, .path = path, .top = top, .typed = false, .pin = false};
                 } else if (last_browse_.id == id) {
                     last_browse_ = shown_browse_;
                     last_browse_.id = id;
@@ -1763,12 +1910,13 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             if (!s.error.empty()) v.set("listError", str(s.error));
         }
 
-        // A typed path as browse uses it; a server's one root is its top.
-        std::string folder = typed ? browse::address_path(path) : path;
-        const bool at_top = top || (typed && roots.size() == 1 && folder == roots.front());
+        // A typed path as browse uses it, a pin's exactly as saved; a server's one root is its top.
         // Several roots make a top of their own; with one, the top is that root's folder.
-        const bool roots_top = at_top && roots.size() > 1;
-        if (at_top && !roots_top) folder = roots.front();
+        auto opened = browse::opening(roots, path, top,
+                                      pin ? browse::Asked::pin : typed ? browse::Asked::typed : browse::Asked::browsed);
+        std::string folder = std::move(opened.folder);
+        const bool at_top = opened.top;
+        const bool roots_top = opened.roots_top;
         std::string select; // a typed file's path: its folder opens with it picked
 
         // A folder's rows: this session's live listing or the list, whichever is newer, else
@@ -1834,7 +1982,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             }
         } else {
             // A file the list holds: its folder.
-            if (typed && view.index) {
+            if (asked && view.index) {
                 if (const auto e = view.index->entry(folder); e && !e->dir) {
                     select = folder;
                     folder = parent_of(folder);
@@ -1842,7 +1990,7 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
             }
             auto rows = rows_of(folder);
             if (stop.stop_requested()) return; // the next request answers instead
-            if (!rows && typed && select.empty() && rows.error().kind == browse::ListError::Kind::file) {
+            if (!rows && asked && select.empty() && rows.error().kind == browse::ListError::Kind::file) {
                 // One STAT said it's a file; its folder opens with it picked, when the folder shows
                 // it (a dot-name may be left out).
                 const std::string parent = parent_of(folder);
@@ -1855,11 +2003,8 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
                 if (stop.stop_requested()) return;
             }
             if (!rows) {
-                if (typed && rows.error().kind == browse::ListError::Kind::not_found) {
-                    return fail(std::format("Not found on {}: {}", remote, folder.empty() ? "~" : folder));
-                }
-                if (typed && rows.error().kind == browse::ListError::Kind::denied) {
-                    return fail(std::format("{} doesn't let you list {}", remote, folder.empty() ? "~" : folder));
+                if (asked) {
+                    if (auto said = browse::asked_failure(remote, folder, rows.error())) return fail(*said);
                 }
                 return fail(rows.error().message);
             }
@@ -1883,8 +2028,8 @@ void App::run_browse(int id, const std::string& remote, const std::string& path,
         {
             // Where the window now is (a typed path resolved), also for the next list refresh.
             std::lock_guard lock(browse_mutex_);
-            shown_browse_ = LastBrowse{id, remote, at, at_top, false};
-            if (typed && last_browse_.id == id) last_browse_ = shown_browse_;
+            shown_browse_ = LastBrowse{.id = id, .remote = remote, .path = at, .top = at_top, .typed = false, .pin = false};
+            if (asked && last_browse_.id == id) last_browse_ = shown_browse_;
         }
         v.set("path", str(at));
         v.set("top", Value::make_bool(at_top));
@@ -2192,6 +2337,13 @@ void App::servers_changed() {
         // Asked again when Browse opens each (the page forgets them with the init below).
         std::scoped_lock lock(files_mutex_);
         accounts_.clear();
+    }
+    {
+        // A Remove dropped the server's pins, an Add those an older grab's Remove left under its
+        // name (server_ops): the list as the file has it now.
+        std::scoped_lock lock(pins_mutex_);
+        if (auto said = reload_pins(); !said.empty()) tell(std::move(said));
+        post_pins(pins_, {});
     }
     if (auto env = load_env()) post_servers(*env);
     host_.defer([this] { send_init(); }); // the search view's server list; state_ is UI-thread only
