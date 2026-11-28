@@ -57,6 +57,9 @@ TEST_CASE("proxy: the forms grab.conf takes, read back from the text grab writes
                   .text = "socks5://[::1]:1080"},
              Form{.written = "http://[2001:db8::7]:3128", .kind = Kind::http, .host = "2001:db8::7", .port = 3128,
                   .user = "", .text = "http://[2001:db8::7]:3128"},
+             // An IPv6 address with an IPv4 tail is still one.
+             Form{.written = "socks5://[::ffff:127.0.0.1]:9050", .kind = Kind::socks5, .host = "::ffff:127.0.0.1",
+                  .port = 9050, .user = "", .text = "socks5://[::ffff:127.0.0.1]:9050"},
              Form{.written = "socks5://al%40ice%2Fx@h:1", .kind = Kind::socks5, .host = "h", .port = 1,
                   .user = "al@ice/x", .text = "socks5://al%40ice%2Fx@h:1"},
              Form{.written = "http://d%C3%A9j%C3%A0@h:65535", .kind = Kind::http, .host = "h", .port = 65535,
@@ -124,6 +127,15 @@ TEST_CASE("proxy: the forms refused, each with its reason, never quoting a passw
         REQUIRE_FALSE(p);
         CHECK(p.error() == r.reason);
     }
+    // In brackets only a real IPv6 address: not host:port, an IPv4 address, a name, nothing, two
+    // '::', a group too long, or one with a zone (written plainly or as RFC 6874's %25).
+    for (const std::string_view written :
+         {"socks5://[127.0.0.1:9050]:1080", "http://[127.0.0.1:9050]:3128", "socks5://[]:1080", "socks5://[host]:1080",
+          "socks5://[1.2.3.4]:1080", "socks5://[1:2]:1080", "socks5://[1::2::3]:1080", "socks5://[12345::1]:1080",
+          "socks5://[fe80::1%eth0]:1080", "socks5://[fe80::1%25eth0]:1080", "socks5://[::1%1]:1080"}) {
+        CAPTURE(written);
+        CHECK(proxy::parse(written).error_or("") == "the proxy's address in brackets isn't an IPv6 address");
+    }
     // Something before :// that isn't a scheme may be a login: never repeated.
     for (const std::string_view written : {"alice:fake-secret@socks5://h:1", "fake-secret.longer://h:1", "://h:1"}) {
         CAPTURE(written);
@@ -165,6 +177,8 @@ TEST_CASE("proxy: rclone's socks_proxy and http_proxy, read as rclone 1.75.1 rea
     CHECK_FALSE(proxy::parse_rclone_socks("h"));
     CHECK_FALSE(proxy::parse_rclone_socks(":pw@h:1"));
     CHECK_FALSE(proxy::parse_rclone_socks("socks5://h:1080"));
+    CHECK(proxy::parse_rclone_socks("[127.0.0.1:9050]:1080").error_or("") ==
+          "the proxy's address in brackets isn't an IPv6 address");
 
     // http_proxy: a URL, its user and password percent-decoded; port 80 when it has none.
     CHECK(proxy::parse_rclone_http("http://alice:p%40ss%3Aw@proxy.example:3128") ==
@@ -176,6 +190,8 @@ TEST_CASE("proxy: rclone's socks_proxy and http_proxy, read as rclone 1.75.1 rea
     CHECK(proxy::parse_rclone_http("https://h:443").error_or("") == "grab can't use HTTPS proxies yet: use http://");
     CHECK(proxy::parse_rclone_http("socks5://h:1080").error_or("") == "an HTTP proxy's address starts with http://");
     CHECK_FALSE(proxy::parse_rclone_http("http://a:%zz@h:1"));
+    CHECK(proxy::parse_rclone_http("http://[1.2.3.4]:8080").error_or("") ==
+          "the proxy's address in brackets isn't an IPv6 address");
 }
 
 TEST_CASE("proxy: the copy for older grabs in rclone's form reads back; the said form holds no password") {
@@ -220,6 +236,8 @@ TEST_CASE("proxy: the address `grab server add` and `edit` ask for: host:port, a
              std::pair{"127.0.0.1", "give the proxy's port too (127.0.0.1:9050)"},
              std::pair{"127.0.0.1:0", "the proxy's port must be from 1 to 65535"},
              std::pair{"::1:1080", "write the proxy's IPv6 address in brackets: [::1]:1080"},
+             std::pair{"[127.0.0.1:9050]:1080", "the proxy's address in brackets isn't an IPv6 address"},
+             std::pair{"[1.2.3.4]:1080", "the proxy's address in brackets isn't an IPv6 address"},
              std::pair{"a b:1", "use a host name (letters, digits, - and .) or an IP address for the proxy"},
              // A whole proxy pasted in: never read for a login, and nothing of it quoted.
              std::pair{"socks5://fake-user:fake-pw@127.0.0.1:1080",

@@ -73,10 +73,13 @@ std::optional<std::string> percent_decode(std::string_view s) {
     return out;
 }
 
-// An IPv6 address as a proxy's host can be (no zone); getaddrinfo checks the rest.
-bool ipv6_like(std::string_view s) {
-    return s.contains(':') && s.size() <= 45 &&
-           std::ranges::all_of(s, [](char c) { return hex_char(c) || c == ':' || c == '.'; });
+// A real IPv6 address as a proxy's host in brackets, as inet_pton reads one: not "[127.0.0.1:9050]"
+// or "[1.2.3.4]". No zone, and nothing (a '%', a NUL) that would make what is dialled differ from
+// what grab.conf says.
+bool ipv6_address(const std::string& s) {
+    in6_addr v6{};
+    return std::ranges::all_of(s, [](char c) { return hex_char(c) || c == ':' || c == '.'; }) &&
+           inet_pton(AF_INET6, s.c_str(), &v6) == 1;
 }
 
 struct HostPort {
@@ -94,7 +97,7 @@ std::expected<HostPort, std::string> split_host_port(std::string_view s, std::st
         const auto close = s.find(']');
         if (close == std::string_view::npos) return util::fail("a ']' is missing after the proxy's IPv6 address");
         out.host = std::string(s.substr(1, close - 1));
-        if (!ipv6_like(out.host)) return util::fail("the proxy's address in brackets isn't an IPv6 address");
+        if (!ipv6_address(out.host)) return util::fail("the proxy's address in brackets isn't an IPv6 address");
         const auto after = s.substr(close + 1);
         if (!after.empty() && after.front() != ':') return util::failf("write the proxy as {}", example);
         has_port = !after.empty();
